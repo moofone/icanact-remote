@@ -1,0 +1,14 @@
+
+use icanact_remote::registry::GossipRegistry;
+use icanact_remote::GossipConfig;
+use std::net::SocketAddr;
+
+#[tokio::main]
+async fn main() {
+    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let config = GossipConfig::default();
+    let registry = GossipRegistry::new(addr, config);
+    
+    // This should FAIL to compile after the fix
+    let _conn = registry.get_connection(addr).await;
+}

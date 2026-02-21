@@ -1,0 +1,29 @@
+/target
+target-linux/
+Cargo.lock
+.direnv
+.envrc
+sprints/
+qa/
+# Keep specific specs in-tree, but ignore everything else under spec/.
+spec/
+!spec/
+spec/*
+!spec/QA.md
+!spec/TEST_IMPROVEMENTS_GOSSIP.md
+.DS_Store
+
+# Generated files and reports
+baselines/
+logs/
+reports/
+*.profraw
+*.profdata
+
+# Test and benchmark outputs
+benches/output/
+
+# Test output files in root directory
+test_output*.log
+test_output*.txt
+validation_output*.log
