@@ -50,11 +50,8 @@ async fn main() -> Result<()> {
     
     let config = GossipConfig::default();
     
-    let registry = GossipRegistryHandle::new_with_tls(
-        server_addr,
-        server_secret,
-        Some(config),
-    ).await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(server_addr, server_secret, Some(config),
+    icanact_remote::BuilderTlsBootstrap).await?;
     
     println!("   ✅ Server listening on: {}", server_addr);
     println!("   ✅ Server NodeId: {}", server_node_id.fmt_short());

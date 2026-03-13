@@ -78,8 +78,8 @@ fn concurrent_locations(loc1: &mut RemoteActorLocation, loc2: &mut RemoteActorLo
 async fn test_gossip_scheduler_concurrent_conflict_converges_across_seeds() {
     let actor = "actor.conflict";
 
-    let base_a = GossipRegistry::new(test_addr(8011), test_config("sched_a"));
-    let base_b = GossipRegistry::new(test_addr(8012), test_config("sched_b"));
+    let base_a = GossipRegistry::<()>::new(test_addr(8011), test_config("sched_a"));
+    let base_b = GossipRegistry::<()>::new(test_addr(8012), test_config("sched_b"));
 
     let peer_a = base_a.peer_id.clone();
     let peer_b = base_b.peer_id.clone();
@@ -116,7 +116,7 @@ async fn test_gossip_scheduler_concurrent_conflict_converges_across_seeds() {
     let mut reference: Option<BTreeMap<String, String>> = None;
 
     for seed in 0u64..25 {
-        let reg_c = GossipRegistry::new(test_addr(8020 + seed as u16), test_config("sched_c"));
+        let reg_c = GossipRegistry::<()>::new(test_addr(8020 + seed as u16), test_config("sched_c"));
 
         // Deterministic "chaos": reorder + duplicates, but always deliver at least one copy of each.
         let mut rng = StdRng::seed_from_u64(seed);
@@ -143,8 +143,8 @@ async fn test_gossip_scheduler_concurrent_conflict_converges_across_seeds() {
 
 #[tokio::test]
 async fn test_gossip_scheduler_full_sync_interleavings_are_order_independent() {
-    let node_a = GossipRegistry::new(test_addr(8101), test_config("fs_a"));
-    let node_b = GossipRegistry::new(test_addr(8102), test_config("fs_b"));
+    let node_a = GossipRegistry::<()>::new(test_addr(8101), test_config("fs_a"));
+    let node_b = GossipRegistry::<()>::new(test_addr(8102), test_config("fs_b"));
 
     // Disjoint actors to avoid conflict; the test is about interleaving/idempotency.
     node_a
@@ -198,7 +198,7 @@ async fn test_gossip_scheduler_full_sync_interleavings_are_order_independent() {
     let mut reference: Option<BTreeMap<String, String>> = None;
 
     for seed in 0u64..20 {
-        let reg_c = GossipRegistry::new(test_addr(8200 + seed as u16), test_config("fs_c"));
+        let reg_c = GossipRegistry::<()>::new(test_addr(8200 + seed as u16), test_config("fs_c"));
         let mut rng = StdRng::seed_from_u64(seed);
 
         let mut order = vec![0u8, 1u8];

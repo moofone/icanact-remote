@@ -27,7 +27,7 @@ fn init_crypto() {
         // `rustls` only allows installing a default crypto provider once per process.
         // The library code may have already installed it by the time this runs, so
         // make init idempotent to avoid flakes.
-        icanact_remote::tls::ensure_crypto_provider();
+        icanact_remote_transports::tls::ensure_crypto_provider();
     });
 }
 
@@ -77,7 +77,7 @@ where
 async fn create_tls_node(config: GossipConfig) -> Result<GossipRegistryHandle, DynError> {
     init_crypto();
     let secret_key = SecretKey::generate();
-    let node = GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, secret_key, Some(config))
+    let node = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, secret_key, Some(config), icanact_remote::BuilderTlsBootstrap)
         .await?;
     Ok(node)
 }
@@ -436,8 +436,8 @@ fn test_resource_exhaustion_protection() -> Result<(), DynError> {
 
         let now = icanact_remote::current_timestamp();
         let mut peers =
-            Vec::with_capacity(icanact_remote::registry::GossipRegistry::MAX_PEER_LIST_SIZE + 1);
-        for i in 0..=icanact_remote::registry::GossipRegistry::MAX_PEER_LIST_SIZE {
+            Vec::with_capacity(icanact_remote::registry::GossipRegistry::<()>::MAX_PEER_LIST_SIZE + 1);
+        for i in 0..=icanact_remote::registry::GossipRegistry::<()>::MAX_PEER_LIST_SIZE {
             peers.push(PeerInfoGossip {
                 address: format!("127.0.0.1:{}", 10_000 + i as u16),
                 peer_address: None,

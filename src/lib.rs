@@ -1,6 +1,6 @@
 pub mod aligned;
 pub mod config;
-pub mod connection_pool;
+pub(crate) mod connection_pool;
 pub mod dns;
 pub mod framing;
 mod handle;
@@ -18,7 +18,7 @@ pub mod reply_to;
 pub mod stream_writer;
 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
 pub mod test_helpers;
-pub mod tls;
+pub mod transport;
 pub mod typed;
 
 use arc_swap::ArcSwap;
@@ -28,25 +28,50 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
 pub use config::GossipConfig;
-pub use connection_pool::{ChannelId, LockFreeStreamHandle, PendingAsk, StreamFrameType};
 pub use dns::{DnsResolver, TokioDnsResolver};
 
 /// Maximum allowed size for streaming payloads (hard cap).
 pub const MAX_STREAM_SIZE: usize = 64 * 1024 * 1024; // 64MB
 pub use handle::{GossipClient, GossipRegistryHandle};
-pub use handle_builder::GossipRegistryBuilder;
+pub use handle_builder::{BuilderTlsBootstrap, GossipRegistryBuilder};
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use remote_actor_location::RemoteActorLocation;
-pub use remote_actor_ref::RemoteActorRef;
+pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
+pub use transport::{
+    AuthContext, PeerAuthenticator, RegistryTransportBootstrap, RemoteAddrMeta, TargetAddr,
+    TransportConnector, TransportListener, TransportStack,
+};
 pub use typed::{WireEncode, WireType, decode_typed, encode_typed};
+
+/// Deferred ask handle exposed as high-level API.
+///
+/// This can be moved to another task and awaited later.
+#[derive(Debug)]
+pub struct DeferredAsk {
+    inner: connection_pool::PendingAsk,
+}
+
+impl DeferredAsk {
+    pub fn correlation_id(&self) -> u16 {
+        self.inner.correlation_id()
+    }
+
+    pub async fn wait(self) -> Result<bytes::Bytes> {
+        self.inner.wait().await
+    }
+
+    pub(crate) fn from_pending(inner: connection_pool::PendingAsk) -> Self {
+        Self { inner }
+    }
+}
 
 // =================== New Iroh-style types ===================
 
@@ -726,12 +751,12 @@ impl From<&PublicKey> for PeerId {
 
 /// Handle to a configured peer
 #[derive(Clone)]
-pub struct Peer {
+pub struct Peer<T = ()> {
     peer_id: PeerId,
-    registry: std::sync::Arc<registry::GossipRegistry>,
+    registry: std::sync::Arc<registry::GossipRegistry<T>>,
 }
 
-impl Peer {
+impl<T: 'static> Peer<T> {
     /// Connect to this peer at the specified address
     pub async fn connect(&self, addr: &SocketAddr) -> Result<()> {
         // Validate the address
@@ -1229,9 +1254,36 @@ pub enum GossipError {
 
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("non-zero-copy API disabled: {0}")]
+    NonZeroCopyPath(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, GossipError>;
+
+#[inline]
+fn strict_zero_copy_env_enabled() -> bool {
+    static STRICT: OnceLock<bool> = OnceLock::new();
+    *STRICT.get_or_init(|| {
+        matches!(
+            std::env::var("ICANACT_STRICT_ZERO_COPY")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+#[inline]
+pub(crate) fn reject_non_zero_copy_path(api: &'static str) -> Result<()> {
+    if cfg!(feature = "strict-zero-copy") || strict_zero_copy_env_enabled() {
+        return Err(GossipError::NonZeroCopyPath(api));
+    }
+    Ok(())
+}
 
 /// Get current timestamp in seconds (still used for TTL)
 pub fn current_timestamp() -> u64 {

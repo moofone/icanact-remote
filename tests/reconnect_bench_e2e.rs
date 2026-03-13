@@ -14,8 +14,8 @@ use icanact_remote::{
     GossipConfig, GossipRegistryHandle, SecretKey,
     aligned::AlignedBytes,
     registry::{ActorMessageFuture, ActorMessageHandler, ActorResponse, PeerDisconnectHandler},
-    tls,
 };
+use icanact_remote_transports::tls;
 use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
 
@@ -110,7 +110,7 @@ async fn start_server_at(
         gossip_interval: Duration::from_secs(3600),
         ..Default::default()
     };
-    let h = GossipRegistryHandle::new_with_tls(bind_addr, secret, Some(config))
+    let h = GossipRegistryHandle::new_with_transport_stack(bind_addr, secret, Some(config), icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("start server");
     h.registry.set_actor_message_handler(handler).await;
@@ -144,14 +144,11 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
     // Client.
     let client_secret = SecretKey::generate();
     let client = Arc::new(
-        GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            client_secret,
-            Some(GossipConfig {
+        GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), client_secret, Some(GossipConfig {
                 gossip_interval: Duration::from_secs(3600),
                 ..Default::default()
             }),
-        )
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("start client"),
     );
@@ -165,7 +162,8 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
         .await
         .expect("initial lookup_peer");
 
-    let (tx, mut rx) = watch::channel::<Option<icanact_remote::RemoteActorRef>>(Some(initial_remote));
+    let (tx, mut rx) =
+        watch::channel::<Option<icanact_remote::RemoteActorRef>>(Some(initial_remote));
     let disconnects = Arc::new(AtomicUsize::new(0));
     let reconnected = Arc::new(Notify::new());
 

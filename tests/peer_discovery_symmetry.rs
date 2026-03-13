@@ -34,9 +34,9 @@ fn peer_info(addr: &str, last_attempt: u64, last_success: u64) -> PeerInfoGossip
 #[tokio::test]
 async fn test_peer_list_cleanup_symmetric() -> Result<(), Box<dyn std::error::Error>> {
     let registry_a =
-        GossipRegistry::new("127.0.0.1:0".parse()?, peer_discovery_config("peer_sym_a"));
+        GossipRegistry::<()>::new("127.0.0.1:0".parse()?, peer_discovery_config("peer_sym_a"));
     let registry_b =
-        GossipRegistry::new("127.0.0.1:0".parse()?, peer_discovery_config("peer_sym_b"));
+        GossipRegistry::<()>::new("127.0.0.1:0".parse()?, peer_discovery_config("peer_sym_b"));
 
     let now = icanact_remote::current_timestamp();
     let stale = peer_info(
@@ -72,11 +72,11 @@ async fn test_peer_list_cleanup_symmetric() -> Result<(), Box<dyn std::error::Er
 
 #[tokio::test]
 async fn test_mesh_formation_metric_symmetric() -> Result<(), Box<dyn std::error::Error>> {
-    let registry_a = GossipRegistry::new(
+    let registry_a = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse()?,
         peer_discovery_config("peer_sym_metric_a"),
     );
-    let registry_b = GossipRegistry::new(
+    let registry_b = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse()?,
         peer_discovery_config("peer_sym_metric_b"),
     );

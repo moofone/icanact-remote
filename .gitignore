@@ -1,4 +1,5 @@
 /target
+**/target/
 target-linux/
 Cargo.lock
 .direnv
@@ -22,6 +23,9 @@ reports/
 
 # Test and benchmark outputs
 benches/output/
+benchmarks/transport_trait/raw/
+benchmarks/**/raw/
+benchmarks/**/logs/
 
 # Test output files in root directory
 test_output*.log

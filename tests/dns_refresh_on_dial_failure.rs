@@ -51,13 +51,16 @@ impl DnsResolver for ScriptedResolver {
     }
 }
 
-async fn new_registry(bind: SocketAddr, seed: &str) -> icanact_remote::Result<GossipRegistryHandle> {
+async fn new_registry(
+    bind: SocketAddr,
+    seed: &str,
+) -> icanact_remote::Result<GossipRegistryHandle> {
     let keypair = KeyPair::new_for_testing(seed);
     let mut cfg = GossipConfig::default();
     cfg.key_pair = Some(keypair.clone());
     cfg.allow_loopback_discovery = true; // tests use 127.0.0.1
     cfg.connection_timeout = Duration::from_millis(150);
-    GossipRegistryHandle::new_with_keypair(bind, keypair, Some(cfg)).await
+    GossipRegistryHandle::new_with_transport_stack(bind, keypair.to_secret_key(), Some(cfg), icanact_remote::BuilderTlsBootstrap).await
 }
 
 fn unused_local_addr() -> SocketAddr {
@@ -116,7 +119,8 @@ async fn dial_failure_triggers_dns_refresh_and_reconnect_succeeds() -> icanact_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact_remote::Result<()> {
+async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact_remote::Result<()>
+{
     let b = new_registry("127.0.0.1:0".parse().unwrap(), "dns-b2").await?;
     let b_addr = b.registry.bind_addr;
     let b_peer_id = b.registry.peer_id.clone();

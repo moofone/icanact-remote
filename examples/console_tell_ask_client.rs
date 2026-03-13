@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
     println!("Actor Id: 0x{:016x}\n", ACTOR_ID);
 
     let mut config = GossipConfig::default();
-    config.ask_inflight_limit = ask_concurrency.max(1);
+    config.ask_window = ask_concurrency.max(1);
     if !use_direct_timeout {
         // Disable per-request timeouts to avoid timer allocations in the hot path.
         config.response_timeout = Duration::ZERO;
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
     // Bind to loopback by default to keep the 2-terminal benchmark self-contained.
     // (Some sandboxed environments disallow binding 0.0.0.0.)
     let registry =
-        GossipRegistryHandle::new_with_tls("127.0.0.1:0".parse()?, client_secret, Some(config))
+        GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, client_secret, Some(config), icanact_remote::BuilderTlsBootstrap)
             .await?;
     registry
         .registry
@@ -575,7 +575,8 @@ where
     }
 
     Ok((
-        server_pub_path.unwrap_or_else(|| "/tmp/icanact_tls/console_tell_ask_server.pub".to_string()),
+        server_pub_path
+            .unwrap_or_else(|| "/tmp/icanact_tls/console_tell_ask_server.pub".to_string()),
         tell_count.unwrap_or(1_000_000),
         ask_count.unwrap_or(100),
         ask_concurrency.unwrap_or(50),

@@ -74,11 +74,11 @@ fn test_connection_survives_multiple_gossip_rounds() {
         };
 
         // Start nodes
-        let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
             .await
             .expect("Failed to create node A");
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
             .await
             .expect("Failed to create node B");
 
@@ -148,11 +148,11 @@ fn test_addr_mappings_preserved_after_fullsync() {
             ..Default::default()
         };
 
-        let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -168,7 +168,10 @@ fn test_addr_mappings_preserved_after_fullsync() {
             .lookup_address(addr_b)
             .await
             .expect("Initial connection");
-        let response = conn.ask(b"ECHO:test").await.expect("Initial ask");
+        let response = conn
+            .ask(bytes::Bytes::from_static(b"ECHO:test"))
+            .await
+            .expect("Initial ask");
         assert_eq!(response.as_ref(), b"ECHOED:test");
 
         // Now let many gossip rounds happen
@@ -179,7 +182,10 @@ fn test_addr_mappings_preserved_after_fullsync() {
             match handle_a.lookup_address(addr_b).await {
                 Ok(conn) => {
                     let request = format!("ECHO:round{}", round);
-                    match conn.ask(request.as_bytes()).await {
+                    match conn
+                        .ask(bytes::Bytes::copy_from_slice(request.as_bytes()))
+                        .await
+                    {
                         Ok(response) => {
                             let expected = format!("ECHOED:round{}", round);
                             assert_eq!(response, expected.as_bytes(), "Round {} mismatch", round);
@@ -233,11 +239,11 @@ fn test_reconnect_cleanup() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -266,14 +272,11 @@ fn test_reconnect_cleanup() {
         info!("Restarting node B with new identity");
         let key_pair_b2 = KeyPair::new_for_testing("reconnect_node_b2");
         let peer_id_b2 = key_pair_b2.peer_id();
-        let handle_b2 = GossipRegistryHandle::new_with_keypair(
-            addr_b,
-            key_pair_b2,
-            Some(GossipConfig {
+        let handle_b2 = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b2.to_secret_key(), Some(GossipConfig {
                 gossip_interval: Duration::from_secs(300),
                 ..Default::default()
             }),
-        )
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 

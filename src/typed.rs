@@ -212,6 +212,7 @@ pub fn encode_typed<T>(value: &T) -> Result<Bytes>
 where
     T: WireEncode,
 {
+    crate::reject_non_zero_copy_path("typed::encode_typed (copying encoder)")?;
     let payload =
         rkyv::to_bytes::<rkyv::rancor::Error>(value).map_err(GossipError::Serialization)?;
 

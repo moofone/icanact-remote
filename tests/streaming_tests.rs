@@ -26,9 +26,12 @@ fn init_tracing() {
     // Avoid sandbox-triggered EPERM flakiness unless explicitly enabled.
     if std::env::var("ICANACT_TEST_LOG").ok().as_deref() == Some("1") {
         let _ = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_filter(
-                EnvFilter::from_default_env().add_directive("icanact_remote=debug".parse().unwrap()),
-            ))
+            .with(
+                tracing_subscriber::fmt::layer().with_filter(
+                    EnvFilter::from_default_env()
+                        .add_directive("icanact_remote=debug".parse().unwrap()),
+                ),
+            )
             .try_init();
     }
 }
@@ -131,11 +134,11 @@ fn test_streaming_request_large_payload() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -199,11 +202,11 @@ fn test_streaming_request_zero_copy() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -266,11 +269,11 @@ fn test_streaming_response_auto() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -285,7 +288,7 @@ fn test_streaming_response_auto() {
         // Send a request that triggers a large response
         let request = b"LARGE_RESPONSE:2097152"; // Request 2MB response
 
-        let response = conn.ask(request).await.unwrap();
+        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
 
         info!(
             "Received potentially streamed response of {} bytes",
@@ -321,11 +324,11 @@ fn test_small_payload_uses_write_queue() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -340,7 +343,7 @@ fn test_small_payload_uses_write_queue() {
         // Small payload (1KB) - should NOT use streaming
         let payload = create_test_payload(1024);
 
-        let response = conn.ask(&payload).await.unwrap();
+        let response = conn.ask(bytes::Bytes::from(payload)).await.unwrap();
 
         info!(
             "Received response of {} bytes via write queue path",
@@ -376,11 +379,11 @@ fn test_streaming_threshold_boundary() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -461,11 +464,11 @@ fn test_concurrent_streaming_requests() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -620,11 +623,11 @@ fn test_streaming_tell_no_response() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 

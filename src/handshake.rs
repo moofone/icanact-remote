@@ -3,7 +3,7 @@
 //! This module implements the Hello handshake that establishes peer capabilities
 //! at connection time for TLS-only v3 peers.
 
-use crate::{GossipError, Result, tls};
+use crate::{GossipError, Result};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -12,6 +12,7 @@ use tracing::debug;
 
 const HELLO_MAX_SIZE: usize = 1024;
 const HELLO_TIMEOUT_MS: u64 = 3_000;
+pub const ALPN_ICANACT_V3: &[u8] = b"icanact-remote-v3";
 
 /// Protocol version constants
 pub const PROTOCOL_VERSION_V3: u16 = 3;
@@ -174,13 +175,45 @@ where
         GossipError::TlsHandshakeFailed("missing ALPN negotiation result".to_string())
     })?;
 
-    if alpn != tls::ALPN_ICANACT_V3 {
+    if alpn != ALPN_ICANACT_V3 {
         return Err(GossipError::TlsHandshakeFailed(format!(
             "unsupported ALPN: {}",
             String::from_utf8_lossy(alpn)
         )));
     }
 
+    let local_hello = if enable_peer_discovery {
+        Hello::new()
+    } else {
+        Hello::with_features(Vec::new())
+    };
+    send_hello_message(stream, &local_hello).await?;
+    let remote_hello = read_hello_message(stream).await?;
+    if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
+        return Err(GossipError::TlsHandshakeFailed(format!(
+            "unsupported protocol version: {}",
+            remote_hello.protocol_version
+        )));
+    }
+    let caps = PeerCapabilities::from_hello_exchange(&local_hello, &remote_hello);
+    debug!(
+        negotiated_version = caps.version,
+        peer_list = caps.can_send_peer_list(),
+        "Hello handshake negotiated capabilities"
+    );
+    Ok(caps)
+}
+
+/// Perform Hello handshake on authenticated non-TLS transports.
+///
+/// This keeps capability/version negotiation identical to TLS mode but skips ALPN checks.
+pub async fn perform_hello_handshake_no_alpn<S>(
+    stream: &mut S,
+    enable_peer_discovery: bool,
+) -> Result<PeerCapabilities>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let local_hello = if enable_peer_discovery {
         Hello::new()
     } else {
@@ -319,7 +352,7 @@ mod tests {
             server.write_all(&serialized).await.unwrap();
         });
 
-        let err = perform_hello_handshake(&mut client, Some(crate::tls::ALPN_ICANACT_V3), true)
+        let err = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V3), true)
             .await
             .expect_err("handshake should reject legacy protocol peers");
 

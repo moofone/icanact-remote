@@ -13,7 +13,7 @@ fn test_config(seed: &str) -> GossipConfig {
 fn create_test_registry() -> GossipRegistry {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = test_config("unit_registry");
-    GossipRegistry::new(bind_addr, config)
+    GossipRegistry::<()>::new(bind_addr, config)
 }
 
 fn create_test_actor_location(addr: SocketAddr) -> ActorLocation {
@@ -30,7 +30,7 @@ async fn test_registry_creation() {
     let bind_addr = "127.0.0.1:8080".parse().unwrap();
     let config = test_config("unit_registry_creation");
     
-    let registry = GossipRegistry::new(bind_addr, config.clone());
+    let registry = GossipRegistry::<()>::new(bind_addr, config.clone());
     
     assert_eq!(registry.bind_addr, bind_addr);
     assert_eq!(registry.config.gossip_interval, config.gossip_interval);

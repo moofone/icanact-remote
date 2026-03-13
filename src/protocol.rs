@@ -7,10 +7,7 @@ use crate::{
     GossipError, Result,
     handle::{
         MessageReadResult, handle_raw_ask_request, handle_response_message, send_inline_response,
-        send_inline_response_aligned, send_inline_response_on_connection,
-        send_inline_response_on_connection_aligned, send_pooled_response,
-        send_pooled_response_on_connection, send_streaming_response,
-        send_streaming_response_on_connection,
+        send_inline_response_aligned, send_pooled_response, send_streaming_response,
     },
     registry::{ActorResponse, GossipRegistry, RegistryMessage},
 };
@@ -595,13 +592,7 @@ async fn handle_assembled_message(
                         response.len(),
                         response_mode,
                     ) {
-                        if let Some(conn) = response_connection {
-                            send_streaming_response_on_connection(conn, corr_id, response).await;
-                        } else {
-                            send_streaming_response(registry, peer_addr, corr_id, response).await;
-                        }
-                    } else if let Some(conn) = response_connection {
-                        send_inline_response_on_connection(conn, corr_id, response).await;
+                        send_streaming_response(registry, peer_addr, corr_id, response).await;
                     } else {
                         send_inline_response(registry, peer_addr, corr_id, response).await;
                     }
@@ -614,13 +605,7 @@ async fn handle_assembled_message(
                         response_mode,
                     ) {
                         let bytes = response.into_bytes();
-                        if let Some(conn) = response_connection {
-                            send_streaming_response_on_connection(conn, corr_id, bytes).await;
-                        } else {
-                            send_streaming_response(registry, peer_addr, corr_id, bytes).await;
-                        }
-                    } else if let Some(conn) = response_connection {
-                        send_inline_response_on_connection_aligned(conn, corr_id, response).await;
+                        send_streaming_response(registry, peer_addr, corr_id, bytes).await;
                     } else {
                         send_inline_response_aligned(registry, peer_addr, corr_id, response).await;
                     }
@@ -654,20 +639,7 @@ async fn handle_assembled_message(
                         }
                         let bytes = buf.freeze();
 
-                        if let Some(conn) = response_connection {
-                            send_streaming_response_on_connection(conn, corr_id, bytes).await;
-                        } else {
-                            send_streaming_response(registry, peer_addr, corr_id, bytes).await;
-                        }
-                    } else if let Some(conn) = response_connection {
-                        send_pooled_response_on_connection(
-                            conn,
-                            corr_id,
-                            payload,
-                            prefix,
-                            payload_len,
-                        )
-                        .await;
+                        send_streaming_response(registry, peer_addr, corr_id, bytes).await;
                     } else {
                         send_pooled_response(
                             registry,
@@ -788,7 +760,7 @@ mod tests {
             schema_hash: Some(0xAABBCCDDEEFF0011),
             ..Default::default()
         };
-        let registry = Arc::new(GossipRegistry::new("127.0.0.1:0".parse().unwrap(), config));
+        let registry = Arc::new(GossipRegistry::<()>::new("127.0.0.1:0".parse().unwrap(), config));
         registry.connection_pool.set_registry(registry.clone());
 
         let hits = Arc::new(AtomicUsize::new(0));

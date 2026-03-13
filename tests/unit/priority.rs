@@ -8,7 +8,7 @@ fn create_test_registry() -> GossipRegistry {
         key_pair: Some(KeyPair::new_for_testing("unit_priority")),
         ..Default::default()
     };
-    GossipRegistry::new(bind_addr, config)
+    GossipRegistry::<()>::new(bind_addr, config)
 }
 
 fn create_test_actor_location(addr: SocketAddr) -> ActorLocation {

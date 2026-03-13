@@ -48,10 +48,10 @@ async fn schema_hash_allows_matching_headers() {
         ..Default::default()
     };
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_a, Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
-    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_b, Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
@@ -108,10 +108,10 @@ async fn schema_hash_rejects_missing_headers() {
         ..Default::default()
     };
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_a, Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
-    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_b, Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 

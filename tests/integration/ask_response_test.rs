@@ -39,13 +39,13 @@ async fn test_ask_response_with_correlation() {
     };
     
     // Start Node A
-    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
     let registry_a = handle_a.registry.clone();
     
     // Start Node B
-    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config.clone()))
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
     let registry_b = handle_b.registry.clone();
@@ -178,7 +178,7 @@ async fn test_ask_error_cases() {
     let key_pair = KeyPair::new_for_testing("test_node");
     let config = GossipConfig::default();
     
-    let handle = GossipRegistryHandle::new_with_keypair(addr, key_pair, Some(config))
+    let handle = GossipRegistryHandle::new_with_transport_stack(addr, key_pair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
     let registry = handle.registry.clone();
@@ -226,12 +226,12 @@ async fn test_ask_performance() {
     let config = GossipConfig::default();
     
     // Start nodes
-    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
     let registry_a = handle_a.registry.clone();
     
-    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
     
@@ -269,7 +269,10 @@ async fn test_ask_performance() {
             let reply_to = conn_clone.ask_with_reply_to(&request).await.unwrap();
             
             // Simulate immediate reply
-            reply_to.reply(b"ok").await.unwrap();
+            reply_to
+                .reply(bytes::Bytes::from_static(b"ok"))
+                .await
+                .unwrap();
         });
         handles.push(handle);
         

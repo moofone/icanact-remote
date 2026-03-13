@@ -36,13 +36,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start Node A with TLS
     let addr_a: SocketAddr = "127.0.0.1:7011".parse()?;
     let registry_a =
-        GossipRegistryHandle::new_with_tls(addr_a, secret_key_a, Some(config.clone())).await?;
+        GossipRegistryHandle::new_with_transport_stack(addr_a, secret_key_a, Some(config.clone()), icanact_remote::BuilderTlsBootstrap).await?;
     info!("Node A started with TLS on {}", addr_a);
 
     // Start Node B with TLS
     let addr_b: SocketAddr = "127.0.0.1:7012".parse()?;
     let registry_b =
-        GossipRegistryHandle::new_with_tls(addr_b, secret_key_b, Some(config.clone())).await?;
+        GossipRegistryHandle::new_with_transport_stack(addr_b, secret_key_b, Some(config.clone()), icanact_remote::BuilderTlsBootstrap).await?;
     info!("Node B started with TLS on {}", addr_b);
 
     // Register an actor on Node A

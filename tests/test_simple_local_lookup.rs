@@ -39,11 +39,8 @@ fn test_simple_local_lookup() {
         };
 
         let key_pair = KeyPair::new_for_testing("test");
-        let handle = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:0".parse().unwrap(),
-            key_pair,
-            Some(config),
-        )
+        let handle = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair.to_secret_key(), Some(config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 

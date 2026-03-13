@@ -1,11 +1,11 @@
 # icanact-remote
 
-`icanact_remote` is a high-throughput, TLS-only transport + registry layer for remote actor discovery and request/response (tell/ask) style messaging.
+`icanact_remote` is a high-throughput, transport-agnostic core for remote actor discovery and request/response (tell/ask) style messaging.
 
 ## Highlights
 
 - High-performance ring buffer: Lock-free ring buffer for tell/ask operations with future io_uring support for Linux 5.1+.
-- TLS 1.3 only: all connections are encrypted and use Ed25519 node identities.
+- Compile-time transport bootstrap via `new_with_transport_stack(...)`.
 - Ask/response correlation tracking and streaming response protocol for large payloads.
 - Zero-copy friendly payload paths (`bytes::Bytes`, aligned buffers, pooled typed payloads).
 
@@ -26,19 +26,26 @@ use icanact_remote::{DnsResolver, GossipRegistryHandle, TokioDnsResolver};
 // Tests can provide a scripted resolver implementing `DnsResolver`.
 ```
 
-## TLS Is Mandatory
+## Transport Bootstrap
 
-TLS is not optional anymore. Creating a registry requires a `SecretKey` (or a `KeyPair`, which is converted to a `SecretKey` under the hood).
+`icanact-remote` core does not ship concrete transport stacks. Use a stack from
+`icanact-remote-transports` and bootstrap with `new_with_transport_stack(...)`.
 
 ```rust
 use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
+use icanact_remote_transports::TcpTlsStack;
 
 #[tokio::main]
 async fn main() -> icanact_remote::Result<()> {
     let secret = SecretKey::generate();
     let bind_addr = "127.0.0.1:0".parse().unwrap();
 
-    let handle = GossipRegistryHandle::new_with_tls(bind_addr, secret, Some(GossipConfig::default())).await?;
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        bind_addr,
+        secret,
+        Some(GossipConfig::default()),
+        TcpTlsStack::default(),
+    ).await?;
     println!("listening on {}", handle.registry.bind_addr);
 
     handle.shutdown().await;

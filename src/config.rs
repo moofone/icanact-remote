@@ -16,7 +16,7 @@ pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_DEAD_PEER_TIMEOUT_SECS: u64 = 900;
 
 /// Default max concurrent ask inflight
-pub const DEFAULT_ASK_INFLIGHT_LIMIT: usize = 128;
+pub const DEFAULT_ASK_WINDOW: usize = 128;
 
 /// Default small cluster threshold - clusters with this many nodes or fewer use full sync
 /// Set to 0 to always use delta sync when possible
@@ -104,8 +104,8 @@ pub struct GossipConfig {
     pub max_immediate_retries: usize,
     /// Timeout for causal consistency operations
     pub causal_consistency_timeout: Duration,
-    /// Max in-flight ask permits per connection
-    pub ask_inflight_limit: usize,
+    /// Target in-flight ask window per connection (used for queue/pool sizing)
+    pub ask_window: usize,
     /// How long to keep disconnected peers before removing them (default: 15 minutes)
     pub dead_peer_timeout: Duration,
     /// Enable peer role-aware NAT reconnect suppression for inbound-only, undialable peers.
@@ -203,7 +203,7 @@ impl Default for GossipConfig {
             urgent_gossip_fanout: 5,
             max_immediate_retries: 3,
             causal_consistency_timeout: Duration::from_millis(500),
-            ask_inflight_limit: DEFAULT_ASK_INFLIGHT_LIMIT,
+            ask_window: DEFAULT_ASK_WINDOW,
             dead_peer_timeout: Duration::from_secs(DEFAULT_DEAD_PEER_TIMEOUT_SECS),
             nat_role_reconnect_enabled: DEFAULT_NAT_ROLE_RECONNECT_ENABLED,
             tcp_keepalive: Some(TcpKeepaliveConfig {
@@ -278,7 +278,7 @@ mod tests {
             config.causal_consistency_timeout,
             Duration::from_millis(500)
         );
-        assert_eq!(config.ask_inflight_limit, DEFAULT_ASK_INFLIGHT_LIMIT);
+        assert_eq!(config.ask_window, DEFAULT_ASK_WINDOW);
         assert_eq!(config.dead_peer_timeout, Duration::from_secs(900));
         assert!(!config.nat_role_reconnect_enabled);
         // Peer discovery defaults

@@ -23,11 +23,8 @@ async fn main() {
     };
 
     println!("Starting Node B on 127.0.0.1:8002...");
-    let handle = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:8002".parse().unwrap(),
-        node_b_keypair.clone(),
-        Some(config),
-    )
+    let handle = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:8002".parse().unwrap(), node_b_keypair.clone().to_secret_key(), Some(config),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .expect("Failed to create node B");
 

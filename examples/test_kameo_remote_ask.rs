@@ -28,11 +28,11 @@ async fn main() {
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
