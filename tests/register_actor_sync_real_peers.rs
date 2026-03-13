@@ -131,22 +131,16 @@ fn test_register_actor_sync_real_single_peer() {
         let config = create_test_config();
 
         // Start first node
-        let handle1 = GossipRegistryHandle::new_with_keypair(
-            node1_addr,
-            test_keypair("node1"),
-            Some(config.clone()),
-        )
+        let handle1 = GossipRegistryHandle::new_with_transport_stack(node1_addr, test_keypair("node1").to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to start node1");
         let node1_actual_addr = handle1.registry.bind_addr;
         println!("✅ Node1 started on {}", node1_actual_addr);
 
         // Start second node
-        let handle2 = GossipRegistryHandle::new_with_keypair(
-            node2_addr,
-            test_keypair("node2"),
-            Some(config.clone()),
-        )
+        let handle2 = GossipRegistryHandle::new_with_transport_stack(node2_addr, test_keypair("node2").to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to start node2");
         let node2_actual_addr = handle2.registry.bind_addr;
@@ -230,11 +224,8 @@ fn test_register_actor_sync_real_no_peers_vs_with_peers() {
 
         // === TEST 1: No peers - should be immediate ===
         let solo_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let solo_handle = GossipRegistryHandle::new_with_keypair(
-            solo_addr,
-            test_keypair("solo"),
-            Some(config.clone()),
-        )
+        let solo_handle = GossipRegistryHandle::new_with_transport_stack(solo_addr, test_keypair("solo").to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to start solo node");
         let solo_actual_addr = solo_handle.registry.bind_addr;
@@ -266,20 +257,14 @@ fn test_register_actor_sync_real_no_peers_vs_with_peers() {
         let node1_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         let node2_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
-        let handle1 = GossipRegistryHandle::new_with_keypair(
-            node1_addr,
-            test_keypair("node1"),
-            Some(config.clone()),
-        )
+        let handle1 = GossipRegistryHandle::new_with_transport_stack(node1_addr, test_keypair("node1").to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to start node1");
         let node1_actual_addr = handle1.registry.bind_addr;
 
-        let handle2 = GossipRegistryHandle::new_with_keypair(
-            node2_addr,
-            test_keypair("node2"),
-            Some(config.clone()),
-        )
+        let handle2 = GossipRegistryHandle::new_with_transport_stack(node2_addr, test_keypair("node2").to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to start node2");
         let _node2_actual_addr = handle2.registry.bind_addr;
@@ -363,11 +348,8 @@ fn test_register_actor_sync_real_multiple_peers() {
         for i in 0..4 {
             let addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
             let node_name = format!("node{}", i);
-            let handle = GossipRegistryHandle::new_with_keypair(
-                addr,
-                test_keypair(&node_name),
-                Some(config.clone()),
-            )
+            let handle = GossipRegistryHandle::new_with_transport_stack(addr, test_keypair(&node_name).to_secret_key(), Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap_or_else(|_| panic!("Failed to start node{}", i));
             let actual_addr = handle.registry.bind_addr;
@@ -475,20 +457,14 @@ fn test_register_actor_sync_real_peer_timeout() {
         };
 
         // Start two nodes
-        let handle1 = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:0".parse().unwrap(),
-            test_keypair("node1_timeout"),
-            Some(config.clone()),
-        )
+        let handle1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), test_keypair("node1_timeout").to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to start node1");
         let node1_addr = handle1.registry.bind_addr;
 
-        let handle2 = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:0".parse().unwrap(),
-            test_keypair("node2_timeout"),
-            Some(config.clone()),
-        )
+        let handle2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), test_keypair("node2_timeout").to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to start node2");
         let _node2_addr = handle2.registry.bind_addr;

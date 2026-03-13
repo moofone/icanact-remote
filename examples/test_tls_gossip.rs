@@ -32,11 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create node 1 with TLS enabled
     println!("\nStarting Node1 with TLS...");
-    let handle1 = GossipRegistryHandle::new_with_tls(addr1, node1_key, None).await?;
+    let handle1 = GossipRegistryHandle::new_with_transport_stack(addr1, node1_key, None, icanact_remote::BuilderTlsBootstrap).await?;
 
     // Create node 2 with TLS enabled
     println!("Starting Node2 with TLS...");
-    let handle2 = GossipRegistryHandle::new_with_tls(addr2, node2_key, None).await?;
+    let handle2 = GossipRegistryHandle::new_with_transport_stack(addr2, node2_key, None, icanact_remote::BuilderTlsBootstrap).await?;
 
     // Add peers
     println!("\nAdding peers...");

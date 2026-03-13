@@ -64,11 +64,11 @@ async fn run_test_basic_ask_correlation() {
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
@@ -94,13 +94,13 @@ async fn run_test_basic_ask_correlation() {
             "Sending ask request: {:?}",
             String::from_utf8_lossy(request)
         );
-        let response = conn.ask(request).await.unwrap();
+        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
         assert_eq!(response.as_ref(), b"ECHOED:Hello from Node A");
         info!("ECHO test passed: {:?}", String::from_utf8_lossy(&response));
 
         // Test REVERSE command
         let request = b"REVERSE:12345";
-        let response = conn.ask(request).await.unwrap();
+        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
         assert_eq!(response.as_ref(), b"REVERSED:54321");
         info!(
             "REVERSE test passed: {:?}",
@@ -109,7 +109,7 @@ async fn run_test_basic_ask_correlation() {
 
         // Test COUNT command
         let request = b"COUNT:Hello World";
-        let response = conn.ask(request).await.unwrap();
+        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
         assert_eq!(response.as_ref(), b"COUNTED:11 chars");
         info!(
             "COUNT test passed: {:?}",
@@ -118,14 +118,14 @@ async fn run_test_basic_ask_correlation() {
 
         // Test HASH command
         let request = b"HASH:test";
-        let response = conn.ask(request).await.unwrap();
+        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.starts_with("HASHED:"));
         info!("HASH test passed: {}", response_str);
 
         // Test default processing
         let request = b"Just a plain message";
-        let response = conn.ask(request).await.unwrap();
+        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
         let expected = b"RECEIVED:20 bytes, content: 'Just a plain message'";
         assert_eq!(response.as_ref(), expected.as_slice());
         info!(
@@ -159,7 +159,7 @@ async fn run_test_basic_ask_correlation() {
             let request = request.to_string().into_bytes();
             let expected_prefix = expected_prefix.to_string();
             let future = tokio::spawn(async move {
-                let response = conn_clone.ask(&request).await.unwrap();
+                let response = conn_clone.ask(bytes::Bytes::from(request)).await.unwrap();
                 (i, response, expected_prefix)
             });
             futures.push(future);
@@ -229,11 +229,11 @@ async fn run_test_ask_high_throughput() {
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config_a))
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config_b))
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
@@ -256,7 +256,7 @@ async fn run_test_ask_high_throughput() {
         let handle = tokio::spawn(async move {
             // Use ECHO to verify the request is transmitted correctly
             let request = format!("ECHO:High throughput request {}", i).into_bytes();
-            let response = conn_clone.ask(&request).await.unwrap();
+            let response = conn_clone.ask(bytes::Bytes::from(request)).await.unwrap();
 
             // Verify we got the correct echoed response
             let expected = format!("ECHOED:High throughput request {}", i).into_bytes();

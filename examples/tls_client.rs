@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let registry =
-        GossipRegistryHandle::new_with_tls(bind_addr, client_secret_key, Some(config)).await?;
+        GossipRegistryHandle::new_with_transport_stack(bind_addr, client_secret_key, Some(config), icanact_remote::BuilderTlsBootstrap).await?;
 
     let actual_addr = registry.registry.bind_addr;
     println!("✅ Client listening on: {}", actual_addr);

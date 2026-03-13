@@ -12,7 +12,7 @@ async fn test_peer_retry_backoff_gate() -> Result<(), Box<dyn std::error::Error>
         ..Default::default()
     };
 
-    let registry = GossipRegistry::new("127.0.0.1:0".parse()?, config.clone());
+    let registry = GossipRegistry::<()>::new("127.0.0.1:0".parse()?, config.clone());
     let peer_addr: SocketAddr = "127.0.0.1:9701".parse()?;
 
     registry.add_peer(peer_addr).await;

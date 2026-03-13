@@ -499,7 +499,7 @@ fn test_gossip_error_types() {
 async fn test_complex_gossip_scenario() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = test_config("unit_gossip_complex");
-    let registry = GossipRegistry::new(bind_addr, config);
+    let registry = GossipRegistry::<()>::new(bind_addr, config);
     
     // Add some peers
     registry.add_peer("127.0.0.1:8001".parse().unwrap()).await;
@@ -550,7 +550,7 @@ async fn test_complex_gossip_scenario() {
 async fn test_gossip_state_transitions() {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
     let config = test_config("unit_gossip_multi");
-    let registry = GossipRegistry::new(bind_addr, config);
+    let registry = GossipRegistry::<()>::new(bind_addr, config);
     
     // Initial state
     assert!(!registry.is_shutdown().await);

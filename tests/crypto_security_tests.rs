@@ -204,11 +204,8 @@ fn test_key_mismatch_connection_rejection() {
             ..Default::default()
         };
 
-        let server_registry = GossipRegistryHandle::new_with_keypair(
-            server_addr,
-            server_keypair,
-            Some(server_config),
-        )
+        let server_registry = GossipRegistryHandle::new_with_transport_stack(server_addr, server_keypair.to_secret_key(), Some(server_config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Should create server registry");
 
@@ -224,11 +221,8 @@ fn test_key_mismatch_connection_rejection() {
             ..Default::default()
         };
 
-        let client_registry = GossipRegistryHandle::new_with_keypair(
-            client_addr,
-            client_keypair,
-            Some(client_config),
-        )
+        let client_registry = GossipRegistryHandle::new_with_transport_stack(client_addr, client_keypair.to_secret_key(), Some(client_config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Should create client registry");
 

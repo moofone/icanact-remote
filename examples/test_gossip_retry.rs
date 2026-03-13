@@ -20,14 +20,12 @@ async fn main() {
 
     // Start node1 with a peer configured for node2 (which isn't running yet)
     info!("Starting node1 with node2 as a peer (node2 not running yet)");
-    let handle1 = GossipRegistryHandle::new_with_keypair(
-        node1_addr,
-        node1_keypair.clone(),
-        Some(GossipConfig {
+    let handle1 = GossipRegistryHandle::new_with_transport_stack(node1_addr, node1_keypair.clone().to_secret_key(), Some(GossipConfig {
             gossip_interval: Duration::from_secs(2), // Gossip every 2 seconds for faster testing
             peer_retry_interval: Duration::from_secs(5), // Retry failed peers every 5 seconds
             ..Default::default()
         }),
+        icanact_remote::BuilderTlsBootstrap,
     )
     .await
     .unwrap();
@@ -52,13 +50,11 @@ async fn main() {
 
     // Now start node2
     info!("Starting node2 after 10 seconds");
-    let handle2 = GossipRegistryHandle::new_with_keypair(
-        node2_addr,
-        node2_keypair.clone(),
-        Some(GossipConfig {
+    let handle2 = GossipRegistryHandle::new_with_transport_stack(node2_addr, node2_keypair.clone().to_secret_key(), Some(GossipConfig {
             gossip_interval: Duration::from_secs(2),
             ..Default::default()
         }),
+        icanact_remote::BuilderTlsBootstrap,
     )
     .await
     .unwrap();

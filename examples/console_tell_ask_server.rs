@@ -42,9 +42,9 @@ async fn main() -> Result<()> {
     let server_addr = "127.0.0.1:29200".parse()?;
     let mut config = GossipConfig::default();
     // Raise ask inflight limit to avoid throttling direct responses under high concurrency.
-    config.ask_inflight_limit = 4096;
+    config.ask_window = 4096;
     let registry =
-        GossipRegistryHandle::new_with_tls(server_addr, secret_key, Some(config)).await?;
+        GossipRegistryHandle::new_with_transport_stack(server_addr, secret_key, Some(config), icanact_remote::BuilderTlsBootstrap).await?;
 
     registry
         .registry

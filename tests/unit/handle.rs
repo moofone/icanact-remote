@@ -9,7 +9,7 @@ async fn create_handle(
     seed: &str,
 ) -> GossipRegistryHandle {
     let keypair = KeyPair::new_for_testing(seed);
-    GossipRegistryHandle::new_with_keypair(bind_addr, keypair, config)
+    GossipRegistryHandle::new_with_transport_stack(bind_addr, keypair.to_secret_key(), config, icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap()
 }

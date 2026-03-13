@@ -107,7 +107,7 @@ fn test_gossip_config_edge_cases() {
 
 #[tokio::test]
 async fn test_registry_with_empty_data() {
-    let registry = GossipRegistry::new(
+    let registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("edge_empty_data"),
     );
@@ -137,7 +137,7 @@ async fn test_registry_with_empty_data() {
 
 #[tokio::test]
 async fn test_registry_with_invalid_data() {
-    let registry = GossipRegistry::new(
+    let registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("edge_invalid_data"),
     );
@@ -155,7 +155,7 @@ async fn test_registry_with_invalid_data() {
 
 #[tokio::test]
 async fn test_delta_application_edge_cases() {
-    let registry = GossipRegistry::new(
+    let registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("edge_delta_cases"),
     );
@@ -199,7 +199,7 @@ async fn test_delta_application_edge_cases() {
 
 #[tokio::test]
 async fn test_registry_concurrent_modifications() {
-    let registry = std::sync::Arc::new(GossipRegistry::new(
+    let registry = std::sync::Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("edge_concurrent_mods"),
     ));
@@ -230,7 +230,7 @@ async fn test_registry_concurrent_modifications() {
 
 #[tokio::test]
 async fn test_registry_memory_pressure() {
-    let registry = GossipRegistry::new(
+    let registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         GossipConfig {
             max_delta_history: 3, // Very small history
@@ -259,7 +259,7 @@ async fn test_registry_memory_pressure() {
 
 #[tokio::test]
 async fn test_registry_time_edge_cases() {
-    let registry = GossipRegistry::new(
+    let registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         GossipConfig {
             key_pair: Some(KeyPair::new_for_testing("edge_time_cases")),
@@ -292,7 +292,7 @@ async fn test_registry_time_edge_cases() {
 
 #[tokio::test]
 async fn test_registry_shutdown_edge_cases() {
-    let registry = GossipRegistry::new(
+    let registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("edge_shutdown"),
     );
@@ -388,7 +388,7 @@ fn test_current_timestamp_edge_cases() {
 
 #[tokio::test]
 async fn test_registry_with_malformed_addresses() {
-    let registry = GossipRegistry::new(
+    let registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("edge_malformed_addrs"),
     );

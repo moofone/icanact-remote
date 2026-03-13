@@ -48,19 +48,13 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -101,7 +95,7 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
         "✅ RemoteActorRef.location.peer_id: {}",
         remote_actor.location.peer_id
     );
-    if let Some(conn) = &remote_actor.connection {
+    if let Some(conn) = remote_actor.connection_ref() {
         println!("✅ RemoteActorRef.connection.addr: {}", conn.addr);
     } else {
         println!("✅ RemoteActorRef.connection: None (actor not yet listening)");
@@ -112,7 +106,7 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
     // ========================================
     let message1 = b"Hello from node A!";
     remote_actor
-        .tell(message1)
+        .tell(bytes::Bytes::from_static(message1))
         .await
         .expect("tell() should work with cached connection");
 
@@ -123,7 +117,7 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
     // ========================================
     let request = b"PING";
     let response = remote_actor
-        .ask(request)
+        .ask(bytes::Bytes::from_static(request))
         .await
         .expect("ask() should work with cached connection");
 
@@ -133,7 +127,7 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
     // ========================================
     // Verify the connection is cached (same instance)
     // ========================================
-    if let Some(conn) = &remote_actor.connection {
+    if let Some(conn) = remote_actor.connection_ref() {
         let conn_addr_1 = conn.addr;
         let conn_addr_2 = conn.addr;
         assert_eq!(
@@ -167,19 +161,13 @@ async fn test_old_api_not_accessible_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_single");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -235,19 +223,13 @@ async fn test_multiple_lookups_return_different_refs_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b2");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -287,7 +269,7 @@ async fn test_multiple_lookups_return_different_refs_inner() {
     // But they are different RemoteActorRef instances
     // (this is OK - each has its own cached ConnectionHandle)
     println!("✅ Multiple lookups work correctly");
-    if let (Some(conn1), Some(conn2)) = (&ref1.connection, &ref2.connection) {
+    if let (Some(conn1), Some(conn2)) = (ref1.connection_ref(), ref2.connection_ref()) {
         println!("   Ref1 addr: {}", conn1.addr);
         println!("   Ref2 addr: {}", conn2.addr);
     } else {
@@ -295,8 +277,12 @@ async fn test_multiple_lookups_return_different_refs_inner() {
     }
 
     // Both refs can send messages independently
-    ref1.tell(b"From ref1").await.unwrap();
-    ref2.tell(b"From ref2").await.unwrap();
+    ref1.tell(bytes::Bytes::from_static(b"From ref1"))
+        .await
+        .unwrap();
+    ref2.tell(bytes::Bytes::from_static(b"From ref2"))
+        .await
+        .unwrap();
 
     println!("✅ Both RemoteActorRefs can send messages independently");
 
@@ -321,19 +307,13 @@ async fn test_lookup_caches_connection_for_zero_lookup_sending_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b3");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -359,7 +339,10 @@ async fn test_lookup_caches_connection_for_zero_lookup_sending_inner() {
     let iterations = 100;
     for i in 0..iterations {
         let msg = format!("Message {}", i);
-        remote_actor.tell(msg.as_bytes()).await.unwrap();
+        remote_actor
+            .tell(bytes::Bytes::copy_from_slice(msg.as_bytes()))
+            .await
+            .unwrap();
     }
 
     println!(

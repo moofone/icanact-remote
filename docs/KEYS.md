@@ -135,8 +135,14 @@ async fn start_node(key_path: &str) -> Result<GossipRegistryHandle, Box<dyn std:
     let config = GossipConfig::default();
     let bind_addr: SocketAddr = "0.0.0.0:9000".parse()?;
 
-    // Create TLS-enabled registry
-    let handle = GossipRegistryHandle::new_with_tls(bind_addr, secret_key, Some(config)).await?;
+    // Create registry with a concrete transport stack (from icanact-remote-transports)
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        bind_addr,
+        secret_key,
+        Some(config),
+        icanact_remote_transports::TcpTlsStack::default(),
+    )
+    .await?;
 
     Ok(handle)
 }
@@ -265,8 +271,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = GossipConfig::default();
     config.enable_peer_discovery = true;
 
-    // Start TLS-enabled registry
-    let handle = GossipRegistryHandle::new_with_tls(bind_addr, secret_key, Some(config)).await?;
+    // Start registry with a concrete transport stack
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        bind_addr,
+        secret_key,
+        Some(config),
+        icanact_remote_transports::TcpTlsStack::default(),
+    )
+    .await?;
 
     // Bootstrap connections
     handle.bootstrap_non_blocking(bootstrap).await;

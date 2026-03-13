@@ -6,33 +6,26 @@ use std::time::{Duration, Instant};
 /// Handle for replying to a remote ask() request
 /// This can be passed between local actors to delegate the reply
 #[derive(Clone)]
-pub struct ReplyTo {
+pub struct ReplyTo<T = ()> {
     /// Correlation ID to match request with response
     pub(crate) correlation_id: u16,
     /// Connection back to the requesting node
-    pub(crate) connection: Arc<crate::connection_pool::ConnectionHandle>,
+    pub(crate) connection: Arc<crate::connection_pool::ConnectionHandle<T>>,
 }
 
-impl ReplyTo {
+impl<T> ReplyTo<T> {
     /// Send reply back to the original requester.
     ///
     /// This method always uses the inline write queue (never streaming).
-    pub async fn reply(self, response: &[u8]) -> Result<()> {
+    pub async fn reply(self, response: Bytes) -> Result<()> {
         let result = self
             .connection
             .send_response_auto(self.correlation_id, response)
             .await;
 
         match &result {
-            Ok(_) => tracing::debug!(
-                "ReplyTo::reply: successfully sent response ({} bytes)",
-                response.len()
-            ),
-            Err(e) => tracing::error!(
-                "ReplyTo::reply: failed to send response ({} bytes): {}",
-                response.len(),
-                e
-            ),
+            Ok(_) => tracing::debug!("ReplyTo::reply: successfully sent response"),
+            Err(e) => tracing::error!("ReplyTo::reply: failed to send response: {}", e),
         }
 
         result
@@ -47,26 +40,26 @@ impl ReplyTo {
 
     /// Reply with the inline write queue (legacy alias).
     #[deprecated(since = "0.2.0", note = "Use reply() instead")]
-    pub async fn reply_auto(self, response: &[u8]) -> Result<()> {
+    pub async fn reply_auto(self, response: Bytes) -> Result<()> {
         self.reply(response).await
     }
 
     /// Reply with a typed payload (rkyv) and debug-only type hash verification.
-    pub async fn reply_typed<T>(self, value: &T) -> Result<()>
+    pub async fn reply_typed<M>(self, value: &M) -> Result<()>
     where
-        T: crate::typed::WireEncode,
+        M: crate::typed::WireEncode,
     {
         let payload = crate::typed::encode_typed_pooled(value)?;
-        let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<T>(payload);
+        let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<M>(payload);
         self.connection
             .send_response_pooled(self.correlation_id, payload, prefix, payload_len)
             .await
     }
 
     /// Reply with a serializable type using rkyv
-    pub async fn reply_with<T>(self, value: &T) -> Result<()>
+    pub async fn reply_with<M>(self, value: &M) -> Result<()>
     where
-        T: for<'a> rkyv::Serialize<
+        M: for<'a> rkyv::Serialize<
                 rkyv::rancor::Strategy<
                     rkyv::ser::Serializer<
                         rkyv::util::AlignedVec,
@@ -79,12 +72,11 @@ impl ReplyTo {
     {
         let response =
             rkyv::to_bytes::<rkyv::rancor::Error>(value).map_err(GossipError::Serialization)?;
-        self.reply_bytes(Bytes::copy_from_slice(response.as_ref()))
-            .await
+        self.reply_bytes(Bytes::from_owner(response)).await
     }
 
     /// Create a reply handle with timeout
-    pub fn with_timeout(self, timeout: Duration) -> TimeoutReplyTo {
+    pub fn with_timeout(self, timeout: Duration) -> TimeoutReplyTo<T> {
         TimeoutReplyTo {
             inner: self,
             deadline: Instant::now() + timeout,
@@ -93,14 +85,14 @@ impl ReplyTo {
 }
 
 /// ReplyTo handle with timeout enforcement
-pub struct TimeoutReplyTo {
-    inner: ReplyTo,
+pub struct TimeoutReplyTo<T = ()> {
+    inner: ReplyTo<T>,
     deadline: Instant,
 }
 
-impl TimeoutReplyTo {
+impl<T> TimeoutReplyTo<T> {
     /// Reply if not timed out
-    pub async fn reply(self, response: &[u8]) -> Result<()> {
+    pub async fn reply(self, response: Bytes) -> Result<()> {
         if Instant::now() > self.deadline {
             return Err(GossipError::Timeout);
         }
@@ -112,14 +104,14 @@ impl TimeoutReplyTo {
     /// NOTE: This is now equivalent to `reply()` since all reply methods
     /// automatically use streaming when needed.
     #[deprecated(since = "0.2.0", note = "Use reply() instead - it now auto-streams")]
-    pub async fn reply_auto(self, response: &[u8]) -> Result<()> {
+    pub async fn reply_auto(self, response: Bytes) -> Result<()> {
         self.reply(response).await
     }
 
     /// Reply with a serializable type if not timed out
-    pub async fn reply_with<T>(self, value: &T) -> Result<()>
+    pub async fn reply_with<M>(self, value: &M) -> Result<()>
     where
-        T: for<'a> rkyv::Serialize<
+        M: for<'a> rkyv::Serialize<
                 rkyv::rancor::Strategy<
                     rkyv::ser::Serializer<
                         rkyv::util::AlignedVec,
@@ -147,7 +139,7 @@ impl TimeoutReplyTo {
     }
 }
 
-impl std::fmt::Debug for ReplyTo {
+impl<T> std::fmt::Debug for ReplyTo<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplyTo")
             .field("correlation_id", &self.correlation_id)
@@ -156,7 +148,7 @@ impl std::fmt::Debug for ReplyTo {
     }
 }
 
-impl std::fmt::Debug for TimeoutReplyTo {
+impl<T> std::fmt::Debug for TimeoutReplyTo<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TimeoutReplyTo")
             .field("correlation_id", &self.inner.correlation_id)

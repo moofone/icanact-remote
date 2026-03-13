@@ -43,6 +43,13 @@ impl PooledAlignedBuffer {
         self.buffer.as_mut_slice()
     }
 
+    pub fn truncate(&mut self, len: usize) {
+        let new_len = len.min(self.buffer.len());
+        if self.buffer.len() > new_len {
+            self.buffer.resize(new_len, 0);
+        }
+    }
+
     pub fn into_aligned_bytes(self) -> AlignedBytes {
         AlignedBytes::from_pooled_buffer(self)
     }
@@ -193,7 +200,6 @@ impl From<AlignedBytes> for Bytes {
 #[derive(Debug)]
 pub struct AlignedBytesPool {
     queue: ArrayQueue<AlignedBuffer>,
-    pool_size: usize,
 }
 
 impl AlignedBytesPool {
@@ -205,7 +211,7 @@ impl AlignedBytesPool {
             ));
         }
 
-        Self { queue, pool_size }
+        Self { queue }
     }
 
     /// CRITICAL_PATH: acquire aligned buffer without extra allocations.

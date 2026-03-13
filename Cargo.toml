@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 test-helpers = []
 io_uring = ["tokio-uring", "io-uring"]
+strict-zero-copy = []
 
 [dependencies]
 crossbeam-queue = "0.3"
@@ -47,6 +48,7 @@ criterion = "0.7"
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing-test = "0.2.5"
+icanact-remote-transports = { git = "https://github.com/moofone/icanact-examples", package = "icanact-remote-transports" }
 
 [[bench]]
 name = "archived_access"

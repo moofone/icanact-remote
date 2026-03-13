@@ -66,19 +66,13 @@ async fn test_remote_actor_ref_detects_shutdown_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_shutdown");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -107,7 +101,10 @@ async fn test_remote_actor_ref_detects_shutdown_inner() {
 
     // Verify it works before shutdown
     assert!(
-        remote_actor.tell(b"before shutdown").await.is_ok(),
+        remote_actor
+            .tell(bytes::Bytes::from_static(b"before shutdown"))
+            .await
+            .is_ok(),
         "tell() should work before shutdown"
     );
 
@@ -119,7 +116,9 @@ async fn test_remote_actor_ref_detects_shutdown_inner() {
     sleep(Duration::from_millis(100)).await;
 
     // Now operations should fail with Shutdown error
-    let result = remote_actor.tell(b"after shutdown").await;
+    let result = remote_actor
+        .tell(bytes::Bytes::from_static(b"after shutdown"))
+        .await;
 
     assert!(
         matches!(result, Err(GossipError::Shutdown)),
@@ -150,19 +149,13 @@ async fn test_concurrent_remote_actor_ref_usage_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_concurrent");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -194,9 +187,9 @@ async fn test_concurrent_remote_actor_ref_usage_inner() {
 
     // Send concurrent messages (all using same underlying Arc<Mutex<Connection>>)
     let (r1, r2, r3) = tokio::join!(
-        actor1.tell(b"message1"),
-        actor2.tell(b"message2"),
-        actor3.tell(b"message3")
+        actor1.tell(bytes::Bytes::from_static(b"message1")),
+        actor2.tell(bytes::Bytes::from_static(b"message2")),
+        actor3.tell(bytes::Bytes::from_static(b"message3"))
     );
 
     // All should succeed
@@ -229,19 +222,13 @@ async fn test_weak_registry_ref_prevents_cycles_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_weak");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -277,7 +264,7 @@ async fn test_weak_registry_ref_prevents_cycles_inner() {
     sleep(Duration::from_millis(100)).await;
 
     // Operations should fail
-    let result = remote_actor.tell(b"test").await;
+    let result = remote_actor.tell(bytes::Bytes::from_static(b"test")).await;
     assert!(
         matches!(result, Err(GossipError::Shutdown)),
         "Should return Shutdown error, got: {:?}",
@@ -306,19 +293,13 @@ async fn test_remote_actor_ref_clone_independence_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_clone");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -350,8 +331,18 @@ async fn test_remote_actor_ref_clone_independence_inner() {
     );
 
     // Both should work independently
-    assert!(actor1.tell(b"from actor1").await.is_ok());
-    assert!(actor2.tell(b"from actor2").await.is_ok());
+    assert!(
+        actor1
+            .tell(bytes::Bytes::from_static(b"from actor1"))
+            .await
+            .is_ok()
+    );
+    assert!(
+        actor2
+            .tell(bytes::Bytes::from_static(b"from actor2"))
+            .await
+            .is_ok()
+    );
 
     println!("✅ RemoteActorRef clones work independently");
 
@@ -378,19 +369,13 @@ async fn test_remote_actor_ref_location_metadata_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_metadata");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -456,19 +441,13 @@ async fn test_connection_reuse_across_lookups_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_reuse");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -493,16 +472,27 @@ async fn test_connection_reuse_across_lookups_inner() {
     let actor1 = handle_a.lookup("reuse_service").await.unwrap();
     let actor2 = handle_a.lookup("reuse_service").await.unwrap();
 
-    // Access connections (test-helpers feature allows this)
-    let conn1 = &actor1.connection;
-    let conn2 = &actor2.connection;
-
-    // Both should point to same peer (connection addr may differ due to aliases)
+    let conn1 = actor1
+        .connection_ref()
+        .expect("first lookup should have a connection");
+    let conn2 = actor2
+        .connection_ref()
+        .expect("second lookup should have a connection");
     assert_eq!(conn1.addr, conn2.addr, "Should use same connection");
 
     // Both should work
-    assert!(actor1.tell(b"from actor1").await.is_ok());
-    assert!(actor2.tell(b"from actor2").await.is_ok());
+    assert!(
+        actor1
+            .tell(bytes::Bytes::from_static(b"from actor1"))
+            .await
+            .is_ok()
+    );
+    assert!(
+        actor2
+            .tell(bytes::Bytes::from_static(b"from actor2"))
+            .await
+            .is_ok()
+    );
 
     println!("✅ Multiple lookups reuse cached connection");
 
@@ -530,19 +520,13 @@ async fn test_remote_actor_ref_debug_output_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_debug");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -603,19 +587,13 @@ async fn test_remote_actor_ref_with_timeout_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_timeout");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -673,19 +651,13 @@ async fn test_multiple_remote_actor_refs_same_actor_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_multi");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_a,
-        Some(config.clone()),
-    )
+    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        key_pair_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .unwrap();
 
@@ -712,9 +684,21 @@ async fn test_multiple_remote_actor_refs_same_actor_inner() {
     let ref3: icanact_remote::RemoteActorRef = handle_a.lookup("multi_ref_service").await.unwrap();
 
     // All should work
-    assert!(ref1.tell(b"from ref1").await.is_ok());
-    assert!(ref2.tell(b"from ref2").await.is_ok());
-    assert!(ref3.tell(b"from ref3").await.is_ok());
+    assert!(
+        ref1.tell(bytes::Bytes::from_static(b"from ref1"))
+            .await
+            .is_ok()
+    );
+    assert!(
+        ref2.tell(bytes::Bytes::from_static(b"from ref2"))
+            .await
+            .is_ok()
+    );
+    assert!(
+        ref3.tell(bytes::Bytes::from_static(b"from ref3"))
+            .await
+            .is_ok()
+    );
 
     println!("✅ Multiple RemoteActorRefs to same actor work independently");
 

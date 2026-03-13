@@ -17,7 +17,7 @@ fn create_test_registry(bind_addr: SocketAddr) -> GossipRegistry {
         dead_peer_timeout: Duration::from_secs(60),
         ..Default::default()
     };
-    GossipRegistry::new(bind_addr, config)
+    GossipRegistry::<()>::new(bind_addr, config)
 }
 
 /// Helper function to create a test actor location

@@ -58,10 +58,10 @@ fn test_typed_ask_over_tls_with_pooled_path() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 
@@ -107,10 +107,10 @@ fn test_typed_tell_over_tls_with_pooled_path() {
         };
 
         let handle_a =
-            GossipRegistryHandle::new_with_keypair(addr_a, key_pair_a, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
-        let handle_b = GossipRegistryHandle::new_with_keypair(addr_b, key_pair_b, Some(config))
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap();
 

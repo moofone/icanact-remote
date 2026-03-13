@@ -7,7 +7,7 @@ async fn stream_assembly_copies_chunks_into_buffer() {
     config.key_pair = Some(KeyPair::new_for_testing("stream_assembly_coverage"));
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
-    let registry = GossipRegistry::new(bind_addr, config);
+    let registry = GossipRegistry::<()>::new(bind_addr, config);
 
     let header0 = StreamHeader {
         stream_id: 42,

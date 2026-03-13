@@ -1,5 +1,44 @@
 use crate::{GossipConfig, GossipRegistryHandle, PeerId, Result};
+use crate::transport::RegistryTransportBootstrap;
 use std::net::SocketAddr;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuilderTlsBootstrap;
+
+impl RegistryTransportBootstrap for BuilderTlsBootstrap {
+    fn stack_name(&self) -> &'static str {
+        "builder+tls"
+    }
+
+    fn prepare_config(
+        &self,
+        secret_key: &crate::SecretKey,
+        config: &mut GossipConfig,
+    ) -> Result<()> {
+        let derived_keypair = secret_key.to_keypair();
+        match config.key_pair.as_ref() {
+            Some(existing) => {
+                if existing.peer_id() != derived_keypair.peer_id() {
+                    return Err(crate::GossipError::InvalidKeyPair(
+                        "GossipConfig.key_pair does not match TLS secret key".to_string(),
+                    ));
+                }
+            }
+            None => {
+                config.key_pair = Some(derived_keypair);
+            }
+        }
+        Ok(())
+    }
+
+    fn configure_registry(
+        &self,
+        registry: &mut crate::registry::GossipRegistry,
+        secret_key: crate::SecretKey,
+    ) -> Result<()> {
+        registry.enable_tls(secret_key)
+    }
+}
 
 /// Builder for creating a GossipRegistryHandle with proper peer configuration
 pub struct GossipRegistryBuilder {
@@ -31,7 +70,7 @@ impl GossipRegistryBuilder {
     }
 
     /// Build and start the gossip registry
-    pub async fn build(self) -> Result<GossipRegistryHandle> {
+    pub async fn build(self) -> Result<GossipRegistryHandle<BuilderTlsBootstrap>> {
         let config = self.config.unwrap_or_default();
         let keypair = config
             .key_pair
@@ -40,8 +79,14 @@ impl GossipRegistryBuilder {
         let secret_key = keypair.to_secret_key();
 
         // Create the handle with TLS enabled
-        let handle =
-            GossipRegistryHandle::new_with_tls(self.bind_addr, secret_key, Some(config)).await?;
+        let handle: GossipRegistryHandle<BuilderTlsBootstrap> =
+            GossipRegistryHandle::new_with_transport_stack(
+                self.bind_addr,
+                secret_key,
+                Some(config),
+                BuilderTlsBootstrap,
+            )
+            .await?;
 
         // Add peers with proper IDs
         for (peer_id, addr) in self.peers {

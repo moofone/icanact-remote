@@ -46,11 +46,11 @@ fn debug_timing_variations() {
         let node2_id = node2_keypair.peer_id();
 
         let node1 =
-            GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(node1_addr, node1_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
         let node2 =
-            GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(node2_addr, node2_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 

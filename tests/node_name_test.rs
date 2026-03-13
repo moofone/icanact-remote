@@ -73,11 +73,9 @@ fn test_node_name_based_connections() {
         // Start Node A first with TLS
         let key_pair_a = KeyPair::new_for_testing("test_node_a");
         let peer_id_a = key_pair_a.peer_id();
-        let node_a = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:0".parse().unwrap(), // Use port 0 for dynamic allocation
-            key_pair_a,
-            Some(config_a),
-        )
+        let node_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), // Use port 0 for dynamic allocation
+            key_pair_a.to_secret_key(), Some(config_a),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create node A");
 
@@ -87,11 +85,8 @@ fn test_node_name_based_connections() {
         // Start Node B with TLS
         let key_pair_b = KeyPair::new_for_testing("test_node_b");
         let peer_id_b = key_pair_b.peer_id();
-        let node_b = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:0".parse().unwrap(),
-            key_pair_b,
-            Some(config_b),
-        )
+        let node_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config_b),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create node B");
 

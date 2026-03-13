@@ -14,8 +14,8 @@ use icanact_remote::{
     aligned::AlignedBytes,
     framing::ASK_RESPONSE_HEADER_LEN,
     registry::{ActorMessageFuture, ActorMessageHandler, ActorResponse},
-    tls,
 };
+use icanact_remote_transports::tls;
 use rand::Rng as _;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -325,11 +325,8 @@ async fn main() {
         ..Default::default()
     };
 
-    let handle = GossipRegistryHandle::new_with_tls(
-        "127.0.0.1:0".parse().unwrap(),
-        server_secret,
-        Some(config),
-    )
+    let handle = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), server_secret, Some(config),
+    icanact_remote::BuilderTlsBootstrap)
     .await
     .expect("start server");
     let server_addr = handle.registry.bind_addr;

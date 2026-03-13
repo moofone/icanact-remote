@@ -1,6 +1,188 @@
 use crate::RemoteActorLocation;
+use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+/// High-level connection view used by `RemoteActorRef`.
+#[derive(Clone)]
+pub struct RemoteConnection {
+    pub addr: SocketAddr,
+    inner: Arc<crate::connection_pool::ConnectionHandle>,
+}
+
+impl RemoteConnection {
+    pub(crate) fn from_handle(handle: crate::connection_pool::ConnectionHandle) -> Self {
+        let addr = handle.addr;
+        Self {
+            addr,
+            inner: Arc::new(handle),
+        }
+    }
+
+    pub fn bytes_written(&self) -> usize {
+        self.inner.bytes_written()
+    }
+
+    pub fn is_streaming_active(&self) -> bool {
+        self.inner.is_streaming_active()
+    }
+
+    pub fn sequence_number(&self) -> usize {
+        self.inner.sequence_number()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    pub async fn tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
+        self.inner.tell_bytes(message).await
+    }
+
+    pub fn try_tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
+        self.inner.try_tell_bytes(message)
+    }
+
+    pub async fn tell_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<()> {
+        self.inner.tell_actor_frame(actor_id, type_hash, payload).await
+    }
+
+    pub fn try_tell_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<()> {
+        self.inner.try_tell_actor_frame(actor_id, type_hash, payload)
+    }
+
+    pub async fn ask_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        self.inner
+            .ask_actor_frame(actor_id, type_hash, payload, timeout)
+            .await
+    }
+
+    pub async fn ask_actor_frame_aligned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner
+            .ask_actor_frame_aligned(actor_id, type_hash, payload, timeout)
+            .await
+    }
+
+    pub async fn ask_actor_frame_no_timeout(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<bytes::Bytes> {
+        self.inner
+            .ask_actor_frame_no_timeout(actor_id, type_hash, payload)
+            .await
+    }
+
+    pub async fn ask_actor_frame_no_timeout_aligned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner
+            .ask_actor_frame_no_timeout_aligned(actor_id, type_hash, payload)
+            .await
+    }
+
+    pub async fn ask_with_timeout_bytes(
+        &self,
+        request: bytes::Bytes,
+        timeout: Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        self.inner.ask_with_timeout_bytes(request, timeout).await
+    }
+
+    pub async fn ask(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
+        self.inner.ask(request).await
+    }
+
+    pub async fn ask_direct(
+        &self,
+        request: bytes::Bytes,
+        timeout: Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        self.inner.ask_direct(request, timeout).await
+    }
+
+    pub async fn ask_direct_no_timeout(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
+        self.inner.ask_direct_no_timeout(request).await
+    }
+
+    pub async fn ask_streaming_bytes(
+        &self,
+        payload: bytes::Bytes,
+        type_hash: u32,
+        actor_id: u64,
+        timeout: Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        self.inner
+            .ask_streaming_bytes(payload, type_hash, actor_id, timeout)
+            .await
+    }
+
+    pub async fn stream_large_message(
+        &self,
+        msg: &[u8],
+        type_hash: u32,
+        actor_id: u64,
+    ) -> crate::Result<()> {
+        self.inner.stream_large_message(msg, type_hash, actor_id).await
+    }
+
+    pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
+        let pending = self.inner.ask_deferred(request).await?;
+        Ok(crate::DeferredAsk::from_pending(pending))
+    }
+
+    pub async fn tell_typed<M>(&self, message: &M) -> crate::Result<()>
+    where
+        M: crate::typed::WireEncode,
+    {
+        self.inner.tell_typed(message).await
+    }
+
+    pub async fn ask_typed<M, R>(&self, request: &M) -> crate::Result<R>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            > + rkyv::Deserialize<R, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
+    {
+        self.inner.ask_typed(request).await
+    }
+}
 
 /// A remote actor reference with a cached connection for zero-lookup message sending.
 ///
@@ -45,38 +227,43 @@ use std::sync::{Arc, Weak};
 /// // Even if peer's IP changes (pod restart), RemoteActorRef auto-reconnects!
 /// ```
 #[derive(Clone)]
-pub struct RemoteActorRef {
+pub struct RemoteActorRef<T = ()> {
     /// The actor location information
     pub location: RemoteActorLocation,
     /// Cached connection handle - set during lookup(), used for direct zero-lookup sending
     /// Lock-free access - ConnectionHandle uses lock-free stream operations
     /// None for actors that aren't listening yet (will be established on first use)
     ///
-    /// # Testing
-    /// This field is only accessible in test builds via cfg(test). Production code should
-    /// always use the public `tell()`, `ask()`, and `ask_streaming_bytes()` methods.
     #[cfg(any(test, feature = "test-helpers", debug_assertions))]
-    pub connection: Option<Arc<crate::connection_pool::ConnectionHandle>>,
-    /// Cached connection handle (production - private)
+    pub connection: Option<RemoteConnection>,
     #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
-    connection: Option<Arc<crate::connection_pool::ConnectionHandle>>,
+    connection: Option<RemoteConnection>,
     /// Registry weak reference - doesn't prevent registry shutdown/cleanup
     /// Used for reconnection after DNS changes
     registry: Weak<crate::registry::GossipRegistry>,
+    _marker: PhantomData<fn() -> T>,
 }
 
-impl RemoteActorRef {
+impl<T> RemoteActorRef<T> {
+    #[inline]
+    fn connection_or_not_listening(&self) -> crate::Result<&RemoteConnection> {
+        self.connection.as_ref().ok_or_else(|| {
+            crate::GossipError::ActorNotFound(format!(
+                "'{}' - not listening yet",
+                self.location.address
+            ))
+        })
+    }
+
     /// Create a new RemoteActorRef from location and connection
     /// Note: This creates a RemoteActorRef without a registry reference (cannot auto-reconnect)
     /// Prefer using `with_registry()` which is called by `lookup()`
-    pub fn new(
-        location: RemoteActorLocation,
-        connection: crate::connection_pool::ConnectionHandle,
-    ) -> Self {
+    pub fn new(location: RemoteActorLocation, connection: RemoteConnection) -> Self {
         Self {
             location,
-            connection: Some(Arc::new(connection)),
+            connection: Some(connection),
             registry: Weak::new(), // No registry reference - cannot reconnect
+            _marker: PhantomData,
         }
     }
 
@@ -89,8 +276,9 @@ impl RemoteActorRef {
     ) -> Self {
         Self {
             location,
-            connection: connection.map(Arc::new),
+            connection: connection.map(RemoteConnection::from_handle),
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
+            _marker: PhantomData,
         }
     }
 
@@ -110,8 +298,8 @@ impl RemoteActorRef {
     /// bypass the RegistryMessage overhead for maximum performance.
     ///
     /// Returns None if no connection is established yet.
-    pub fn connection_ref(&self) -> Option<&Arc<crate::connection_pool::ConnectionHandle>> {
-        self.connection.as_ref()
+    pub fn connection_ref(&self) -> Option<RemoteConnection> {
+        self.connection.clone()
     }
 
     /// Send a fire-and-forget message to the remote actor.
@@ -120,29 +308,72 @@ impl RemoteActorRef {
     /// ConnectionHandle internally uses lock-free stream operations.
     ///
     /// Returns error if registry has shut down or no connection is available.
-    pub async fn tell(&self, message: &[u8]) -> crate::Result<()> {
-        // Check if registry has been shut down
-        if let Some(registry) = self.registry.upgrade() {
-            // LOCK-FREE CHECK: Check atomic shutdown flag
-            if registry.shutdown.load(Ordering::Relaxed) {
-                return Err(crate::GossipError::Shutdown);
-            }
-        } else {
-            // Registry was dropped
-            return Err(crate::GossipError::Shutdown);
-        }
+    pub async fn tell(&self, message: bytes::Bytes) -> crate::Result<()> {
+        self.tell_bytes(message).await
+    }
 
-        // Get connection reference
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
+    /// Send a fire-and-forget message using owned bytes (no payload copy at this layer).
+    pub async fn tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
+        let conn = self.connection_or_not_listening()?;
 
         // Direct call - ZERO LOCKS
-        // ConnectionHandle.tell() uses internal lock-free operations
-        conn.tell(message).await
+        // ConnectionHandle.tell_bytes() avoids an extra payload clone.
+        conn.tell_bytes(message).await
+    }
+
+    /// Non-blocking tell using owned bytes.
+    ///
+    /// Returns `GossipError::WriteQueueFull` when the connection write queue is saturated.
+    pub fn try_tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
+        let conn = self.connection_or_not_listening()?;
+        conn.try_tell_bytes(message)
+    }
+
+    /// Send an actor-routed fire-and-forget frame (MessageType::ActorTell).
+    pub async fn tell_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<()> {
+        let conn = self.connection_or_not_listening()?;
+        conn.tell_actor_frame(actor_id, type_hash, payload).await
+    }
+
+    /// Non-blocking actor-routed tell. Returns `GossipError::WriteQueueFull` on backpressure.
+    pub fn try_tell_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<()> {
+        let conn = self.connection_or_not_listening()?;
+        conn.try_tell_actor_frame(actor_id, type_hash, payload)
+    }
+
+    /// Ask an actor-routed frame and wait for a reply (MessageType::ActorAsk).
+    pub async fn ask_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        let conn = self.connection_or_not_listening()?;
+        conn.ask_actor_frame(actor_id, type_hash, payload, timeout)
+            .await
+    }
+
+    /// Ask an actor-routed frame without timeout allocation.
+    pub async fn ask_actor_frame_no_timeout(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<bytes::Bytes> {
+        let conn = self.connection_or_not_listening()?;
+        conn.ask_actor_frame_no_timeout(actor_id, type_hash, payload)
+            .await
     }
 
     /// Send a request and wait for a response.
@@ -152,23 +383,8 @@ impl RemoteActorRef {
     /// ConnectionHandle internally uses lock-free stream operations.
     ///
     /// Returns error if registry has shut down or no connection is available.
-    pub async fn ask(&self, request: &[u8]) -> crate::Result<bytes::Bytes> {
-        // Check if registry has been shut down
-        if let Some(registry) = self.registry.upgrade() {
-            if registry.shutdown.load(Ordering::Relaxed) {
-                return Err(crate::GossipError::Shutdown);
-            }
-        } else {
-            return Err(crate::GossipError::Shutdown);
-        }
-
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
-
+    pub async fn ask(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
+        let conn = self.connection_or_not_listening()?;
         // Direct call - ZERO LOCKS
         conn.ask(request).await
     }
@@ -182,22 +398,7 @@ impl RemoteActorRef {
         request: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        // Check if registry has been shut down
-        if let Some(registry) = self.registry.upgrade() {
-            if registry.shutdown.load(Ordering::Relaxed) {
-                return Err(crate::GossipError::Shutdown);
-            }
-        } else {
-            return Err(crate::GossipError::Shutdown);
-        }
-
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
-
+        let conn = self.connection_or_not_listening()?;
         conn.ask_with_timeout_bytes(request, timeout).await
     }
 
@@ -208,8 +409,17 @@ impl RemoteActorRef {
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
     pub async fn ask_deferred(
         &self,
-        request: &[u8],
-    ) -> crate::Result<crate::connection_pool::PendingAsk> {
+        request: bytes::Bytes,
+    ) -> crate::Result<crate::DeferredAsk> {
+        let conn = self.connection_or_not_listening()?;
+        conn.ask_deferred(request).await
+    }
+
+    /// Send a typed fire-and-forget message
+    pub async fn tell_typed<M>(&self, message: &M) -> crate::Result<()>
+    where
+        M: crate::typed::WireEncode,
+    {
         // Check if registry has been shut down
         if let Some(registry) = self.registry.upgrade() {
             if registry.shutdown.load(Ordering::Relaxed) {
@@ -226,22 +436,13 @@ impl RemoteActorRef {
             ))
         })?;
 
-        conn.ask_deferred(request).await
-    }
-
-    /// Send a typed fire-and-forget message
-    pub async fn tell_typed<T>(&self, message: &T) -> crate::Result<()>
-    where
-        T: crate::typed::WireEncode,
-    {
-        let bytes = crate::typed::encode_typed(message)?;
-        self.tell(&bytes).await
+        conn.tell_typed(message).await
     }
 
     /// Send a typed request and wait for a typed response
-    pub async fn ask_typed<T, R>(&self, request: &T) -> crate::Result<R>
+    pub async fn ask_typed<M, R>(&self, request: &M) -> crate::Result<R>
     where
-        T: crate::typed::WireEncode,
+        M: crate::typed::WireEncode,
         R: crate::typed::WireType + rkyv::Archive,
         for<'a> R::Archived: rkyv::bytecheck::CheckBytes<
                 rkyv::rancor::Strategy<
@@ -253,9 +454,13 @@ impl RemoteActorRef {
                 >,
             > + rkyv::Deserialize<R, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
     {
-        let req_bytes = crate::typed::encode_typed(request)?;
-        let resp_bytes = self.ask(&req_bytes).await?;
-        crate::typed::decode_typed(&resp_bytes)
+        let conn = self.connection.as_ref().ok_or_else(|| {
+            crate::GossipError::ActorNotFound(format!(
+                "'{}' - not listening yet",
+                self.location.address
+            ))
+        })?;
+        conn.ask_typed(request).await
     }
 
     /// Send a large request using streaming (for payloads > 1MB)
@@ -271,22 +476,7 @@ impl RemoteActorRef {
         type_hash: u32,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        // Check if registry has been shut down
-        if let Some(registry) = self.registry.upgrade() {
-            if registry.shutdown.load(Ordering::Relaxed) {
-                return Err(crate::GossipError::Shutdown);
-            }
-        } else {
-            return Err(crate::GossipError::Shutdown);
-        }
-
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
-
+        let conn = self.connection_or_not_listening()?;
         // Direct call - ZERO LOCKS
         conn.ask_streaming_bytes(payload, type_hash, actor_id, timeout)
             .await
@@ -299,7 +489,7 @@ impl RemoteActorRef {
 }
 
 // Custom Debug implementation
-impl std::fmt::Debug for RemoteActorRef {
+impl<T> std::fmt::Debug for RemoteActorRef<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteActorRef")
             .field("location", &self.location)

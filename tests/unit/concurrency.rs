@@ -14,7 +14,7 @@ fn test_config(seed: &str) -> GossipConfig {
 
 #[tokio::test]
 async fn test_concurrent_actor_registration() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -46,7 +46,7 @@ async fn test_concurrent_actor_registration() {
 
 #[tokio::test]
 async fn test_concurrent_actor_lookup() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -85,7 +85,7 @@ async fn test_concurrent_actor_lookup() {
 
 #[tokio::test]
 async fn test_concurrent_register_and_unregister() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -125,7 +125,7 @@ async fn test_concurrent_register_and_unregister() {
 
 #[tokio::test]
 async fn test_concurrent_delta_application() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -172,7 +172,7 @@ async fn test_concurrent_delta_application() {
 
 #[tokio::test]
 async fn test_concurrent_gossip_round_preparation() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -213,7 +213,7 @@ async fn test_concurrent_gossip_round_preparation() {
 
 #[tokio::test]
 async fn test_concurrent_stats_access() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -245,7 +245,7 @@ async fn test_concurrent_stats_access() {
 
 #[tokio::test]
 async fn test_concurrent_cleanup_operations() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -291,7 +291,7 @@ async fn test_concurrent_cleanup_operations() {
 
 #[tokio::test]
 async fn test_concurrent_shutdown_and_operations() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -350,7 +350,7 @@ async fn test_concurrent_shutdown_and_operations() {
 
 #[tokio::test]
 async fn test_concurrent_peer_management() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -382,7 +382,7 @@ async fn test_concurrent_peer_management() {
 
 #[tokio::test]
 async fn test_concurrent_full_sync_operations() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));
@@ -440,7 +440,7 @@ async fn test_concurrent_handle_operations() {
     
     let keypair = KeyPair::new_for_testing("unit_concurrency_handle");
     let handle = Arc::new(
-        GossipRegistryHandle::new_with_keypair(bind_addr, keypair, Some(config))
+        GossipRegistryHandle::new_with_transport_stack(bind_addr, keypair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
             .await
             .unwrap(),
     );
@@ -486,7 +486,7 @@ async fn test_concurrent_handle_operations() {
 
 #[tokio::test]
 async fn test_deadlock_prevention() {
-    let registry = Arc::new(GossipRegistry::new(
+    let registry = Arc::new(GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         test_config("concurrency_default"),
     ));

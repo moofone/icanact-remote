@@ -183,6 +183,51 @@ pub struct PeerConnectHandlerCell {
     handler: Arc<dyn PeerConnectHandler>,
 }
 
+#[derive(Debug, Clone)]
+pub struct UdpFailureDetectorConfig {
+    pub health_probe_interval: Duration,
+    pub suspect_after_missed_probes: u32,
+    pub terminate_after_missed_probes: u32,
+    pub terminate_timeout: Duration,
+}
+
+impl Default for UdpFailureDetectorConfig {
+    fn default() -> Self {
+        Self {
+            health_probe_interval: Duration::from_millis(200),
+            suspect_after_missed_probes: 2,
+            terminate_after_missed_probes: 4,
+            terminate_timeout: Duration::from_secs(3),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpLivenessState {
+    Alive,
+    Suspect,
+    Terminated,
+}
+
+#[derive(Debug, Clone)]
+struct UdpPeerLiveness {
+    state: UdpLivenessState,
+    missed_probes: u32,
+    last_probe_at_ms: u64,
+    suspect_since_ms: Option<u64>,
+}
+
+impl UdpPeerLiveness {
+    fn alive(now_ms: u64) -> Self {
+        Self {
+            state: UdpLivenessState::Alive,
+            missed_probes: 0,
+            last_probe_at_ms: now_ms,
+            suspect_since_ms: None,
+        }
+    }
+}
+
 impl ActorResponse {
     pub fn pooled(
         payload: crate::typed::PooledPayload,
@@ -688,7 +733,7 @@ pub struct GossipState {
 
 /// Core gossip registry implementation with separated locks
 #[derive(Clone)]
-pub struct GossipRegistry {
+pub struct GossipRegistry<T = ()> {
     // Immutable config
     pub bind_addr: SocketAddr,
     pub peer_id: crate::PeerId, // Unique peer identifier (public key)
@@ -696,8 +741,10 @@ pub struct GossipRegistry {
     pub start_time: u64,
     pub start_instant: Instant,
 
-    // Optional TLS configuration for encrypted connections
-    pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
+    // UDP datagram transport mode flag and liveness detector controls.
+    pub udp_mode: bool,
+    pub udp_failure_detector_config: UdpFailureDetectorConfig,
+    udp_liveness: Arc<Mutex<HashMap<SocketAddr, UdpPeerLiveness>>>,
 
     /// Atomic shutdown flag for lock-free checking in hot paths
     pub shutdown: Arc<AtomicBool>,
@@ -706,7 +753,7 @@ pub struct GossipRegistry {
     pub actor_state: Arc<ActorState>,
     pub gossip_state: Arc<Mutex<GossipState>>,
     // Connection pool is internally lock-free (scc-based), no external locking needed
-    pub connection_pool: Arc<ConnectionPool>,
+    pub connection_pool: Arc<ConnectionPool<T>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
         Arc<SccHashMap<crate::NodeId, crate::handshake::PeerCapabilities>>,
@@ -808,7 +855,7 @@ pub struct StreamAssemblyResult {
     pub header: crate::StreamHeader,
 }
 
-impl GossipRegistry {
+impl<T: 'static> GossipRegistry<T> {
     /// Create a new gossip registry
     pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
         // Use public key from config (required for TLS identity)
@@ -824,8 +871,8 @@ impl GossipRegistry {
             "creating new gossip registry"
         );
 
-        let aligned_pool_size = crate::aligned::DEFAULT_ALIGNED_POOL_SIZE
-            .max(config.ask_inflight_limit.saturating_mul(8));
+        let aligned_pool_size =
+            crate::aligned::DEFAULT_ALIGNED_POOL_SIZE.max(config.ask_window.saturating_mul(8));
         let connection_pool = ConnectionPool::new_with_aligned_pool_size(
             config.max_pooled_connections,
             config.connection_timeout,
@@ -839,7 +886,9 @@ impl GossipRegistry {
             config: config.clone(),
             start_time: current_timestamp(),
             start_instant: crate::current_instant(),
-            tls_config: None,
+            udp_mode: false,
+            udp_failure_detector_config: UdpFailureDetectorConfig::default(),
+            udp_liveness: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             actor_state: Arc::new(ActorState::default()),
             gossip_state: Arc::new(Mutex::new(GossipState {
@@ -902,15 +951,121 @@ impl GossipRegistry {
 
     /// Enable TLS for secure connections
     /// This must be called before starting the registry to enable TLS
-    pub fn enable_tls(&mut self, secret_key: crate::SecretKey) -> Result<()> {
-        let tls_config = crate::tls::TlsConfig::with_peer_discovery(
-            secret_key,
-            self.config.enable_peer_discovery,
-        )
-        .map_err(|e| GossipError::TlsConfigError(format!("Failed to create TLS config: {}", e)))?;
-        self.tls_config = Some(Arc::new(tls_config));
-        info!("TLS enabled for gossip registry");
+    pub fn enable_tls(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
+        self.udp_mode = false;
+        Err(GossipError::InvalidConfig(
+            "TLS transport implementation has been extracted from core; use icanact-remote-transports".to_string(),
+        ))
+    }
+
+    /// Enable signed Noise-style authentication for plain TCP connections.
+    pub fn enable_noise_auth(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
+        self.udp_mode = false;
+        Err(GossipError::InvalidConfig(
+            "Noise transport implementation has been extracted from core; use icanact-remote-transports".to_string(),
+        ))
+    }
+
+    /// Enable UDP datagram transport mode with transport-neutral liveness detection.
+    pub fn enable_udp(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
+        self.udp_mode = true;
+        self.udp_failure_detector_config = UdpFailureDetectorConfig::default();
+        info!("UDP mode enabled (native datagram transport)");
         Ok(())
+    }
+
+    fn udp_now_ms(&self) -> u64 {
+        self.start_instant.elapsed().as_millis() as u64
+    }
+
+    async fn reset_udp_liveness_for_peer(&self, peer_addr: SocketAddr) {
+        if !self.udp_mode {
+            return;
+        }
+        let mut liveness = self.udp_liveness.lock().await;
+        liveness.insert(peer_addr, UdpPeerLiveness::alive(self.udp_now_ms()));
+    }
+
+    /// Run one UDP liveness detector cycle.
+    /// Any transition to `Terminated` emits the same disconnect path as stream transports.
+    pub async fn run_udp_failure_detector_once(&self) -> Result<usize> {
+        if !self.udp_mode {
+            return Ok(0);
+        }
+
+        let tracked_peers: Vec<SocketAddr> = {
+            let gossip_state = self.gossip_state.lock().await;
+            gossip_state.peers.keys().copied().collect()
+        };
+        if tracked_peers.is_empty() {
+            return Ok(0);
+        }
+
+        let now_ms = self.udp_now_ms();
+        let mut should_terminate = Vec::new();
+        {
+            let mut liveness = self.udp_liveness.lock().await;
+            for peer_addr in tracked_peers {
+                if self.connection_pool.has_connection(&peer_addr) {
+                    liveness.insert(peer_addr, UdpPeerLiveness::alive(now_ms));
+                    continue;
+                }
+
+                let peer_state = liveness
+                    .entry(peer_addr)
+                    .or_insert_with(|| UdpPeerLiveness::alive(now_ms));
+
+                if now_ms.saturating_sub(peer_state.last_probe_at_ms)
+                    < self
+                        .udp_failure_detector_config
+                        .health_probe_interval
+                        .as_millis() as u64
+                {
+                    continue;
+                }
+
+                peer_state.last_probe_at_ms = now_ms;
+                peer_state.missed_probes = peer_state.missed_probes.saturating_add(1);
+
+                if peer_state.state == UdpLivenessState::Alive
+                    && peer_state.missed_probes
+                        >= self.udp_failure_detector_config.suspect_after_missed_probes
+                {
+                    peer_state.state = UdpLivenessState::Suspect;
+                    peer_state.suspect_since_ms = Some(now_ms);
+                }
+
+                let suspect_timed_out = peer_state.suspect_since_ms.is_some_and(|since| {
+                    now_ms.saturating_sub(since)
+                        >= self
+                            .udp_failure_detector_config
+                            .terminate_timeout
+                            .as_millis() as u64
+                });
+
+                let should_term = peer_state.missed_probes
+                    >= self
+                        .udp_failure_detector_config
+                        .terminate_after_missed_probes
+                    || suspect_timed_out;
+                if peer_state.state != UdpLivenessState::Terminated && should_term {
+                    peer_state.state = UdpLivenessState::Terminated;
+                    should_terminate.push(peer_addr);
+                }
+            }
+        }
+
+        for peer_addr in should_terminate.iter().copied() {
+            if let Err(err) = self.handle_peer_connection_failure(peer_addr).await {
+                warn!(
+                    peer = %peer_addr,
+                    error = %err,
+                    "udp detector failed to propagate terminated peer"
+                );
+            }
+        }
+
+        Ok(should_terminate.len())
     }
 
     /// Track negotiated peer capabilities for a peer connection
@@ -3486,7 +3641,7 @@ impl GossipRegistry {
     pub(crate) async fn get_connection(
         &self,
         addr: SocketAddr,
-    ) -> Result<crate::connection_pool::ConnectionHandle> {
+    ) -> Result<crate::connection_pool::ConnectionHandle<T>> {
         self.connection_pool.get_connection(addr).await
     }
 
@@ -3496,7 +3651,7 @@ impl GossipRegistry {
     pub(crate) fn get_connection_direct(
         &self,
         addr: SocketAddr,
-    ) -> Option<crate::connection_pool::ConnectionHandle> {
+    ) -> Option<crate::connection_pool::ConnectionHandle<T>> {
         // Best-effort: avoid await by using try_lock; return None if busy or not connected.
         self.connection_pool.get_existing_connection(addr)
     }
@@ -3514,6 +3669,9 @@ impl GossipRegistry {
         if let Some(_peer_info) = gossip_state.peers.get(&peer_addr) {
             // Activity is recorded through last_success/last_attempt timestamps
         }
+
+        drop(gossip_state);
+        self.reset_udp_liveness_for_peer(peer_addr).await;
     }
 
     /// Handle peer connection failure - start consensus process
@@ -3525,10 +3683,18 @@ impl GossipRegistry {
         );
 
         let current_time = current_timestamp();
-        let peer_id = {
+        let mut peer_id = {
             let pool = &self.connection_pool;
             pool.get_peer_id_by_addr(&failed_peer_addr)
         };
+        if peer_id.is_none() {
+            let gossip_state = self.gossip_state.lock().await;
+            peer_id = gossip_state
+                .peers
+                .get(&failed_peer_addr)
+                .and_then(|peer| peer.node_id)
+                .map(crate::PeerId::from);
+        }
 
         // IMMEDIATELY mark the connection as failed and remove from pool
         // Use disconnect_connection_by_peer_id when possible to clean up ALL address aliases
@@ -3822,15 +3988,14 @@ impl GossipRegistry {
         );
 
         // Send queries to all healthy peers
+        let payload = bytes::Bytes::from_owner(
+            rkyv::to_bytes::<rkyv::rancor::Error>(&query_msg).map_err(crate::GossipError::from)?,
+        );
         for peer in peers_to_query {
-            if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&query_msg) {
-                // Try to send through existing connection
-                let pool = &self.connection_pool;
-                if let Ok(conn) = pool.get_connection(peer).await {
-                    // Create message buffer with length header using buffer pool
-                    let buffer = pool.create_message_buffer(&data);
-                    let _ = conn.send_data(buffer).await;
-                }
+            // Try to send through existing connection
+            let pool = &self.connection_pool;
+            if let Ok(conn) = pool.get_connection(peer).await {
+                let _ = conn.send_gossip_payload(payload.clone()).await;
             }
         }
 
@@ -4174,7 +4339,7 @@ impl GossipRegistry {
             .unwrap()
             .as_nanos();
 
-        let mut serialized_messages: Vec<Arc<rkyv::util::AlignedVec>> = Vec::new();
+        let mut serialized_messages: Vec<bytes::Bytes> = Vec::new();
         let mut current_changes: Vec<RegistryChange> = Vec::new();
 
         for change in urgent_changes {
@@ -4205,7 +4370,7 @@ impl GossipRegistry {
                     },
                 };
                 let chunk_serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk_message)?;
-                serialized_messages.push(Arc::new(chunk_serialized));
+                serialized_messages.push(bytes::Bytes::from_owner(chunk_serialized));
                 current_changes.clear();
                 current_changes.push(last);
             } else if serialized.len() > self.config.max_message_size {
@@ -4214,7 +4379,7 @@ impl GossipRegistry {
                     max = self.config.max_message_size,
                     "Immediate gossip change exceeds max message size; sending as single chunk"
                 );
-                serialized_messages.push(Arc::new(serialized));
+                serialized_messages.push(bytes::Bytes::from_owner(serialized));
                 current_changes.clear();
             }
         }
@@ -4231,7 +4396,7 @@ impl GossipRegistry {
                 },
             };
             let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&message)?;
-            serialized_messages.push(Arc::new(serialized));
+            serialized_messages.push(bytes::Bytes::from_owner(serialized));
         }
 
         let serialization_end = std::time::SystemTime::now()
@@ -4258,31 +4423,21 @@ impl GossipRegistry {
             serialized_messages.len()
         );
 
-        // Pre-establish all connections and pre-create buffers (single lock acquisition)
-        let peer_connections_buffers: Vec<(
-            SocketAddr,
-            crate::connection_pool::ConnectionHandle,
-            Vec<Vec<u8>>,
-        )> = {
+        // Pre-establish all connections once.
+        let peer_connections: Vec<(SocketAddr, crate::connection_pool::ConnectionHandle<T>)> = {
             let pool_guard = &self.connection_pool;
-            let mut connections_buffers = Vec::new();
+            let mut connections = Vec::new();
 
             for peer_addr in &critical_peers {
                 if let Ok(conn) = pool_guard.get_connection(*peer_addr).await {
-                    let mut buffers = Vec::new();
-                    for serialized_data in &serialized_messages {
-                        // Create message buffer with length header using buffer pool
-                        let buffer = pool_guard.create_message_buffer(serialized_data);
-                        buffers.push(buffer);
-                    }
-                    connections_buffers.push((*peer_addr, conn, buffers));
+                    connections.push((*peer_addr, conn));
                 }
             }
 
-            connections_buffers
+            connections
         };
 
-        if peer_connections_buffers.is_empty() {
+        if peer_connections.is_empty() {
             let mut gossip_state = self.gossip_state.lock().await;
             gossip_state
                 .pending_changes
@@ -4290,11 +4445,14 @@ impl GossipRegistry {
             return Ok(());
         }
 
-        // Send to all peers concurrently with pre-established connections and buffers
+        let payloads = Arc::new(serialized_messages);
+
+        // Send to all peers concurrently with pre-established connections.
         let mut join_handles = Vec::new();
 
         let mut had_failure = false;
-        for (peer_addr, conn, buffers) in peer_connections_buffers {
+        for (peer_addr, conn) in peer_connections {
+            let payloads = payloads.clone();
             let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
                 // Measure pure network send time
                 let send_start = std::time::SystemTime::now()
@@ -4302,8 +4460,8 @@ impl GossipRegistry {
                     .unwrap()
                     .as_nanos();
 
-                for buffer in buffers {
-                    conn.send_data(buffer).await?;
+                for payload in payloads.iter() {
+                    conn.send_gossip_payload(payload.clone()).await?;
                 }
 
                 let send_end = std::time::SystemTime::now()
@@ -5011,7 +5169,7 @@ impl GossipRegistry {
     pub async fn ensure_connection_for_actor(
         &self,
         node_id: &crate::NodeId,
-    ) -> Result<crate::connection_pool::ConnectionHandle> {
+    ) -> Result<crate::connection_pool::ConnectionHandle<T>> {
         // Check if we have an active connection to the node already
         if let Some(addr) = self.lookup_advertised_addr(node_id).await {
             if self.has_active_connection(&addr).await {
@@ -5087,6 +5245,8 @@ impl GossipRegistry {
             let peer_id = self.connection_pool.get_peer_id_by_addr(&addr);
             cell.handler.handle_peer_connect(addr, peer_id).await;
         }
+
+        self.reset_udp_liveness_for_peer(addr).await;
     }
 
     /// Record that this peer was observed on an inbound connection accepted by this node.
@@ -5450,7 +5610,7 @@ mod tests {
             },
         ];
 
-        let deduped = GossipRegistry::deduplicate_changes(changes);
+        let deduped = GossipRegistry::<()>::deduplicate_changes(changes);
         assert_eq!(deduped.len(), 2); // Only one change per actor
 
         // Verify we kept the last change for actor1
@@ -5473,7 +5633,7 @@ mod tests {
             priority: RegistrationPriority::Normal,
         };
         assert_eq!(
-            GossipRegistry::get_change_actor_name(&add_change),
+            GossipRegistry::<()>::get_change_actor_name(&add_change),
             "test_actor"
         );
 
@@ -5484,21 +5644,21 @@ mod tests {
             priority: RegistrationPriority::Normal,
         };
         assert_eq!(
-            GossipRegistry::get_change_actor_name(&remove_change),
+            GossipRegistry::<()>::get_change_actor_name(&remove_change),
             "test_actor"
         );
     }
 
     #[tokio::test]
     async fn test_registry_creation() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         assert_eq!(registry.bind_addr, test_addr(8080));
         assert!(!registry.is_shutdown().await);
     }
 
     // #[tokio::test]
     // async fn test_add_bootstrap_peers() {
-    //     let registry = GossipRegistry::new(test_addr(8080), test_config());
+    //     let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
     //     let peers = vec![test_addr(8081), test_addr(8082), test_addr(8080)]; // Including self
 
     //     registry.add_bootstrap_peers(peers).await;
@@ -5512,7 +5672,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_peer() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         registry.add_peer(test_addr(8081)).await;
         registry.add_peer(test_addr(8080)).await; // Try to add self
@@ -5525,7 +5685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_actor() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let location = test_location(test_addr(9001));
         let result = registry
@@ -5548,7 +5708,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_actor_duplicate() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let location = test_location(test_addr(9001));
         registry
@@ -5567,7 +5727,7 @@ mod tests {
     async fn test_register_actor_with_priority() {
         let mut config = test_config();
         config.immediate_propagation_enabled = false; // Disable to test queuing
-        let registry = GossipRegistry::new(test_addr(8080), config);
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
 
         let location = test_location(test_addr(9001));
         let result = registry
@@ -5589,7 +5749,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unregister_actor() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let location = test_location(test_addr(9001));
         registry
@@ -5615,7 +5775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lookup_actor() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Test local actor
         let location = test_location(test_addr(9001));
@@ -5637,7 +5797,7 @@ mod tests {
     async fn test_lookup_actor_ttl() {
         let mut config = test_config();
         config.actor_ttl = Duration::from_millis(50); // Very short TTL for testing
-        let registry = GossipRegistry::new(test_addr(8080), config);
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
 
         // Add a known actor with old timestamp
         let mut location = test_location(test_addr(9001));
@@ -5655,7 +5815,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_stats() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Add some data
         registry
@@ -5677,7 +5837,7 @@ mod tests {
         config.enable_peer_discovery = true;
         config.mesh_formation_target = 1;
 
-        let registry = GossipRegistry::new(test_addr(8080), config);
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
         registry.mark_peer_connected(test_addr(8082)).await;
 
         let stats = registry.get_stats().await;
@@ -5689,7 +5849,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_delta() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let location = test_location(test_addr(9001));
         let delta = RegistryDelta {
@@ -5718,7 +5878,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_delta_skip_local() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Register local actor
         let local_location = test_location(test_addr(9001));
@@ -5755,7 +5915,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_use_delta_state() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let gossip_state = registry.gossip_state.lock().await;
 
@@ -5806,7 +5966,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_gossip_round_no_peers() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let tasks = registry.prepare_gossip_round().await.unwrap();
         assert!(tasks.is_empty());
@@ -5814,7 +5974,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_gossip_round_with_peers() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Add peers
         registry.add_peer(test_addr(8081)).await;
@@ -5833,7 +5993,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Add some data
         registry
@@ -5858,7 +6018,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_peer_connection_failure() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Add a peer
         registry.add_peer(test_addr(8081)).await;
@@ -5902,7 +6062,7 @@ mod tests {
             }
         }
 
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         let peer_addr = test_addr(8081);
         let peer_id = crate::KeyPair::new_for_testing("disconnect-handler-test").peer_id();
 
@@ -5963,7 +6123,7 @@ mod tests {
             }
         }
 
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         let peer_addr = test_addr(8081);
 
         let (tx, rx) = oneshot::channel();
@@ -5990,7 +6150,7 @@ mod tests {
     async fn test_cleanup_stale_actors() {
         let mut config = test_config();
         config.actor_ttl = Duration::from_millis(50);
-        let registry = GossipRegistry::new(test_addr(8080), config);
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
 
         // Add old actor
         let mut old_location = test_location(test_addr(9001));
@@ -6012,7 +6172,7 @@ mod tests {
         let mut config = test_config();
         config.dead_peer_timeout = Duration::from_millis(50);
         config.max_peer_failures = 3;
-        let registry = GossipRegistry::new(test_addr(8080), config);
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
 
         // Add a failed peer with old failure time
         {
@@ -6069,7 +6229,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_full_sync() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let mut remote_local = HashMap::new();
         remote_local.insert("remote_actor1".to_string(), test_location(test_addr(9001)));
@@ -6163,7 +6323,7 @@ mod tests {
     async fn test_trigger_immediate_gossip() {
         let mut config = test_config();
         config.immediate_propagation_enabled = true;
-        let registry = GossipRegistry::new(test_addr(8080), config);
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
 
         // NOTE: Don't add a peer here - tests only the no-peers path.
         // (Adding a peer would require TLS setup which is tested in integration tests)
@@ -6192,7 +6352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_assembly_copies_chunks_into_buffer() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let header0 = crate::StreamHeader {
             stream_id: 42,
@@ -6222,7 +6382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enforce_bounds() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Add many pending changes
         {
@@ -6247,7 +6407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_peer_consensus() {
-        let registry = GossipRegistry::new(test_addr(8080), test_config());
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         // Add a pending failure
         {
@@ -6358,7 +6518,7 @@ mod tests {
             ..test_config()
         };
 
-        let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
+        let registry = GossipRegistry::<()>::new("127.0.0.1:9000".parse().unwrap(), config);
         registry.add_peer(test_addr(9001)).await;
         registry.add_peer(test_addr(9002)).await;
 
@@ -6382,7 +6542,7 @@ mod tests {
             ..test_config()
         };
 
-        let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
+        let registry = GossipRegistry::<()>::new("127.0.0.1:9000".parse().unwrap(), config);
 
         let node_id = crate::SecretKey::generate().public();
         let peers = vec![
@@ -6427,7 +6587,7 @@ mod tests {
             ..test_config()
         };
 
-        let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
+        let registry = GossipRegistry::<()>::new("127.0.0.1:9000".parse().unwrap(), config);
 
         let peers = vec![PeerInfoGossip {
             address: "10.0.0.1:9001".to_string(),
@@ -6461,7 +6621,7 @@ mod tests {
             ..test_config()
         };
 
-        let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
+        let registry = GossipRegistry::<()>::new("127.0.0.1:9000".parse().unwrap(), config);
 
         {
             let mut gossip_state = registry.gossip_state.lock().await;
@@ -6514,7 +6674,7 @@ mod tests {
             ..test_config()
         };
 
-        let registry = GossipRegistry::new("127.0.0.1:9000".parse().unwrap(), config);
+        let registry = GossipRegistry::<()>::new("127.0.0.1:9000".parse().unwrap(), config);
 
         // Simulate attacker-controlled state injection: unsafe private address present in known_peers.
         // Pre-fix, peers_snapshot() would include this and re-gossip it.
@@ -6726,8 +6886,8 @@ mod tests {
     #[tokio::test]
     async fn test_apply_delta_concurrent_add_add_is_order_independent() {
         let config = test_config();
-        let reg1 = GossipRegistry::new(test_addr(7001), config.clone());
-        let reg2 = GossipRegistry::new(test_addr(7002), config.clone());
+        let reg1 = GossipRegistry::<()>::new(test_addr(7001), config.clone());
+        let reg2 = GossipRegistry::<()>::new(test_addr(7002), config.clone());
 
         let actor = "actor.concurrent";
         let peer_a = test_peer_id("peer_a");
@@ -6792,7 +6952,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_delta_stale_self_announcement_is_ignored() {
-        let reg = GossipRegistry::new(test_addr(7003), test_config());
+        let reg = GossipRegistry::<()>::new(test_addr(7003), test_config());
         let actor = "actor.self";
 
         let mut loc = RemoteActorLocation::new_with_peer(test_addr(9001), reg.peer_id.clone());
@@ -6816,7 +6976,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_delta_duplicate_delivery_is_idempotent() {
-        let reg = GossipRegistry::new(test_addr(7004), test_config());
+        let reg = GossipRegistry::<()>::new(test_addr(7004), test_config());
         let actor = "actor.dupe";
         let peer = test_peer_id("peer_dupe");
 
@@ -6845,7 +7005,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_full_sync_ignores_stale_sequence() {
-        let reg = GossipRegistry::new(test_addr(7005), test_config());
+        let reg = GossipRegistry::<()>::new(test_addr(7005), test_config());
         let sender_addr = test_addr(7006);
         let sender_peer_id = test_peer_id("sender-stale");
 
@@ -6893,7 +7053,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_full_sync_omission_does_not_remove_actor_moved_to_different_peer() {
-        let reg = GossipRegistry::new(test_addr(7007), test_config());
+        let reg = GossipRegistry::<()>::new(test_addr(7007), test_config());
         let actor = "actor.move";
 
         let sender1_addr = test_addr(7008);
@@ -6971,7 +7131,7 @@ mod tests {
     async fn test_prepare_gossip_round_uses_full_sync_when_peer_too_far_behind() {
         let mut cfg = test_config();
         cfg.small_cluster_threshold = 0;
-        let reg = GossipRegistry::new(test_addr(7010), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(7010), cfg);
         let peer_addr = test_addr(7011);
 
         {
@@ -7024,7 +7184,7 @@ mod tests {
         cfg.nat_role_reconnect_enabled = true;
         cfg.max_peer_failures = 1;
         cfg.small_cluster_threshold = 0;
-        let reg = GossipRegistry::new(test_addr(7014), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(7014), cfg);
         let peer_addr: SocketAddr = "10.0.0.9:9100".parse().unwrap();
 
         {
@@ -7064,7 +7224,7 @@ mod tests {
         cfg.max_peer_failures = 1;
         cfg.peer_retry_interval = Duration::from_secs(0);
         cfg.small_cluster_threshold = 0;
-        let reg = GossipRegistry::new(test_addr(7016), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(7016), cfg);
         let peer_addr: SocketAddr = "10.0.0.11:9102".parse().unwrap();
 
         {
@@ -7116,7 +7276,7 @@ mod tests {
         cfg.peer_retry_interval = Duration::from_secs(2);
         cfg.small_cluster_threshold = 0;
         let retry_secs = cfg.peer_retry_interval.as_secs();
-        let reg = GossipRegistry::new(test_addr(7020), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(7020), cfg);
         let peer_addr = test_addr(7021);
         let now = current_timestamp();
 
@@ -7170,7 +7330,7 @@ mod tests {
         cfg.peer_retry_interval = Duration::from_secs(0);
         cfg.max_gossip_peers = 64;
         cfg.small_cluster_threshold = 0;
-        let reg = GossipRegistry::new(test_addr(7030), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(7030), cfg);
 
         let mut suppressed = HashSet::new();
         let mut eligible = HashSet::new();
@@ -7274,8 +7434,8 @@ mod tests {
         let mut cfg_on = cfg_off.clone();
         cfg_on.nat_role_reconnect_enabled = true;
 
-        let reg_off = GossipRegistry::new(test_addr(7040), cfg_off);
-        let reg_on = GossipRegistry::new(test_addr(7041), cfg_on);
+        let reg_off = GossipRegistry::<()>::new(test_addr(7040), cfg_off);
+        let reg_on = GossipRegistry::<()>::new(test_addr(7041), cfg_on);
         let peer_addr = test_addr(7042);
         let template_peer = PeerInfo {
             address: peer_addr,
@@ -7325,7 +7485,7 @@ mod tests {
         cfg.nat_role_reconnect_enabled = true;
         cfg.max_peer_failures = 1;
         cfg.small_cluster_threshold = 0;
-        let reg = GossipRegistry::new(test_addr(7015), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(7015), cfg);
         let peer_addr: SocketAddr = "10.0.0.10:9101".parse().unwrap();
 
         {
@@ -7361,7 +7521,7 @@ mod tests {
 
     #[test]
     fn test_is_practically_dialable_from_here_matrix() {
-        let reg_loopback = GossipRegistry::new(test_addr(8099), test_config());
+        let reg_loopback = GossipRegistry::<()>::new(test_addr(8099), test_config());
 
         assert!(reg_loopback.is_practically_dialable_from_here(test_addr(9000)));
         assert!(!reg_loopback.is_practically_dialable_from_here("127.0.0.1:0".parse().unwrap()));
@@ -7375,7 +7535,7 @@ mod tests {
         assert!(!reg_loopback.is_practically_dialable_from_here("10.1.2.3:9000".parse().unwrap()));
         assert!(!reg_loopback.is_practically_dialable_from_here("[::1]:9000".parse().unwrap()));
 
-        let reg_private_v4 = GossipRegistry::new("10.10.0.1:9000".parse().unwrap(), test_config());
+        let reg_private_v4 = GossipRegistry::<()>::new("10.10.0.1:9000".parse().unwrap(), test_config());
         assert!(
             reg_private_v4.is_practically_dialable_from_here("10.10.0.2:9001".parse().unwrap())
         );
@@ -7383,7 +7543,7 @@ mod tests {
             !reg_private_v4.is_practically_dialable_from_here("127.0.0.1:9001".parse().unwrap())
         );
 
-        let reg_loopback_v6 = GossipRegistry::new(
+        let reg_loopback_v6 = GossipRegistry::<()>::new(
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9002),
             test_config(),
         );
@@ -7392,7 +7552,7 @@ mod tests {
             !reg_loopback_v6.is_practically_dialable_from_here("[fd00::1]:9003".parse().unwrap())
         );
 
-        let reg_ula_v6 = GossipRegistry::new("[fd00::100]:9004".parse().unwrap(), test_config());
+        let reg_ula_v6 = GossipRegistry::<()>::new("[fd00::100]:9004".parse().unwrap(), test_config());
         assert!(reg_ula_v6.is_practically_dialable_from_here("[fd00::101]:9005".parse().unwrap()));
         assert!(!reg_ula_v6.is_practically_dialable_from_here("[fe80::1]:9005".parse().unwrap()));
     }
@@ -7401,7 +7561,7 @@ mod tests {
     async fn test_should_attempt_outbound_dial_role_matrix() {
         let mut cfg = test_config();
         cfg.nat_role_reconnect_enabled = true;
-        let reg = GossipRegistry::new(test_addr(8110), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(8110), cfg);
         let peer_addr: SocketAddr = "10.1.1.9:9100".parse().unwrap();
 
         {
@@ -7466,7 +7626,7 @@ mod tests {
     async fn test_should_attempt_outbound_dial_allows_live_connection_even_if_undialable() {
         let mut cfg = test_config();
         cfg.nat_role_reconnect_enabled = true;
-        let reg = GossipRegistry::new(test_addr(8111), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(8111), cfg);
         let peer_addr: SocketAddr = "10.1.1.10:9101".parse().unwrap();
 
         {
@@ -7511,7 +7671,7 @@ mod tests {
     async fn test_mark_inbound_connection_observed_preserves_outbound_success() {
         let mut cfg = test_config();
         cfg.nat_role_reconnect_enabled = true;
-        let reg = GossipRegistry::new(test_addr(8112), cfg);
+        let reg = GossipRegistry::<()>::new(test_addr(8112), cfg);
         let peer_addr: SocketAddr = "10.1.1.11:9102".parse().unwrap();
         let source_addr: SocketAddr = "203.0.113.10:58000".parse().unwrap();
 
@@ -7550,7 +7710,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_sync_response_encoding_is_stable_across_insertion_order() {
-        let reg = GossipRegistry::new(test_addr(7012), test_config());
+        let reg = GossipRegistry::<()>::new(test_addr(7012), test_config());
 
         let l1 = RemoteActorLocation::new_with_peer(test_addr(9301), test_peer_id("p1"));
         let l2 = RemoteActorLocation::new_with_peer(test_addr(9302), test_peer_id("p2"));
@@ -7577,7 +7737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delta_bootstrap_encoding_is_stable_across_insertion_order() {
-        let reg = GossipRegistry::new(test_addr(7013), test_config());
+        let reg = GossipRegistry::<()>::new(test_addr(7013), test_config());
 
         let l1 = RemoteActorLocation::new_with_peer(test_addr(9401), test_peer_id("p1"));
         let l2 = RemoteActorLocation::new_with_peer(test_addr(9402), test_peer_id("p2"));

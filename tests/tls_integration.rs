@@ -6,6 +6,7 @@ use tokio::runtime::Builder;
 const TLS_TEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 const TLS_TEST_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 const TLS_TEST_WORKERS: usize = 4;
+type TlsHandle = GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>;
 
 fn maybe_init_tracing(level: &'static str) {
     // In this sandboxed environment, enabling tracing can trigger EPERM ("Operation not
@@ -39,7 +40,7 @@ where
     handle.join().expect("TLS test panicked");
 }
 
-async fn wait_for_actor(handle: &GossipRegistryHandle, name: &str, timeout: Duration) -> bool {
+async fn wait_for_actor(handle: &TlsHandle, name: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if handle.lookup(name).await.is_some() {
@@ -51,8 +52,8 @@ async fn wait_for_actor(handle: &GossipRegistryHandle, name: &str, timeout: Dura
 }
 
 async fn wait_for_peers(
-    a: &GossipRegistryHandle,
-    b: &GossipRegistryHandle,
+    a: &TlsHandle,
+    b: &TlsHandle,
     timeout: Duration,
 ) -> bool {
     let start = Instant::now();
@@ -92,19 +93,13 @@ fn test_mutual_authentication() {
         };
 
         // Create TLS-enabled registries
-        let registry_a = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_a,
-            Some(config.clone()),
-        )
+        let registry_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_a, Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry A");
 
-        let registry_b = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_b,
-            Some(config),
-        )
+        let registry_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_b, Some(config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry B");
 
@@ -195,19 +190,13 @@ fn test_impersonation_prevention() {
         };
 
         // Create registries
-        let registry_a = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_a,
-            Some(config.clone()),
-        )
+        let registry_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_a, Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry A");
 
-        let registry_imposter = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_imposter,
-            Some(config),
-        )
+        let registry_imposter = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_imposter, Some(config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create imposter registry");
 
@@ -275,19 +264,13 @@ fn test_bidirectional_tls_communication() {
         };
 
         // Create registries
-        let registry_a = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_a,
-            Some(config.clone()),
-        )
+        let registry_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_a, Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry A");
 
-        let registry_b = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_b,
-            Some(config),
-        )
+        let registry_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_b, Some(config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry B");
 
@@ -355,27 +338,18 @@ fn test_multi_node_tls_chain() {
             ..Default::default()
         };
 
-        let registry_a = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_a,
-            Some(config.clone()),
-        )
+        let registry_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_a, Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry A");
 
-        let registry_b = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_b,
-            Some(config.clone()),
-        )
+        let registry_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_b, Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry B");
 
-        let registry_c = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_c,
-            Some(config),
-        )
+        let registry_c = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_c, Some(config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry C");
 
@@ -454,20 +428,14 @@ fn test_tls_reconnection() {
         };
 
         // Create registry A
-        let registry_a = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_a.clone(),
-            Some(config.clone()),
-        )
+        let registry_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_a.clone(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry A");
 
         // Create registry B
-        let registry_b = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_b.clone(),
-            Some(config.clone()),
-        )
+        let registry_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_b.clone(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry B");
 
@@ -514,11 +482,8 @@ fn test_tls_reconnection() {
         // This is acceptable behavior with fast gossip interval
 
         // Restart B with same key (but different port since old one might be in TIME_WAIT)
-        let registry_b_new = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_b,
-            Some(config),
-        )
+        let registry_b_new = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_b, Some(config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to recreate registry B");
 
@@ -575,7 +540,7 @@ fn test_tls_reconnection() {
 #[test]
 fn test_node_id_dns_encoding() {
     run_tls_test("node-id-dns-encoding", || async {
-        use icanact_remote::tls::name;
+        use icanact_remote_transports::tls::name;
 
         // Test with various NodeIds
         for _ in 0..10 {
@@ -631,11 +596,8 @@ fn test_instant_gossip_with_long_interval() {
         let node_id_b = secret_key_b.public();
 
         // Start node A and register an actor
-        let registry_a = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_a,
-            Some(config.clone()),
-        )
+        let registry_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_a, Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry A");
 
@@ -653,11 +615,8 @@ fn test_instant_gossip_with_long_interval() {
         );
 
         // Start node B (which will connect to A)
-        let registry_b = GossipRegistryHandle::new_with_tls(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key_b,
-            Some(config),
-        )
+        let registry_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_key_b, Some(config),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .expect("Failed to create registry B");
 
@@ -734,8 +693,8 @@ fn test_certificate_generation() {
             let node_id = secret_key.public();
 
             // Create a TLS config which internally creates certificates
-            let tls_config =
-                icanact_remote::tls::TlsConfig::new(secret_key).expect("Failed to create TLS config");
+            let tls_config = icanact_remote_transports::tls::TlsConfig::new(secret_key)
+                .expect("Failed to create TLS config");
 
             // Verify the node_id matches
             assert_eq!(

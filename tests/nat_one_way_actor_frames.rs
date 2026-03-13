@@ -75,11 +75,11 @@ async fn wait_for_connection(
     handle: &GossipRegistryHandle,
     peer_id: &icanact_remote::PeerId,
     timeout: Duration,
-) -> icanact_remote::Result<Arc<icanact_remote::connection_pool::ConnectionHandle>> {
+) -> icanact_remote::Result<icanact_remote::RemoteConnection> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(peer_ref) = handle.lookup_peer(peer_id).await
-            && let Some(conn) = peer_ref.connection_ref().cloned()
+            && let Some(conn) = peer_ref.connection_ref()
             && !conn.is_closed()
         {
             return Ok(conn);
@@ -116,11 +116,8 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
     let tell_b = Arc::new(AtomicU64::new(0));
     let ask_b = Arc::new(AtomicU64::new(0));
 
-    let handle_b = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        KeyPair::new_for_testing(&b_seed),
-        Some(test_cfg()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), KeyPair::new_for_testing(&b_seed).to_secret_key(), Some(test_cfg()),
+    icanact_remote::BuilderTlsBootstrap)
     .await?;
     handle_b
         .registry
@@ -131,11 +128,8 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
         }))
         .await;
 
-    let handle_a_1 = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        KeyPair::new_for_testing(&a_seed),
-        Some(test_cfg()),
-    )
+    let handle_a_1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), KeyPair::new_for_testing(&a_seed).to_secret_key(), Some(test_cfg()),
+    icanact_remote::BuilderTlsBootstrap)
     .await?;
     handle_a_1
         .registry
@@ -158,7 +152,7 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
 
     let conn_a_to_b = wait_for_connection(&handle_a_1, &peer_id_b, Duration::from_secs(6)).await?;
     let conn_b_to_a = wait_for_connection(&handle_b, &peer_id_a, Duration::from_secs(6)).await?;
-    let conn_b_to_a_baseline = Arc::clone(&conn_b_to_a);
+    let conn_b_to_a_baseline = conn_b_to_a.clone();
     let seq_before = conn_b_to_a_baseline.sequence_number();
 
     // Unsolicited tell from inbound-observer side (B) to NAT-side (A) over same session.
@@ -237,11 +231,8 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
     );
 
     // NAT-side restart with same identity and outbound reconnect.
-    let handle_a_2 = GossipRegistryHandle::new_with_keypair(
-        "127.0.0.1:0".parse().unwrap(),
-        KeyPair::new_for_testing(&a_seed),
-        Some(test_cfg()),
-    )
+    let handle_a_2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), KeyPair::new_for_testing(&a_seed).to_secret_key(), Some(test_cfg()),
+    icanact_remote::BuilderTlsBootstrap)
     .await?;
     handle_a_2
         .registry

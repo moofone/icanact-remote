@@ -16,16 +16,13 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn tcp_only_transport_guardrail_no_udp_socket_usage() {
+fn udp_transport_guardrail_udp_socket_usage_is_scoped() {
     let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rs_files(&src_root, &mut files);
 
-    let forbidden = [
-        "std::net::UdpSocket",
-        "tokio::net::UdpSocket",
-        "UdpSocket::bind",
-    ];
+    let allowed_files = ["src/connection_pool.rs", "src/handle.rs"];
+    let mut udp_usages = Vec::new();
     let mut violations = Vec::new();
 
     for file in files {
@@ -33,15 +30,26 @@ fn tcp_only_transport_guardrail_no_udp_socket_usage() {
             continue;
         };
         for (idx, line) in content.lines().enumerate() {
-            if forbidden.iter().any(|needle| line.contains(needle)) {
-                violations.push(format!("{}:{}: {}", file.display(), idx + 1, line.trim()));
+            if line.contains("tokio::net::UdpSocket") || line.contains("UdpSocket::from_std") {
+                let display = file.display().to_string();
+                udp_usages.push(format!("{display}:{}: {}", idx + 1, line.trim()));
+                if !allowed_files
+                    .iter()
+                    .any(|allowed| display.ends_with(allowed))
+                {
+                    violations.push(format!("{display}:{}: {}", idx + 1, line.trim()));
+                }
             }
         }
     }
 
     assert!(
+        !udp_usages.is_empty(),
+        "expected UDP socket usage for UDP transport, but found none"
+    );
+    assert!(
         violations.is_empty(),
-        "UDP usage violates TCP-only scope lock:\n{}",
+        "UDP socket usage must stay scoped to transport runtime files:\n{}",
         violations.join("\n")
     );
 }

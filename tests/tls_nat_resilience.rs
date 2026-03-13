@@ -53,20 +53,14 @@ async fn tls_one_way_nat_outbound_reconnect_restores_bidirectional() -> icanact_
 
     let secret_b = SecretKey::generate();
     let node_id_b = secret_b.public();
-    let handle_b = GossipRegistryHandle::new_with_tls(
-        "127.0.0.1:0".parse().unwrap(),
-        secret_b,
-        Some(config.clone()),
-    )
+    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_b, Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await?;
     let addr_b = handle_b.registry.bind_addr;
 
     let secret_a = SecretKey::generate();
-    let handle_a1 = GossipRegistryHandle::new_with_tls(
-        "127.0.0.1:0".parse().unwrap(),
-        secret_a.clone(),
-        Some(config.clone()),
-    )
+    let handle_a1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_a.clone(), Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await?;
 
     // One-way establishment: only A dials B.
@@ -107,11 +101,8 @@ async fn tls_one_way_nat_outbound_reconnect_restores_bidirectional() -> icanact_
         "B should observe A disconnect"
     );
 
-    let handle_a2 = GossipRegistryHandle::new_with_tls(
-        "127.0.0.1:0".parse().unwrap(),
-        secret_a,
-        Some(config.clone()),
-    )
+    let handle_a2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), secret_a, Some(config.clone()),
+    icanact_remote::BuilderTlsBootstrap)
     .await?;
     let peer_b = handle_a2.add_peer(&node_id_b.to_peer_id()).await;
     peer_b.connect(&addr_b).await?;

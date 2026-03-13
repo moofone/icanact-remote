@@ -1,11 +1,12 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::marker::PhantomData;
 
 use crate::aligned::{AlignedBuffer, AlignedBytes};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use tokio::{
     io::AsyncReadExt,
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     time::{Instant, interval},
 };
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -13,6 +14,7 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use crate::{
     GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
     registry::{GossipRegistry, GossipResult, GossipTask, RegistryMessage, RegistryStats},
+    transport::{RegistryTransportBootstrap, TransportWireKind},
 };
 
 const REGISTRY_MESSAGE_ALIGNMENT: usize = {
@@ -59,11 +61,12 @@ fn is_registry_payload_aligned(payload: &[u8]) -> bool {
 }
 
 /// Main API for the gossip registry with vector clocks and separated locks
-pub struct GossipRegistryHandle {
+pub struct GossipRegistryHandle<T = crate::BuilderTlsBootstrap> {
     pub registry: Arc<GossipRegistry>,
     _server_handle: Option<tokio::task::JoinHandle<()>>,
     _timer_handle: Option<tokio::task::JoinHandle<()>>,
     _monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    _marker: PhantomData<fn() -> T>,
 }
 
 /// Cloneable client view for performing peer lookups and sending messages via the underlying
@@ -72,11 +75,12 @@ pub struct GossipRegistryHandle {
 /// This intentionally does **not** own server/task lifetimes; it is safe to clone and use from
 /// service handlers (e.g. feature-gated relay protocols).
 #[derive(Clone)]
-pub struct GossipClient {
+pub struct GossipClient<T = ()> {
     registry: Arc<GossipRegistry>,
+    _marker: PhantomData<fn() -> T>,
 }
 
-impl Drop for GossipRegistryHandle {
+impl<T> Drop for GossipRegistryHandle<T> {
     fn drop(&mut self) {
         // If the handle is dropped without an explicit shutdown, the runtime would otherwise
         // keep the accept loop + timer alive and the process may require multiple SIGINTs
@@ -93,44 +97,40 @@ impl Drop for GossipRegistryHandle {
     }
 }
 
-impl GossipRegistryHandle {
-    /// Create and start a new gossip registry with TLS encryption
-    ///
-    /// This creates a secure gossip registry that uses TLS 1.3 for all connections.
-    /// The secret_key is used to generate the node's identity certificate.
-    pub async fn new_with_tls(
+impl<T> GossipRegistryHandle<T> {
+    /// Create and start a new gossip registry using a compile-time transport stack.
+    pub async fn new_with_transport_stack(
         bind_addr: SocketAddr,
         secret_key: crate::SecretKey,
         config: Option<GossipConfig>,
-    ) -> Result<Self> {
+        transport_stack: T,
+    ) -> Result<Self>
+    where
+        T: RegistryTransportBootstrap,
+    {
         let mut config = config.unwrap_or_default();
+        transport_stack.prepare_config(&secret_key, &mut config)?;
 
-        // Ensure config keypair matches the TLS identity (or set it)
-        let derived_keypair = secret_key.to_keypair();
-        match config.key_pair.as_ref() {
-            Some(existing) => {
-                if existing.peer_id() != derived_keypair.peer_id() {
-                    return Err(GossipError::InvalidKeyPair(
-                        "GossipConfig.key_pair does not match TLS secret key".to_string(),
-                    ));
-                }
+        let (listener, udp_socket, actual_bind_addr) = match transport_stack.wire_kind() {
+            TransportWireKind::TcpStream => {
+                // Create the TCP listener first to get the actual bound address.
+                //
+                // We set `SO_REUSEADDR` so tests and local dev can restart a server on the same
+                // port without spurious `AddrInUse` (common on macOS due to TIME_WAIT).
+                let listener = bind_with_reuseaddr(bind_addr)?;
+                let actual_bind_addr = listener.local_addr()?;
+                (Some(listener), None, actual_bind_addr)
             }
-            None => {
-                config.key_pair = Some(derived_keypair);
+            TransportWireKind::UdpDatagram => {
+                let socket = bind_udp_with_reuseaddr(bind_addr)?;
+                let actual_bind_addr = socket.local_addr()?;
+                (None, Some(Arc::new(socket)), actual_bind_addr)
             }
-        }
+        };
 
-        // Create the TCP listener first to get the actual bound address.
-        //
-        // We set `SO_REUSEADDR` so tests and local dev can restart a server on the same port
-        // without spurious `AddrInUse` (common on macOS due to TIME_WAIT).
-        let listener = bind_with_reuseaddr(bind_addr)?;
-        let actual_bind_addr = listener.local_addr()?;
-
-        // Create registry with TLS enabled
-        let mut registry = GossipRegistry::new(actual_bind_addr, config.clone());
-        registry.enable_tls(secret_key)?;
-
+        // Create registry and let the selected transport stack configure it.
+        let mut registry = GossipRegistry::<()>::new(actual_bind_addr, config.clone());
+        transport_stack.configure_registry(&mut registry, secret_key)?;
         let registry = Arc::new(registry);
 
         // Set the registry reference in the connection pool
@@ -139,13 +139,31 @@ impl GossipRegistryHandle {
             pool.set_registry(registry.clone());
         }
 
-        // Start the server with the existing listener
+        if let Some(socket) = udp_socket.clone() {
+            registry.connection_pool.set_udp_socket(socket);
+        }
+
+        // Start the server with the selected wire transport
         let server_registry = registry.clone();
-        let server_handle = tokio::spawn(async move {
-            if let Err(err) = start_gossip_server_with_listener(server_registry, listener).await {
-                error!(error = %err, "TLS server error");
+        let server_handle = match (listener, udp_socket) {
+            (Some(listener), None) => tokio::spawn(async move {
+                if let Err(err) = start_gossip_server_with_listener(server_registry, listener).await
+                {
+                    error!(error = %err, "server error");
+                }
+            }),
+            (None, Some(socket)) => tokio::spawn(async move {
+                if let Err(err) = start_gossip_server_with_udp_socket(server_registry, socket).await
+                {
+                    error!(error = %err, "udp server error");
+                }
+            }),
+            _ => {
+                return Err(GossipError::Network(std::io::Error::other(
+                    "invalid transport bootstrap wiring",
+                )));
             }
-        });
+        };
 
         // Start the gossip timer
         let timer_registry = registry.clone();
@@ -161,7 +179,8 @@ impl GossipRegistryHandle {
         info!(
             bind_addr = %actual_bind_addr,
             advertise_dns = dns_mode,
-            "TLS-enabled gossip registry started"
+            transport = transport_stack.stack_name(),
+            "gossip registry started"
         );
 
         Ok(Self {
@@ -169,40 +188,8 @@ impl GossipRegistryHandle {
             _server_handle: Some(server_handle),
             _timer_handle: Some(timer_handle),
             _monitor_handle: monitor_handle,
+            _marker: PhantomData,
         })
-    }
-
-    /// Create and start a new gossip registry using a keypair (TLS-only helper)
-    pub async fn new_with_keypair(
-        bind_addr: SocketAddr,
-        keypair: crate::KeyPair,
-        config: Option<GossipConfig>,
-    ) -> Result<Self> {
-        let mut config = config.unwrap_or_default();
-        match config.key_pair.as_ref() {
-            Some(existing) => {
-                if existing.peer_id() != keypair.peer_id() {
-                    return Err(GossipError::InvalidKeyPair(
-                        "GossipConfig.key_pair does not match provided keypair".to_string(),
-                    ));
-                }
-            }
-            None => {
-                config.key_pair = Some(keypair.clone());
-            }
-        }
-        let secret_key = keypair.to_secret_key();
-        Self::new_with_tls(bind_addr, secret_key, Some(config)).await
-    }
-
-    /// Create and start a new gossip registry (TLS-only)
-    #[instrument(skip(config))]
-    pub async fn new(
-        bind_addr: SocketAddr,
-        secret_key: crate::SecretKey,
-        config: Option<GossipConfig>,
-    ) -> Result<Self> {
-        Self::new_with_tls(bind_addr, secret_key, config).await
     }
 
     /// Register a local actor
@@ -315,9 +302,10 @@ impl GossipRegistryHandle {
     }
 
     /// Get a cloneable client handle for lookups without taking ownership of server/task lifetimes.
-    pub fn client(&self) -> GossipClient {
+    pub fn client(&self) -> GossipClient<T> {
         GossipClient {
             registry: Arc::clone(&self.registry),
+            _marker: PhantomData,
         }
     }
 
@@ -527,7 +515,7 @@ impl GossipRegistryHandle {
     }
 }
 
-impl GossipClient {
+impl<T> GossipClient<T> {
     /// Lookup a peer and return a RemoteActorRef for communicating with it.
     ///
     /// This mirrors `GossipRegistryHandle::lookup_peer` but is available on a cloneable handle.
@@ -552,20 +540,70 @@ impl GossipClient {
 mod tests {
     use super::*;
     use crate::KeyPair;
+    use crate::transport::RegistryTransportBootstrap;
     use std::net::SocketAddr;
     use std::time::Duration;
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct TestTlsBootstrap;
+
+    impl RegistryTransportBootstrap for TestTlsBootstrap {
+        fn stack_name(&self) -> &'static str {
+            "test+tls"
+        }
+
+        fn prepare_config(
+            &self,
+            secret_key: &crate::SecretKey,
+            config: &mut GossipConfig,
+        ) -> Result<()> {
+            let derived_keypair = secret_key.to_keypair();
+            match config.key_pair.as_ref() {
+                Some(existing) => {
+                    if existing.peer_id() != derived_keypair.peer_id() {
+                        return Err(GossipError::InvalidKeyPair(
+                            "GossipConfig.key_pair does not match TLS secret key".to_string(),
+                        ));
+                    }
+                }
+                None => {
+                    config.key_pair = Some(derived_keypair);
+                }
+            }
+            Ok(())
+        }
+
+        fn configure_registry(
+            &self,
+            registry: &mut crate::registry::GossipRegistry,
+            secret_key: crate::SecretKey,
+        ) -> Result<()> {
+            registry.enable_tls(secret_key)
+        }
+    }
 
     fn test_cfg() -> GossipConfig {
         GossipConfig {
             gossip_interval: Duration::from_millis(25),
-            ask_inflight_limit: 1024,
+            ask_window: 1024,
             ..Default::default()
         }
     }
 
-    async fn new_registry(bind: SocketAddr, seed: &str) -> crate::Result<GossipRegistryHandle> {
+    async fn new_registry(
+        bind: SocketAddr,
+        seed: &str,
+    ) -> crate::Result<GossipRegistryHandle<TestTlsBootstrap>> {
         let keypair = KeyPair::new_for_testing(seed);
-        GossipRegistryHandle::new_with_keypair(bind, keypair, Some(test_cfg())).await
+        let mut config = test_cfg();
+        config.key_pair = Some(keypair.clone());
+        GossipRegistryHandle::new_with_transport_stack(
+            bind,
+            keypair.to_secret_key(),
+            Some(config),
+            TestTlsBootstrap,
+        )
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -608,9 +646,33 @@ mod tests {
         h.shutdown_and_wait().await;
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_with_transport_stack_requires_external_transport_runtime() -> crate::Result<()> {
+        let keypair = KeyPair::new_for_testing("stack-bootstrap");
+        let mut config = test_cfg();
+        config.key_pair = Some(keypair.clone());
+
+        let err = match GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            keypair.to_secret_key(),
+            Some(config),
+            TestTlsBootstrap,
+        )
+        .await
+        {
+            Ok(_) => panic!("core no longer carries TLS bootstrap implementation"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("extracted from core"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
 }
 
-fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> {
+pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> {
     use socket2::{Domain, Socket, Type};
 
     fn is_sandbox_eperm(err: &std::io::Error) -> bool {
@@ -786,6 +848,30 @@ fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> {
     TcpListener::from_std(std_listener).map_err(GossipError::Network)
 }
 
+pub(crate) fn bind_udp_with_reuseaddr(bind_addr: SocketAddr) -> Result<UdpSocket> {
+    use socket2::{Domain, Socket, Type};
+
+    let domain = match bind_addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+
+    let socket = Socket::new(domain, Type::DGRAM, None).map_err(GossipError::Network)?;
+    let _ = socket.set_reuse_address(true);
+    let udp_buf_size = std::env::var("ICANACT_UDP_SOCKET_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8 * 1024 * 1024);
+    let _ = socket.set_recv_buffer_size(udp_buf_size);
+    let _ = socket.set_send_buffer_size(udp_buf_size);
+    socket
+        .bind(&bind_addr.into())
+        .map_err(GossipError::Network)?;
+    socket.set_nonblocking(true).map_err(GossipError::Network)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket).map_err(GossipError::Network)
+}
+
 /// Start the gossip registry server with an existing listener
 #[instrument(skip(registry, listener))]
 async fn start_gossip_server_with_listener(
@@ -815,6 +901,188 @@ async fn start_gossip_server_with_listener(
     }
 }
 
+/// Parse and dispatch a UDP datagram using the shared message parser/protocol pipeline.
+///
+/// A single UDP datagram may contain one or more framed messages. This path keeps UDP receive
+/// native (no channel bridge) while reusing the same parser/dispatcher logic
+/// used by the other transport stacks.
+async fn process_udp_datagram_native(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    mut datagram: crate::PooledAlignedBuffer,
+    datagram_len: usize,
+    streaming_state: &mut crate::protocol::StreamingState,
+) -> Result<()> {
+    if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
+        return Ok(());
+    }
+
+    // Fast path: reuse existing per-peer connection state.
+    // Slow path: initialize it once on first packet for this peer.
+    let mut response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
+    if response_connection.is_none() {
+        registry
+            .connection_pool
+            .ensure_udp_peer_connection(peer_addr)
+            .await?;
+        response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
+    }
+    let response_correlation = response_connection
+        .as_ref()
+        .and_then(|conn| conn.correlation.clone());
+    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
+
+    let msg_len = u32::from_be_bytes(
+        datagram.as_ref()[..crate::framing::LENGTH_PREFIX_LEN]
+            .try_into()
+            .expect("slice length checked"),
+    ) as usize;
+    if msg_len > registry.config.max_message_size {
+        return Err(GossipError::MessageTooLarge {
+            size: msg_len,
+            max: registry.config.max_message_size,
+        });
+    }
+    let frame_len = crate::framing::LENGTH_PREFIX_LEN + msg_len;
+
+    // Common case: one framed message per datagram.
+    // Keep the datagram-owned aligned buffer and parse directly without frame copy.
+    if frame_len == datagram_len {
+        datagram.truncate(frame_len);
+        let parsed = parse_message_from_pooled_buffer(datagram, msg_len)?;
+        crate::protocol::process_read_result(
+            parsed,
+            streaming_state,
+            registry,
+            peer_addr,
+            response_correlation.as_deref(),
+            response_connection.as_ref(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let datagram_bytes = Bytes::from_owner(datagram);
+    let datagram_slice = &datagram_bytes.as_ref()[..datagram_len];
+    let mut offset = 0usize;
+    while offset + crate::framing::LENGTH_PREFIX_LEN <= datagram_len {
+        let msg_len = u32::from_be_bytes(
+            datagram_slice[offset..offset + crate::framing::LENGTH_PREFIX_LEN]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+
+        if msg_len > registry.config.max_message_size {
+            return Err(GossipError::MessageTooLarge {
+                size: msg_len,
+                max: registry.config.max_message_size,
+            });
+        }
+
+        let frame_len = crate::framing::LENGTH_PREFIX_LEN + msg_len;
+        if offset + frame_len > datagram_len {
+            // Truncated frame tail in one datagram: drop the remainder to preserve framing safety.
+            warn!(
+                peer = %peer_addr,
+                datagram_len = datagram_len,
+                frame_offset = offset,
+                frame_len = frame_len,
+                "dropping truncated udp frame batch tail"
+            );
+            break;
+        }
+
+        let mut frame = crate::PooledAlignedBuffer::with_len(frame_len, aligned_pool.clone());
+        frame.as_mut_slice().copy_from_slice(&datagram_slice[offset..offset + frame_len]);
+        let parsed = parse_message_from_pooled_buffer(frame, msg_len)?;
+        crate::protocol::process_read_result(
+            parsed,
+            streaming_state,
+            registry,
+            peer_addr,
+            response_correlation.as_deref(),
+            response_connection.as_ref(),
+        )
+        .await?;
+
+        offset += frame_len;
+    }
+
+    Ok(())
+}
+
+/// Start the gossip registry server with a UDP socket.
+#[instrument(skip(registry, socket))]
+async fn start_gossip_server_with_udp_socket(
+    registry: Arc<GossipRegistry>,
+    socket: Arc<UdpSocket>,
+) -> Result<()> {
+    let bind_addr = registry.bind_addr;
+    info!(bind_addr = %bind_addr, "gossip udp server started");
+
+    let max_datagram_size =
+        (registry.config.max_message_size + crate::framing::LENGTH_PREFIX_LEN).min(65_507);
+    let datagram_capacity = max_datagram_size.max(2048);
+    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
+    // Mirror TCP read-loop batching behavior to reduce per-packet wakeups and dispatcher overhead.
+    const UDP_RECV_BATCH_LIMIT: usize = 512;
+    let mut streaming_states = HashMap::<SocketAddr, crate::protocol::StreamingState>::new();
+
+    loop {
+        let mut datagram =
+            crate::PooledAlignedBuffer::with_len(datagram_capacity, aligned_pool.clone());
+        match socket.recv_from(datagram.as_mut_slice()).await {
+            Ok((len, peer_addr)) => {
+                if len >= crate::framing::LENGTH_PREFIX_LEN {
+                    let state = streaming_states.entry(peer_addr).or_default();
+                    if let Err(err) =
+                        process_udp_datagram_native(&registry, peer_addr, datagram, len, state).await
+                    {
+                        warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
+                    }
+                }
+
+                // Drain immediately available datagrams in one wake-up, similar to TCP read batching.
+                let mut drained = 0usize;
+                while drained < UDP_RECV_BATCH_LIMIT {
+                    let mut datagram = crate::PooledAlignedBuffer::with_len(
+                        datagram_capacity,
+                        aligned_pool.clone(),
+                    );
+                    match socket.try_recv_from(datagram.as_mut_slice()) {
+                        Ok((len, peer_addr)) => {
+                            drained += 1;
+                            if len < crate::framing::LENGTH_PREFIX_LEN {
+                                continue;
+                            }
+                            let state = streaming_states.entry(peer_addr).or_default();
+                            if let Err(err) = process_udp_datagram_native(
+                                &registry,
+                                peer_addr,
+                                datagram,
+                                len,
+                                state,
+                            )
+                            .await
+                            {
+                                warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(err) => {
+                            warn!(error = %err, "failed to drain udp datagram batch");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "failed to receive udp datagram");
+            }
+        }
+    }
+}
+
 /// Start the gossip timer with vector clock support
 #[instrument(skip(registry))]
 async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
@@ -824,6 +1092,13 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     let cleanup_interval = registry.config.cleanup_interval;
     let vector_clock_gc_interval = registry.config.vector_clock_gc_frequency;
     let peer_gossip_interval = registry.config.peer_gossip_interval;
+    let mut udp_failure_timer = if registry.udp_mode {
+        Some(interval(
+            registry.udp_failure_detector_config.health_probe_interval,
+        ))
+    } else {
+        None
+    };
 
     let max_jitter = std::cmp::min(gossip_interval, Duration::from_millis(1000));
     let jitter_ms = if max_jitter.is_zero() {
@@ -845,6 +1120,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         cleanup_interval_secs = cleanup_interval.as_secs(),
         vector_clock_gc_interval_secs = vector_clock_gc_interval.as_secs(),
         peer_gossip_interval_secs = peer_gossip_interval.map(|i| i.as_secs()),
+        udp_failure_detector = registry.udp_mode,
         "gossip timer started with non-blocking I/O"
     );
 
@@ -977,6 +1253,21 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                     }
                 }
             }
+            // UDP detector timer - only active for udp experimental stack.
+            _ = async {
+                if let Some(ref mut timer) = udp_failure_timer {
+                    timer.tick().await
+                } else {
+                    std::future::pending::<tokio::time::Instant>().await
+                }
+            } => {
+                if registry.is_shutdown().await {
+                    break;
+                }
+                if let Err(err) = registry.run_udp_failure_detector_once().await {
+                    warn!(error = %err, "udp failure detector tick failed");
+                }
+            }
         }
     }
 
@@ -984,138 +1275,26 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
 }
 
 /// Handle incoming TCP connections - immediately set up bidirectional communication
-#[instrument(skip(stream, registry), fields(peer = %peer_addr))]
+#[instrument(skip(_stream, _registry), fields(peer = %peer_addr))]
 async fn handle_connection(
-    stream: TcpStream,
+    _stream: TcpStream,
     peer_addr: SocketAddr,
-    registry: Arc<GossipRegistry>,
+    _registry: Arc<GossipRegistry>,
 ) {
-    debug!("🔌 HANDLE_CONNECTION: Starting to handle new incoming connection");
-
-    // Apply TCP keepalive to inbound sockets for idle-dead detection.
-    crate::net::apply_tcp_keepalive(&stream, &registry.config);
-
-    // Check if TLS is enabled
-    if let Some(tls_config) = &registry.tls_config {
-        // TLS is enabled - perform TLS handshake
-        info!(
-            "🔐 TLS ENABLED: Performing TLS handshake with peer {}",
-            peer_addr
-        );
-
-        let acceptor = tls_config.acceptor();
-        match acceptor.accept(stream).await {
-            Ok(tls_stream) => {
-                info!("✅ TLS handshake successful with peer {}", peer_addr);
-                handle_tls_connection(tls_stream, peer_addr, registry).await;
-            }
-            Err(e) => {
-                error!(error = %e, peer = %peer_addr, "❌ TLS handshake failed - rejecting connection");
-                // Connection failed, don't continue
-                // This is correct - we should NOT fall back to plain TCP if TLS is enabled
-            }
-        }
-    } else {
-        // No TLS - panic for now to ensure we're using TLS
-        panic!(
-            "⚠️ TLS DISABLED: Server attempted to accept plain TCP connection from {}. TLS is required!",
-            peer_addr
-        );
-    }
+    warn!(
+        peer = %peer_addr,
+        "stream transport auth is no longer implemented in core; use icanact-remote-transports"
+    );
 }
 
-/// Handle an incoming TLS connection
-async fn handle_tls_connection(
-    mut tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
-    peer_addr: SocketAddr,
-    registry: Arc<GossipRegistry>,
-) {
-    let negotiated_alpn = tls_stream
-        .get_ref()
-        .1
-        .alpn_protocol()
-        .map(|proto| proto.to_vec());
-
-    let peer_node_id = tls_stream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .and_then(|cert| crate::tls::extract_node_id_from_cert(cert).ok());
-
-    let capabilities = match crate::handshake::perform_hello_handshake(
-        &mut tls_stream,
-        negotiated_alpn.as_deref(),
-        registry.config.enable_peer_discovery,
-    )
-    .await
-    {
-        Ok(caps) => caps,
-        Err(err) => {
-            warn!(
-                peer = %peer_addr,
-                error = %err,
-                "Hello handshake failed, closing inbound TLS connection"
-            );
-            return;
-        }
-    };
-
-    registry.set_peer_capabilities(peer_addr, capabilities);
-    if let Some(node_id) = registry.lookup_node_id(&peer_addr).await {
-        registry
-            .associate_peer_capabilities_with_node(peer_addr, node_id)
-            .await;
-    }
-
-    // Get registry reference for the handler
-    let registry_weak = Some(Arc::downgrade(&registry));
-
-    // Start the incoming persistent connection handler
-    tokio::spawn(async move {
-        debug!(peer = %peer_addr, "HANDLE.RS: Starting incoming TLS connection handler");
-        match handle_incoming_connection_tls(
-            tls_stream,
-            peer_addr,
-            registry.clone(),
-            registry_weak,
-            peer_node_id,
-        )
-        .await
-        {
-            ConnectionCloseOutcome::Normal {
-                node_id: Some(failed_peer_id_hex),
-            } => match crate::PeerId::from_hex(&failed_peer_id_hex) {
-                Ok(peer_id) => {
-                    debug!(peer_id = %peer_id, "HANDLE.RS: Triggering peer failure handling for node");
-                    if let Err(e) = registry
-                        .handle_peer_connection_failure_by_peer_id(&peer_id)
-                        .await
-                    {
-                        warn!(error = %e, peer_id = %peer_id, "HANDLE.RS: Failed to handle peer connection failure");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, peer_id = %failed_peer_id_hex, "HANDLE.RS: Invalid peer id in connection close outcome");
-                }
-            },
-            ConnectionCloseOutcome::Normal { node_id: None } => {
-                warn!(peer = %peer_addr, "⚠️ HANDLE.RS: Connection handler returned without node_id - early exit path taken");
-            }
-            ConnectionCloseOutcome::DroppedByTieBreaker => {
-                warn!(peer = %peer_addr, "⚠️ HANDLE.RS: Dropped duplicate connection via tie-breaker");
-            }
-        }
-        warn!(peer = %peer_addr, "📤 HANDLE.RS: Incoming TLS connection handler task EXITED");
-    });
-}
-
+#[allow(dead_code)]
 enum ConnectionCloseOutcome {
     Normal { node_id: Option<String> },
     DroppedByTieBreaker,
 }
 
 /// Handle an incoming TLS connection - processes all messages over encrypted stream
+#[allow(dead_code)]
 async fn handle_incoming_connection_tls<S>(
     mut stream: S,
     peer_addr: SocketAddr,
@@ -1318,7 +1497,7 @@ where
     // Register the TLS stream with the connection pool before handling the first message so responses work
     let (response_correlation, response_connection) = {
         let buffer_config = crate::connection_pool::BufferConfig::default()
-            .with_ask_inflight_limit(registry.config.ask_inflight_limit);
+            .with_ask_window(registry.config.ask_window);
         let correlation_tracker = registry
             .connection_pool
             .get_or_create_correlation_tracker(&peer_id);
@@ -1614,38 +1793,11 @@ pub(crate) async fn send_streaming_response(
                 // Intentionally quiet: this is the hot-path and can spam logs in benchmarks.
             }
         } else {
-            warn!(peer = %peer_addr, correlation_id = correlation_id, "No stream handle for streaming response");
+            // UDP transport has no stream writer path; fall back to inline response.
+            send_inline_response(registry, peer_addr, correlation_id, response).await;
         }
     } else {
         warn!(peer = %peer_addr, correlation_id = correlation_id, "No connection found for streaming response");
-    }
-}
-
-/// Send a streaming response on the already-accepted connection (no pool lookup).
-pub(crate) async fn send_streaming_response_on_connection(
-    conn: &crate::connection_pool::LockFreeConnection,
-    correlation_id: u16,
-    response: bytes::Bytes,
-) {
-    if let Some(ref stream_handle) = conn.stream_handle {
-        // Streaming responses always use the streaming protocol.
-        if let Err(e) = stream_handle
-            .stream_response_bytes(response, correlation_id)
-            .await
-        {
-            warn!(
-                peer = %conn.addr,
-                error = %e,
-                correlation_id = correlation_id,
-                "Failed to send streaming response on existing connection"
-            );
-        }
-    } else {
-        warn!(
-            peer = %conn.addr,
-            correlation_id = correlation_id,
-            "No stream handle for streaming response on existing connection"
-        );
     }
 }
 
@@ -1658,32 +1810,21 @@ pub(crate) async fn send_inline_response(
     response: bytes::Bytes,
 ) {
     let pool = &registry.connection_pool;
-
-    let conn_opt: Option<Arc<crate::connection_pool::LockFreeConnection>> =
-        if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-            pool.get_connection_by_peer_id(&peer_id)
-        } else {
-            pool.get_connection_by_addr(&peer_addr)
-        };
-
-    if let Some(conn) = conn_opt {
-        if let Some(ref stream_handle) = conn.stream_handle {
-            let header = crate::framing::write_ask_response_header(
-                crate::MessageType::Response,
-                correlation_id,
-                response.len(),
+    if let Some(conn) = pool.get_existing_connection(peer_addr) {
+        if let Err(e) = conn.send_response_bytes(correlation_id, response).await {
+            warn!(
+                peer = %peer_addr,
+                error = %e,
+                correlation_id = correlation_id,
+                "Failed to send inline response"
             );
-            if let Err(e) = stream_handle
-                .write_header_and_payload_control_inline(header, 16, response)
-                .await
-            {
-                warn!(peer = %peer_addr, error = %e, correlation_id = correlation_id, "Failed to send inline response");
-            }
-        } else {
-            warn!(peer = %peer_addr, correlation_id = correlation_id, "No stream handle for inline response");
         }
     } else {
-        warn!(peer = %peer_addr, correlation_id = correlation_id, "No connection found for inline response");
+        warn!(
+            peer = %peer_addr,
+            correlation_id = correlation_id,
+            "No connection found for inline response"
+        );
     }
 }
 
@@ -1694,84 +1835,7 @@ pub(crate) async fn send_inline_response_aligned(
     correlation_id: u16,
     response: crate::AlignedBytes,
 ) {
-    let pool = &registry.connection_pool;
-
-    let conn_opt: Option<Arc<crate::connection_pool::LockFreeConnection>> =
-        if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-            pool.get_connection_by_peer_id(&peer_id)
-        } else {
-            pool.get_connection_by_addr(&peer_addr)
-        };
-
-    if let Some(conn) = conn_opt {
-        send_inline_response_on_connection_aligned(&conn, correlation_id, response).await;
-    } else {
-        warn!(peer = %peer_addr, correlation_id = correlation_id, "No connection found for inline response");
-    }
-}
-
-/// Send a response using the already-accepted connection (no pool lookup).
-pub(crate) async fn send_inline_response_on_connection(
-    conn: &crate::connection_pool::LockFreeConnection,
-    correlation_id: u16,
-    response: bytes::Bytes,
-) {
-    if let Some(ref stream_handle) = conn.stream_handle {
-        let header = crate::framing::write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            response.len(),
-        );
-        if let Err(e) = stream_handle
-            .write_header_and_payload_control_inline(header, 16, response)
-            .await
-        {
-            warn!(
-                peer = %conn.addr,
-                error = %e,
-                correlation_id = correlation_id,
-                "Failed to send inline response on existing connection"
-            );
-        }
-    } else {
-        warn!(
-            peer = %conn.addr,
-            correlation_id = correlation_id,
-            "No stream handle for inline response on existing connection"
-        );
-    }
-}
-
-/// Send a response using the already-accepted connection (no pool lookup), aligned payload.
-pub(crate) async fn send_inline_response_on_connection_aligned(
-    conn: &crate::connection_pool::LockFreeConnection,
-    correlation_id: u16,
-    response: crate::AlignedBytes,
-) {
-    if let Some(ref stream_handle) = conn.stream_handle {
-        let header = crate::framing::write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            response.len(),
-        );
-        if let Err(e) = stream_handle
-            .write_header_and_payload_control_inline_aligned(header, 16, response)
-            .await
-        {
-            warn!(
-                peer = %conn.addr,
-                error = %e,
-                correlation_id = correlation_id,
-                "Failed to send inline response on existing connection"
-            );
-        }
-    } else {
-        warn!(
-            peer = %conn.addr,
-            correlation_id = correlation_id,
-            "No stream handle for inline response on existing connection"
-        );
-    }
+    send_inline_response(registry, peer_addr, correlation_id, response.into_bytes()).await;
 }
 
 /// Send a pooled response back to the peer for an ask request.
@@ -1785,67 +1849,23 @@ pub(crate) async fn send_pooled_response(
     payload_len: usize,
 ) {
     let pool = &registry.connection_pool;
-
-    let conn_opt: Option<Arc<crate::connection_pool::LockFreeConnection>> =
-        if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-            pool.get_connection_by_peer_id(&peer_id)
-        } else {
-            pool.get_connection_by_addr(&peer_addr)
-        };
-
-    if let Some(conn) = conn_opt {
-        if let Some(ref stream_handle) = conn.stream_handle {
-            let header = crate::framing::write_ask_response_header(
-                crate::MessageType::Response,
-                correlation_id,
-                payload_len,
-            );
-            let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
-            if let Err(e) = stream_handle
-                .write_pooled_control_inline(header, 16, prefix, prefix_len, payload)
-                .await
-            {
-                warn!(peer = %peer_addr, error = %e, correlation_id = correlation_id, "Failed to send pooled response");
-            }
-        } else {
-            warn!(peer = %peer_addr, correlation_id = correlation_id, "No stream handle for pooled response");
-        }
-    } else {
-        warn!(peer = %peer_addr, correlation_id = correlation_id, "No connection found for pooled response");
-    }
-}
-
-/// Send a pooled response using the already-accepted connection (no pool lookup).
-pub(crate) async fn send_pooled_response_on_connection(
-    conn: &crate::connection_pool::LockFreeConnection,
-    correlation_id: u16,
-    payload: crate::typed::PooledPayload,
-    prefix: Option<[u8; 16]>,
-    payload_len: usize,
-) {
-    if let Some(ref stream_handle) = conn.stream_handle {
-        let header = crate::framing::write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            payload_len,
-        );
-        let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
-        if let Err(e) = stream_handle
-            .write_pooled_control_inline(header, 16, prefix, prefix_len, payload)
+    if let Some(conn) = pool.get_existing_connection(peer_addr) {
+        if let Err(e) = conn
+            .send_response_pooled(correlation_id, payload, prefix, payload_len)
             .await
         {
             warn!(
-                peer = %conn.addr,
+                peer = %peer_addr,
                 error = %e,
                 correlation_id = correlation_id,
-                "Failed to send pooled response on existing connection"
+                "Failed to send pooled response"
             );
         }
     } else {
         warn!(
-            peer = %conn.addr,
+            peer = %peer_addr,
             correlation_id = correlation_id,
-            "No stream handle for pooled response on existing connection"
+            "No connection found for pooled response"
         );
     }
 }
@@ -1857,9 +1877,10 @@ pub(crate) async fn handle_response_message(
     payload: crate::AlignedBytes,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
 ) {
+    let mut payload = Some(payload);
+
     if let Some(correlation) = response_correlation {
-        if correlation.has_pending(correlation_id) {
-            correlation.complete(correlation_id, payload);
+        if correlation.complete(correlation_id, &mut payload) {
             return;
         }
     }
@@ -1869,8 +1890,7 @@ pub(crate) async fn handle_response_message(
     // First, try to deliver via connection's embedded correlation tracker
     if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
         if let Some(ref correlation) = conn.correlation {
-            if correlation.has_pending(correlation_id) {
-                correlation.complete(correlation_id, payload);
+            if correlation.complete(correlation_id, &mut payload) {
                 return;
             }
         }
@@ -1879,9 +1899,7 @@ pub(crate) async fn handle_response_message(
     // FALLBACK: Use shared correlation tracker by peer_id.
     if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
         if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
-            if correlation.has_pending(correlation_id) {
-                correlation.complete(correlation_id, payload);
-            }
+            let _ = correlation.complete(correlation_id, &mut payload);
         }
     }
 }
@@ -2123,6 +2141,7 @@ pub(crate) fn parse_message_from_pooled_buffer(
 }
 
 /// Read a message from a TLS reader
+#[allow(dead_code)]
 pub(crate) async fn read_message_from_tls_reader<R>(
     reader: &mut R,
     max_message_size: usize,
@@ -2520,12 +2539,12 @@ mod keepalive_apply_tests {
         let b_keypair = crate::KeyPair::new_for_testing("keepalive-b");
 
         let a =
-            GossipRegistryHandle::new_with_keypair("127.0.0.1:0".parse().unwrap(), a_keypair, None)
+            GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), a_keypair.to_secret_key(), None, crate::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
         let b =
-            GossipRegistryHandle::new_with_keypair("127.0.0.1:0".parse().unwrap(), b_keypair, None)
+            GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), b_keypair.to_secret_key(), None, crate::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
@@ -2691,7 +2710,7 @@ async fn send_gossip_message_zero_copy(
     // Use zero-copy tell() which uses try_send() internally for max performance
     // This completely bypasses async overhead when the channel has capacity
     let tcp_start = std::time::Instant::now();
-    conn.tell(msg_with_type.as_slice()).await?;
+    conn.tell(bytes::Bytes::from(msg_with_type)).await?;
     let _tcp_elapsed = tcp_start.elapsed();
     // eprintln!("🔍 TCP_WRITE_TIME: {:?}", tcp_elapsed);
     Ok(())

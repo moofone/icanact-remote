@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
+type TlsHandle = GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>;
 
 static CRYPTO_INIT: Once = Once::new();
 
@@ -14,12 +15,12 @@ fn init_crypto() {
         // `rustls` only allows installing a default crypto provider once per process.
         // The library code may have already installed it by the time this runs, so
         // make init idempotent to avoid test flakes.
-        icanact_remote::tls::ensure_crypto_provider();
+        icanact_remote_transports::tls::ensure_crypto_provider();
     });
 }
 
 #[allow(dead_code)]
-pub async fn create_tls_node(config: GossipConfig) -> Result<GossipRegistryHandle, DynError> {
+pub async fn create_tls_node(config: GossipConfig) -> Result<TlsHandle, DynError> {
     init_crypto();
     let secret_key = SecretKey::generate();
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
@@ -37,11 +38,115 @@ pub async fn create_tls_node(config: GossipConfig) -> Result<GossipRegistryHandl
     let mut backoff = Duration::from_millis(25);
 
     loop {
-        match GossipRegistryHandle::new_with_tls(
-            bind_addr,
-            secret_key.clone(),
-            Some(config.clone()),
-        )
+        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
+        .await
+        {
+            Ok(node) => return Ok(node),
+            Err(e) => {
+                let is_eperm = matches!(&e, icanact_remote::GossipError::Network(io) if io.raw_os_error() == Some(1));
+                if is_eperm && Instant::now() < deadline {
+                    sleep(backoff).await;
+                    backoff =
+                        std::cmp::min(backoff.saturating_mul(2), Duration::from_millis(1_000));
+                    continue;
+                }
+                return Err(Box::new(e));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn create_quic_node(config: GossipConfig) -> Result<TlsHandle, DynError> {
+    init_crypto();
+    let secret_key = SecretKey::generate();
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            std::env::var("ICANACT_TEST_EPERM_MAX_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+    let mut backoff = Duration::from_millis(25);
+
+    loop {
+        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
+        .await
+        {
+            Ok(node) => return Ok(node),
+            Err(e) => {
+                let is_eperm = matches!(&e, icanact_remote::GossipError::Network(io) if io.raw_os_error() == Some(1));
+                if is_eperm && Instant::now() < deadline {
+                    sleep(backoff).await;
+                    backoff =
+                        std::cmp::min(backoff.saturating_mul(2), Duration::from_millis(1_000));
+                    continue;
+                }
+                return Err(Box::new(e));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn create_native_quic_node(
+    config: GossipConfig,
+) -> Result<TlsHandle, DynError> {
+    init_crypto();
+    let secret_key = SecretKey::generate();
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            std::env::var("ICANACT_TEST_EPERM_MAX_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+    let mut backoff = Duration::from_millis(25);
+
+    loop {
+        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
+        .await
+        {
+            Ok(node) => return Ok(node),
+            Err(e) => {
+                let is_eperm = matches!(&e, icanact_remote::GossipError::Network(io) if io.raw_os_error() == Some(1));
+                if is_eperm && Instant::now() < deadline {
+                    sleep(backoff).await;
+                    backoff =
+                        std::cmp::min(backoff.saturating_mul(2), Duration::from_millis(1_000));
+                    continue;
+                }
+                return Err(Box::new(e));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn create_udp_node(config: GossipConfig) -> Result<TlsHandle, DynError> {
+    init_crypto();
+    let secret_key = SecretKey::generate();
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            std::env::var("ICANACT_TEST_EPERM_MAX_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+    let mut backoff = Duration::from_millis(25);
+
+    loop {
+        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         {
             Ok(node) => return Ok(node),
@@ -61,8 +166,8 @@ pub async fn create_tls_node(config: GossipConfig) -> Result<GossipRegistryHandl
 
 #[allow(dead_code)]
 pub async fn connect_bidirectional(
-    a: &GossipRegistryHandle,
-    b: &GossipRegistryHandle,
+    a: &TlsHandle,
+    b: &TlsHandle,
 ) -> Result<(), DynError> {
     let addr_a = a.registry.bind_addr;
     let addr_b = b.registry.bind_addr;
@@ -91,7 +196,7 @@ pub async fn connect_bidirectional(
 }
 
 #[allow(dead_code)]
-pub async fn force_disconnect(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
+pub async fn force_disconnect(a: &TlsHandle, b: &TlsHandle) {
     let addr_a = a.registry.bind_addr;
     let addr_b = b.registry.bind_addr;
 
@@ -116,7 +221,7 @@ where
 }
 
 #[allow(dead_code)]
-pub async fn wait_for_actor(node: &GossipRegistryHandle, actor: &str, timeout: Duration) -> bool {
+pub async fn wait_for_actor(node: &TlsHandle, actor: &str, timeout: Duration) -> bool {
     wait_for_condition(
         timeout,
         || async move { node.lookup(actor).await.is_some() },
@@ -126,7 +231,7 @@ pub async fn wait_for_actor(node: &GossipRegistryHandle, actor: &str, timeout: D
 
 #[allow(dead_code)]
 pub async fn wait_for_actor_absent(
-    node: &GossipRegistryHandle,
+    node: &TlsHandle,
     actor: &str,
     timeout: Duration,
 ) -> bool {
@@ -139,7 +244,7 @@ pub async fn wait_for_actor_absent(
 
 #[allow(dead_code)]
 pub async fn wait_for_active_peers(
-    node: &GossipRegistryHandle,
+    node: &TlsHandle,
     min_peers: usize,
     timeout: Duration,
 ) -> bool {

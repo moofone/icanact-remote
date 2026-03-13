@@ -94,27 +94,18 @@ fn test_ask_with_lookup_and_performance() {
         let node2_id = node2_keypair.peer_id();
         let node3_id = node3_keypair.peer_id();
 
-        let node1 = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:30001".parse().unwrap(),
-            node1_keypair,
-            Some(config.clone()),
-        )
+        let node1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:30001".parse().unwrap(), node1_keypair.to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
-        let node2 = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:30002".parse().unwrap(),
-            node2_keypair,
-            Some(config.clone()),
-        )
+        let node2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:30002".parse().unwrap(), node2_keypair.to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
-        let node3 = GossipRegistryHandle::new_with_keypair(
-            "127.0.0.1:30003".parse().unwrap(),
-            node3_keypair,
-            Some(config.clone()),
-        )
+        let node3 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:30003".parse().unwrap(), node3_keypair.to_secret_key(), Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap)
         .await
         .unwrap();
 
@@ -258,7 +249,10 @@ fn test_ask_with_lookup_and_performance() {
                 ));
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(5) {
-                    match actor.ask(query.as_bytes()).await {
+                    match actor
+                        .ask(bytes::Bytes::copy_from_slice(query.as_bytes()))
+                        .await
+                    {
                         Ok(r) => {
                             result = Ok(r);
                             break;
@@ -308,12 +302,12 @@ fn test_ask_with_lookup_and_performance() {
         // Send all queries in parallel
         // Send all queries in parallel using RemoteActorRefs (each uses cached connection)
         let (r1, r2, r3, r4, r5, r6) = tokio::join!(
-            db_actor.ask(queries[0].1.as_bytes()),
-            compute_actor.ask(queries[1].1.as_bytes()),
-            cache_actor.ask(queries[2].1.as_bytes()),
-            db_actor.ask(queries[3].1.as_bytes()),
-            compute_actor.ask(queries[4].1.as_bytes()),
-            cache_actor.ask(queries[5].1.as_bytes()),
+            db_actor.ask(bytes::Bytes::copy_from_slice(queries[0].1.as_bytes())),
+            compute_actor.ask(bytes::Bytes::copy_from_slice(queries[1].1.as_bytes())),
+            cache_actor.ask(bytes::Bytes::copy_from_slice(queries[2].1.as_bytes())),
+            db_actor.ask(bytes::Bytes::copy_from_slice(queries[3].1.as_bytes())),
+            compute_actor.ask(bytes::Bytes::copy_from_slice(queries[4].1.as_bytes())),
+            cache_actor.ask(bytes::Bytes::copy_from_slice(queries[5].1.as_bytes())),
         );
 
         // Verify all responses
@@ -353,7 +347,7 @@ fn test_ask_with_lookup_and_performance() {
         println!("\n📊 PART 3: ASK() VS TELL() COMPARISON");
         println!("=====================================");
 
-        let test_message = "PING test request".as_bytes();
+        let test_message = bytes::Bytes::from_static(b"PING test request");
         let iterations = 100;
 
         println!(
@@ -362,7 +356,7 @@ fn test_ask_with_lookup_and_performance() {
         );
         let tell_start = Instant::now();
         for _ in 0..iterations {
-            db_actor.tell(test_message).await.unwrap();
+            db_actor.tell(test_message.clone()).await.unwrap();
         }
         let tell_total = tell_start.elapsed();
         let tell_avg = tell_total / iterations;
@@ -389,7 +383,7 @@ fn test_ask_with_lookup_and_performance() {
         );
         let ask_start = Instant::now();
         for _ in 0..iterations {
-            let _ = db_actor.ask(test_message).await.unwrap();
+            let _ = db_actor.ask(test_message.clone()).await.unwrap();
         }
         let ask_total = ask_start.elapsed();
         let ask_avg = ask_total / iterations;
@@ -493,12 +487,12 @@ fn test_ask_high_throughput() {
         let node2_id = node2_keypair.peer_id();
 
         let node1 =
-            GossipRegistryHandle::new_with_keypair(node1_addr, node1_keypair, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(node1_addr, node1_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
         let node2 =
-            GossipRegistryHandle::new_with_keypair(node2_addr, node2_keypair, Some(config.clone()))
+            GossipRegistryHandle::new_with_transport_stack(node2_addr, node2_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
                 .await
                 .unwrap();
 
@@ -538,7 +532,10 @@ fn test_ask_high_throughput() {
         // Warmup
         println!("\n🔥 Warming up...");
         for _ in 0..10 {
-            let _ = api_conn.ask(b"warmup").await.unwrap();
+            let _ = api_conn
+                .ask(bytes::Bytes::from_static(b"warmup"))
+                .await
+                .unwrap();
         }
 
         // High-throughput test
@@ -559,7 +556,10 @@ fn test_ask_high_throughput() {
                 let handle = tokio::spawn(async move {
                     let req_start = Instant::now();
                     let request = format!("REQUEST:{}", request_id);
-                    match conn.ask(request.as_bytes()).await {
+                    match conn
+                        .ask(bytes::Bytes::copy_from_slice(request.as_bytes()))
+                        .await
+                    {
                         Ok(_) => Some(req_start.elapsed()),
                         Err(err) => {
                             eprintln!(

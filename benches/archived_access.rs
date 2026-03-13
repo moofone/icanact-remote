@@ -1,6 +1,7 @@
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
+use std::hint::black_box;
 
 #[derive(Archive, Serialize, Deserialize)]
 struct BenchPayload {

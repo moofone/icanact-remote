@@ -107,8 +107,8 @@ async fn main() -> Result<()> {
     println!("7. How to use these keys with TLS:");
     println!("   // Server setup:");
     println!("   let secret_key = load_key(\"/tmp/icanact_tls_keys/server.key\")?;");
-    println!("   let registry = GossipRegistryHandle::new_with_tls(");
-    println!("       bind_addr, secret_key, config");
+    println!("   let registry = GossipRegistryHandle::new_with_transport_stack(", icanact_remote::BuilderTlsBootstrap);
+    println!("       bind_addr, secret_key, config", icanact_remote::BuilderTlsBootstrap);
     println!("   ).await?;");
     println!();
     println!("   // Client setup with server verification:");

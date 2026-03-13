@@ -13,7 +13,6 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 const TEST_ACTOR_ID: u64 = 7;
 const TEST_TYPE_HASH: u32 = 0xA57A_A5C0;
 const TEST_THREAD_STACK: usize = 8 * 1024 * 1024;
-const TEST_WORKER_STACK: usize = 4 * 1024 * 1024;
 
 static E2E_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -339,7 +338,8 @@ fn test_end_to_end_ask_reply() {
         info!("=== Test 6: Connection failure path (connect to missing peer) ===");
         {
             let addr_missing: SocketAddr = "127.0.0.1:8004".parse().unwrap(); // should not exist
-            let missing_peer_id = icanact_remote::KeyPair::new_for_testing("node_missing").peer_id();
+            let missing_peer_id =
+                icanact_remote::KeyPair::new_for_testing("node_missing").peer_id();
             let missing_peer = handle_a.add_peer(&missing_peer_id).await;
 
             match missing_peer.connect(&addr_missing).await {
