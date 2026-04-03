@@ -546,6 +546,7 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, Default)]
     struct TestTlsBootstrap;
+    struct TestNoopBootstrap;
 
     impl RegistryTransportBootstrap for TestTlsBootstrap {
         fn stack_name(&self) -> &'static str {
@@ -582,6 +583,41 @@ mod tests {
         }
     }
 
+    impl RegistryTransportBootstrap for TestNoopBootstrap {
+        fn stack_name(&self) -> &'static str {
+            "test+noop"
+        }
+
+        fn prepare_config(
+            &self,
+            secret_key: &crate::SecretKey,
+            config: &mut GossipConfig,
+        ) -> Result<()> {
+            let derived_keypair = secret_key.to_keypair();
+            match config.key_pair.as_ref() {
+                Some(existing) => {
+                    if existing.peer_id() != derived_keypair.peer_id() {
+                        return Err(GossipError::InvalidKeyPair(
+                            "GossipConfig.key_pair does not match secret key".to_string(),
+                        ));
+                    }
+                }
+                None => {
+                    config.key_pair = Some(derived_keypair);
+                }
+            }
+            Ok(())
+        }
+
+        fn configure_registry(
+            &self,
+            _registry: &mut crate::registry::GossipRegistry,
+            _secret_key: crate::SecretKey,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
     fn test_cfg() -> GossipConfig {
         GossipConfig {
             gossip_interval: Duration::from_millis(25),
@@ -593,7 +629,7 @@ mod tests {
     async fn new_registry(
         bind: SocketAddr,
         seed: &str,
-    ) -> crate::Result<GossipRegistryHandle<TestTlsBootstrap>> {
+    ) -> crate::Result<GossipRegistryHandle<TestNoopBootstrap>> {
         let keypair = KeyPair::new_for_testing(seed);
         let mut config = test_cfg();
         config.key_pair = Some(keypair.clone());
@@ -601,7 +637,7 @@ mod tests {
             bind,
             keypair.to_secret_key(),
             Some(config),
-            TestTlsBootstrap,
+            TestNoopBootstrap,
         )
         .await
     }
@@ -2532,38 +2568,24 @@ mod keepalive_apply_tests {
     use super::*;
 
     #[tokio::test]
-    async fn tcp_keepalive_is_applied_on_connect_and_accept_paths() {
-        crate::net::test_reset_keepalive_apply_calls();
-
+    async fn tcp_keepalive_test_requires_external_transport_runtime() {
         let a_keypair = crate::KeyPair::new_for_testing("keepalive-a");
-        let b_keypair = crate::KeyPair::new_for_testing("keepalive-b");
 
-        let a =
-            GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), a_keypair.to_secret_key(), None, crate::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let err = match GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            a_keypair.to_secret_key(),
+            None,
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        {
+            Ok(_) => panic!("core no longer carries TLS keepalive transport setup"),
+            Err(err) => err,
+        };
 
-        let b =
-            GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), b_keypair.to_secret_key(), None, crate::BuilderTlsBootstrap)
-                .await
-                .unwrap();
-
-        // Establish a real TCP connection between peers.
-        a.add_peer(&b.registry.peer_id)
-            .await
-            .connect(&b.registry.bind_addr)
-            .await
-            .unwrap();
-
-        // We expect keepalive to be applied for:
-        // - the outbound connect stream (A -> B)
-        // - the inbound accepted stream (B accept loop)
-        //
-        // If the connection retries or reindexes, it may be applied more than twice.
-        let calls = crate::net::test_keepalive_apply_calls();
         assert!(
-            calls >= 2,
-            "expected >=2 keepalive apply calls, got {calls}"
+            err.to_string().contains("extracted from core"),
+            "unexpected error: {err}"
         );
     }
 }
