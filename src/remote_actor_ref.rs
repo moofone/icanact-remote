@@ -33,6 +33,10 @@ impl RemoteConnection {
         self.inner.sequence_number()
     }
 
+    pub fn actor_tell_empty_header(&self, actor_id: u64, type_hash: u32) -> [u8; 32] {
+        self.inner.actor_tell_empty_header(actor_id, type_hash)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
@@ -64,6 +68,10 @@ impl RemoteConnection {
     ) -> crate::Result<()> {
         self.inner
             .try_tell_actor_frame(actor_id, type_hash, payload)
+    }
+
+    pub fn try_tell_actor_frame_empty_with_header(&self, header: [u8; 32]) -> crate::Result<()> {
+        self.inner.try_tell_actor_frame_empty_with_header(header)
     }
 
     pub async fn ask_actor_frame(

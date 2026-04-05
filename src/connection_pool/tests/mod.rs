@@ -970,7 +970,7 @@ fn stream_direct_ask_throughput_bench() {
 fn stream_tell_throughput_bench() {
     run_multi_thread_test(async {
         let server_addr: std::net::SocketAddr = "127.0.0.1:42001".parse().unwrap();
-        let client_addr: std::net::SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let _client_addr: std::net::SocketAddr = "127.0.0.1:42002".parse().unwrap();
 
         let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
         let (client_writer, _writer_task) = LockFreeStreamHandle::new(
@@ -1107,8 +1107,7 @@ fn stream_protocol_ask_throughput_bench() {
         let server_addr: std::net::SocketAddr = "127.0.0.1:43001".parse().unwrap();
         let client_addr: std::net::SocketAddr = "127.0.0.1:43002".parse().unwrap();
 
-        let delivered = Arc::new(AtomicU64::new(0));
-        let delivered = Arc::new(AtomicU64::new(0));
+        let _delivered = Arc::new(AtomicU64::new(0));
         let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
             server_addr,
             crate::GossipConfig {

@@ -415,6 +415,7 @@ impl LockFreeStreamHandle {
         let mut inline32_headers: Vec<[u8; 32]> = Vec::with_capacity(OWNER_BATCH_SIZE);
         let mut inline32_payloads: Vec<bytes::Bytes> = Vec::with_capacity(OWNER_BATCH_SIZE);
         let mut response_batch = ResponseBatch::new(READ_BATCH_LIMIT);
+        let mut direct_response_batch = DirectResponseBatch::new(READ_BATCH_LIMIT);
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
         let mut streaming_state = read_context
@@ -429,6 +430,7 @@ impl LockFreeStreamHandle {
             let mut wrote_actor_responses = false;
             let mut wrote_fast_responses = false;
             response_batch.clear();
+            direct_response_batch.clear();
 
             while let Some(cmd) = streaming_queue.pop() {
                 did_work = true;
@@ -1259,7 +1261,6 @@ impl LockFreeStreamHandle {
                     bytes_written_counter.fetch_add(bytes_written, Ordering::Relaxed);
                     total_bytes_written += bytes_written;
                 }
-
                 if !direct_ask_headers.is_empty() {
                     let bytes_written = match flush_direct_ask_batch(
                         &mut stream,
@@ -1350,6 +1351,7 @@ impl LockFreeStreamHandle {
                                 &bytes_written_counter,
                                 &mut bytes_since_flush,
                                 &mut response_batch,
+                                &mut direct_response_batch,
                                 &mut wrote_fast_responses,
                                 perf,
                             )
@@ -1376,6 +1378,7 @@ impl LockFreeStreamHandle {
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
                                     &mut response_batch,
+                                    &mut direct_response_batch,
                                     perf,
                                 )
                                 .await
@@ -1414,6 +1417,24 @@ impl LockFreeStreamHandle {
                             return;
                         }
                         wrote_actor_responses = true;
+                    }
+                    if !direct_response_batch.is_empty() {
+                        if let Err(e) = write_direct_response_batch(
+                            &mut stream,
+                            &bytes_written_counter,
+                            &mut bytes_since_flush,
+                            &mut direct_response_batch,
+                        )
+                        .await
+                        {
+                            warn!(
+                                peer = %ctx.peer_addr,
+                                error = %e,
+                                "Failed to write direct response batch"
+                            );
+                            return;
+                        }
+                        wrote_fast_responses = true;
                     }
                 }
             }
@@ -1469,6 +1490,7 @@ impl LockFreeStreamHandle {
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
                                     &mut response_batch,
+                                    &mut direct_response_batch,
                                     &mut wrote_fast_responses,
                                     perf,
                                 )
@@ -1495,6 +1517,7 @@ impl LockFreeStreamHandle {
                                         &bytes_written_counter,
                                         &mut bytes_since_flush,
                                         &mut response_batch,
+                                        &mut direct_response_batch,
                                         perf,
                                     )
                                     .await
@@ -1556,6 +1579,7 @@ impl LockFreeStreamHandle {
                                         &bytes_written_counter,
                                         &mut bytes_since_flush,
                                         &mut response_batch,
+                                        &mut direct_response_batch,
                                         &mut wrote_fast_responses,
                                         perf,
                                     )
@@ -1582,6 +1606,7 @@ impl LockFreeStreamHandle {
                                             &bytes_written_counter,
                                             &mut bytes_since_flush,
                                             &mut response_batch,
+                                            &mut direct_response_batch,
                                             perf,
                                         )
                                         .await
@@ -1617,6 +1642,23 @@ impl LockFreeStreamHandle {
                                         peer = %ctx.peer_addr,
                                         error = %e,
                                         "Failed to write response batch"
+                                    );
+                                    return;
+                                }
+                            }
+                            if !direct_response_batch.is_empty() {
+                                if let Err(e) = write_direct_response_batch(
+                                    &mut stream,
+                                    &bytes_written_counter,
+                                    &mut bytes_since_flush,
+                                    &mut direct_response_batch,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to write direct response batch"
                                     );
                                     return;
                                 }

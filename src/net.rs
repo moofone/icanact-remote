@@ -11,11 +11,13 @@ use crate::GossipConfig;
 static KEEPALIVE_APPLY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn test_reset_keepalive_apply_calls() {
     KEEPALIVE_APPLY_CALLS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn test_keepalive_apply_calls() -> usize {
     KEEPALIVE_APPLY_CALLS.load(Ordering::Relaxed)
 }

@@ -275,6 +275,17 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    pub fn actor_tell_empty_header(&self, actor_id: u64, type_hash: u32) -> [u8; 32] {
+        crate::framing::write_actor_frame_header(
+            crate::MessageType::ActorTell,
+            0,
+            actor_id,
+            type_hash,
+            self.schema_hash(),
+            0,
+        )
+    }
+
     /// Returns true if the underlying IO task has exited and the connection is closed.
     pub fn is_closed(&self) -> bool {
         self.stream_handle
@@ -534,6 +545,10 @@ impl<T> ConnectionHandle<T> {
             payload.len(),
         );
         self.write_header_and_payload_control_inline32_nonblocking(header, payload)
+    }
+
+    pub fn try_tell_actor_frame_empty_with_header(&self, header: [u8; 32]) -> Result<()> {
+        self.write_header_and_payload_control_inline32_nonblocking(header, bytes::Bytes::new())
     }
 
     /// Ask an actor using the direct actor frame envelope (MessageType::ActorAsk).

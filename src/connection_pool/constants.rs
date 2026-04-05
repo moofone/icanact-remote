@@ -67,6 +67,34 @@ impl ResponseBatch {
     }
 }
 
+struct DirectResponseBatch {
+    correlation_ids: Vec<u16>,
+    payloads: Vec<bytes::Bytes>,
+}
+
+impl DirectResponseBatch {
+    fn new(capacity: usize) -> Self {
+        Self {
+            correlation_ids: Vec::with_capacity(capacity),
+            payloads: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.correlation_ids.clear();
+        self.payloads.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.payloads.is_empty()
+    }
+
+    fn push_bytes(&mut self, correlation_id: u16, payload: bytes::Bytes) {
+        self.correlation_ids.push(correlation_id);
+        self.payloads.push(payload);
+    }
+}
+
 async fn write_remaining_chunks<S: AsyncWrite + Unpin>(
     stream: &mut S,
     chunks: &[bytes::Bytes],
@@ -308,6 +336,131 @@ where
         *bytes_since_flush += n;
 
         // Advance across slices by `n` bytes.
+        let mut remaining = n;
+        while remaining > 0 && cur_slice < total_slices {
+            let resp_idx = cur_slice / 2;
+            let is_header = (cur_slice & 1) == 0;
+            let slice_len = if is_header {
+                HDR_LEN
+            } else {
+                batch.payloads[resp_idx].len()
+            };
+            let avail = slice_len.saturating_sub(cur_off);
+            if remaining < avail {
+                cur_off += remaining;
+                remaining = 0;
+            } else {
+                remaining -= avail;
+                cur_slice += 1;
+                cur_off = 0;
+            }
+        }
+    }
+
+    batch.clear();
+    Ok(())
+}
+
+async fn write_direct_response_batch<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    batch: &mut DirectResponseBatch,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if batch.is_empty() {
+        return Ok(());
+    }
+    debug_assert_eq!(
+        batch.correlation_ids.len(),
+        batch.payloads.len(),
+        "DirectResponseBatch must keep correlation_ids and payloads in sync"
+    );
+    if batch.payloads.len() == 1 {
+        let header = crate::framing::write_direct_response_header(
+            batch.correlation_ids[0],
+            batch.payloads[0].len(),
+        );
+        let n = write_header_payload_all(stream, &header, batch.payloads[0].as_ref())
+            .await
+            .map_err(GossipError::Network)?;
+        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+        *bytes_since_flush += n;
+        batch.clear();
+        return Ok(());
+    }
+
+    const HDR_LEN: usize = crate::framing::DIRECT_RESPONSE_FRAME_HEADER_LEN;
+    const MAX_IOV: usize = 256;
+    let total_slices = batch.payloads.len().saturating_mul(2);
+    let mut cur_slice = 0usize;
+    let mut cur_off = 0usize;
+    let mut iov: [MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV] = unsafe {
+        MaybeUninit::<[MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV]>::uninit().assume_init()
+    };
+    let mut scratch_headers: [MaybeUninit<[u8; HDR_LEN]>; MAX_IOV] =
+        unsafe { MaybeUninit::<[MaybeUninit<[u8; HDR_LEN]>; MAX_IOV]>::uninit().assume_init() };
+
+    while cur_slice < total_slices {
+        let mut iov_len = 0usize;
+        while iov_len < MAX_IOV && (cur_slice + iov_len) < total_slices {
+            let k = cur_slice + iov_len;
+            let resp_idx = k / 2;
+            let is_header = (k & 1) == 0;
+            let slice_bytes: &[u8] = if is_header {
+                let header = crate::framing::write_direct_response_header(
+                    batch.correlation_ids[resp_idx],
+                    batch.payloads[resp_idx].len(),
+                );
+                let hdr_slot = unsafe { scratch_headers.as_mut_ptr().add(iov_len) };
+                unsafe {
+                    (*hdr_slot).write(header);
+                    (&*(*hdr_slot).as_ptr()).as_slice()
+                }
+            } else {
+                batch.payloads[resp_idx].as_ref()
+            };
+            let slice_bytes = if iov_len == 0 && cur_off != 0 {
+                &slice_bytes[cur_off..]
+            } else {
+                slice_bytes
+            };
+            if slice_bytes.is_empty() {
+                if iov_len == 0 {
+                    cur_slice += 1;
+                    cur_off = 0;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            iov[iov_len].write(std::io::IoSlice::new(slice_bytes));
+            iov_len += 1;
+        }
+
+        if iov_len == 0 {
+            break;
+        }
+
+        let slices = unsafe {
+            std::slice::from_raw_parts(iov.as_ptr() as *const std::io::IoSlice<'_>, iov_len)
+        };
+
+        let n = stream
+            .write_vectored(slices)
+            .await
+            .map_err(GossipError::Network)?;
+        if n == 0 {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write_vectored returned 0",
+            )));
+        }
+        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+        *bytes_since_flush += n;
+
         let mut remaining = n;
         while remaining > 0 && cur_slice < total_slices {
             let resp_idx = cur_slice / 2;

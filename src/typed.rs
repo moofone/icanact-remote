@@ -229,7 +229,7 @@ where
 
     #[cfg(not(debug_assertions))]
     {
-        Ok(Bytes::copy_from_slice(payload.as_ref()))
+        Ok(Bytes::from_owner(payload))
     }
 }
 
