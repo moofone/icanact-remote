@@ -1,5 +1,5 @@
-use crate::{GossipConfig, GossipRegistryHandle, PeerId, Result};
 use crate::transport::RegistryTransportBootstrap;
+use crate::{GossipConfig, GossipRegistryHandle, PeerId, Result};
 use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Copy, Default)]

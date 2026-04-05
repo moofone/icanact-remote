@@ -33,6 +33,21 @@ impl PooledAlignedBuffer {
         Self { buffer, pool }
     }
 
+    /// Create a pooled buffer with logical length set but without zero-filling the contents.
+    ///
+    /// Safety:
+    /// Callers must fully initialize every byte before any read from the slice.
+    pub unsafe fn with_len_uninit(len: usize, pool: Arc<AlignedBytesPool>) -> Self {
+        let mut buffer = pool.get_buffer(len);
+        if buffer.capacity() < len {
+            buffer.reserve(len - buffer.len());
+        }
+        unsafe {
+            buffer.set_len(len);
+        }
+        Self { buffer, pool }
+    }
+
     pub fn from_slice(data: &[u8], pool: Arc<AlignedBytesPool>) -> Self {
         let mut buffer = pool.get_buffer(data.len());
         buffer.extend_from_slice(data);
@@ -218,7 +233,7 @@ impl AlignedBytesPool {
     pub fn get_buffer(&self, min_capacity: usize) -> AlignedBuffer {
         if let Some(mut buffer) = self.queue.pop() {
             if buffer.capacity() < min_capacity {
-                buffer.reserve(min_capacity - buffer.capacity());
+                buffer.reserve(min_capacity - buffer.len());
             }
             buffer.clear();
             buffer

@@ -160,11 +160,17 @@ impl<T> TransportDatagramWriterDyn for T where T: TransportDatagramWriter + Debu
 pub trait TransportDatagramRuntime {
     type Writer: TransportDatagramWriter + Clone + Debug + Send + Sync + 'static;
 
-    fn make_writer(socket: Arc<UdpSocket>, peer_addr: SocketAddr, queue_capacity: usize)
-    -> Self::Writer;
+    fn make_writer(
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        queue_capacity: usize,
+    ) -> Self::Writer;
 
-    fn try_send_bytes_to_addr(socket: &UdpSocket, addr: SocketAddr, data: bytes::Bytes)
-    -> Result<()>;
+    fn try_send_bytes_to_addr(
+        socket: &UdpSocket,
+        addr: SocketAddr,
+        data: bytes::Bytes,
+    ) -> Result<()>;
 
     fn try_send_parts_to_addr(
         socket: &UdpSocket,
@@ -174,14 +180,9 @@ pub trait TransportDatagramRuntime {
     ) -> Result<()>;
 }
 
-type MakeWriterFn = fn(
-    Arc<UdpSocket>,
-    SocketAddr,
-    usize,
-) -> Arc<dyn TransportDatagramWriterDyn>;
+type MakeWriterFn = fn(Arc<UdpSocket>, SocketAddr, usize) -> Arc<dyn TransportDatagramWriterDyn>;
 type TrySendBytesToAddrFn = fn(&UdpSocket, SocketAddr, bytes::Bytes) -> Result<()>;
-type TrySendPartsToAddrFn =
-    fn(&UdpSocket, SocketAddr, bytes::Bytes, bytes::Bytes) -> Result<()>;
+type TrySendPartsToAddrFn = fn(&UdpSocket, SocketAddr, bytes::Bytes, bytes::Bytes) -> Result<()>;
 
 #[derive(Clone, Copy)]
 struct DatagramRuntimeHooks {
@@ -232,7 +233,11 @@ impl TransportDatagramWriter for UnconfiguredDatagramWriter {
         Err(datagram_runtime_not_installed_error())
     }
 
-    fn try_send_header_and_payload32(&self, _header: [u8; 32], _payload: bytes::Bytes) -> Result<()> {
+    fn try_send_header_and_payload32(
+        &self,
+        _header: [u8; 32],
+        _payload: bytes::Bytes,
+    ) -> Result<()> {
         Err(datagram_runtime_not_installed_error())
     }
 

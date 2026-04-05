@@ -205,6 +205,94 @@ impl LockFreeStreamHandle {
             Ok(total_len)
         }
 
+        async fn flush_inline32_batch<S>(
+            stream: &mut S,
+            headers: &mut Vec<[u8; 32]>,
+            payloads: &mut Vec<bytes::Bytes>,
+        ) -> std::io::Result<usize>
+        where
+            S: AsyncWrite + Unpin,
+        {
+            if headers.is_empty() {
+                return Ok(0);
+            }
+
+            let mut total_len = 0usize;
+            const MAX_IOV: usize = OWNER_BATCH_SIZE * 2;
+            let mut storage: [MaybeUninit<IoSlice<'_>>; MAX_IOV] = unsafe {
+                MaybeUninit::<[MaybeUninit<IoSlice<'_>>; MAX_IOV]>::uninit().assume_init()
+            };
+
+            let count = headers.len().min(payloads.len());
+            for idx in 0..count {
+                storage[idx * 2].write(IoSlice::new(&headers[idx]));
+                storage[idx * 2 + 1].write(IoSlice::new(&payloads[idx]));
+                total_len += headers[idx].len() + payloads[idx].len();
+            }
+
+            let slices = unsafe {
+                std::slice::from_raw_parts(storage.as_ptr() as *const IoSlice<'_>, count * 2)
+            };
+            let written = write_vectored_all(stream, slices).await?;
+            headers.clear();
+            payloads.clear();
+            debug_assert_eq!(written, total_len);
+            Ok(written)
+        }
+
+        async fn flush_direct_ask_batch<S>(
+            stream: &mut S,
+            headers: &mut Vec<[u8; 16]>,
+            payloads: &mut Vec<bytes::Bytes>,
+        ) -> std::io::Result<usize>
+        where
+            S: AsyncWrite + Unpin,
+        {
+            if headers.is_empty() {
+                return Ok(0);
+            }
+
+            let mut total_len = 0usize;
+            const MAX_IOV: usize = OWNER_BATCH_SIZE * 2;
+            let mut storage: [MaybeUninit<IoSlice<'_>>; MAX_IOV] = unsafe {
+                MaybeUninit::<[MaybeUninit<IoSlice<'_>>; MAX_IOV]>::uninit().assume_init()
+            };
+
+            let count = headers.len().min(payloads.len());
+            for idx in 0..count {
+                storage[idx * 2].write(IoSlice::new(&headers[idx]));
+                storage[idx * 2 + 1].write(IoSlice::new(&payloads[idx]));
+                total_len += headers[idx].len() + payloads[idx].len();
+            }
+
+            let slices = unsafe {
+                std::slice::from_raw_parts(storage.as_ptr() as *const IoSlice<'_>, count * 2)
+            };
+            let written = write_vectored_all(stream, slices).await?;
+            headers.clear();
+            payloads.clear();
+            debug_assert_eq!(written, total_len);
+            Ok(written)
+        }
+
+        fn read_batch_limit_for(result: &ReadIoResult) -> usize {
+            match result {
+                ReadIoResult::DirectAsk { .. } => ASK_READ_BATCH_LIMIT,
+                ReadIoResult::ActorAsk { .. } => ASK_READ_BATCH_LIMIT,
+                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor { msg_type, .. })
+                    if *msg_type == crate::MessageType::ActorAsk as u8 =>
+                {
+                    ASK_READ_BATCH_LIMIT
+                }
+                ReadIoResult::Generic(crate::handle::MessageReadResult::DirectAsk { .. })
+                | ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse { .. })
+                | ReadIoResult::Generic(crate::handle::MessageReadResult::Response { .. }) => {
+                    ASK_READ_BATCH_LIMIT
+                }
+                _ => READ_BATCH_LIMIT,
+            }
+        }
+
         struct ExitGuard {
             flag: Arc<AtomicBool>,
             notify: Arc<Notify>,
@@ -308,18 +396,13 @@ impl LockFreeStreamHandle {
             }
         }
 
-        // Buffered stream for both reads and writes.
-        //
-        // On tokio-rustls, direct `write_vectored` to the TLS stream tends to degenerate into
-        // per-slice writes (effectively non-vectored), which destroys ActorAsk throughput.
-        // `BufStream` coalesces writes efficiently and keeps the two-terminal benchmark fast.
-        let mut stream =
-            tokio::io::BufStream::with_capacity(TCP_BUFFER_SIZE, TCP_BUFFER_SIZE, stream);
+        let mut stream = stream;
 
         // Larger batches for higher throughput (reduced syscalls)
-        const OWNER_BATCH_SIZE: usize = 32;
-        const READ_BATCH_LIMIT: usize = 512;
-        const FLUSH_THRESHOLD: usize = 4 * 1024; // 4KB before flush (much lower for ask/reply)
+        const OWNER_BATCH_SIZE: usize = 64;
+        const READ_BATCH_LIMIT: usize = 2048;
+        const ASK_READ_BATCH_LIMIT: usize = 8192;
+        const FLUSH_THRESHOLD: usize = 64 * 1024; // Favor batching on tell; ask has its own fast flush path
 
         let mut bytes_since_flush = 0;
         let mut last_flush = std::time::Instant::now();
@@ -327,6 +410,10 @@ impl LockFreeStreamHandle {
         // Pre-allocate reusable buffers to avoid allocations in the hot loop
         let mut write_chunks: Vec<bytes::Bytes> = Vec::with_capacity(OWNER_BATCH_SIZE * 2);
         let mut owner_batch: Vec<WriteCommand> = Vec::with_capacity(OWNER_BATCH_SIZE);
+        let mut direct_ask_headers: Vec<[u8; 16]> = Vec::with_capacity(OWNER_BATCH_SIZE);
+        let mut direct_ask_payloads: Vec<bytes::Bytes> = Vec::with_capacity(OWNER_BATCH_SIZE);
+        let mut inline32_headers: Vec<[u8; 32]> = Vec::with_capacity(OWNER_BATCH_SIZE);
+        let mut inline32_payloads: Vec<bytes::Bytes> = Vec::with_capacity(OWNER_BATCH_SIZE);
         let mut response_batch = ResponseBatch::new(READ_BATCH_LIMIT);
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
@@ -340,6 +427,7 @@ impl LockFreeStreamHandle {
             let mut did_work = false;
             let mut wrote_ask_payload = false;
             let mut wrote_actor_responses = false;
+            let mut wrote_fast_responses = false;
             response_batch.clear();
 
             while let Some(cmd) = streaming_queue.pop() {
@@ -480,6 +568,8 @@ impl LockFreeStreamHandle {
                 // Reuse pre-allocated buffers instead of creating new ones
                 write_chunks.clear();
                 owner_batch.clear();
+                inline32_headers.clear();
+                inline32_payloads.clear();
 
                 if let Some(cmd) = pending_cmd.take() {
                     owner_batch.push(cmd);
@@ -495,6 +585,7 @@ impl LockFreeStreamHandle {
                 if !owner_batch.is_empty() {
                     did_work = true;
                     for command in owner_batch.drain(..) {
+                        let is_ask_payload = matches!(&command, WriteCommand::AskPayload(_));
                         let payload = match command {
                             WriteCommand::Payload(payload) => payload,
                             WriteCommand::AskPayload(payload) => {
@@ -502,10 +593,62 @@ impl LockFreeStreamHandle {
                                 payload
                             }
                         };
+                        let ask_write_start =
+                            if is_ask_payload && perf.is_some() {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
                         write_queue.notify_space();
+                        if !matches!(&payload, WritePayload::DirectAskInline { .. })
+                            && !direct_ask_headers.is_empty()
+                        {
+                            let bytes_written = match flush_direct_ask_batch(
+                                &mut stream,
+                                &mut direct_ask_headers,
+                                &mut direct_ask_payloads,
+                            )
+                            .await
+                            {
+                                Ok(n) => n,
+                                Err(_) => return,
+                            };
+                            bytes_written_counter.fetch_add(bytes_written, Ordering::Relaxed);
+                            total_bytes_written += bytes_written;
+                        }
                         match payload {
                             WritePayload::Single(data) => write_chunks.push(data),
                             WritePayload::HeaderPayload { header, payload } => {
+                                if !direct_ask_headers.is_empty() {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
+                                if !inline32_headers.is_empty() {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
                                 write_chunks.push(header);
                                 write_chunks.push(payload);
                             }
@@ -514,6 +657,36 @@ impl LockFreeStreamHandle {
                                 header_len,
                                 payload,
                             } => {
+                                if !direct_ask_headers.is_empty() {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
+                                if !inline32_headers.is_empty() {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
                                 if !write_chunks.is_empty() {
                                     let bytes_written = match write_chunks_batched(
                                         &mut stream,
@@ -578,6 +751,36 @@ impl LockFreeStreamHandle {
                                 header_len,
                                 payload,
                             } => {
+                                if !direct_ask_headers.is_empty() {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
+                                if !inline32_headers.is_empty() {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
                                 if !write_chunks.is_empty() {
                                     let bytes_written = match write_chunks_batched(
                                         &mut stream,
@@ -639,6 +842,21 @@ impl LockFreeStreamHandle {
                                 }
                             }
                             WritePayload::HeaderInline32 { header, payload } => {
+                                if !direct_ask_headers.is_empty() {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
                                 if !write_chunks.is_empty() {
                                     let bytes_written = match write_chunks_batched(
                                         &mut stream,
@@ -654,48 +872,22 @@ impl LockFreeStreamHandle {
                                     total_bytes_written += bytes_written;
                                     write_chunks.clear();
                                 }
-
-                                let header_len = 32usize;
-                                let mut header_off = 0usize;
-                                let mut payload_off = 0usize;
-                                let payload_len = payload.len();
-
-                                while header_off < header_len || payload_off < payload_len {
-                                    let h = &header[header_off..header_len];
-                                    let p = &payload[payload_off..];
-                                    let mut slices = [IoSlice::new(h), IoSlice::new(p)];
-                                    let slice_count = if h.is_empty() {
-                                        slices[0] = IoSlice::new(p);
-                                        1
-                                    } else if p.is_empty() {
-                                        slices[0] = IoSlice::new(h);
-                                        1
-                                    } else {
-                                        2
-                                    };
-
-                                    match write_vectored_all(&mut stream, &slices[..slice_count])
-                                        .await
+                                inline32_headers.push(header);
+                                inline32_payloads.push(payload);
+                                if inline32_headers.len() == OWNER_BATCH_SIZE {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
                                     {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                            total_bytes_written += n;
-                                            if header_off < header_len {
-                                                let h_rem = header_len - header_off;
-                                                if n < h_rem {
-                                                    header_off += n;
-                                                    continue;
-                                                } else {
-                                                    header_off = header_len;
-                                                    payload_off += n - h_rem;
-                                                }
-                                            } else {
-                                                payload_off += n;
-                                            }
-                                        }
+                                        Ok(n) => n,
                                         Err(_) => return,
-                                    }
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
                                 }
                             }
                             WritePayload::HeaderPooled {
@@ -703,6 +895,36 @@ impl LockFreeStreamHandle {
                                 prefix,
                                 mut payload,
                             } => {
+                                if !direct_ask_headers.is_empty() {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
+                                if !inline32_headers.is_empty() {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
                                 if !write_chunks.is_empty() {
                                     const MAX_IOV: usize = 64;
                                     // Use drain to preserve buffer capacity
@@ -788,6 +1010,36 @@ impl LockFreeStreamHandle {
                                 prefix_len,
                                 mut payload,
                             } => {
+                                if !direct_ask_headers.is_empty() {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
+                                if !inline32_headers.is_empty() {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
                                 if !write_chunks.is_empty() {
                                     // Use drain to preserve buffer capacity
                                     let mut slices = Vec::with_capacity(write_chunks.len());
@@ -881,6 +1133,36 @@ impl LockFreeStreamHandle {
                                 }
                             }
                             WritePayload::Buf(mut buf) => {
+                                if !direct_ask_headers.is_empty() {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
+                                if !inline32_headers.is_empty() {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
                                 if !write_chunks.is_empty() {
                                     // Use drain to preserve buffer capacity
                                     let mut slices = Vec::with_capacity(write_chunks.len());
@@ -909,71 +1191,88 @@ impl LockFreeStreamHandle {
                                 }
                             }
                             WritePayload::DirectAskInline { header, payload } => {
-                                // DirectAsk fast path: write full framed header + payload
-                                const DIRECT_ASK_HEADER_LEN: usize =
-                                    crate::framing::DIRECT_ASK_FRAME_HEADER_LEN;
                                 if !write_chunks.is_empty() {
-                                    // Use drain to preserve buffer capacity
-                                    let mut slices = Vec::with_capacity(write_chunks.len());
-                                    for chunk in &write_chunks {
-                                        slices.push(IoSlice::new(&chunk));
-                                    }
-                                    match write_vectored_all(&mut stream, &slices).await {
-                                        Ok(bytes_written) => {
-                                            bytes_written_counter
-                                                .fetch_add(bytes_written, Ordering::Relaxed);
-                                            total_bytes_written += bytes_written;
-                                        }
-                                        Err(_) => return,
-                                    }
+                                    let bytes_written =
+                                        match write_chunks_batched(&mut stream, &write_chunks).await
+                                        {
+                                            Ok(n) => n,
+                                            Err(_) => return,
+                                        };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                    write_chunks.clear();
                                 }
-
-                                let mut header_off = 0usize;
-                                let mut payload_off = 0usize;
-                                let payload_len = payload.len();
-
-                                while header_off < DIRECT_ASK_HEADER_LEN
-                                    || payload_off < payload_len
-                                {
-                                    let h = &header[header_off..DIRECT_ASK_HEADER_LEN];
-                                    let p = &payload[payload_off..];
-                                    let mut slices = [IoSlice::new(h), IoSlice::new(p)];
-                                    let slice_count = if h.is_empty() {
-                                        slices[0] = IoSlice::new(p);
-                                        1
-                                    } else if p.is_empty() {
-                                        slices[0] = IoSlice::new(h);
-                                        1
-                                    } else {
-                                        2
-                                    };
-
-                                    match write_vectored_all(&mut stream, &slices[..slice_count])
-                                        .await
+                                if !inline32_headers.is_empty() {
+                                    let bytes_written = match flush_inline32_batch(
+                                        &mut stream,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                    )
+                                    .await
                                     {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                            total_bytes_written += n;
-                                            if header_off < DIRECT_ASK_HEADER_LEN {
-                                                let h_rem = DIRECT_ASK_HEADER_LEN - header_off;
-                                                if n < h_rem {
-                                                    header_off += n;
-                                                    continue;
-                                                } else {
-                                                    header_off = DIRECT_ASK_HEADER_LEN;
-                                                    payload_off += n - h_rem;
-                                                }
-                                            } else {
-                                                payload_off += n;
-                                            }
-                                        }
+                                        Ok(n) => n,
                                         Err(_) => return,
-                                    }
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
+                                }
+                                direct_ask_headers.push(header);
+                                direct_ask_payloads.push(payload);
+                                if direct_ask_headers.len() == OWNER_BATCH_SIZE {
+                                    let bytes_written = match flush_direct_ask_batch(
+                                        &mut stream,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
+                                    bytes_written_counter
+                                        .fetch_add(bytes_written, Ordering::Relaxed);
+                                    total_bytes_written += bytes_written;
                                 }
                             }
                         }
+                        if let (Some(perf), Some(start)) = (perf, ask_write_start) {
+                            perf.ask_write_calls.fetch_add(1, Ordering::Relaxed);
+                            perf.ask_write_ns
+                                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
                     }
+                }
+
+                if !inline32_headers.is_empty() {
+                    let bytes_written = match flush_inline32_batch(
+                        &mut stream,
+                        &mut inline32_headers,
+                        &mut inline32_payloads,
+                    )
+                    .await
+                    {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    bytes_written_counter.fetch_add(bytes_written, Ordering::Relaxed);
+                    total_bytes_written += bytes_written;
+                }
+
+                if !direct_ask_headers.is_empty() {
+                    let bytes_written = match flush_direct_ask_batch(
+                        &mut stream,
+                        &mut direct_ask_headers,
+                        &mut direct_ask_payloads,
+                    )
+                    .await
+                    {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    bytes_written_counter.fetch_add(bytes_written, Ordering::Relaxed);
+                    total_bytes_written += bytes_written;
                 }
 
                 if !write_chunks.is_empty() {
@@ -1015,7 +1314,8 @@ impl LockFreeStreamHandle {
 
                 if did_work {
                     let mut reads = 0usize;
-                    while reads < READ_BATCH_LIMIT {
+                    let mut read_batch_limit = READ_BATCH_LIMIT;
+                    while reads < read_batch_limit {
                         let read_start = perf.map(|_| Instant::now());
                         let read_result =
                             match read_message_step_nonblocking(&mut stream, state, ctx).await {
@@ -1041,6 +1341,29 @@ impl LockFreeStreamHandle {
 
                         if let Some(result) = read_result.result {
                             reads += 1;
+                            read_batch_limit =
+                                read_batch_limit.max(read_batch_limit_for(&result));
+                            let Some(result) = try_handle_fast_io(
+                                result,
+                                ctx,
+                                &mut stream,
+                                &bytes_written_counter,
+                                &mut bytes_since_flush,
+                                &mut response_batch,
+                                &mut wrote_fast_responses,
+                                perf,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    peer = %ctx.peer_addr,
+                                    error = %e,
+                                    "Failed to process fast IO message"
+                                );
+                                None
+                            }) else {
+                                continue;
+                            };
                             if let Some(registry) = ctx.registry_weak.upgrade() {
                                 if let Err(e) = process_read_result_io(
                                     result,
@@ -1048,6 +1371,7 @@ impl LockFreeStreamHandle {
                                     &registry,
                                     ctx.peer_addr,
                                     ctx.response_correlation.as_ref().map(|c| c.as_ref()),
+                                    ctx.sync_actor_handler.as_ref().map(|v| &**v),
                                     &mut stream,
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
@@ -1096,7 +1420,9 @@ impl LockFreeStreamHandle {
 
             // Ask RTT fast path: when this loop writes ask requests and/or actor responses,
             // flush immediately to avoid waiting on generic throughput-oriented flush thresholds.
-            if (wrote_ask_payload || wrote_actor_responses) && bytes_since_flush > 0 {
+            if (wrote_ask_payload || wrote_actor_responses || wrote_fast_responses)
+                && bytes_since_flush > 0
+            {
                 let _ = stream.flush().await;
                 bytes_since_flush = 0;
                 last_flush = std::time::Instant::now();
@@ -1136,6 +1462,27 @@ impl LockFreeStreamHandle {
                             }
 
                             if let Some(result) = read_result.result {
+                                let Some(result) = try_handle_fast_io(
+                                    result,
+                                    ctx,
+                                    &mut stream,
+                                    &bytes_written_counter,
+                                    &mut bytes_since_flush,
+                                    &mut response_batch,
+                                    &mut wrote_fast_responses,
+                                    perf,
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to process fast IO message"
+                                    );
+                                    None
+                                }) else {
+                                    continue;
+                                };
                                 if let Some(registry) = ctx.registry_weak.upgrade() {
                                     if let Err(e) = process_read_result_io(
                                         result,
@@ -1143,6 +1490,7 @@ impl LockFreeStreamHandle {
                                         &registry,
                                         ctx.peer_addr,
                                         ctx.response_correlation.as_ref().map(|c| c.as_ref()),
+                                        ctx.sync_actor_handler.as_ref().map(|v| &**v),
                                         &mut stream,
                                         &bytes_written_counter,
                                         &mut bytes_since_flush,
@@ -1173,7 +1521,8 @@ impl LockFreeStreamHandle {
                             //
                             // Drain additional frames non-blocking to batch handler + response writes.
                             let mut drained = 0usize;
-                            while drained < READ_BATCH_LIMIT {
+                            let mut drain_batch_limit = READ_BATCH_LIMIT;
+                            while drained < drain_batch_limit {
                                 let read_start = perf.map(|_| Instant::now());
                                 let next = match read_message_step_nonblocking(&mut stream, state, ctx).await {
                                     Ok(r) => r,
@@ -1198,6 +1547,29 @@ impl LockFreeStreamHandle {
 
                                 if let Some(result) = next.result {
                                     drained += 1;
+                                    drain_batch_limit =
+                                        drain_batch_limit.max(read_batch_limit_for(&result));
+                                    let Some(result) = try_handle_fast_io(
+                                        result,
+                                        ctx,
+                                        &mut stream,
+                                        &bytes_written_counter,
+                                        &mut bytes_since_flush,
+                                        &mut response_batch,
+                                        &mut wrote_fast_responses,
+                                        perf,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        warn!(
+                                            peer = %ctx.peer_addr,
+                                            error = %e,
+                                            "Failed to process fast IO message"
+                                        );
+                                        None
+                                    }) else {
+                                        continue;
+                                    };
                                     if let Some(registry) = ctx.registry_weak.upgrade() {
                                         if let Err(e) = process_read_result_io(
                                             result,
@@ -1205,6 +1577,7 @@ impl LockFreeStreamHandle {
                                             &registry,
                                             ctx.peer_addr,
                                             ctx.response_correlation.as_ref().map(|c| c.as_ref()),
+                                            ctx.sync_actor_handler.as_ref().map(|v| &**v),
                                             &mut stream,
                                             &bytes_written_counter,
                                             &mut bytes_since_flush,
@@ -1247,15 +1620,7 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
-                                // Ask RTT fast path for server-side response-heavy workloads.
-                                if bytes_since_flush > 0 {
-                                    let _ = stream.flush().await;
-                                    bytes_since_flush = 0;
-                                    last_flush = std::time::Instant::now();
-                                    flush_pending.store(false, Ordering::Release);
-                                }
                             }
-
                             // Ensure actor responses don't sit in the kernel/TLS buffers indefinitely
                             // on links that are primarily request->response (server-side).
                             if should_flush(
@@ -1302,21 +1667,34 @@ impl LockFreeStreamHandle {
 
             if let Some(perf) = perf {
                 if perf_last.elapsed() >= perf_interval {
-                    let (read_calls, read_ns, handle_calls, handle_ns, write_calls, write_ns) =
+                    let (
+                        read_calls,
+                        read_ns,
+                        handle_calls,
+                        handle_ns,
+                        write_calls,
+                        write_ns,
+                        ask_write_calls,
+                        ask_write_ns,
+                    ) =
                         perf.snapshot_and_reset();
                     let read_us = read_ns as f64 / 1000.0;
                     let handle_us = handle_ns as f64 / 1000.0;
                     let write_us = write_ns as f64 / 1000.0;
+                    let ask_write_us = ask_write_ns as f64 / 1000.0;
                     info!(
                         read_calls,
                         handle_calls,
                         write_calls,
+                        ask_write_calls,
                         read_us = read_us,
                         handle_us = handle_us,
                         write_us = write_us,
+                        ask_write_us = ask_write_us,
                         read_avg_us = read_us / (read_calls.max(1) as f64),
                         handle_avg_us = handle_us / (handle_calls.max(1) as f64),
                         write_avg_us = write_us / (write_calls.max(1) as f64),
+                        ask_write_avg_us = ask_write_us / (ask_write_calls.max(1) as f64),
                         "IO PERF"
                     );
                     perf_last = Instant::now();
@@ -2171,4 +2549,3 @@ fn parse_direct_message_payload<'a>(
 
     Ok(&msg_data[payload_start..payload_end])
 }
-

@@ -45,8 +45,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let server_addr: SocketAddr = "127.0.0.1:29501".parse()?;
-    let registry =
-        GossipRegistryHandle::new_with_transport_stack(server_addr, server_keypair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap).await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        server_addr,
+        server_keypair.to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
 
     // Register test actors
     registry
@@ -96,8 +101,13 @@ async fn run_client_with_valid_keypair() -> Result<(), Box<dyn std::error::Error
     };
 
     let client_addr: SocketAddr = "127.0.0.1:29504".parse()?;
-    let registry =
-        GossipRegistryHandle::new_with_transport_stack(client_addr, client_keypair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap).await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        client_addr,
+        client_keypair.to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
 
     // Connect to server
     let server_keypair = KeyPair::new_for_testing("test_server_2025");
@@ -178,8 +188,13 @@ async fn run_client_with_invalid_keypair() -> Result<(), Box<dyn std::error::Err
     };
 
     let client_addr: SocketAddr = "127.0.0.1:29505".parse()?;
-    let registry =
-        GossipRegistryHandle::new_with_transport_stack(client_addr, actual_keypair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap).await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        client_addr,
+        actual_keypair.to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
 
     // Connect to server
     let server_keypair = KeyPair::new_for_testing("test_server_2025");

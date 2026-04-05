@@ -1,5 +1,5 @@
 use icanact_remote::SecretKey;
-use icanact_remote_transports::tls::{TlsConfig, name};
+use icanact_remote::tls::{TlsConfig, name};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

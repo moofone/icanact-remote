@@ -104,13 +104,84 @@ impl<T> ConnectionPool<T> {
                 let registry_arc = registry_weak.upgrade().ok_or(GossipError::Shutdown)?;
                 crate::net::apply_tcp_keepalive(&stream, &registry_arc.config);
 
-                let _ = resolved_node_id;
-                let _ = registry_arc;
-                let _ = stream;
-                Err(GossipError::InvalidConfig(format!(
-                    "stream transport auth is no longer implemented in core (addr={}); use icanact-remote-transports",
-                    addr
-                )))
+                let tls_config = registry_arc.tls_config.clone().ok_or_else(|| {
+                    GossipError::TlsConfigError(format!(
+                        "TLS is required but not configured (addr={})",
+                        addr
+                    ))
+                })?;
+
+                let mut discovered_node_id = match resolved_node_id {
+                    Some(node_id) => Some(node_id),
+                    None => registry_arc.lookup_node_id(&addr).await,
+                };
+
+                let (server_name, server_name_label) = if let Some(node_id) = discovered_node_id {
+                    let dns_name = crate::tls::name::encode(&node_id);
+                    let server_name = rustls::pki_types::ServerName::try_from(dns_name)
+                        .map_err(|e| GossipError::TlsError(format!("Invalid DNS name: {}", e)))?;
+                    (server_name, format!("NodeId {}", node_id.fmt_short()))
+                } else {
+                    let placeholder = format!("peer-{}.icanact.invalid", addr.port());
+                    let server_name = rustls::pki_types::ServerName::try_from(placeholder.clone())
+                        .map_err(|e| {
+                            GossipError::TlsError(format!("Invalid fallback DNS name: {}", e))
+                        })?;
+                    (
+                        server_name,
+                        format!("placeholder SNI {} (NodeId unknown)", placeholder),
+                    )
+                };
+
+                debug!(
+                    addr = %addr,
+                    server_name = %server_name_label,
+                    "stream connect: performing TLS handshake"
+                );
+                let connector = tls_config.connector();
+                let mut tls_stream = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    connector.connect(server_name, stream),
+                )
+                .await
+                .map_err(|_| GossipError::Timeout)?
+                .map_err(|e| GossipError::TlsError(format!("TLS handshake failed: {}", e)))?;
+
+                if discovered_node_id.is_none() {
+                    if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                        if let Some(cert) = certs.first() {
+                            if let Ok(node_id) = crate::tls::extract_node_id_from_cert(cert) {
+                                if registry_arc.lookup_node_id(&addr).await.is_none() {
+                                    registry_arc.add_peer_with_node_id(addr, Some(node_id)).await;
+                                }
+                                discovered_node_id = Some(node_id);
+                            }
+                        }
+                    }
+                }
+
+                let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(|proto| proto.to_vec());
+                let peer_caps = crate::handshake::perform_hello_handshake(
+                    &mut tls_stream,
+                    negotiated_alpn.as_deref(),
+                    registry_arc.config.enable_peer_discovery,
+                )
+                .await?;
+                registry_arc.set_peer_capabilities(addr, peer_caps);
+
+                let associated_node_id = match discovered_node_id {
+                    Some(node_id) => Some(node_id),
+                    None => registry_arc.lookup_node_id(&addr).await,
+                };
+                if let Some(node_id) = associated_node_id {
+                    registry_arc
+                        .associate_peer_capabilities_with_node(addr, node_id)
+                        .await;
+                    registry_arc.mark_peer_connected(addr).await;
+                }
+
+                self.finalize_new_outbound_connection(addr, tls_stream, registry_weak.clone())
+                    .await
             }
             .await;
 

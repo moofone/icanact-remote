@@ -81,23 +81,35 @@ async fn test_peer_initialization_with_names_inner() {
         ..Default::default()
     };
 
-    let handle1 = GossipRegistryHandle::new_with_transport_stack(node1_addr, node1_keypair.to_secret_key(), Some(config1),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle1 = GossipRegistryHandle::new_with_transport_stack(
+        node1_addr,
+        node1_keypair.to_secret_key(),
+        Some(config1),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
     // Get actual addresses after port assignment
     let node1_actual_addr = handle1.registry.bind_addr;
 
-    let handle2 = GossipRegistryHandle::new_with_transport_stack(node2_addr, node2_keypair.to_secret_key(), Some(config2),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle2 = GossipRegistryHandle::new_with_transport_stack(
+        node2_addr,
+        node2_keypair.to_secret_key(),
+        Some(config2),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
     let node2_actual_addr = handle2.registry.bind_addr;
 
-    let handle3 = GossipRegistryHandle::new_with_transport_stack(node3_addr, node3_keypair.to_secret_key(), Some(config3),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle3 = GossipRegistryHandle::new_with_transport_stack(
+        node3_addr,
+        node3_keypair.to_secret_key(),
+        Some(config3),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 

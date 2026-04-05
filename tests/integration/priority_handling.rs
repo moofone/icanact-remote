@@ -7,9 +7,14 @@ async fn create_test_registry(
     keypair: KeyPair,
     config: Option<GossipConfig>,
 ) -> GossipRegistryHandle {
-    GossipRegistryHandle::new_with_transport_stack(bind_addr.parse().unwrap(), keypair.to_secret_key(), config, icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap()
+    GossipRegistryHandle::new_with_transport_stack(
+        bind_addr.parse().unwrap(),
+        keypair.to_secret_key(),
+        config,
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap()
 }
 
 async fn connect_bidirectional(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {

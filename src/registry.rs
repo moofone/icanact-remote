@@ -170,7 +170,56 @@ pub struct ActorMessageHandlerCell {
 
 #[derive(Clone)]
 pub struct ActorMessageHandlerSyncCell {
-    handler: Arc<dyn ActorMessageHandlerSync>,
+    owner: Arc<dyn ActorMessageHandlerSync>,
+    ptr: usize,
+    call: unsafe fn(
+        usize,
+        u64,
+        u32,
+        crate::aligned::AlignedBytes,
+        Option<u16>,
+    ) -> Result<Option<ActorResponse>>,
+}
+
+impl ActorMessageHandlerSyncCell {
+    pub(crate) fn new<H>(handler: Arc<H>) -> Self
+    where
+        H: ActorMessageHandlerSync + 'static,
+    {
+        unsafe fn call_impl<H>(
+            ptr: usize,
+            actor_id: u64,
+            type_hash: u32,
+            payload: crate::aligned::AlignedBytes,
+            correlation_id: Option<u16>,
+        ) -> Result<Option<ActorResponse>>
+        where
+            H: ActorMessageHandlerSync + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.handle_actor_message_sync(actor_id, type_hash, payload, correlation_id)
+        }
+
+        let ptr = Arc::as_ptr(&handler) as usize;
+        let owner: Arc<dyn ActorMessageHandlerSync> = handler;
+        Self {
+            owner,
+            ptr,
+            call: call_impl::<H>,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn handle(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+        correlation_id: Option<u16>,
+    ) -> Result<Option<ActorResponse>> {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, actor_id, type_hash, payload, correlation_id) }
+    }
 }
 
 #[derive(Clone)]
@@ -754,6 +803,7 @@ pub struct GossipRegistry<T = ()> {
     pub gossip_state: Arc<Mutex<GossipState>>,
     // Connection pool is internally lock-free (scc-based), no external locking needed
     pub connection_pool: Arc<ConnectionPool<T>>,
+    pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
         Arc<SccHashMap<crate::NodeId, crate::handshake::PeerCapabilities>>,
@@ -927,6 +977,7 @@ impl<T: 'static> GossipRegistry<T> {
                 mesh_formation_time_ms: None,
             })),
             connection_pool: Arc::new(connection_pool),
+            tls_config: None,
             peer_capabilities: peer_capabilities.clone(),
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
             peer_capability_addr_to_node: Arc::new(SccHashMap::default()),
@@ -951,19 +1002,22 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Enable TLS for secure connections
     /// This must be called before starting the registry to enable TLS
-    pub fn enable_tls(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
+    pub fn enable_tls(&mut self, secret_key: crate::SecretKey) -> Result<()> {
         self.udp_mode = false;
-        Err(GossipError::InvalidConfig(
-            "TLS transport implementation has been extracted from core; use icanact-remote-transports".to_string(),
-        ))
+        self.tls_config = Some(Arc::new(crate::tls::TlsConfig::with_peer_discovery(
+            secret_key,
+            self.config.enable_peer_discovery,
+        )?));
+        Ok(())
     }
 
     /// Enable signed Noise-style authentication for plain TCP connections.
     pub fn enable_noise_auth(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
         self.udp_mode = false;
-        Err(GossipError::InvalidConfig(
-            "Noise transport implementation has been extracted from core; use icanact-remote-transports".to_string(),
-        ))
+        tracing::warn!(
+            "Noise transport auth is not active in this build; falling back to plain stream transport"
+        );
+        Ok(())
     }
 
     /// Enable UDP datagram transport mode with transport-neutral liveness detection.
@@ -1183,9 +1237,12 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Register a synchronous actor message handler callback (fast path).
-    pub async fn set_actor_message_handler_sync(&self, handler: Arc<dyn ActorMessageHandlerSync>) {
+    pub async fn set_actor_message_handler_sync<H>(&self, handler: Arc<H>)
+    where
+        H: ActorMessageHandlerSync + 'static,
+    {
         self.actor_message_handler_sync
-            .store(Some(Arc::new(ActorMessageHandlerSyncCell { handler })));
+            .store(Some(Arc::new(ActorMessageHandlerSyncCell::new(handler))));
         info!("actor message handler sync registered");
     }
 
@@ -1236,12 +1293,7 @@ impl<T: 'static> GossipRegistry<T> {
         correlation_id: Option<u16>,
     ) -> Result<Option<ActorResponse>> {
         if let Some(cell) = self.actor_message_handler_sync.load_full() {
-            return cell.handler.handle_actor_message_sync(
-                actor_id,
-                type_hash,
-                payload,
-                correlation_id,
-            );
+            return cell.handle(actor_id, type_hash, payload, correlation_id);
         }
         if let Some(cell) = self.actor_message_handler.load_full() {
             debug!(
@@ -7535,7 +7587,8 @@ mod tests {
         assert!(!reg_loopback.is_practically_dialable_from_here("10.1.2.3:9000".parse().unwrap()));
         assert!(!reg_loopback.is_practically_dialable_from_here("[::1]:9000".parse().unwrap()));
 
-        let reg_private_v4 = GossipRegistry::<()>::new("10.10.0.1:9000".parse().unwrap(), test_config());
+        let reg_private_v4 =
+            GossipRegistry::<()>::new("10.10.0.1:9000".parse().unwrap(), test_config());
         assert!(
             reg_private_v4.is_practically_dialable_from_here("10.10.0.2:9001".parse().unwrap())
         );
@@ -7552,7 +7605,8 @@ mod tests {
             !reg_loopback_v6.is_practically_dialable_from_here("[fd00::1]:9003".parse().unwrap())
         );
 
-        let reg_ula_v6 = GossipRegistry::<()>::new("[fd00::100]:9004".parse().unwrap(), test_config());
+        let reg_ula_v6 =
+            GossipRegistry::<()>::new("[fd00::100]:9004".parse().unwrap(), test_config());
         assert!(reg_ula_v6.is_practically_dialable_from_here("[fd00::101]:9005".parse().unwrap()));
         assert!(!reg_ula_v6.is_practically_dialable_from_here("[fe80::1]:9005".parse().unwrap()));
     }

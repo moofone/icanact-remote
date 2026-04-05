@@ -13,7 +13,7 @@ pub const TCP_BUFFER_SIZE: usize = MASTER_BUFFER_SIZE; // BufWriter & io_uring b
 pub const STREAM_CHUNK_SIZE: usize = MASTER_BUFFER_SIZE; // Streaming chunk size
 pub const STREAMING_THRESHOLD: usize = MASTER_BUFFER_SIZE.saturating_sub(1024); // Just under buffer limit
 
-const WRITER_MAX_LATENCY: Duration = Duration::from_micros(50);
+const WRITER_MAX_LATENCY: Duration = Duration::from_micros(250);
 
 struct IoPerfCounters {
     read_calls: AtomicU64,
@@ -22,6 +22,8 @@ struct IoPerfCounters {
     actor_handle_ns: AtomicU64,
     response_write_calls: AtomicU64,
     response_write_ns: AtomicU64,
+    ask_write_calls: AtomicU64,
+    ask_write_ns: AtomicU64,
 }
 
 fn flush_each_actor_response() -> bool {
@@ -210,7 +212,6 @@ where
         batch.payloads.len(),
         "ResponseBatch must keep correlation_ids and payloads in sync"
     );
-
     if batch.payloads.len() == 1 {
         let header = crate::framing::write_ask_response_header(
             crate::MessageType::Response,
@@ -332,6 +333,8 @@ where
     Ok(())
 }
 
+
+
 impl IoPerfCounters {
     fn global() -> &'static IoPerfCounters {
         static PERF: OnceLock<IoPerfCounters> = OnceLock::new();
@@ -342,6 +345,8 @@ impl IoPerfCounters {
             actor_handle_ns: AtomicU64::new(0),
             response_write_calls: AtomicU64::new(0),
             response_write_ns: AtomicU64::new(0),
+            ask_write_calls: AtomicU64::new(0),
+            ask_write_ns: AtomicU64::new(0),
         })
     }
 
@@ -366,7 +371,7 @@ impl IoPerfCounters {
         })
     }
 
-    fn snapshot_and_reset(&self) -> (u64, u64, u64, u64, u64, u64) {
+    fn snapshot_and_reset(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             self.read_calls.swap(0, Ordering::Relaxed),
             self.read_ns.swap(0, Ordering::Relaxed),
@@ -374,6 +379,8 @@ impl IoPerfCounters {
             self.actor_handle_ns.swap(0, Ordering::Relaxed),
             self.response_write_calls.swap(0, Ordering::Relaxed),
             self.response_write_ns.swap(0, Ordering::Relaxed),
+            self.ask_write_calls.swap(0, Ordering::Relaxed),
+            self.ask_write_ns.swap(0, Ordering::Relaxed),
         )
     }
 }
@@ -683,4 +690,3 @@ impl Default for BufferConfig {
         }
     }
 }
-

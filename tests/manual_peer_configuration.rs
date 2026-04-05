@@ -4,8 +4,12 @@ use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
 async fn test_manual_peer_configuration_enables_lookup() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup a registry (client side)
     let secret = SecretKey::generate();
-    let registry = GossipRegistryHandle::new_with_transport_stack("0.0.0.0:0".parse()?, secret, Some(GossipConfig::default()),
-    icanact_remote::BuilderTlsBootstrap)
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        "0.0.0.0:0".parse()?,
+        secret,
+        Some(GossipConfig::default()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     // 2. Define a target server (doesn't need to actually exist for this test,

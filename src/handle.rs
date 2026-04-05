@@ -1,5 +1,5 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use std::marker::PhantomData;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::aligned::{AlignedBuffer, AlignedBytes};
 use bytes::Bytes;
@@ -1028,8 +1028,11 @@ async fn process_udp_datagram_native(
             break;
         }
 
-        let mut frame = crate::PooledAlignedBuffer::with_len(frame_len, aligned_pool.clone());
-        frame.as_mut_slice().copy_from_slice(&datagram_slice[offset..offset + frame_len]);
+        let mut frame =
+            unsafe { crate::PooledAlignedBuffer::with_len_uninit(frame_len, aligned_pool.clone()) };
+        frame
+            .as_mut_slice()
+            .copy_from_slice(&datagram_slice[offset..offset + frame_len]);
         let parsed = parse_message_from_pooled_buffer(frame, msg_len)?;
         crate::protocol::process_read_result(
             parsed,
@@ -1065,14 +1068,16 @@ async fn start_gossip_server_with_udp_socket(
     let mut streaming_states = HashMap::<SocketAddr, crate::protocol::StreamingState>::new();
 
     loop {
-        let mut datagram =
-            crate::PooledAlignedBuffer::with_len(datagram_capacity, aligned_pool.clone());
+        let mut datagram = unsafe {
+            crate::PooledAlignedBuffer::with_len_uninit(datagram_capacity, aligned_pool.clone())
+        };
         match socket.recv_from(datagram.as_mut_slice()).await {
             Ok((len, peer_addr)) => {
                 if len >= crate::framing::LENGTH_PREFIX_LEN {
                     let state = streaming_states.entry(peer_addr).or_default();
                     if let Err(err) =
-                        process_udp_datagram_native(&registry, peer_addr, datagram, len, state).await
+                        process_udp_datagram_native(&registry, peer_addr, datagram, len, state)
+                            .await
                     {
                         warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
                     }
@@ -1081,10 +1086,12 @@ async fn start_gossip_server_with_udp_socket(
                 // Drain immediately available datagrams in one wake-up, similar to TCP read batching.
                 let mut drained = 0usize;
                 while drained < UDP_RECV_BATCH_LIMIT {
-                    let mut datagram = crate::PooledAlignedBuffer::with_len(
-                        datagram_capacity,
-                        aligned_pool.clone(),
-                    );
+                    let mut datagram = unsafe {
+                        crate::PooledAlignedBuffer::with_len_uninit(
+                            datagram_capacity,
+                            aligned_pool.clone(),
+                        )
+                    };
                     match socket.try_recv_from(datagram.as_mut_slice()) {
                         Ok((len, peer_addr)) => {
                             drained += 1;
@@ -1093,11 +1100,7 @@ async fn start_gossip_server_with_udp_socket(
                             }
                             let state = streaming_states.entry(peer_addr).or_default();
                             if let Err(err) = process_udp_datagram_native(
-                                &registry,
-                                peer_addr,
-                                datagram,
-                                len,
-                                state,
+                                &registry, peer_addr, datagram, len, state,
                             )
                             .await
                             {
@@ -1311,16 +1314,79 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
 }
 
 /// Handle incoming TCP connections - immediately set up bidirectional communication
-#[instrument(skip(_stream, _registry), fields(peer = %peer_addr))]
+#[instrument(skip(stream, registry), fields(peer = %peer_addr))]
 async fn handle_connection(
-    _stream: TcpStream,
+    stream: TcpStream,
     peer_addr: SocketAddr,
-    _registry: Arc<GossipRegistry>,
+    registry: Arc<GossipRegistry>,
 ) {
-    warn!(
-        peer = %peer_addr,
-        "stream transport auth is no longer implemented in core; use icanact-remote-transports"
-    );
+    let Some(tls_config) = registry.tls_config.clone() else {
+        warn!(peer = %peer_addr, "stream connection received without TLS config");
+        return;
+    };
+
+    let acceptor = tls_config.acceptor();
+    match acceptor.accept(stream).await {
+        Ok(mut tls_stream) => {
+            let negotiated_alpn = tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .map(|proto| proto.to_vec());
+            let peer_node_id = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .and_then(|cert| crate::tls::extract_node_id_from_cert(cert).ok());
+
+            let capabilities = match crate::handshake::perform_hello_handshake(
+                &mut tls_stream,
+                negotiated_alpn.as_deref(),
+                registry.config.enable_peer_discovery,
+            )
+            .await
+            {
+                Ok(caps) => caps,
+                Err(err) => {
+                    warn!(
+                        peer = %peer_addr,
+                        error = %err,
+                        "Hello handshake failed, closing inbound TLS connection"
+                    );
+                    return;
+                }
+            };
+
+            registry.set_peer_capabilities(peer_addr, capabilities);
+            if let Some(node_id) = registry.lookup_node_id(&peer_addr).await {
+                registry
+                    .associate_peer_capabilities_with_node(peer_addr, node_id)
+                    .await;
+            }
+
+            let registry_weak = Arc::downgrade(&registry);
+            match handle_incoming_connection_tls(
+                tls_stream,
+                peer_addr,
+                registry,
+                Some(registry_weak),
+                peer_node_id,
+            )
+            .await
+            {
+                ConnectionCloseOutcome::Normal { node_id } => {
+                    debug!(peer = %peer_addr, ?node_id, "stream connection closed");
+                }
+                ConnectionCloseOutcome::DroppedByTieBreaker => {
+                    debug!(peer = %peer_addr, "stream connection dropped by tie-breaker");
+                }
+            }
+        }
+        Err(err) => {
+            warn!(peer = %peer_addr, error = %err, "TLS accept failed");
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1542,8 +1608,10 @@ where
             peer_addr,
             peer_id: Some(peer_id.clone()),
             max_message_size,
+            expected_schema_hash: registry.config.schema_hash,
             aligned_pool: aligned_pool.clone(),
             response_correlation: Some(correlation_tracker.clone()),
+            sync_actor_handler: registry.actor_message_handler_sync.load_full(),
         };
         let (stream_handle, writer_task_handle) = crate::connection_pool::LockFreeStreamHandle::new(
             stream,
@@ -1960,8 +2028,37 @@ pub(crate) fn parse_message_from_pooled_buffer(
         MessageReadResult::Raw(msg_data)
     };
 
-    // Check if this is an Ask message with envelope
-    if msg_len >= crate::framing::ASK_RESPONSE_HEADER_LEN
+    // Fast path: actor messages dominate the remote tell/ask hot path.
+    if msg_len >= crate::framing::ACTOR_HEADER_LEN
+        && matches!(
+            crate::MessageType::from_byte(msg_data[0]),
+            Some(crate::MessageType::ActorTell | crate::MessageType::ActorAsk)
+        )
+    {
+        let msg_type_byte = msg_data[0];
+        let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+        let schema_hash = crate::framing::read_schema_hash(&msg_data[3..12]);
+        let actor_id = u64::from_be_bytes(msg_data[12..20].try_into().unwrap());
+        let type_hash = u32::from_be_bytes(msg_data[20..24].try_into().unwrap());
+        let payload_len =
+            u32::from_be_bytes([msg_data[24], msg_data[25], msg_data[26], msg_data[27]]) as usize;
+
+        if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
+            return Ok(raw(buffer));
+        }
+
+        let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::ACTOR_HEADER_LEN;
+        let payload = AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
+
+        return Ok(MessageReadResult::Actor {
+            msg_type: msg_type_byte,
+            correlation_id,
+            actor_id,
+            type_hash,
+            schema_hash,
+            payload,
+        });
+    } else if msg_len >= crate::framing::ASK_RESPONSE_HEADER_LEN
         && msg_data[0] == crate::MessageType::Ask as u8
     {
         // This is an Ask message with envelope format:
@@ -2203,7 +2300,8 @@ where
     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
 
     if let Some(pool) = aligned_pool {
-        let mut buffer = crate::PooledAlignedBuffer::with_len(total_len, pool.clone());
+        let mut buffer =
+            unsafe { crate::PooledAlignedBuffer::with_len_uninit(total_len, pool.clone()) };
         buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&len_buf);
         reader
             .read_exact(&mut buffer.as_mut_slice()[crate::framing::LENGTH_PREFIX_LEN..])
@@ -2233,7 +2331,38 @@ where
     }
 
     // Check if this is an Ask message with envelope
-    if msg_len >= crate::framing::ASK_RESPONSE_HEADER_LEN
+    if msg_len >= crate::framing::ACTOR_HEADER_LEN
+        && matches!(
+            crate::MessageType::from_byte(msg_data[0]),
+            Some(crate::MessageType::ActorTell | crate::MessageType::ActorAsk)
+        )
+    {
+        let msg_type_byte = msg_data[0];
+        let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+        let schema_hash = crate::framing::read_schema_hash(&msg_data[3..12]);
+        let actor_id = u64::from_be_bytes(msg_data[12..20].try_into().unwrap());
+        let type_hash = u32::from_be_bytes(msg_data[20..24].try_into().unwrap());
+        let payload_len =
+            u32::from_be_bytes([msg_data[24], msg_data[25], msg_data[26], msg_data[27]]) as usize;
+
+        if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
+            return Ok(MessageReadResult::Raw(msg_data));
+        }
+
+        let payload = msg_data.slice(
+            crate::framing::ACTOR_HEADER_LEN..crate::framing::ACTOR_HEADER_LEN + payload_len,
+        );
+        let payload = AlignedBytes::from_bytes(payload)?;
+
+        return Ok(MessageReadResult::Actor {
+            msg_type: msg_type_byte,
+            correlation_id,
+            actor_id,
+            type_hash,
+            schema_hash,
+            payload,
+        });
+    } else if msg_len >= crate::framing::ASK_RESPONSE_HEADER_LEN
         && msg_data[0] == crate::MessageType::Ask as u8
     {
         // This is an Ask message with envelope format:

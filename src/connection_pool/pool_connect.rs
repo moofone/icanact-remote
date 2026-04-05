@@ -660,8 +660,10 @@ impl<T> ConnectionPool<T> {
                     peer_addr: addr,
                     peer_id: None,
                     max_message_size: registry.config.max_message_size,
+                    expected_schema_hash: registry.config.schema_hash,
                     aligned_pool: registry.connection_pool.aligned_bytes_pool(),
                     response_correlation: None,
+                    sync_actor_handler: registry.actor_message_handler_sync.load_full(),
                 };
                 (
                     BufferConfig::default().with_ask_window(registry.config.ask_window),
@@ -1202,8 +1204,10 @@ impl<T> ConnectionPool<T> {
                     peer_addr: addr,
                     peer_id: peer_id_opt.clone(),
                     max_message_size: registry.config.max_message_size,
+                    expected_schema_hash: registry.config.schema_hash,
                     aligned_pool: registry.connection_pool.aligned_bytes_pool(),
                     response_correlation: Some(correlation_tracker.clone()),
+                    sync_actor_handler: registry.actor_message_handler_sync.load_full(),
                 };
                 (
                     BufferConfig::default().with_ask_window(registry.config.ask_window),

@@ -23,8 +23,12 @@ async fn main() {
     };
 
     println!("Starting Node C on 127.0.0.1:8003...");
-    let handle = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:8003".parse().unwrap(), node_c_keypair.clone().to_secret_key(), Some(config),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:8003".parse().unwrap(),
+        node_c_keypair.clone().to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .expect("Failed to create node C");
 

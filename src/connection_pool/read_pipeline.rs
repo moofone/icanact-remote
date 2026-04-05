@@ -9,8 +9,10 @@ pub struct ReadContext {
     /// connections (for example tie-breaker drops during simultaneous dial).
     pub(crate) peer_id: Option<crate::PeerId>,
     pub(crate) max_message_size: usize,
+    pub(crate) expected_schema_hash: Option<u64>,
     pub(crate) aligned_pool: Arc<crate::AlignedBytesPool>,
     pub(crate) response_correlation: Option<Arc<CorrelationTracker>>,
+    pub(crate) sync_actor_handler: Option<Arc<crate::registry::ActorMessageHandlerSyncCell>>,
 }
 
 enum ReadState {
@@ -110,8 +112,170 @@ where
 }
 
 struct ReadPollResult {
-    result: Option<crate::handle::MessageReadResult>,
+    result: Option<ReadIoResult>,
     progressed: bool,
+}
+
+enum ReadIoResult {
+    Generic(crate::handle::MessageReadResult),
+    DirectAsk {
+        correlation_id: u16,
+        payload: crate::AlignedBytes,
+    },
+    ActorAsk {
+        correlation_id: u16,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::AlignedBytes,
+    },
+}
+
+enum FastReadOutcome {
+    Handled,
+    Parsed(ReadIoResult),
+    Unhandled(crate::PooledAlignedBuffer),
+}
+
+fn try_handle_read_fast_from_pooled(
+    buffer: crate::PooledAlignedBuffer,
+    msg_len: usize,
+    ctx: &ReadContext,
+) -> Result<FastReadOutcome> {
+    let msg_data = &buffer.as_ref()[crate::framing::LENGTH_PREFIX_LEN..];
+
+    if let Some(correlation) = ctx.response_correlation.as_deref() {
+        if msg_len >= crate::framing::ASK_RESPONSE_HEADER_LEN
+            && msg_data[0] == crate::MessageType::Response as u8
+        {
+            let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+            let payload_len = msg_len - crate::framing::ASK_RESPONSE_HEADER_LEN;
+            let payload_offset =
+                crate::framing::LENGTH_PREFIX_LEN + crate::framing::ASK_RESPONSE_HEADER_LEN;
+            let mut payload = Some(crate::AlignedBytes::from_pooled_buffer_range(
+                buffer,
+                payload_offset,
+                payload_len,
+            )?);
+            if correlation.complete(correlation_id, &mut payload) {
+                return Ok(FastReadOutcome::Handled);
+            }
+            return Ok(FastReadOutcome::Parsed(
+                ReadIoResult::Generic(crate::handle::MessageReadResult::Response {
+                    correlation_id,
+                    payload: payload.expect("payload retained when response was not consumed"),
+                }),
+            ));
+        }
+
+        if msg_len >= crate::framing::DIRECT_RESPONSE_HEADER_LEN
+            && msg_data[0] == crate::MessageType::DirectResponse as u8
+        {
+            let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+            let payload_len =
+                u32::from_be_bytes([msg_data[3], msg_data[4], msg_data[5], msg_data[6]]) as usize;
+            if msg_data.len() < crate::framing::DIRECT_RESPONSE_HEADER_LEN + payload_len {
+                return Ok(FastReadOutcome::Unhandled(buffer));
+            }
+            let payload_offset =
+                crate::framing::LENGTH_PREFIX_LEN + crate::framing::DIRECT_RESPONSE_HEADER_LEN;
+            let mut payload = Some(crate::AlignedBytes::from_pooled_buffer_range(
+                buffer,
+                payload_offset,
+                payload_len,
+            )?);
+            if correlation.complete(correlation_id, &mut payload) {
+                return Ok(FastReadOutcome::Handled);
+            }
+            return Ok(FastReadOutcome::Parsed(
+                ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
+                    correlation_id,
+                    payload: payload.expect("payload retained when direct response was not consumed"),
+                }),
+            ));
+        }
+    }
+
+    if msg_len >= crate::framing::DIRECT_ASK_HEADER_LEN
+        && msg_data[0] == crate::MessageType::DirectAsk as u8
+    {
+        let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+        let payload_len =
+            u32::from_be_bytes([msg_data[3], msg_data[4], msg_data[5], msg_data[6]]) as usize;
+        if msg_data.len() < crate::framing::DIRECT_ASK_HEADER_LEN + payload_len {
+            return Ok(FastReadOutcome::Unhandled(buffer));
+        }
+        let payload_offset =
+            crate::framing::LENGTH_PREFIX_LEN + crate::framing::DIRECT_ASK_HEADER_LEN;
+        let payload =
+            crate::AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
+        return Ok(FastReadOutcome::Parsed(ReadIoResult::DirectAsk {
+            correlation_id,
+            payload,
+        }));
+    }
+
+    let Some(cell) = ctx.sync_actor_handler.as_ref() else {
+        return Ok(FastReadOutcome::Unhandled(buffer));
+    };
+    if msg_len < crate::framing::ACTOR_HEADER_LEN {
+        return Ok(FastReadOutcome::Unhandled(buffer));
+    }
+
+    if msg_data[0] != crate::MessageType::ActorTell as u8 {
+        if msg_data[0] != crate::MessageType::ActorAsk as u8 {
+            return Ok(FastReadOutcome::Unhandled(buffer));
+        }
+        let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+        if correlation_id == 0 {
+            return Ok(FastReadOutcome::Unhandled(buffer));
+        }
+        if let Some(expected) = ctx.expected_schema_hash {
+            let schema_hash = crate::framing::read_schema_hash(&msg_data[3..12]);
+            if schema_hash != Some(expected) {
+                return Ok(FastReadOutcome::Handled);
+            }
+        }
+        let actor_id = u64::from_be_bytes(msg_data[12..20].try_into().unwrap());
+        let type_hash = u32::from_be_bytes(msg_data[20..24].try_into().unwrap());
+        let payload_len =
+            u32::from_be_bytes([msg_data[24], msg_data[25], msg_data[26], msg_data[27]]) as usize;
+        if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
+            return Ok(FastReadOutcome::Unhandled(buffer));
+        }
+        let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::ACTOR_HEADER_LEN;
+        let payload =
+            crate::AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
+        return Ok(FastReadOutcome::Parsed(ReadIoResult::ActorAsk {
+            correlation_id,
+            actor_id,
+            type_hash,
+            payload,
+        }));
+    }
+    if msg_data[1] != 0 || msg_data[2] != 0 {
+        return Ok(FastReadOutcome::Unhandled(buffer));
+    }
+
+    if let Some(expected) = ctx.expected_schema_hash {
+        let schema_hash = crate::framing::read_schema_hash(&msg_data[3..12]);
+        if schema_hash != Some(expected) {
+            return Ok(FastReadOutcome::Handled);
+        }
+    }
+
+    let actor_id = u64::from_be_bytes(msg_data[12..20].try_into().unwrap());
+    let type_hash = u32::from_be_bytes(msg_data[20..24].try_into().unwrap());
+    let payload_len =
+        u32::from_be_bytes([msg_data[24], msg_data[25], msg_data[26], msg_data[27]]) as usize;
+
+    if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
+        return Ok(FastReadOutcome::Unhandled(buffer));
+    }
+
+    let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::ACTOR_HEADER_LEN;
+    let payload = crate::AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
+    let _ = cell.handle(actor_id, type_hash, payload, None);
+    Ok(FastReadOutcome::Handled)
 }
 
 fn poll_read_once<S>(stream: &mut S, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize>>
@@ -122,6 +286,63 @@ where
     match Pin::new(stream).poll_read(cx, &mut read_buf) {
         Poll::Pending => Poll::Pending,
         Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+        Poll::Ready(Err(e)) => Poll::Ready(Err(GossipError::Network(e))),
+    }
+}
+
+fn try_parse_buffered_frame<S>(
+    stream: &mut S,
+    cx: &mut Context<'_>,
+    ctx: &ReadContext,
+) -> Poll<Result<Option<ReadIoResult>>>
+where
+    S: tokio::io::AsyncBufRead + Unpin,
+{
+    match Pin::new(&mut *stream).poll_fill_buf(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(buf)) => {
+            if buf.is_empty() {
+                return Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ))));
+            }
+            if buf.len() < crate::framing::LENGTH_PREFIX_LEN {
+                return Poll::Ready(Ok(None));
+            }
+            let msg_len =
+                u32::from_be_bytes(buf[..crate::framing::LENGTH_PREFIX_LEN].try_into().unwrap())
+                    as usize;
+            if msg_len > ctx.max_message_size {
+                return Poll::Ready(Err(GossipError::MessageTooLarge {
+                    size: msg_len,
+                    max: ctx.max_message_size,
+                }));
+            }
+            let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
+            if buf.len() < total_len {
+                return Poll::Ready(Ok(None));
+            }
+
+            let buffer = crate::PooledAlignedBuffer::from_slice(
+                &buf[..total_len],
+                ctx.aligned_pool.clone(),
+            );
+            let result = match try_handle_read_fast_from_pooled(buffer, msg_len, ctx) {
+                Ok(FastReadOutcome::Handled) => {
+                    Pin::new(&mut *stream).consume(total_len);
+                    return Poll::Ready(Ok(None));
+                }
+                Ok(FastReadOutcome::Parsed(result)) => result,
+                Ok(FastReadOutcome::Unhandled(buffer)) => ReadIoResult::Generic(
+                    crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
+                ),
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+
+            Pin::new(&mut *stream).consume(total_len);
+            Poll::Ready(Ok(Some(result)))
+        }
         Poll::Ready(Err(e)) => Poll::Ready(Err(GossipError::Network(e))),
     }
 }
@@ -177,8 +398,12 @@ where
                     }
 
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-                    let mut buffer =
-                        crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone());
+                    let mut buffer = unsafe {
+                        crate::PooledAlignedBuffer::with_len_uninit(
+                            total_len,
+                            ctx.aligned_pool.clone(),
+                        )
+                    };
                     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
 
                     *state = ReadState::ReadBody {
@@ -239,7 +464,20 @@ where
                         _ => unreachable!("read state must be ReadBody when complete"),
                     };
 
-                    let result = crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?;
+                    let result = match try_handle_read_fast_from_pooled(buffer, msg_len, ctx)? {
+                        FastReadOutcome::Handled => {
+                            return Poll::Ready(Ok(ReadPollResult {
+                                result: None,
+                                progressed: true,
+                            }));
+                        }
+                        FastReadOutcome::Parsed(result) => result,
+                        FastReadOutcome::Unhandled(buffer) => {
+                            ReadIoResult::Generic(
+                                crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
+                            )
+                        }
+                    };
                     Poll::Ready(Ok(ReadPollResult {
                         result: Some(result),
                         progressed: true,
@@ -303,8 +541,12 @@ where
                     }
 
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-                    let mut buffer =
-                        crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone());
+                    let mut buffer = unsafe {
+                        crate::PooledAlignedBuffer::with_len_uninit(
+                            total_len,
+                            ctx.aligned_pool.clone(),
+                        )
+                    };
                     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
 
                     *state = ReadState::ReadBody {
@@ -359,7 +601,20 @@ where
                         _ => unreachable!("read state must be ReadBody when complete"),
                     };
 
-                    let result = crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?;
+                    let result = match try_handle_read_fast_from_pooled(buffer, msg_len, ctx)? {
+                        FastReadOutcome::Handled => {
+                            return Poll::Ready(Ok(ReadPollResult {
+                                result: None,
+                                progressed: true,
+                            }));
+                        }
+                        FastReadOutcome::Parsed(result) => result,
+                        FastReadOutcome::Unhandled(buffer) => {
+                            ReadIoResult::Generic(
+                                crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
+                            )
+                        }
+                    };
                     Poll::Ready(Ok(ReadPollResult {
                         result: Some(result),
                         progressed: true,
@@ -853,6 +1108,7 @@ async fn process_read_result_io<S>(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
     response_correlation: Option<&CorrelationTracker>,
+    sync_actor_handler: Option<&crate::registry::ActorMessageHandlerSyncCell>,
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
@@ -892,9 +1148,13 @@ where
             };
             let correlation_opt = if corr_id == 0 { None } else { Some(corr_id) };
             let handle_start = perf.map(|_| Instant::now());
-            let response = registry
-                .handle_actor_message(actor_id, type_hash, payload, correlation_opt)
-                .await;
+            let response = if let Some(cell) = sync_actor_handler {
+                cell.handle(actor_id, type_hash, payload, correlation_opt)
+            } else {
+                registry
+                    .handle_actor_message(actor_id, type_hash, payload, correlation_opt)
+                    .await
+            };
             if let (Some(perf), Some(start)) = (perf, handle_start) {
                 perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
                 perf.actor_handle_ns
@@ -1035,6 +1295,45 @@ where
             }
             Ok(())
         }
+        crate::handle::MessageReadResult::DirectAsk {
+            correlation_id,
+            payload,
+        } => {
+            let write_start = perf.map(|_| Instant::now());
+            let header = crate::framing::write_direct_response_header(correlation_id, payload.len());
+            stream
+                .write_all(&header)
+                .await
+                .map_err(GossipError::Network)?;
+            stream
+                .write_all(payload.as_ref())
+                .await
+                .map_err(GossipError::Network)?;
+            stream.flush().await.map_err(GossipError::Network)?;
+            let bytes_written = header.len() + payload.len();
+            bytes_written_counter.fetch_add(bytes_written, Ordering::Relaxed);
+            *bytes_since_flush = 0;
+            if let (Some(perf), Some(start)) = (perf, write_start) {
+                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+                perf.response_write_ns
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+        crate::handle::MessageReadResult::DirectResponse {
+            correlation_id,
+            payload,
+        } => {
+            crate::handle::handle_response_message(
+                registry,
+                peer_addr,
+                correlation_id,
+                payload,
+                response_correlation,
+            )
+            .await;
+            Ok(())
+        }
         other => {
             crate::protocol::process_read_result(
                 other,
@@ -1046,5 +1345,349 @@ where
             )
             .await
         }
+    }
+}
+
+async fn try_handle_fast_io<S>(
+    result: ReadIoResult,
+    ctx: &ReadContext,
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    response_batch: &mut ResponseBatch,
+    wrote_response_bytes: &mut bool,
+    perf: Option<&IoPerfCounters>,
+) -> Result<Option<crate::handle::MessageReadResult>>
+where
+    S: AsyncWrite + Unpin,
+{
+    async fn handle_fast_actor_sync_io<S>(
+        cell: &crate::registry::ActorMessageHandlerSyncCell,
+        ctx: &ReadContext,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::AlignedBytes,
+        correlation_id: Option<u16>,
+        stream: &mut S,
+        bytes_written_counter: &Arc<AtomicUsize>,
+        bytes_since_flush: &mut usize,
+        response_batch: &mut ResponseBatch,
+        wrote_response_bytes: &mut bool,
+        perf: Option<&IoPerfCounters>,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let handle_start = perf.map(|_| Instant::now());
+        let response = cell.handle(actor_id, type_hash, payload, correlation_id);
+        if let (Some(perf), Some(start)) = (perf, handle_start) {
+            perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+            perf.actor_handle_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        let Some(correlation_id) = correlation_id else {
+            return Ok(());
+        };
+
+        if let Ok(Some(response)) = response {
+            let write_start = perf.map(|_| Instant::now());
+            let inline_payload_limit = ctx
+                .max_message_size
+                .saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
+            let schema_hash = ctx.expected_schema_hash;
+            match response {
+                crate::registry::ActorResponse::Bytes(payload) => {
+                    let should_stream =
+                        payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
+                    if should_stream {
+                        write_streaming_response_direct(
+                            stream,
+                            bytes_written_counter,
+                            bytes_since_flush,
+                            correlation_id,
+                            payload,
+                            ctx.max_message_size,
+                            schema_hash,
+                        )
+                        .await?;
+                        *wrote_response_bytes = true;
+                        if flush_each_actor_response() {
+                            stream.flush().await.map_err(GossipError::Network)?;
+                            *bytes_since_flush = 0;
+                        }
+                    } else {
+                        let header = crate::framing::write_ask_response_header(
+                            crate::MessageType::Response,
+                            correlation_id,
+                            payload.len(),
+                        );
+                        let n = write_header_payload_all(stream, &header, payload.as_ref())
+                            .await
+                            .map_err(GossipError::Network)?;
+                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                        *bytes_since_flush += n;
+                        *wrote_response_bytes = true;
+                    }
+                }
+                crate::registry::ActorResponse::Aligned(payload) => {
+                    let len = payload.len();
+                    let should_stream =
+                        len > inline_payload_limit || len > STREAMING_THRESHOLD;
+                    if should_stream {
+                        write_streaming_response_direct(
+                            stream,
+                            bytes_written_counter,
+                            bytes_since_flush,
+                            correlation_id,
+                            payload.into_bytes(),
+                            ctx.max_message_size,
+                            schema_hash,
+                        )
+                        .await?;
+                        *wrote_response_bytes = true;
+                        if flush_each_actor_response() {
+                            stream.flush().await.map_err(GossipError::Network)?;
+                            *bytes_since_flush = 0;
+                        }
+                    } else {
+                        let payload = payload.into_bytes();
+                        let header = crate::framing::write_ask_response_header(
+                            crate::MessageType::Response,
+                            correlation_id,
+                            payload.len(),
+                        );
+                        let n = write_header_payload_all(stream, &header, payload.as_ref())
+                            .await
+                            .map_err(GossipError::Network)?;
+                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                        *bytes_since_flush += n;
+                        *wrote_response_bytes = true;
+                    }
+                }
+                other => {
+                    let should_stream = match &other {
+                        crate::registry::ActorResponse::Pooled { payload_len, .. } => {
+                            *payload_len > inline_payload_limit
+                                || *payload_len > STREAMING_THRESHOLD
+                        }
+                        _ => false,
+                    };
+                    if should_stream {
+                        if let crate::registry::ActorResponse::Pooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        } = other
+                        {
+                            write_streaming_response_direct_pooled(
+                                stream,
+                                bytes_written_counter,
+                                bytes_since_flush,
+                                correlation_id,
+                                payload,
+                                prefix,
+                                payload_len,
+                                ctx.max_message_size,
+                                schema_hash,
+                            )
+                            .await?;
+                        } else {
+                            let bytes = match other {
+                                crate::registry::ActorResponse::Bytes(b) => b,
+                                crate::registry::ActorResponse::Aligned(b) => b.into_bytes(),
+                                crate::registry::ActorResponse::Pooled { .. } => unreachable!(),
+                            };
+                            write_streaming_response_direct(
+                                stream,
+                                bytes_written_counter,
+                                bytes_since_flush,
+                                correlation_id,
+                                bytes,
+                                ctx.max_message_size,
+                                schema_hash,
+                            )
+                            .await?;
+                        }
+                        *wrote_response_bytes = true;
+                        if flush_each_actor_response() {
+                            stream.flush().await.map_err(GossipError::Network)?;
+                            *bytes_since_flush = 0;
+                        }
+                    } else {
+                        write_actor_response_direct(
+                            stream,
+                            bytes_written_counter,
+                            bytes_since_flush,
+                            correlation_id,
+                            other,
+                        )
+                        .await?;
+                        *wrote_response_bytes = true;
+                        if flush_each_actor_response() {
+                            stream.flush().await.map_err(GossipError::Network)?;
+                            *bytes_since_flush = 0;
+                        }
+                    }
+                }
+            }
+            if let (Some(perf), Some(start)) = (perf, write_start) {
+                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+                perf.response_write_ns
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        }
+
+        Ok(())
+    }
+
+    match result {
+        ReadIoResult::DirectAsk {
+            correlation_id,
+            payload,
+        } => {
+            let write_start = perf.map(|_| Instant::now());
+            let payload = payload.into_bytes();
+            let header = crate::framing::write_direct_response_header(correlation_id, payload.len());
+            let n = write_header_payload_all(stream, &header, payload.as_ref())
+                .await
+                .map_err(GossipError::Network)?;
+            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+            *bytes_since_flush += n;
+            *wrote_response_bytes = true;
+            if let (Some(perf), Some(start)) = (perf, write_start) {
+                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+                perf.response_write_ns
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            Ok(None)
+        }
+        ReadIoResult::ActorAsk {
+            correlation_id,
+            actor_id,
+            type_hash,
+            payload,
+        } => {
+            let Some(cell) = ctx.sync_actor_handler.as_ref() else {
+                return Ok(Some(crate::handle::MessageReadResult::Actor {
+                    msg_type: crate::MessageType::ActorAsk as u8,
+                    correlation_id,
+                    actor_id,
+                    type_hash,
+                    schema_hash: ctx.expected_schema_hash,
+                    payload,
+                }));
+            };
+            handle_fast_actor_sync_io(
+                cell,
+                ctx,
+                actor_id,
+                type_hash,
+                payload,
+                Some(correlation_id),
+                stream,
+                bytes_written_counter,
+                bytes_since_flush,
+                response_batch,
+                wrote_response_bytes,
+                perf,
+            )
+            .await?;
+            Ok(None)
+        }
+        ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+            msg_type,
+            correlation_id,
+            actor_id,
+            type_hash,
+            schema_hash,
+            payload,
+        }) => {
+            let is_tell = msg_type == crate::MessageType::ActorTell as u8 && correlation_id == 0;
+            let is_ask = msg_type == crate::MessageType::ActorAsk as u8 && correlation_id != 0;
+            let Some(cell) = ctx.sync_actor_handler.as_ref().filter(|_| is_tell || is_ask) else {
+                return Ok(Some(crate::handle::MessageReadResult::Actor {
+                    msg_type,
+                    correlation_id,
+                    actor_id,
+                    type_hash,
+                    schema_hash,
+                    payload,
+                }));
+            };
+
+            if let Some(expected) = ctx.expected_schema_hash
+                && schema_hash != Some(expected)
+            {
+                return Ok(None);
+            }
+            handle_fast_actor_sync_io(
+                cell,
+                ctx,
+                actor_id,
+                type_hash,
+                payload,
+                if is_ask { Some(correlation_id) } else { None },
+                stream,
+                bytes_written_counter,
+                bytes_since_flush,
+                response_batch,
+                wrote_response_bytes,
+                perf,
+            )
+            .await?;
+            Ok(None)
+        }
+        ReadIoResult::Generic(crate::handle::MessageReadResult::DirectAsk {
+            correlation_id,
+            payload,
+        }) => {
+            let write_start = perf.map(|_| Instant::now());
+            let payload = payload.into_bytes();
+            let header = crate::framing::write_direct_response_header(correlation_id, payload.len());
+            let n = write_header_payload_all(stream, &header, payload.as_ref())
+                .await
+                .map_err(GossipError::Network)?;
+            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+            *bytes_since_flush += n;
+            *wrote_response_bytes = true;
+            if let (Some(perf), Some(start)) = (perf, write_start) {
+                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+                perf.response_write_ns
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            Ok(None)
+        }
+        ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
+            correlation_id,
+            payload,
+        }) => {
+            let mut payload = Some(payload);
+            if let Some(correlation) = ctx.response_correlation.as_deref()
+                && correlation.complete(correlation_id, &mut payload)
+            {
+                return Ok(None);
+            }
+            Ok(Some(crate::handle::MessageReadResult::DirectResponse {
+                correlation_id,
+                payload: payload.expect("payload retained when direct response was not consumed"),
+            }))
+        }
+        ReadIoResult::Generic(crate::handle::MessageReadResult::Response {
+            correlation_id,
+            payload,
+        }) => {
+            let mut payload = Some(payload);
+            if let Some(correlation) = ctx.response_correlation.as_deref()
+                && correlation.complete(correlation_id, &mut payload)
+            {
+                return Ok(None);
+            }
+            Ok(Some(crate::handle::MessageReadResult::Response {
+                correlation_id,
+                payload: payload.expect("payload retained when response was not consumed"),
+            }))
+        }
+        ReadIoResult::Generic(other) => Ok(Some(other)),
     }
 }

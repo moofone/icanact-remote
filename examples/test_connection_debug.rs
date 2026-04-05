@@ -20,8 +20,12 @@ async fn main() {
 
     // Start Node A
     println!("Starting Node A on 127.0.0.1:8001...");
-    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:8001".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:8001".parse().unwrap(),
+        key_pair_a.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .expect("Failed to create node A");
     println!("Node A started");
@@ -31,8 +35,12 @@ async fn main() {
 
     // Start Node B
     println!("Starting Node B on 127.0.0.1:8002...");
-    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:8002".parse().unwrap(), key_pair_b.to_secret_key(), Some(config),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:8002".parse().unwrap(),
+        key_pair_b.to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .expect("Failed to create node B");
     println!("Node B started");

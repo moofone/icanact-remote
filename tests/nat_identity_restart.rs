@@ -14,15 +14,23 @@ async fn restart_with_different_identity_is_treated_as_new_peer() -> icanact_rem
 
     let keypair_b = KeyPair::new_for_testing("identity_change_public_b");
     let peer_id_b = keypair_b.peer_id();
-    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), keypair_b.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        keypair_b.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
     let node_b_addr = handle_b.registry.bind_addr;
 
     let keypair_a1 = KeyPair::new_for_testing("identity_change_private_a_old");
     let peer_id_a1 = keypair_a1.peer_id();
-    let handle_a1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), keypair_a1.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a1 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        keypair_a1.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let peer_b = handle_a1.add_peer(&peer_id_b).await;
@@ -56,8 +64,12 @@ async fn restart_with_different_identity_is_treated_as_new_peer() -> icanact_rem
     let keypair_a2 = KeyPair::new_for_testing("identity_change_private_a_new");
     let peer_id_a2 = keypair_a2.peer_id();
     assert_ne!(peer_id_a1, peer_id_a2);
-    let handle_a2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), keypair_a2.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a2 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        keypair_a2.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let peer_b = handle_a2.add_peer(&peer_id_b).await;

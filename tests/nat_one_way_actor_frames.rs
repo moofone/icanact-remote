@@ -116,8 +116,12 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
     let tell_b = Arc::new(AtomicU64::new(0));
     let ask_b = Arc::new(AtomicU64::new(0));
 
-    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), KeyPair::new_for_testing(&b_seed).to_secret_key(), Some(test_cfg()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        KeyPair::new_for_testing(&b_seed).to_secret_key(),
+        Some(test_cfg()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
     handle_b
         .registry
@@ -128,8 +132,12 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
         }))
         .await;
 
-    let handle_a_1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), KeyPair::new_for_testing(&a_seed).to_secret_key(), Some(test_cfg()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a_1 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        KeyPair::new_for_testing(&a_seed).to_secret_key(),
+        Some(test_cfg()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
     handle_a_1
         .registry
@@ -231,8 +239,12 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
     );
 
     // NAT-side restart with same identity and outbound reconnect.
-    let handle_a_2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), KeyPair::new_for_testing(&a_seed).to_secret_key(), Some(test_cfg()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a_2 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        KeyPair::new_for_testing(&a_seed).to_secret_key(),
+        Some(test_cfg()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
     handle_a_2
         .registry

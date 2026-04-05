@@ -35,14 +35,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start Node A with TLS
     let addr_a: SocketAddr = "127.0.0.1:7001".parse()?;
-    let registry_a =
-        GossipRegistryHandle::new_with_transport_stack(addr_a, secret_key_a, Some(config.clone()), icanact_remote::BuilderTlsBootstrap).await?;
+    let registry_a = GossipRegistryHandle::new_with_transport_stack(
+        addr_a,
+        secret_key_a,
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
     info!("Node A started with TLS on {}", addr_a);
 
     // Start Node B with TLS
     let addr_b: SocketAddr = "127.0.0.1:7002".parse()?;
-    let registry_b =
-        GossipRegistryHandle::new_with_transport_stack(addr_b, secret_key_b, Some(config.clone()), icanact_remote::BuilderTlsBootstrap).await?;
+    let registry_b = GossipRegistryHandle::new_with_transport_stack(
+        addr_b,
+        secret_key_b,
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
     info!("Node B started with TLS on {}", addr_b);
 
     // Register an actor on Node A
@@ -116,8 +126,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secret_key_c = SecretKey::generate();
     let node_id_c = secret_key_c.public();
     let addr_c: SocketAddr = "127.0.0.1:7003".parse()?;
-    let _registry_c =
-        GossipRegistryHandle::new_with_transport_stack(addr_c, secret_key_c, Some(config), icanact_remote::BuilderTlsBootstrap).await?;
+    let _registry_c = GossipRegistryHandle::new_with_transport_stack(
+        addr_c,
+        secret_key_c,
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
     info!("Node C started with ID: {}", node_id_c.fmt_short());
 
     // Node A tries to connect to Node C but with wrong NodeId (Node B's ID)
