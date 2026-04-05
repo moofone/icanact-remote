@@ -48,13 +48,21 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_a.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_b.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
@@ -161,13 +169,21 @@ async fn test_old_api_not_accessible_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b_single");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_a.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_b.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
@@ -223,13 +239,21 @@ async fn test_multiple_lookups_return_different_refs_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b2");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_a.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_b.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
@@ -307,13 +331,21 @@ async fn test_lookup_caches_connection_for_zero_lookup_sending_inner() {
     let key_pair_b = KeyPair::new_for_testing("node_b3");
     let peer_id_b = key_pair_b.peer_id();
 
-    let handle_a = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_a.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_a.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), key_pair_b.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_pair_b.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await
     .unwrap();
 

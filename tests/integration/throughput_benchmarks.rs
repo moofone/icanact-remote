@@ -47,9 +47,14 @@ impl ActorMessageHandlerSync for EchoActor {
 
 async fn create_registry(seed: &str, config: GossipConfig) -> GossipRegistryHandle {
     let keypair = KeyPair::new_for_testing(seed);
-    GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), keypair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap()
+    GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        keypair.to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap()
 }
 
 async fn connect_bidirectional(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {

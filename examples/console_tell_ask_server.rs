@@ -43,8 +43,13 @@ async fn main() -> Result<()> {
     let mut config = GossipConfig::default();
     // Raise ask inflight limit to avoid throttling direct responses under high concurrency.
     config.ask_window = 4096;
-    let registry =
-        GossipRegistryHandle::new_with_transport_stack(server_addr, secret_key, Some(config), icanact_remote::BuilderTlsBootstrap).await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        server_addr,
+        secret_key,
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
 
     registry
         .registry

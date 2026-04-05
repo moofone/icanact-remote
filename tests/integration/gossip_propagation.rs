@@ -28,19 +28,31 @@ async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::
 
     let node1_keypair = KeyPair::new_for_testing("gossip_prop_node1");
     let node1_id = node1_keypair.peer_id();
-    let node1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, node1_keypair.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let node1 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        node1_keypair.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let node2_keypair = KeyPair::new_for_testing("gossip_prop_node2");
     let node2_id = node2_keypair.peer_id();
-    let node2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, node2_keypair.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let node2 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        node2_keypair.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let node3_keypair = KeyPair::new_for_testing("gossip_prop_node3");
-    let node3 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, node3_keypair.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let node3 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        node3_keypair.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let peer1_from_2 = node2.add_peer(&node1_id).await;
@@ -115,13 +127,21 @@ async fn test_actor_update_propagation() -> Result<(), Box<dyn std::error::Error
 
     let node1_keypair = KeyPair::new_for_testing("gossip_prop_update_node1");
     let node1_id = node1_keypair.peer_id();
-    let node1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, node1_keypair.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let node1 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        node1_keypair.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let node2_keypair = KeyPair::new_for_testing("gossip_prop_update_node2");
-    let node2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, node2_keypair.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let node2 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        node2_keypair.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let peer1_from_2 = node2.add_peer(&node1_id).await;
@@ -168,13 +188,21 @@ async fn test_actor_removal_propagation() -> Result<(), Box<dyn std::error::Erro
 
     let node1_keypair = KeyPair::new_for_testing("gossip_prop_remove_node1");
     let node1_id = node1_keypair.peer_id();
-    let node1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, node1_keypair.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let node1 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        node1_keypair.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let node2_keypair = KeyPair::new_for_testing("gossip_prop_remove_node2");
-    let node2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, node2_keypair.to_secret_key(), Some(config.clone()),
-    icanact_remote::BuilderTlsBootstrap)
+    let node2 = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        node2_keypair.to_secret_key(),
+        Some(config.clone()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
     .await?;
 
     let peer1_from_2 = node2.add_peer(&node1_id).await;

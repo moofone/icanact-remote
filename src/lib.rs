@@ -18,6 +18,7 @@ pub mod reply_to;
 pub mod stream_writer;
 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
 pub mod test_helpers;
+pub mod tls;
 pub mod transport;
 pub mod typed;
 

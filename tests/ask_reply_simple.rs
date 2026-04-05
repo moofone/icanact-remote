@@ -64,13 +64,23 @@ async fn run_test_basic_ask_correlation() {
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        addr_a,
+        key_pair_a.to_secret_key(),
+        Some(config_a),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        addr_b,
+        key_pair_b.to_secret_key(),
+        Some(config_b),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
 
     // Connect nodes - single direction to avoid duplicate tie-breaker churn
     let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -229,13 +239,23 @@ async fn run_test_ask_high_throughput() {
     };
 
     // Start nodes
-    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        addr_a,
+        key_pair_a.to_secret_key(),
+        Some(config_a),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
 
-    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        addr_b,
+        key_pair_b.to_secret_key(),
+        Some(config_b),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
 
     // Connect single direction to avoid duplicate tie-breaker churn
     let peer_b = handle_a.add_peer(&peer_id_b).await;

@@ -57,13 +57,22 @@ fn test_typed_ask_over_tls_with_pooled_path() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
         peer_b.connect(&addr_b).await.unwrap();
@@ -106,13 +115,22 @@ fn test_typed_tell_over_tls_with_pooled_path() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
         peer_b.connect(&addr_b).await.unwrap();

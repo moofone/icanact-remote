@@ -25,8 +25,9 @@ async fn connect_tls(
 ) {
     let client_secret = SecretKey::generate();
     let client_peer_id = client_secret.to_keypair().peer_id();
-    let tls_cfg = icanact_remote_transports::tls::TlsConfig::new(client_secret).expect("tls config");
-    let server_name = icanact_remote_transports::tls::name::encode(&server_node_id);
+    let tls_cfg =
+        icanact_remote::tls::TlsConfig::new(client_secret).expect("tls config");
+    let server_name = icanact_remote::tls::name::encode(&server_node_id);
     let server_name = rustls::pki_types::ServerName::try_from(server_name).expect("server name");
 
     let tcp = TcpStream::connect(server_addr).await.expect("tcp connect");
@@ -113,18 +114,17 @@ async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
 
 #[tokio::test(flavor = "current_thread")]
 async fn direct_ask_roundtrip_with_tcp_fragmentation() {
-    icanact_remote_transports::tls::ensure_crypto_provider();
+    icanact_remote::tls::ensure_crypto_provider();
 
     let server_secret = SecretKey::generate();
-    let handle =
-        GossipRegistryHandle::new_with_transport_stack(
-            "127.0.0.1:0".parse().unwrap(),
-            server_secret.clone(),
-            None,
-            icanact_remote::BuilderTlsBootstrap,
-        )
-        .await
-        .expect("start server");
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        server_secret.clone(),
+        None,
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .expect("start server");
     let server_addr = handle.registry.bind_addr;
     let server_node_id = server_secret.public();
 
@@ -156,18 +156,17 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn truncated_frame_does_not_crash_server() {
-    icanact_remote_transports::tls::ensure_crypto_provider();
+    icanact_remote::tls::ensure_crypto_provider();
 
     let server_secret = SecretKey::generate();
-    let handle =
-        GossipRegistryHandle::new_with_transport_stack(
-            "127.0.0.1:0".parse().unwrap(),
-            server_secret.clone(),
-            None,
-            icanact_remote::BuilderTlsBootstrap,
-        )
-        .await
-        .expect("start server");
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        server_secret.clone(),
+        None,
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .expect("start server");
     let server_addr = handle.registry.bind_addr;
     let server_node_id = server_secret.public();
 
@@ -198,18 +197,17 @@ async fn truncated_frame_does_not_crash_server() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unknown_message_type_is_ignored_and_server_continues() {
-    icanact_remote_transports::tls::ensure_crypto_provider();
+    icanact_remote::tls::ensure_crypto_provider();
 
     let server_secret = SecretKey::generate();
-    let handle =
-        GossipRegistryHandle::new_with_transport_stack(
-            "127.0.0.1:0".parse().unwrap(),
-            server_secret.clone(),
-            None,
-            icanact_remote::BuilderTlsBootstrap,
-        )
-        .await
-        .expect("start server");
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        server_secret.clone(),
+        None,
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .expect("start server");
     let server_addr = handle.registry.bind_addr;
     let server_node_id = server_secret.public();
 

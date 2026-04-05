@@ -760,7 +760,10 @@ mod tests {
             schema_hash: Some(0xAABBCCDDEEFF0011),
             ..Default::default()
         };
-        let registry = Arc::new(GossipRegistry::<()>::new("127.0.0.1:0".parse().unwrap(), config));
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+        ));
         registry.connection_pool.set_registry(registry.clone());
 
         let hits = Arc::new(AtomicUsize::new(0));

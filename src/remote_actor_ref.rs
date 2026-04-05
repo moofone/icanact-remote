@@ -51,7 +51,9 @@ impl RemoteConnection {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> crate::Result<()> {
-        self.inner.tell_actor_frame(actor_id, type_hash, payload).await
+        self.inner
+            .tell_actor_frame(actor_id, type_hash, payload)
+            .await
     }
 
     pub fn try_tell_actor_frame(
@@ -60,7 +62,8 @@ impl RemoteConnection {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> crate::Result<()> {
-        self.inner.try_tell_actor_frame(actor_id, type_hash, payload)
+        self.inner
+            .try_tell_actor_frame(actor_id, type_hash, payload)
     }
 
     pub async fn ask_actor_frame(
@@ -129,7 +132,10 @@ impl RemoteConnection {
         self.inner.ask_direct(request, timeout).await
     }
 
-    pub async fn ask_direct_no_timeout(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
+    pub async fn ask_direct_no_timeout(
+        &self,
+        request: bytes::Bytes,
+    ) -> crate::Result<bytes::Bytes> {
         self.inner.ask_direct_no_timeout(request).await
     }
 
@@ -151,7 +157,9 @@ impl RemoteConnection {
         type_hash: u32,
         actor_id: u64,
     ) -> crate::Result<()> {
-        self.inner.stream_large_message(msg, type_hash, actor_id).await
+        self.inner
+            .stream_large_message(msg, type_hash, actor_id)
+            .await
     }
 
     pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
@@ -407,10 +415,7 @@ impl<T> RemoteActorRef<T> {
     /// This is the correct way to delegate "waiting for the response" to another task.
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
-    pub async fn ask_deferred(
-        &self,
-        request: bytes::Bytes,
-    ) -> crate::Result<crate::DeferredAsk> {
+    pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
         let conn = self.connection_or_not_listening()?;
         conn.ask_deferred(request).await
     }

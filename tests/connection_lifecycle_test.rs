@@ -74,13 +74,23 @@ fn test_connection_survives_multiple_gossip_rounds() {
         };
 
         // Start nodes
-        let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .expect("Failed to create node A");
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config_a),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .expect("Failed to create node A");
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .expect("Failed to create node B");
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config_b),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .expect("Failed to create node B");
 
         // Connect A -> B (single direction is sufficient for this test)
         let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -148,13 +158,23 @@ fn test_addr_mappings_preserved_after_fullsync() {
             ..Default::default()
         };
 
-        let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config_a),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config_b),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         // Connect
         let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -238,14 +258,23 @@ fn test_reconnect_cleanup() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         // Initial connect
         let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -272,11 +301,15 @@ fn test_reconnect_cleanup() {
         info!("Restarting node B with new identity");
         let key_pair_b2 = KeyPair::new_for_testing("reconnect_node_b2");
         let peer_id_b2 = key_pair_b2.peer_id();
-        let handle_b2 = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b2.to_secret_key(), Some(GossipConfig {
+        let handle_b2 = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b2.to_secret_key(),
+            Some(GossipConfig {
                 gossip_interval: Duration::from_secs(300),
                 ..Default::default()
             }),
-        icanact_remote::BuilderTlsBootstrap)
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         .unwrap();
 

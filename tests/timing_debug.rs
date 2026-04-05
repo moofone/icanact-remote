@@ -45,14 +45,22 @@ fn debug_timing_variations() {
         let node1_id = node1_keypair.peer_id();
         let node2_id = node2_keypair.peer_id();
 
-        let node1 =
-            GossipRegistryHandle::new_with_transport_stack(node1_addr, node1_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
-        let node2 =
-            GossipRegistryHandle::new_with_transport_stack(node2_addr, node2_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let node1 = GossipRegistryHandle::new_with_transport_stack(
+            node1_addr,
+            node1_keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let node2 = GossipRegistryHandle::new_with_transport_stack(
+            node2_addr,
+            node2_keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         let peer2 = node1.add_peer(&node2_id).await;
         peer2.connect(&node2_addr).await.unwrap();

@@ -39,8 +39,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let server_addr: SocketAddr = "127.0.0.1:28101".parse()?;
-    let registry =
-        GossipRegistryHandle::new_with_transport_stack(server_addr, server_keypair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap).await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        server_addr,
+        server_keypair.to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
 
     // Register a test actor
     registry
@@ -110,9 +115,13 @@ async fn run_client_with_wrong_key() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client_addr: SocketAddr = "127.0.0.1:28103".parse()?;
-    let registry =
-        GossipRegistryHandle::new_with_transport_stack(client_addr, wrong_client_keypair.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        client_addr,
+        wrong_client_keypair.to_secret_key(),
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
 
     println!(
         "\n✅ Client started on {} with WRONG PeerId: {}",

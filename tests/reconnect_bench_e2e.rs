@@ -15,7 +15,7 @@ use icanact_remote::{
     aligned::AlignedBytes,
     registry::{ActorMessageFuture, ActorMessageHandler, ActorResponse, PeerDisconnectHandler},
 };
-use icanact_remote_transports::tls;
+use icanact_remote::tls;
 use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
 
@@ -110,9 +110,14 @@ async fn start_server_at(
         gossip_interval: Duration::from_secs(3600),
         ..Default::default()
     };
-    let h = GossipRegistryHandle::new_with_transport_stack(bind_addr, secret, Some(config), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .expect("start server");
+    let h = GossipRegistryHandle::new_with_transport_stack(
+        bind_addr,
+        secret,
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .expect("start server");
     h.registry.set_actor_message_handler(handler).await;
     h
 }
@@ -144,11 +149,15 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
     // Client.
     let client_secret = SecretKey::generate();
     let client = Arc::new(
-        GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse().unwrap(), client_secret, Some(GossipConfig {
+        GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            client_secret,
+            Some(GossipConfig {
                 gossip_interval: Duration::from_secs(3600),
                 ..Default::default()
             }),
-        icanact_remote::BuilderTlsBootstrap)
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         .expect("start client"),
     );

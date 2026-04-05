@@ -60,7 +60,13 @@ async fn new_registry(
     cfg.key_pair = Some(keypair.clone());
     cfg.allow_loopback_discovery = true; // tests use 127.0.0.1
     cfg.connection_timeout = Duration::from_millis(150);
-    GossipRegistryHandle::new_with_transport_stack(bind, keypair.to_secret_key(), Some(cfg), icanact_remote::BuilderTlsBootstrap).await
+    GossipRegistryHandle::new_with_transport_stack(
+        bind,
+        keypair.to_secret_key(),
+        Some(cfg),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
 }
 
 fn unused_local_addr() -> SocketAddr {

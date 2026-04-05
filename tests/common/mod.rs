@@ -15,7 +15,7 @@ fn init_crypto() {
         // `rustls` only allows installing a default crypto provider once per process.
         // The library code may have already installed it by the time this runs, so
         // make init idempotent to avoid test flakes.
-        icanact_remote_transports::tls::ensure_crypto_provider();
+        icanact_remote::tls::ensure_crypto_provider();
     });
 }
 
@@ -38,8 +38,12 @@ pub async fn create_tls_node(config: GossipConfig) -> Result<TlsHandle, DynError
     let mut backoff = Duration::from_millis(25);
 
     loop {
-        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
-        icanact_remote::BuilderTlsBootstrap)
+        match GossipRegistryHandle::new_with_transport_stack(
+            bind_addr,
+            secret_key.clone(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         {
             Ok(node) => return Ok(node),
@@ -73,8 +77,12 @@ pub async fn create_quic_node(config: GossipConfig) -> Result<TlsHandle, DynErro
     let mut backoff = Duration::from_millis(25);
 
     loop {
-        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
-        icanact_remote::BuilderTlsBootstrap)
+        match GossipRegistryHandle::new_with_transport_stack(
+            bind_addr,
+            secret_key.clone(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         {
             Ok(node) => return Ok(node),
@@ -93,9 +101,7 @@ pub async fn create_quic_node(config: GossipConfig) -> Result<TlsHandle, DynErro
 }
 
 #[allow(dead_code)]
-pub async fn create_native_quic_node(
-    config: GossipConfig,
-) -> Result<TlsHandle, DynError> {
+pub async fn create_native_quic_node(config: GossipConfig) -> Result<TlsHandle, DynError> {
     init_crypto();
     let secret_key = SecretKey::generate();
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
@@ -110,8 +116,12 @@ pub async fn create_native_quic_node(
     let mut backoff = Duration::from_millis(25);
 
     loop {
-        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
-        icanact_remote::BuilderTlsBootstrap)
+        match GossipRegistryHandle::new_with_transport_stack(
+            bind_addr,
+            secret_key.clone(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         {
             Ok(node) => return Ok(node),
@@ -145,8 +155,12 @@ pub async fn create_udp_node(config: GossipConfig) -> Result<TlsHandle, DynError
     let mut backoff = Duration::from_millis(25);
 
     loop {
-        match GossipRegistryHandle::new_with_transport_stack(bind_addr, secret_key.clone(), Some(config.clone()),
-        icanact_remote::BuilderTlsBootstrap)
+        match GossipRegistryHandle::new_with_transport_stack(
+            bind_addr,
+            secret_key.clone(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         {
             Ok(node) => return Ok(node),
@@ -165,10 +179,7 @@ pub async fn create_udp_node(config: GossipConfig) -> Result<TlsHandle, DynError
 }
 
 #[allow(dead_code)]
-pub async fn connect_bidirectional(
-    a: &TlsHandle,
-    b: &TlsHandle,
-) -> Result<(), DynError> {
+pub async fn connect_bidirectional(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
     let addr_a = a.registry.bind_addr;
     let addr_b = b.registry.bind_addr;
     let peer_id_a = a.registry.peer_id.clone();
@@ -230,11 +241,7 @@ pub async fn wait_for_actor(node: &TlsHandle, actor: &str, timeout: Duration) ->
 }
 
 #[allow(dead_code)]
-pub async fn wait_for_actor_absent(
-    node: &TlsHandle,
-    actor: &str,
-    timeout: Duration,
-) -> bool {
+pub async fn wait_for_actor_absent(node: &TlsHandle, actor: &str, timeout: Duration) -> bool {
     wait_for_condition(
         timeout,
         || async move { node.lookup(actor).await.is_none() },
@@ -243,11 +250,7 @@ pub async fn wait_for_actor_absent(
 }
 
 #[allow(dead_code)]
-pub async fn wait_for_active_peers(
-    node: &TlsHandle,
-    min_peers: usize,
-    timeout: Duration,
-) -> bool {
+pub async fn wait_for_active_peers(node: &TlsHandle, min_peers: usize, timeout: Duration) -> bool {
     wait_for_condition(timeout, || async move {
         node.stats().await.active_peers >= min_peers
     })

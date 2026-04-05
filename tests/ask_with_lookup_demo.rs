@@ -94,18 +94,30 @@ fn test_ask_with_lookup_and_performance() {
         let node2_id = node2_keypair.peer_id();
         let node3_id = node3_keypair.peer_id();
 
-        let node1 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:30001".parse().unwrap(), node1_keypair.to_secret_key(), Some(config.clone()),
-        icanact_remote::BuilderTlsBootstrap)
+        let node1 = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:30001".parse().unwrap(),
+            node1_keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         .unwrap();
 
-        let node2 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:30002".parse().unwrap(), node2_keypair.to_secret_key(), Some(config.clone()),
-        icanact_remote::BuilderTlsBootstrap)
+        let node2 = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:30002".parse().unwrap(),
+            node2_keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         .unwrap();
 
-        let node3 = GossipRegistryHandle::new_with_transport_stack("127.0.0.1:30003".parse().unwrap(), node3_keypair.to_secret_key(), Some(config.clone()),
-        icanact_remote::BuilderTlsBootstrap)
+        let node3 = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:30003".parse().unwrap(),
+            node3_keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
         .await
         .unwrap();
 
@@ -486,15 +498,23 @@ fn test_ask_high_throughput() {
         let node2_keypair = KeyPair::new_for_testing("node2_ht");
         let node2_id = node2_keypair.peer_id();
 
-        let node1 =
-            GossipRegistryHandle::new_with_transport_stack(node1_addr, node1_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let node1 = GossipRegistryHandle::new_with_transport_stack(
+            node1_addr,
+            node1_keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let node2 =
-            GossipRegistryHandle::new_with_transport_stack(node2_addr, node2_keypair.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let node2 = GossipRegistryHandle::new_with_transport_stack(
+            node2_addr,
+            node2_keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         // Connect nodes (single-direction dial avoids tie-breaker churn)
         let peer2 = node1.add_peer(&node2_id).await;

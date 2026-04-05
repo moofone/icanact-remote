@@ -117,9 +117,13 @@ async fn main() -> Result<()> {
     }
     // Bind to loopback by default to keep the 2-terminal benchmark self-contained.
     // (Some sandboxed environments disallow binding 0.0.0.0.)
-    let registry =
-        GossipRegistryHandle::new_with_transport_stack("127.0.0.1:0".parse()?, client_secret, Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await?;
+    let registry = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        client_secret,
+        Some(config),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
     registry
         .registry
         .set_peer_disconnect_handler(Arc::new(ConsoleDisconnectHandler))

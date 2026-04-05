@@ -116,7 +116,8 @@ async fn test_gossip_scheduler_concurrent_conflict_converges_across_seeds() {
     let mut reference: Option<BTreeMap<String, String>> = None;
 
     for seed in 0u64..25 {
-        let reg_c = GossipRegistry::<()>::new(test_addr(8020 + seed as u16), test_config("sched_c"));
+        let reg_c =
+            GossipRegistry::<()>::new(test_addr(8020 + seed as u16), test_config("sched_c"));
 
         // Deterministic "chaos": reorder + duplicates, but always deliver at least one copy of each.
         let mut rng = StdRng::seed_from_u64(seed);

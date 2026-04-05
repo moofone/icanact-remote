@@ -133,14 +133,23 @@ fn test_streaming_request_large_payload() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         // Set up actor message handler for ask tests
         let handler = Arc::new(AskTestHandler {
@@ -201,14 +210,23 @@ fn test_streaming_request_zero_copy() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         // Set up actor message handler for ask tests
         let handler = Arc::new(AskTestHandler {
@@ -268,14 +286,23 @@ fn test_streaming_response_auto() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
         peer_b.connect(&addr_b).await.unwrap();
@@ -323,14 +350,23 @@ fn test_small_payload_uses_write_queue() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
         peer_b.connect(&addr_b).await.unwrap();
@@ -378,14 +414,23 @@ fn test_streaming_threshold_boundary() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         let handler = Arc::new(AskTestHandler {
             message_received: AtomicBool::new(false),
@@ -463,14 +508,23 @@ fn test_concurrent_streaming_requests() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
         peer_b.connect(&addr_b).await.unwrap();
@@ -622,14 +676,23 @@ fn test_streaming_tell_no_response() {
             ..Default::default()
         };
 
-        let handle_a =
-            GossipRegistryHandle::new_with_transport_stack(addr_a, key_pair_a.to_secret_key(), Some(config.clone()), icanact_remote::BuilderTlsBootstrap)
-                .await
-                .unwrap();
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_pair_b.to_secret_key(), Some(config), icanact_remote::BuilderTlsBootstrap)
-            .await
-            .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
 
         // Set up the test handler on node B
         let handler = Arc::new(TellTestHandler {
