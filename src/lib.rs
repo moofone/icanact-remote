@@ -981,30 +981,15 @@ impl<T: 'static> Peer<T> {
 
     /// Disconnect from this peer
     pub async fn disconnect(&self) -> Result<()> {
-        let pool = &self.registry.connection_pool;
+        self.registry
+            .handle_peer_connection_failure_by_peer_id(&self.peer_id)
+            .await?;
 
-        if let Some(conn) = pool.get_connection_by_peer_id(&self.peer_id) {
-            // Mark connection as disconnected
-            conn.set_state(crate::connection_pool::ConnectionState::Disconnected);
-
-            // Get the peer address for mark_disconnected
-            let peer_addr = pool.peer_id_to_addr.read_sync(&self.peer_id, |_, v| *v);
-            if let Some(addr) = peer_addr {
-                pool.mark_disconnected(addr);
-            }
-
-            tracing::info!(
-                peer_id = %self.peer_id,
-                "Disconnected from peer"
-            );
-            Ok(())
-        } else {
-            tracing::debug!(
-                peer_id = %self.peer_id,
-                "No connection found to disconnect"
-            );
-            Ok(()) // Not an error if no connection exists
-        }
+        tracing::info!(
+            peer_id = %self.peer_id,
+            "Disconnected from peer"
+        );
+        Ok(())
     }
 
     /// Get the peer ID
