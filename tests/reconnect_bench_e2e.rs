@@ -10,12 +10,12 @@ use std::{
 };
 
 use bytes::Bytes;
+use icanact_remote::tls;
 use icanact_remote::{
     GossipConfig, GossipRegistryHandle, SecretKey,
     aligned::AlignedBytes,
     registry::{ActorMessageFuture, ActorMessageHandler, ActorResponse, PeerDisconnectHandler},
 };
-use icanact_remote::tls;
 use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
 

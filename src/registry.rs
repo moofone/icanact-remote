@@ -2975,6 +2975,8 @@ impl<T: 'static> GossipRegistry<T> {
             }
 
             let mut tasks = Vec::new();
+            let mut full_sync_message: Option<RegistryMessage> = None;
+            let mut delta_messages: HashMap<u64, RegistryMessage> = HashMap::new();
             for peer_addr in selected_peers {
                 let peer_info = gossip_state
                     .peers
@@ -3000,37 +3002,61 @@ impl<T: 'static> GossipRegistry<T> {
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
 
                 let message = if use_delta {
-                    match self
-                        .create_delta_from_state(
-                            &gossip_state,
-                            &local_actors,
-                            &known_actors,
-                            peer_info.last_sequence,
-                        )
-                        .await
-                    {
-                        Ok(delta) => RegistryMessage::DeltaGossip { delta },
-                        Err(err) => {
-                            debug!(
-                                peer = %peer_addr,
-                                error = %err,
-                                "failed to create delta, falling back to full sync"
-                            );
+                    if let Some(message) = delta_messages.get(&peer_info.last_sequence) {
+                        message.clone()
+                    } else {
+                        match self
+                            .create_delta_from_state(
+                                &gossip_state,
+                                &local_actors,
+                                &known_actors,
+                                peer_info.last_sequence,
+                            )
+                            .await
+                        {
+                            Ok(delta) => {
+                                let message = RegistryMessage::DeltaGossip { delta };
+                                delta_messages.insert(peer_info.last_sequence, message.clone());
+                                message
+                            }
+                            Err(err) => {
+                                debug!(
+                                    peer = %peer_addr,
+                                    error = %err,
+                                    "failed to create delta, falling back to full sync"
+                                );
+                                if full_sync_message.is_none() {
+                                    full_sync_message = Some(
+                                        self.create_full_sync_message_from_state(
+                                            &local_actors,
+                                            &known_actors,
+                                            current_sequence,
+                                        )
+                                        .await,
+                                    );
+                                }
+                                full_sync_message
+                                    .as_ref()
+                                    .expect("full sync message initialized")
+                                    .clone()
+                            }
+                        }
+                    }
+                } else {
+                    if full_sync_message.is_none() {
+                        full_sync_message = Some(
                             self.create_full_sync_message_from_state(
                                 &local_actors,
                                 &known_actors,
                                 current_sequence,
                             )
-                            .await
-                        }
+                            .await,
+                        );
                     }
-                } else {
-                    self.create_full_sync_message_from_state(
-                        &local_actors,
-                        &known_actors,
-                        current_sequence,
-                    )
-                    .await
+                    full_sync_message
+                        .as_ref()
+                        .expect("full sync message initialized")
+                        .clone()
                 };
 
                 match &message {
@@ -4393,6 +4419,7 @@ impl<T: 'static> GossipRegistry<T> {
 
         let mut serialized_messages: Vec<bytes::Bytes> = Vec::new();
         let mut current_changes: Vec<RegistryChange> = Vec::new();
+        let mut current_serialized: Option<bytes::Bytes> = None;
 
         for change in urgent_changes {
             current_changes.push(change);
@@ -4407,11 +4434,17 @@ impl<T: 'static> GossipRegistry<T> {
                     precise_timing_nanos,
                 },
             };
-            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&message)?;
+            let serialized =
+                bytes::Bytes::from_owner(rkyv::to_bytes::<rkyv::rancor::Error>(&message)?);
 
             if serialized.len() > self.config.max_message_size && current_changes.len() > 1 {
                 let last = current_changes.pop().unwrap();
-                let chunk_message = RegistryMessage::DeltaGossip {
+                if let Some(previous) = current_serialized.take() {
+                    serialized_messages.push(previous);
+                }
+                current_changes.clear();
+                current_changes.push(last);
+                let tail_message = RegistryMessage::DeltaGossip {
                     delta: RegistryDelta {
                         sender_peer_id: self.peer_id.clone(),
                         since_sequence: 0,
@@ -4421,34 +4454,27 @@ impl<T: 'static> GossipRegistry<T> {
                         precise_timing_nanos,
                     },
                 };
-                let chunk_serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk_message)?;
-                serialized_messages.push(bytes::Bytes::from_owner(chunk_serialized));
-                current_changes.clear();
-                current_changes.push(last);
+                current_serialized = Some(bytes::Bytes::from_owner(rkyv::to_bytes::<
+                    rkyv::rancor::Error,
+                >(
+                    &tail_message
+                )?));
             } else if serialized.len() > self.config.max_message_size {
                 warn!(
                     size = serialized.len(),
                     max = self.config.max_message_size,
                     "Immediate gossip change exceeds max message size; sending as single chunk"
                 );
-                serialized_messages.push(bytes::Bytes::from_owner(serialized));
+                serialized_messages.push(serialized);
                 current_changes.clear();
+                current_serialized = None;
+            } else {
+                current_serialized = Some(serialized);
             }
         }
 
-        if !current_changes.is_empty() {
-            let message = RegistryMessage::DeltaGossip {
-                delta: RegistryDelta {
-                    sender_peer_id: self.peer_id.clone(),
-                    since_sequence: 0,
-                    current_sequence: 0,
-                    changes: current_changes,
-                    wall_clock_time,
-                    precise_timing_nanos,
-                },
-            };
-            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&message)?;
-            serialized_messages.push(bytes::Bytes::from_owner(serialized));
+        if let Some(serialized) = current_serialized.take() {
+            serialized_messages.push(serialized);
         }
 
         let serialization_end = std::time::SystemTime::now()

@@ -418,7 +418,7 @@ impl<T> ConnectionHandle<T> {
             );
             let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
             stream_handle
-                .write_pooled_control_inline(header, 16, prefix, prefix_len, payload)
+                .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
                 .await
         } else {
             let header = framing::write_ask_response_header(

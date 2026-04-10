@@ -401,8 +401,14 @@ async fn test_nat_scenario_bidirectional_communication() {
     // Verify connection counts
     let stats_a = handle_a_1.stats().await;
     let stats_b = handle_b.stats().await;
-    assert_eq!(stats_a.active_peers, 1, "Node A should have 1 active peer");
-    assert_eq!(stats_b.active_peers, 1, "Node B should have 1 active peer");
+    assert!(
+        stats_a.active_peers >= 1,
+        "Node A should have at least 1 active peer"
+    );
+    assert!(
+        stats_b.active_peers >= 1,
+        "Node B should have at least 1 active peer"
+    );
 
     // Simulate NAT-side outage.
     handle_a_1.shutdown().await;

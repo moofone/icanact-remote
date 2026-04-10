@@ -1,39 +1,23 @@
 # icanact-remote
 
-`icanact_remote` is a high-throughput, transport-agnostic core for remote actor discovery and request/response (tell/ask) style messaging.
+`icanact_remote` is a Rust crate for remote actor discovery, peer connectivity, and tell/ask messaging over authenticated transports.
 
-## Highlights
+## What the crate provides
 
-- High-performance ring buffer: Lock-free ring buffer for tell/ask operations with future io_uring support for Linux 5.1+.
-- Compile-time transport bootstrap via `new_with_transport_stack(...)`.
-- Ask/response correlation tracking and streaming response protocol for large payloads.
-- Zero-copy friendly payload paths (`bytes::Bytes`, aligned buffers, pooled typed payloads).
+- `GossipRegistryHandle` for node lifecycle, peer registration, gossip, and shutdown.
+- `RemoteActorRef` for cached remote sends via `tell`, `ask`, `ask_deferred`, and typed helpers.
+- Built-in TLS bootstrap through `BuilderTlsBootstrap`.
+- DNS refresh hooks for peer addresses that may change over time.
+- Optional Linux `io_uring` writer support behind the `io_uring` feature flag.
 
-## DNS Refresh (Kubernetes IP Churn)
+## Quick start
 
-If a peer is configured with a `dns_name` (for example, a StatefulSet pod DNS name),
-`icanact_remote` will re-resolve DNS on dial/reconnect failure before the next attempt.
-
-For deterministic tests, you can inject a resolver:
+The default transport bootstrap shipped in this crate is `BuilderTlsBootstrap`.
 
 ```rust
-use std::sync::Arc;
-use icanact_remote::{DnsResolver, GossipRegistryHandle, TokioDnsResolver};
-
-// Default behavior uses Tokio DNS:
-// handle.registry.set_dns_resolver(Arc::new(TokioDnsResolver::default())).await;
-//
-// Tests can provide a scripted resolver implementing `DnsResolver`.
-```
-
-## Transport Bootstrap
-
-`icanact-remote` core does not ship concrete transport stacks. Use a stack from
-`icanact-remote-transports` and bootstrap with `new_with_transport_stack(...)`.
-
-```rust
-use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
-use icanact_remote_transports::TcpTlsStack;
+use icanact_remote::{
+    BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, SecretKey,
+};
 
 #[tokio::main]
 async fn main() -> icanact_remote::Result<()> {
@@ -44,32 +28,69 @@ async fn main() -> icanact_remote::Result<()> {
         bind_addr,
         secret,
         Some(GossipConfig::default()),
-        TcpTlsStack::default(),
-    ).await?;
-    println!("listening on {}", handle.registry.bind_addr);
+        BuilderTlsBootstrap,
+    )
+    .await?;
 
+    println!("listening on {}", handle.registry.bind_addr);
     handle.shutdown().await;
     Ok(())
 }
 ```
 
-## io_uring (Linux)
+## Lookup model
 
-There is an `io_uring` feature flag intended for Linux 5.1+:
+- `lookup("actor_name")` returns `Option<RemoteActorRef>`.
+- `lookup_peer(&PeerId)` returns `Result<RemoteActorRef>` and is the preferred path when peer identity matters.
+- Low-level connection APIs are intentionally not public; callers should work through lookup methods.
+
+## DNS refresh on reconnect
+
+If a peer is configured with a DNS name, reconnect paths can re-resolve that name after dial failure.
+
+Tests can inject a custom resolver:
+
+```rust
+use std::sync::Arc;
+use icanact_remote::{DnsResolver, GossipRegistryHandle, TokioDnsResolver};
+
+// Default behavior:
+// handle.registry.set_dns_resolver(Arc::new(TokioDnsResolver::default())).await;
+//
+// Custom test resolvers can implement `DnsResolver`.
+```
+
+You can also associate a DNS name with a peer address through `handle.set_peer_dns_name(...)`.
+
+## Key types
+
+- `SecretKey` is the private Ed25519 signing key used for TLS identity.
+- `PublicKey` and `NodeId` refer to the same public key type.
+- `PeerId` is the wire-facing peer identity and can be converted to and from `NodeId`.
+- `KeyPair` remains available, especially in tests and examples, and can be converted to `SecretKey`.
+
+## Feature flags
+
+- `io_uring`: enables the Linux-only `io_uring` stream writer path when supported by the target.
+- `strict-zero-copy`: reserved feature flag present in `Cargo.toml`.
+- `test-helpers`: exports the `test_helpers` module.
+
+Build with `io_uring`:
 
 ```bash
 cargo build --features io_uring
 ```
 
-This is currently a platform-specific optimization path; non-Linux platforms use the default Tokio networking path.
+On non-Linux platforms, or without that feature, the crate uses the standard Tokio-based writer path.
 
-## Security Note
+## Examples and tests
 
-The old note about “not using proper cryptographic PeerId keys” is no longer accurate: `PeerId` is an Ed25519 public key, and TLS identities are derived from Ed25519 keys.
+- Runnable examples live under [`examples/`](./examples).
+- TLS-focused walkthroughs are in [`examples/TLS_EXAMPLES.md`](./examples/TLS_EXAMPLES.md).
+- API behavior around `lookup()` and `RemoteActorRef` is covered by integration tests such as `tests/test_new_lookup_api.rs`.
 
-However, peer authentication is still intentionally permissive in places:
+## Security notes
 
-- Certificate parsing/identity extraction uses a simplified placeholder approach (not full X.509 parsing).
-- Unless you encode an expected NodeId in SNI, the client verifier does not strictly pin the peer identity when connecting via IP.
-
-If you need production-grade node identity verification, you should implement strict identity pinning (expected `PeerId`/`NodeId` per address) and replace the placeholder certificate parsing with proper X.509/SPKI extraction.
+- TLS identity verification is tied to Ed25519-derived node identities.
+- When the client connects with an expected node identity, the TLS verifier rejects mismatches with a `NodeId mismatch` error.
+- Address-only flows are still possible in the API, so prefer peer-id-driven flows such as `add_peer(...)` plus `lookup_peer(...)` when identity pinning matters.

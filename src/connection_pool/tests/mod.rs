@@ -311,7 +311,7 @@ fn test_connection_handle_send_data() {
     run_multi_thread_test(async {
         let (writer, recorded) = RecordingWriter::new();
 
-        let (stream_handle, _writer_task) = LockFreeStreamHandle::new(
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
             writer,
             "127.0.0.1:8080".parse().unwrap(),
             ChannelId::Global,
@@ -343,7 +343,7 @@ fn test_writer_owner_batch_preserves_order() {
     run_multi_thread_test(async {
         let (writer, recorded) = RecordingWriter::new();
 
-        let (stream_handle, _writer_task) = LockFreeStreamHandle::new(
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
             writer,
             "127.0.0.1:8080".parse().unwrap(),
             ChannelId::Global,
@@ -378,7 +378,7 @@ fn test_writer_vectored_sequence_header_payload() {
     run_multi_thread_test(async {
         let (writer, recorded) = RecordingWriter::new();
 
-        let (stream_handle, _writer_task) = LockFreeStreamHandle::new(
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
             writer,
             "127.0.0.1:8080".parse().unwrap(),
             ChannelId::Global,
@@ -457,7 +457,7 @@ fn parse_direct_message_payload_header_too_short() {
 #[test]
 fn test_connection_handle_send_data_closed() {
     run_multi_thread_test(async {
-        let (stream_handle, _writer_task) = LockFreeStreamHandle::new(
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
             ClosedWriter,
             "127.0.0.1:8080".parse().unwrap(),
             ChannelId::Global,
@@ -578,7 +578,7 @@ async fn test_wait_for_response_returns_on_cancelled_slot() {
 async fn test_ask_backpressure_no_write_buffer_full() {
     let (writer, mut reader) = tokio::io::duplex(64 * 1024);
 
-    let (handle, _writer_task) = LockFreeStreamHandle::new(
+    let (handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
         writer,
         "127.0.0.1:0".parse().unwrap(),
         ChannelId::TellAsk,
@@ -631,7 +631,7 @@ crate::wire_type!(WireMsg, "connection_pool_tests::WireMsg");
 #[tokio::test]
 async fn test_pooled_typed_send_matches_wire_bytes() {
     let (writer, mut reader) = tokio::io::duplex(64 * 1024);
-    let (handle, _writer_task) = LockFreeStreamHandle::new(
+    let (handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
         writer,
         "127.0.0.1:0".parse().unwrap(),
         ChannelId::TellAsk,
@@ -668,6 +668,7 @@ async fn test_pooled_typed_send_matches_wire_bytes() {
 }
 
 #[test]
+#[ignore = "benchmark-only; run explicitly when profiling"]
 fn stream_direct_ask_throughput_bench() {
     run_multi_thread_test(async {
         let server_addr: std::net::SocketAddr = "127.0.0.1:41001".parse().unwrap();
@@ -694,7 +695,7 @@ fn stream_direct_ask_throughput_bench() {
             response_correlation: Some(correlation.clone()),
             sync_actor_handler: None,
         };
-        let (client_writer, _writer_task) = LockFreeStreamHandle::new(
+        let (client_writer, _writer_task, _reader_task) = LockFreeStreamHandle::new(
             client_io,
             server_addr,
             ChannelId::TellAsk,
@@ -967,13 +968,13 @@ fn stream_direct_ask_throughput_bench() {
 }
 
 #[test]
+#[ignore = "benchmark-only; run explicitly when profiling"]
 fn stream_tell_throughput_bench() {
     run_multi_thread_test(async {
         let server_addr: std::net::SocketAddr = "127.0.0.1:42001".parse().unwrap();
-        let client_addr: std::net::SocketAddr = "127.0.0.1:42002".parse().unwrap();
 
         let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
-        let (client_writer, _writer_task) = LockFreeStreamHandle::new(
+        let (client_writer, _writer_task, _reader_task) = LockFreeStreamHandle::new(
             client_io,
             server_addr,
             ChannelId::TellAsk,
@@ -1102,13 +1103,12 @@ fn stream_tell_throughput_bench() {
 }
 
 #[test]
+#[ignore = "benchmark-only; run explicitly when profiling"]
 fn stream_protocol_ask_throughput_bench() {
     run_multi_thread_test(async {
         let server_addr: std::net::SocketAddr = "127.0.0.1:43001".parse().unwrap();
         let client_addr: std::net::SocketAddr = "127.0.0.1:43002".parse().unwrap();
 
-        let delivered = Arc::new(AtomicU64::new(0));
-        let delivered = Arc::new(AtomicU64::new(0));
         let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
             server_addr,
             crate::GossipConfig {
@@ -1145,7 +1145,7 @@ fn stream_protocol_ask_throughput_bench() {
             response_correlation: Some(correlation.clone()),
             sync_actor_handler: None,
         };
-        let (client_writer, _client_task) = LockFreeStreamHandle::new(
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
             client_io,
             server_addr,
             ChannelId::TellAsk,
@@ -1173,7 +1173,7 @@ fn stream_protocol_ask_throughput_bench() {
             response_correlation: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
-        let (_server_writer, _server_task) = LockFreeStreamHandle::new(
+        let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
             server_io,
             client_addr,
             ChannelId::TellAsk,
@@ -1197,6 +1197,7 @@ fn stream_protocol_ask_throughput_bench() {
             assert_eq!(reply.as_ref(), b"pingpong");
         }
 
+        reset_io_perf();
         let start = std::time::Instant::now();
         for _ in 0..iters {
             let reply = client_conn
@@ -1212,6 +1213,7 @@ fn stream_protocol_ask_throughput_bench() {
             elapsed.as_secs_f64(),
             iters as f64 / elapsed.as_secs_f64()
         );
+        print_io_perf("stream_protocol_direct_ask_timeout");
 
         for _ in 0..warmup {
             let reply = client_conn
@@ -1226,6 +1228,7 @@ fn stream_protocol_ask_throughput_bench() {
             assert_eq!(reply.as_ref(), b"pingpong");
         }
 
+        reset_io_perf();
         let start = std::time::Instant::now();
         for _ in 0..iters {
             let reply = client_conn
@@ -1246,6 +1249,67 @@ fn stream_protocol_ask_throughput_bench() {
             elapsed.as_secs_f64(),
             iters as f64 / elapsed.as_secs_f64()
         );
+        print_io_perf("stream_protocol_actor_ask_timeout");
+
+        for _ in 0..warmup {
+            let reply = client_conn
+                .ask_direct_no_timeout(bytes::Bytes::from_static(b"pingpong"))
+                .await
+                .unwrap();
+            assert_eq!(reply.as_ref(), b"pingpong");
+        }
+
+        reset_io_perf();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let reply = client_conn
+                .ask_direct_no_timeout(bytes::Bytes::from_static(b"pingpong"))
+                .await
+                .unwrap();
+            assert_eq!(reply.as_ref(), b"pingpong");
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "[stream_protocol_direct_ask_no_timeout_seq] iters={} elapsed_s={:.6} ops_per_sec={:.3}",
+            iters,
+            elapsed.as_secs_f64(),
+            iters as f64 / elapsed.as_secs_f64()
+        );
+        print_io_perf("stream_protocol_direct_ask_no_timeout_seq");
+
+        for _ in 0..warmup {
+            let reply = client_conn
+                .ask_actor_frame_no_timeout(
+                    0xC0DE_BEEF,
+                    0xA11C_0001,
+                    bytes::Bytes::from_static(b"pingpong"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.as_ref(), b"pingpong");
+        }
+
+        reset_io_perf();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let reply = client_conn
+                .ask_actor_frame_no_timeout(
+                    0xC0DE_BEEF,
+                    0xA11C_0001,
+                    bytes::Bytes::from_static(b"pingpong"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.as_ref(), b"pingpong");
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "[stream_protocol_actor_ask_no_timeout_seq] iters={} elapsed_s={:.6} ops_per_sec={:.3}",
+            iters,
+            elapsed.as_secs_f64(),
+            iters as f64 / elapsed.as_secs_f64()
+        );
+        print_io_perf("stream_protocol_actor_ask_no_timeout_seq");
 
         let inflight = 64usize;
         let drive_direct = |count: u64| {
@@ -1282,6 +1346,7 @@ fn stream_protocol_ask_throughput_bench() {
             }
         };
 
+        reset_io_perf();
         let start = std::time::Instant::now();
         let checksum = drive_direct(iters).await;
         let elapsed = start.elapsed();
@@ -1292,6 +1357,7 @@ fn stream_protocol_ask_throughput_bench() {
             iters as f64 / elapsed.as_secs_f64(),
             checksum
         );
+        print_io_perf("stream_protocol_direct_ask_no_timeout_inflight64");
 
         let drive_actor = |count: u64| {
             let client_conn = client_conn.clone();
@@ -1335,6 +1401,7 @@ fn stream_protocol_ask_throughput_bench() {
             }
         };
 
+        reset_io_perf();
         let start = std::time::Instant::now();
         let checksum = drive_actor(iters).await;
         let elapsed = start.elapsed();
@@ -1345,12 +1412,14 @@ fn stream_protocol_ask_throughput_bench() {
             iters as f64 / elapsed.as_secs_f64(),
             checksum
         );
+        print_io_perf("stream_protocol_actor_ask_no_timeout_inflight64");
 
         client_writer.shutdown();
     });
 }
 
 #[test]
+#[ignore = "benchmark-only; run explicitly when profiling"]
 fn stream_protocol_direct_ask_inflight64_bench() {
     run_multi_thread_test(async {
         let server_addr: std::net::SocketAddr = "127.0.0.1:43101".parse().unwrap();
@@ -1391,7 +1460,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
             response_correlation: Some(correlation.clone()),
             sync_actor_handler: None,
         };
-        let (client_writer, _client_task) = LockFreeStreamHandle::new(
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
             client_io,
             server_addr,
             ChannelId::TellAsk,
@@ -1419,7 +1488,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
             response_correlation: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
-        let (_server_writer, _server_task) = LockFreeStreamHandle::new(
+        let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
             server_io,
             client_addr,
             ChannelId::TellAsk,
@@ -1486,6 +1555,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
 }
 
 #[test]
+#[ignore = "benchmark-only; run explicitly when profiling"]
 fn stream_protocol_actor_ask_inflight64_bench() {
     run_multi_thread_test(async {
         let server_addr: std::net::SocketAddr = "127.0.0.1:43201".parse().unwrap();
@@ -1526,7 +1596,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
             response_correlation: Some(correlation.clone()),
             sync_actor_handler: None,
         };
-        let (client_writer, _client_task) = LockFreeStreamHandle::new(
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
             client_io,
             server_addr,
             ChannelId::TellAsk,
@@ -1554,7 +1624,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
             response_correlation: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
-        let (_server_writer, _server_task) = LockFreeStreamHandle::new(
+        let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
             server_io,
             client_addr,
             ChannelId::TellAsk,
@@ -1629,6 +1699,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
 }
 
 #[test]
+#[ignore = "benchmark-only; run explicitly when profiling"]
 fn stream_protocol_tell_throughput_bench() {
     run_multi_thread_test(async {
         let server_addr: std::net::SocketAddr = "127.0.0.1:44001".parse().unwrap();
@@ -1672,7 +1743,7 @@ fn stream_protocol_tell_throughput_bench() {
             response_correlation: None,
             sync_actor_handler: None,
         };
-        let (client_writer, _client_task) = LockFreeStreamHandle::new(
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
             client_io,
             server_addr,
             ChannelId::TellAsk,
@@ -1700,7 +1771,7 @@ fn stream_protocol_tell_throughput_bench() {
             response_correlation: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
-        let (_server_writer, _server_task) = LockFreeStreamHandle::new(
+        let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
             server_io,
             client_addr,
             ChannelId::TellAsk,
@@ -1815,6 +1886,7 @@ fn stream_protocol_tell_throughput_bench() {
 }
 
 #[test]
+#[ignore = "benchmark-only; run explicitly when profiling"]
 fn correlation_tracker_throughput_bench() {
     run_multi_thread_test(async {
         let tracker = CorrelationTracker::new();

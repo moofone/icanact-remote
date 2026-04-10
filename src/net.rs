@@ -10,16 +10,6 @@ use crate::GossipConfig;
 #[cfg(test)]
 static KEEPALIVE_APPLY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
-pub(crate) fn test_reset_keepalive_apply_calls() {
-    KEEPALIVE_APPLY_CALLS.store(0, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(crate) fn test_keepalive_apply_calls() -> usize {
-    KEEPALIVE_APPLY_CALLS.load(Ordering::Relaxed)
-}
-
 pub(crate) fn apply_tcp_keepalive(stream: &TcpStream, config: &GossipConfig) {
     #[cfg(test)]
     KEEPALIVE_APPLY_CALLS.fetch_add(1, Ordering::Relaxed);

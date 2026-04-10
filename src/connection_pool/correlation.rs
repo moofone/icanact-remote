@@ -282,10 +282,6 @@ impl CorrelationTracker {
                 {
                     return Err(crate::GossipError::Timeout);
                 }
-                // The slot isn't WAITING anymore. It might be READY/WRITING/EMPTY (cancelled).
-                // READY: return the response.
-                // WRITING: wait without timeout to avoid dropping an in-progress write.
-                // EMPTY: treat as timeout/cancel to avoid hanging forever.
                 if let Some(response) = Self::try_take_ready(slot_ref) {
                     return Ok(response);
                 }

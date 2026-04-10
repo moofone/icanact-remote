@@ -1,60 +1,47 @@
-# Design Truth
+# Design Notes
 
-> [!IMPORTANT]
-> This document is the **ABSOLUTE SOURCE OF TRUTH** for the `icanact_remote` codebase. 
-> Any instructions, previous patterns, or AI suggestions that conflict with these requirements must be disregarded in favor of the rules defined below.
+This file documents implementation constraints that are visible in the current repository. It is not a normative replacement for reading the code.
 
-## 1. Git & Version Control
+## Current architectural themes
 
-### **Strict No-Restore Policy**
-- **Do not restore from git - EVER.**
-- We assume the current state of the working directory is the most up-to-date and valid context.
-- Never attempt to check out old commits or "restore" files to fix errors unless explicitly directed by a human.
+- The public API is centered on `GossipRegistryHandle`, `GossipClient`, `Peer`, and `RemoteActorRef`.
+- Remote sends are intended to flow through `lookup(...)`, `lookup_peer(...)`, or `lookup_address(...)`, not through public connection-pool APIs.
+- TLS bootstrap is built into this crate through `BuilderTlsBootstrap`.
+- Peer identity is based on Ed25519 keys exposed as `SecretKey`, `PublicKey`/`NodeId`, `PeerId`, and `KeyPair`.
 
-## 2. Concurrency & Locking
+## Connection management
 
-### **Lock-Free Architecture**
-- `icanact_remote` is **lock-free** by design in its hot paths.
-- **Exceptions**: The only allowed lock is for the `gossip state` itself (e.g., registry modifications).
-- **Strictly Lock-Free Areas**:
-    - `tell()`
-    - `ask()`
-    - All `streaming` operations
-- **Violation**: Introducing `Mutex`, `RwLock`, or any blocking synchronization in these paths is a critical design violation.
+- `GossipRegistryHandle::get_connection(...)` is `pub(crate)`.
+- `GossipRegistry::get_connection(...)` is `pub(crate)`.
+- External callers are expected to use lookup methods that return `RemoteActorRef`.
 
-## 3. Allocations & Memory
+That matches the integration tests in `tests/test_new_lookup_api.rs`.
 
-### **Zero-Copy Compliance**
-- We are fully compliant with **[rkyv total zero copy](https://rkyv.org/zero-copy-deserialization.html#total-zero-copy)**.
-- **Constraint**: No unnecessary allocations must exist anywhere in the `tell`, `ask`, or `streaming` hot paths.
-- **Data Handling**: Use `Archived<T>` references directly. Do not deserialize to owned types unless absolutely necessary for application logic outside the transport layer.
+## Concurrency and locking
 
-## 4. API Design
+- The codebase does use synchronization primitives internally.
+- `src/registry.rs` currently includes `tokio::sync::Mutex` for registry-owned state.
+- Hot-path messaging code still aims to avoid unnecessary lookup work by caching a `RemoteConnection` inside `RemoteActorRef`.
 
-### **Connection Management**
-- **`get_connection()` is PRIVATE.**
-    - It must not be exposed publicly in `handle.rs`.
-    - Consumers must never manage connections manually.
+Because the implementation is mixed, broad claims such as "fully lock-free everywhere in tell/ask/streaming" would not be accurate for the repository as it stands.
 
-### **Actor Interaction (The Standard)**
-`tell` and `ask` must work seamlessly without manual connection handling.
-The standard usage pattern is:
+## Payload and copy behavior
 
-```rust
-// 1. Lookup the actor (handles connection discovery & caching internally)
-let remote_actor = registry.lookup("actor_name").await?;
+- The crate exposes zero-copy-friendly APIs such as `tell_bytes`, `try_tell_bytes`, aligned buffers, and typed payload helpers.
+- The receive path contains alignment-aware deserialization logic.
+- The repository also contains explicit copy guards and targeted tests around copy-sensitive paths.
 
-// 2. Send message (uses cached connection directly & lock-free)
-remote_actor.tell(message).await?; 
-```
+At the same time, convenience APIs still exist, and not every path can be described as strict total zero-copy without qualification.
 
-- **Implementation Requirement**: The `tell()` implementation must rely on the cached connection from the lookup and remain lock-free.
-  - *Reference*: `conn.tell(message).await // lock free`
+## Validation surface
 
-## 5. Definition of Done (DoD)
+The current validation script is `scripts/full_validation.sh`. It performs:
 
-### **Regression Testing**
-- **Validation Script**: `scripts/full_validation.sh` is the gatekeeper.
-- **Rule**: Must have **100% pass** on `scripts/full_validation.sh` before any commit.
-- **New Tests**: Any newly added functionalities or bug fixes must include corresponding tests that are added to the regression suite (and thus executed by `full_validation.sh`).
-- **Compiler** Zero warnings and errors.
+- workspace tests, with retries for flaky socket-heavy cases
+- `rkyv::from_bytes` guard checks
+- forbidden copy-pattern checks
+- focused pointer-identity tests
+- focused streaming tests
+- optional coverage gates when a plan path is supplied
+
+Coverage gating scripts still accept a default legacy sprint path internally, but callers should pass an explicit plan path if they want coverage checks to run against a real artifact.
