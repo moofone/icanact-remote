@@ -673,7 +673,7 @@ impl<T> ConnectionPool<T> {
             })
             .unwrap_or((BufferConfig::default(), None, None));
 
-        let (stream_handle, writer_task_handle) = LockFreeStreamHandle::new(
+        let (stream_handle, writer_task_handle, reader_task_handle) = LockFreeStreamHandle::new(
             tcp_stream,
             addr,
             ChannelId::Global,
@@ -692,6 +692,11 @@ impl<T> ConnectionPool<T> {
         connection
             .task_tracker
             .set_writer(writer_task_handle.abort_handle());
+        if let Some(reader_task_handle) = reader_task_handle {
+            connection
+                .task_tracker
+                .set_reader(reader_task_handle.abort_handle());
+        }
 
         let connection_arc = Arc::new(connection);
 
@@ -1216,7 +1221,7 @@ impl<T> ConnectionPool<T> {
                 )
             })
             .unwrap_or((BufferConfig::default(), None, None));
-        let (stream_handle, writer_task_handle) = LockFreeStreamHandle::new(
+        let (stream_handle, writer_task_handle, reader_task_handle) = LockFreeStreamHandle::new(
             stream,
             addr,
             ChannelId::Global,
@@ -1234,6 +1239,10 @@ impl<T> ConnectionPool<T> {
         // Track the writer task handle (H-004).
         conn.task_tracker
             .set_writer(writer_task_handle.abort_handle());
+        if let Some(reader_task_handle) = reader_task_handle {
+            conn.task_tracker
+                .set_reader(reader_task_handle.abort_handle());
+        }
 
         // For outgoing connections, we might know the peer ID from configuration
         if let Some(peer_id) = peer_id_opt.clone() {
@@ -1288,14 +1297,9 @@ impl<T> ConnectionPool<T> {
                 }
             };
 
-            // Serialize and send the initial message with Gossip type prefix
+            // Serialize and send the initial message without flattening header + payload.
             match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
                 Ok(data) => {
-                    let header = framing::write_gossip_frame_prefix(data.len());
-                    let mut msg_buffer = Vec::with_capacity(header.len() + data.len());
-                    msg_buffer.extend_from_slice(&header); // ALLOW_COPY
-                    msg_buffer.extend_from_slice(&data); // ALLOW_COPY
-
                     // Create a connection handle to send the message
                     let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
                         addr,
@@ -1305,7 +1309,10 @@ impl<T> ConnectionPool<T> {
                             .clone()
                             .unwrap_or_else(CorrelationTracker::new),
                     );
-                    if let Err(e) = conn_handle.send_data(msg_buffer).await {
+                    if let Err(e) = conn_handle
+                        .send_gossip_payload(bytes::Bytes::from_owner(data))
+                        .await
+                    {
                         warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
                     } else {
                         info!(peer = %addr, "Sent initial FullSync message to identify ourselves");

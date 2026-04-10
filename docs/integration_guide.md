@@ -1,61 +1,67 @@
-# LLM Integration Guide: Remote Actor Handle + TLS Transport
+# Integration Guide
 
-This is the minimum you need to wire remote actor calls and implement a transport bootstrap.
+This guide covers the crate surface that exists in this repository today: built-in TLS bootstrap, peer-aware lookup, and DNS-aware reconnect behavior.
 
-## 1. Use the right integration point
+## 1. Bootstrap a node
 
-Use `GossipRegistryHandle::new_with_transport_stack(...)` with a concrete transport stack.
-
-For TLS, use `icanact_remote_transports::TcpTlsStack`.
+Use `GossipRegistryHandle::new_with_transport_stack(...)` with the built-in `BuilderTlsBootstrap`.
 
 ```toml
 [dependencies]
 icanact-remote = "*"
-icanact-remote-transports = "*"
 bytes = "1"
+tokio = { version = "1", features = ["full"] }
 ```
 
-## 2. Bootstrap two TLS nodes
-
 ```rust
-use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
-use icanact_remote_transports::{tls, TcpTlsStack};
-use std::time::Duration;
+use icanact_remote::{
+    BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, SecretKey,
+};
 
-async fn make_node(seed: &str) -> icanact_remote::Result<
-    (icanact_remote::KeyPair, GossipRegistryHandle<TcpTlsStack>)
-> {
-    tls::ensure_crypto_provider();
-
-    let keypair = KeyPair::new_for_testing(seed);
-    let mut cfg = GossipConfig::default();
-    cfg.key_pair = Some(keypair.clone());
-    cfg.gossip_interval = Duration::from_millis(100);
-
-    let handle = GossipRegistryHandle::new_with_transport_stack(
+async fn make_node() -> icanact_remote::Result<GossipRegistryHandle> {
+    GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
-        keypair.to_secret_key(),
-        Some(cfg),
-        TcpTlsStack,
+        SecretKey::generate(),
+        Some(GossipConfig::default()),
+        BuilderTlsBootstrap,
     )
-    .await?;
-
-    Ok((keypair, handle))
+    .await
 }
 ```
 
-## 3. Connect peers, then create a remote actor handle
+If you need deterministic identities in tests, use `KeyPair::new_for_testing(...)` and pass `keypair.to_secret_key()`.
+
+## 2. Connect peers and discover an actor
 
 ```rust
 use bytes::Bytes;
+use icanact_remote::{BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
+use tokio::time::{sleep, Duration};
 
 async fn remote_actor_flow() -> icanact_remote::Result<()> {
-    let (_kp_a, a) = make_node("node-a").await?;
-    let (kp_b, b) = make_node("node-b").await?;
+    let key_a = KeyPair::new_for_testing("node-a");
+    let key_b = KeyPair::new_for_testing("node-b");
+    let peer_b_id = key_b.peer_id();
 
-    let peer_b_id = kp_b.peer_id();
+    let a = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_a.to_secret_key(),
+        Some(GossipConfig::default()),
+        BuilderTlsBootstrap,
+    )
+    .await?;
 
-    // Register a remote actor on node B.
+    let b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        key_b.to_secret_key(),
+        Some(GossipConfig::default()),
+        BuilderTlsBootstrap,
+    )
+    .await?;
+
+    let peer_b = a.add_peer(&peer_b_id).await;
+    peer_b.connect(&b.registry.bind_addr).await?;
+
     b.register_urgent(
         "echo_service".to_string(),
         b.registry.bind_addr,
@@ -63,15 +69,11 @@ async fn remote_actor_flow() -> icanact_remote::Result<()> {
     )
     .await?;
 
-    // Connect A -> B with expected peer identity.
-    let peer_b = a.add_peer(&peer_b_id).await;
-    peer_b.connect(&b.registry.bind_addr).await?;
+    sleep(Duration::from_millis(200)).await;
 
-    // Preferred for secure direct peer traffic.
     let peer_ref = a.lookup_peer(&peer_b_id).await?;
     peer_ref.tell(Bytes::from_static(b"ping")).await?;
 
-    // Actor-name lookup path (returns RemoteActorRef with cached connection).
     let actor_ref = a
         .lookup("echo_service")
         .await
@@ -86,59 +88,34 @@ async fn remote_actor_flow() -> icanact_remote::Result<()> {
 }
 ```
 
-## 4. Transport trait implementation you actually need
+## 3. Implementing a custom bootstrap
 
-Implement `RegistryTransportBootstrap` for your transport stack type.
+If you need a different transport bootstrap, implement `RegistryTransportBootstrap`.
 
 Required methods:
+
 - `stack_name()`
 - `prepare_config(secret_key, config)`
 - `configure_registry(registry, secret_key)`
 
-TLS example:
+The built-in TLS bootstrap is implemented by `BuilderTlsBootstrap` in `src/handle_builder.rs` and is the best reference for matching the current code.
 
-```rust
-use icanact_remote::{
-    GossipConfig, GossipError, Result, SecretKey,
-    registry::GossipRegistry,
-    transport::RegistryTransportBootstrap,
-};
+## 4. DNS refresh for moving peers
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MyTlsStack;
+The registry supports swapping in a custom `DnsResolver`, and reconnect paths can refresh DNS after dial failures.
 
-impl RegistryTransportBootstrap for MyTlsStack {
-    fn stack_name(&self) -> &'static str {
-        "my-tcp+tls"
-    }
+Relevant APIs:
 
-    fn prepare_config(&self, secret_key: &SecretKey, config: &mut GossipConfig) -> Result<()> {
-        let derived = secret_key.to_keypair();
-        match config.key_pair.as_ref() {
-            Some(existing) if existing.peer_id() != derived.peer_id() => {
-                Err(GossipError::InvalidKeyPair(
-                    "GossipConfig.key_pair does not match transport secret key".into(),
-                ))
-            }
-            Some(_) => Ok(()),
-            None => {
-                config.key_pair = Some(derived);
-                Ok(())
-            }
-        }
-    }
+- `registry.set_dns_resolver(...)`
+- `handle.set_peer_dns_name(peer_addr, dns_name)`
+- `registry.connect_to_peer(&peer_id)`
 
-    fn configure_registry(&self, registry: &mut GossipRegistry, secret_key: SecretKey) -> Result<()> {
-        registry.enable_tls(secret_key)
-    }
-}
-```
+The test file `tests/dns_refresh_on_dial_failure.rs` shows the current end-to-end behavior.
 
-## 5. Rules to keep your LLM-generated code correct
+## 5. Rules for generated code
 
-- Prefer `lookup_peer(&PeerId)` over `lookup_address(...)` when identity matters.
-- Do not call private connection APIs; use `lookup(...)`/`lookup_peer(...)` to get `RemoteActorRef`.
-- `RemoteActorRef` is the send surface: `tell(...)`, `ask(...)`, `ask_deferred(...)`, typed variants.
-- Always set or derive `config.key_pair` from the same `SecretKey` used for transport.
-- Prefer concrete stacks from `icanact_remote_transports` (for TLS: `TcpTlsStack`) over local test/bootstrap shims.
-- Call `shutdown()` for clean task teardown.
+- Prefer `lookup_peer(&PeerId)` when identity matters.
+- Use `lookup(...)` when actor-name discovery is the right abstraction.
+- Treat `RemoteActorRef` as the send surface: `tell`, `tell_bytes`, `ask`, `ask_deferred`, typed variants, and streaming helpers.
+- Keep `GossipConfig.key_pair` aligned with the `SecretKey` used to bootstrap the node.
+- Use `shutdown()` for clean teardown in examples and tests.

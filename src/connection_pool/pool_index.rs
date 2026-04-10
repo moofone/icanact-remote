@@ -27,4 +27,3 @@ pub struct ConnectionPool<T = ()> {
     connection_counter: AtomicUsize,
     _marker: PhantomData<fn() -> T>,
 }
-

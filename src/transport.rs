@@ -1,7 +1,7 @@
 use std::{fmt::Debug, io, net::SocketAddr, sync::Arc, sync::OnceLock};
 
 use futures::future::BoxFuture;
-use tokio::net::UdpSocket;
+use tokio::net as tokio_net;
 
 use crate::{
     GossipConfig, NodeId, PeerId, Result, SecretKey, handshake::PeerCapabilities,
@@ -76,7 +76,7 @@ pub struct TransportBootstrapArtifacts {
     pub wire_kind: TransportWireKind,
     pub bind_addr: SocketAddr,
     pub tcp_listener: Option<tokio::net::TcpListener>,
-    pub udp_socket: Option<Arc<UdpSocket>>,
+    pub udp_socket: Option<Arc<tokio_net::UdpSocket>>,
 }
 
 /// Core bootstrap contract used by `GossipRegistryHandle::new_with_transport_stack`.
@@ -161,28 +161,30 @@ pub trait TransportDatagramRuntime {
     type Writer: TransportDatagramWriter + Clone + Debug + Send + Sync + 'static;
 
     fn make_writer(
-        socket: Arc<UdpSocket>,
+        socket: Arc<tokio_net::UdpSocket>,
         peer_addr: SocketAddr,
         queue_capacity: usize,
     ) -> Self::Writer;
 
     fn try_send_bytes_to_addr(
-        socket: &UdpSocket,
+        socket: &tokio_net::UdpSocket,
         addr: SocketAddr,
         data: bytes::Bytes,
     ) -> Result<()>;
 
     fn try_send_parts_to_addr(
-        socket: &UdpSocket,
+        socket: &tokio_net::UdpSocket,
         addr: SocketAddr,
         header: bytes::Bytes,
         payload: bytes::Bytes,
     ) -> Result<()>;
 }
 
-type MakeWriterFn = fn(Arc<UdpSocket>, SocketAddr, usize) -> Arc<dyn TransportDatagramWriterDyn>;
-type TrySendBytesToAddrFn = fn(&UdpSocket, SocketAddr, bytes::Bytes) -> Result<()>;
-type TrySendPartsToAddrFn = fn(&UdpSocket, SocketAddr, bytes::Bytes, bytes::Bytes) -> Result<()>;
+type MakeWriterFn =
+    fn(Arc<tokio_net::UdpSocket>, SocketAddr, usize) -> Arc<dyn TransportDatagramWriterDyn>;
+type TrySendBytesToAddrFn = fn(&tokio_net::UdpSocket, SocketAddr, bytes::Bytes) -> Result<()>;
+type TrySendPartsToAddrFn =
+    fn(&tokio_net::UdpSocket, SocketAddr, bytes::Bytes, bytes::Bytes) -> Result<()>;
 
 #[derive(Clone, Copy)]
 struct DatagramRuntimeHooks {
@@ -265,7 +267,7 @@ impl TransportDatagramWriter for UnconfiguredDatagramWriter {
 }
 
 fn make_writer_for_runtime<R: TransportDatagramRuntime>(
-    socket: Arc<UdpSocket>,
+    socket: Arc<tokio_net::UdpSocket>,
     peer_addr: SocketAddr,
     queue_capacity: usize,
 ) -> Arc<dyn TransportDatagramWriterDyn> {
@@ -273,7 +275,7 @@ fn make_writer_for_runtime<R: TransportDatagramRuntime>(
 }
 
 fn try_send_bytes_to_addr_for_runtime<R: TransportDatagramRuntime>(
-    socket: &UdpSocket,
+    socket: &tokio_net::UdpSocket,
     addr: SocketAddr,
     data: bytes::Bytes,
 ) -> Result<()> {
@@ -281,7 +283,7 @@ fn try_send_bytes_to_addr_for_runtime<R: TransportDatagramRuntime>(
 }
 
 fn try_send_parts_to_addr_for_runtime<R: TransportDatagramRuntime>(
-    socket: &UdpSocket,
+    socket: &tokio_net::UdpSocket,
     addr: SocketAddr,
     header: bytes::Bytes,
     payload: bytes::Bytes,
@@ -298,7 +300,7 @@ pub fn install_datagram_runtime<R: TransportDatagramRuntime>() {
 }
 
 pub(crate) fn make_datagram_writer(
-    socket: Arc<UdpSocket>,
+    socket: Arc<tokio_net::UdpSocket>,
     peer_addr: SocketAddr,
     queue_capacity: usize,
 ) -> Arc<dyn TransportDatagramWriterDyn> {
@@ -310,7 +312,7 @@ pub(crate) fn make_datagram_writer(
 }
 
 pub(crate) fn try_send_bytes_to_addr(
-    socket: &UdpSocket,
+    socket: &tokio_net::UdpSocket,
     addr: SocketAddr,
     data: bytes::Bytes,
 ) -> Result<()> {
@@ -322,7 +324,7 @@ pub(crate) fn try_send_bytes_to_addr(
 }
 
 pub(crate) fn try_send_parts_to_addr(
-    socket: &UdpSocket,
+    socket: &tokio_net::UdpSocket,
     addr: SocketAddr,
     header: bytes::Bytes,
     payload: bytes::Bytes,

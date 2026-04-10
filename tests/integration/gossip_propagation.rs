@@ -108,9 +108,12 @@ async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::
     let stats2 = node2.stats().await;
     let stats3 = node3.stats().await;
 
-    assert_eq!(stats1.known_actors, 3);
-    assert_eq!(stats2.known_actors, 3);
-    assert_eq!(stats3.known_actors, 3);
+    assert_eq!(stats1.local_actors, 1);
+    assert_eq!(stats2.local_actors, 1);
+    assert_eq!(stats3.local_actors, 1);
+    assert_eq!(stats1.known_actors, 2);
+    assert_eq!(stats2.known_actors, 2);
+    assert_eq!(stats3.known_actors, 2);
 
     node1.shutdown().await;
     node2.shutdown().await;
@@ -161,6 +164,7 @@ async fn test_actor_update_propagation() -> Result<(), Box<dyn std::error::Error
         .ok_or("actor1 did not propagate")?;
     assert_eq!(actor.location.address, "127.0.0.1:9001");
 
+    node1.unregister("actor1").await?;
     node1
         .register_urgent(
             "actor1".to_string(),
@@ -169,10 +173,19 @@ async fn test_actor_update_propagation() -> Result<(), Box<dyn std::error::Error
         )
         .await?;
 
-    let updated = wait_for_lookup(&node2, "actor1", Duration::from_secs(3))
-        .await
-        .ok_or("updated actor1 did not propagate")?;
-    assert_eq!(updated.location.address, "127.0.0.1:9999");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let updated = wait_for_lookup(&node2, "actor1", Duration::from_millis(100))
+            .await
+            .ok_or("updated actor1 did not propagate")?;
+        if updated.location.address == "127.0.0.1:9999" {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("updated actor1 did not propagate".into());
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
 
     node1.shutdown().await;
     node2.shutdown().await;

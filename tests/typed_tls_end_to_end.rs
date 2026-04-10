@@ -94,6 +94,65 @@ fn test_typed_ask_over_tls_with_pooled_path() {
 }
 
 #[test]
+fn test_typed_ask_archived_over_tls_with_pooled_path() {
+    run_typed_tls_test("typed-ask-archived-pooled", || async {
+        unsafe {
+            std::env::set_var("ICANACT_REMOTE_TYPED_ECHO", "1");
+        }
+
+        let addr_a: SocketAddr = "127.0.0.1:9015".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:9016".parse().unwrap();
+
+        let key_pair_a = KeyPair::new_for_testing("typed_tls_archived_a");
+        let key_pair_b = KeyPair::new_for_testing("typed_tls_archived_b");
+        let peer_id_b = key_pair_b.peer_id();
+
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let peer_b = handle_a.add_peer(&peer_id_b).await;
+        peer_b.connect(&addr_b).await.unwrap();
+
+        sleep(Duration::from_millis(200)).await;
+
+        let conn = handle_a.lookup_address(addr_b).await.unwrap();
+        let request = Ping { id: 99 };
+        let response = conn
+            .ask_typed_archived::<Ping, Ping>(&request)
+            .await
+            .unwrap();
+        let archived = response.archived().unwrap();
+        assert_eq!(archived.id, request.id);
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+
+        unsafe {
+            std::env::remove_var("ICANACT_REMOTE_TYPED_ECHO");
+        }
+    });
+}
+
+#[test]
 fn test_typed_tell_over_tls_with_pooled_path() {
     run_typed_tls_test("typed-tell-pooled", || async {
         use tokio::time::{Duration, Instant};

@@ -5,8 +5,8 @@ use crate::{NodeId, Result, SecretKey};
 use rustls::client::Resumption;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::version::TLS13;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::version::TLS13;
 use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme,
 };
@@ -53,7 +53,10 @@ impl TlsConfig {
     }
 }
 
-fn make_client_config(secret_key: &SecretKey, _enable_peer_discovery: bool) -> Result<ClientConfig> {
+fn make_client_config(
+    secret_key: &SecretKey,
+    _enable_peer_discovery: bool,
+) -> Result<ClientConfig> {
     let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NodeIdServerVerifier::new()))
@@ -69,7 +72,10 @@ fn make_client_config(secret_key: &SecretKey, _enable_peer_discovery: bool) -> R
     Ok(config)
 }
 
-fn make_server_config(secret_key: &SecretKey, _enable_peer_discovery: bool) -> Result<ServerConfig> {
+fn make_server_config(
+    secret_key: &SecretKey,
+    _enable_peer_discovery: bool,
+) -> Result<ServerConfig> {
     let mut config = ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_client_cert_verifier(Arc::new(NodeIdClientVerifier::new()))
         .with_cert_resolver(Arc::new(resolver::AlwaysResolvesCert::new(secret_key)?));

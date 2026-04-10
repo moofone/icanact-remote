@@ -50,7 +50,9 @@ pub use transport::{
     AuthContext, PeerAuthenticator, RegistryTransportBootstrap, RemoteAddrMeta, TargetAddr,
     TransportConnector, TransportListener, TransportStack,
 };
-pub use typed::{WireEncode, WireType, decode_typed, encode_typed};
+pub use typed::{
+    ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,
+};
 
 /// Deferred ask handle exposed as high-level API.
 ///

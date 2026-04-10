@@ -1,59 +1,59 @@
-# Gossip Zero-Copy Validation Scripts
+# Validation Scripts
 
-This directory contains the tooling referenced throughout `spec/GOSSIP_ZERO_COPY.md`
-and `sprints/GOSSIP_ZERO_COPY/sprint_3.md`. The scripts prove that inbound gossip
-traffic stays zero-copy, telemetry counters are emitted, and Critical Path sections
-stay fully covered.
+This directory contains repository validation helpers. The current scripts are centered on test execution, copy-guard checks, and optional coverage analysis.
 
-## Primary workflow
+## Main scripts
 
 | Script | Purpose |
 | ------ | ------- |
-| `full_validation.sh` | Runs the end-to-end validation playbook (tests, allocation guards, telemetry smoke test, coverage gates). |
-| `check_critical_coverage.sh <plan_path>` | Fails if any `CRITICAL_PATH` annotation lacks coverage. Requires `reports/coverage.lcov`. |
-| `analyze_coverage_gaps.sh <plan_path>` | Generates `reports/coverage_gaps_<timestamp>.md` summarizing uncovered lines. |
-| `coverage.sh` | Convenience wrapper around `cargo llvm-cov --workspace --lcov`. |
-| `capture_baseline.sh` / `compare_allocations.sh` | Legacy allocation comparison helpers kept for historical regressions. |
+| `full_validation.sh` | Runs the main validation flow: isolated TLS e2e, workspace tests, copy guards, pointer tests, and streaming tests. |
+| `check_no_rkyv_from_bytes.sh` | Fails if forbidden `rkyv::from_bytes` usage is present. |
+| `check_forbidden_copy_patterns.sh` | Fails on selected copy-pattern regressions. |
+| `coverage.sh` | Builds `reports/coverage.lcov` with `cargo llvm-cov`. |
+| `check_critical_coverage.sh [plan_path]` | Ensures `CRITICAL_PATH`-annotated lines are covered. |
+| `analyze_coverage_gaps.sh [plan_path]` | Writes a timestamped Markdown report of uncovered lines. |
+| `capture_baseline.sh` / `compare_allocations.sh` | Historical helpers for baseline and allocation comparisons. |
 
-### Running the full suite
+## Running the full suite
 
 ```bash
 ./scripts/full_validation.sh
 ```
 
-This script automatically:
+The script currently:
 
-1. Runs `cargo test --all`.
-2. Enforces the `rkyv::from_bytes` guard.
-3. Executes the gossip allocation guard in both debug and release profiles.
-4. Re-runs the TLS pointer identity proofs (`gossip_frame_uses_zero_copy_buffer`, etc.).
-5. Performs the telemetry smoke test (`tests/gossip_zero_copy_observability.rs`).
-6. Invokes the Critical Path coverage gate and coverage gap report with plan `sprints/GOSSIP_ZERO_COPY/sprint_3.md`.
+1. Runs `cargo test --test ask_reply_end_to_end -j 1 -- --test-threads=1` first.
+2. Runs the broader workspace test suite with retries.
+3. Runs `check_no_rkyv_from_bytes.sh`.
+4. Runs `check_forbidden_copy_patterns.sh`.
+5. Runs focused pointer-identity tests.
+6. Runs focused streaming tests from `tests/streaming_tests.rs`.
+7. Optionally runs coverage gates if a plan path is supplied.
 
-The log is written to `logs/validation_<timestamp>.txt`.
+It also creates `baselines/`, `reports/`, and `logs/` if they do not exist, and writes a log to `logs/validation_<timestamp>.txt`.
 
-### Checking coverage gates manually
-
-```bash
-./scripts/check_critical_coverage.sh sprints/GOSSIP_ZERO_COPY/sprint_3.md
-./scripts/analyze_coverage_gaps.sh sprints/GOSSIP_ZERO_COPY/sprint_3.md
-```
-
-Both scripts auto-run `scripts/coverage.sh` if `reports/coverage.lcov` is missing.
-
-### Updating allocation baselines
-
-The baseline helpers remain available when we need to refresh allocator guard
-expectations:
+## Coverage scripts
 
 ```bash
-./scripts/capture_baseline.sh
-./scripts/compare_allocations.sh baselines/baseline_allocations_<timestamp>.txt
+./scripts/check_critical_coverage.sh path/to/plan.md
+./scripts/analyze_coverage_gaps.sh path/to/plan.md
 ```
 
-## Definition of done for Sprint 3 tooling
+Notes:
 
-- Full validation fails on any gossip zero-copy regression.
-- `CRITICAL_PATH` lines in `src/handle.rs` and `src/connection_pool.rs` are enforced via `check_critical_coverage.sh`.
-- Coverage gap reports are attached to the sprint artifacts (see `reports/coverage_gaps_*.md`).
-- Telemetry counters (`gossip_zero_copy_frames_total`, `gossip_zero_copy_alignment_failures_total`) are visible via tracing logs and the integration smoke test.
+- Both scripts rebuild coverage unless `SKIP_COVERAGE_REBUILD=1` is set.
+- Both scripts have an internal default plan path of `sprints/LEGACY_FUNCTION_CLEANUP/sprint_3.md`.
+- That legacy path is not present in this repository, so pass an explicit plan path when you want the plan label in output to point at a real file.
+
+## Prerequisites
+
+- `cargo`
+- `python3`
+- `rg`
+- `cargo-llvm-cov` for coverage workflows
+
+Install coverage support with:
+
+```bash
+cargo install cargo-llvm-cov
+```

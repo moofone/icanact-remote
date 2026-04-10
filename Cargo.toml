@@ -44,11 +44,19 @@ io-uring = { version = "0.6", optional = true }
 [dev-dependencies]
 anyhow = "1.0"
 bytes = "1.0"
-criterion = "0.7"
+criterion = { version = "0.7", features = ["async_tokio"] }
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tracing-test = "0.2.5"
 
 [[bench]]
 name = "archived_access"
+harness = false
+
+[[bench]]
+name = "gossip_round"
+harness = false
+
+[[bench]]
+name = "connect_paths"
 harness = false

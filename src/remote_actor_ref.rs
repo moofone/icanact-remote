@@ -190,6 +190,51 @@ impl RemoteConnection {
     {
         self.inner.ask_typed(request).await
     }
+
+    pub async fn ask_typed_archived<M, R>(
+        &self,
+        request: &M,
+    ) -> crate::Result<crate::typed::ArchivedBytes<R>>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::Portable
+            + rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        self.inner.ask_typed_archived(request).await
+    }
+
+    pub async fn ask_typed_archived_with_timeout<M, R>(
+        &self,
+        request: &M,
+        timeout: std::time::Duration,
+    ) -> crate::Result<crate::typed::ArchivedBytes<R>>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::Portable
+            + rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        self.inner
+            .ask_typed_archived_with_timeout(request, timeout)
+            .await
+    }
 }
 
 /// A remote actor reference with a cached connection for zero-lookup message sending.
@@ -203,7 +248,8 @@ impl RemoteConnection {
 /// - `registry: Weak<GossipRegistry>` - doesn't prevent registry cleanup
 /// - `connection: Option<Arc<Mutex<ConnectionHandle>>>` - optional strong ref
 ///
-/// When the registry shuts down, `tell()`/`ask()` will return `Err(Shutdown)`.
+/// When the registry shuts down, `tell()`/`ask()` will fail on the next use.
+/// Cached connections may observe `ConnectionClosed` before weak-registry shutdown is noticed.
 /// Connections are cleaned up by periodic `cleanup_stale_connections()` calls.
 ///
 /// # Connection Optional for Unstarted Actors
@@ -410,6 +456,25 @@ impl<T> RemoteActorRef<T> {
         conn.ask_with_timeout_bytes(request, timeout).await
     }
 
+    /// Send a direct request and wait for a direct response.
+    pub async fn ask_direct(
+        &self,
+        request: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        let conn = self.connection_or_not_listening()?;
+        conn.ask_direct(request, timeout).await
+    }
+
+    /// Send a direct request and wait without timeout allocation.
+    pub async fn ask_direct_no_timeout(
+        &self,
+        request: bytes::Bytes,
+    ) -> crate::Result<bytes::Bytes> {
+        let conn = self.connection_or_not_listening()?;
+        conn.ask_direct_no_timeout(request).await
+    }
+
     /// Send a request and return a deferred handle that can be awaited later.
     ///
     /// This is the correct way to delegate "waiting for the response" to another task.
@@ -466,6 +531,63 @@ impl<T> RemoteActorRef<T> {
             ))
         })?;
         conn.ask_typed(request).await
+    }
+
+    /// Send a typed request and keep the reply as an archived zero-copy view.
+    pub async fn ask_typed_archived<M, R>(
+        &self,
+        request: &M,
+    ) -> crate::Result<crate::typed::ArchivedBytes<R>>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::Portable
+            + rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        let conn = self.connection.as_ref().ok_or_else(|| {
+            crate::GossipError::ActorNotFound(format!(
+                "'{}' - not listening yet",
+                self.location.address
+            ))
+        })?;
+        conn.ask_typed_archived(request).await
+    }
+
+    /// Send a typed request and keep the reply as an archived zero-copy view.
+    pub async fn ask_typed_archived_with_timeout<M, R>(
+        &self,
+        request: &M,
+        timeout: std::time::Duration,
+    ) -> crate::Result<crate::typed::ArchivedBytes<R>>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::Portable
+            + rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        let conn = self.connection.as_ref().ok_or_else(|| {
+            crate::GossipError::ActorNotFound(format!(
+                "'{}' - not listening yet",
+                self.location.address
+            ))
+        })?;
+        conn.ask_typed_archived_with_timeout(request, timeout).await
     }
 
     /// Send a large request using streaming (for payloads > 1MB)

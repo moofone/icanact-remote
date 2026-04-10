@@ -684,26 +684,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn new_with_transport_stack_requires_external_transport_runtime() -> crate::Result<()> {
+    async fn new_with_transport_stack_bootstraps_test_tls_runtime() -> crate::Result<()> {
         let keypair = KeyPair::new_for_testing("stack-bootstrap");
         let mut config = test_cfg();
         config.key_pair = Some(keypair.clone());
 
-        let err = match GossipRegistryHandle::new_with_transport_stack(
+        let handle = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             keypair.to_secret_key(),
             Some(config),
             TestTlsBootstrap,
         )
-        .await
-        {
-            Ok(_) => panic!("core no longer carries TLS bootstrap implementation"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("extracted from core"),
-            "unexpected error: {err}"
-        );
+        .await?;
+        handle.shutdown_and_wait().await;
         Ok(())
     }
 }
@@ -1613,14 +1606,15 @@ where
             response_correlation: Some(correlation_tracker.clone()),
             sync_actor_handler: registry.actor_message_handler_sync.load_full(),
         };
-        let (stream_handle, writer_task_handle) = crate::connection_pool::LockFreeStreamHandle::new(
-            stream,
-            peer_addr,
-            crate::connection_pool::ChannelId::Global,
-            buffer_config,
-            registry.config.schema_hash,
-            Some(read_context),
-        );
+        let (stream_handle, writer_task_handle, reader_task_handle) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                stream,
+                peer_addr,
+                crate::connection_pool::ChannelId::Global,
+                buffer_config,
+                registry.config.schema_hash,
+                Some(read_context),
+            );
         let stream_handle = Arc::new(stream_handle);
 
         let mut connection = crate::connection_pool::LockFreeConnection::new(
@@ -1635,6 +1629,11 @@ where
         connection
             .task_tracker
             .set_writer(writer_task_handle.abort_handle());
+        if let Some(reader_task_handle) = reader_task_handle {
+            connection
+                .task_tracker
+                .set_reader(reader_task_handle.abort_handle());
+        }
 
         // CRITICAL: Get the shared correlation tracker BEFORE wrapping in Arc
         // This ensures the inbound connection uses the same correlation tracker as the outbound connection
@@ -2697,25 +2696,18 @@ mod keepalive_apply_tests {
     use super::*;
 
     #[tokio::test]
-    async fn tcp_keepalive_test_requires_external_transport_runtime() {
+    async fn tcp_keepalive_bootstrap_supports_builder_tls_runtime() {
         let a_keypair = crate::KeyPair::new_for_testing("keepalive-a");
 
-        let err = match GossipRegistryHandle::new_with_transport_stack(
+        let handle = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             a_keypair.to_secret_key(),
             None,
             crate::BuilderTlsBootstrap,
         )
         .await
-        {
-            Ok(_) => panic!("core no longer carries TLS keepalive transport setup"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string().contains("extracted from core"),
-            "unexpected error: {err}"
-        );
+        .unwrap();
+        handle.shutdown_and_wait().await;
     }
 }
 

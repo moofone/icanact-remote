@@ -290,63 +290,6 @@ where
     }
 }
 
-fn try_parse_buffered_frame<S>(
-    stream: &mut S,
-    cx: &mut Context<'_>,
-    ctx: &ReadContext,
-) -> Poll<Result<Option<ReadIoResult>>>
-where
-    S: tokio::io::AsyncBufRead + Unpin,
-{
-    match Pin::new(&mut *stream).poll_fill_buf(cx) {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Ok(buf)) => {
-            if buf.is_empty() {
-                return Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                ))));
-            }
-            if buf.len() < crate::framing::LENGTH_PREFIX_LEN {
-                return Poll::Ready(Ok(None));
-            }
-            let msg_len =
-                u32::from_be_bytes(buf[..crate::framing::LENGTH_PREFIX_LEN].try_into().unwrap())
-                    as usize;
-            if msg_len > ctx.max_message_size {
-                return Poll::Ready(Err(GossipError::MessageTooLarge {
-                    size: msg_len,
-                    max: ctx.max_message_size,
-                }));
-            }
-            let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-            if buf.len() < total_len {
-                return Poll::Ready(Ok(None));
-            }
-
-            let buffer = crate::PooledAlignedBuffer::from_slice(
-                &buf[..total_len],
-                ctx.aligned_pool.clone(),
-            );
-            let result = match try_handle_read_fast_from_pooled(buffer, msg_len, ctx) {
-                Ok(FastReadOutcome::Handled) => {
-                    Pin::new(&mut *stream).consume(total_len);
-                    return Poll::Ready(Ok(None));
-                }
-                Ok(FastReadOutcome::Parsed(result)) => result,
-                Ok(FastReadOutcome::Unhandled(buffer)) => ReadIoResult::Generic(
-                    crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
-                ),
-                Err(err) => return Poll::Ready(Err(err)),
-            };
-
-            Pin::new(&mut *stream).consume(total_len);
-            Poll::Ready(Ok(Some(result)))
-        }
-        Poll::Ready(Err(e)) => Poll::Ready(Err(GossipError::Network(e))),
-    }
-}
-
 async fn read_message_step_poll<S>(
     stream: &mut S,
     state: &mut ReadState,
@@ -1113,6 +1056,7 @@ async fn process_read_result_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
+    direct_response_batch: &mut DirectResponseBatch,
     perf: Option<&IoPerfCounters>,
 ) -> Result<()>
 where
@@ -1300,19 +1244,7 @@ where
             payload,
         } => {
             let write_start = perf.map(|_| Instant::now());
-            let header = crate::framing::write_direct_response_header(correlation_id, payload.len());
-            stream
-                .write_all(&header)
-                .await
-                .map_err(GossipError::Network)?;
-            stream
-                .write_all(payload.as_ref())
-                .await
-                .map_err(GossipError::Network)?;
-            stream.flush().await.map_err(GossipError::Network)?;
-            let bytes_written = header.len() + payload.len();
-            bytes_written_counter.fetch_add(bytes_written, Ordering::Relaxed);
-            *bytes_since_flush = 0;
+            direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
             if let (Some(perf), Some(start)) = (perf, write_start) {
                 perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
                 perf.response_write_ns
@@ -1355,6 +1287,7 @@ async fn try_handle_fast_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
+    direct_response_batch: &mut DirectResponseBatch,
     wrote_response_bytes: &mut bool,
     perf: Option<&IoPerfCounters>,
 ) -> Result<Option<crate::handle::MessageReadResult>>
@@ -1417,16 +1350,7 @@ where
                             *bytes_since_flush = 0;
                         }
                     } else {
-                        let header = crate::framing::write_ask_response_header(
-                            crate::MessageType::Response,
-                            correlation_id,
-                            payload.len(),
-                        );
-                        let n = write_header_payload_all(stream, &header, payload.as_ref())
-                            .await
-                            .map_err(GossipError::Network)?;
-                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                        *bytes_since_flush += n;
+                        response_batch.push_bytes(correlation_id, payload);
                         *wrote_response_bytes = true;
                     }
                 }
@@ -1451,17 +1375,7 @@ where
                             *bytes_since_flush = 0;
                         }
                     } else {
-                        let payload = payload.into_bytes();
-                        let header = crate::framing::write_ask_response_header(
-                            crate::MessageType::Response,
-                            correlation_id,
-                            payload.len(),
-                        );
-                        let n = write_header_payload_all(stream, &header, payload.as_ref())
-                            .await
-                            .map_err(GossipError::Network)?;
-                        bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                        *bytes_since_flush += n;
+                        response_batch.push_bytes(correlation_id, payload.into_bytes());
                         *wrote_response_bytes = true;
                     }
                 }
@@ -1547,13 +1461,7 @@ where
             payload,
         } => {
             let write_start = perf.map(|_| Instant::now());
-            let payload = payload.into_bytes();
-            let header = crate::framing::write_direct_response_header(correlation_id, payload.len());
-            let n = write_header_payload_all(stream, &header, payload.as_ref())
-                .await
-                .map_err(GossipError::Network)?;
-            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-            *bytes_since_flush += n;
+            direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
             *wrote_response_bytes = true;
             if let (Some(perf), Some(start)) = (perf, write_start) {
                 perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
@@ -1643,13 +1551,7 @@ where
             payload,
         }) => {
             let write_start = perf.map(|_| Instant::now());
-            let payload = payload.into_bytes();
-            let header = crate::framing::write_direct_response_header(correlation_id, payload.len());
-            let n = write_header_payload_all(stream, &header, payload.as_ref())
-                .await
-                .map_err(GossipError::Network)?;
-            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-            *bytes_since_flush += n;
+            direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
             *wrote_response_bytes = true;
             if let (Some(perf), Some(start)) = (perf, write_start) {
                 perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
