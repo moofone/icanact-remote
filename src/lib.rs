@@ -37,7 +37,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
-pub use ask_forwarder::AskForwarder;
+pub use ask_forwarder::{AskForwardObserver, AskForwarder};
 pub use ask_responder::{AskContext, AskResponder};
 pub use config::GossipConfig;
 pub use dns::{DnsResolver, TokioDnsResolver};
