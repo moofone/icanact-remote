@@ -319,10 +319,8 @@ impl<T> GossipRegistryHandle<T> {
         // Pre-configure the peer as allowed (address will be set when connect() is called)
         {
             let pool = &self.registry.connection_pool;
-            // Use a placeholder address - will be updated when connect() is called
-            let _ = pool
-                .peer_id_to_addr
-                .insert_sync(peer_id.clone(), "0.0.0.0:0".parse().unwrap());
+            // Use a placeholder address - will be updated when connect() is called.
+            pool.set_configured_peer_addr(peer_id, "0.0.0.0:0".parse().unwrap());
         }
 
         crate::Peer {
@@ -516,6 +514,31 @@ impl<T> GossipRegistryHandle<T> {
 }
 
 impl<T> GossipClient<T> {
+    pub fn lookup_connected_connection(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Option<crate::RemoteConnection> {
+        let conn = self
+            .registry
+            .connection_pool
+            .get_connected_connection_to_peer(peer_id)?;
+        Some(crate::RemoteConnection::from_handle(conn))
+    }
+
+    pub fn lookup_connected_peer(&self, peer_id: &crate::PeerId) -> Option<crate::RemoteActorRef> {
+        let conn = self
+            .registry
+            .connection_pool
+            .get_connected_connection_to_peer(peer_id)?;
+        let addr = conn.addr;
+        let location = crate::RemoteActorLocation::new_with_peer(addr, peer_id.clone());
+        Some(crate::RemoteActorRef::with_registry(
+            location,
+            Some(conn),
+            Arc::clone(&self.registry),
+        ))
+    }
+
     /// Lookup a peer and return a RemoteActorRef for communicating with it.
     ///
     /// This mirrors `GossipRegistryHandle::lookup_peer` but is available on a cloneable handle.
@@ -1596,6 +1619,7 @@ where
         let correlation_tracker = registry
             .connection_pool
             .get_or_create_correlation_tracker(&peer_id);
+        let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(peer_addr));
         let read_context = crate::connection_pool::ReadContext {
             registry_weak: Arc::downgrade(&registry),
             peer_addr,
@@ -1604,6 +1628,10 @@ where
             expected_schema_hash: registry.config.schema_hash,
             aligned_pool: aligned_pool.clone(),
             response_correlation: Some(correlation_tracker.clone()),
+            response_writer: Some(response_writer.clone()),
+            tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
+            ask_immediate_handler_sync: registry.actor_ask_immediate_handler_sync.load_full(),
+            ask_handler_sync: registry.actor_ask_handler_sync.load_full(),
             sync_actor_handler: registry.actor_message_handler_sync.load_full(),
         };
         let (stream_handle, writer_task_handle, reader_task_handle) =
@@ -1616,6 +1644,7 @@ where
                 Some(read_context),
             );
         let stream_handle = Arc::new(stream_handle);
+        response_writer.bind_stream_handle(stream_handle.clone());
 
         let mut connection = crate::connection_pool::LockFreeConnection::new(
             peer_state_addr,
@@ -1654,30 +1683,12 @@ where
             let has_existing = pool.has_connection_by_peer_id(&peer_id);
 
             if has_existing {
-                if registry.should_keep_connection(&peer_id, false) {
-                    debug!(
-                        peer_id = %peer_id,
-                        "tie-breaker: favoring inbound connection, dropping existing outbound"
-                    );
-                    if let Some(existing) = pool.disconnect_connection_by_peer_id(&peer_id) {
-                        if let Some(handle) = existing.stream_handle.as_ref() {
-                            handle.shutdown();
-                        }
-                    }
-                    pool.add_connection_by_peer_id(
-                        peer_id.clone(),
-                        peer_state_addr,
-                        connection_arc.clone(),
-                    );
-                    true
-                } else {
-                    debug!(
-                        peer_id = %peer_id,
-                        "tie-breaker: rejecting inbound duplicate connection"
-                    );
-                    registry.clear_peer_capabilities(&peer_addr);
-                    false
-                }
+                debug!(
+                    peer_id = %peer_id,
+                    "tie-breaker: keeping existing live connection and rejecting inbound duplicate"
+                );
+                registry.clear_peer_capabilities(&peer_addr);
+                false
             } else {
                 pool.add_connection_by_peer_id(
                     peer_id.clone(),

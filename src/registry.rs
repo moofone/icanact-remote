@@ -163,9 +163,183 @@ pub enum ActorResponse {
     },
 }
 
+pub enum AskDisposition {
+    Immediate(ActorResponse),
+    ImmediateBytes(bytes::Bytes),
+    ImmediateAligned(crate::AlignedBytes),
+    ImmediatePooled {
+        payload: crate::typed::PooledPayload,
+        prefix: Option<[u8; 16]>,
+        payload_len: usize,
+    },
+    Deferred,
+}
+
 #[derive(Clone)]
 pub struct ActorMessageHandlerCell {
     handler: Arc<dyn ActorMessageHandler>,
+}
+
+#[derive(Clone)]
+pub struct ActorTellHandlerSyncCell {
+    owner: Arc<dyn ActorTellHandlerSync>,
+    ptr: usize,
+    call: unsafe fn(usize, u64, u32, crate::aligned::AlignedBytes) -> Result<()>,
+}
+
+impl ActorTellHandlerSyncCell {
+    pub(crate) fn new<H>(handler: Arc<H>) -> Self
+    where
+        H: ActorTellHandlerSync + 'static,
+    {
+        unsafe fn call_impl<H>(
+            ptr: usize,
+            actor_id: u64,
+            type_hash: u32,
+            payload: crate::aligned::AlignedBytes,
+        ) -> Result<()>
+        where
+            H: ActorTellHandlerSync + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.handle_actor_tell_sync(actor_id, type_hash, payload)
+        }
+
+        let ptr = Arc::as_ptr(&handler) as usize;
+        let owner: Arc<dyn ActorTellHandlerSync> = handler;
+        Self {
+            owner,
+            ptr,
+            call: call_impl::<H>,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn handle(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+    ) -> Result<()> {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, actor_id, type_hash, payload) }
+    }
+}
+
+#[derive(Clone)]
+pub struct ActorAskHandlerSyncCell {
+    owner: Arc<dyn ActorAskHandlerSync>,
+    ptr: usize,
+    call: for<'a> unsafe fn(
+        usize,
+        u64,
+        u32,
+        crate::aligned::AlignedBytes,
+        crate::AskContext<'a>,
+    ) -> Result<AskDisposition>,
+}
+
+#[derive(Clone)]
+pub struct ActorAskImmediateHandlerSyncCell {
+    owner: Arc<dyn ActorAskImmediateHandlerSync>,
+    ptr: usize,
+    can_handle: unsafe fn(usize, u64, u32) -> bool,
+    call: unsafe fn(usize, u64, u32, crate::aligned::AlignedBytes) -> Result<AskDisposition>,
+}
+
+impl ActorAskImmediateHandlerSyncCell {
+    pub(crate) fn new<H>(handler: Arc<H>) -> Self
+    where
+        H: ActorAskImmediateHandlerSync + 'static,
+    {
+        unsafe fn can_handle_impl<H>(ptr: usize, actor_id: u64, type_hash: u32) -> bool
+        where
+            H: ActorAskImmediateHandlerSync + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.can_handle_actor_ask_sync_immediate(actor_id, type_hash)
+        }
+
+        unsafe fn call_impl<H>(
+            ptr: usize,
+            actor_id: u64,
+            type_hash: u32,
+            payload: crate::aligned::AlignedBytes,
+        ) -> Result<AskDisposition>
+        where
+            H: ActorAskImmediateHandlerSync + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.handle_actor_ask_sync_immediate(actor_id, type_hash, payload)
+        }
+
+        let ptr = Arc::as_ptr(&handler) as usize;
+        let owner: Arc<dyn ActorAskImmediateHandlerSync> = handler;
+        Self {
+            owner,
+            ptr,
+            can_handle: can_handle_impl::<H>,
+            call: call_impl::<H>,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn can_handle(&self, actor_id: u64, type_hash: u32) -> bool {
+        let _keepalive = &self.owner;
+        unsafe { (self.can_handle)(self.ptr, actor_id, type_hash) }
+    }
+
+    #[inline]
+    pub(crate) fn handle(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+    ) -> Result<AskDisposition> {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, actor_id, type_hash, payload) }
+    }
+}
+
+impl ActorAskHandlerSyncCell {
+    pub(crate) fn new<H>(handler: Arc<H>) -> Self
+    where
+        H: ActorAskHandlerSync + 'static,
+    {
+        unsafe fn call_impl<H>(
+            ptr: usize,
+            actor_id: u64,
+            type_hash: u32,
+            payload: crate::aligned::AlignedBytes,
+            context: crate::AskContext<'_>,
+        ) -> Result<AskDisposition>
+        where
+            H: ActorAskHandlerSync + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.handle_actor_ask_sync(actor_id, type_hash, payload, context)
+        }
+
+        let ptr = Arc::as_ptr(&handler) as usize;
+        let owner: Arc<dyn ActorAskHandlerSync> = handler;
+        Self {
+            owner,
+            ptr,
+            call: call_impl::<H>,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn handle(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+        context: crate::AskContext<'_>,
+    ) -> Result<AskDisposition> {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, actor_id, type_hash, payload, context) }
+    }
 }
 
 #[derive(Clone)]
@@ -323,6 +497,41 @@ pub trait ActorMessageHandler: Send + Sync {
         payload: crate::aligned::AlignedBytes,
         correlation_id: Option<u16>,
     ) -> ActorMessageFuture<'_>;
+}
+
+/// Synchronous tell handler for ultra-low-latency fire-and-forget paths.
+pub trait ActorTellHandlerSync: Send + Sync {
+    fn handle_actor_tell_sync(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+    ) -> Result<()>;
+}
+
+/// Synchronous ask handler that may either reply inline or complete later via `AskResponder`.
+pub trait ActorAskHandlerSync: Send + Sync {
+    fn handle_actor_ask_sync(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+        context: crate::AskContext<'_>,
+    ) -> Result<AskDisposition>;
+}
+
+/// Synchronous ask handler for the immediate-response hot path.
+pub trait ActorAskImmediateHandlerSync: Send + Sync {
+    fn can_handle_actor_ask_sync_immediate(&self, _actor_id: u64, _type_hash: u32) -> bool {
+        true
+    }
+
+    fn handle_actor_ask_sync_immediate(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+    ) -> Result<AskDisposition>;
 }
 
 /// Synchronous actor message handler for ultra-low-latency paths.
@@ -811,6 +1020,9 @@ pub struct GossipRegistry<T = ()> {
 
     // Actor message handler callback
     pub actor_message_handler: Arc<ArcSwapOption<ActorMessageHandlerCell>>,
+    pub actor_tell_handler_sync: Arc<ArcSwapOption<ActorTellHandlerSyncCell>>,
+    pub actor_ask_immediate_handler_sync: Arc<ArcSwapOption<ActorAskImmediateHandlerSyncCell>>,
+    pub actor_ask_handler_sync: Arc<ArcSwapOption<ActorAskHandlerSyncCell>>,
     pub actor_message_handler_sync: Arc<ArcSwapOption<ActorMessageHandlerSyncCell>>,
     pub peer_disconnect_handler: Arc<ArcSwapOption<PeerDisconnectHandlerCell>>,
     pub peer_connect_handler: Arc<ArcSwapOption<PeerConnectHandlerCell>>,
@@ -982,6 +1194,9 @@ impl<T: 'static> GossipRegistry<T> {
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
             peer_capability_addr_to_node: Arc::new(SccHashMap::default()),
             actor_message_handler: Arc::new(ArcSwapOption::empty()),
+            actor_tell_handler_sync: Arc::new(ArcSwapOption::empty()),
+            actor_ask_immediate_handler_sync: Arc::new(ArcSwapOption::empty()),
+            actor_ask_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_message_handler_sync: Arc::new(ArcSwapOption::empty()),
             peer_disconnect_handler: Arc::new(ArcSwapOption::empty()),
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
@@ -1236,6 +1451,37 @@ impl<T: 'static> GossipRegistry<T> {
         info!("actor message handler registered");
     }
 
+    /// Register a synchronous tell handler callback (fast path).
+    pub async fn set_actor_tell_handler_sync<H>(&self, handler: Arc<H>)
+    where
+        H: ActorTellHandlerSync + 'static,
+    {
+        self.actor_tell_handler_sync
+            .store(Some(Arc::new(ActorTellHandlerSyncCell::new(handler))));
+        info!("actor tell handler sync registered");
+    }
+
+    /// Register a synchronous immediate ask handler callback.
+    pub async fn set_actor_ask_immediate_handler_sync<H>(&self, handler: Arc<H>)
+    where
+        H: ActorAskImmediateHandlerSync + 'static,
+    {
+        self.actor_ask_immediate_handler_sync.store(Some(Arc::new(
+            ActorAskImmediateHandlerSyncCell::new(handler),
+        )));
+        info!("actor ask immediate handler sync registered");
+    }
+
+    /// Register a synchronous ask handler callback.
+    pub async fn set_actor_ask_handler_sync<H>(&self, handler: Arc<H>)
+    where
+        H: ActorAskHandlerSync + 'static,
+    {
+        self.actor_ask_handler_sync
+            .store(Some(Arc::new(ActorAskHandlerSyncCell::new(handler))));
+        info!("actor ask handler sync registered");
+    }
+
     /// Register a synchronous actor message handler callback (fast path).
     pub async fn set_actor_message_handler_sync<H>(&self, handler: Arc<H>)
     where
@@ -1250,6 +1496,24 @@ impl<T: 'static> GossipRegistry<T> {
     pub async fn clear_actor_message_handler(&self) {
         self.actor_message_handler.store(None);
         info!("actor message handler cleared");
+    }
+
+    /// Remove the synchronous tell handler callback.
+    pub async fn clear_actor_tell_handler_sync(&self) {
+        self.actor_tell_handler_sync.store(None);
+        info!("actor tell handler sync cleared");
+    }
+
+    /// Remove the synchronous immediate ask handler callback.
+    pub async fn clear_actor_ask_immediate_handler_sync(&self) {
+        self.actor_ask_immediate_handler_sync.store(None);
+        info!("actor ask immediate handler sync cleared");
+    }
+
+    /// Remove the synchronous ask handler callback.
+    pub async fn clear_actor_ask_handler_sync(&self) {
+        self.actor_ask_handler_sync.store(None);
+        info!("actor ask handler sync cleared");
     }
 
     /// Remove the synchronous actor message handler callback
@@ -1467,7 +1731,7 @@ impl<T: 'static> GossipRegistry<T> {
                 // Check if we need to close an existing connection to a different address
                 {
                     let pool = &self.connection_pool;
-                    if let Some(old_addr) = pool.peer_id_to_addr.read_sync(&peer_id, |_, v| *v) {
+                    if let Some(old_addr) = pool.get_configured_peer_addr(&peer_id) {
                         if old_addr != peer_addr {
                             info!(
                                 peer_id = %peer_id,
@@ -1476,13 +1740,7 @@ impl<T: 'static> GossipRegistry<T> {
                                 "Closing old connection for peer due to address change"
                             );
 
-                            // Remove connection and abort tasks
-                            if let Some((_, conn)) = pool.connections_by_peer.remove_sync(&peer_id)
-                            {
-                                let _ = pool.connections_by_addr.remove_sync(&conn.addr);
-                                conn_to_abort = Some(conn);
-                            }
-                            let _ = pool.addr_to_peer_id.remove_sync(&old_addr);
+                            conn_to_abort = pool.disconnect_connection_by_peer_id(&peer_id);
                         }
                     }
                 }
@@ -1503,9 +1761,7 @@ impl<T: 'static> GossipRegistry<T> {
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
         let pool = &self.connection_pool;
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
-        let _ = pool
-            .peer_id_to_addr
-            .upsert_sync(peer_id.clone(), connect_addr);
+        pool.set_configured_peer_addr(&peer_id, connect_addr);
         let _ = pool
             .addr_to_peer_id
             .upsert_sync(connect_addr, peer_id.clone());
@@ -1732,7 +1988,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Get peer_id for this address
             if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
                 // Update peer_id_to_addr mapping
-                let _ = pool.peer_id_to_addr.upsert_sync(peer_id.clone(), new_addr);
+                pool.set_configured_peer_addr(&peer_id, new_addr);
                 // Add new address to addr_to_peer_id mapping
                 pool.add_addr_to_peer_id(new_addr, peer_id.clone());
 
@@ -1744,10 +2000,7 @@ impl<T: 'static> GossipRegistry<T> {
                         let _ = pool
                             .connections_by_addr
                             .upsert_sync(new_addr, connection.clone());
-                        // Also update connections_by_peer to point to the same connection
-                        let _ = pool
-                            .connections_by_peer
-                            .upsert_sync(peer_id.clone(), connection);
+                        pool.publish_current_peer_connection(&peer_id, connection);
                         debug!(
                             old_addr = %peer_addr,
                             new_addr = %new_addr,
@@ -1756,7 +2009,7 @@ impl<T: 'static> GossipRegistry<T> {
                     } else {
                         // Connection is dead - remove it from connections_by_peer too
                         // This ensures the next send attempt will trigger reconnection
-                        let _ = pool.connections_by_peer.remove_sync(&peer_id);
+                        pool.clear_current_peer_connection_if_matches(&peer_id, &connection);
                         info!(
                             old_addr = %peer_addr,
                             new_addr = %new_addr,
@@ -2424,7 +2677,7 @@ impl<T: 'static> GossipRegistry<T> {
 
         if let Some(sender_addr) = {
             let pool = &self.connection_pool;
-            pool.peer_id_to_addr.read_sync(&sender_peer_id, |_, v| *v)
+            pool.get_configured_peer_addr(&sender_peer_id)
         } {
             let mut gossip_state = self.gossip_state.lock().await;
             let entry = gossip_state
@@ -3895,7 +4148,7 @@ impl<T: 'static> GossipRegistry<T> {
             let pool = &self.connection_pool;
 
             // Try to find the address from our node ID mapping
-            let addr_opt = pool.peer_id_to_addr.read_sync(failed_peer_id, |_, v| *v);
+            let addr_opt = pool.get_configured_peer_addr(failed_peer_id);
 
             match addr_opt {
                 Some(addr) => addr,

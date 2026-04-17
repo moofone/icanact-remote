@@ -307,52 +307,51 @@ impl LockFreeStreamHandle {
             fn drop(&mut self) {
                 self.flag.store(true, Ordering::Release);
                 self.notify.notify_waiters();
-                if let Some(correlation) = self.response_correlation.as_ref() {
-                    correlation.cancel_all();
-                }
+                let mut should_cancel_pending = true;
                 if let (Some(registry_weak), Some(peer_addr)) =
                     (self.registry_weak.as_ref(), self.peer_addr)
+                    && let Some(registry) = registry_weak.upgrade()
                 {
-                    if let Some(registry) = registry_weak.upgrade() {
-                        // Guard against mis-attributing disconnects from stale/duplicate
-                        // connections. Tie-breaker drops and replacements are expected and
-                        // must not mark the peer failed or drop the currently active link.
-                        let expected_instance = self.instance_id;
-                        let peer_id_hint = self.peer_id.clone();
+                    // Guard against mis-attributing disconnects from stale/duplicate
+                    // connections. Tie-breaker drops and replacements are expected and
+                    // must not mark the peer failed or cancel pending asks on the current link.
+                    let expected_instance = self.instance_id;
+                    let peer_id_hint = self.peer_id.clone();
+                    let pool = &registry.connection_pool;
+                    let peer_id = peer_id_hint.or_else(|| pool.get_peer_id_by_addr(&peer_addr));
+
+                    if let Some(peer_id) = peer_id.as_ref()
+                        && let Some(current) = pool.get_connection_by_peer_id(peer_id)
+                        && let Some(handle) = current.stream_handle.as_ref()
+                        && handle.instance_id() != expected_instance
+                    {
+                        should_cancel_pending = false;
+                        debug!(
+                            peer = %peer_addr,
+                            peer_id = %peer_id,
+                            exiting_instance = expected_instance,
+                            current_instance = handle.instance_id(),
+                            "IO task exited for stale connection; skipping pending cancel/failure handling"
+                        );
+                    } else if peer_id.is_none()
+                        && let Some(current) = pool.get_lock_free_connection(peer_addr)
+                        && let Some(handle) = current.stream_handle.as_ref()
+                        && handle.instance_id() != expected_instance
+                    {
+                        should_cancel_pending = false;
+                        debug!(
+                            peer = %peer_addr,
+                            exiting_instance = expected_instance,
+                            current_instance = handle.instance_id(),
+                            "IO task exited for stale addr-mapped connection; skipping pending cancel/failure handling"
+                        );
+                    }
+
+                    if should_cancel_pending {
+                        if let Some(correlation) = self.response_correlation.as_ref() {
+                            correlation.cancel_all();
+                        }
                         tokio::spawn(async move {
-                            let pool = &registry.connection_pool;
-                            let peer_id =
-                                peer_id_hint.or_else(|| pool.get_peer_id_by_addr(&peer_addr));
-
-                            if let Some(peer_id) = peer_id {
-                                if let Some(current) = pool.get_connection_by_peer_id(&peer_id) {
-                                    if let Some(handle) = current.stream_handle.as_ref() {
-                                        if handle.instance_id() != expected_instance {
-                                            debug!(
-                                                peer = %peer_addr,
-                                                peer_id = %peer_id,
-                                                exiting_instance = expected_instance,
-                                                current_instance = handle.instance_id(),
-                                                "IO task exited for stale connection; skipping failure handling"
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                            } else if let Some(current) = pool.get_lock_free_connection(peer_addr) {
-                                if let Some(handle) = current.stream_handle.as_ref() {
-                                    if handle.instance_id() != expected_instance {
-                                        debug!(
-                                            peer = %peer_addr,
-                                            exiting_instance = expected_instance,
-                                            current_instance = handle.instance_id(),
-                                            "IO task exited for stale addr-mapped connection; skipping failure handling"
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-
                             if let Err(e) = registry.handle_peer_connection_failure(peer_addr).await
                             {
                                 warn!(
@@ -363,6 +362,11 @@ impl LockFreeStreamHandle {
                             }
                         });
                     }
+                    return;
+                }
+
+                if let Some(correlation) = self.response_correlation.as_ref() {
+                    correlation.cancel_all();
                 }
             }
         }

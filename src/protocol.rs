@@ -578,10 +578,109 @@ async fn handle_assembled_message(
             return;
         }
     }
-    if let Ok(Some(response)) = registry
-        .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
-        .await
-    {
+    let response = if corr_id == 0 {
+        if let Some(cell) = registry.actor_tell_handler_sync.load_full() {
+            cell.handle(actor_id, type_hash, complete_data)
+                .map(|_| None)
+        } else {
+            registry
+                .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
+                .await
+        }
+    } else if let Some(cell) = registry.actor_ask_immediate_handler_sync.load_full() {
+        if cell.can_handle(actor_id, type_hash) {
+            cell.handle(actor_id, type_hash, complete_data)
+                .map(|disposition| match disposition {
+                    crate::registry::AskDisposition::Immediate(response) => Some(response),
+                    crate::registry::AskDisposition::ImmediateBytes(response) => {
+                        Some(ActorResponse::Bytes(response))
+                    }
+                    crate::registry::AskDisposition::ImmediateAligned(response) => {
+                        Some(ActorResponse::Aligned(response))
+                    }
+                    crate::registry::AskDisposition::ImmediatePooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    } => Some(ActorResponse::Pooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    }),
+                    crate::registry::AskDisposition::Deferred => None,
+                })
+        } else if let Some(cell) = registry.actor_ask_handler_sync.load_full() {
+            if let Some(stream_handle) =
+                response_connection.and_then(|conn| conn.stream_handle.as_ref().cloned())
+            {
+                let context = crate::AskContext::from_stream_handle(corr_id, &stream_handle);
+                cell.handle(actor_id, type_hash, complete_data, context)
+                    .map(|disposition| match disposition {
+                        crate::registry::AskDisposition::Immediate(response) => Some(response),
+                        crate::registry::AskDisposition::ImmediateBytes(response) => {
+                            Some(ActorResponse::Bytes(response))
+                        }
+                        crate::registry::AskDisposition::ImmediateAligned(response) => {
+                            Some(ActorResponse::Aligned(response))
+                        }
+                        crate::registry::AskDisposition::ImmediatePooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        } => Some(ActorResponse::Pooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        }),
+                        crate::registry::AskDisposition::Deferred => None,
+                    })
+            } else {
+                registry
+                    .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
+                    .await
+            }
+        } else {
+            registry
+                .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
+                .await
+        }
+    } else if let Some(cell) = registry.actor_ask_handler_sync.load_full() {
+        if let Some(stream_handle) =
+            response_connection.and_then(|conn| conn.stream_handle.as_ref().cloned())
+        {
+            let context = crate::AskContext::from_stream_handle(corr_id, &stream_handle);
+            cell.handle(actor_id, type_hash, complete_data, context)
+                .map(|disposition| match disposition {
+                    crate::registry::AskDisposition::Immediate(response) => Some(response),
+                    crate::registry::AskDisposition::ImmediateBytes(response) => {
+                        Some(ActorResponse::Bytes(response))
+                    }
+                    crate::registry::AskDisposition::ImmediateAligned(response) => {
+                        Some(ActorResponse::Aligned(response))
+                    }
+                    crate::registry::AskDisposition::ImmediatePooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    } => Some(ActorResponse::Pooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    }),
+                    crate::registry::AskDisposition::Deferred => None,
+                })
+        } else {
+            registry
+                .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
+                .await
+        }
+    } else {
+        registry
+            .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
+            .await
+    };
+
+    if let Ok(Some(response)) = response {
         // Only send response for asks (non-zero correlation_id)
         if corr_id != 0 {
             match response {
