@@ -109,10 +109,10 @@ async fn test_remote_actor_ref_detects_shutdown_inner() {
     sleep(Duration::from_millis(100)).await;
 
     // Get RemoteActorRef
-    let remote_actor: icanact_remote::RemoteActorRef = handle_a.lookup("test_service").await;
-    assert!(remote_actor.is_some(), "lookup should succeed");
-
-    let remote_actor = remote_actor.unwrap();
+    let remote_actor = handle_a
+        .lookup("test_service")
+        .await
+        .expect("lookup should succeed");
 
     // Verify it works before shutdown
     assert!(

@@ -1,4 +1,6 @@
 pub mod aligned;
+mod ask_forwarder;
+mod ask_responder;
 pub mod config;
 pub(crate) mod connection_pool;
 pub mod dns;
@@ -35,6 +37,8 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
+pub use ask_forwarder::AskForwarder;
+pub use ask_responder::{AskContext, AskResponder};
 pub use config::GossipConfig;
 pub use dns::{DnsResolver, TokioDnsResolver};
 
@@ -773,9 +777,7 @@ impl<T: 'static> Peer<T> {
         // First configure the address for this peer
         {
             let pool = &self.registry.connection_pool;
-            let _ = pool
-                .peer_id_to_addr
-                .upsert_sync(self.peer_id.clone(), *addr);
+            pool.set_configured_peer_addr(&self.peer_id, *addr);
             pool.reindex_connection_addr(&self.peer_id, *addr);
         }
 
@@ -988,7 +990,7 @@ impl<T: 'static> Peer<T> {
             conn.set_state(crate::connection_pool::ConnectionState::Disconnected);
 
             // Get the peer address for mark_disconnected
-            let peer_addr = pool.peer_id_to_addr.read_sync(&self.peer_id, |_, v| *v);
+            let peer_addr = pool.get_configured_peer_addr(&self.peer_id);
             if let Some(addr) = peer_addr {
                 pool.mark_disconnected(addr);
             }

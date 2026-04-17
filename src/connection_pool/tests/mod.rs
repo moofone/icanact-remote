@@ -28,6 +28,46 @@ impl crate::registry::ActorMessageHandlerSync for TestActor {
     }
 }
 
+struct DeferredTestActor;
+
+impl crate::registry::ActorAskHandlerSync for DeferredTestActor {
+    fn handle_actor_ask_sync(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::AlignedBytes,
+        context: crate::AskContext<'_>,
+    ) -> crate::Result<crate::registry::AskDisposition> {
+        if actor_id != 0xD3F3_10AB || type_hash != 0xA55D_0001 {
+            return Ok(crate::registry::AskDisposition::Deferred);
+        }
+
+        let responder = context.responder();
+        tokio::spawn(async move {
+            let _ = responder.reply_bytes(payload.into_bytes()).await;
+        });
+
+        Ok(crate::registry::AskDisposition::Deferred)
+    }
+}
+
+struct ImmediateMissActor;
+
+impl crate::registry::ActorAskImmediateHandlerSync for ImmediateMissActor {
+    fn can_handle_actor_ask_sync_immediate(&self, _actor_id: u64, _type_hash: u32) -> bool {
+        false
+    }
+
+    fn handle_actor_ask_sync_immediate(
+        &self,
+        _actor_id: u64,
+        _type_hash: u32,
+        _payload: crate::AlignedBytes,
+    ) -> crate::Result<crate::registry::AskDisposition> {
+        unreachable!("can_handle=false should prevent immediate ask dispatch")
+    }
+}
+
 const TEST_TELL_ACTOR_ID: u64 = 0xC0DE_BEEF;
 const TEST_TELL_HASH: u32 = 0xA11C_0001;
 struct TestActorCounter {
@@ -103,6 +143,486 @@ fn print_io_perf(label: &str) {
         ask_write_calls,
         (ask_write_ns as f64 / 1000.0) / (ask_write_calls.max(1) as f64),
     );
+}
+
+#[test]
+fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("session_correlation").peer_id();
+    let addr: SocketAddr = "127.0.0.1:40555".parse().unwrap();
+
+    pool.set_configured_peer_addr(&peer_id, addr);
+    let original = pool.get_or_create_correlation_tracker(&peer_id);
+
+    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    connection.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
+
+    pool.disconnect_connection_by_peer_id(&peer_id)
+        .expect("expected connection to be removed");
+
+    let preserved = pool.get_or_create_correlation_tracker(&peer_id);
+    assert!(Arc::ptr_eq(&original, &preserved));
+    assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
+}
+
+#[test]
+fn get_connection_by_peer_id_uses_session_current_connection() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("session_current_connection").peer_id();
+    let addr: SocketAddr = "127.0.0.1:40556".parse().unwrap();
+
+    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    connection.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection.clone()));
+
+    let _ = pool.connections_by_peer.remove_sync(&peer_id);
+
+    let resolved = pool
+        .get_connection_by_peer_id(&peer_id)
+        .expect("session should retain current connection");
+    assert!(Arc::ptr_eq(&resolved, &connection));
+}
+
+#[test]
+fn connection_count_uses_session_current_connection() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("session_connection_count").peer_id();
+    let addr: SocketAddr = "127.0.0.1:40557".parse().unwrap();
+
+    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    connection.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
+
+    let _ = pool.connections_by_peer.remove_sync(&peer_id);
+
+    assert_eq!(pool.connection_count(), 1);
+}
+
+#[test]
+fn deferred_actor_ask_sync_replies_via_responder() {
+    run_multi_thread_test(async {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:40501".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:40502".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("deferred_actor_ask_server")),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        server_registry
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .await;
+
+        let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            client_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("deferred_actor_ask_client")),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let correlation = CorrelationTracker::new();
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+        let client_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&client_registry),
+            peer_addr: server_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
+            client_io,
+            server_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(client_read_ctx),
+        );
+        let client_writer = Arc::new(client_writer);
+        let client_conn = ConnectionHandle::<()>::new_stream(
+            server_addr,
+            Arc::clone(&client_writer),
+            correlation,
+        );
+
+        let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
+        let server_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr: client_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: None,
+            response_writer: Some(response_writer.clone()),
+            tell_handler_sync: server_registry.actor_tell_handler_sync.load_full(),
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: server_registry.actor_ask_handler_sync.load_full(),
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            client_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+        let server_writer = Arc::new(server_writer);
+        response_writer.bind_stream_handle(server_writer.clone());
+
+        let payload = bytes::Bytes::from_static(b"deferred-ping");
+        let reply = client_conn
+            .ask_actor_frame_no_timeout(0xD3F3_10AB, 0xA55D_0001, payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(reply, payload);
+
+        client_writer.shutdown();
+        server_writer.shutdown();
+    });
+}
+
+#[test]
+fn deferred_actor_ask_pending_wait_replies_repeatedly() {
+    run_multi_thread_test(async {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:40503".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:40504".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "deferred_actor_ask_pending_wait_server",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        server_registry
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .await;
+
+        let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            client_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "deferred_actor_ask_pending_wait_client",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let correlation = CorrelationTracker::new();
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+        let client_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&client_registry),
+            peer_addr: server_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
+            client_io,
+            server_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(client_read_ctx),
+        );
+        let client_writer = Arc::new(client_writer);
+        let client_conn = ConnectionHandle::<()>::new_stream(
+            server_addr,
+            Arc::clone(&client_writer),
+            correlation,
+        );
+
+        let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
+        let server_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr: client_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: None,
+            response_writer: Some(response_writer.clone()),
+            tell_handler_sync: server_registry.actor_tell_handler_sync.load_full(),
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: server_registry.actor_ask_handler_sync.load_full(),
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            client_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+        let server_writer = Arc::new(server_writer);
+        response_writer.bind_stream_handle(server_writer.clone());
+
+        for round in 0..128u8 {
+            let payload = bytes::Bytes::from(vec![round; 32]);
+            let pending = client_conn
+                .ask_actor_frame_deferred(
+                    0xD3F3_10AB,
+                    0xA55D_0001,
+                    payload.clone(),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let reply = pending.wait().await.unwrap();
+            assert_eq!(reply, payload);
+        }
+
+        client_writer.shutdown();
+        server_writer.shutdown();
+    });
+}
+
+#[test]
+fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
+    run_multi_thread_test(async {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:40511".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:40512".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "deferred_actor_ask_server_immediate_miss",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        server_registry
+            .set_actor_ask_immediate_handler_sync(Arc::new(ImmediateMissActor))
+            .await;
+        server_registry
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .await;
+
+        let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            client_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "deferred_actor_ask_client_immediate_miss",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let correlation = CorrelationTracker::new();
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+        let client_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&client_registry),
+            peer_addr: server_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
+            client_io,
+            server_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(client_read_ctx),
+        );
+        let client_writer = Arc::new(client_writer);
+        let client_conn = ConnectionHandle::<()>::new_stream(
+            server_addr,
+            Arc::clone(&client_writer),
+            correlation,
+        );
+
+        let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
+        let server_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr: client_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: None,
+            response_writer: Some(response_writer.clone()),
+            tell_handler_sync: server_registry.actor_tell_handler_sync.load_full(),
+            ask_immediate_handler_sync: server_registry
+                .actor_ask_immediate_handler_sync
+                .load_full(),
+            ask_handler_sync: server_registry.actor_ask_handler_sync.load_full(),
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            client_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+        let server_writer = Arc::new(server_writer);
+        response_writer.bind_stream_handle(server_writer.clone());
+
+        let payload = bytes::Bytes::from_static(b"deferred-ping-immediate-miss");
+        let reply = client_conn
+            .ask_actor_frame_no_timeout(0xD3F3_10AB, 0xA55D_0001, payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(reply, payload);
+
+        client_writer.shutdown();
+        server_writer.shutdown();
+    });
+}
+
+#[test]
+fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
+    run_multi_thread_test(async {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:40521".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:40522".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "existing_connection_correlation_server",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        server_registry
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .await;
+
+        let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            client_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "existing_connection_correlation_client",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+
+        let peer_id = server_registry.peer_id.clone();
+        let session_correlation = client_registry
+            .connection_pool
+            .get_or_create_correlation_tracker(&peer_id);
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let connection_correlation = CorrelationTracker::new();
+        assert!(
+            !Arc::ptr_eq(&session_correlation, &connection_correlation),
+            "test requires a distinct live-connection correlation tracker"
+        );
+
+        let client_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&client_registry),
+            peer_addr: server_addr,
+            peer_id: Some(peer_id.clone()),
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: Some(connection_correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
+            client_io,
+            server_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(client_read_ctx),
+        );
+        let client_writer = Arc::new(client_writer);
+        let mut connection = LockFreeConnection::new(server_addr, ConnectionDirection::Inbound);
+        connection.stream_handle = Some(client_writer.clone());
+        connection.correlation = Some(connection_correlation);
+        connection.embedded_peer_id = Some(peer_id.clone());
+        connection.set_state(ConnectionState::Connected);
+        connection.update_last_used();
+        assert!(client_registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            server_addr,
+            Arc::new(connection),
+        ));
+
+        let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
+        let server_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr: client_addr,
+            peer_id: Some(client_registry.peer_id.clone()),
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            response_correlation: None,
+            response_writer: Some(response_writer.clone()),
+            tell_handler_sync: server_registry.actor_tell_handler_sync.load_full(),
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: server_registry.actor_ask_handler_sync.load_full(),
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            client_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+        let server_writer = Arc::new(server_writer);
+        response_writer.bind_stream_handle(server_writer.clone());
+
+        let handle = client_registry
+            .connection_pool
+            .get_connection_to_peer(&peer_id)
+            .await
+            .expect("existing connection handle");
+
+        let payload = bytes::Bytes::from_static(b"existing-connection-correlation");
+        let reply = handle
+            .ask_actor_frame_no_timeout(0xD3F3_10AB, 0xA55D_0001, payload.clone())
+            .await
+            .expect("reply should complete through the live connection tracker");
+        assert_eq!(reply, payload);
+
+        client_writer.shutdown();
+        server_writer.shutdown();
+    });
 }
 
 /// Simple in-memory writer that records bytes for verification without
@@ -693,6 +1213,10 @@ fn stream_direct_ask_throughput_bench() {
             expected_schema_hash: None,
             aligned_pool: registry.connection_pool.aligned_bytes_pool(),
             response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: None,
         };
         let (client_writer, _writer_task, _reader_task) = LockFreeStreamHandle::new(
@@ -1143,6 +1667,10 @@ fn stream_protocol_ask_throughput_bench() {
             expected_schema_hash: None,
             aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: None,
         };
         let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
@@ -1171,6 +1699,10 @@ fn stream_protocol_ask_throughput_bench() {
             expected_schema_hash: None,
             aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
         let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
@@ -1458,6 +1990,10 @@ fn stream_protocol_direct_ask_inflight64_bench() {
             expected_schema_hash: None,
             aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: None,
         };
         let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
@@ -1486,6 +2022,10 @@ fn stream_protocol_direct_ask_inflight64_bench() {
             expected_schema_hash: None,
             aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
         let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
@@ -1594,6 +2134,10 @@ fn stream_protocol_actor_ask_inflight64_bench() {
             expected_schema_hash: None,
             aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: None,
         };
         let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
@@ -1622,6 +2166,10 @@ fn stream_protocol_actor_ask_inflight64_bench() {
             expected_schema_hash: None,
             aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
         let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
@@ -1741,6 +2289,10 @@ fn stream_protocol_tell_throughput_bench() {
             expected_schema_hash: None,
             aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: None,
         };
         let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
@@ -1769,6 +2321,10 @@ fn stream_protocol_tell_throughput_bench() {
             expected_schema_hash: None,
             aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
             response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
             sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
         };
         let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(

@@ -19,7 +19,8 @@ impl<T> ConnectionPool<T> {
             addr_to_peer_id: SccHashMap::default(),
             peer_id_to_addr: SccHashMap::default(),
             connections_by_addr: SccHashMap::default(),
-            correlation_trackers: SccHashMap::default(),
+            peer_sessions: SccHashMap::default(),
+            outbound_dial_gates: SccHashMap::default(),
             max_connections,
             connection_timeout,
             registry: ArcSwapWeak::new(std::sync::Weak::new()),
@@ -86,12 +87,32 @@ impl<T> ConnectionPool<T> {
             .unwrap_or_else(|| BufferConfig::default().write_queue_capacity())
     }
 
+    fn handle_correlation(
+        &self,
+        addr: SocketAddr,
+        conn: &Arc<LockFreeConnection>,
+    ) -> Arc<CorrelationTracker> {
+        if let Some(correlation) = conn.correlation.clone() {
+            return correlation;
+        }
+
+        if let Some(peer_id) = conn.embedded_peer_id.as_ref() {
+            return self.get_or_create_correlation_tracker(peer_id);
+        }
+
+        if let Some(peer_id) = self.addr_to_peer_id.read_sync(&addr, |_, v| v.clone()) {
+            return self.get_or_create_correlation_tracker(&peer_id);
+        }
+
+        CorrelationTracker::new()
+    }
+
     fn make_connection_handle(
         &self,
         addr: SocketAddr,
         conn: &Arc<LockFreeConnection>,
-        correlation: Arc<CorrelationTracker>,
     ) -> Option<ConnectionHandle<T>> {
+        let correlation = self.handle_correlation(addr, conn);
         if let Some(stream_handle) = conn.stream_handle.as_ref() {
             return Some(ConnectionHandle::new_stream(
                 addr,
@@ -112,6 +133,120 @@ impl<T> ConnectionPool<T> {
         }
 
         None
+    }
+
+    fn get_or_create_peer_session(&self, peer_id: &crate::PeerId) -> Arc<PeerSession> {
+        self.peer_sessions
+            .entry_sync(peer_id.clone())
+            .or_insert_with(|| {
+                debug!(
+                    "CONNECTION POOL: Creating new peer session for peer {}",
+                    peer_id
+                );
+                Arc::new(PeerSession::new())
+            })
+            .get()
+            .clone()
+    }
+
+    pub(crate) fn get_configured_peer_addr(&self, peer_id: &crate::PeerId) -> Option<SocketAddr> {
+        self.peer_sessions
+            .read_sync(peer_id, |_, session| session.configured_addr())
+            .flatten()
+            .or_else(|| self.peer_id_to_addr.read_sync(peer_id, |_, v| *v))
+    }
+
+    fn set_session_configured_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        self.get_or_create_peer_session(peer_id).set_configured_addr(addr);
+        let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
+    }
+
+    pub(crate) fn set_configured_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        self.set_session_configured_addr(peer_id, addr);
+    }
+
+    pub(crate) fn set_current_peer_connection(
+        &self,
+        peer_id: &crate::PeerId,
+        connection: Option<Arc<LockFreeConnection>>,
+    ) {
+        self.get_or_create_peer_session(peer_id)
+            .set_current_connection(connection);
+    }
+
+    pub(crate) fn publish_current_peer_connection(
+        &self,
+        peer_id: &crate::PeerId,
+        connection: Arc<LockFreeConnection>,
+    ) {
+        self.set_current_peer_connection(peer_id, Some(connection.clone()));
+        let _ = self
+            .connections_by_peer
+            .upsert_sync(peer_id.clone(), connection);
+    }
+
+    pub(crate) fn clear_current_peer_connection(&self, peer_id: &crate::PeerId) {
+        self.set_current_peer_connection(peer_id, None);
+        let _ = self.connections_by_peer.remove_sync(peer_id);
+    }
+
+    pub(crate) fn clear_current_peer_connection_if_matches(
+        &self,
+        peer_id: &crate::PeerId,
+        candidate: &Arc<LockFreeConnection>,
+    ) {
+        let should_clear = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| {
+                session
+                    .current_connection()
+                    .map(|current| Arc::ptr_eq(&current, candidate))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if should_clear {
+            self.clear_current_peer_connection(peer_id);
+        }
+    }
+
+    fn session_peer_ids(&self) -> Vec<crate::PeerId> {
+        let mut peer_ids = Vec::new();
+        self.peer_sessions.iter_sync(|peer_id, _| {
+            peer_ids.push(peer_id.clone());
+            true
+        });
+        peer_ids
+    }
+
+    fn acquire_outbound_dial_gate(&self, addr: SocketAddr) -> OutboundDialLease {
+        let candidate = Arc::new(OutboundDialGate::new());
+        let gate = self
+            .outbound_dial_gates
+            .entry_sync(addr)
+            .or_insert_with(|| candidate.clone())
+            .get()
+            .clone();
+        if Arc::ptr_eq(&candidate, &gate) {
+            OutboundDialLease::Leader(gate)
+        } else {
+            OutboundDialLease::Follower(gate)
+        }
+    }
+
+    fn finish_outbound_dial_gate(
+        &self,
+        addr: SocketAddr,
+        gate: &Arc<OutboundDialGate>,
+        succeeded: bool,
+    ) {
+        gate.finish(succeeded);
+        let should_remove = self
+            .outbound_dial_gates
+            .read_sync(&addr, |_, current| Arc::ptr_eq(current, gate))
+            .unwrap_or(false);
+        if should_remove {
+            let _ = self.outbound_dial_gates.remove_sync(&addr);
+        }
     }
 
     async fn ensure_udp_connection(&self, addr: SocketAddr) -> Result<()> {
@@ -241,7 +376,7 @@ impl<T> ConnectionPool<T> {
     /// Only updates if no address is already configured for this peer
     pub fn update_node_address(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
         // Check if we already have a configured address for this node
-        if let Some(existing_addr) = self.peer_id_to_addr.read_sync(peer_id, |_, v| *v) {
+        if let Some(existing_addr) = self.get_configured_peer_addr(peer_id) {
             debug!(
                 "CONNECTION POOL: Node {} already has configured address {}, not updating to ephemeral port {}",
                 peer_id, existing_addr, addr
@@ -255,6 +390,7 @@ impl<T> ConnectionPool<T> {
             .insert_sync(peer_id.clone(), addr)
             .is_ok()
         {
+            self.get_or_create_peer_session(peer_id).set_configured_addr(addr);
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
         }
         debug!(
@@ -271,10 +407,7 @@ impl<T> ConnectionPool<T> {
     pub fn reindex_connection_addr(&self, peer_id: &crate::PeerId, new_addr: SocketAddr) {
         // First, check if this peer still has an active connection
         // This guards against race conditions where disconnect happens between checks
-        let Some(connection) = self
-            .connections_by_peer
-            .read_sync(peer_id, |_, v| v.clone())
-        else {
+        let Some(connection) = self.get_connection_by_peer_id(peer_id) else {
             // Peer was disconnected, nothing to reindex.
             return;
         };
@@ -315,7 +448,7 @@ impl<T> ConnectionPool<T> {
         let old_addr = connection.addr;
 
         // Double-check peer still exists (guard against concurrent disconnect)
-        if !self.connections_by_peer.contains_sync(peer_id) {
+        if !self.has_connection_by_peer_id(peer_id) {
             return;
         }
 
@@ -325,7 +458,7 @@ impl<T> ConnectionPool<T> {
             .upsert_sync(new_addr, connection.clone());
         let _ = self.addr_to_peer_id.upsert_sync(new_addr, peer_id.clone());
         // Also update peer_id_to_addr so disconnect uses the correct address
-        let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), new_addr);
+        self.set_session_configured_addr(peer_id, new_addr);
 
         // IMPORTANT: Keep the old (ephemeral) address entry as well!
         // Inbound messages still arrive with the TCP source address (old_addr),
@@ -351,10 +484,11 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
-        // PRIMARY: Look up connection directly by peer ID
+        // PRIMARY: Look up live connection through the peer session.
         if let Some(conn) = self
-            .connections_by_peer
-            .read_sync(peer_id, |_, v| v.clone())
+            .peer_sessions
+            .read_sync(peer_id, |_, session| session.current_connection())
+            .flatten()
         {
             if conn.is_connected() {
                 debug!("CONNECTION POOL: Found connection for peer '{}'", peer_id);
@@ -364,11 +498,12 @@ impl<T> ConnectionPool<T> {
                 "CONNECTION POOL: Connection for peer '{}' is disconnected",
                 peer_id
             );
+            self.clear_current_peer_connection(peer_id);
         }
 
         // FALLBACK: Outbound connections may only be indexed by address.
-        // Look up the address via peer_id_to_addr, then get the connection by address.
-        if let Some(addr) = self.peer_id_to_addr.read_sync(peer_id, |_, v| *v) {
+        // Look up the configured address via peer session, then get the connection by address.
+        if let Some(addr) = self.get_configured_peer_addr(peer_id) {
             if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
                 if conn.is_connected() {
                     debug!(
@@ -376,9 +511,7 @@ impl<T> ConnectionPool<T> {
                         peer_id, addr
                     );
                     // Index by peer_id for future lookups
-                    let _ = self
-                        .connections_by_peer
-                        .upsert_sync(peer_id.clone(), conn.clone());
+                    self.publish_current_peer_connection(peer_id, conn.clone());
                     return Some(conn);
                 }
             }
@@ -430,8 +563,8 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<CorrelationTracker>> {
-        self.correlation_trackers
-            .read_sync(peer_id, |_, v| v.clone())
+        self.peer_sessions
+            .read_sync(peer_id, |_, session| session.correlation.clone())
     }
 
     /// Get or create a correlation tracker for a peer
@@ -439,23 +572,8 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Arc<CorrelationTracker> {
-        let tracker = self
-            .correlation_trackers
-            .entry_sync(peer_id.clone())
-            .or_insert_with(|| {
-                debug!(
-                    "CONNECTION POOL: Creating new correlation tracker for peer {}",
-                    peer_id
-                );
-                CorrelationTracker::new()
-            })
-            .get()
-            .clone();
-        debug!(
-            "CONNECTION POOL: Got correlation tracker for peer {} (total trackers: {})",
-            peer_id,
-            self.correlation_trackers.len()
-        );
+        let tracker = self.get_or_create_peer_session(peer_id).correlation.clone();
+        debug!("CONNECTION POOL: Got correlation tracker for peer {}", peer_id);
         tracker
     }
 
@@ -481,19 +599,11 @@ impl<T> ConnectionPool<T> {
                 );
             }
         } else {
-            // Connection already has a correlation tracker - ensure it's registered
-            if let Some(ref correlation) = connection.correlation {
-                let _ = self
-                    .correlation_trackers
-                    .upsert_sync(peer_id.clone(), correlation.clone());
-                debug!(
-                    "CONNECTION POOL: Registered existing correlation tracker for peer '{}'",
-                    peer_id
-                );
-            }
+            let _ = self.get_or_create_peer_session(&peer_id);
         }
 
         // Update the address mappings
+        self.set_session_configured_addr(&peer_id, addr);
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
 
         debug!(
@@ -501,10 +611,7 @@ impl<T> ConnectionPool<T> {
             peer_id, addr
         );
 
-        // PRIMARY: Store the connection by peer ID
-        let _ = self
-            .connections_by_peer
-            .upsert_sync(peer_id, connection.clone());
+        self.publish_current_peer_connection(&peer_id, connection.clone());
 
         // Also index by address for direct lookups
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
@@ -649,12 +756,15 @@ impl<T> ConnectionPool<T> {
             ))));
         }
 
+        let correlation_tracker = CorrelationTracker::new();
+
         // Create lock-free streaming handle with exclusive socket ownership.
-        let (buffer_config, schema_hash, read_context) = self
+        let (buffer_config, schema_hash, read_context, response_writer) = self
             .registry
             .load()
             .upgrade()
             .map(|registry| {
+                let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(addr));
                 let read_context = ReadContext {
                     registry_weak: Arc::downgrade(&registry),
                     peer_addr: addr,
@@ -662,16 +772,23 @@ impl<T> ConnectionPool<T> {
                     max_message_size: registry.config.max_message_size,
                     expected_schema_hash: registry.config.schema_hash,
                     aligned_pool: registry.connection_pool.aligned_bytes_pool(),
-                    response_correlation: None,
+                    response_correlation: Some(correlation_tracker.clone()),
+                    response_writer: Some(response_writer.clone()),
+                    tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
+                    ask_immediate_handler_sync: registry
+                        .actor_ask_immediate_handler_sync
+                        .load_full(),
+                    ask_handler_sync: registry.actor_ask_handler_sync.load_full(),
                     sync_actor_handler: registry.actor_message_handler_sync.load_full(),
                 };
                 (
                     BufferConfig::default().with_ask_window(registry.config.ask_window),
                     registry.config.schema_hash,
                     Some(read_context),
+                    Some(response_writer),
                 )
             })
-            .unwrap_or((BufferConfig::default(), None, None));
+            .unwrap_or((BufferConfig::default(), None, None, None));
 
         let (stream_handle, writer_task_handle, reader_task_handle) = LockFreeStreamHandle::new(
             tcp_stream,
@@ -682,9 +799,13 @@ impl<T> ConnectionPool<T> {
             read_context,
         );
         let stream_handle = Arc::new(stream_handle);
+        if let Some(response_writer) = response_writer.as_ref() {
+            response_writer.bind_stream_handle(stream_handle.clone());
+        }
 
         let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
         connection.stream_handle = Some(stream_handle);
+        connection.correlation = Some(correlation_tracker);
         connection.set_state(ConnectionState::Connected);
         connection.update_last_used();
 
@@ -799,7 +920,8 @@ impl<T> ConnectionPool<T> {
 
             // Also remove from node ID mapping
             if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&addr) {
-                if self.connections_by_peer.remove_sync(&node_id).is_some() {
+                if self.connections_by_peer.contains_sync(&node_id) {
+                    self.clear_current_peer_connection_if_matches(&node_id, &connection);
                     debug!(
                         "CONNECTION POOL: Also removed connection by node ID '{}'",
                         node_id
@@ -824,17 +946,9 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
-        if let Some((_, connection)) = self.connections_by_peer.remove_sync(peer_id) {
-            // Remove peer_id_to_addr entry
-            let _ = self.peer_id_to_addr.remove_sync(peer_id);
-
-            // Remove correlation tracker to prevent memory leak (LEAK-001 fix)
-            if self.correlation_trackers.remove_sync(peer_id).is_some() {
-                debug!(
-                    peer_id = %peer_id,
-                    "Cleaned up correlation tracker for disconnected peer"
-                );
-            }
+        if let Some(connection) = self.get_connection_by_peer_id(peer_id) {
+            self.clear_current_peer_connection(peer_id);
+            // Preserve the configured peer address so reconnect logic keeps a stable destination.
 
             // Remove ALL addr_to_peer_id entries for this peer
             // (may have multiple due to reindexing keeping both ephemeral and bind addresses)
@@ -866,8 +980,12 @@ impl<T> ConnectionPool<T> {
     /// Get connection count - lock-free operation
     pub fn connection_count(&self) -> usize {
         let mut count = 0usize;
-        self.connections_by_peer.iter_sync(|_, conn| {
-            if conn.is_connected() {
+        self.peer_sessions.iter_sync(|_, session| {
+            if session
+                .current_connection()
+                .map(|conn| conn.is_connected())
+                .unwrap_or(false)
+            {
                 count += 1;
             }
             true
@@ -953,18 +1071,7 @@ impl<T> ConnectionPool<T> {
         debug!(addr = %addr, "using existing persistent connection (fast path)");
 
         // Look up peer_id to get shared correlation tracker.
-        let peer_id = self.addr_to_peer_id.read_sync(&addr, |_, v| v.clone());
-
-        // Use shared correlation tracker if we have a peer_id, otherwise use connection's tracker.
-        let correlation = if let Some(pid) = peer_id {
-            self.get_or_create_correlation_tracker(&pid)
-        } else {
-            conn.correlation
-                .clone()
-                .unwrap_or_else(CorrelationTracker::new)
-        };
-
-        self.make_connection_handle(addr, &conn, correlation)
+        self.make_connection_handle(addr, &conn)
     }
 
     /// Get or create a connection to a peer by its ID
@@ -1004,8 +1111,7 @@ impl<T> ConnectionPool<T> {
                     let _ = self.remove_connection(addr);
                 } else {
                     let addr = conn.addr;
-                    let correlation = self.get_or_create_correlation_tracker(peer_id);
-                    if let Some(handle) = self.make_connection_handle(addr, &conn, correlation) {
+                    if let Some(handle) = self.make_connection_handle(addr, &conn) {
                         return Ok(handle);
                     }
                     return Err(crate::GossipError::Network(std::io::Error::other(
@@ -1018,12 +1124,12 @@ impl<T> ConnectionPool<T> {
                     "CONNECTION POOL: Removing disconnected connection to peer '{}'",
                     peer_id
                 );
-                let _ = self.connections_by_peer.remove_sync(peer_id);
+                self.clear_current_peer_connection(peer_id);
             }
         }
 
         // Look up the address for this node
-        let addr = if let Some(addr) = self.peer_id_to_addr.read_sync(peer_id, |_, v| *v) {
+        let addr = if let Some(addr) = self.get_configured_peer_addr(peer_id) {
             addr
         } else {
             return Err(crate::GossipError::Network(std::io::Error::new(
@@ -1048,7 +1154,7 @@ impl<T> ConnectionPool<T> {
 
         // After successful connection, ensure it's indexed by node ID
         if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
-            let _ = self.connections_by_peer.upsert_sync(peer_id.clone(), conn);
+            self.publish_current_peer_connection(peer_id, conn);
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
             debug!(
                 "CONNECTION POOL: Indexed new connection under peer ID '{}'",
@@ -1057,6 +1163,16 @@ impl<T> ConnectionPool<T> {
         }
 
         Ok(handle)
+    }
+
+    pub(crate) fn get_connected_connection_to_peer(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Option<ConnectionHandle<T>> {
+        let conn = self.get_connection_by_peer_id(peer_id)?;
+        let addr = conn.addr;
+        conn.update_last_used();
+        self.make_connection_handle(addr, &conn)
     }
 
     pub(crate) async fn get_connection(&self, addr: SocketAddr) -> Result<ConnectionHandle<T>> {
@@ -1069,80 +1185,52 @@ impl<T> ConnectionPool<T> {
         node_id: Option<crate::NodeId>,
     ) -> Result<ConnectionHandle<T>> {
         let _current_time = current_timestamp();
-        let addr = addr;
         // Debug logging removed for performance - these logs were too verbose
         // debug!("CONNECTION POOL: get_connection called on pool at {:p} for {}", self as *const _, addr);
         // debug!("CONNECTION POOL: This pool instance has {} connections stored", self.connections_by_addr.len());
-
-        // Use address index to reuse existing connections when available
-
-        // Check if we already have a lock-free connection (fast path).
-        if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
-            if conn.is_connected() {
-                if let Some(stream_handle) = conn.stream_handle.as_ref() {
-                    // If IO task exited, treat as disconnected and force a fresh dial.
-                    if stream_handle.exit_flag.load(Ordering::Acquire) {
-                        debug!(addr = %addr, "found closed stream handle, removing stale connection");
-                        conn.set_state(ConnectionState::Disconnected);
-                        let _ = self.connections_by_addr.remove_sync(&addr);
-                    } else {
-                        conn.update_last_used();
-                        debug!(addr = %addr, "found existing lock-free connection, reusing handle");
-
-                        let peer_id = self.addr_to_peer_id.read_sync(&addr, |_, v| v.clone());
-                        let correlation = if let Some(pid) = peer_id {
-                            self.get_or_create_correlation_tracker(&pid)
-                        } else {
-                            conn.correlation
-                                .clone()
-                                .unwrap_or_else(CorrelationTracker::new)
-                        };
-
-                        if let Some(handle) = self.make_connection_handle(addr, &conn, correlation)
-                        {
-                            return Ok(handle);
-                        }
-                        return Err(crate::GossipError::Network(std::io::Error::other(
-                            "Connection exists but has no usable writer handle",
-                        )));
-                    }
-                } else if self.is_udp_transport_enabled() {
-                    conn.update_last_used();
-                    debug!(addr = %addr, "found existing udp connection, reusing handle");
-                    let peer_id = self.addr_to_peer_id.read_sync(&addr, |_, v| v.clone());
-                    let correlation = if let Some(pid) = peer_id {
-                        self.get_or_create_correlation_tracker(&pid)
-                    } else {
-                        conn.correlation
-                            .clone()
-                            .unwrap_or_else(CorrelationTracker::new)
-                    };
-                    if let Some(handle) = self.make_connection_handle(addr, &conn, correlation) {
-                        return Ok(handle);
-                    }
-                    return Err(crate::GossipError::Network(std::io::Error::other(
-                        "UDP connection exists but writer handle is unavailable",
-                    )));
-                } else {
-                    return Err(crate::GossipError::Network(std::io::Error::other(
-                        "Connection exists but no stream handle",
-                    )));
-                }
-            } else {
-                // Remove disconnected connection.
-                debug!(addr = %addr, "removing disconnected connection");
-                let _ = self.connections_by_addr.remove_sync(&addr);
-            }
-        }
 
         // Extract what we need before any await points to avoid Send issues
         let max_connections = self.max_connections;
         let connection_timeout = self.connection_timeout;
         let registry_weak = self.registry.load_full();
-        let resolved_node_id = match node_id {
-            Some(node_id) => Some(node_id),
-            None => {
-                if let Some(registry_arc) = registry_weak.upgrade() {
+
+        if self.is_udp_transport_enabled() {
+            return self.connect_via_udp(addr).await;
+        }
+
+        let mut resolved_node_id = node_id;
+        loop {
+            if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
+                if conn.is_connected() {
+                    if let Some(stream_handle) = conn.stream_handle.as_ref() {
+                        if stream_handle.exit_flag.load(Ordering::Acquire) {
+                            debug!(addr = %addr, "found closed stream handle, removing stale connection");
+                            conn.set_state(ConnectionState::Disconnected);
+                            let _ = self.connections_by_addr.remove_sync(&addr);
+                        } else {
+                            conn.update_last_used();
+                            debug!(addr = %addr, "found existing lock-free connection, reusing handle");
+
+                            if let Some(handle) = self.make_connection_handle(addr, &conn) {
+                                return Ok(handle);
+                            }
+                            return Err(crate::GossipError::Network(std::io::Error::other(
+                                "Connection exists but has no usable writer handle",
+                            )));
+                        }
+                    } else {
+                        return Err(crate::GossipError::Network(std::io::Error::other(
+                            "Connection exists but no stream handle",
+                        )));
+                    }
+                } else {
+                    debug!(addr = %addr, "removing disconnected connection");
+                    let _ = self.connections_by_addr.remove_sync(&addr);
+                }
+            }
+
+            if resolved_node_id.is_none() {
+                resolved_node_id = if let Some(registry_arc) = registry_weak.upgrade() {
                     registry_arc.lookup_node_id(&addr).await.or_else(|| {
                         registry_arc
                             .peer_capability_addr_to_node
@@ -1150,22 +1238,28 @@ impl<T> ConnectionPool<T> {
                     })
                 } else {
                     None
+                };
+            }
+
+            match self.acquire_outbound_dial_gate(addr) {
+                OutboundDialLease::Leader(gate) => {
+                    let result = self
+                        .connect_via_stream(
+                            addr,
+                            resolved_node_id,
+                            max_connections,
+                            connection_timeout,
+                            registry_weak.clone(),
+                        )
+                        .await;
+                    self.finish_outbound_dial_gate(addr, &gate, result.is_ok());
+                    return result;
+                }
+                OutboundDialLease::Follower(gate) => {
+                    gate.wait().await;
                 }
             }
-        };
-
-        if self.is_udp_transport_enabled() {
-            return self.connect_via_udp(addr).await;
         }
-
-        self.connect_via_stream(
-            addr,
-            resolved_node_id,
-            max_connections,
-            connection_timeout,
-            registry_weak,
-        )
-        .await
     }
 
     #[allow(dead_code)]
@@ -1201,9 +1295,10 @@ impl<T> ConnectionPool<T> {
             .unwrap_or_else(CorrelationTracker::new);
 
         // Create lock-free connection for receiving
-        let (buffer_config, schema_hash, read_context) = registry_weak
+        let (buffer_config, schema_hash, read_context, response_writer) = registry_weak
             .upgrade()
             .map(|registry| {
+                let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(addr));
                 let read_context = ReadContext {
                     registry_weak: Arc::downgrade(&registry),
                     peer_addr: addr,
@@ -1212,15 +1307,22 @@ impl<T> ConnectionPool<T> {
                     expected_schema_hash: registry.config.schema_hash,
                     aligned_pool: registry.connection_pool.aligned_bytes_pool(),
                     response_correlation: Some(correlation_tracker.clone()),
+                    response_writer: Some(response_writer.clone()),
+                    tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
+                    ask_immediate_handler_sync: registry
+                        .actor_ask_immediate_handler_sync
+                        .load_full(),
+                    ask_handler_sync: registry.actor_ask_handler_sync.load_full(),
                     sync_actor_handler: registry.actor_message_handler_sync.load_full(),
                 };
                 (
                     BufferConfig::default().with_ask_window(registry.config.ask_window),
                     registry.config.schema_hash,
                     Some(read_context),
+                    Some(response_writer),
                 )
             })
-            .unwrap_or((BufferConfig::default(), None, None));
+            .unwrap_or((BufferConfig::default(), None, None, None));
         let (stream_handle, writer_task_handle, reader_task_handle) = LockFreeStreamHandle::new(
             stream,
             addr,
@@ -1230,6 +1332,9 @@ impl<T> ConnectionPool<T> {
             read_context,
         );
         let stream_handle = Arc::new(stream_handle);
+        if let Some(response_writer) = response_writer.as_ref() {
+            response_writer.bind_stream_handle(stream_handle.clone());
+        }
 
         let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
         conn.stream_handle = Some(stream_handle.clone());
@@ -1274,12 +1379,9 @@ impl<T> ConnectionPool<T> {
             addr,
             self.connections_by_addr.len()
         );
-        // Double check it's really there
-        assert!(
-            self.connections_by_addr.contains_sync(&addr),
-            "Connection was not added to pool!"
-        );
-        debug!("CONNECTION POOL: Verified connection exists for {}", addr);
+        // Another task can observe and tear down the connection immediately after publication,
+        // so publication must not assume the address entry remains present beyond this point.
+        debug!("CONNECTION POOL: Published connection for {}", addr);
 
         // Send initial FullSync message to identify ourselves
         if let Some(registry_arc) = registry_weak.upgrade() {
@@ -1410,8 +1512,13 @@ impl<T> ConnectionPool<T> {
 
     /// Check if we have a connection to a peer by peer ID
     pub fn has_connection_by_peer_id(&self, peer_id: &crate::PeerId) -> bool {
-        self.connections_by_peer
-            .read_sync(peer_id, |_, v| v.is_connected())
+        self.peer_sessions
+            .read_sync(peer_id, |_, session| {
+                session
+                    .current_connection()
+                    .map(|conn| conn.is_connected())
+                    .unwrap_or(false)
+            })
             .unwrap_or(false)
     }
 
@@ -1425,8 +1532,12 @@ impl<T> ConnectionPool<T> {
     pub fn cleanup_stale_connections(&self) {
         // Find disconnected peers and use peer-id-based removal to clean up all maps
         let mut stale_peer_ids: Vec<crate::PeerId> = Vec::new();
-        self.connections_by_peer.iter_sync(|peer_id, conn| {
-            if !conn.is_connected() {
+        self.peer_sessions.iter_sync(|peer_id, session| {
+            if session
+                .current_connection()
+                .map(|conn| !conn.is_connected())
+                .unwrap_or(false)
+            {
                 stale_peer_ids.push(peer_id.clone());
             }
             true
@@ -1444,11 +1555,7 @@ impl<T> ConnectionPool<T> {
         // Use peer-id-based removal to properly clean up all address aliases
         // This avoids double-decrement of connection_counter when a connection
         // has both ephemeral and bind addresses after reindexing
-        let mut peer_ids: Vec<crate::PeerId> = Vec::new();
-        self.connections_by_peer.iter_sync(|peer_id, _| {
-            peer_ids.push(peer_id.clone());
-            true
-        });
+        let peer_ids = self.session_peer_ids();
         let count = peer_ids.len();
         for peer_id in peer_ids {
             self.disconnect_connection_by_peer_id(&peer_id);

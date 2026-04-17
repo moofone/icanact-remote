@@ -54,9 +54,8 @@ impl<T> ConnectionPool<T> {
                         remote = %remote_peer_id,
                         "tie-breaker: reusing existing connection instead of dialing outbound"
                     );
-                    let correlation = self.get_or_create_correlation_tracker(&remote_peer_id);
                     if let Some(handle) =
-                        self.make_connection_handle(existing_conn.addr, &existing_conn, correlation)
+                        self.make_connection_handle(existing_conn.addr, &existing_conn)
                     {
                         return Ok(handle);
                     }
@@ -66,13 +65,16 @@ impl<T> ConnectionPool<T> {
                 } else {
                     debug!(
                         remote = %remote_peer_id,
-                        "tie-breaker: replacing existing connection with outbound dial"
+                        "tie-breaker: existing live connection already satisfies outbound policy; reusing it"
                     );
-                    if let Some(removed) = self.disconnect_connection_by_peer_id(&remote_peer_id) {
-                        if let Some(handle) = removed.stream_handle.as_ref() {
-                            handle.shutdown();
-                        }
+                    if let Some(handle) =
+                        self.make_connection_handle(existing_conn.addr, &existing_conn)
+                    {
+                        return Ok(handle);
                     }
+                    return Err(GossipError::Network(std::io::Error::other(
+                        "Existing connection missing writer handle",
+                    )));
                 }
             }
         }

@@ -41,10 +41,13 @@ impl PendingAsk {
     }
 
     pub(crate) async fn wait(self) -> Result<bytes::Bytes> {
-        let response = self
-            .correlation
-            .wait_for_response(self.correlation_id, self.timeout)
-            .await?;
+        let this = std::mem::ManuallyDrop::new(self);
+        let correlation_id = this.correlation_id;
+        let timeout = this.timeout;
+        // `wait(self)` consumes the handle, so a successful/terminal wait no longer needs
+        // the drop-time cancellation path that is only for abandoned pending asks.
+        let correlation = unsafe { std::ptr::read(&this.correlation) };
+        let response = correlation.wait_for_response(correlation_id, timeout).await?;
         Ok(response.into_bytes())
     }
 }
@@ -568,10 +571,7 @@ impl<T> ConnectionHandle<T> {
             schema_hash,
             payload.len(),
         );
-        if let Err(e) = self
-            .write_header_and_payload_ask_inline32(header, payload)
-            .await
-        {
+        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
             self.correlation.cancel(correlation_id);
             return Err(e);
         }
@@ -612,10 +612,7 @@ impl<T> ConnectionHandle<T> {
             payload.len(),
         );
 
-        if let Err(e) = self
-            .write_header_and_payload_ask_inline32(header, payload)
-            .await
-        {
+        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
             self.correlation.cancel(correlation_id);
             return Err(e);
         }
@@ -623,6 +620,37 @@ impl<T> ConnectionHandle<T> {
         self.correlation
             .wait_for_response_no_timeout(correlation_id)
             .await
+    }
+
+    /// Send an actor ask frame and return a deferred handle that can be awaited later.
+    pub(crate) async fn ask_actor_frame_deferred(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+    ) -> Result<PendingAsk> {
+        let correlation_id = self.correlation.allocate();
+        let schema_hash = self.schema_hash();
+        let header = crate::framing::write_actor_frame_header(
+            crate::MessageType::ActorAsk,
+            correlation_id,
+            actor_id,
+            type_hash,
+            schema_hash,
+            payload.len(),
+        );
+
+        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
+            self.correlation.cancel(correlation_id);
+            return Err(e);
+        }
+
+        Ok(PendingAsk {
+            correlation_id,
+            correlation: self.correlation.clone(),
+            timeout,
+        })
     }
 
     /// Tell with typed payload (rkyv) and debug-only type hash verification.

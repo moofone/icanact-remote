@@ -12,6 +12,11 @@ pub struct ReadContext {
     pub(crate) expected_schema_hash: Option<u64>,
     pub(crate) aligned_pool: Arc<crate::AlignedBytesPool>,
     pub(crate) response_correlation: Option<Arc<CorrelationTracker>>,
+    pub(crate) response_writer: Option<Arc<crate::ask_responder::ResponseWriter>>,
+    pub(crate) tell_handler_sync: Option<Arc<crate::registry::ActorTellHandlerSyncCell>>,
+    pub(crate) ask_immediate_handler_sync:
+        Option<Arc<crate::registry::ActorAskImmediateHandlerSyncCell>>,
+    pub(crate) ask_handler_sync: Option<Arc<crate::registry::ActorAskHandlerSyncCell>>,
     pub(crate) sync_actor_handler: Option<Arc<crate::registry::ActorMessageHandlerSyncCell>>,
 }
 
@@ -159,12 +164,12 @@ fn try_handle_read_fast_from_pooled(
             if correlation.complete(correlation_id, &mut payload) {
                 return Ok(FastReadOutcome::Handled);
             }
-            return Ok(FastReadOutcome::Parsed(
-                ReadIoResult::Generic(crate::handle::MessageReadResult::Response {
+            return Ok(FastReadOutcome::Parsed(ReadIoResult::Generic(
+                crate::handle::MessageReadResult::Response {
                     correlation_id,
                     payload: payload.expect("payload retained when response was not consumed"),
-                }),
-            ));
+                },
+            )));
         }
 
         if msg_len >= crate::framing::DIRECT_RESPONSE_HEADER_LEN
@@ -186,12 +191,13 @@ fn try_handle_read_fast_from_pooled(
             if correlation.complete(correlation_id, &mut payload) {
                 return Ok(FastReadOutcome::Handled);
             }
-            return Ok(FastReadOutcome::Parsed(
-                ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
+            return Ok(FastReadOutcome::Parsed(ReadIoResult::Generic(
+                crate::handle::MessageReadResult::DirectResponse {
                     correlation_id,
-                    payload: payload.expect("payload retained when direct response was not consumed"),
-                }),
-            ));
+                    payload: payload
+                        .expect("payload retained when direct response was not consumed"),
+                },
+            )));
         }
     }
 
@@ -214,15 +220,18 @@ fn try_handle_read_fast_from_pooled(
         }));
     }
 
-    let Some(cell) = ctx.sync_actor_handler.as_ref() else {
-        return Ok(FastReadOutcome::Unhandled(buffer));
-    };
     if msg_len < crate::framing::ACTOR_HEADER_LEN {
         return Ok(FastReadOutcome::Unhandled(buffer));
     }
 
     if msg_data[0] != crate::MessageType::ActorTell as u8 {
         if msg_data[0] != crate::MessageType::ActorAsk as u8 {
+            return Ok(FastReadOutcome::Unhandled(buffer));
+        }
+        if ctx.ask_immediate_handler_sync.is_none()
+            && ctx.ask_handler_sync.is_none()
+            && ctx.sync_actor_handler.is_none()
+        {
             return Ok(FastReadOutcome::Unhandled(buffer));
         }
         let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
@@ -252,6 +261,9 @@ fn try_handle_read_fast_from_pooled(
             payload,
         }));
     }
+    if ctx.tell_handler_sync.is_none() && ctx.sync_actor_handler.is_none() {
+        return Ok(FastReadOutcome::Unhandled(buffer));
+    }
     if msg_data[1] != 0 || msg_data[2] != 0 {
         return Ok(FastReadOutcome::Unhandled(buffer));
     }
@@ -273,9 +285,17 @@ fn try_handle_read_fast_from_pooled(
     }
 
     let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::ACTOR_HEADER_LEN;
-    let payload = crate::AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
-    let _ = cell.handle(actor_id, type_hash, payload, None);
-    Ok(FastReadOutcome::Handled)
+    let payload =
+        crate::AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
+    if let Some(cell) = ctx.tell_handler_sync.as_ref() {
+        let _ = cell.handle(actor_id, type_hash, payload);
+        return Ok(FastReadOutcome::Handled);
+    }
+    if let Some(cell) = ctx.sync_actor_handler.as_ref() {
+        let _ = cell.handle(actor_id, type_hash, payload, None);
+        return Ok(FastReadOutcome::Handled);
+    }
+    unreachable!("actor tell path checked handler presence before payload extraction")
 }
 
 fn poll_read_once<S>(stream: &mut S, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize>>
@@ -415,11 +435,9 @@ where
                             }));
                         }
                         FastReadOutcome::Parsed(result) => result,
-                        FastReadOutcome::Unhandled(buffer) => {
-                            ReadIoResult::Generic(
-                                crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
-                            )
-                        }
+                        FastReadOutcome::Unhandled(buffer) => ReadIoResult::Generic(
+                            crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
+                        ),
                     };
                     Poll::Ready(Ok(ReadPollResult {
                         result: Some(result),
@@ -552,11 +570,9 @@ where
                             }));
                         }
                         FastReadOutcome::Parsed(result) => result,
-                        FastReadOutcome::Unhandled(buffer) => {
-                            ReadIoResult::Generic(
-                                crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
-                            )
-                        }
+                        FastReadOutcome::Unhandled(buffer) => ReadIoResult::Generic(
+                            crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
+                        ),
                     };
                     Poll::Ready(Ok(ReadPollResult {
                         result: Some(result),
@@ -720,6 +736,252 @@ where
         }
     }
 
+    Ok(())
+}
+
+fn ask_context_from_context(
+    ctx: &ReadContext,
+    correlation_id: u16,
+) -> Option<crate::AskContext<'_>> {
+    ctx.response_writer
+        .as_ref()
+        .map(|writer| crate::AskContext::from_writer(correlation_id, writer))
+}
+
+async fn write_ask_disposition_io<S>(
+    ctx: &ReadContext,
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    response_batch: &mut ResponseBatch,
+    wrote_response_bytes: &mut bool,
+    correlation_id: u16,
+    disposition: crate::registry::AskDisposition,
+    perf: Option<&IoPerfCounters>,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let write_start = perf.map(|_| Instant::now());
+    let inline_payload_limit = ctx
+        .max_message_size
+        .saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
+    let schema_hash = ctx.expected_schema_hash;
+    match disposition {
+        crate::registry::AskDisposition::Deferred => {}
+        crate::registry::AskDisposition::Immediate(response) => match response {
+            crate::registry::ActorResponse::Bytes(payload) => {
+                let should_stream =
+                    payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
+                if should_stream {
+                    write_streaming_response_direct(
+                        stream,
+                        bytes_written_counter,
+                        bytes_since_flush,
+                        correlation_id,
+                        payload,
+                        ctx.max_message_size,
+                        schema_hash,
+                    )
+                    .await?;
+                    *wrote_response_bytes = true;
+                    if flush_each_actor_response() {
+                        stream.flush().await.map_err(GossipError::Network)?;
+                        *bytes_since_flush = 0;
+                    }
+                } else {
+                    response_batch.push_bytes(correlation_id, payload);
+                    *wrote_response_bytes = true;
+                }
+            }
+            crate::registry::ActorResponse::Aligned(payload) => {
+                let len = payload.len();
+                let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
+                if should_stream {
+                    write_streaming_response_direct(
+                        stream,
+                        bytes_written_counter,
+                        bytes_since_flush,
+                        correlation_id,
+                        payload.into_bytes(),
+                        ctx.max_message_size,
+                        schema_hash,
+                    )
+                    .await?;
+                    *wrote_response_bytes = true;
+                    if flush_each_actor_response() {
+                        stream.flush().await.map_err(GossipError::Network)?;
+                        *bytes_since_flush = 0;
+                    }
+                } else {
+                    response_batch.push_bytes(correlation_id, payload.into_bytes());
+                    *wrote_response_bytes = true;
+                }
+            }
+            other => {
+                let should_stream = match &other {
+                    crate::registry::ActorResponse::Pooled { payload_len, .. } => {
+                        *payload_len > inline_payload_limit || *payload_len > STREAMING_THRESHOLD
+                    }
+                    _ => false,
+                };
+                if should_stream {
+                    if let crate::registry::ActorResponse::Pooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    } = other
+                    {
+                        write_streaming_response_direct_pooled(
+                            stream,
+                            bytes_written_counter,
+                            bytes_since_flush,
+                            correlation_id,
+                            payload,
+                            prefix,
+                            payload_len,
+                            ctx.max_message_size,
+                            schema_hash,
+                        )
+                        .await?;
+                    } else {
+                        let bytes = match other {
+                            crate::registry::ActorResponse::Bytes(b) => b,
+                            crate::registry::ActorResponse::Aligned(b) => b.into_bytes(),
+                            crate::registry::ActorResponse::Pooled { .. } => unreachable!(),
+                        };
+                        write_streaming_response_direct(
+                            stream,
+                            bytes_written_counter,
+                            bytes_since_flush,
+                            correlation_id,
+                            bytes,
+                            ctx.max_message_size,
+                            schema_hash,
+                        )
+                        .await?;
+                    }
+                    *wrote_response_bytes = true;
+                    if flush_each_actor_response() {
+                        stream.flush().await.map_err(GossipError::Network)?;
+                        *bytes_since_flush = 0;
+                    }
+                } else {
+                    write_actor_response_direct(
+                        stream,
+                        bytes_written_counter,
+                        bytes_since_flush,
+                        correlation_id,
+                        other,
+                    )
+                    .await?;
+                    *wrote_response_bytes = true;
+                    if flush_each_actor_response() {
+                        stream.flush().await.map_err(GossipError::Network)?;
+                        *bytes_since_flush = 0;
+                    }
+                }
+            }
+        },
+        crate::registry::AskDisposition::ImmediateBytes(payload) => {
+            let should_stream =
+                payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
+            if should_stream {
+                write_streaming_response_direct(
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    correlation_id,
+                    payload,
+                    ctx.max_message_size,
+                    schema_hash,
+                )
+                .await?;
+                *wrote_response_bytes = true;
+                if flush_each_actor_response() {
+                    stream.flush().await.map_err(GossipError::Network)?;
+                    *bytes_since_flush = 0;
+                }
+            } else {
+                response_batch.push_bytes(correlation_id, payload);
+                *wrote_response_bytes = true;
+            }
+        }
+        crate::registry::AskDisposition::ImmediateAligned(payload) => {
+            let len = payload.len();
+            let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
+            if should_stream {
+                write_streaming_response_direct(
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    correlation_id,
+                    payload.into_bytes(),
+                    ctx.max_message_size,
+                    schema_hash,
+                )
+                .await?;
+                *wrote_response_bytes = true;
+                if flush_each_actor_response() {
+                    stream.flush().await.map_err(GossipError::Network)?;
+                    *bytes_since_flush = 0;
+                }
+            } else {
+                response_batch.push_bytes(correlation_id, payload.into_bytes());
+                *wrote_response_bytes = true;
+            }
+        }
+        crate::registry::AskDisposition::ImmediatePooled {
+            payload,
+            prefix,
+            payload_len,
+        } => {
+            let should_stream =
+                payload_len > inline_payload_limit || payload_len > STREAMING_THRESHOLD;
+            if should_stream {
+                write_streaming_response_direct_pooled(
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    correlation_id,
+                    payload,
+                    prefix,
+                    payload_len,
+                    ctx.max_message_size,
+                    schema_hash,
+                )
+                .await?;
+                *wrote_response_bytes = true;
+                if flush_each_actor_response() {
+                    stream.flush().await.map_err(GossipError::Network)?;
+                    *bytes_since_flush = 0;
+                }
+            } else {
+                write_actor_response_direct(
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    correlation_id,
+                    crate::registry::ActorResponse::Pooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    },
+                )
+                .await?;
+                *wrote_response_bytes = true;
+                if flush_each_actor_response() {
+                    stream.flush().await.map_err(GossipError::Network)?;
+                    *bytes_since_flush = 0;
+                }
+            }
+        }
+    }
+    if let (Some(perf), Some(start)) = (perf, write_start) {
+        perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+        perf.response_write_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -1091,6 +1353,19 @@ where
                 0
             };
             let correlation_opt = if corr_id == 0 { None } else { Some(corr_id) };
+            if msg_type == crate::MessageType::ActorTell as u8
+                && let Some(cell) = registry.actor_tell_handler_sync.load_full()
+            {
+                let handle_start = perf.map(|_| Instant::now());
+                cell.handle(actor_id, type_hash, payload)?;
+                if let (Some(perf), Some(start)) = (perf, handle_start) {
+                    perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.actor_handle_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+
             let handle_start = perf.map(|_| Instant::now());
             let response = if let Some(cell) = sync_actor_handler {
                 cell.handle(actor_id, type_hash, payload, correlation_opt)
@@ -1104,138 +1379,36 @@ where
                 perf.actor_handle_ns
                     .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            if let Ok(Some(response)) = response {
-                if corr_id != 0 {
-                    let write_start = perf.map(|_| Instant::now());
-                    let inline_payload_limit = registry
-                        .config
-                        .max_message_size
-                        .saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
-                    let schema_hash = registry.config.schema_hash;
-                    match response {
-                        // Hot path (console bench): zero-copy batchable payloads.
-                        crate::registry::ActorResponse::Bytes(payload) => {
-                            let should_stream = payload.len() > inline_payload_limit
-                                || payload.len() > STREAMING_THRESHOLD;
-                            if should_stream {
-                                write_streaming_response_direct(
-                                    stream,
-                                    bytes_written_counter,
-                                    bytes_since_flush,
-                                    corr_id,
-                                    payload,
-                                    registry.config.max_message_size,
-                                    schema_hash,
-                                )
-                                .await?;
-                                if flush_each_actor_response() {
-                                    stream.flush().await.map_err(GossipError::Network)?;
-                                    *bytes_since_flush = 0;
-                                }
-                            } else {
-                                response_batch.push_bytes(corr_id, payload);
-                            }
-                        }
-                        crate::registry::ActorResponse::Aligned(payload) => {
-                            let len = payload.len();
-                            let should_stream =
-                                len > inline_payload_limit || len > STREAMING_THRESHOLD;
-                            if should_stream {
-                                write_streaming_response_direct(
-                                    stream,
-                                    bytes_written_counter,
-                                    bytes_since_flush,
-                                    corr_id,
-                                    payload.into_bytes(),
-                                    registry.config.max_message_size,
-                                    schema_hash,
-                                )
-                                .await?;
-                                if flush_each_actor_response() {
-                                    stream.flush().await.map_err(GossipError::Network)?;
-                                    *bytes_since_flush = 0;
-                                }
-                            } else {
-                                response_batch.push_bytes(corr_id, payload.into_bytes());
-                            }
-                        }
-                        // Less common: keep correctness, allow existing slow-path writes.
-                        other => {
-                            let should_stream = match &other {
-                                crate::registry::ActorResponse::Pooled { payload_len, .. } => {
-                                    *payload_len > inline_payload_limit
-                                        || *payload_len > STREAMING_THRESHOLD
-                                }
-                                _ => false,
-                            };
-                            if should_stream {
-                                if let crate::registry::ActorResponse::Pooled {
-                                    payload,
-                                    prefix,
-                                    payload_len,
-                                } = other
-                                {
-                                    // Stream pooled responses directly from the Buf (no materialization copy).
-                                    write_streaming_response_direct_pooled(
-                                        stream,
-                                        bytes_written_counter,
-                                        bytes_since_flush,
-                                        corr_id,
-                                        payload,
-                                        prefix,
-                                        payload_len,
-                                        registry.config.max_message_size,
-                                        schema_hash,
-                                    )
-                                    .await?;
-                                } else {
-                                    // Non-pooled non-hot-path variant: stream by converting to Bytes.
-                                    let bytes = match other {
-                                        crate::registry::ActorResponse::Bytes(b) => b,
-                                        crate::registry::ActorResponse::Aligned(b) => {
-                                            b.into_bytes()
-                                        }
-                                        crate::registry::ActorResponse::Pooled { .. } => {
-                                            unreachable!()
-                                        }
-                                    };
-                                    write_streaming_response_direct(
-                                        stream,
-                                        bytes_written_counter,
-                                        bytes_since_flush,
-                                        corr_id,
-                                        bytes,
-                                        registry.config.max_message_size,
-                                        schema_hash,
-                                    )
-                                    .await?;
-                                }
-                                if flush_each_actor_response() {
-                                    stream.flush().await.map_err(GossipError::Network)?;
-                                    *bytes_since_flush = 0;
-                                }
-                            } else {
-                                write_actor_response_direct(
-                                    stream,
-                                    bytes_written_counter,
-                                    bytes_since_flush,
-                                    corr_id,
-                                    other,
-                                )
-                                .await?;
-                                if flush_each_actor_response() {
-                                    stream.flush().await.map_err(GossipError::Network)?;
-                                    *bytes_since_flush = 0;
-                                }
-                            }
-                        }
-                    }
-                    if let (Some(perf), Some(start)) = (perf, write_start) {
-                        perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                        perf.response_write_ns
-                            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    }
-                }
+            if let Ok(Some(response)) = response
+                && corr_id != 0
+            {
+                let temp_ctx = ReadContext {
+                    registry_weak: Arc::downgrade(registry),
+                    peer_addr,
+                    peer_id: None,
+                    max_message_size: registry.config.max_message_size,
+                    expected_schema_hash: registry.config.schema_hash,
+                    aligned_pool: registry.connection_pool.aligned_bytes_pool(),
+                    response_correlation: None,
+                    response_writer: None,
+                    tell_handler_sync: None,
+                    ask_immediate_handler_sync: None,
+                    ask_handler_sync: None,
+                    sync_actor_handler: None,
+                };
+                let mut wrote_response_bytes = false;
+                write_ask_disposition_io(
+                    &temp_ctx,
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    response_batch,
+                    &mut wrote_response_bytes,
+                    corr_id,
+                    crate::registry::AskDisposition::Immediate(response),
+                    perf,
+                )
+                .await?;
             }
             Ok(())
         }
@@ -1295,8 +1468,8 @@ where
     S: AsyncWrite + Unpin,
 {
     async fn handle_fast_actor_sync_io<S>(
-        cell: &crate::registry::ActorMessageHandlerSyncCell,
         ctx: &ReadContext,
+        msg_type: u8,
         actor_id: u64,
         type_hash: u32,
         payload: crate::AlignedBytes,
@@ -1311,6 +1484,105 @@ where
     where
         S: AsyncWrite + Unpin,
     {
+        if msg_type == crate::MessageType::ActorAsk as u8
+            && ctx.ask_immediate_handler_sync.is_none()
+            && ctx.ask_handler_sync.is_none()
+            && let Some(cell) = ctx.sync_actor_handler.as_ref()
+        {
+            let handle_start = perf.map(|_| Instant::now());
+            let response = cell.handle(actor_id, type_hash, payload, correlation_id);
+            if let (Some(perf), Some(start)) = (perf, handle_start) {
+                perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+                perf.actor_handle_ns
+                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            if let Some(correlation_id) = correlation_id
+                && let Ok(Some(response)) = response
+            {
+                write_ask_disposition_io(
+                    ctx,
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    response_batch,
+                    wrote_response_bytes,
+                    correlation_id,
+                    crate::registry::AskDisposition::Immediate(response),
+                    perf,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
+        if msg_type == crate::MessageType::ActorTell as u8 {
+            if let Some(cell) = ctx.tell_handler_sync.as_ref() {
+                let handle_start = perf.map(|_| Instant::now());
+                let result = cell.handle(actor_id, type_hash, payload);
+                if let (Some(perf), Some(start)) = (perf, handle_start) {
+                    perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.actor_handle_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                result?;
+                return Ok(());
+            }
+        } else if msg_type == crate::MessageType::ActorAsk as u8
+            && let Some(correlation_id) = correlation_id
+        {
+            if let Some(cell) = ctx.ask_immediate_handler_sync.as_ref()
+                && cell.can_handle(actor_id, type_hash)
+            {
+                let handle_start = perf.map(|_| Instant::now());
+                let disposition = cell.handle(actor_id, type_hash, payload)?;
+                if let (Some(perf), Some(start)) = (perf, handle_start) {
+                    perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.actor_handle_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                write_ask_disposition_io(
+                    ctx,
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    response_batch,
+                    wrote_response_bytes,
+                    correlation_id,
+                    disposition,
+                    perf,
+                )
+                .await?;
+                return Ok(());
+            }
+            if let Some(cell) = ctx.ask_handler_sync.as_ref()
+                && let Some(context) = ask_context_from_context(ctx, correlation_id)
+            {
+                let handle_start = perf.map(|_| Instant::now());
+                let disposition = cell.handle(actor_id, type_hash, payload, context)?;
+                if let (Some(perf), Some(start)) = (perf, handle_start) {
+                    perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.actor_handle_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                write_ask_disposition_io(
+                    ctx,
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    response_batch,
+                    wrote_response_bytes,
+                    correlation_id,
+                    disposition,
+                    perf,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        let Some(cell) = ctx.sync_actor_handler.as_ref() else {
+            return Ok(());
+        };
         let handle_start = perf.map(|_| Instant::now());
         let response = cell.handle(actor_id, type_hash, payload, correlation_id);
         if let (Some(perf), Some(start)) = (perf, handle_start) {
@@ -1319,137 +1591,21 @@ where
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
-        let Some(correlation_id) = correlation_id else {
-            return Ok(());
-        };
-
-        if let Ok(Some(response)) = response {
-            let write_start = perf.map(|_| Instant::now());
-            let inline_payload_limit = ctx
-                .max_message_size
-                .saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
-            let schema_hash = ctx.expected_schema_hash;
-            match response {
-                crate::registry::ActorResponse::Bytes(payload) => {
-                    let should_stream =
-                        payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
-                    if should_stream {
-                        write_streaming_response_direct(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
-                            correlation_id,
-                            payload,
-                            ctx.max_message_size,
-                            schema_hash,
-                        )
-                        .await?;
-                        *wrote_response_bytes = true;
-                        if flush_each_actor_response() {
-                            stream.flush().await.map_err(GossipError::Network)?;
-                            *bytes_since_flush = 0;
-                        }
-                    } else {
-                        response_batch.push_bytes(correlation_id, payload);
-                        *wrote_response_bytes = true;
-                    }
-                }
-                crate::registry::ActorResponse::Aligned(payload) => {
-                    let len = payload.len();
-                    let should_stream =
-                        len > inline_payload_limit || len > STREAMING_THRESHOLD;
-                    if should_stream {
-                        write_streaming_response_direct(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
-                            correlation_id,
-                            payload.into_bytes(),
-                            ctx.max_message_size,
-                            schema_hash,
-                        )
-                        .await?;
-                        *wrote_response_bytes = true;
-                        if flush_each_actor_response() {
-                            stream.flush().await.map_err(GossipError::Network)?;
-                            *bytes_since_flush = 0;
-                        }
-                    } else {
-                        response_batch.push_bytes(correlation_id, payload.into_bytes());
-                        *wrote_response_bytes = true;
-                    }
-                }
-                other => {
-                    let should_stream = match &other {
-                        crate::registry::ActorResponse::Pooled { payload_len, .. } => {
-                            *payload_len > inline_payload_limit
-                                || *payload_len > STREAMING_THRESHOLD
-                        }
-                        _ => false,
-                    };
-                    if should_stream {
-                        if let crate::registry::ActorResponse::Pooled {
-                            payload,
-                            prefix,
-                            payload_len,
-                        } = other
-                        {
-                            write_streaming_response_direct_pooled(
-                                stream,
-                                bytes_written_counter,
-                                bytes_since_flush,
-                                correlation_id,
-                                payload,
-                                prefix,
-                                payload_len,
-                                ctx.max_message_size,
-                                schema_hash,
-                            )
-                            .await?;
-                        } else {
-                            let bytes = match other {
-                                crate::registry::ActorResponse::Bytes(b) => b,
-                                crate::registry::ActorResponse::Aligned(b) => b.into_bytes(),
-                                crate::registry::ActorResponse::Pooled { .. } => unreachable!(),
-                            };
-                            write_streaming_response_direct(
-                                stream,
-                                bytes_written_counter,
-                                bytes_since_flush,
-                                correlation_id,
-                                bytes,
-                                ctx.max_message_size,
-                                schema_hash,
-                            )
-                            .await?;
-                        }
-                        *wrote_response_bytes = true;
-                        if flush_each_actor_response() {
-                            stream.flush().await.map_err(GossipError::Network)?;
-                            *bytes_since_flush = 0;
-                        }
-                    } else {
-                        write_actor_response_direct(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
-                            correlation_id,
-                            other,
-                        )
-                        .await?;
-                        *wrote_response_bytes = true;
-                        if flush_each_actor_response() {
-                            stream.flush().await.map_err(GossipError::Network)?;
-                            *bytes_since_flush = 0;
-                        }
-                    }
-                }
-            }
-            if let (Some(perf), Some(start)) = (perf, write_start) {
-                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                perf.response_write_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
+        if let Some(correlation_id) = correlation_id
+            && let Ok(Some(response)) = response
+        {
+            write_ask_disposition_io(
+                ctx,
+                stream,
+                bytes_written_counter,
+                bytes_since_flush,
+                response_batch,
+                wrote_response_bytes,
+                correlation_id,
+                crate::registry::AskDisposition::Immediate(response),
+                perf,
+            )
+            .await?;
         }
 
         Ok(())
@@ -1476,7 +1632,10 @@ where
             type_hash,
             payload,
         } => {
-            let Some(cell) = ctx.sync_actor_handler.as_ref() else {
+            if ctx.ask_immediate_handler_sync.is_none()
+                && ctx.ask_handler_sync.is_none()
+                && ctx.sync_actor_handler.is_none()
+            {
                 return Ok(Some(crate::handle::MessageReadResult::Actor {
                     msg_type: crate::MessageType::ActorAsk as u8,
                     correlation_id,
@@ -1485,10 +1644,10 @@ where
                     schema_hash: ctx.expected_schema_hash,
                     payload,
                 }));
-            };
+            }
             handle_fast_actor_sync_io(
-                cell,
                 ctx,
+                crate::MessageType::ActorAsk as u8,
                 actor_id,
                 type_hash,
                 payload,
@@ -1513,7 +1672,12 @@ where
         }) => {
             let is_tell = msg_type == crate::MessageType::ActorTell as u8 && correlation_id == 0;
             let is_ask = msg_type == crate::MessageType::ActorAsk as u8 && correlation_id != 0;
-            let Some(cell) = ctx.sync_actor_handler.as_ref().filter(|_| is_tell || is_ask) else {
+            let has_split = (is_tell && ctx.tell_handler_sync.is_some())
+                || (is_ask
+                    && (ctx.ask_immediate_handler_sync.is_some()
+                        || ctx.ask_handler_sync.is_some()));
+            let has_legacy = ctx.sync_actor_handler.is_some() && (is_tell || is_ask);
+            if !has_split && !has_legacy {
                 return Ok(Some(crate::handle::MessageReadResult::Actor {
                     msg_type,
                     correlation_id,
@@ -1522,7 +1686,7 @@ where
                     schema_hash,
                     payload,
                 }));
-            };
+            }
 
             if let Some(expected) = ctx.expected_schema_hash
                 && schema_hash != Some(expected)
@@ -1530,8 +1694,8 @@ where
                 return Ok(None);
             }
             handle_fast_actor_sync_io(
-                cell,
                 ctx,
+                msg_type,
                 actor_id,
                 type_hash,
                 payload,

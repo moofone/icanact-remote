@@ -11,8 +11,10 @@ pub struct ConnectionPool<T = ()> {
     pub peer_id_to_addr: SccHashMap<crate::PeerId, SocketAddr>,
     /// Address-based connection index for fast lookup by SocketAddr
     pub connections_by_addr: SccHashMap<SocketAddr, Arc<LockFreeConnection>>,
-    /// Shared correlation trackers by peer ID - ensures ask/response works across bidirectional connections
-    correlation_trackers: SccHashMap<crate::PeerId, Arc<CorrelationTracker>>,
+    /// Stable per-peer session state that survives reconnects.
+    peer_sessions: SccHashMap<crate::PeerId, Arc<PeerSession>>,
+    /// Cold-path dial ownership gate keyed by address so concurrent callers share one outbound dial.
+    outbound_dial_gates: SccHashMap<SocketAddr, Arc<OutboundDialGate>>,
     max_connections: usize,
     connection_timeout: Duration,
     /// Registry reference for handling incoming messages
@@ -26,4 +28,87 @@ pub struct ConnectionPool<T = ()> {
     /// Connection counter for load balancing
     connection_counter: AtomicUsize,
     _marker: PhantomData<fn() -> T>,
+}
+
+struct PeerSession {
+    configured_addr: std::sync::RwLock<Option<SocketAddr>>,
+    correlation: Arc<CorrelationTracker>,
+    current_connection: ArcSwapOption<LockFreeConnection>,
+}
+
+impl PeerSession {
+    fn new() -> Self {
+        Self {
+            configured_addr: std::sync::RwLock::new(None),
+            correlation: CorrelationTracker::new(),
+            current_connection: ArcSwapOption::empty(),
+        }
+    }
+
+    fn configured_addr(&self) -> Option<SocketAddr> {
+        *self
+            .configured_addr
+            .read()
+            .expect("peer session configured_addr poisoned")
+    }
+
+    fn set_configured_addr(&self, addr: SocketAddr) {
+        *self
+            .configured_addr
+            .write()
+            .expect("peer session configured_addr poisoned") = Some(addr);
+    }
+
+    fn current_connection(&self) -> Option<Arc<LockFreeConnection>> {
+        self.current_connection.load_full()
+    }
+
+    fn set_current_connection(&self, connection: Option<Arc<LockFreeConnection>>) {
+        self.current_connection.store(connection);
+    }
+}
+
+const OUTBOUND_DIAL_PENDING: u8 = 0;
+const OUTBOUND_DIAL_SUCCEEDED: u8 = 1;
+const OUTBOUND_DIAL_FAILED: u8 = 2;
+
+struct OutboundDialGate {
+    state: AtomicU8,
+    notify: Notify,
+}
+
+impl OutboundDialGate {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(OUTBOUND_DIAL_PENDING),
+            notify: Notify::new(),
+        }
+    }
+
+    fn finish(&self, succeeded: bool) {
+        self.state.store(
+            if succeeded {
+                OUTBOUND_DIAL_SUCCEEDED
+            } else {
+                OUTBOUND_DIAL_FAILED
+            },
+            Ordering::Release,
+        );
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.state.load(Ordering::Acquire) != OUTBOUND_DIAL_PENDING {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+enum OutboundDialLease {
+    Leader(Arc<OutboundDialGate>),
+    Follower(Arc<OutboundDialGate>),
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct RemoteConnection {
     pub addr: SocketAddr,
-    inner: Arc<crate::connection_pool::ConnectionHandle>,
+    inner: crate::connection_pool::ConnectionHandle,
 }
 
 impl RemoteConnection {
@@ -17,7 +17,7 @@ impl RemoteConnection {
         let addr = handle.addr;
         Self {
             addr,
-            inner: Arc::new(handle),
+            inner: handle,
         }
     }
 
@@ -110,6 +110,20 @@ impl RemoteConnection {
         self.inner
             .ask_actor_frame_no_timeout_aligned(actor_id, type_hash, payload)
             .await
+    }
+
+    pub async fn ask_actor_frame_deferred(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+    ) -> crate::Result<crate::DeferredAsk> {
+        let pending = self
+            .inner
+            .ask_actor_frame_deferred(actor_id, type_hash, payload, timeout)
+            .await?;
+        Ok(crate::DeferredAsk::from_pending(pending))
     }
 
     pub async fn ask_with_timeout_bytes(
