@@ -1243,6 +1243,8 @@ impl<T> ConnectionPool<T> {
 
             match self.acquire_outbound_dial_gate(addr) {
                 OutboundDialLease::Leader(gate) => {
+                    let mut gate_completion =
+                        OutboundDialGateCompletion::new(self, addr, gate.clone());
                     let result = self
                         .connect_via_stream(
                             addr,
@@ -1252,7 +1254,7 @@ impl<T> ConnectionPool<T> {
                             registry_weak.clone(),
                         )
                         .await;
-                    self.finish_outbound_dial_gate(addr, &gate, result.is_ok());
+                    gate_completion.finish(result.is_ok());
                     return result;
                 }
                 OutboundDialLease::Follower(gate) => {

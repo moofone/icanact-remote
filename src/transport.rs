@@ -4,8 +4,8 @@ use futures::future::BoxFuture;
 use tokio::net as tokio_net;
 
 use crate::{
-    GossipConfig, NodeId, PeerId, Result, SecretKey, handshake::PeerCapabilities,
-    registry::GossipRegistry,
+    GossipConfig, NodeId, PeerId, Result, SecretKey, config::ConnectionRecoveryPolicy,
+    handshake::PeerCapabilities, registry::GossipRegistry,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +84,9 @@ pub trait RegistryTransportBootstrap {
     fn stack_name(&self) -> &'static str;
     fn wire_kind(&self) -> TransportWireKind {
         TransportWireKind::TcpStream
+    }
+    fn connection_recovery_policy(&self) -> Option<ConnectionRecoveryPolicy> {
+        None
     }
     fn prepare_config(&self, secret_key: &SecretKey, config: &mut GossipConfig) -> Result<()>;
     fn configure_registry(

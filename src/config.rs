@@ -45,6 +45,31 @@ pub struct TcpKeepaliveConfig {
     pub retries: Option<u32>,
 }
 
+/// Domain-specific recovery behavior for cached peer connections.
+///
+/// Defaults are intentionally conservative for general actor traffic: a slow actor handler should
+/// not normally cause a transport session to be torn down. Latency-sensitive domains can opt in
+/// through their `RegistryTransportBootstrap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConnectionRecoveryPolicy {
+    /// On actor-ask timeout, evict the cached transport session for the target peer.
+    pub evict_peer_on_ask_timeout: bool,
+    /// On actor-ask cancellation, evict the cached transport session for the target peer.
+    pub evict_peer_on_ask_cancel: bool,
+    /// After evicting on timeout, reconnect and retry the actor ask once.
+    pub retry_actor_ask_once_after_timeout: bool,
+}
+
+impl ConnectionRecoveryPolicy {
+    pub const fn aggressive_ask_timeout_recovery() -> Self {
+        Self {
+            evict_peer_on_ask_timeout: true,
+            evict_peer_on_ask_cancel: true,
+            retry_actor_ask_once_after_timeout: true,
+        }
+    }
+}
+
 /// Configuration for the gossip registry
 #[derive(Debug, Clone)]
 pub struct GossipConfig {
@@ -113,6 +138,8 @@ pub struct GossipConfig {
     pub nat_role_reconnect_enabled: bool,
     /// TCP keepalive settings for faster idle disconnect detection
     pub tcp_keepalive: Option<TcpKeepaliveConfig>,
+    /// Optional domain-specific recovery policy for cached transport sessions.
+    pub connection_recovery: ConnectionRecoveryPolicy,
 
     // =================== Peer Discovery Configuration ===================
     /// Advertised address for peer discovery (what we tell others to connect to)
@@ -211,6 +238,7 @@ impl Default for GossipConfig {
                 interval: Duration::from_secs(DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS),
                 retries: Some(DEFAULT_TCP_KEEPALIVE_RETRIES),
             }),
+            connection_recovery: ConnectionRecoveryPolicy::default(),
             // Peer discovery defaults
             advertise_address: None,
             enable_peer_discovery: false, // Safe rollout: disabled by default
@@ -281,6 +309,10 @@ mod tests {
         assert_eq!(config.ask_window, DEFAULT_ASK_WINDOW);
         assert_eq!(config.dead_peer_timeout, Duration::from_secs(900));
         assert!(!config.nat_role_reconnect_enabled);
+        assert_eq!(
+            config.connection_recovery,
+            ConnectionRecoveryPolicy::default()
+        );
         // Peer discovery defaults
         assert!(config.advertise_address.is_none());
         assert!(!config.enable_peer_discovery); // Disabled by default for safe rollout
@@ -306,6 +338,15 @@ mod tests {
         assert_eq!(config.gossip_interval, cloned.gossip_interval);
         assert_eq!(config.max_gossip_peers, cloned.max_gossip_peers);
         assert_eq!(config.dead_peer_timeout, cloned.dead_peer_timeout);
+    }
+
+    #[test]
+    fn test_aggressive_connection_recovery_policy() {
+        let policy = ConnectionRecoveryPolicy::aggressive_ask_timeout_recovery();
+
+        assert!(policy.evict_peer_on_ask_timeout);
+        assert!(policy.evict_peer_on_ask_cancel);
+        assert!(policy.retry_actor_ask_once_after_timeout);
     }
 
     #[test]

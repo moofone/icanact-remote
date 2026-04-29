@@ -141,13 +141,13 @@ impl<T> ConnectionPool<T> {
                     "stream connect: performing TLS handshake"
                 );
                 let connector = tls_config.connector();
-                let mut tls_stream = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    connector.connect(server_name, stream),
-                )
-                .await
-                .map_err(|_| GossipError::Timeout)?
-                .map_err(|e| GossipError::TlsError(format!("TLS handshake failed: {}", e)))?;
+                let mut tls_stream =
+                    tokio::time::timeout(connection_timeout, connector.connect(server_name, stream))
+                        .await
+                        .map_err(|_| GossipError::Timeout)?
+                        .map_err(|e| {
+                            GossipError::TlsError(format!("TLS handshake failed: {}", e))
+                        })?;
 
                 if discovered_node_id.is_none() {
                     if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
@@ -163,12 +163,16 @@ impl<T> ConnectionPool<T> {
                 }
 
                 let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(|proto| proto.to_vec());
-                let peer_caps = crate::handshake::perform_hello_handshake(
-                    &mut tls_stream,
-                    negotiated_alpn.as_deref(),
-                    registry_arc.config.enable_peer_discovery,
+                let peer_caps = tokio::time::timeout(
+                    connection_timeout,
+                    crate::handshake::perform_hello_handshake(
+                        &mut tls_stream,
+                        negotiated_alpn.as_deref(),
+                        registry_arc.config.enable_peer_discovery,
+                    ),
                 )
-                .await?;
+                .await
+                .map_err(|_| GossipError::Timeout)??;
                 registry_arc.set_peer_capabilities(addr, peer_caps);
 
                 let associated_node_id = match discovered_node_id {

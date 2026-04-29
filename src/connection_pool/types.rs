@@ -187,6 +187,15 @@ impl LockFreeConnection {
         self.get_state() == ConnectionState::Connected
     }
 
+    pub(crate) fn has_live_stream(&self) -> bool {
+        self.is_connected()
+            && self
+                .stream_handle
+                .as_ref()
+                .map(|handle| !handle.exit_flag.load(Ordering::Acquire))
+                .unwrap_or(false)
+    }
+
     pub fn is_failed(&self) -> bool {
         self.get_state() == ConnectionState::Failed
     }
