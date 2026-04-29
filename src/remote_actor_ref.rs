@@ -343,6 +343,13 @@ impl Drop for ActorAskCancellationGuard {
 }
 
 impl<T> RemoteActorRef<T> {
+    fn remaining_until(deadline: tokio::time::Instant) -> crate::Result<std::time::Duration> {
+        deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(crate::GossipError::Timeout)
+    }
+
     async fn ask_actor_frame_with_deadline(
         conn: &RemoteConnection,
         actor_id: u64,
@@ -432,6 +439,7 @@ impl<T> RemoteActorRef<T> {
 
     async fn recover_connection_after_actor_ask_timeout(
         &self,
+        deadline: tokio::time::Instant,
     ) -> crate::Result<Option<RemoteConnection>> {
         let Some(registry) = self.registry.upgrade() else {
             return Err(crate::GossipError::Shutdown);
@@ -457,10 +465,13 @@ impl<T> RemoteActorRef<T> {
             return Ok(None);
         }
 
-        let handle = registry
-            .connection_pool
-            .get_connection_to_peer(peer_id)
-            .await?;
+        let remaining = Self::remaining_until(deadline)?;
+        let handle = tokio::time::timeout(
+            remaining,
+            registry.connection_pool.get_connection_to_peer(peer_id),
+        )
+        .await
+        .map_err(|_| crate::GossipError::Timeout)??;
         Ok(Some(RemoteConnection::from_handle(handle)))
     }
 
@@ -522,13 +533,15 @@ impl<T> RemoteActorRef<T> {
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
         let conn = self.connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut guard = self.actor_ask_cancellation_guard();
+        let remaining = Self::remaining_until(deadline)?;
         let result = Self::ask_actor_frame_with_deadline(
             conn,
             actor_id,
             type_hash,
             payload.clone(),
-            timeout,
+            remaining,
         )
         .await;
         if let Some(guard) = guard.as_mut() {
@@ -536,15 +549,18 @@ impl<T> RemoteActorRef<T> {
         }
         match result {
             Err(crate::GossipError::Timeout) => {
-                if let Some(reconnected) = self.recover_connection_after_actor_ask_timeout().await?
+                if let Some(reconnected) = self
+                    .recover_connection_after_actor_ask_timeout(deadline)
+                    .await?
                 {
                     let mut retry_guard = self.actor_ask_cancellation_guard();
+                    let remaining = Self::remaining_until(deadline)?;
                     let retry_result = Self::ask_actor_frame_with_deadline(
                         &reconnected,
                         actor_id,
                         type_hash,
                         payload,
-                        timeout,
+                        remaining,
                     )
                     .await;
                     if let Some(guard) = retry_guard.as_mut() {

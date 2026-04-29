@@ -166,14 +166,25 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
 }
 
-#[test]
-fn get_connection_by_peer_id_uses_session_current_connection() {
+#[tokio::test]
+async fn get_connection_by_peer_id_uses_session_current_connection() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer_id = crate::KeyPair::new_for_testing("session_current_connection").peer_id();
     let addr: SocketAddr = "127.0.0.1:40556".parse().unwrap();
 
-    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
     connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection.clone()));
 
     let _ = pool.connections_by_peer.remove_sync(&peer_id);
@@ -182,6 +193,42 @@ fn get_connection_by_peer_id_uses_session_current_connection() {
         .get_connection_by_peer_id(&peer_id)
         .expect("session should retain current connection");
     assert!(Arc::ptr_eq(&resolved, &connection));
+}
+
+#[tokio::test]
+async fn get_connection_by_peer_id_recovers_live_alias_connection() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("session_alias_connection").peer_id();
+    let configured_addr: SocketAddr = "127.0.0.1:40558".parse().unwrap();
+    let alias_addr: SocketAddr = "127.0.0.1:50558".parse().unwrap();
+
+    pool.set_configured_peer_addr(&peer_id, configured_addr);
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        alias_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
+
+    pool.index_connection_by_addr(alias_addr, connection.clone());
+    pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
+
+    let resolved = pool
+        .get_connection_by_peer_id(&peer_id)
+        .expect("alias should retain live inbound connection");
+    assert!(Arc::ptr_eq(&resolved, &connection));
+    assert!(pool.has_connection_by_peer_id(&peer_id));
+    assert_eq!(
+        pool.get_configured_peer_addr(&peer_id),
+        Some(configured_addr)
+    );
 }
 
 #[test]

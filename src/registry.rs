@@ -7986,13 +7986,24 @@ mod tests {
         }
         assert!(!reg.should_attempt_outbound_dial(peer_addr).await);
 
-        let conn = Arc::new(crate::connection_pool::LockFreeConnection::new(
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                io,
+                peer_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut conn = crate::connection_pool::LockFreeConnection::new(
             peer_addr,
             crate::connection_pool::ConnectionDirection::Outbound,
-        ));
+        );
+        conn.stream_handle = Some(Arc::new(stream_handle));
         conn.set_state(crate::connection_pool::ConnectionState::Connected);
         reg.connection_pool
-            .index_connection_by_addr(peer_addr, conn);
+            .index_connection_by_addr(peer_addr, Arc::new(conn));
 
         assert!(
             reg.should_attempt_outbound_dial(peer_addr).await,
