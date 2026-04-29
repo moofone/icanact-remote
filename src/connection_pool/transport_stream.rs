@@ -81,25 +81,17 @@ impl<T> ConnectionPool<T> {
 
         let mut dns_refreshed = false;
         loop {
-            let attempt: Result<ConnectionHandle<T>> = async {
-                debug!("CONNECTION POOL: Attempting to connect to {}", addr);
-                let stream = tokio::time::timeout(connection_timeout, TcpStream::connect(addr))
-                    .await
-                    .map_err(|_| {
-                        debug!(
-                            "CONNECTION POOL: Connection to {} timed out after {:?}",
-                            addr, connection_timeout
-                        );
-                        GossipError::Timeout
-                    })?
-                    .map_err(|e| {
+            let attempt: Result<ConnectionHandle<T>> =
+                match tokio::time::timeout(connection_timeout, async {
+                    debug!("CONNECTION POOL: Attempting to connect to {}", addr);
+                    let stream = TcpStream::connect(addr).await.map_err(|e| {
                         debug!(
                             "CONNECTION POOL: Connection to {} failed: {} (will retry in {}s if this is a gossip peer)",
                             addr, e, 5
                         );
                         GossipError::Network(e)
                     })?;
-                debug!("CONNECTION POOL: Successfully connected to {}", addr);
+                    debug!("CONNECTION POOL: Successfully connected to {}", addr);
 
                 stream.set_nodelay(true).map_err(GossipError::Network)?;
 
@@ -141,13 +133,9 @@ impl<T> ConnectionPool<T> {
                     "stream connect: performing TLS handshake"
                 );
                 let connector = tls_config.connector();
-                let mut tls_stream =
-                    tokio::time::timeout(connection_timeout, connector.connect(server_name, stream))
-                        .await
-                        .map_err(|_| GossipError::Timeout)?
-                        .map_err(|e| {
-                            GossipError::TlsError(format!("TLS handshake failed: {}", e))
-                        })?;
+                let mut tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
+                    GossipError::TlsError(format!("TLS handshake failed: {}", e))
+                })?;
 
                 if discovered_node_id.is_none() {
                     if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
@@ -163,16 +151,12 @@ impl<T> ConnectionPool<T> {
                 }
 
                 let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(|proto| proto.to_vec());
-                let peer_caps = tokio::time::timeout(
-                    connection_timeout,
-                    crate::handshake::perform_hello_handshake(
-                        &mut tls_stream,
-                        negotiated_alpn.as_deref(),
-                        registry_arc.config.enable_peer_discovery,
-                    ),
+                let peer_caps = crate::handshake::perform_hello_handshake(
+                    &mut tls_stream,
+                    negotiated_alpn.as_deref(),
+                    registry_arc.config.enable_peer_discovery,
                 )
-                .await
-                .map_err(|_| GossipError::Timeout)??;
+                .await?;
                 registry_arc.set_peer_capabilities(addr, peer_caps);
 
                 let associated_node_id = match discovered_node_id {
@@ -186,10 +170,20 @@ impl<T> ConnectionPool<T> {
                     registry_arc.mark_peer_connected(addr).await;
                 }
 
-                self.finalize_new_outbound_connection(addr, tls_stream, registry_weak.clone())
-                    .await
-            }
-            .await;
+                    self.finalize_new_outbound_connection(addr, tls_stream, registry_weak.clone())
+                        .await
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        debug!(
+                            "CONNECTION POOL: Connection attempt to {} timed out after {:?}",
+                            addr, connection_timeout
+                        );
+                        Err(GossipError::Timeout)
+                    }
+                };
 
             match attempt {
                 Ok(handle) => return Ok(handle),

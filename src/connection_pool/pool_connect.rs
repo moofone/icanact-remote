@@ -114,6 +114,9 @@ impl<T> ConnectionPool<T> {
     ) -> Option<ConnectionHandle<T>> {
         let correlation = self.handle_correlation(addr, conn);
         if let Some(stream_handle) = conn.stream_handle.as_ref() {
+            if !conn.is_connected() || stream_handle.exit_flag.load(Ordering::Acquire) {
+                return None;
+            }
             return Some(ConnectionHandle::new_stream(
                 addr,
                 stream_handle.clone(),
@@ -207,6 +210,31 @@ impl<T> ConnectionPool<T> {
         if should_clear {
             self.clear_current_peer_connection(peer_id);
         }
+    }
+
+    fn is_usable_connection(&self, conn: &LockFreeConnection) -> bool {
+        if self.is_udp_transport_enabled() {
+            conn.is_connected()
+        } else {
+            conn.has_live_stream()
+        }
+    }
+
+    fn indexed_connection_by_peer_id(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Option<Arc<LockFreeConnection>> {
+        self.peer_sessions
+            .read_sync(peer_id, |_, session| session.current_connection())
+            .flatten()
+            .or_else(|| {
+                self.connections_by_peer
+                    .read_sync(peer_id, |_, v| v.clone())
+            })
+            .or_else(|| {
+                self.get_configured_peer_addr(peer_id)
+                    .and_then(|addr| self.connections_by_addr.read_sync(&addr, |_, v| v.clone()))
+            })
     }
 
     fn session_peer_ids(&self) -> Vec<crate::PeerId> {
@@ -490,22 +518,22 @@ impl<T> ConnectionPool<T> {
             .read_sync(peer_id, |_, session| session.current_connection())
             .flatten()
         {
-            if conn.is_connected() {
+            if self.is_usable_connection(&conn) {
                 debug!("CONNECTION POOL: Found connection for peer '{}'", peer_id);
                 return Some(conn);
             }
             warn!(
-                "CONNECTION POOL: Connection for peer '{}' is disconnected",
+                "CONNECTION POOL: Connection for peer '{}' is not usable",
                 peer_id
             );
-            self.clear_current_peer_connection(peer_id);
+            self.clear_current_peer_connection_if_matches(peer_id, &conn);
         }
 
         // FALLBACK: Outbound connections may only be indexed by address.
         // Look up the configured address via peer session, then get the connection by address.
         if let Some(addr) = self.get_configured_peer_addr(peer_id) {
             if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
-                if conn.is_connected() {
+                if self.is_usable_connection(&conn) {
                     debug!(
                         "CONNECTION POOL: Found connection for peer '{}' via address fallback ({})",
                         peer_id, addr
@@ -540,7 +568,7 @@ impl<T> ConnectionPool<T> {
         addr: &SocketAddr,
     ) -> Option<Arc<LockFreeConnection>> {
         let conn = self.connections_by_addr.read_sync(addr, |_, v| v.clone())?;
-        conn.is_connected().then_some(conn)
+        self.is_usable_connection(&conn).then_some(conn)
     }
 
     /// Get the peer ID for a given socket address
@@ -946,7 +974,7 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
-        if let Some(connection) = self.get_connection_by_peer_id(peer_id) {
+        if let Some(connection) = self.indexed_connection_by_peer_id(peer_id) {
             self.clear_current_peer_connection(peer_id);
             // Preserve the configured peer address so reconnect logic keeps a stable destination.
 
@@ -1508,7 +1536,7 @@ impl<T> ConnectionPool<T> {
     /// Check if we have a connection to a peer by address
     pub fn has_connection(&self, addr: &SocketAddr) -> bool {
         self.connections_by_addr
-            .read_sync(addr, |_, v| v.is_connected())
+            .read_sync(addr, |_, v| self.is_usable_connection(v))
             .unwrap_or(false)
     }
 
@@ -1518,7 +1546,7 @@ impl<T> ConnectionPool<T> {
             .read_sync(peer_id, |_, session| {
                 session
                     .current_connection()
-                    .map(|conn| conn.is_connected())
+                    .map(|conn| self.is_usable_connection(&conn))
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -1537,7 +1565,7 @@ impl<T> ConnectionPool<T> {
         self.peer_sessions.iter_sync(|peer_id, session| {
             if session
                 .current_connection()
-                .map(|conn| !conn.is_connected())
+                .map(|conn| !self.is_usable_connection(&conn))
                 .unwrap_or(false)
             {
                 stale_peer_ids.push(peer_id.clone());
