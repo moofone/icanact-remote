@@ -235,6 +235,50 @@ impl<T> ConnectionPool<T> {
                 self.get_configured_peer_addr(peer_id)
                     .and_then(|addr| self.connections_by_addr.read_sync(&addr, |_, v| v.clone()))
             })
+            .or_else(|| self.aliased_connection_by_peer_id(peer_id))
+    }
+
+    fn aliased_connection_by_peer_id(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Option<Arc<LockFreeConnection>> {
+        let registry = self.registry.load().upgrade();
+        let mut fallback = None;
+
+        self.addr_to_peer_id.iter_sync(|addr, mapped_peer_id| {
+            if mapped_peer_id != peer_id {
+                return true;
+            }
+
+            let Some(conn) = self.connections_by_addr.read_sync(addr, |_, v| v.clone()) else {
+                return true;
+            };
+            if !self.is_usable_connection(&conn) {
+                return true;
+            }
+
+            let is_preferred = registry
+                .as_ref()
+                .map(|registry| {
+                    registry.should_keep_connection(
+                        peer_id,
+                        conn.direction == ConnectionDirection::Outbound,
+                    )
+                })
+                .unwrap_or(true);
+
+            if is_preferred {
+                fallback = Some(conn);
+                false
+            } else {
+                if fallback.is_none() {
+                    fallback = Some(conn);
+                }
+                true
+            }
+        });
+
+        fallback
     }
 
     fn session_peer_ids(&self) -> Vec<crate::PeerId> {
@@ -543,6 +587,18 @@ impl<T> ConnectionPool<T> {
                     return Some(conn);
                 }
             }
+        }
+
+        // FALLBACK: inbound connections are also indexed by the peer's ephemeral
+        // socket address. If a non-preferred outbound connection overwrote the
+        // current peer slot and then closed, this alias is still the live stream.
+        if let Some(conn) = self.aliased_connection_by_peer_id(peer_id) {
+            debug!(
+                "CONNECTION POOL: Found connection for peer '{}' via address alias ({})",
+                peer_id, conn.addr
+            );
+            self.publish_current_peer_connection(peer_id, conn.clone());
+            return Some(conn);
         }
 
         warn!(
@@ -1112,48 +1168,17 @@ impl<T> ConnectionPool<T> {
             peer_id
         );
 
-        // First check if we already have a connection to this node
-        if let Some(conn) = self
-            .connections_by_peer
-            .read_sync(peer_id, |_, v| v.clone())
-        {
-            if conn.is_connected() {
-                conn.update_last_used();
-                debug!(
-                    "CONNECTION POOL: Found existing connection to peer '{}'",
-                    peer_id
-                );
-
-                let stale_stream = conn
-                    .stream_handle
-                    .as_ref()
-                    .map(|h| h.exit_flag.load(Ordering::Acquire))
-                    .unwrap_or(false);
-                if stale_stream {
-                    let addr = conn.addr;
-                    debug!(
-                        peer_id = %peer_id,
-                        addr = %addr,
-                        "CONNECTION POOL: existing peer entry has exited IO task; evicting"
-                    );
-                    let _ = self.remove_connection(addr);
-                } else {
-                    let addr = conn.addr;
-                    if let Some(handle) = self.make_connection_handle(addr, &conn) {
-                        return Ok(handle);
-                    }
-                    return Err(crate::GossipError::Network(std::io::Error::other(
-                        "Connection exists but has no usable writer handle",
-                    )));
-                }
-            } else {
-                // Remove disconnected connection
-                debug!(
-                    "CONNECTION POOL: Removing disconnected connection to peer '{}'",
-                    peer_id
-                );
-                self.clear_current_peer_connection(peer_id);
+        // First check if we already have any usable stream for this peer. This includes
+        // inbound alias addresses, which are the preferred side for higher node IDs.
+        if let Some(conn) = self.get_connection_by_peer_id(peer_id) {
+            conn.update_last_used();
+            let addr = conn.addr;
+            if let Some(handle) = self.make_connection_handle(addr, &conn) {
+                return Ok(handle);
             }
+            return Err(crate::GossipError::Network(std::io::Error::other(
+                "Connection exists but has no usable writer handle",
+            )));
         }
 
         // Look up the address for this node
@@ -1550,6 +1575,7 @@ impl<T> ConnectionPool<T> {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+            || self.aliased_connection_by_peer_id(peer_id).is_some()
     }
 
     /// Check health of all connections
