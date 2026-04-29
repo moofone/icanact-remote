@@ -312,6 +312,14 @@ impl<T> GossipRegistryHandle<T> {
         }
     }
 
+    /// Disconnect the cached transport session for a peer, preserving configured peer address.
+    pub fn disconnect_peer_connection(&self, peer_id: &crate::PeerId) -> bool {
+        self.registry
+            .connection_pool
+            .disconnect_connection_by_peer_id(peer_id)
+            .is_some()
+    }
+
     /// Get registry statistics including vector clock metrics
     pub async fn stats(&self) -> RegistryStats {
         self.registry.get_stats().await
@@ -540,6 +548,14 @@ impl<T> GossipClient<T> {
             Some(conn),
             Arc::clone(&self.registry),
         ))
+    }
+
+    /// Disconnect the cached transport session for a peer, preserving configured peer address.
+    pub fn disconnect_peer_connection(&self, peer_id: &crate::PeerId) -> bool {
+        self.registry
+            .connection_pool
+            .disconnect_connection_by_peer_id(peer_id)
+            .is_some()
     }
 
     /// Lookup a peer and return a RemoteActorRef for communicating with it.
@@ -1395,8 +1411,18 @@ async fn handle_connection(
     };
 
     let acceptor = tls_config.acceptor();
-    match acceptor.accept(stream).await {
-        Ok(mut tls_stream) => {
+    match tokio::time::timeout(registry.config.connection_timeout, acceptor.accept(stream)).await {
+        Err(_) => {
+            warn!(
+                peer = %peer_addr,
+                timeout_ms = registry.config.connection_timeout.as_millis(),
+                "TLS accept timed out"
+            );
+        }
+        Ok(Err(err)) => {
+            warn!(peer = %peer_addr, error = %err, "TLS accept failed");
+        }
+        Ok(Ok(mut tls_stream)) => {
             let negotiated_alpn = tls_stream
                 .get_ref()
                 .1
@@ -1409,19 +1435,30 @@ async fn handle_connection(
                 .and_then(|certs| certs.first())
                 .and_then(|cert| crate::tls::extract_node_id_from_cert(cert).ok());
 
-            let capabilities = match crate::handshake::perform_hello_handshake(
-                &mut tls_stream,
-                negotiated_alpn.as_deref(),
-                registry.config.enable_peer_discovery,
+            let capabilities = match tokio::time::timeout(
+                registry.config.connection_timeout,
+                crate::handshake::perform_hello_handshake(
+                    &mut tls_stream,
+                    negotiated_alpn.as_deref(),
+                    registry.config.enable_peer_discovery,
+                ),
             )
             .await
             {
-                Ok(caps) => caps,
-                Err(err) => {
+                Ok(Ok(caps)) => caps,
+                Ok(Err(err)) => {
                     warn!(
                         peer = %peer_addr,
                         error = %err,
                         "Hello handshake failed, closing inbound TLS connection"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        peer = %peer_addr,
+                        timeout_ms = registry.config.connection_timeout.as_millis(),
+                        "Hello handshake timed out, closing inbound TLS connection"
                     );
                     return;
                 }
@@ -1451,9 +1488,6 @@ async fn handle_connection(
                     debug!(peer = %peer_addr, "stream connection dropped by tie-breaker");
                 }
             }
-        }
-        Err(err) => {
-            warn!(peer = %peer_addr, error = %err, "TLS accept failed");
         }
     }
 }
@@ -1733,15 +1767,58 @@ where
 
         let keep_connection = {
             let pool = &registry.connection_pool;
-            let has_existing = pool.has_connection_by_peer_id(&peer_id);
+            let inbound_preferred = registry.should_keep_connection(&peer_id, false);
 
-            if has_existing {
-                debug!(
-                    peer_id = %peer_id,
-                    "tie-breaker: keeping existing live connection and rejecting inbound duplicate"
-                );
-                registry.clear_peer_capabilities(&peer_addr);
-                false
+            if let Some(existing_conn) = pool.get_connection_by_peer_id(&peer_id) {
+                let existing_usable = existing_conn.has_live_stream();
+
+                if !existing_usable {
+                    debug!(
+                        peer_id = %peer_id,
+                        addr = %existing_conn.addr,
+                        "tie-breaker: evicting stale existing connection before accepting inbound"
+                    );
+                    let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                    pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        peer_state_addr,
+                        connection_arc.clone(),
+                    );
+                    true
+                } else if inbound_preferred {
+                    if existing_conn.direction
+                        == crate::connection_pool::ConnectionDirection::Inbound
+                    {
+                        debug!(
+                            peer_id = %peer_id,
+                            addr = %existing_conn.addr,
+                            "tie-breaker: keeping existing usable inbound connection and rejecting inbound duplicate"
+                        );
+                        registry.clear_peer_capabilities(&peer_addr);
+                        false
+                    } else {
+                        debug!(
+                            peer_id = %peer_id,
+                            addr = %existing_conn.addr,
+                            "tie-breaker: replacing outbound connection with preferred inbound connection"
+                        );
+                        let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                        pool.add_connection_by_peer_id(
+                            peer_id.clone(),
+                            peer_state_addr,
+                            connection_arc.clone(),
+                        );
+                        true
+                    }
+                } else {
+                    debug!(
+                        peer_id = %peer_id,
+                        addr = %existing_conn.addr,
+                        "tie-breaker: keeping preferred existing outbound connection and rejecting inbound duplicate"
+                    );
+                    registry.clear_peer_capabilities(&peer_addr);
+                    false
+                }
             } else {
                 pool.add_connection_by_peer_id(
                     peer_id.clone(),

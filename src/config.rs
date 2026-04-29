@@ -54,6 +54,8 @@ pub struct TcpKeepaliveConfig {
 pub struct ConnectionRecoveryPolicy {
     /// On actor-ask timeout, evict the cached transport session for the target peer.
     pub evict_peer_on_ask_timeout: bool,
+    /// On actor-ask cancellation, evict the cached transport session for the target peer.
+    pub evict_peer_on_ask_cancel: bool,
     /// After evicting on timeout, reconnect and retry the actor ask once.
     pub retry_actor_ask_once_after_timeout: bool,
 }
@@ -62,6 +64,7 @@ impl ConnectionRecoveryPolicy {
     pub const fn aggressive_ask_timeout_recovery() -> Self {
         Self {
             evict_peer_on_ask_timeout: true,
+            evict_peer_on_ask_cancel: true,
             retry_actor_ask_once_after_timeout: true,
         }
     }
@@ -342,6 +345,7 @@ mod tests {
         let policy = ConnectionRecoveryPolicy::aggressive_ask_timeout_recovery();
 
         assert!(policy.evict_peer_on_ask_timeout);
+        assert!(policy.evict_peer_on_ask_cancel);
         assert!(policy.retry_actor_ask_once_after_timeout);
     }
 

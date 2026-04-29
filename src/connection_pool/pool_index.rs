@@ -112,3 +112,39 @@ enum OutboundDialLease {
     Leader(Arc<OutboundDialGate>),
     Follower(Arc<OutboundDialGate>),
 }
+
+struct OutboundDialGateCompletion<'a, T = ()> {
+    pool: &'a ConnectionPool<T>,
+    addr: SocketAddr,
+    gate: Arc<OutboundDialGate>,
+    finished: bool,
+}
+
+impl<'a, T> OutboundDialGateCompletion<'a, T> {
+    fn new(pool: &'a ConnectionPool<T>, addr: SocketAddr, gate: Arc<OutboundDialGate>) -> Self {
+        Self {
+            pool,
+            addr,
+            gate,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, succeeded: bool) {
+        if self.finished {
+            return;
+        }
+        self.pool
+            .finish_outbound_dial_gate(self.addr, &self.gate, succeeded);
+        self.finished = true;
+    }
+}
+
+impl<T> Drop for OutboundDialGateCompletion<'_, T> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.pool
+                .finish_outbound_dial_gate(self.addr, &self.gate, false);
+        }
+    }
+}

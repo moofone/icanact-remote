@@ -811,6 +811,32 @@ async fn test_connection_pool_new() {
 }
 
 #[tokio::test]
+async fn test_outbound_dial_gate_is_released_when_leader_is_cancelled() {
+    let pool = ConnectionPool::<()>::new(10, Duration::from_secs(5));
+    let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+    let gate = match pool.acquire_outbound_dial_gate(addr) {
+        OutboundDialLease::Leader(gate) => gate,
+        OutboundDialLease::Follower(_) => panic!("first dial should own the outbound gate"),
+    };
+
+    {
+        let _completion = OutboundDialGateCompletion::new(&pool, addr, gate.clone());
+    }
+
+    tokio::time::timeout(Duration::from_millis(10), gate.wait())
+        .await
+        .expect("cancelled dial owner must wake outbound gate waiters");
+
+    match pool.acquire_outbound_dial_gate(addr) {
+        OutboundDialLease::Leader(_) => {}
+        OutboundDialLease::Follower(_) => {
+            panic!("cancelled dial owner must remove stale outbound gate")
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_set_registry() {
     use crate::{GossipConfig, KeyPair, registry::GossipRegistry};
     let pool = ConnectionPool::<()>::new(10, Duration::from_secs(5));

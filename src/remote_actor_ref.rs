@@ -312,7 +312,55 @@ pub struct RemoteActorRef<T = ()> {
     _marker: PhantomData<fn() -> T>,
 }
 
+struct ActorAskCancellationGuard {
+    registry: Arc<crate::registry::GossipRegistry>,
+    peer_id: crate::PeerId,
+    armed: bool,
+}
+
+impl ActorAskCancellationGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActorAskCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let evicted = self
+            .registry
+            .connection_pool
+            .disconnect_connection_by_peer_id(&self.peer_id)
+            .is_some();
+        tracing::warn!(
+            peer_id = %self.peer_id,
+            evicted,
+            "actor ask cancelled; evicted peer transport session"
+        );
+    }
+}
+
 impl<T> RemoteActorRef<T> {
+    async fn ask_actor_frame_with_deadline(
+        conn: &RemoteConnection,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        match tokio::time::timeout(
+            timeout,
+            conn.ask_actor_frame(actor_id, type_hash, payload, timeout),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(crate::GossipError::Timeout),
+        }
+    }
+
     #[inline]
     fn connection_or_not_listening(&self) -> crate::Result<&RemoteConnection> {
         self.connection.as_ref().ok_or_else(|| {
@@ -368,6 +416,18 @@ impl<T> RemoteActorRef<T> {
     /// Returns None if no connection is established yet.
     pub fn connection_ref(&self) -> Option<RemoteConnection> {
         self.connection.clone()
+    }
+
+    fn actor_ask_cancellation_guard(&self) -> Option<ActorAskCancellationGuard> {
+        let registry = self.registry.upgrade()?;
+        if !registry.config.connection_recovery.evict_peer_on_ask_cancel {
+            return None;
+        }
+        Some(ActorAskCancellationGuard {
+            registry,
+            peer_id: self.location.peer_id.clone(),
+            armed: true,
+        })
     }
 
     async fn recover_connection_after_actor_ask_timeout(
@@ -462,16 +522,35 @@ impl<T> RemoteActorRef<T> {
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
         let conn = self.connection_or_not_listening()?;
-        match conn
-            .ask_actor_frame(actor_id, type_hash, payload.clone(), timeout)
-            .await
-        {
+        let mut guard = self.actor_ask_cancellation_guard();
+        let result = Self::ask_actor_frame_with_deadline(
+            conn,
+            actor_id,
+            type_hash,
+            payload.clone(),
+            timeout,
+        )
+        .await;
+        if let Some(guard) = guard.as_mut() {
+            guard.disarm();
+        }
+        match result {
             Err(crate::GossipError::Timeout) => {
                 if let Some(reconnected) = self.recover_connection_after_actor_ask_timeout().await?
                 {
-                    return reconnected
-                        .ask_actor_frame(actor_id, type_hash, payload, timeout)
-                        .await;
+                    let mut retry_guard = self.actor_ask_cancellation_guard();
+                    let retry_result = Self::ask_actor_frame_with_deadline(
+                        &reconnected,
+                        actor_id,
+                        type_hash,
+                        payload,
+                        timeout,
+                    )
+                    .await;
+                    if let Some(guard) = retry_guard.as_mut() {
+                        guard.disarm();
+                    }
+                    return retry_result;
                 }
                 Err(crate::GossipError::Timeout)
             }
