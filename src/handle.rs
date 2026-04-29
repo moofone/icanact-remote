@@ -109,6 +109,9 @@ impl<T> GossipRegistryHandle<T> {
         T: RegistryTransportBootstrap,
     {
         let mut config = config.unwrap_or_default();
+        if let Some(policy) = transport_stack.connection_recovery_policy() {
+            config.connection_recovery = policy;
+        }
         transport_stack.prepare_config(&secret_key, &mut config)?;
 
         let (listener, udp_socket, actual_bind_addr) = match transport_stack.wire_kind() {
@@ -570,6 +573,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, Default)]
     struct TestTlsBootstrap;
     struct TestNoopBootstrap;
+    struct TestRecoveringBootstrap;
 
     impl RegistryTransportBootstrap for TestTlsBootstrap {
         fn stack_name(&self) -> &'static str {
@@ -638,6 +642,32 @@ mod tests {
             _secret_key: crate::SecretKey,
         ) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl RegistryTransportBootstrap for TestRecoveringBootstrap {
+        fn stack_name(&self) -> &'static str {
+            "test+recovering"
+        }
+
+        fn connection_recovery_policy(&self) -> Option<crate::ConnectionRecoveryPolicy> {
+            Some(crate::ConnectionRecoveryPolicy::aggressive_ask_timeout_recovery())
+        }
+
+        fn prepare_config(
+            &self,
+            secret_key: &crate::SecretKey,
+            config: &mut GossipConfig,
+        ) -> Result<()> {
+            TestNoopBootstrap.prepare_config(secret_key, config)
+        }
+
+        fn configure_registry(
+            &self,
+            registry: &mut crate::registry::GossipRegistry,
+            secret_key: crate::SecretKey,
+        ) -> Result<()> {
+            TestNoopBootstrap.configure_registry(registry, secret_key)
         }
     }
 
@@ -719,6 +749,29 @@ mod tests {
             TestTlsBootstrap,
         )
         .await?;
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_with_transport_stack_applies_connection_recovery_policy() -> crate::Result<()> {
+        let keypair = KeyPair::new_for_testing("stack-recovery");
+        let mut config = test_cfg();
+        config.key_pair = Some(keypair.clone());
+
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            keypair.to_secret_key(),
+            Some(config),
+            TestRecoveringBootstrap,
+        )
+        .await?;
+
+        assert_eq!(
+            handle.registry.config.connection_recovery,
+            crate::ConnectionRecoveryPolicy::aggressive_ask_timeout_recovery()
+        );
+
         handle.shutdown_and_wait().await;
         Ok(())
     }

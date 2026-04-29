@@ -370,6 +370,40 @@ impl<T> RemoteActorRef<T> {
         self.connection.clone()
     }
 
+    async fn recover_connection_after_actor_ask_timeout(
+        &self,
+    ) -> crate::Result<Option<RemoteConnection>> {
+        let Some(registry) = self.registry.upgrade() else {
+            return Err(crate::GossipError::Shutdown);
+        };
+        let policy = registry.config.connection_recovery;
+        if !policy.evict_peer_on_ask_timeout {
+            return Ok(None);
+        }
+
+        let peer_id = &self.location.peer_id;
+        let evicted = registry
+            .connection_pool
+            .disconnect_connection_by_peer_id(peer_id)
+            .is_some();
+        tracing::warn!(
+            peer_id = %peer_id,
+            evicted,
+            retry = policy.retry_actor_ask_once_after_timeout,
+            "actor ask timed out; evicted peer transport session"
+        );
+
+        if !policy.retry_actor_ask_once_after_timeout {
+            return Ok(None);
+        }
+
+        let handle = registry
+            .connection_pool
+            .get_connection_to_peer(peer_id)
+            .await?;
+        Ok(Some(RemoteConnection::from_handle(handle)))
+    }
+
     /// Send a fire-and-forget message to the remote actor.
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
@@ -428,8 +462,21 @@ impl<T> RemoteActorRef<T> {
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
         let conn = self.connection_or_not_listening()?;
-        conn.ask_actor_frame(actor_id, type_hash, payload, timeout)
+        match conn
+            .ask_actor_frame(actor_id, type_hash, payload.clone(), timeout)
             .await
+        {
+            Err(crate::GossipError::Timeout) => {
+                if let Some(reconnected) = self.recover_connection_after_actor_ask_timeout().await?
+                {
+                    return reconnected
+                        .ask_actor_frame(actor_id, type_hash, payload, timeout)
+                        .await;
+                }
+                Err(crate::GossipError::Timeout)
+            }
+            result => result,
+        }
     }
 
     /// Ask an actor-routed frame without timeout allocation.
