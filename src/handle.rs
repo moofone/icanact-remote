@@ -1411,18 +1411,39 @@ async fn handle_connection(
     };
 
     let acceptor = tls_config.acceptor();
+    let tls_accept_started = Instant::now();
+    info!(
+        target: "icanact_remote_lifecycle",
+        peer = %peer_addr,
+        timeout_ms = registry.config.connection_timeout.as_millis(),
+        "inbound_tls_accept_start"
+    );
     match tokio::time::timeout(registry.config.connection_timeout, acceptor.accept(stream)).await {
         Err(_) => {
             warn!(
+                target: "icanact_remote_lifecycle",
                 peer = %peer_addr,
                 timeout_ms = registry.config.connection_timeout.as_millis(),
+                elapsed_ms = tls_accept_started.elapsed().as_millis(),
                 "TLS accept timed out"
             );
         }
         Ok(Err(err)) => {
-            warn!(peer = %peer_addr, error = %err, "TLS accept failed");
+            warn!(
+                target: "icanact_remote_lifecycle",
+                peer = %peer_addr,
+                elapsed_ms = tls_accept_started.elapsed().as_millis(),
+                error = %err,
+                "TLS accept failed"
+            );
         }
         Ok(Ok(mut tls_stream)) => {
+            info!(
+                target: "icanact_remote_lifecycle",
+                peer = %peer_addr,
+                elapsed_ms = tls_accept_started.elapsed().as_millis(),
+                "inbound_tls_accept_ok"
+            );
             let negotiated_alpn = tls_stream
                 .get_ref()
                 .1
@@ -1435,6 +1456,7 @@ async fn handle_connection(
                 .and_then(|certs| certs.first())
                 .and_then(|cert| crate::tls::extract_node_id_from_cert(cert).ok());
 
+            let hello_started = Instant::now();
             let capabilities = match tokio::time::timeout(
                 registry.config.connection_timeout,
                 crate::handshake::perform_hello_handshake(
@@ -1445,10 +1467,24 @@ async fn handle_connection(
             )
             .await
             {
-                Ok(Ok(caps)) => caps,
+                Ok(Ok(caps)) => {
+                    info!(
+                        target: "icanact_remote_lifecycle",
+                        peer = %peer_addr,
+                        peer_node_id = %peer_node_id
+                            .as_ref()
+                            .map(|node_id| node_id.fmt_short())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        elapsed_ms = hello_started.elapsed().as_millis(),
+                        "inbound_hello_handshake_ok"
+                    );
+                    caps
+                }
                 Ok(Err(err)) => {
                     warn!(
+                        target: "icanact_remote_lifecycle",
                         peer = %peer_addr,
+                        elapsed_ms = hello_started.elapsed().as_millis(),
                         error = %err,
                         "Hello handshake failed, closing inbound TLS connection"
                     );
@@ -1456,8 +1492,10 @@ async fn handle_connection(
                 }
                 Err(_) => {
                     warn!(
+                        target: "icanact_remote_lifecycle",
                         peer = %peer_addr,
                         timeout_ms = registry.config.connection_timeout.as_millis(),
+                        elapsed_ms = hello_started.elapsed().as_millis(),
                         "Hello handshake timed out, closing inbound TLS connection"
                     );
                     return;
@@ -1634,7 +1672,16 @@ where
         }
     };
 
-    debug!(peer_addr = %peer_addr, node_id = %sender_node_id, "Identified incoming TLS connection from node");
+    info!(
+        target: "icanact_remote_lifecycle",
+        peer_addr = %peer_addr,
+        node_id = %sender_node_id,
+        sender_bind_addr = sender_bind_addr_opt
+            .as_ref()
+            .map(|addr| addr.as_str())
+            .unwrap_or("none"),
+        "inbound_identified"
+    );
 
     // Update the gossip state with the NodeId for this peer
     // This is critical for bidirectional TLS connections
@@ -1773,10 +1820,12 @@ where
                 let existing_usable = existing_conn.has_live_stream();
 
                 if !existing_usable {
-                    debug!(
+                    info!(
+                        target: "icanact_remote_lifecycle",
                         peer_id = %peer_id,
                         addr = %existing_conn.addr,
-                        "tie-breaker: evicting stale existing connection before accepting inbound"
+                        peer_state_addr = %peer_state_addr,
+                        "inbound_tiebreak_evict_stale"
                     );
                     let _ = pool.disconnect_connection_by_peer_id(&peer_id);
                     pool.add_connection_by_peer_id(
@@ -1789,18 +1838,22 @@ where
                     if existing_conn.direction
                         == crate::connection_pool::ConnectionDirection::Inbound
                     {
-                        debug!(
+                        info!(
+                            target: "icanact_remote_lifecycle",
                             peer_id = %peer_id,
                             addr = %existing_conn.addr,
-                            "tie-breaker: keeping existing usable inbound connection and rejecting inbound duplicate"
+                            peer_state_addr = %peer_state_addr,
+                            "inbound_tiebreak_reject_duplicate_inbound"
                         );
                         registry.clear_peer_capabilities(&peer_addr);
                         false
                     } else {
-                        debug!(
+                        info!(
+                            target: "icanact_remote_lifecycle",
                             peer_id = %peer_id,
                             addr = %existing_conn.addr,
-                            "tie-breaker: replacing outbound connection with preferred inbound connection"
+                            peer_state_addr = %peer_state_addr,
+                            "inbound_tiebreak_replace_outbound"
                         );
                         let _ = pool.disconnect_connection_by_peer_id(&peer_id);
                         pool.add_connection_by_peer_id(
@@ -1811,10 +1864,12 @@ where
                         true
                     }
                 } else {
-                    debug!(
+                    info!(
+                        target: "icanact_remote_lifecycle",
                         peer_id = %peer_id,
                         addr = %existing_conn.addr,
-                        "tie-breaker: keeping preferred existing outbound connection and rejecting inbound duplicate"
+                        peer_state_addr = %peer_state_addr,
+                        "inbound_tiebreak_reject_preferred_outbound"
                     );
                     registry.clear_peer_capabilities(&peer_addr);
                     false
@@ -1824,6 +1879,13 @@ where
                     peer_id.clone(),
                     peer_state_addr,
                     connection_arc.clone(),
+                );
+                info!(
+                    target: "icanact_remote_lifecycle",
+                    peer_id = %peer_id,
+                    peer_addr = %peer_addr,
+                    peer_state_addr = %peer_state_addr,
+                    "inbound_connection_accepted"
                 );
                 true
             }
