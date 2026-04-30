@@ -616,18 +616,21 @@ fn bench_env_bool(name: &str, default: bool) -> bool {
 }
 
 async fn connect_bidirectional(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
-    let b_id = b.registry.peer_id.clone();
-    let a_id = a.registry.peer_id.clone();
-
-    let peer_b = a.add_peer(&b_id).await;
-    peer_b.connect(&b.registry.bind_addr).await.unwrap();
-    let peer_a = b.add_peer(&a_id).await;
-    peer_a.connect(&a.registry.bind_addr).await.unwrap();
+    connect_unidirectional(a, b).await;
+    connect_unidirectional(b, a).await;
 }
 
 async fn connect_unidirectional(from: &GossipRegistryHandle, to: &GossipRegistryHandle) {
-    let peer = from.add_peer(&to.registry.peer_id).await;
-    peer.connect(&to.registry.bind_addr).await.unwrap();
+    if from
+        .registry
+        .should_keep_connection(&to.registry.peer_id, true)
+    {
+        let peer = from.add_peer(&to.registry.peer_id).await;
+        peer.connect(&to.registry.bind_addr).await.unwrap();
+    } else {
+        let peer = to.add_peer(&from.registry.peer_id).await;
+        peer.connect(&from.registry.bind_addr).await.unwrap();
+    }
 }
 
 async fn run_connect_to_peer_contention_benchmark(label: &str, lanes: usize, rounds: u64) {

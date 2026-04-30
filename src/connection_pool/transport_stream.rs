@@ -53,6 +53,13 @@ impl<T> ConnectionPool<T> {
             (registry_weak.upgrade(), resolved_node_id.as_ref())
         {
             let remote_peer_id = crate::PeerId::from(node_id_value);
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::OutboundStart {
+                    peer: Some(remote_peer_id.clone()),
+                    addr,
+                    attempt_id,
+                },
+            );
             if let Some(existing_conn) = self.get_connection_by_peer_id(&remote_peer_id) {
                 let alive = if let Some(stream_handle) = existing_conn.stream_handle.as_ref() {
                     existing_conn.is_connected() && !stream_handle.exit_flag.load(Ordering::Acquire)
@@ -68,7 +75,10 @@ impl<T> ConnectionPool<T> {
                         "outbound_tiebreak_evict_stale"
                     );
                     let _ = self.remove_connection(existing_conn.addr);
-                } else if !registry_arc.should_keep_connection(&remote_peer_id, true) {
+                } else if registry_arc.should_keep_connection(
+                    &remote_peer_id,
+                    existing_conn.direction == ConnectionDirection::Outbound,
+                ) {
                     info!(
                         target: "icanact_remote_lifecycle",
                         attempt_id,
@@ -90,17 +100,85 @@ impl<T> ConnectionPool<T> {
                         attempt_id,
                         remote = %remote_peer_id,
                         addr = %existing_conn.addr,
-                        "outbound_tiebreak_keep_existing"
+                        existing_direction = ?existing_conn.direction,
+                        "outbound_tiebreak_evict_wrong_direction"
                     );
-                    if let Some(handle) =
-                        self.make_connection_handle(existing_conn.addr, &existing_conn)
-                    {
-                        return Ok(handle);
-                    }
-                    return Err(GossipError::Network(std::io::Error::other(
-                        "Existing connection missing writer handle",
-                    )));
+                    crate::lifecycle::record_transport_event(
+                        crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
+                            peer: remote_peer_id.clone(),
+                            addr: existing_conn.addr,
+                            direction: match existing_conn.direction {
+                                ConnectionDirection::Inbound => {
+                                    crate::lifecycle::TransportDirection::Inbound
+                                }
+                                ConnectionDirection::Outbound => {
+                                    crate::lifecycle::TransportDirection::Outbound
+                                }
+                            },
+                        },
+                    );
+                    let _ = self.disconnect_connection_by_peer_id(&remote_peer_id);
                 }
+            }
+
+            if !registry_arc.should_keep_connection(&remote_peer_id, true) {
+                info!(
+                    target: "icanact_remote_lifecycle",
+                    attempt_id,
+                    remote = %remote_peer_id,
+                    addr = %addr,
+                    timeout_ms = connection_timeout.as_millis(),
+                    "outbound_connect_suppressed_wait_inbound"
+                );
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedWaitInbound {
+                        peer: remote_peer_id.clone(),
+                        addr,
+                        attempt_id,
+                    },
+                );
+                if let Some(handle) = self
+                    .wait_for_preferred_connection(
+                        &remote_peer_id,
+                        &registry_arc,
+                        connection_timeout,
+                    )
+                    .await
+                {
+                    info!(
+                        target: "icanact_remote_lifecycle",
+                        attempt_id,
+                        remote = %remote_peer_id,
+                        addr = %handle.addr,
+                        "outbound_connect_suppressed_inbound_ready"
+                    );
+                    crate::lifecycle::record_transport_event(
+                        crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedInboundReady {
+                            peer: remote_peer_id,
+                            addr: handle.addr,
+                            attempt_id,
+                        },
+                    );
+                    return Ok(handle);
+                }
+                info!(
+                    target: "icanact_remote_lifecycle",
+                    attempt_id,
+                    remote = %remote_peer_id,
+                    addr = %addr,
+                    "outbound_connect_suppressed_inbound_timeout"
+                );
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedInboundTimeout {
+                        peer: remote_peer_id,
+                        addr,
+                        attempt_id,
+                    },
+                );
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for preferred inbound connection",
+                )));
             }
         }
 
@@ -334,6 +412,31 @@ impl<T> ConnectionPool<T> {
                     return Err(e);
                 }
             }
+        }
+    }
+
+    async fn wait_for_preferred_connection(
+        &self,
+        remote_peer_id: &crate::PeerId,
+        registry: &GossipRegistry,
+        timeout: Duration,
+    ) -> Option<ConnectionHandle<T>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(conn) = self.get_connection_by_peer_id(remote_peer_id) {
+                let is_outbound = conn.direction == ConnectionDirection::Outbound;
+                if registry.should_keep_connection(remote_peer_id, is_outbound) {
+                    if let Some(handle) = self.make_connection_handle(conn.addr, &conn) {
+                        return Some(handle);
+                    }
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return None;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

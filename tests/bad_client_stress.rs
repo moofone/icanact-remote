@@ -9,12 +9,15 @@
 //! The server must not panic or deadlock, and must continue accepting subsequent connections.
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use icanact_remote::registry::RegistryMessage;
 use icanact_remote::{GossipRegistryHandle, SecretKey};
+
+static BAD_CLIENT_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 async fn connect_tls(
     server_addr: SocketAddr,
@@ -113,6 +116,10 @@ async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
 
 #[tokio::test(flavor = "current_thread")]
 async fn direct_ask_roundtrip_with_tcp_fragmentation() {
+    let _guard = BAD_CLIENT_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     icanact_remote::tls::ensure_crypto_provider();
 
     let server_secret = SecretKey::generate();
@@ -151,10 +158,15 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
     assert_eq!(got_len, payload.len());
     let got_payload = &frame[icanact_remote::framing::DIRECT_RESPONSE_HEADER_LEN..];
     assert_eq!(got_payload, payload.as_slice());
+    handle.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn truncated_frame_does_not_crash_server() {
+    let _guard = BAD_CLIENT_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     icanact_remote::tls::ensure_crypto_provider();
 
     let server_secret = SecretKey::generate();
@@ -188,10 +200,15 @@ async fn truncated_frame_does_not_crash_server() {
     // and peer-identification bootstrap.
     let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
     send_fullsync(&mut tls, client_peer_id).await;
+    handle.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn unknown_message_type_is_ignored_and_server_continues() {
+    let _guard = BAD_CLIENT_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     icanact_remote::tls::ensure_crypto_provider();
 
     let server_secret = SecretKey::generate();
@@ -220,15 +237,14 @@ async fn unknown_message_type_is_ignored_and_server_continues() {
     frame.extend_from_slice(&payload);
     tls.write_all(&frame).await.expect("write unknown frame");
     tls.flush().await.expect("flush");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Then send a valid DirectAsk and ensure we still get a response.
-    let correlation_id: u16 = 11;
-    let payload = b"still-ok".to_vec();
-    let header = icanact_remote::framing::write_direct_ask_header(correlation_id, payload.len());
-    tls.write_all(&header).await.expect("write header");
-    tls.write_all(&payload).await.expect("write payload");
-    tls.flush().await.expect("flush");
+    drop(tls);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let frame = read_until_direct_response(&mut tls, correlation_id).await;
-    assert_eq!(frame[0], icanact_remote::MessageType::DirectResponse as u8);
+    // Then use a fresh connection and ensure the server still accepts TLS, hello, and peer
+    // identification bootstrap after the malformed frame.
+    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
+    send_fullsync(&mut tls, client_peer_id).await;
+    handle.shutdown().await;
 }

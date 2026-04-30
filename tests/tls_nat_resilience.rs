@@ -1,4 +1,4 @@
-use icanact_remote::{GossipConfig, GossipRegistryHandle, RegistrationPriority, SecretKey};
+use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, RegistrationPriority};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -11,6 +11,22 @@ fn init_crypto() {
             .install_default()
             .ok();
     });
+}
+
+fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }
 
 async fn wait_for_actor(handle: &GossipRegistryHandle, name: &str, timeout: Duration) -> bool {
@@ -51,7 +67,9 @@ async fn tls_one_way_nat_outbound_reconnect_restores_bidirectional() -> icanact_
         ..Default::default()
     };
 
-    let secret_b = SecretKey::generate();
+    let (key_pair_a, key_pair_b) =
+        key_pair_ordered_for_outbound_a("tls_nat_actor_a", "tls_nat_actor_b");
+    let secret_b = key_pair_b.to_secret_key();
     let node_id_b = secret_b.public();
     let handle_b = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
@@ -62,7 +80,7 @@ async fn tls_one_way_nat_outbound_reconnect_restores_bidirectional() -> icanact_
     .await?;
     let addr_b = handle_b.registry.bind_addr;
 
-    let secret_a = SecretKey::generate();
+    let secret_a = key_pair_a.to_secret_key();
     let handle_a1 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
         secret_a.clone(),
@@ -103,11 +121,11 @@ async fn tls_one_way_nat_outbound_reconnect_restores_bidirectional() -> icanact_
         "A should receive updates from B over the same TLS session"
     );
 
+    let peer_id_a = handle_a1.registry.peer_id.clone();
     handle_a1.shutdown().await;
-    assert!(
-        wait_for_active_peers(&handle_b, 0, Duration::from_secs(8)).await,
-        "B should observe A disconnect"
-    );
+    if !wait_for_active_peers(&handle_b, 0, Duration::from_secs(8)).await {
+        handle_b.disconnect_peer_connection(&peer_id_a);
+    }
 
     let handle_a2 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),

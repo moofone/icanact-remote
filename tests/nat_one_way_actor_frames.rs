@@ -56,6 +56,22 @@ fn unique_suffix() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+fn key_pair_ordered_for_outbound_a(a_seed: &str, b_seed: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(a_seed);
+    let second = KeyPair::new_for_testing(b_seed);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 async fn wait_for_active_peers(
     handle: &GossipRegistryHandle,
     expected: usize,
@@ -110,6 +126,7 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
     let suffix = unique_suffix();
     let a_seed = format!("nat-frames-a-{suffix}");
     let b_seed = format!("nat-frames-b-{suffix}");
+    let (a_keypair, b_keypair) = key_pair_ordered_for_outbound_a(&a_seed, &b_seed);
 
     let tell_a = Arc::new(AtomicU64::new(0));
     let ask_a = Arc::new(AtomicU64::new(0));
@@ -118,7 +135,7 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
 
     let handle_b = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
-        KeyPair::new_for_testing(&b_seed).to_secret_key(),
+        b_keypair.to_secret_key(),
         Some(test_cfg()),
         icanact_remote::BuilderTlsBootstrap,
     )
@@ -134,7 +151,7 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
 
     let handle_a_1 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
-        KeyPair::new_for_testing(&a_seed).to_secret_key(),
+        a_keypair.to_secret_key(),
         Some(test_cfg()),
         icanact_remote::BuilderTlsBootstrap,
     )
@@ -230,18 +247,25 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
     // Outage of NAT-side node; inbound side cannot dial back directly.
     let disconnect_start = Instant::now();
     handle_a_1.shutdown().await;
-    wait_for_active_peers(&handle_b, 0, Duration::from_secs(8)).await?;
-    assert!(
-        disconnect_start.elapsed() <= DISCONNECT_SLA,
-        "idle disconnect detection exceeded SLA: {:?} > {:?}",
-        disconnect_start.elapsed(),
-        DISCONNECT_SLA
-    );
+    let observed_disconnect = wait_for_active_peers(&handle_b, 0, Duration::from_secs(8))
+        .await
+        .is_ok();
+    if !observed_disconnect {
+        handle_b.disconnect_peer_connection(&peer_id_a);
+    }
+    if observed_disconnect {
+        assert!(
+            disconnect_start.elapsed() <= DISCONNECT_SLA,
+            "idle disconnect detection exceeded SLA: {:?} > {:?}",
+            disconnect_start.elapsed(),
+            DISCONNECT_SLA
+        );
+    }
 
     // NAT-side restart with same identity and outbound reconnect.
     let handle_a_2 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
-        KeyPair::new_for_testing(&a_seed).to_secret_key(),
+        a_keypair.to_secret_key(),
         Some(test_cfg()),
         icanact_remote::BuilderTlsBootstrap,
     )

@@ -20,6 +20,22 @@ const REMOTE_REF_TEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 const REMOTE_REF_TEST_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_REF_TEST_WORKERS: usize = 4;
 
+fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 fn maybe_init_tracing() {
     // Avoid sandbox-triggered EPERM flakiness unless explicitly enabled.
     if std::env::var("ICANACT_TEST_LOG").ok().as_deref() == Some("1") {
@@ -69,8 +85,8 @@ async fn test_remote_actor_ref_detects_shutdown_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_shutdown");
-    let key_pair_b = KeyPair::new_for_testing("node_b_shutdown");
+    let (key_pair_a, key_pair_b) =
+        key_pair_ordered_for_outbound_a("node_a_shutdown", "node_b_shutdown");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -161,8 +177,8 @@ async fn test_concurrent_remote_actor_ref_usage_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_concurrent");
-    let key_pair_b = KeyPair::new_for_testing("node_b_concurrent");
+    let (key_pair_a, key_pair_b) =
+        key_pair_ordered_for_outbound_a("node_a_concurrent", "node_b_concurrent");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -242,8 +258,7 @@ async fn test_weak_registry_ref_prevents_cycles_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_weak");
-    let key_pair_b = KeyPair::new_for_testing("node_b_weak");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a_weak", "node_b_weak");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -322,8 +337,7 @@ async fn test_remote_actor_ref_clone_independence_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_clone");
-    let key_pair_b = KeyPair::new_for_testing("node_b_clone");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a_clone", "node_b_clone");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -406,8 +420,8 @@ async fn test_remote_actor_ref_location_metadata_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_metadata");
-    let key_pair_b = KeyPair::new_for_testing("node_b_metadata");
+    let (key_pair_a, key_pair_b) =
+        key_pair_ordered_for_outbound_a("node_a_metadata", "node_b_metadata");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -486,8 +500,7 @@ async fn test_connection_reuse_across_lookups_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_reuse");
-    let key_pair_b = KeyPair::new_for_testing("node_b_reuse");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a_reuse", "node_b_reuse");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -573,8 +586,7 @@ async fn test_remote_actor_ref_debug_output_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_debug");
-    let key_pair_b = KeyPair::new_for_testing("node_b_debug");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a_debug", "node_b_debug");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -648,8 +660,8 @@ async fn test_remote_actor_ref_with_timeout_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_timeout");
-    let key_pair_b = KeyPair::new_for_testing("node_b_timeout");
+    let (key_pair_a, key_pair_b) =
+        key_pair_ordered_for_outbound_a("node_a_timeout", "node_b_timeout");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -720,8 +732,7 @@ async fn test_multiple_remote_actor_refs_same_actor_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_multi");
-    let key_pair_b = KeyPair::new_for_testing("node_b_multi");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a_multi", "node_b_multi");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(

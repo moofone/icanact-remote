@@ -64,6 +64,22 @@ async fn wait_for_peers(a: &TlsHandle, b: &TlsHandle, timeout: Duration) -> bool
     false
 }
 
+async fn connect_preferred(a: &TlsHandle, b: &TlsHandle) {
+    if a.registry.should_keep_connection(&b.registry.peer_id, true) {
+        a.add_peer(&b.registry.peer_id)
+            .await
+            .connect(&b.registry.bind_addr)
+            .await
+            .expect("preferred A->B connect");
+    } else {
+        b.add_peer(&a.registry.peer_id)
+            .await
+            .connect(&a.registry.bind_addr)
+            .await
+            .expect("preferred B->A connect");
+    }
+}
+
 /// Test mutual authentication between two TLS-enabled nodes
 #[test]
 fn test_mutual_authentication() {
@@ -398,6 +414,8 @@ fn test_multi_node_tls_chain() {
             .registry
             .add_peer_with_node_id(addr_c, Some(node_id_c))
             .await;
+        connect_preferred(&registry_a, &registry_b).await;
+        connect_preferred(&registry_b, &registry_c).await;
 
         // Register actors on each node
         registry_a
@@ -539,13 +557,9 @@ fn test_tls_reconnection() {
             .add_peer_with_node_id(addr_b_new, Some(node_id_b))
             .await;
 
-        // Manually trigger immediate connection to new address for robustness
-        {
-            registry_a
-                .lookup_peer(&node_id_b.to_peer_id())
-                .await
-                .expect("Failed to connect A to new B address manually");
-        }
+        // Manually trigger immediate connection to new address for robustness, using the
+        // deterministic transport direction rule.
+        connect_preferred(&registry_a, &registry_b_new).await;
 
         // Wait for reconnection and gossip propagation
         // With 100ms gossip interval, need a few seconds for:
@@ -682,19 +696,15 @@ fn test_instant_gossip_with_long_interval() {
             .add_peer_with_node_id(addr_a, Some(node_id_a))
             .await;
 
-        // Manually trigger immediate connection since add_peer is passive and gossip interval is 20s
-        {
-            registry_b
-                .lookup_peer(&node_id_a.to_peer_id())
-                .await
-                .expect("Failed to connect B to A");
-        }
-
         // Connect A to B for bidirectional communication
         registry_a
             .registry
             .add_peer_with_node_id(addr_b, Some(node_id_b))
             .await;
+
+        // Manually trigger immediate connection since add_peer is passive and gossip interval is
+        // 20s. Use the same deterministic direction rule as the transport layer.
+        connect_preferred(&registry_a, &registry_b).await;
 
         tracing::info!("🔗 Connected nodes A and B");
 

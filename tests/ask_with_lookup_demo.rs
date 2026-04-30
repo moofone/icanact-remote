@@ -62,6 +62,31 @@ async fn wait_for_actor(
     }
 }
 
+async fn connect_preferred_direction(
+    node_a: &GossipRegistryHandle,
+    node_a_id: &PeerId,
+    node_a_addr: std::net::SocketAddr,
+    node_b: &GossipRegistryHandle,
+    node_b_id: &PeerId,
+    node_b_addr: std::net::SocketAddr,
+) {
+    if node_a.registry.should_keep_connection(node_b_id, true) {
+        node_a
+            .add_peer(node_b_id)
+            .await
+            .connect(&node_b_addr)
+            .await
+            .unwrap();
+    } else {
+        node_b
+            .add_peer(node_a_id)
+            .await
+            .connect(&node_a_addr)
+            .await
+            .unwrap();
+    }
+}
+
 /// Comprehensive ask() API demonstration with lookup() by actor name
 /// Tests request-response patterns with performance comparisons
 #[test]
@@ -90,7 +115,7 @@ fn test_ask_with_lookup_and_performance() {
         let node1_keypair = KeyPair::new_for_testing("node1");
         let node2_keypair = KeyPair::new_for_testing("node2");
         let node3_keypair = KeyPair::new_for_testing("node3");
-        let _node1_id = node1_keypair.peer_id();
+        let node1_id = node1_keypair.peer_id();
         let node2_id = node2_keypair.peer_id();
         let node3_id = node3_keypair.peer_id();
 
@@ -121,20 +146,26 @@ fn test_ask_with_lookup_and_performance() {
         .await
         .unwrap();
 
-        // Connect nodes (single-direction dial avoids tie-breaker churn)
+        // Connect nodes from each pair's deterministic outbound owner.
         println!("\n🔗 Establishing peer connections...");
-
-        // Node1 connects to Node2 and Node3 (bidirectional once established)
-        let peer2 = node1.add_peer(&node2_id).await;
-        let peer3 = node1.add_peer(&node3_id).await;
-        peer2
-            .connect(&"127.0.0.1:30002".parse().unwrap())
-            .await
-            .unwrap();
-        peer3
-            .connect(&"127.0.0.1:30003".parse().unwrap())
-            .await
-            .unwrap();
+        connect_preferred_direction(
+            &node1,
+            &node1_id,
+            "127.0.0.1:30001".parse().unwrap(),
+            &node2,
+            &node2_id,
+            "127.0.0.1:30002".parse().unwrap(),
+        )
+        .await;
+        connect_preferred_direction(
+            &node1,
+            &node1_id,
+            "127.0.0.1:30001".parse().unwrap(),
+            &node3,
+            &node3_id,
+            "127.0.0.1:30003".parse().unwrap(),
+        )
+        .await;
 
         wait_for_active_peers(&node2, 1, Duration::from_secs(2)).await;
         wait_for_active_peers(&node3, 1, Duration::from_secs(2)).await;
@@ -173,8 +204,35 @@ fn test_ask_with_lookup_and_performance() {
             .unwrap();
         println!("   ✅ Node3: registered 'cache_service'");
 
-        // Wait for propagation
-        sleep(Duration::from_millis(500)).await;
+        node1.disconnect_peer_connection(&node3_id);
+        node3.disconnect_peer_connection(&node1_id);
+        connect_preferred_direction(
+            &node1,
+            &node1_id,
+            "127.0.0.1:30001".parse().unwrap(),
+            &node3,
+            &node3_id,
+            "127.0.0.1:30003".parse().unwrap(),
+        )
+        .await;
+        node2.registry.trigger_immediate_gossip().await.unwrap();
+        node3.registry.trigger_immediate_gossip().await.unwrap();
+        wait_for_active_peers(&node1, 2, Duration::from_secs(2)).await;
+        let propagation_start = Instant::now();
+        loop {
+            if node1.stats().await.known_actors >= 3 {
+                break;
+            }
+            if propagation_start.elapsed() > Duration::from_secs(5) {
+                panic!(
+                    "Timed out waiting for all actors to propagate to node1: node1={:?}, node2={:?}, node3={:?}",
+                    node1.stats().await,
+                    node2.stats().await,
+                    node3.stats().await
+                );
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
         println!(
             "   🔍 Stats after registration:\n      node1={:?}\n      node2={:?}\n      node3={:?}",
             node1.stats().await,
@@ -496,6 +554,7 @@ fn test_ask_high_throughput() {
 
         let node1_keypair = KeyPair::new_for_testing("node1_ht");
         let node2_keypair = KeyPair::new_for_testing("node2_ht");
+        let node1_id = node1_keypair.peer_id();
         let node2_id = node2_keypair.peer_id();
 
         let node1 = GossipRegistryHandle::new_with_transport_stack(
@@ -516,9 +575,9 @@ fn test_ask_high_throughput() {
         .await
         .unwrap();
 
-        // Connect nodes (single-direction dial avoids tie-breaker churn)
-        let peer2 = node1.add_peer(&node2_id).await;
-        peer2.connect(&node2_addr).await.unwrap();
+        // Connect nodes from the deterministic outbound owner.
+        connect_preferred_direction(&node1, &node1_id, node1_addr, &node2, &node2_id, node2_addr)
+            .await;
 
         sleep(Duration::from_millis(100)).await;
 

@@ -51,11 +51,10 @@ impl DnsResolver for ScriptedResolver {
     }
 }
 
-async fn new_registry(
+async fn new_registry_with_keypair(
     bind: SocketAddr,
-    seed: &str,
+    keypair: KeyPair,
 ) -> icanact_remote::Result<GossipRegistryHandle> {
-    let keypair = KeyPair::new_for_testing(seed);
     let mut cfg = GossipConfig::default();
     cfg.key_pair = Some(keypair.clone());
     cfg.allow_loopback_discovery = true; // tests use 127.0.0.1
@@ -69,6 +68,22 @@ async fn new_registry(
     .await
 }
 
+fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 fn unused_local_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -78,11 +93,12 @@ fn unused_local_addr() -> SocketAddr {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_failure_triggers_dns_refresh_and_reconnect_succeeds() -> icanact_remote::Result<()> {
-    let b = new_registry("127.0.0.1:0".parse().unwrap(), "dns-b").await?;
+    let (a_keypair, b_keypair) = key_pair_ordered_for_outbound_a("dns-a", "dns-b");
+    let b = new_registry_with_keypair("127.0.0.1:0".parse().unwrap(), b_keypair).await?;
     let b_addr = b.registry.bind_addr;
     let b_peer_id = b.registry.peer_id.clone();
 
-    let a = new_registry("127.0.0.1:0".parse().unwrap(), "dns-a").await?;
+    let a = new_registry_with_keypair("127.0.0.1:0".parse().unwrap(), a_keypair).await?;
 
     let stale_addr = loop {
         let candidate = unused_local_addr();
@@ -127,11 +143,12 @@ async fn dial_failure_triggers_dns_refresh_and_reconnect_succeeds() -> icanact_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact_remote::Result<()>
 {
-    let b = new_registry("127.0.0.1:0".parse().unwrap(), "dns-b2").await?;
+    let (a_keypair, b_keypair) = key_pair_ordered_for_outbound_a("dns-a2", "dns-b2");
+    let b = new_registry_with_keypair("127.0.0.1:0".parse().unwrap(), b_keypair).await?;
     let b_addr = b.registry.bind_addr;
     let b_peer_id = b.registry.peer_id.clone();
 
-    let a = new_registry("127.0.0.1:0".parse().unwrap(), "dns-a2").await?;
+    let a = new_registry_with_keypair("127.0.0.1:0".parse().unwrap(), a_keypair).await?;
 
     let stale_addr = loop {
         let candidate = unused_local_addr();

@@ -3,7 +3,7 @@ use tokio::time::{Duration, sleep};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
+use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, PeerId};
 
 fn maybe_init_tracing(level: &'static str) {
     // In this sandboxed environment, enabling tracing can trigger EPERM ("Operation not
@@ -16,6 +16,31 @@ fn maybe_init_tracing(level: &'static str) {
                     .with_filter(EnvFilter::from_default_env().add_directive(directive)),
             )
             .try_init();
+    }
+}
+
+async fn connect_preferred_direction(
+    handle_a: &GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>,
+    peer_id_a: &PeerId,
+    addr_a: SocketAddr,
+    handle_b: &GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>,
+    peer_id_b: &PeerId,
+    addr_b: SocketAddr,
+) {
+    if handle_a.registry.should_keep_connection(peer_id_b, true) {
+        handle_a
+            .add_peer(peer_id_b)
+            .await
+            .connect(&addr_b)
+            .await
+            .unwrap();
+    } else {
+        handle_b
+            .add_peer(peer_id_a)
+            .await
+            .connect(&addr_a)
+            .await
+            .unwrap();
     }
 }
 
@@ -50,7 +75,7 @@ async fn run_test_basic_ask_correlation() {
     let key_pair_a = KeyPair::new_for_testing("node_a");
     let key_pair_b = KeyPair::new_for_testing("node_b");
 
-    let _peer_id_a = key_pair_a.peer_id();
+    let peer_id_a = key_pair_a.peer_id();
     let peer_id_b = key_pair_b.peer_id();
 
     let config_a = GossipConfig {
@@ -82,9 +107,8 @@ async fn run_test_basic_ask_correlation() {
     .await
     .unwrap();
 
-    // Connect nodes - single direction to avoid duplicate tie-breaker churn
-    let peer_b = handle_a.add_peer(&peer_id_b).await;
-    peer_b.connect(&addr_b).await.unwrap();
+    // Connect the deterministic outbound owner so tie-break suppression does not race the test.
+    connect_preferred_direction(&handle_a, &peer_id_a, addr_a, &handle_b, &peer_id_b, addr_b).await;
 
     // Wait for initial gossip protocol to establish and settle
     sleep(Duration::from_millis(100)).await;
@@ -95,7 +119,7 @@ async fn run_test_basic_ask_correlation() {
     {
         info!("Test 1: Testing ask() with processed response");
         info!("Getting connection from {} to {}", addr_a, addr_b);
-        let conn = handle_a.lookup_address(addr_b).await.unwrap();
+        let conn = handle_a.lookup_peer(&peer_id_b).await.unwrap();
         info!("Got connection handle");
 
         // Test ECHO command
@@ -147,7 +171,7 @@ async fn run_test_basic_ask_correlation() {
     // Test 2: Verify correlation IDs work with multiple concurrent asks
     {
         info!("Test 2: Testing multiple concurrent asks");
-        let conn = handle_a.lookup_address(addr_b).await.unwrap();
+        let conn = handle_a.lookup_peer(&peer_id_b).await.unwrap();
 
         // Send multiple asks concurrently with different commands
         let mut futures = Vec::new();
@@ -225,7 +249,7 @@ async fn run_test_ask_high_throughput() {
 
     let key_pair_a = KeyPair::new_for_testing("perf_a");
     let key_pair_b = KeyPair::new_for_testing("perf_b");
-    let _peer_id_a = key_pair_a.peer_id();
+    let peer_id_a = key_pair_a.peer_id();
     let peer_id_b = key_pair_b.peer_id();
 
     let config_a = GossipConfig {
@@ -257,14 +281,13 @@ async fn run_test_ask_high_throughput() {
     .await
     .unwrap();
 
-    // Connect single direction to avoid duplicate tie-breaker churn
-    let peer_b = handle_a.add_peer(&peer_id_b).await;
-    peer_b.connect(&addr_b).await.unwrap();
+    // Connect the deterministic outbound owner so tie-break suppression does not race the test.
+    connect_preferred_direction(&handle_a, &peer_id_a, addr_a, &handle_b, &peer_id_b, addr_b).await;
 
     sleep(Duration::from_millis(500)).await;
 
     // Get connection
-    let conn = handle_a.lookup_address(addr_b).await.unwrap();
+    let conn = handle_a.lookup_peer(&peer_id_b).await.unwrap();
 
     let num_requests = 1000;
     let start = std::time::Instant::now();
