@@ -347,6 +347,27 @@ impl<T> ConnectionHandle<T> {
         .await
     }
 
+    /// Send a routed PubSub payload with framing, without copying the payload.
+    pub async fn send_pubsub_payload(&self, payload: bytes::Bytes) -> Result<()> {
+        let header = framing::write_pubsub_frame_prefix(payload.len());
+        self.write_header_and_payload_control_inline(
+            header,
+            crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+            payload,
+        )
+        .await
+    }
+
+    /// Try to send a routed PubSub payload without awaiting on the write queue.
+    pub fn try_send_pubsub_payload(&self, payload: bytes::Bytes) -> Result<()> {
+        let header = framing::write_pubsub_frame_prefix(payload.len());
+        self.write_header_and_payload_control_inline_nonblocking(
+            header,
+            crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+            payload,
+        )
+    }
+
     /// Send a response using the inline write queue (never streaming).
     pub async fn send_response_auto(
         &self,

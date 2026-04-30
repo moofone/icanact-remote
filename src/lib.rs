@@ -14,6 +14,7 @@ mod net_security;
 pub mod peer_discovery;
 pub mod priority;
 pub mod protocol;
+pub mod pubsub;
 pub mod registry;
 pub mod remote_actor_location;
 pub mod remote_actor_ref;
@@ -52,6 +53,11 @@ pub use lifecycle::{
     set_transport_lifecycle_recorder,
 };
 pub use priority::{ConsistencyLevel, RegistrationPriority};
+pub use pubsub::{
+    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameV1, PubSubIngressHandler,
+    PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope, PubSubSubscription,
+    RoutedPubSub, topic_key,
+};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
@@ -1164,6 +1170,8 @@ pub enum MessageType {
     DirectAsk = 0x20,
     /// Fast-path direct response
     DirectResponse = 0x21,
+    /// Routed PubSub data-plane frame
+    PubSub = 0x30,
 }
 
 impl MessageType {
@@ -1183,6 +1191,7 @@ impl MessageType {
             0x15 => Some(MessageType::StreamResponseEnd),
             0x20 => Some(MessageType::DirectAsk),
             0x21 => Some(MessageType::DirectResponse),
+            0x30 => Some(MessageType::PubSub),
             _ => None,
         }
     }
@@ -1479,9 +1488,10 @@ mod tests {
         assert_eq!(MessageType::StreamResponseEnd as u8, 0x15);
         assert_eq!(MessageType::DirectAsk as u8, 0x20);
         assert_eq!(MessageType::DirectResponse as u8, 0x21);
+        assert_eq!(MessageType::PubSub as u8, 0x30);
 
         for byte in [
-            0, 1, 2, 3, 4, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21,
+            0, 1, 2, 3, 4, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x30,
         ] {
             let parsed = MessageType::from_byte(byte).expect("known message type byte");
             assert_eq!(parsed as u8, byte);

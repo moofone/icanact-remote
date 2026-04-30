@@ -66,6 +66,14 @@ impl RemoteConnection {
             .try_tell_actor_frame(actor_id, type_hash, payload)
     }
 
+    pub async fn pubsub_frame(&self, payload: bytes::Bytes) -> crate::Result<()> {
+        self.inner.send_pubsub_payload(payload).await
+    }
+
+    pub fn try_pubsub_frame(&self, payload: bytes::Bytes) -> crate::Result<()> {
+        self.inner.try_send_pubsub_payload(payload)
+    }
+
     pub async fn ask_actor_frame(
         &self,
         actor_id: u64,

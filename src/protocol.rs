@@ -318,6 +318,13 @@ pub(crate) async fn process_read_result(
             )
             .await;
         }
+        MessageReadResult::PubSub { payload } => {
+            if let Some(handler) = registry.pubsub_ingress_handler.load_full() {
+                if let Err(e) = handler.handle(payload) {
+                    warn!(peer = %peer_addr, error = %e, "Failed to process PubSub frame");
+                }
+            }
+        }
         MessageReadResult::Actor {
             msg_type,
             correlation_id,

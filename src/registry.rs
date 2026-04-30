@@ -181,6 +181,11 @@ pub struct ActorMessageHandlerCell {
 }
 
 #[derive(Clone)]
+pub struct PubSubIngressHandlerCell {
+    handler: Arc<dyn crate::pubsub::PubSubIngressHandler>,
+}
+
+#[derive(Clone)]
 pub struct ActorTellHandlerSyncCell {
     owner: Arc<dyn ActorTellHandlerSync>,
     ptr: usize,
@@ -393,6 +398,17 @@ impl ActorMessageHandlerSyncCell {
     ) -> Result<Option<ActorResponse>> {
         let _keepalive = &self.owner;
         unsafe { (self.call)(self.ptr, actor_id, type_hash, payload, correlation_id) }
+    }
+}
+
+impl PubSubIngressHandlerCell {
+    pub(crate) fn new(handler: Arc<dyn crate::pubsub::PubSubIngressHandler>) -> Self {
+        Self { handler }
+    }
+
+    #[inline]
+    pub(crate) fn handle(&self, payload: crate::AlignedBytes) -> Result<()> {
+        self.handler.handle_pubsub_frame(payload)
     }
 }
 
@@ -1024,6 +1040,7 @@ pub struct GossipRegistry<T = ()> {
     pub actor_ask_immediate_handler_sync: Arc<ArcSwapOption<ActorAskImmediateHandlerSyncCell>>,
     pub actor_ask_handler_sync: Arc<ArcSwapOption<ActorAskHandlerSyncCell>>,
     pub actor_message_handler_sync: Arc<ArcSwapOption<ActorMessageHandlerSyncCell>>,
+    pub pubsub_ingress_handler: Arc<ArcSwapOption<PubSubIngressHandlerCell>>,
     pub peer_disconnect_handler: Arc<ArcSwapOption<PeerDisconnectHandlerCell>>,
     pub peer_connect_handler: Arc<ArcSwapOption<PeerConnectHandlerCell>>,
 
@@ -1198,6 +1215,7 @@ impl<T: 'static> GossipRegistry<T> {
             actor_ask_immediate_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_ask_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_message_handler_sync: Arc::new(ArcSwapOption::empty()),
+            pubsub_ingress_handler: Arc::new(ArcSwapOption::empty()),
             peer_disconnect_handler: Arc::new(ArcSwapOption::empty()),
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
             stream_assemblies: Arc::new(SccHashMap::default()),
@@ -1490,6 +1508,16 @@ impl<T: 'static> GossipRegistry<T> {
         self.actor_message_handler_sync
             .store(Some(Arc::new(ActorMessageHandlerSyncCell::new(handler))));
         info!("actor message handler sync registered");
+    }
+
+    /// Register the routed PubSub ingress handler.
+    pub async fn set_pubsub_ingress_handler(
+        &self,
+        handler: Arc<dyn crate::pubsub::PubSubIngressHandler>,
+    ) {
+        self.pubsub_ingress_handler
+            .store(Some(Arc::new(PubSubIngressHandlerCell::new(handler))));
+        info!("pubsub ingress handler registered");
     }
 
     /// Remove the actor message handler callback

@@ -11,12 +11,14 @@ pub const SCHEMA_HASH_LEN: usize = 8;
 // DirectAsk fast path constants
 pub const DIRECT_ASK_HEADER_LEN: usize = 12; // type(1) + correlation_id(2) + payload_len(4) + pad(5)
 pub const DIRECT_RESPONSE_HEADER_LEN: usize = 12; // type(1) + correlation_id(2) + payload_len(4) + pad(5)
+pub const PUBSUB_HEADER_LEN: usize = 12; // type(1) + pad(11)
 
 pub const ASK_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ASK_RESPONSE_HEADER_LEN;
 pub const GOSSIP_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + GOSSIP_HEADER_LEN;
 pub const ACTOR_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ACTOR_HEADER_LEN;
 pub const DIRECT_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_ASK_HEADER_LEN;
 pub const DIRECT_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_RESPONSE_HEADER_LEN;
+pub const PUBSUB_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + PUBSUB_HEADER_LEN;
 
 /// Write ActorTell/ActorAsk header with padded 16-byte alignment.
 ///
@@ -96,6 +98,15 @@ pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER
     let mut header = [0u8; GOSSIP_FRAME_HEADER_LEN];
     header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
     header[4] = MessageType::Gossip as u8;
+    header[5..16].fill(0);
+    header
+}
+
+pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER_LEN] {
+    let total_size = PUBSUB_HEADER_LEN + payload_len;
+    let mut header = [0u8; PUBSUB_FRAME_HEADER_LEN];
+    header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+    header[4] = MessageType::PubSub as u8;
     header[5..16].fill(0);
     header
 }
@@ -221,6 +232,16 @@ mod tests {
     }
 
     #[test]
+    fn write_pubsub_frame_prefix_sets_padding() {
+        let payload_len = 10;
+        let header = write_pubsub_frame_prefix(payload_len);
+        let total = (PUBSUB_HEADER_LEN + payload_len) as u32;
+        assert_eq!(u32::from_be_bytes(header[0..4].try_into().unwrap()), total);
+        assert_eq!(header[4], MessageType::PubSub as u8);
+        assert_eq!(&header[5..16], &[0u8; 11]);
+    }
+
+    #[test]
     fn header_lengths_hold_for_varied_payload_sizes() {
         for payload_len in 0..256 {
             let ask_header = write_ask_response_header(MessageType::Ask, 0, payload_len);
@@ -239,6 +260,7 @@ mod tests {
 
             assert!(is_aligned(LENGTH_PREFIX_LEN + ASK_RESPONSE_HEADER_LEN));
             assert!(is_aligned(LENGTH_PREFIX_LEN + GOSSIP_HEADER_LEN));
+            assert!(is_aligned(LENGTH_PREFIX_LEN + PUBSUB_HEADER_LEN));
             // Actor header is now 8-byte aligned (32 % 8 = 0)
             assert!(is_aligned(LENGTH_PREFIX_LEN + ACTOR_HEADER_LEN));
         }
