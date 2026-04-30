@@ -348,6 +348,12 @@ impl LockFreeStreamHandle {
                     }
 
                     if should_cancel_pending {
+                        warn!(
+                            peer = %peer_addr,
+                            peer_id = ?peer_id,
+                            stream_instance_id = expected_instance,
+                            "transport_io_task_exit_current_connection"
+                        );
                         if let Some(correlation) = self.response_correlation.as_ref() {
                             correlation.cancel_all();
                         }
@@ -365,6 +371,12 @@ impl LockFreeStreamHandle {
                     return;
                 }
 
+                warn!(
+                    peer = ?self.peer_addr,
+                    peer_id = ?self.peer_id,
+                    stream_instance_id = self.instance_id,
+                    "transport_io_task_exit_without_registry"
+                );
                 if let Some(correlation) = self.response_correlation.as_ref() {
                     correlation.cancel_all();
                 }

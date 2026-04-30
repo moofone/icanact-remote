@@ -582,6 +582,7 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
         timeout: Duration,
     ) -> Result<crate::AlignedBytes> {
+        let started_at = Instant::now();
         let correlation_id = self.correlation.allocate();
         let schema_hash = self.schema_hash();
         let header = crate::framing::write_actor_frame_header(
@@ -594,12 +595,58 @@ impl<T> ConnectionHandle<T> {
         );
         if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
             self.correlation.cancel(correlation_id);
+            warn!(
+                addr = %self.addr,
+                actor_id,
+                type_hash,
+                correlation_id,
+                error = %e,
+                stream_instance_id = ?self.stream_handle.as_ref().map(|handle| handle.instance_id()),
+                stream_closed = self.is_closed(),
+                bytes_written = self.bytes_written(),
+                "transport_ask_write_failed"
+            );
             return Err(e);
         }
 
-        self.correlation
+        let result = self
+            .correlation
             .wait_for_response(correlation_id, timeout)
-            .await
+            .await;
+        if let Err(error) = &result {
+            match error {
+                crate::GossipError::ConnectionDropped => {
+                    warn!(
+                        addr = %self.addr,
+                        actor_id,
+                        type_hash,
+                        correlation_id,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        timeout_ms = timeout.as_millis(),
+                        stream_instance_id = ?self.stream_handle.as_ref().map(|handle| handle.instance_id()),
+                        stream_closed = self.is_closed(),
+                        bytes_written = self.bytes_written(),
+                        "transport_ask_connection_dropped"
+                    );
+                }
+                crate::GossipError::Timeout => {
+                    debug!(
+                        addr = %self.addr,
+                        actor_id,
+                        type_hash,
+                        correlation_id,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        timeout_ms = timeout.as_millis(),
+                        stream_instance_id = ?self.stream_handle.as_ref().map(|handle| handle.instance_id()),
+                        stream_closed = self.is_closed(),
+                        bytes_written = self.bytes_written(),
+                        "transport_ask_response_timeout"
+                    );
+                }
+                _ => {}
+            }
+        }
+        result
     }
 
     /// Ask an actor using the direct actor frame envelope without timeout allocation.

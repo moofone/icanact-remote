@@ -182,6 +182,17 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) {
+        let stream_instance_id = connection
+            .stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id());
+        info!(
+            peer_id = %peer_id,
+            addr = %connection.addr,
+            direction = ?connection.direction,
+            stream_instance_id = ?stream_instance_id,
+            "transport_session_published"
+        );
         crate::lifecycle::record_transport_event(
             crate::lifecycle::TransportLifecycleEvent::SessionPublished {
                 peer: peer_id.clone(),
@@ -218,6 +229,18 @@ impl<T> ConnectionPool<T> {
             })
             .unwrap_or(false);
         if should_clear {
+            let stream_instance_id = candidate
+                .stream_handle
+                .as_ref()
+                .map(|handle| handle.instance_id());
+            info!(
+                peer_id = %peer_id,
+                addr = %candidate.addr,
+                direction = ?candidate.direction,
+                stream_instance_id = ?stream_instance_id,
+                reason = "current_connection_cleared",
+                "transport_session_removed"
+            );
             crate::lifecycle::record_transport_event(
                 crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
                     peer: peer_id.clone(),
@@ -228,6 +251,7 @@ impl<T> ConnectionPool<T> {
                             crate::lifecycle::TransportDirection::Outbound
                         }
                     },
+                    reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
                 },
             );
             self.clear_current_peer_connection(peer_id);
@@ -1072,6 +1096,18 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
         if let Some(connection) = self.indexed_connection_by_peer_id(peer_id) {
+            let stream_instance_id = connection
+                .stream_handle
+                .as_ref()
+                .map(|handle| handle.instance_id());
+            info!(
+                peer_id = %peer_id,
+                addr = %connection.addr,
+                direction = ?connection.direction,
+                stream_instance_id = ?stream_instance_id,
+                reason = "disconnect_by_peer_id",
+                "transport_session_removed"
+            );
             crate::lifecycle::record_transport_event(
                 crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
                     peer: peer_id.clone(),
@@ -1084,6 +1120,7 @@ impl<T> ConnectionPool<T> {
                             crate::lifecycle::TransportDirection::Outbound
                         }
                     },
+                    reason: crate::lifecycle::SessionRemovalReason::DisconnectByPeerId,
                 },
             );
             self.clear_current_peer_connection(peer_id);
