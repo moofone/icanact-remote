@@ -106,11 +106,36 @@ impl<T> ConnectionPool<T> {
                     attempt_id,
                     remote = %remote_peer_id,
                     addr = %addr,
-                    "outbound_connect_suppressed_prefer_inbound"
+                    timeout_ms = connection_timeout.as_millis(),
+                    "outbound_connect_suppressed_wait_inbound"
+                );
+                if let Some(handle) = self
+                    .wait_for_preferred_connection(
+                        &remote_peer_id,
+                        &registry_arc,
+                        connection_timeout,
+                    )
+                    .await
+                {
+                    info!(
+                        target: "icanact_remote_lifecycle",
+                        attempt_id,
+                        remote = %remote_peer_id,
+                        addr = %handle.addr,
+                        "outbound_connect_suppressed_inbound_ready"
+                    );
+                    return Ok(handle);
+                }
+                info!(
+                    target: "icanact_remote_lifecycle",
+                    attempt_id,
+                    remote = %remote_peer_id,
+                    addr = %addr,
+                    "outbound_connect_suppressed_inbound_timeout"
                 );
                 return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "outbound suppressed; deterministic tiebreak prefers inbound",
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for preferred inbound connection",
                 )));
             }
         }
@@ -345,6 +370,31 @@ impl<T> ConnectionPool<T> {
                     return Err(e);
                 }
             }
+        }
+    }
+
+    async fn wait_for_preferred_connection(
+        &self,
+        remote_peer_id: &crate::PeerId,
+        registry: &GossipRegistry,
+        timeout: Duration,
+    ) -> Option<ConnectionHandle<T>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(conn) = self.get_connection_by_peer_id(remote_peer_id) {
+                let is_outbound = conn.direction == ConnectionDirection::Outbound;
+                if registry.should_keep_connection(remote_peer_id, is_outbound) {
+                    if let Some(handle) = self.make_connection_handle(conn.addr, &conn) {
+                        return Some(handle);
+                    }
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return None;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
