@@ -53,6 +53,13 @@ impl<T> ConnectionPool<T> {
             (registry_weak.upgrade(), resolved_node_id.as_ref())
         {
             let remote_peer_id = crate::PeerId::from(node_id_value);
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::OutboundStart {
+                    peer: Some(remote_peer_id.clone()),
+                    addr,
+                    attempt_id,
+                },
+            );
             if let Some(existing_conn) = self.get_connection_by_peer_id(&remote_peer_id) {
                 let alive = if let Some(stream_handle) = existing_conn.stream_handle.as_ref() {
                     existing_conn.is_connected() && !stream_handle.exit_flag.load(Ordering::Acquire)
@@ -96,6 +103,20 @@ impl<T> ConnectionPool<T> {
                         existing_direction = ?existing_conn.direction,
                         "outbound_tiebreak_evict_wrong_direction"
                     );
+                    crate::lifecycle::record_transport_event(
+                        crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
+                            peer: remote_peer_id.clone(),
+                            addr: existing_conn.addr,
+                            direction: match existing_conn.direction {
+                                ConnectionDirection::Inbound => {
+                                    crate::lifecycle::TransportDirection::Inbound
+                                }
+                                ConnectionDirection::Outbound => {
+                                    crate::lifecycle::TransportDirection::Outbound
+                                }
+                            },
+                        },
+                    );
                     let _ = self.disconnect_connection_by_peer_id(&remote_peer_id);
                 }
             }
@@ -108,6 +129,13 @@ impl<T> ConnectionPool<T> {
                     addr = %addr,
                     timeout_ms = connection_timeout.as_millis(),
                     "outbound_connect_suppressed_wait_inbound"
+                );
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedWaitInbound {
+                        peer: remote_peer_id.clone(),
+                        addr,
+                        attempt_id,
+                    },
                 );
                 if let Some(handle) = self
                     .wait_for_preferred_connection(
@@ -124,6 +152,13 @@ impl<T> ConnectionPool<T> {
                         addr = %handle.addr,
                         "outbound_connect_suppressed_inbound_ready"
                     );
+                    crate::lifecycle::record_transport_event(
+                        crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedInboundReady {
+                            peer: remote_peer_id,
+                            addr: handle.addr,
+                            attempt_id,
+                        },
+                    );
                     return Ok(handle);
                 }
                 info!(
@@ -132,6 +167,13 @@ impl<T> ConnectionPool<T> {
                     remote = %remote_peer_id,
                     addr = %addr,
                     "outbound_connect_suppressed_inbound_timeout"
+                );
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedInboundTimeout {
+                        peer: remote_peer_id,
+                        addr,
+                        attempt_id,
+                    },
                 );
                 return Err(GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,

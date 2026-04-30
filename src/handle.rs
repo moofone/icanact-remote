@@ -1848,6 +1848,20 @@ where
                         existing_direction = ?existing_conn.direction,
                         "inbound_tiebreak_replace_wrong_direction"
                     );
+                    crate::lifecycle::record_transport_event(
+                        crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
+                            peer: peer_id.clone(),
+                            addr: existing_conn.addr,
+                            direction: match existing_conn.direction {
+                                crate::connection_pool::ConnectionDirection::Inbound => {
+                                    crate::lifecycle::TransportDirection::Inbound
+                                }
+                                crate::connection_pool::ConnectionDirection::Outbound => {
+                                    crate::lifecycle::TransportDirection::Outbound
+                                }
+                            },
+                        },
+                    );
                     let _ = pool.disconnect_connection_by_peer_id(&peer_id);
                     pool.add_connection_by_peer_id(
                         peer_id.clone(),
@@ -1883,6 +1897,14 @@ where
                 true
             }
         };
+        if keep_connection {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::InboundReady {
+                    peer: peer_id.clone(),
+                    addr: peer_state_addr,
+                },
+            );
+        }
 
         if !keep_connection {
             if let Some(handle) = connection_arc.stream_handle.as_ref() {

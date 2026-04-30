@@ -182,6 +182,16 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) {
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SessionPublished {
+                peer: peer_id.clone(),
+                addr: connection.addr,
+                direction: match connection.direction {
+                    ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
+                    ConnectionDirection::Outbound => crate::lifecycle::TransportDirection::Outbound,
+                },
+            },
+        );
         self.set_current_peer_connection(peer_id, Some(connection.clone()));
         let _ = self
             .connections_by_peer
@@ -1050,6 +1060,20 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
         if let Some(connection) = self.indexed_connection_by_peer_id(peer_id) {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
+                    peer: peer_id.clone(),
+                    addr: connection.addr,
+                    direction: match connection.direction {
+                        ConnectionDirection::Inbound => {
+                            crate::lifecycle::TransportDirection::Inbound
+                        }
+                        ConnectionDirection::Outbound => {
+                            crate::lifecycle::TransportDirection::Outbound
+                        }
+                    },
+                },
+            );
             self.clear_current_peer_connection(peer_id);
             // Preserve the configured peer address so reconnect logic keeps a stable destination.
 

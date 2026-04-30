@@ -8,6 +8,7 @@ pub mod framing;
 mod handle;
 mod handle_builder;
 pub mod handshake;
+pub mod lifecycle;
 mod net;
 mod net_security;
 pub mod peer_discovery;
@@ -46,6 +47,10 @@ pub use dns::{DnsResolver, TokioDnsResolver};
 pub const MAX_STREAM_SIZE: usize = 64 * 1024 * 1024; // 64MB
 pub use handle::{GossipClient, GossipRegistryHandle};
 pub use handle_builder::{BuilderTlsBootstrap, GossipRegistryBuilder};
+pub use lifecycle::{
+    TransportDirection, TransportLifecycleEvent, TransportLifecycleRecorder,
+    set_transport_lifecycle_recorder,
+};
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
@@ -845,6 +850,20 @@ impl<T: 'static> Peer<T> {
                         existing_direction = ?existing_conn.direction,
                         "outbound_connect_suppressed_drop_wrong_direction"
                     );
+                    crate::lifecycle::record_transport_event(
+                        crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
+                            peer: self.peer_id.clone(),
+                            addr: existing_conn.addr,
+                            direction: match existing_conn.direction {
+                                crate::connection_pool::ConnectionDirection::Inbound => {
+                                    crate::lifecycle::TransportDirection::Inbound
+                                }
+                                crate::connection_pool::ConnectionDirection::Outbound => {
+                                    crate::lifecycle::TransportDirection::Outbound
+                                }
+                            },
+                        },
+                    );
                     let _ = self
                         .registry
                         .connection_pool
@@ -856,6 +875,12 @@ impl<T: 'static> Peer<T> {
                 peer_id = %self.peer_id,
                 addr = %addr,
                 "outbound_connect_suppressed_prefer_inbound"
+            );
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedPreferInbound {
+                    peer: self.peer_id.clone(),
+                    addr: *addr,
+                },
             );
             return Ok(());
         }
