@@ -1199,7 +1199,7 @@ async fn test_wait_for_response_returns_on_cancelled_slot() {
     let err = res
         .expect("wait_for_response hung")
         .expect_err("expected error");
-    assert!(matches!(err, GossipError::Timeout));
+    assert!(matches!(err, GossipError::ConnectionDropped));
 }
 
 #[tokio::test]

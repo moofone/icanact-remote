@@ -251,7 +251,7 @@ impl CorrelationTracker {
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
-                return std::task::Poll::Ready(Err(crate::GossipError::Timeout));
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
 
             slot_ref.waker.register(cx.waker());
@@ -261,7 +261,7 @@ impl CorrelationTracker {
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
-                return std::task::Poll::Ready(Err(crate::GossipError::Timeout));
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
 
             std::task::Poll::Pending
@@ -287,7 +287,7 @@ impl CorrelationTracker {
                 }
                 match slot_ref.state.load(Ordering::Acquire) {
                     SLOT_WRITING => self.wait_for_response_no_timeout(correlation_id).await,
-                    SLOT_EMPTY => Err(crate::GossipError::Timeout),
+                    SLOT_EMPTY => Err(crate::GossipError::ConnectionDropped),
                     _ => Err(crate::GossipError::Timeout),
                 }
             }
@@ -307,7 +307,7 @@ impl CorrelationTracker {
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
-                return std::task::Poll::Ready(Err(crate::GossipError::Timeout));
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
             slot_ref.waker.register(cx.waker());
             if let Some(response) = Self::try_take_ready(slot_ref) {
@@ -315,7 +315,7 @@ impl CorrelationTracker {
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
-                return std::task::Poll::Ready(Err(crate::GossipError::Timeout));
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
             std::task::Poll::Pending
         })

@@ -4061,6 +4061,16 @@ impl<T: 'static> GossipRegistry<T> {
             let pool = &self.connection_pool;
             // Try to find peer_id for proper cleanup of all aliases
             if let Some(peer_id) = peer_id.clone() {
+                if let Some(current) = pool.get_connection_by_peer_id(&peer_id) {
+                    info!(
+                        addr = %failed_peer_addr,
+                        peer_id = %peer_id,
+                        current_addr = %current.addr,
+                        current_direction = ?current.direction,
+                        current_stream_instance_id = ?current.stream_handle.as_ref().map(|handle| handle.instance_id()),
+                        "handling peer connection failure for indexed connection"
+                    );
+                }
                 if let Some(_conn) = pool.disconnect_connection_by_peer_id(&peer_id) {
                     info!(addr = %failed_peer_addr, peer_id = %peer_id, "removed disconnected connection from pool (all address aliases cleaned up)");
                 }

@@ -9,6 +9,12 @@ pub enum TransportDirection {
     Outbound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRemovalReason {
+    CurrentConnectionCleared,
+    DisconnectByPeerId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportLifecycleEvent {
     OutboundStart {
@@ -53,6 +59,7 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
         direction: TransportDirection,
+        reason: SessionRemovalReason,
     },
 }
 

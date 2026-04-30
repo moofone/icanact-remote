@@ -1280,6 +1280,9 @@ pub enum GossipError {
     #[error("connection timeout")]
     Timeout,
 
+    #[error("connection dropped while waiting for response")]
+    ConnectionDropped,
+
     #[error("peer not found: {0}")]
     PeerNotFound(SocketAddr),
 
