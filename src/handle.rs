@@ -1814,7 +1814,6 @@ where
 
         let keep_connection = {
             let pool = &registry.connection_pool;
-            let inbound_preferred = registry.should_keep_connection(&peer_id, false);
 
             if let Some(existing_conn) = pool.get_connection_by_peer_id(&peer_id) {
                 let existing_usable = existing_conn.has_live_stream();
@@ -1834,42 +1833,14 @@ where
                         connection_arc.clone(),
                     );
                     true
-                } else if inbound_preferred {
-                    if existing_conn.direction
-                        == crate::connection_pool::ConnectionDirection::Inbound
-                    {
-                        info!(
-                            target: "icanact_remote_lifecycle",
-                            peer_id = %peer_id,
-                            addr = %existing_conn.addr,
-                            peer_state_addr = %peer_state_addr,
-                            "inbound_tiebreak_reject_duplicate_inbound"
-                        );
-                        registry.clear_peer_capabilities(&peer_addr);
-                        false
-                    } else {
-                        info!(
-                            target: "icanact_remote_lifecycle",
-                            peer_id = %peer_id,
-                            addr = %existing_conn.addr,
-                            peer_state_addr = %peer_state_addr,
-                            "inbound_tiebreak_replace_outbound"
-                        );
-                        let _ = pool.disconnect_connection_by_peer_id(&peer_id);
-                        pool.add_connection_by_peer_id(
-                            peer_id.clone(),
-                            peer_state_addr,
-                            connection_arc.clone(),
-                        );
-                        true
-                    }
                 } else {
                     info!(
                         target: "icanact_remote_lifecycle",
                         peer_id = %peer_id,
                         addr = %existing_conn.addr,
                         peer_state_addr = %peer_state_addr,
-                        "inbound_tiebreak_reject_preferred_outbound"
+                        existing_direction = ?existing_conn.direction,
+                        "inbound_tiebreak_reject_live_duplicate"
                     );
                     registry.clear_peer_capabilities(&peer_addr);
                     false
