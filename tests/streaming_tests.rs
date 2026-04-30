@@ -45,6 +45,22 @@ fn create_test_payload(size: usize) -> Vec<u8> {
     payload
 }
 
+fn key_pair_ordered_for_outbound_a(a_seed: &str, b_seed: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(a_seed);
+    let second = KeyPair::new_for_testing(b_seed);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 /// Verify a test payload matches expected pattern
 #[allow(dead_code)]
 fn verify_payload(payload: &[u8], expected_size: usize) -> bool {
@@ -123,8 +139,8 @@ fn test_streaming_request_large_payload() {
         let addr_a: SocketAddr = "127.0.0.1:7921".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7922".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("stream_node_a");
-        let key_pair_b = KeyPair::new_for_testing("stream_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("stream_node_a", "stream_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -200,8 +216,7 @@ fn test_streaming_request_zero_copy() {
         let addr_a: SocketAddr = "127.0.0.1:7923".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7924".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("zc_node_a");
-        let key_pair_b = KeyPair::new_for_testing("zc_node_b");
+        let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("zc_node_a", "zc_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -276,8 +291,8 @@ fn test_streaming_response_auto() {
         let addr_a: SocketAddr = "127.0.0.1:7925".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7926".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("resp_node_a");
-        let key_pair_b = KeyPair::new_for_testing("resp_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("resp_node_a", "resp_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -340,8 +355,8 @@ fn test_small_payload_uses_write_queue() {
         let addr_a: SocketAddr = "127.0.0.1:7927".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7928".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("small_node_a");
-        let key_pair_b = KeyPair::new_for_testing("small_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("small_node_a", "small_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -404,8 +419,8 @@ fn test_streaming_threshold_boundary() {
         let addr_a: SocketAddr = "127.0.0.1:7929".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7930".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("boundary_node_a");
-        let key_pair_b = KeyPair::new_for_testing("boundary_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("boundary_node_a", "boundary_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -498,8 +513,8 @@ fn test_concurrent_streaming_requests() {
         let addr_a: SocketAddr = "127.0.0.1:7931".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7932".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("concurrent_node_a");
-        let key_pair_b = KeyPair::new_for_testing("concurrent_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("concurrent_node_a", "concurrent_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -666,8 +681,8 @@ fn test_streaming_tell_no_response() {
         let addr_a: SocketAddr = "127.0.0.1:7941".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7942".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("tell_node_a");
-        let key_pair_b = KeyPair::new_for_testing("tell_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("tell_node_a", "tell_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 

@@ -5,7 +5,7 @@ use icanact_remote::{
 };
 use std::{hint::black_box, net::SocketAddr, time::Duration};
 
-fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<()> {
+async fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<()> {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = GossipConfig {
         key_pair: Some(KeyPair::new_for_testing("bench_gossip_round")),
@@ -26,7 +26,7 @@ fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<()> {
             .connection_pool
             .addr_to_peer_id
             .upsert_sync(peer_addr, peer_id.clone());
-        runtime_block_on(registry.configure_peer(peer_id, peer_addr));
+        registry.configure_peer(peer_id, peer_addr).await;
     }
 
     for idx in 0..actor_count {
@@ -43,7 +43,7 @@ fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<()> {
             .ok();
     }
 
-    runtime_block_on(async {
+    {
         let mut gossip_state = registry.gossip_state.lock().await;
         for idx in 0..actor_count {
             let actor_addr: SocketAddr = format!("127.0.0.1:{}", 30_000 + (idx % 10_000))
@@ -60,16 +60,9 @@ fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<()> {
                     priority: RegistrationPriority::Immediate,
                 });
         }
-    });
+    }
 
     registry
-}
-
-fn runtime_block_on<F, T>(future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    tokio::runtime::Runtime::new().unwrap().block_on(future)
 }
 
 fn bench_gossip_round(c: &mut Criterion) {
@@ -82,8 +75,9 @@ fn bench_gossip_round(c: &mut Criterion) {
             format!("prepare_gossip_round_{actors}actors_{peers}peers"),
             |b| {
                 b.to_async(&runtime).iter_batched(
-                    || make_registry(actors, peers),
-                    |registry| async move {
+                    || async move { make_registry(actors, peers).await },
+                    |setup| async move {
+                        let registry = setup.await;
                         let tasks = registry.prepare_gossip_round().await.unwrap();
                         black_box(tasks);
                     },

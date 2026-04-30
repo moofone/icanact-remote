@@ -1,8 +1,8 @@
 mod common;
 
 use common::{create_tls_node, wait_for_condition};
-use icanact_remote::GossipConfig;
 use icanact_remote::registry::{ActorMessageFuture, ActorMessageHandler};
+use icanact_remote::{GossipConfig, KeyPair};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -128,10 +128,25 @@ fn test_end_to_end_ask_reply() {
             .set_actor_message_handler(Arc::new(TestActorHandler))
             .await;
 
+        let addr_a = handle_a.registry.bind_addr;
+        let peer_a_id = handle_a.registry.peer_id.clone();
         let addr_b = handle_b.registry.bind_addr;
         let peer_b_id = handle_b.registry.peer_id.clone();
-        let peer_b = handle_a.add_peer(&peer_b_id).await;
-        peer_b.connect(&addr_b).await.unwrap();
+        if handle_a.registry.should_keep_connection(&peer_b_id, true) {
+            handle_a
+                .add_peer(&peer_b_id)
+                .await
+                .connect(&addr_b)
+                .await
+                .unwrap();
+        } else {
+            handle_b
+                .add_peer(&peer_a_id)
+                .await
+                .connect(&addr_a)
+                .await
+                .unwrap();
+        }
 
         assert!(
             wait_for_condition(Duration::from_secs(3), || async {
@@ -337,9 +352,13 @@ fn test_end_to_end_ask_reply() {
 
         info!("=== Test 6: Connection failure path (connect to missing peer) ===");
         {
-            let addr_missing: SocketAddr = "127.0.0.1:8004".parse().unwrap(); // should not exist
-            let missing_peer_id =
-                icanact_remote::KeyPair::new_for_testing("node_missing").peer_id();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr_missing: SocketAddr = listener.local_addr().unwrap();
+            drop(listener);
+            let missing_peer_id = (0..100)
+                .map(|idx| KeyPair::new_for_testing(&format!("node_missing_{idx}")).peer_id())
+                .find(|peer_id| handle_a.registry.should_keep_connection(peer_id, true))
+                .expect("find outbound-preferred missing peer id");
             let missing_peer = handle_a.add_peer(&missing_peer_id).await;
 
             match missing_peer.connect(&addr_missing).await {

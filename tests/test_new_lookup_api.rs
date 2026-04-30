@@ -16,6 +16,22 @@ const LOOKUP_API_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 const LOOKUP_API_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 const LOOKUP_API_WORKERS: usize = 4;
 
+fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
 fn run_lookup_api_test<F, Fut>(name: &'static str, test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -44,8 +60,7 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a");
-    let key_pair_b = KeyPair::new_for_testing("node_b");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a", "node_b");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -165,8 +180,8 @@ async fn test_old_api_not_accessible_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a_single");
-    let key_pair_b = KeyPair::new_for_testing("node_b_single");
+    let (key_pair_a, key_pair_b) =
+        key_pair_ordered_for_outbound_a("node_a_single", "node_b_single");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -235,8 +250,7 @@ async fn test_multiple_lookups_return_different_refs_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a2");
-    let key_pair_b = KeyPair::new_for_testing("node_b2");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a2", "node_b2");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(
@@ -327,8 +341,7 @@ async fn test_lookup_caches_connection_for_zero_lookup_sending_inner() {
         ..Default::default()
     };
 
-    let key_pair_a = KeyPair::new_for_testing("node_a3");
-    let key_pair_b = KeyPair::new_for_testing("node_b3");
+    let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("node_a3", "node_b3");
     let peer_id_b = key_pair_b.peer_id();
 
     let handle_a = GossipRegistryHandle::new_with_transport_stack(

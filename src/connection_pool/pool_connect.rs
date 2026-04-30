@@ -218,6 +218,18 @@ impl<T> ConnectionPool<T> {
             })
             .unwrap_or(false);
         if should_clear {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
+                    peer: peer_id.clone(),
+                    addr: candidate.addr,
+                    direction: match candidate.direction {
+                        ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
+                        ConnectionDirection::Outbound => {
+                            crate::lifecycle::TransportDirection::Outbound
+                        }
+                    },
+                },
+            );
             self.clear_current_peer_connection(peer_id);
         }
     }

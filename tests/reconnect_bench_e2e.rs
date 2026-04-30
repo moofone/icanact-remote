@@ -12,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use icanact_remote::tls;
 use icanact_remote::{
-    GossipConfig, GossipRegistryHandle, SecretKey,
+    GossipConfig, GossipRegistryHandle, KeyPair, SecretKey,
     aligned::AlignedBytes,
     registry::{ActorMessageFuture, ActorMessageHandler, ActorResponse, PeerDisconnectHandler},
 };
@@ -28,6 +28,22 @@ impl EchoAskHandler {
         Self {
             asks: AtomicUsize::new(0),
         }
+    }
+}
+
+fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
     }
 }
 
@@ -133,7 +149,9 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
             .try_init();
     }
 
-    let server_secret = SecretKey::generate();
+    let (client_keypair, server_keypair) =
+        key_pair_ordered_for_outbound_a("reconnect_bench_client", "reconnect_bench_server");
+    let server_secret = server_keypair.to_secret_key();
     let server_peer_id = server_secret.public().to_peer_id();
     let server_handler = Arc::new(EchoAskHandler::new());
 
@@ -147,7 +165,7 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
     let server_addr = server.registry.bind_addr;
 
     // Client.
-    let client_secret = SecretKey::generate();
+    let client_secret = client_keypair.to_secret_key();
     let client = Arc::new(
         GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),

@@ -9,8 +9,9 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
+use std::thread;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -26,6 +27,7 @@ static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 struct EchoHandler {
     label: &'static str,
     asks: Arc<AtomicU64>,
+    slow_payload_delay: Option<Duration>,
 }
 
 impl ActorMessageHandlerSync for EchoHandler {
@@ -43,6 +45,9 @@ impl ActorMessageHandlerSync for EchoHandler {
         }
 
         self.asks.fetch_add(1, Ordering::AcqRel);
+        if self.slow_payload_delay.is_some() && payload.as_ref() == b"slow" {
+            thread::sleep(self.slow_payload_delay.expect("slow payload delay"));
+        }
         Ok(Some(ActorResponse::from(
             format!(
                 "{}:{}",
@@ -54,6 +59,14 @@ impl ActorMessageHandlerSync for EchoHandler {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct ProxyPlan {
+    connect_delay: Duration,
+    client_first_byte_delay: Duration,
+    server_first_byte_delay: Duration,
+    close_after: Option<Duration>,
+}
+
 struct ScriptedProxy {
     listen_addr: SocketAddr,
     task: JoinHandle<()>,
@@ -61,6 +74,17 @@ struct ScriptedProxy {
 
 impl ScriptedProxy {
     async fn new(target_addr: SocketAddr, connect_delay: Duration) -> Self {
+        Self::with_plan(
+            target_addr,
+            ProxyPlan {
+                connect_delay,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn with_plan(target_addr: SocketAddr, plan: ProxyPlan) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scripted proxy");
@@ -70,20 +94,91 @@ impl ScriptedProxy {
                 let Ok((mut inbound, _)) = listener.accept().await else {
                     return;
                 };
+                let plan = plan;
                 tokio::spawn(async move {
-                    if !connect_delay.is_zero() {
-                        sleep(connect_delay).await;
+                    if !plan.connect_delay.is_zero() {
+                        sleep(plan.connect_delay).await;
                     }
 
-                    let Ok(mut outbound) = TcpStream::connect(target_addr).await else {
+                    let Ok(outbound) = TcpStream::connect(target_addr).await else {
                         let _ = inbound.shutdown().await;
                         return;
                     };
-                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    let (inbound_read, inbound_write) = inbound.into_split();
+                    let (outbound_read, outbound_write) = outbound.into_split();
+                    let client_to_server = tokio::spawn(relay_with_initial_delay(
+                        inbound_read,
+                        outbound_write,
+                        plan.client_first_byte_delay,
+                    ));
+                    let server_to_client = tokio::spawn(relay_with_initial_delay(
+                        outbound_read,
+                        inbound_write,
+                        plan.server_first_byte_delay,
+                    ));
+                    run_relay_pair(client_to_server, server_to_client, plan.close_after).await;
                 });
             }
         });
         Self { listen_addr, task }
+    }
+}
+
+async fn relay_with_initial_delay<R, W>(
+    mut reader: R,
+    mut writer: W,
+    first_byte_delay: Duration,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut first_read = true;
+    let mut buf = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        if first_read {
+            first_read = false;
+            if !first_byte_delay.is_zero() {
+                sleep(first_byte_delay).await;
+            }
+        }
+        writer.write_all(&buf[..read]).await?;
+    }
+}
+
+async fn run_relay_pair(
+    mut first: JoinHandle<std::io::Result<()>>,
+    mut second: JoinHandle<std::io::Result<()>>,
+    close_after: Option<Duration>,
+) {
+    if let Some(close_after) = close_after {
+        tokio::select! {
+            _ = sleep(close_after) => {
+                first.abort();
+                second.abort();
+            }
+            _ = &mut first => {
+                second.abort();
+            }
+            _ = &mut second => {
+                first.abort();
+            }
+        }
+        return;
+    }
+
+    tokio::select! {
+        _ = &mut first => {
+            second.abort();
+        }
+        _ = &mut second => {
+            first.abort();
+        }
     }
 }
 
@@ -111,6 +206,15 @@ async fn node(
     label: &'static str,
     asks: Arc<AtomicU64>,
 ) -> icanact_remote::Result<TlsHandle> {
+    node_with_slow_payload(key_pair, label, asks, None).await
+}
+
+async fn node_with_slow_payload(
+    key_pair: KeyPair,
+    label: &'static str,
+    asks: Arc<AtomicU64>,
+    slow_payload_delay: Option<Duration>,
+) -> icanact_remote::Result<TlsHandle> {
     let handle = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
         key_pair.to_secret_key(),
@@ -120,7 +224,11 @@ async fn node(
     .await?;
     handle
         .registry
-        .set_actor_message_handler_sync(Arc::new(EchoHandler { label, asks }))
+        .set_actor_message_handler_sync(Arc::new(EchoHandler {
+            label,
+            asks,
+            slow_payload_delay,
+        }))
         .await;
     Ok(handle)
 }
@@ -178,6 +286,98 @@ fn count_events(
         .iter()
         .filter(|event| predicate(event))
         .count()
+}
+
+fn with_events<R>(
+    events: &Arc<Mutex<Vec<TransportLifecycleEvent>>>,
+    f: impl FnOnce(&[TransportLifecycleEvent]) -> R,
+) -> R {
+    let guard = events.lock().expect("event recorder poisoned");
+    f(&guard)
+}
+
+fn session_published_count(
+    events: &[TransportLifecycleEvent],
+    peer_id: &PeerId,
+    direction: TransportDirection,
+) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TransportLifecycleEvent::SessionPublished {
+                    peer,
+                    direction: event_direction,
+                    ..
+                } if peer == peer_id && *event_direction == direction
+            )
+        })
+        .count()
+}
+
+fn session_removed_count(
+    events: &[TransportLifecycleEvent],
+    peer_id: &PeerId,
+    direction: TransportDirection,
+) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TransportLifecycleEvent::SessionRemoved {
+                    peer,
+                    direction: event_direction,
+                    ..
+                } if peer == peer_id && *event_direction == direction
+            )
+        })
+        .count()
+}
+
+async fn connect_preferred_direction(
+    local: &TlsHandle,
+    remote: &TlsHandle,
+    remote_to_local: &ScriptedProxy,
+) -> icanact_remote::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let connect_result = timeout(Duration::from_secs(2), async {
+            remote
+                .add_peer(&local.registry.peer_id)
+                .await
+                .connect(&remote_to_local.listen_addr)
+                .await
+        })
+        .await;
+
+        if matches!(connect_result, Ok(Ok(())))
+            && timeout(
+                Duration::from_secs(2),
+                local.lookup_peer(&remote.registry.peer_id),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            return Ok(());
+        }
+
+        local.disconnect_peer_connection(&remote.registry.peer_id);
+        remote.disconnect_peer_connection(&local.registry.peer_id);
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    Err(icanact_remote::GossipError::Network(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "preferred-direction connection did not converge",
+    )))
+}
+
+async fn shutdown_pair(left: TlsHandle, right: TlsHandle) {
+    set_transport_lifecycle_recorder(None);
+    left.shutdown().await;
+    right.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -290,6 +490,374 @@ async fn inbound_preferred_lookup_waits_for_scripted_inbound() -> icanact_remote
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_connect_collision_keeps_one_preferred_direction() -> icanact_remote::Result<()>
+{
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let events = install_recorder();
+
+    let (local_key, remote_key) = inbound_preferred_key_pair();
+    let asks_local = Arc::new(AtomicU64::new(0));
+    let asks_remote = Arc::new(AtomicU64::new(0));
+    let local = node(local_key, "local", Arc::clone(&asks_local)).await?;
+    let remote = node(remote_key, "remote", Arc::clone(&asks_remote)).await?;
+    let remote_to_local = ScriptedProxy::new(local.registry.bind_addr, Duration::ZERO).await;
+    let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
+
+    configure_static_peer(
+        &local,
+        remote.registry.peer_id.clone(),
+        local_to_remote.listen_addr,
+    )
+    .await;
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        remote_to_local.listen_addr,
+    )
+    .await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let local_lookup = {
+        let barrier = Arc::clone(&barrier);
+        let local = &local;
+        let remote_peer_id = &remote.registry.peer_id;
+        async move {
+            barrier.wait().await;
+            local.lookup_peer(remote_peer_id).await
+        }
+    };
+    let remote_lookup = {
+        let barrier = Arc::clone(&barrier);
+        let remote = &remote;
+        let local_peer_id = &local.registry.peer_id;
+        async move {
+            barrier.wait().await;
+            remote.lookup_peer(local_peer_id).await
+        }
+    };
+    let (_, local_result, remote_result) = tokio::join!(
+        barrier.wait(),
+        timeout(Duration::from_secs(2), local_lookup),
+        timeout(Duration::from_secs(2), remote_lookup)
+    );
+
+    local_result
+        .expect("local simultaneous lookup timed out")
+        .expect("local lookup should converge");
+    remote_result
+        .expect("remote simultaneous lookup timed out")
+        .expect("remote lookup should converge");
+
+    ask_once(
+        &local,
+        &remote.registry.peer_id,
+        b"collision-local",
+        b"remote:collision-local",
+    )
+    .await;
+    ask_once(
+        &remote,
+        &local.registry.peer_id,
+        b"collision-remote",
+        b"local:collision-remote",
+    )
+    .await;
+
+    with_events(&events, |events| {
+        assert_eq!(
+            session_published_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Outbound
+            ),
+            0,
+            "inbound-preferred side must not publish outbound during simultaneous collision"
+        );
+        assert_eq!(
+            session_published_count(events, &local.registry.peer_id, TransportDirection::Inbound),
+            0,
+            "outbound owner must not preserve inbound during simultaneous collision"
+        );
+        assert!(
+            session_published_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Inbound
+            ) >= 1,
+            "inbound-preferred side should publish the preferred inbound session"
+        );
+        assert!(
+            session_published_count(
+                events,
+                &local.registry.peer_id,
+                TransportDirection::Outbound
+            ) >= 1,
+            "outbound owner should publish the preferred outbound session"
+        );
+    });
+    assert_eq!(
+        count_events(&events, |event| matches!(
+            event,
+            TransportLifecycleEvent::WrongDirectionEvicted { .. }
+        )),
+        0,
+        "simultaneous collision should converge without a replace_wrong_direction loop"
+    );
+
+    shutdown_pair(local, remote).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn actor_timeout_does_not_destroy_healthy_session() -> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let events = install_recorder();
+
+    let (local_key, remote_key) = inbound_preferred_key_pair();
+    let asks_local = Arc::new(AtomicU64::new(0));
+    let asks_remote = Arc::new(AtomicU64::new(0));
+    let local = node(local_key, "local", Arc::clone(&asks_local)).await?;
+    let remote = node_with_slow_payload(
+        remote_key,
+        "remote",
+        Arc::clone(&asks_remote),
+        Some(Duration::from_millis(250)),
+    )
+    .await?;
+    let remote_to_local = ScriptedProxy::new(local.registry.bind_addr, Duration::ZERO).await;
+    let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
+
+    configure_static_peer(
+        &local,
+        remote.registry.peer_id.clone(),
+        local_to_remote.listen_addr,
+    )
+    .await;
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        remote_to_local.listen_addr,
+    )
+    .await;
+    connect_preferred_direction(&local, &remote, &remote_to_local).await?;
+
+    let remote_ref = local.lookup_peer(&remote.registry.peer_id).await?;
+    let timed_out = remote_ref
+        .ask_actor_frame(
+            TEST_ACTOR_ID,
+            TEST_TYPE_HASH,
+            Bytes::from_static(b"slow"),
+            Duration::from_millis(50),
+        )
+        .await;
+    assert!(
+        matches!(timed_out, Err(icanact_remote::GossipError::Timeout)),
+        "slow actor ask should time out without being treated as transport death: {timed_out:?}"
+    );
+
+    ask_once(&local, &remote.registry.peer_id, b"fast", b"remote:fast").await;
+    with_events(&events, |events| {
+        assert_eq!(
+            session_removed_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Inbound
+            ),
+            0,
+            "ordinary actor timeout must not evict the healthy inbound session"
+        );
+    });
+
+    shutdown_pair(local, remote).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_hello_slow_path_succeeds_within_budget_and_leaves_no_stale_timeout_session()
+-> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    let (local_key, remote_key) = inbound_preferred_key_pair();
+    let asks_local = Arc::new(AtomicU64::new(0));
+    let asks_remote = Arc::new(AtomicU64::new(0));
+    let local = node(local_key, "local", Arc::clone(&asks_local)).await?;
+    let remote = node(remote_key, "remote", Arc::clone(&asks_remote)).await?;
+
+    let within_budget_events = install_recorder();
+    let remote_to_local = ScriptedProxy::with_plan(
+        local.registry.bind_addr,
+        ProxyPlan {
+            client_first_byte_delay: Duration::from_millis(150),
+            server_first_byte_delay: Duration::from_millis(150),
+            ..Default::default()
+        },
+    )
+    .await;
+    let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
+    configure_static_peer(
+        &local,
+        remote.registry.peer_id.clone(),
+        local_to_remote.listen_addr,
+    )
+    .await;
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        remote_to_local.listen_addr,
+    )
+    .await;
+    connect_preferred_direction(&local, &remote, &remote_to_local).await?;
+    ask_once(
+        &local,
+        &remote.registry.peer_id,
+        b"tls-ok",
+        b"remote:tls-ok",
+    )
+    .await;
+    with_events(&within_budget_events, |events| {
+        assert!(
+            session_published_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Inbound
+            ) >= 1,
+            "slow TLS/hello bytes inside the connection budget should publish a session"
+        );
+    });
+
+    drop(remote_to_local);
+    drop(local_to_remote);
+    shutdown_pair(local, remote).await;
+
+    let (local_key, remote_key) = inbound_preferred_key_pair();
+    let asks_local = Arc::new(AtomicU64::new(0));
+    let asks_remote = Arc::new(AtomicU64::new(0));
+    let local = node(local_key, "local", Arc::clone(&asks_local)).await?;
+    let remote = node(remote_key, "remote", Arc::clone(&asks_remote)).await?;
+    let timeout_events = install_recorder();
+    let delayed_remote_to_local = ScriptedProxy::with_plan(
+        local.registry.bind_addr,
+        ProxyPlan {
+            client_first_byte_delay: Duration::from_millis(900),
+            server_first_byte_delay: Duration::from_millis(900),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        remote
+            .registry
+            .should_keep_connection(&local.registry.peer_id, true),
+        "timeout phase must use the outbound owner so suppression cannot hide TLS/hello timing"
+    );
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        delayed_remote_to_local.listen_addr,
+    )
+    .await;
+    let result = timeout(
+        Duration::from_secs(2),
+        remote
+            .add_peer(&local.registry.peer_id)
+            .await
+            .connect(&delayed_remote_to_local.listen_addr),
+    )
+    .await
+    .expect("over-budget TLS/hello connect should return before outer timeout");
+    assert!(
+        result.is_err(),
+        "over-budget TLS/hello delay should fail cleanly"
+    );
+    with_events(&timeout_events, |events| {
+        assert_eq!(
+            session_published_count(
+                events,
+                &local.registry.peer_id,
+                TransportDirection::Outbound
+            ),
+            0,
+            "failed TLS/hello attempt must not publish a stale outbound session: {events:#?}"
+        );
+    });
+
+    shutdown_pair(local, remote).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn half_open_reset_evicts_dead_session_but_actor_timeout_does_not()
+-> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let events = install_recorder();
+
+    let (local_key, remote_key) = inbound_preferred_key_pair();
+    let asks_local = Arc::new(AtomicU64::new(0));
+    let asks_remote = Arc::new(AtomicU64::new(0));
+    let local = node(local_key, "local", Arc::clone(&asks_local)).await?;
+    let remote = node(remote_key, "remote", Arc::clone(&asks_remote)).await?;
+    let remote_to_local = ScriptedProxy::with_plan(
+        local.registry.bind_addr,
+        ProxyPlan {
+            close_after: Some(Duration::from_millis(250)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
+
+    configure_static_peer(
+        &local,
+        remote.registry.peer_id.clone(),
+        local_to_remote.listen_addr,
+    )
+    .await;
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        remote_to_local.listen_addr,
+    )
+    .await;
+    connect_preferred_direction(&local, &remote, &remote_to_local).await?;
+    ask_once(
+        &local,
+        &remote.registry.peer_id,
+        b"before-close",
+        b"remote:before-close",
+    )
+    .await;
+
+    sleep(Duration::from_millis(400)).await;
+    let _ = local.lookup_peer(&remote.registry.peer_id).await;
+    let removed = with_events(&events, |events| {
+        session_removed_count(
+            events,
+            &remote.registry.peer_id,
+            TransportDirection::Inbound,
+        )
+    });
+    assert!(
+        removed >= 1,
+        "forced transport close should evict the stale inbound session"
+    );
+
+    shutdown_pair(local, remote).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sessions()
 -> icanact_remote::Result<()> {
     let _guard = TEST_LOCK
@@ -319,57 +887,50 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
     )
     .await;
 
-    for cycle in 0..25 {
+    const SOAK_ROUNDS: usize = 500;
+
+    for cycle in 0..SOAK_ROUNDS {
         local.disconnect_peer_connection(&remote.registry.peer_id);
         remote.disconnect_peer_connection(&local.registry.peer_id);
+        sleep(Duration::from_millis(5)).await;
 
-        let (local_lookup, remote_connect) = tokio::join!(
-            timeout(
-                Duration::from_secs(2),
-                local.lookup_peer(&remote.registry.peer_id)
-            ),
-            async {
-                remote
-                    .add_peer(&local.registry.peer_id)
-                    .await
-                    .connect(&remote_to_local.listen_addr)
-                    .await
-            },
-        );
-        local_lookup
-            .expect("lookup timed out")
-            .expect("lookup should converge");
-        remote_connect.expect("outbound owner connect should converge");
+        connect_preferred_direction(&local, &remote, &remote_to_local).await?;
 
         let payload = format!("cycle-{cycle}");
         let expected = format!("remote:{payload}");
-        let reply = local
-            .lookup_peer(&remote.registry.peer_id)
-            .await?
-            .ask_actor_frame(
-                TEST_ACTOR_ID,
-                TEST_TYPE_HASH,
-                Bytes::from(payload),
-                Duration::from_millis(750),
-            )
-            .await?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reply = loop {
+            match local
+                .lookup_peer(&remote.registry.peer_id)
+                .await?
+                .ask_actor_frame(
+                    TEST_ACTOR_ID,
+                    TEST_TYPE_HASH,
+                    Bytes::from(payload.clone()),
+                    Duration::from_secs(2),
+                )
+                .await
+            {
+                Ok(reply) => break reply,
+                Err(err) if Instant::now() < deadline => {
+                    local.disconnect_peer_connection(&remote.registry.peer_id);
+                    remote.disconnect_peer_connection(&local.registry.peer_id);
+                    sleep(Duration::from_millis(10)).await;
+                    connect_preferred_direction(&local, &remote, &remote_to_local).await?;
+                    let _ = err;
+                }
+                Err(err) => return Err(err),
+            }
+        };
         assert_eq!(reply.as_ref(), expected.as_bytes());
 
-        let local_outbound = events
-            .lock()
-            .expect("event recorder poisoned")
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    TransportLifecycleEvent::SessionPublished {
-                        peer,
-                        direction: TransportDirection::Outbound,
-                        ..
-                    } if peer == &remote.registry.peer_id
-                )
-            })
-            .count();
+        let local_outbound = with_events(&events, |events| {
+            session_published_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Outbound,
+            )
+        });
         assert_eq!(
             local_outbound, 0,
             "inbound-preferred side must never publish outbound to remote"
@@ -377,7 +938,7 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
     }
 
     assert!(
-        asks_remote.load(Ordering::Acquire) >= 25,
+        asks_remote.load(Ordering::Acquire) >= SOAK_ROUNDS as u64,
         "remote should answer every scripted reconnect ask"
     );
     assert_eq!(
@@ -387,9 +948,17 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
         )),
         0
     );
+    let suppressed_timeouts = count_events(&events, |event| {
+        matches!(
+            event,
+            TransportLifecycleEvent::OutboundSuppressedInboundTimeout { .. }
+        )
+    });
+    assert!(
+        suppressed_timeouts <= 5,
+        "soak should not spin in suppressed inbound timeouts, observed {suppressed_timeouts}"
+    );
 
-    set_transport_lifecycle_recorder(None);
-    local.shutdown().await;
-    remote.shutdown().await;
+    shutdown_pair(local, remote).await;
     Ok(())
 }

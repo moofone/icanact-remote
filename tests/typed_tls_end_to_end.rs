@@ -1,6 +1,7 @@
 use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, wire_type};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::time::sleep;
@@ -8,12 +9,33 @@ use tokio::time::sleep;
 const TYPED_TLS_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 const TYPED_TLS_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 const TYPED_TLS_WORKERS: usize = 4;
+static TYPED_TLS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
 
 fn run_typed_tls_test<F, Fut>(name: &'static str, test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let _guard = TYPED_TLS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let handle = std::thread::Builder::new()
         .name(format!("typed-tls-test-{}", name))
         .stack_size(TYPED_TLS_THREAD_STACK_SIZE)
@@ -48,8 +70,8 @@ fn test_typed_ask_over_tls_with_pooled_path() {
         let addr_a: SocketAddr = "127.0.0.1:9011".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:9012".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("typed_tls_a");
-        let key_pair_b = KeyPair::new_for_testing("typed_tls_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("typed_tls_a", "typed_tls_b");
         let peer_id_b = key_pair_b.peer_id();
 
         let config = GossipConfig {
@@ -103,8 +125,8 @@ fn test_typed_ask_archived_over_tls_with_pooled_path() {
         let addr_a: SocketAddr = "127.0.0.1:9015".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:9016".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("typed_tls_archived_a");
-        let key_pair_b = KeyPair::new_for_testing("typed_tls_archived_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("typed_tls_archived_a", "typed_tls_archived_b");
         let peer_id_b = key_pair_b.peer_id();
 
         let config = GossipConfig {
@@ -165,8 +187,8 @@ fn test_typed_tell_over_tls_with_pooled_path() {
         let addr_a: SocketAddr = "127.0.0.1:9013".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:9014".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("typed_tls_tell_a");
-        let key_pair_b = KeyPair::new_for_testing("typed_tls_tell_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("typed_tls_tell_a", "typed_tls_tell_b");
         let peer_id_b = key_pair_b.peer_id();
 
         let config = GossipConfig {

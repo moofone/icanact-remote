@@ -19,6 +19,22 @@ async fn wait_for_lookup(
     }
 }
 
+async fn connect_preferred(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
+    if a.registry.should_keep_connection(&b.registry.peer_id, true) {
+        a.add_peer(&b.registry.peer_id)
+            .await
+            .connect(&b.registry.bind_addr)
+            .await
+            .unwrap();
+    } else {
+        b.add_peer(&a.registry.peer_id)
+            .await
+            .connect(&a.registry.bind_addr)
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::Error>> {
     let config = GossipConfig {
@@ -27,7 +43,6 @@ async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::
     };
 
     let node1_keypair = KeyPair::new_for_testing("gossip_prop_node1");
-    let node1_id = node1_keypair.peer_id();
     let node1 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse()?,
         node1_keypair.to_secret_key(),
@@ -37,7 +52,6 @@ async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::
     .await?;
 
     let node2_keypair = KeyPair::new_for_testing("gossip_prop_node2");
-    let node2_id = node2_keypair.peer_id();
     let node2 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse()?,
         node2_keypair.to_secret_key(),
@@ -55,12 +69,9 @@ async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::
     )
     .await?;
 
-    let peer1_from_2 = node2.add_peer(&node1_id).await;
-    peer1_from_2.connect(&node1.registry.bind_addr).await?;
-    let peer1_from_3 = node3.add_peer(&node1_id).await;
-    peer1_from_3.connect(&node1.registry.bind_addr).await?;
-    let peer2_from_3 = node3.add_peer(&node2_id).await;
-    peer2_from_3.connect(&node2.registry.bind_addr).await?;
+    connect_preferred(&node1, &node2).await;
+    connect_preferred(&node1, &node3).await;
+    connect_preferred(&node2, &node3).await;
 
     sleep(Duration::from_millis(300)).await;
 
@@ -129,7 +140,6 @@ async fn test_actor_update_propagation() -> Result<(), Box<dyn std::error::Error
     };
 
     let node1_keypair = KeyPair::new_for_testing("gossip_prop_update_node1");
-    let node1_id = node1_keypair.peer_id();
     let node1 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse()?,
         node1_keypair.to_secret_key(),
@@ -147,8 +157,7 @@ async fn test_actor_update_propagation() -> Result<(), Box<dyn std::error::Error
     )
     .await?;
 
-    let peer1_from_2 = node2.add_peer(&node1_id).await;
-    peer1_from_2.connect(&node1.registry.bind_addr).await?;
+    connect_preferred(&node1, &node2).await;
     sleep(Duration::from_millis(300)).await;
 
     node1
@@ -200,7 +209,6 @@ async fn test_actor_removal_propagation() -> Result<(), Box<dyn std::error::Erro
     };
 
     let node1_keypair = KeyPair::new_for_testing("gossip_prop_remove_node1");
-    let node1_id = node1_keypair.peer_id();
     let node1 = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse()?,
         node1_keypair.to_secret_key(),
@@ -218,8 +226,7 @@ async fn test_actor_removal_propagation() -> Result<(), Box<dyn std::error::Erro
     )
     .await?;
 
-    let peer1_from_2 = node2.add_peer(&node1_id).await;
-    peer1_from_2.connect(&node1.registry.bind_addr).await?;
+    connect_preferred(&node1, &node2).await;
     sleep(Duration::from_millis(300)).await;
 
     node1

@@ -40,6 +40,36 @@ where
     handle.join().expect("lifecycle test panicked");
 }
 
+fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first
+        .peer_id()
+        .to_node_id()
+        .as_bytes()
+        .cmp(second.peer_id().to_node_id().as_bytes())
+        .is_lt()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn key_pair_greater_than(seed_prefix: &str, lower: &KeyPair) -> KeyPair {
+    (0..100)
+        .map(|idx| KeyPair::new_for_testing(&format!("{seed_prefix}_{idx}")))
+        .find(|candidate| {
+            lower
+                .peer_id()
+                .to_node_id()
+                .as_bytes()
+                .cmp(candidate.peer_id().to_node_id().as_bytes())
+                .is_lt()
+        })
+        .expect("find higher peer id")
+}
+
 /// Test that connection mappings remain valid after multiple gossip rounds.
 ///
 /// This test verifies that the fix for the FullSync/FullSyncResponse addr_to_peer_id
@@ -57,8 +87,8 @@ fn test_connection_survives_multiple_gossip_rounds() {
         let addr_a: SocketAddr = "127.0.0.1:7921".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7922".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("lifecycle_node_a");
-        let key_pair_b = KeyPair::new_for_testing("lifecycle_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("lifecycle_node_a", "lifecycle_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -143,8 +173,8 @@ fn test_addr_mappings_preserved_after_fullsync() {
         let addr_a: SocketAddr = "127.0.0.1:7930".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7924".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("mapping_node_a");
-        let key_pair_b = KeyPair::new_for_testing("mapping_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("mapping_node_a", "mapping_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -248,8 +278,8 @@ fn test_reconnect_cleanup() {
         let addr_a: SocketAddr = "127.0.0.1:7935".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7936".parse().unwrap();
 
-        let key_pair_a = KeyPair::new_for_testing("reconnect_node_a");
-        let key_pair_b = KeyPair::new_for_testing("reconnect_node_b");
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("reconnect_node_a", "reconnect_node_b");
 
         let peer_id_b = key_pair_b.peer_id();
 
@@ -299,7 +329,7 @@ fn test_reconnect_cleanup() {
 
         // Restart B with same address but NEW identity
         info!("Restarting node B with new identity");
-        let key_pair_b2 = KeyPair::new_for_testing("reconnect_node_b2");
+        let key_pair_b2 = key_pair_greater_than("reconnect_node_b2", &key_pair_a);
         let peer_id_b2 = key_pair_b2.peer_id();
         let handle_b2 = GossipRegistryHandle::new_with_transport_stack(
             addr_b,
