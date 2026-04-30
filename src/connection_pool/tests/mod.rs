@@ -231,6 +231,41 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     );
 }
 
+#[tokio::test]
+async fn remove_connection_cleans_all_address_aliases_for_same_stream() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("remove_alias_connection").peer_id();
+    let configured_addr: SocketAddr = "127.0.0.1:40559".parse().unwrap();
+    let alias_addr: SocketAddr = "127.0.0.1:50559".parse().unwrap();
+
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        alias_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
+
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), configured_addr, connection.clone()));
+    pool.index_connection_by_addr(alias_addr, connection.clone());
+    pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
+
+    let removed = pool
+        .remove_connection(alias_addr)
+        .expect("alias removal should remove the connection");
+
+    assert!(Arc::ptr_eq(&removed, &connection));
+    assert!(pool.get_connection_by_addr(&alias_addr).is_none());
+    assert!(pool.get_connection_by_addr(&configured_addr).is_none());
+    assert!(pool.get_connection_by_peer_id(&peer_id).is_none());
+}
+
 #[test]
 fn connection_count_uses_session_current_connection() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));

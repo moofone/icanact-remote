@@ -1002,15 +1002,34 @@ impl<T> ConnectionPool<T> {
                 self.connections_by_addr.len()
             );
 
-            // Also remove from node ID mapping
-            if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&addr) {
-                if self.connections_by_peer.contains_sync(&node_id) {
-                    self.clear_current_peer_connection_if_matches(&node_id, &connection);
-                    debug!(
-                        "CONNECTION POOL: Also removed connection by node ID '{}'",
-                        node_id
-                    );
+            let mut alias_addrs = Vec::new();
+            self.connections_by_addr.iter_sync(|alias_addr, alias_conn| {
+                if Arc::ptr_eq(alias_conn, &connection) {
+                    alias_addrs.push(*alias_addr);
                 }
+                true
+            });
+
+            let mut peer_ids = Vec::new();
+            if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&addr) {
+                peer_ids.push(node_id);
+            }
+            for alias_addr in alias_addrs {
+                let _ = self.connections_by_addr.remove_sync(&alias_addr);
+                if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&alias_addr)
+                    && !peer_ids.contains(&node_id)
+                {
+                    peer_ids.push(node_id);
+                }
+                self.clear_capabilities_for_addr(&alias_addr);
+            }
+
+            for peer_id in peer_ids {
+                self.clear_current_peer_connection_if_matches(&peer_id, &connection);
+                debug!(
+                    "CONNECTION POOL: Also removed connection by node ID '{}'",
+                    peer_id
+                );
             }
 
             self.connection_counter.fetch_sub(1, Ordering::AcqRel);
@@ -1253,6 +1272,20 @@ impl<T> ConnectionPool<T> {
 
         let mut resolved_node_id = node_id;
         loop {
+            if let Some(node_id) = resolved_node_id.as_ref() {
+                let peer_id = crate::PeerId::from(node_id);
+                if let Some(conn) = self.get_connection_by_peer_id(&peer_id) {
+                    conn.update_last_used();
+                    let addr = conn.addr;
+                    if let Some(handle) = self.make_connection_handle(addr, &conn) {
+                        return Ok(handle);
+                    }
+                    return Err(crate::GossipError::Network(std::io::Error::other(
+                        "Connection exists but has no usable writer handle",
+                    )));
+                }
+            }
+
             if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
                 if conn.is_connected() {
                     if let Some(stream_handle) = conn.stream_handle.as_ref() {
@@ -1429,6 +1462,10 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_addr
             .upsert_sync(addr, connection_arc.clone());
+        if let Some(peer_id) = peer_id_opt.as_ref() {
+            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+            self.publish_current_peer_connection(peer_id, connection_arc.clone());
+        }
         debug!(
             "CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections",
             addr,
