@@ -818,26 +818,50 @@ impl<T: 'static> Peer<T> {
             );
             let peers_after = gossip_state.peers.len();
             tracing::debug!(
+              peer_id = %self.peer_id,
+              addr = %addr,
+              peers_before = peers_before,
+              peers_after = peers_after,
+              "🎯 Added peer to gossip state for gossip rounds"
+            );
+        }
+
+        if !self.registry.should_keep_connection(&self.peer_id, true) {
+            if let Some(existing_conn) = self
+                .registry
+                .connection_pool
+                .get_connection_by_peer_id(&self.peer_id)
+            {
+                let existing_is_outbound = existing_conn.direction
+                    == crate::connection_pool::ConnectionDirection::Outbound;
+                if !self
+                    .registry
+                    .should_keep_connection(&self.peer_id, existing_is_outbound)
+                {
+                    tracing::info!(
+                        target: "icanact_remote_lifecycle",
+                        peer_id = %self.peer_id,
+                        addr = %existing_conn.addr,
+                        existing_direction = ?existing_conn.direction,
+                        "outbound_connect_suppressed_drop_wrong_direction"
+                    );
+                    let _ = self
+                        .registry
+                        .connection_pool
+                        .disconnect_connection_by_peer_id(&self.peer_id);
+                }
+            }
+            tracing::info!(
+                target: "icanact_remote_lifecycle",
                 peer_id = %self.peer_id,
                 addr = %addr,
-                peers_before = peers_before,
-                peers_after = peers_after,
-                "🎯 Added peer to gossip state for gossip rounds"
-              );
-          }
+                "outbound_connect_suppressed_prefer_inbound"
+            );
+            return Ok(());
+        }
 
-          if !self.registry.should_keep_connection(&self.peer_id, true) {
-              tracing::info!(
-                  target: "icanact_remote_lifecycle",
-                  peer_id = %self.peer_id,
-                  addr = %addr,
-                  "outbound_connect_suppressed_prefer_inbound"
-              );
-              return Ok(());
-          }
-
-          // Then attempt to connect with enhanced error context
-          match self.registry.connect_to_peer(&self.peer_id).await {
+        // Then attempt to connect with enhanced error context
+        match self.registry.connect_to_peer(&self.peer_id).await {
             Ok(()) => {
                 tracing::info!(
                     peer_id = %self.peer_id,
@@ -1480,6 +1504,67 @@ mod tests {
                 .get_connection_by_peer_id(&remote_peer_id)
                 .is_none(),
             "suppressed outbound path must not create a wrong-direction connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_connect_suppression_drops_existing_wrong_direction_outbound() {
+        let (local_key, remote_key) = inbound_preferred_key_pair();
+        let remote_peer_id = remote_key.peer_id();
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41003".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(local_key),
+                connection_timeout: Duration::from_millis(10),
+                ..GossipConfig::default()
+            },
+        ));
+        assert!(!registry.should_keep_connection(&remote_peer_id, true));
+
+        let wrong_addr: SocketAddr = "127.0.0.1:51003".parse().unwrap();
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                io,
+                wrong_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut connection = crate::connection_pool::LockFreeConnection::new(
+            wrong_addr,
+            crate::connection_pool::ConnectionDirection::Outbound,
+        );
+        connection.stream_handle = Some(std::sync::Arc::new(stream_handle));
+        connection.set_state(crate::connection_pool::ConnectionState::Connected);
+        assert!(registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            wrong_addr,
+            std::sync::Arc::new(connection)
+        ));
+        assert!(
+            registry
+                .connection_pool
+                .get_connection_by_peer_id(&remote_peer_id)
+                .is_some(),
+            "test must start with a live wrong-direction connection"
+        );
+
+        let peer = Peer {
+            peer_id: remote_peer_id.clone(),
+            registry: registry.clone(),
+        };
+        peer.connect(&"127.0.0.1:9".parse().unwrap())
+            .await
+            .expect("suppressed outbound path should not dial");
+
+        assert!(
+            registry
+                .connection_pool
+                .get_connection_by_peer_id(&remote_peer_id)
+                .is_none(),
+            "suppressed outbound path must remove a live wrong-direction outbound"
         );
     }
 

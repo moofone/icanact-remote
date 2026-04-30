@@ -68,7 +68,10 @@ impl<T> ConnectionPool<T> {
                         "outbound_tiebreak_evict_stale"
                     );
                     let _ = self.remove_connection(existing_conn.addr);
-                } else if !registry_arc.should_keep_connection(&remote_peer_id, true) {
+                } else if registry_arc.should_keep_connection(
+                    &remote_peer_id,
+                    existing_conn.direction == ConnectionDirection::Outbound,
+                ) {
                     info!(
                         target: "icanact_remote_lifecycle",
                         attempt_id,
@@ -90,17 +93,25 @@ impl<T> ConnectionPool<T> {
                         attempt_id,
                         remote = %remote_peer_id,
                         addr = %existing_conn.addr,
-                        "outbound_tiebreak_keep_existing"
+                        existing_direction = ?existing_conn.direction,
+                        "outbound_tiebreak_evict_wrong_direction"
                     );
-                    if let Some(handle) =
-                        self.make_connection_handle(existing_conn.addr, &existing_conn)
-                    {
-                        return Ok(handle);
-                    }
-                    return Err(GossipError::Network(std::io::Error::other(
-                        "Existing connection missing writer handle",
-                    )));
+                    let _ = self.disconnect_connection_by_peer_id(&remote_peer_id);
                 }
+            }
+
+            if !registry_arc.should_keep_connection(&remote_peer_id, true) {
+                info!(
+                    target: "icanact_remote_lifecycle",
+                    attempt_id,
+                    remote = %remote_peer_id,
+                    addr = %addr,
+                    "outbound_connect_suppressed_prefer_inbound"
+                );
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "outbound suppressed; deterministic tiebreak prefers inbound",
+                )));
             }
         }
 
