@@ -525,6 +525,13 @@ impl<T> GossipRegistryHandle<T> {
 }
 
 impl<T> GossipClient<T> {
+    pub(crate) fn from_registry(registry: Arc<GossipRegistry>) -> Self {
+        Self {
+            registry,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn lookup_connected_connection(
         &self,
         peer_id: &crate::PeerId,
@@ -1642,6 +1649,17 @@ where
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
         }
+        Ok(MessageReadResult::PubSub { .. }) => {
+            if let Some(node_id) = known_node_id {
+                (node_id.to_peer_id().to_hex(), None, None)
+            } else {
+                warn!(
+                    peer_addr = %peer_addr,
+                    "PubSub frame arrived before peer NodeId is known"
+                );
+                return ConnectionCloseOutcome::Normal { node_id: None };
+            }
+        }
         Ok(MessageReadResult::Actor { actor_id, .. }) => {
             // For actor messages received as the first message, we can't determine the sender
             // Use a placeholder identifier
@@ -1983,6 +2001,9 @@ pub(crate) enum MessageReadResult {
         payload: AlignedBytes,
     },
     Raw(bytes::Bytes),
+    PubSub {
+        payload: AlignedBytes,
+    },
     Actor {
         msg_type: u8,
         correlation_id: u16,
@@ -2356,6 +2377,14 @@ pub(crate) fn parse_message_from_pooled_buffer(
             correlation_id,
             payload: AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?,
         });
+    } else if msg_len >= crate::framing::PUBSUB_HEADER_LEN
+        && msg_data[0] == crate::MessageType::PubSub as u8
+    {
+        let payload_len = msg_len - crate::framing::PUBSUB_HEADER_LEN;
+        let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::PUBSUB_HEADER_LEN;
+        return Ok(MessageReadResult::PubSub {
+            payload: AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?,
+        });
     } else {
         // Check if this is a Gossip message with type prefix
         if msg_len >= 1 {
@@ -2476,6 +2505,21 @@ pub(crate) fn parse_message_from_pooled_buffer(
                             schema_hash,
                             stream_header,
                             chunk_data,
+                        });
+                    }
+                    crate::MessageType::PubSub => {
+                        if msg_data.len() < crate::framing::PUBSUB_HEADER_LEN {
+                            return Ok(raw(buffer));
+                        }
+                        let payload_len = msg_len - crate::framing::PUBSUB_HEADER_LEN;
+                        let payload_offset =
+                            crate::framing::LENGTH_PREFIX_LEN + crate::framing::PUBSUB_HEADER_LEN;
+                        return Ok(MessageReadResult::PubSub {
+                            payload: AlignedBytes::from_pooled_buffer_range(
+                                buffer,
+                                payload_offset,
+                                payload_len,
+                            )?,
                         });
                     }
                     _ => {
@@ -2656,6 +2700,13 @@ where
             correlation_id,
             payload: AlignedBytes::from_bytes(payload)?,
         })
+    } else if msg_len >= crate::framing::PUBSUB_HEADER_LEN
+        && msg_data[0] == crate::MessageType::PubSub as u8
+    {
+        let payload = msg_data.slice(crate::framing::PUBSUB_HEADER_LEN..);
+        Ok(MessageReadResult::PubSub {
+            payload: AlignedBytes::from_bytes(payload)?,
+        })
     } else {
         // Check if this is a Gossip message with type prefix
         if msg_len >= 1 {
@@ -2769,6 +2820,15 @@ where
                             schema_hash,
                             stream_header,
                             chunk_data,
+                        });
+                    }
+                    crate::MessageType::PubSub => {
+                        if msg_data.len() < crate::framing::PUBSUB_HEADER_LEN {
+                            return Ok(MessageReadResult::Raw(msg_data));
+                        }
+                        let payload = msg_data.slice(crate::framing::PUBSUB_HEADER_LEN..);
+                        return Ok(MessageReadResult::PubSub {
+                            payload: AlignedBytes::from_bytes(payload)?,
                         });
                     }
                     _ => {

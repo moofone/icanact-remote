@@ -60,3 +60,7 @@ harness = false
 [[bench]]
 name = "connect_paths"
 harness = false
+
+[[bench]]
+name = "pubsub_hotpath"
+harness = false
