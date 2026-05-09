@@ -3650,14 +3650,15 @@ impl<T: 'static> GossipRegistry<T> {
         // STEP 3: Apply all updates to the lock-free map.
         if !updates_to_apply.is_empty() {
             for (name, location) in &updates_to_apply {
-                // Also ensure the peer's NodeId is in the gossip state for TLS.
+                // Actor locations learned through full sync are routing targets, not
+                // necessarily gossip seeds. Configure the TLS peer-id mapping for direct
+                // sends without enrolling every learned actor host into periodic gossip.
                 if let Ok(addr) = location.address.parse::<SocketAddr>() {
-                    let node_id = Some(location.peer_id.to_node_id());
-                    self.add_peer_with_node_id(addr, node_id).await;
+                    self.configure_peer(location.peer_id.clone(), addr).await;
                     debug!(
                         actor = %name,
                         peer_addr = %addr,
-                        "Added NodeId to gossip state for actor's host"
+                        "Configured direct route for actor's host"
                     );
                 }
 
@@ -6628,10 +6629,16 @@ mod tests {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
 
         let mut remote_local = HashMap::new();
-        remote_local.insert("remote_actor1".to_string(), test_location(test_addr(9001)));
+        remote_local.insert(
+            "remote_actor1".to_string(),
+            RemoteActorLocation::new_with_peer(test_addr(9001), test_peer_id("remote_actor1")),
+        );
 
         let mut remote_known = HashMap::new();
-        remote_known.insert("remote_actor2".to_string(), test_location(test_addr(9002)));
+        remote_known.insert(
+            "remote_actor2".to_string(),
+            RemoteActorLocation::new_with_peer(test_addr(9002), test_peer_id("remote_actor2")),
+        );
 
         registry
             .merge_full_sync(
@@ -6657,6 +6664,25 @@ mod tests {
                 .known_actors
                 .contains_sync("remote_actor2")
         );
+
+        // Actor hosts learned from full-sync payloads are direct routing targets.
+        // They must not become periodic gossip peers, otherwise stale actor
+        // advertisements can create retry loops to retired service addresses.
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(!gossip_state.peers.contains_key(&test_addr(9001)));
+        assert!(!gossip_state.peers.contains_key(&test_addr(9002)));
+        drop(gossip_state);
+
+        let remote_actor1 = registry
+            .actor_state
+            .known_actors
+            .read_sync("remote_actor1", |_, v| v.clone())
+            .expect("remote_actor1 location");
+        let actor1_addr = registry
+            .connection_pool
+            .peer_id_to_addr
+            .read_sync(&remote_actor1.peer_id, |_, v| *v);
+        assert_eq!(actor1_addr, Some(test_addr(9001)));
     }
 
     #[tokio::test]
