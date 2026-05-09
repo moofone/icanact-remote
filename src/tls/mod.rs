@@ -197,7 +197,7 @@ impl ClientCertVerifier for NodeIdClientVerifier {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        false
+        true
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
@@ -251,4 +251,16 @@ pub fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Resu
 
     NodeId::from_bytes(key_bytes)
         .map_err(|e| Error::General(format!("Invalid public key in certificate: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_cert_verifier_requires_authenticated_clients() {
+        let verifier = NodeIdClientVerifier::new();
+
+        assert!(verifier.client_auth_mandatory());
+    }
 }
