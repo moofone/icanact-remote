@@ -407,8 +407,13 @@ impl PubSubIngressHandlerCell {
     }
 
     #[inline]
-    pub(crate) fn handle(&self, payload: crate::AlignedBytes) -> Result<()> {
-        self.handler.handle_pubsub_frame(payload)
+    pub(crate) fn handle(
+        &self,
+        authenticated_source_peer_id: &crate::PeerId,
+        payload: crate::AlignedBytes,
+    ) -> Result<()> {
+        self.handler
+            .handle_pubsub_frame(authenticated_source_peer_id, payload)
     }
 }
 

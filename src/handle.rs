@@ -1085,6 +1085,9 @@ async fn process_udp_datagram_native(
             peer_addr,
             response_correlation.as_deref(),
             response_connection.as_ref(),
+            response_connection
+                .as_ref()
+                .and_then(|conn| conn.embedded_peer_id.as_ref()),
         )
         .await?;
         return Ok(());
@@ -1133,6 +1136,9 @@ async fn process_udp_datagram_native(
             peer_addr,
             response_correlation.as_deref(),
             response_connection.as_ref(),
+            response_connection
+                .as_ref()
+                .and_then(|conn| conn.embedded_peer_id.as_ref()),
         )
         .await?;
 
@@ -1969,6 +1975,7 @@ where
         peer_addr,
         response_correlation.as_ref().map(|c| c.as_ref()),
         Some(&response_connection),
+        Some(&peer_id),
     )
     .await
     {
