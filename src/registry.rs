@@ -1254,11 +1254,16 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Enable UDP datagram transport mode with transport-neutral liveness detection.
+    ///
+    /// Native UDP datagrams are currently rejected because the datagram receive path
+    /// has no handshake or message authentication boundary. Keeping this API as an
+    /// explicit error prevents deployments from accidentally exposing unauthenticated
+    /// gossip and actor dispatch over UDP.
     pub fn enable_udp(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
-        self.udp_mode = true;
-        self.udp_failure_detector_config = UdpFailureDetectorConfig::default();
-        info!("UDP mode enabled (native datagram transport)");
-        Ok(())
+        Err(GossipError::InvalidConfig(
+            "native UDP datagram transport is disabled until inbound datagrams are authenticated"
+                .to_string(),
+        ))
     }
 
     fn udp_now_ms(&self) -> u64 {
@@ -5768,6 +5773,23 @@ mod tests {
             peer_retry_interval: Duration::from_millis(50),
             immediate_propagation_enabled: true, // Enable for testing
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enable_udp_rejects_unauthenticated_datagram_mode() {
+        let keypair = KeyPair::new_for_testing("udp-disabled-registry");
+        let mut registry = GossipRegistry::<()>::new(test_addr(0), test_config());
+
+        let err = registry
+            .enable_udp(keypair.to_secret_key())
+            .expect_err("unauthenticated UDP mode must remain disabled");
+
+        match err {
+            GossipError::InvalidConfig(message) => {
+                assert!(message.contains("disabled until inbound datagrams are authenticated"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
         }
     }
 
