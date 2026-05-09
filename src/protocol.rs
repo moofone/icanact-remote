@@ -4,7 +4,7 @@ use bytes::{Buf, Bytes};
 use tracing::{info, warn};
 
 use crate::{
-    GossipError, Result,
+    GossipError, PeerId, Result,
     handle::{
         MessageReadResult, handle_raw_ask_request, handle_response_message, send_inline_response,
         send_inline_response_aligned, send_pooled_response, send_streaming_response,
@@ -281,6 +281,7 @@ pub(crate) async fn process_read_result(
     peer_addr: SocketAddr,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
     response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
+    authenticated_peer_id: Option<&PeerId>,
 ) -> Result<()> {
     match result {
         MessageReadResult::Gossip(msg, _correlation_id) => {
@@ -319,10 +320,16 @@ pub(crate) async fn process_read_result(
             .await;
         }
         MessageReadResult::PubSub { payload } => {
-            if let Some(handler) = registry.pubsub_ingress_handler.load_full() {
-                if let Err(e) = handler.handle(payload) {
-                    warn!(peer = %peer_addr, error = %e, "Failed to process PubSub frame");
+            let authenticated_peer_id = authenticated_peer_id
+                .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));
+            if let Some(authenticated_peer_id) = authenticated_peer_id {
+                if let Some(handler) = registry.pubsub_ingress_handler.load_full() {
+                    if let Err(e) = handler.handle(authenticated_peer_id, payload) {
+                        warn!(peer = %peer_addr, error = %e, "Failed to process PubSub frame");
+                    }
                 }
+            } else {
+                warn!(peer = %peer_addr, "Dropping PubSub frame without authenticated peer identity");
             }
         }
         MessageReadResult::Actor {
@@ -477,7 +484,6 @@ pub(crate) async fn process_read_result(
                     crate::test_helpers::record_raw_payload(_payload.clone());
                 }
             }
-            ()
         }
         MessageReadResult::DirectAsk {
             correlation_id,

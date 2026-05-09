@@ -144,7 +144,11 @@ impl<'a> crate::WireType for PubSubFrameV1Encode<'a> {
 }
 
 pub trait PubSubIngressHandler: Send + Sync {
-    fn handle_pubsub_frame(&self, payload: crate::AlignedBytes) -> Result<()>;
+    fn handle_pubsub_frame(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: crate::AlignedBytes,
+    ) -> Result<()>;
 }
 
 pub trait PubSubRouteProvider: Send + Sync {
@@ -534,7 +538,11 @@ impl RoutedPubSub {
 }
 
 impl PubSubIngressHandler for RoutedPubSub {
-    fn handle_pubsub_frame(&self, payload: crate::AlignedBytes) -> Result<()> {
+    fn handle_pubsub_frame(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: crate::AlignedBytes,
+    ) -> Result<()> {
         let frame = match crate::decode_typed::<PubSubFrameV1>(payload.as_ref()) {
             Ok(frame) => frame,
             Err(err) => {
@@ -544,6 +552,12 @@ impl PubSubIngressHandler for RoutedPubSub {
         };
         if frame.hops_remaining == 0 {
             self.counters.ttl_drops.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if frame.source_peer_id != *authenticated_source_peer_id {
+            self.counters
+                .reflection_drops
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         if frame.origin_peer_id == self.local_peer_id || frame.source_peer_id == self.local_peer_id
@@ -672,6 +686,148 @@ fn parse_interest_name(name: &str) -> Option<(u64, PeerId)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pubsub(registry_peer_seed: &str) -> RoutedPubSub {
+        let mut config = crate::GossipConfig::default();
+        config.key_pair = Some(crate::KeyPair::new_for_testing(registry_peer_seed));
+        let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+        ));
+        RoutedPubSub {
+            local_peer_id: registry.peer_id.clone(),
+            client: crate::GossipClient::from_registry(Arc::clone(&registry)),
+            registry,
+            subscribers: ArcSwap::from_pointee(HashMap::new()),
+            type_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            local_counts: Mutex::new(HashMap::new()),
+            route_groups: ArcSwap::from_pointee(HashMap::new()),
+            conns: ArcSwap::from_pointee(HashMap::new()),
+            seen: Mutex::new(Vec::with_capacity(DEFAULT_SEEN_CAPACITY)),
+            counters: PubSubIngressCounters::default(),
+            next_sub_id: AtomicU64::new(1),
+            next_msg_id: AtomicU64::new(1),
+            route_provider: ArcSwap::from_pointee(None),
+        }
+    }
+
+    fn aligned_frame(bytes: Bytes) -> crate::AlignedBytes {
+        crate::AlignedBytes::from_pooled_slice(
+            bytes.as_ref(),
+            Arc::new(crate::AlignedBytesPool::default()),
+        )
+    }
+
+    fn add_test_subscriber(pubsub: &RoutedPubSub, topic: u64, type_hash: u64, deliver: Subscriber) {
+        let mut next = (*pubsub.subscribers.load_full()).clone();
+        next.insert(
+            (topic, type_hash),
+            Arc::from(vec![deliver].into_boxed_slice()),
+        );
+        pubsub.subscribers.store(Arc::new(next));
+    }
+
+    #[test]
+    fn pubsub_rejects_source_peer_id_that_does_not_match_authenticated_peer() {
+        let pubsub = test_pubsub("pubsub-local-auth-mismatch");
+        let victim = crate::KeyPair::new_for_testing("pubsub-victim-auth-mismatch").peer_id();
+        let attacker = crate::KeyPair::new_for_testing("pubsub-attacker-auth-mismatch").peer_id();
+        let topic = topic_key("auth-mismatch");
+        let type_hash = 99;
+        let delivered = Arc::new(AtomicU64::new(0));
+        let delivered_for_sub = Arc::clone(&delivered);
+        add_test_subscriber(
+            &pubsub,
+            topic,
+            type_hash,
+            Arc::new(move |_| {
+                delivered_for_sub.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        let spoofed = encode_frame(
+            topic,
+            type_hash,
+            42,
+            victim.clone(),
+            attacker,
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            std::slice::from_ref(&pubsub.local_peer_id),
+            b"spoofed",
+        )
+        .unwrap();
+
+        pubsub
+            .handle_pubsub_frame(&victim, aligned_frame(spoofed))
+            .unwrap();
+
+        let stats = pubsub.stats();
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.delivered_local, 0);
+        assert_eq!(stats.reflection_drops, 1);
+        assert_eq!(delivered.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rejected_spoofed_pubsub_frame_does_not_poison_seen_entries() {
+        let pubsub = test_pubsub("pubsub-local-no-poison");
+        let victim = crate::KeyPair::new_for_testing("pubsub-victim-no-poison").peer_id();
+        let attacker = crate::KeyPair::new_for_testing("pubsub-attacker-no-poison").peer_id();
+        let topic = topic_key("no-poison");
+        let type_hash = 101;
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let delivered_for_sub = Arc::clone(&delivered);
+        add_test_subscriber(
+            &pubsub,
+            topic,
+            type_hash,
+            Arc::new(move |payload| {
+                delivered_for_sub.lock().unwrap().push(payload);
+            }),
+        );
+
+        let spoofed = encode_frame(
+            topic,
+            type_hash,
+            7,
+            victim.clone(),
+            attacker,
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            std::slice::from_ref(&pubsub.local_peer_id),
+            b"spoofed",
+        )
+        .unwrap();
+        pubsub
+            .handle_pubsub_frame(&victim, aligned_frame(spoofed))
+            .unwrap();
+
+        let legitimate = encode_frame(
+            topic,
+            type_hash,
+            7,
+            victim.clone(),
+            victim.clone(),
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            std::slice::from_ref(&pubsub.local_peer_id),
+            b"legitimate",
+        )
+        .unwrap();
+        pubsub
+            .handle_pubsub_frame(&victim, aligned_frame(legitimate))
+            .unwrap();
+
+        let stats = pubsub.stats();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.delivered_local, 1);
+        assert_eq!(stats.duplicate_drops, 0);
+        assert_eq!(stats.reflection_drops, 1);
+        let deliveries = delivered.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].as_ref(), b"legitimate");
+    }
 
     #[test]
     fn interest_name_round_trips() {

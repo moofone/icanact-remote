@@ -1787,6 +1787,7 @@ impl<T> ConnectionPool<T> {
                             peer_addr,
                             None,
                             None,
+                            None,
                         )
                         .await
                         {
