@@ -1543,6 +1543,13 @@ enum ConnectionCloseOutcome {
     DroppedByTieBreaker,
 }
 
+fn inbound_tls_sender_is_authenticated(
+    peer_node_id: Option<crate::NodeId>,
+    claimed_node_id: crate::NodeId,
+) -> bool {
+    peer_node_id.is_some_and(|authenticated_node_id| authenticated_node_id == claimed_node_id)
+}
+
 /// Handle an incoming TLS connection - processes all messages over encrypted stream
 #[allow(dead_code)]
 async fn handle_incoming_connection_tls<S>(
@@ -1714,7 +1721,28 @@ where
             return ConnectionCloseOutcome::Normal { node_id: None };
         }
     };
-    let node_id_opt = Some(peer_id.to_node_id());
+    let sender_node_id_from_message = peer_id.to_node_id();
+    if !inbound_tls_sender_is_authenticated(peer_node_id, sender_node_id_from_message) {
+        match peer_node_id {
+            Some(authenticated_node_id) => {
+                warn!(
+                    peer_addr = %peer_addr,
+                    authenticated_node_id = %authenticated_node_id.fmt_short(),
+                    claimed_node_id = %sender_node_id_from_message.fmt_short(),
+                    "TLS client certificate NodeId does not match first message sender; dropping connection"
+                );
+            }
+            None => {
+                warn!(
+                    peer_addr = %peer_addr,
+                    claimed_node_id = %sender_node_id_from_message.fmt_short(),
+                    "TLS client certificate NodeId missing for inbound connection; dropping connection"
+                );
+            }
+        }
+        return ConnectionCloseOutcome::Normal { node_id: None };
+    }
+    let node_id_opt = Some(sender_node_id_from_message);
 
     // Prefer the sender's advertised bind address (validated) and fall back
     // to any configured address, then the TCP source address.
@@ -3135,4 +3163,29 @@ async fn send_gossip_message_zero_copy(
     let _tcp_elapsed = tcp_start.elapsed();
     // eprintln!("🔍 TCP_WRITE_TIME: {:?}", tcp_elapsed);
     Ok(())
+}
+#[cfg(test)]
+mod inbound_tls_identity_tests {
+    use super::inbound_tls_sender_is_authenticated;
+    use crate::KeyPair;
+
+    #[test]
+    fn inbound_tls_sender_identity_requires_matching_certificate_node_id() {
+        let authenticated = KeyPair::new_for_testing("inbound-tls-authenticated")
+            .peer_id()
+            .to_node_id();
+        let claimed = KeyPair::new_for_testing("inbound-tls-claimed")
+            .peer_id()
+            .to_node_id();
+
+        assert!(inbound_tls_sender_is_authenticated(
+            Some(authenticated),
+            authenticated
+        ));
+        assert!(!inbound_tls_sender_is_authenticated(None, authenticated));
+        assert!(!inbound_tls_sender_is_authenticated(
+            Some(authenticated),
+            claimed
+        ));
+    }
 }
