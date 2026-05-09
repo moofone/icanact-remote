@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -11,7 +11,7 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 #[cfg(any(feature = "test-helpers", debug_assertions))]
 use icanact_remote::wire_type;
 use icanact_remote::{
-    AlignedBytes, AskContext, AskForwarder, GossipConfig, GossipRegistryHandle, KeyPair,
+    AlignedBytes, AskContext, GossipConfig, GossipRegistryHandle, KeyPair,
     RemoteConnection,
     registry::{
         ActorAskHandlerSync, ActorAskImmediateHandlerSync, ActorMessageFuture, ActorMessageHandler,
@@ -34,10 +34,6 @@ const DEFERRED_TIMEOUT_PROXY_ACTOR_ID: u64 = 0xC0DE_F77E;
 const DEFERRED_TIMEOUT_PROXY_TYPE_HASH: u32 = 0xA11C_0009;
 const NONBLOCKING_DEFERRED_PROXY_ACTOR_ID: u64 = 0xC0DE_F33E;
 const NONBLOCKING_DEFERRED_PROXY_TYPE_HASH: u32 = 0xA11C_0005;
-const FORWARDER_PROXY_ACTOR_ID: u64 = 0xC0DE_F55E;
-const FORWARDER_PROXY_TYPE_HASH: u32 = 0xA11C_0007;
-const DROPPING_FORWARDER_PROXY_ACTOR_ID: u64 = 0xC0DE_F5DE;
-const DROPPING_FORWARDER_PROXY_TYPE_HASH: u32 = 0xA11C_000E;
 const BOUND_FORWARDER_PROXY_ACTOR_ID: u64 = 0xC0DE_FA5E;
 const BOUND_FORWARDER_PROXY_TYPE_HASH: u32 = 0xA11C_000C;
 const BOUND_TIMEOUT_PROXY_ACTOR_ID: u64 = 0xC0DE_FB6E;
@@ -109,18 +105,6 @@ struct AsyncProxyActor {
 #[derive(Clone)]
 struct WorkerProxyAskActor {
     tx: mpsc::UnboundedSender<(Bytes, icanact_remote::AskResponder)>,
-}
-
-#[derive(Clone)]
-struct ForwarderProxyAskActor {
-    destination: RemoteConnection,
-    forwarder: AskForwarder,
-}
-
-#[derive(Clone)]
-struct DroppingForwarderProxyAskActor {
-    destination: RemoteConnection,
-    forwarder: Arc<Mutex<Option<AskForwarder>>>,
 }
 
 #[derive(Clone)]
@@ -467,32 +451,6 @@ impl ActorAskHandlerSync for WorkerProxyAskActor {
     }
 }
 
-impl ActorAskHandlerSync for ForwarderProxyAskActor {
-    fn handle_actor_ask_sync(
-        &self,
-        actor_id: u64,
-        type_hash: u32,
-        payload: AlignedBytes,
-        context: AskContext<'_>,
-    ) -> icanact_remote::Result<AskDisposition> {
-        if actor_id != FORWARDER_PROXY_ACTOR_ID || type_hash != FORWARDER_PROXY_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
-        }
-
-        self.forwarder.try_forward_actor_ask_no_timeout(
-            self.destination.clone(),
-            BENCH_ACTOR_ID,
-            BENCH_TYPE_HASH,
-            payload.into_bytes(),
-            context.responder(),
-        )?;
-
-        Ok(AskDisposition::Deferred)
-    }
-}
-
 impl ActorAskHandlerSync for BoundForwarderProxyAskActor {
     fn handle_actor_ask_sync(
         &self,
@@ -516,40 +474,6 @@ impl ActorAskHandlerSync for BoundForwarderProxyAskActor {
                 mpsc::error::TrySendError::Full(_) => icanact_remote::GossipError::WriteQueueFull,
                 mpsc::error::TrySendError::Closed(_) => icanact_remote::GossipError::Shutdown,
             })?;
-        Ok(AskDisposition::Deferred)
-    }
-}
-
-impl ActorAskHandlerSync for DroppingForwarderProxyAskActor {
-    fn handle_actor_ask_sync(
-        &self,
-        actor_id: u64,
-        type_hash: u32,
-        payload: AlignedBytes,
-        context: AskContext<'_>,
-    ) -> icanact_remote::Result<AskDisposition> {
-        if actor_id != DROPPING_FORWARDER_PROXY_ACTOR_ID
-            || type_hash != DROPPING_FORWARDER_PROXY_TYPE_HASH
-        {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
-        }
-
-        let forwarder = {
-            let mut guard = self.forwarder.lock().expect("forwarder mutex poisoned");
-            guard.take().ok_or(icanact_remote::GossipError::Shutdown)?
-        };
-
-        forwarder.try_forward_actor_ask_no_timeout(
-            self.destination.clone(),
-            BENCH_ACTOR_ID,
-            BENCH_TYPE_HASH,
-            payload.into_bytes(),
-            context.responder(),
-        )?;
-        drop(forwarder);
-
         Ok(AskDisposition::Deferred)
     }
 }
@@ -867,36 +791,6 @@ async fn register_worker_proxy_ask_actor(
 
     registry
         .set_actor_ask_handler_sync(Arc::new(WorkerProxyAskActor { tx }))
-        .await;
-}
-
-async fn register_forwarder_proxy_ask_actor(
-    registry: &icanact_remote::registry::GossipRegistry,
-    destination: RemoteConnection,
-    workers: usize,
-    capacity: usize,
-) {
-    let forwarder = AskForwarder::new(workers, capacity);
-    registry
-        .set_actor_ask_handler_sync(Arc::new(ForwarderProxyAskActor {
-            destination,
-            forwarder,
-        }))
-        .await;
-}
-
-async fn register_dropping_forwarder_proxy_ask_actor(
-    registry: &icanact_remote::registry::GossipRegistry,
-    destination: RemoteConnection,
-    workers: usize,
-    capacity: usize,
-) {
-    let forwarder = AskForwarder::new(workers, capacity);
-    registry
-        .set_actor_ask_handler_sync(Arc::new(DroppingForwarderProxyAskActor {
-            destination,
-            forwarder: Arc::new(Mutex::new(Some(forwarder))),
-        }))
         .await;
 }
 
@@ -3452,140 +3346,6 @@ async fn probe_actor_ask_worker_proxy_inflight(
     destination.shutdown().await;
 }
 
-async fn probe_actor_ask_forwarder_proxy_inflight(
-    label: &str,
-    inflight: usize,
-    ask_count: u64,
-    workers: usize,
-    capacity: usize,
-) {
-    let config = GossipConfig {
-        gossip_interval: Duration::from_millis(100),
-        ask_window: 65_536,
-        ..Default::default()
-    };
-
-    let destination = create_registry(&format!("{}_destination", label), config.clone()).await;
-    let middle = create_registry(&format!("{}_middle", label), config.clone()).await;
-    let source = create_registry(&format!("{}_source", label), config).await;
-
-    register_split_echo_actor(
-        &destination.registry,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(Notify::new()),
-    )
-    .await;
-
-    connect_unidirectional(&middle, &destination).await;
-    sleep(Duration::from_millis(300)).await;
-
-    let destination_remote = middle
-        .lookup_peer(&destination.registry.peer_id)
-        .await
-        .unwrap()
-        .connection_ref()
-        .expect("connected destination ref");
-    register_forwarder_proxy_ask_actor(&middle.registry, destination_remote, workers, capacity)
-        .await;
-
-    connect_unidirectional(&source, &middle).await;
-    sleep(Duration::from_millis(300)).await;
-
-    let proxy_conn = source
-        .lookup_peer(&middle.registry.peer_id)
-        .await
-        .unwrap()
-        .connection_ref()
-        .expect("connected proxy ref");
-    let payload = Bytes::from(vec![26u8; PAYLOAD_BYTES]);
-
-    let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
-    > = FuturesUnordered::new();
-    let mut next = 0u64;
-    let mut completed = 0u64;
-    let mut checksum = 0u64;
-    let start = Instant::now();
-
-    while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
-        let idx = next;
-        pending.push(
-            async move {
-                (
-                    idx,
-                    proxy_conn
-                        .ask_actor_frame(
-                            FORWARDER_PROXY_ACTOR_ID,
-                            FORWARDER_PROXY_TYPE_HASH,
-                            payload,
-                            ASK_BENCH_TIMEOUT,
-                        )
-                        .await,
-                )
-            }
-            .boxed(),
-        );
-        next += 1;
-    }
-
-    while let Some((idx, result)) = pending.next().await {
-        let response = result.unwrap_or_else(|err| {
-            panic!("forwarder proxy ask benchmark failed at request {idx}: {err:?}")
-        });
-        checksum ^= response.len() as u64 + idx;
-        completed += 1;
-
-        if next < ask_count {
-            let proxy_conn = proxy_conn.clone();
-            let payload = payload.clone();
-            let next_idx = next;
-            pending.push(
-                async move {
-                    (
-                        next_idx,
-                        proxy_conn
-                            .ask_actor_frame(
-                                FORWARDER_PROXY_ACTOR_ID,
-                                FORWARDER_PROXY_TYPE_HASH,
-                                payload,
-                                ASK_BENCH_TIMEOUT,
-                            )
-                            .await,
-                    )
-                }
-                .boxed(),
-            );
-            next += 1;
-        }
-    }
-
-    let elapsed = start.elapsed();
-    let req_per_sec = if completed == 0 {
-        0.0
-    } else {
-        completed as f64 / elapsed.as_secs_f64()
-    };
-    println!(
-        "[throughput_benchmarks::{label}] inflight={} workers={} capacity={} completed={} requested={} payload={}B elapsed={:.6}s throughput={:.2} req/s checksum={}",
-        inflight,
-        workers,
-        capacity,
-        completed,
-        ask_count,
-        PAYLOAD_BYTES,
-        elapsed.as_secs_f64(),
-        req_per_sec,
-        checksum
-    );
-
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
-}
-
 async fn probe_actor_ask_bound_forwarder_proxy_inflight(
     label: &str,
     inflight: usize,
@@ -4795,21 +4555,6 @@ async fn test_ask_actor_frame_worker64_proxy_probe_scaling() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "benchmark-only; run explicitly when profiling"]
-async fn test_ask_actor_frame_forwarder_proxy_probe_scaling() {
-    for inflight in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
-        probe_actor_ask_forwarder_proxy_inflight(
-            &format!("ask_actor_forwarder_proxy_probe_inflight{}", inflight),
-            inflight,
-            256,
-            64,
-            4_096,
-        )
-        .await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "benchmark-only; run explicitly when profiling"]
 async fn test_ask_actor_frame_bound_forwarder_proxy_probe_scaling() {
     for inflight in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
         probe_actor_ask_bound_forwarder_proxy_inflight(
@@ -5129,113 +4874,6 @@ async fn test_deferred_timeout_proxy_actor_ask_round_trip() {
             .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
-
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_forwarder_proxy_actor_ask_round_trip() {
-    let config = GossipConfig {
-        gossip_interval: Duration::from_millis(100),
-        ask_window: 65_536,
-        ..Default::default()
-    };
-
-    let destination =
-        create_registry("forwarder_proxy_round_trip_destination", config.clone()).await;
-    let middle = create_registry("forwarder_proxy_round_trip_middle", config.clone()).await;
-    let source = create_registry("forwarder_proxy_round_trip_source", config).await;
-
-    register_split_echo_actor(
-        &destination.registry,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(Notify::new()),
-    )
-    .await;
-
-    connect_unidirectional(&middle, &destination).await;
-    sleep(Duration::from_millis(300)).await;
-
-    let destination_remote = middle
-        .lookup_peer(&destination.registry.peer_id)
-        .await
-        .unwrap()
-        .connection_ref()
-        .expect("connected destination ref");
-    register_forwarder_proxy_ask_actor(&middle.registry, destination_remote, 64, 4_096).await;
-
-    connect_unidirectional(&source, &middle).await;
-    sleep(Duration::from_millis(300)).await;
-
-    let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
-    let payload = Bytes::from(vec![27u8; PAYLOAD_BYTES]);
-
-    for _ in 0..64 {
-        let reply = proxy_remote
-            .ask_actor_frame(
-                FORWARDER_PROXY_ACTOR_ID,
-                FORWARDER_PROXY_TYPE_HASH,
-                payload.clone(),
-                ASK_BENCH_TIMEOUT,
-            )
-            .await
-            .unwrap();
-        assert_eq!(reply.len(), PAYLOAD_BYTES);
-    }
-
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_forwarder_drop_drains_inflight_ask() {
-    let config = GossipConfig {
-        gossip_interval: Duration::from_millis(100),
-        ask_window: 65_536,
-        ..Default::default()
-    };
-
-    let destination = create_registry("forwarder_drop_drains_destination", config.clone()).await;
-    let middle = create_registry("forwarder_drop_drains_middle", config.clone()).await;
-    let source = create_registry("forwarder_drop_drains_source", config).await;
-
-    register_split_echo_actor(
-        &destination.registry,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(Notify::new()),
-    )
-    .await;
-
-    connect_unidirectional(&middle, &destination).await;
-    sleep(Duration::from_millis(300)).await;
-
-    let destination_remote = middle
-        .lookup_peer(&destination.registry.peer_id)
-        .await
-        .unwrap()
-        .connection_ref()
-        .expect("connected destination ref");
-    register_dropping_forwarder_proxy_ask_actor(&middle.registry, destination_remote, 4, 256).await;
-
-    connect_unidirectional(&source, &middle).await;
-    sleep(Duration::from_millis(300)).await;
-
-    let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
-    let reply = proxy_remote
-        .ask_actor_frame(
-            DROPPING_FORWARDER_PROXY_ACTOR_ID,
-            DROPPING_FORWARDER_PROXY_TYPE_HASH,
-            Bytes::from(vec![31u8; PAYLOAD_BYTES]),
-            ASK_BENCH_TIMEOUT,
-        )
-        .await
-        .unwrap();
-    assert_eq!(reply.len(), PAYLOAD_BYTES);
 
     source.shutdown().await;
     middle.shutdown().await;
