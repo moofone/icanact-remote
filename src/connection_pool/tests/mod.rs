@@ -1186,9 +1186,12 @@ async fn test_task_tracker_replaces_old_handle() {
 async fn test_wait_for_response_returns_on_cancelled_slot() {
     let tracker = CorrelationTracker::new();
     // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+    // the test's manual complete()/wait_for_response()/cancel() lifecycle
+    // intact without leaking the slot.
+    let correlation_id = tracker
+        .allocate()
+        .expect("ring should not be exhausted in test")
+        .disarm();
 
     // Simulate a connection drop cancelling all pending requests.
     tracker.cancel_all();
@@ -2563,9 +2566,12 @@ fn correlation_tracker_throughput_bench() {
         let start = std::time::Instant::now();
         for _ in 0..iters {
             // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+            // the test's manual complete()/wait_for_response()/cancel() lifecycle
+            // intact without leaking the slot.
+            let correlation_id = tracker
+                .allocate()
+                .expect("ring should not be exhausted in test")
+                .disarm();
             let mut payload = Some(crate::AlignedBytes::from_pooled_slice(
                 b"pingpong",
                 Arc::clone(&pool),
@@ -2593,9 +2599,12 @@ fn correlation_tracker_throughput_bench() {
         let mut next = 0u64;
         while next < iters && pending.len() < inflight {
             // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+            // the test's manual complete()/wait_for_response()/cancel() lifecycle
+            // intact without leaking the slot.
+            let correlation_id = tracker
+                .allocate()
+                .expect("ring should not be exhausted in test")
+                .disarm();
             let tracker_clone = Arc::clone(&tracker);
             pending.push(Box::pin(async move {
                 tracker_clone
@@ -2614,9 +2623,12 @@ fn correlation_tracker_throughput_bench() {
             assert_eq!(reply.as_ref(), b"pingpong");
             if next < iters {
                 // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+                // the test's manual complete()/wait_for_response()/cancel() lifecycle
+                // intact without leaking the slot.
+                let correlation_id = tracker
+                    .allocate()
+                    .expect("ring should not be exhausted in test")
+                    .disarm();
                 let tracker_clone = Arc::clone(&tracker);
                 pending.push(Box::pin(async move {
                     tracker_clone
@@ -2683,10 +2695,7 @@ fn allocate_terminates_when_every_slot_is_already_waiting() {
         })
         .expect("spawn probe thread");
 
-    if rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .is_err()
-    {
+    if rx.recv_timeout(std::time::Duration::from_secs(3)).is_err() {
         panic!(
             "LIVELOCK: CorrelationTracker::allocate() did not return within 3s \
              after the ring was exhausted. The producer spins in user space \
