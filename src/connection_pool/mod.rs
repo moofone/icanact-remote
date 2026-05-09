@@ -19,7 +19,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinHandle};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
+#[cfg(feature = "trace-correlation")]
+use tracing::trace;
 
 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
 use sha2::{Digest, Sha256};

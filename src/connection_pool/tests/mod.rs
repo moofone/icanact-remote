@@ -1185,7 +1185,10 @@ async fn test_task_tracker_replaces_old_handle() {
 #[tokio::test]
 async fn test_wait_for_response_returns_on_cancelled_slot() {
     let tracker = CorrelationTracker::new();
-    let correlation_id = tracker.allocate();
+    // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
+        // the test's manual complete()/wait_for_response()/cancel() lifecycle
+        // intact without leaking the slot.
+        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
 
     // Simulate a connection drop cancelling all pending requests.
     tracker.cancel_all();
@@ -2559,7 +2562,10 @@ fn correlation_tracker_throughput_bench() {
 
         let start = std::time::Instant::now();
         for _ in 0..iters {
-            let correlation_id = tracker.allocate();
+            // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
+        // the test's manual complete()/wait_for_response()/cancel() lifecycle
+        // intact without leaking the slot.
+        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
             let mut payload = Some(crate::AlignedBytes::from_pooled_slice(
                 b"pingpong",
                 Arc::clone(&pool),
@@ -2586,7 +2592,10 @@ fn correlation_tracker_throughput_bench() {
         > = futures::stream::FuturesUnordered::new();
         let mut next = 0u64;
         while next < iters && pending.len() < inflight {
-            let correlation_id = tracker.allocate();
+            // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
+        // the test's manual complete()/wait_for_response()/cancel() lifecycle
+        // intact without leaking the slot.
+        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
             let tracker_clone = Arc::clone(&tracker);
             pending.push(Box::pin(async move {
                 tracker_clone
@@ -2604,7 +2613,10 @@ fn correlation_tracker_throughput_bench() {
             let reply = result.unwrap();
             assert_eq!(reply.as_ref(), b"pingpong");
             if next < iters {
-                let correlation_id = tracker.allocate();
+                // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
+        // the test's manual complete()/wait_for_response()/cancel() lifecycle
+        // intact without leaking the slot.
+        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
                 let tracker_clone = Arc::clone(&tracker);
                 pending.push(Box::pin(async move {
                     tracker_clone
@@ -2627,4 +2639,117 @@ fn correlation_tracker_throughput_bench() {
             iters as f64 / elapsed.as_secs_f64()
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Bug-hunt regression guards: CorrelationTracker livelock + slot leak.
+//
+// Production incident 2026-05-09: raft-1 wedged at 100% CPU because the
+// tokio current_thread runtime got monopolised by `CorrelationTracker::
+// allocate()` spinning in a `loop {}` after every slot landed in
+// SLOT_WAITING. Slots accumulated because in-flight `wait_for_response`
+// futures were dropped by outer `tokio::time::timeout` cancellations
+// without restoring slot state.
+// ---------------------------------------------------------------------------
+
+/// Tier 1: `allocate()` must terminate even when the entire ring is
+/// already in a non-EMPTY state. Pre-fix this test panics with
+/// "LIVELOCK"; post-fix it returns within milliseconds.
+#[test]
+fn allocate_terminates_when_every_slot_is_already_waiting() {
+    let tracker = CorrelationTracker::new();
+
+    // Force the ring to the exact state the bug produced in prod: every
+    // slot in SLOT_WAITING with no consumer ever going to clear it.
+    for slot in tracker.pending.iter() {
+        slot.state.store(SLOT_WAITING, Ordering::Release);
+    }
+
+    // Probe on a separate OS thread. The current_thread tokio executor
+    // is irrelevant here — the bug spins in pure user space, so a
+    // same-runtime `tokio::time::timeout` would never fire. A blocking
+    // mpsc channel with `recv_timeout` is the only reliable detector.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let probe = Arc::clone(&tracker);
+    std::thread::Builder::new()
+        .name("correlation-livelock-probe".into())
+        .spawn(move || {
+            // `let _` is intentional: this works for both the pre-fix
+            // signature (`-> u16`) and the post-fix signature
+            // (`-> Result<SlotGuard<'_>, NoFreeSlots>`). We only care
+            // that `allocate()` returns at all.
+            let _ = probe.allocate();
+            let _ = tx.send(());
+        })
+        .expect("spawn probe thread");
+
+    if rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .is_err()
+    {
+        panic!(
+            "LIVELOCK: CorrelationTracker::allocate() did not return within 3s \
+             after the ring was exhausted. The producer spins in user space \
+             with no yield point; on a tokio current_thread runtime this \
+             monopolises the executor and stalls every other task — exactly \
+             the production wedge observed on raft-1 (2026-05-09 04:59:02Z)."
+        );
+    }
+}
+
+/// Tier 2: a `wait_for_response` future that is cancelled mid-await
+/// (e.g. by an outer `tokio::time::timeout` firing) MUST release its
+/// correlation slot via the [`SlotGuard`] Drop. Otherwise slots leak,
+/// the ring fills, and `allocate()` reaches the regression-guard test
+/// above.
+///
+/// This is the ground-truth regression test for the production bug:
+/// without the SlotGuard, this test would leak 256 slots and the
+/// assertion below would fail with `0 != 256`.
+#[test]
+fn cancelled_wait_for_response_releases_slot_via_drop_guard() {
+    run_multi_thread_test(async {
+        let tracker = CorrelationTracker::new();
+        let baseline_waiting = count_waiting_slots(&tracker);
+
+        // 256 cancelled awaits — well below ring capacity (8192) so we
+        // are isolating the leak signal rather than measuring exhaustion.
+        for _ in 0..256 {
+            // The async block needs an Arc<CorrelationTracker> it owns
+            // (so the future can call wait_for_response across the await
+            // boundary). The outer `tracker` Arc is also kept alive by the
+            // surrounding scope, which keeps the SlotGuard borrow valid.
+            let tracker_for_await = Arc::clone(&tracker);
+            let slot = tracker.allocate().expect("ring should not be exhausted");
+            let id = slot.id();
+            let work = async move {
+                // Hold the guard across an await that never resolves —
+                // mimics `wait_for_response` blocked on a peer that
+                // never responds.
+                let _slot = slot;
+                let _ = tracker_for_await.wait_for_response_no_timeout(id).await;
+            };
+            // Outer timeout fires before `work` can complete, dropping
+            // the future and (post-fix) running the SlotGuard Drop.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1), work).await;
+        }
+
+        let leaked = count_waiting_slots(&tracker) - baseline_waiting;
+        assert_eq!(
+            leaked, 0,
+            "{leaked} slots leaked from cancelled wait_for_response futures. \
+             SlotGuard Drop must run when the awaiter is cancelled — \
+             otherwise leaked slots accumulate until the ring is exhausted, \
+             at which point allocate() livelocks (see \
+             allocate_terminates_when_every_slot_is_already_waiting)."
+        );
+    });
+}
+
+fn count_waiting_slots(tracker: &CorrelationTracker) -> usize {
+    tracker
+        .pending
+        .iter()
+        .filter(|s| s.state.load(Ordering::Acquire) == SLOT_WAITING)
+        .count()
 }

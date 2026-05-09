@@ -1333,6 +1333,15 @@ pub enum GossipError {
 
     #[error("non-zero-copy API disabled: {0}")]
     NonZeroCopyPath(&'static str),
+
+    #[error("correlation tracker exhausted: all slots in use (slot leak suspected)")]
+    CorrelationTrackerExhausted,
+}
+
+impl From<crate::connection_pool::NoFreeSlots> for GossipError {
+    fn from(_: crate::connection_pool::NoFreeSlots) -> Self {
+        GossipError::CorrelationTrackerExhausted
+    }
 }
 
 pub type Result<T> = std::result::Result<T, GossipError>;

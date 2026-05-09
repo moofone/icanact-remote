@@ -68,8 +68,28 @@ impl CorrelationTracker {
     }
 
     /// Allocate a correlation ID and reserve the response slot.
-    fn allocate(&self) -> u16 {
-        loop {
+    ///
+    /// Returns a borrowed RAII [`SlotGuard`] which cancels the slot on drop
+    /// unless [`SlotGuard::disarm`] is called. This is the cancellation-safe
+    /// path: async callers can use `?` and rely on the guard to release the
+    /// slot if the awaiter is dropped (e.g. by an outer
+    /// `tokio::time::timeout` firing).
+    ///
+    /// Returns [`Err(NoFreeSlots)`](NoFreeSlots) when the entire ring is in
+    /// a non-EMPTY state. Previously this method was an unbounded `loop {}`
+    /// which monopolised single-threaded tokio runtimes when slots leaked
+    /// (production incident raft-1 2026-05-09).
+    ///
+    /// The returned guard borrows from `self` rather than holding an Arc
+    /// clone, so the success path adds zero atomic refcount traffic over
+    /// the previous bare-`u16` API.
+    pub(crate) fn allocate(&self) -> std::result::Result<SlotGuard<'_>, NoFreeSlots> {
+        // Bounded sweep: at most one full pass over the ring. On the
+        // overwhelmingly common uncontended hot path the loop exits on the
+        // first iteration, so the bound adds one register-resident counter
+        // dec+jne per iteration — under one cycle on modern x86, lost in
+        // the noise of the existing fetch_add+CAS.
+        for _ in 0..PENDING_RESPONSES_SIZE {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             if id == 0 {
                 continue; // Skip 0 as it's reserved
@@ -87,16 +107,23 @@ impl CorrelationTracker {
                 )
                 .is_ok()
             {
+                #[cfg(feature = "trace-correlation")]
                 trace!(
                     "CorrelationTracker: Allocated correlation_id {} in slot {}",
                     id, slot
                 );
-                return id;
+                return Ok(SlotGuard { tracker: self, id });
             }
 
-            // Slot is occupied, try next ID (trace level - fires frequently under load)
+            // Slot is occupied, try next ID. Gated behind the
+            // `trace-correlation` feature: in production this fires once
+            // per contended iteration and burned measurable cycles on the
+            // tracing dispatcher's filter check even when the level was
+            // disabled.
+            #[cfg(feature = "trace-correlation")]
             trace!("CorrelationTracker: Slot {} occupied, trying next ID", slot);
         }
+        Err(NoFreeSlots)
     }
 
     /// Complete a pending request with a response.
@@ -320,5 +347,75 @@ impl CorrelationTracker {
             std::task::Poll::Pending
         })
         .await
+    }
+}
+
+/// Returned by [`CorrelationTracker::allocate`] when a full sweep over the
+/// 8192-slot ring found no slot in `SLOT_EMPTY` state. Operators seeing
+/// this in logs should treat it as evidence of an upstream slot leak —
+/// the previous `loop {}` implementation silently spun the executor
+/// instead of surfacing the condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NoFreeSlots;
+
+impl std::fmt::Display for NoFreeSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "correlation tracker exhausted: all {PENDING_RESPONSES_SIZE} slots in use"
+        )
+    }
+}
+
+impl std::error::Error for NoFreeSlots {}
+
+/// RAII guard for a correlation slot reservation.
+///
+/// Holds a shared borrow of the tracker (no Arc clone) and a single 16-bit
+/// id. On drop the slot is cancelled — this is what closes the production
+/// leak where a future awaiting [`CorrelationTracker::wait_for_response`]
+/// could be cancelled mid-await (outer `tokio::time::timeout`, `select!`
+/// arm losing) without restoring slot state.
+///
+/// Call [`SlotGuard::disarm`] on the success path to consume the guard
+/// without running the cancellation Drop. The disarm path uses
+/// `mem::forget`, so the success path adds zero atomic ops over the
+/// previous bare-`u16` API.
+#[must_use = "dropping a SlotGuard cancels the slot; call .disarm() on success"]
+pub(crate) struct SlotGuard<'a> {
+    tracker: &'a CorrelationTracker,
+    id: u16,
+}
+
+impl<'a> SlotGuard<'a> {
+    #[inline(always)]
+    pub(crate) fn id(&self) -> u16 {
+        self.id
+    }
+
+    /// Consume the guard without running the cancellation Drop. Use this
+    /// after the consumer has moved the slot out of `SLOT_WAITING`
+    /// (i.e. on the success path of `wait_for_response`).
+    #[inline(always)]
+    pub(crate) fn disarm(self) -> u16 {
+        let id = self.id;
+        std::mem::forget(self);
+        id
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    // `#[cold]` + `#[inline(never)]` keep the cancel path out of the hot
+    // icache — Drop only runs on the cancellation path, never on success.
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        self.tracker.cancel(self.id);
+    }
+}
+
+impl std::fmt::Debug for SlotGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotGuard").field("id", &self.id).finish()
     }
 }

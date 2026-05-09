@@ -583,7 +583,8 @@ impl<T> ConnectionHandle<T> {
         timeout: Duration,
     ) -> Result<crate::AlignedBytes> {
         let started_at = Instant::now();
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
         let schema_hash = self.schema_hash();
         let header = crate::framing::write_actor_frame_header(
             crate::MessageType::ActorAsk,
@@ -594,7 +595,7 @@ impl<T> ConnectionHandle<T> {
             payload.len(),
         );
         if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             warn!(
                 addr = %self.addr,
                 actor_id,
@@ -646,6 +647,7 @@ impl<T> ConnectionHandle<T> {
                 _ => {}
             }
         }
+        let _ = slot.disarm();
         result
     }
 
@@ -669,7 +671,8 @@ impl<T> ConnectionHandle<T> {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<crate::AlignedBytes> {
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
         let schema_hash = self.schema_hash();
         let header = crate::framing::write_actor_frame_header(
             crate::MessageType::ActorAsk,
@@ -681,13 +684,16 @@ impl<T> ConnectionHandle<T> {
         );
 
         if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
 
-        self.correlation
+        let result = self
+            .correlation
             .wait_for_response_no_timeout(correlation_id)
-            .await
+            .await;
+        let _ = slot.disarm();
+        result
     }
 
     /// Send an actor ask frame and return a deferred handle that can be awaited later.
@@ -698,7 +704,8 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
         timeout: Duration,
     ) -> Result<PendingAsk> {
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
         let schema_hash = self.schema_hash();
         let header = crate::framing::write_actor_frame_header(
             crate::MessageType::ActorAsk,
@@ -710,12 +717,15 @@ impl<T> ConnectionHandle<T> {
         );
 
         if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
 
         Ok(PendingAsk {
-            correlation_id,
+            // Transfer slot ownership to PendingAsk: its own Drop becomes
+            // responsible for cancelling the reservation if the handle is
+            // dropped without being awaited.
+            correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
             timeout,
         })
@@ -899,7 +909,8 @@ impl<T> ConnectionHandle<T> {
         payload_len: usize,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
         let header = framing::write_ask_response_header(
             crate::MessageType::Ask,
             correlation_id,
@@ -911,7 +922,7 @@ impl<T> ConnectionHandle<T> {
                 .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
                 .await
             {
-                self.correlation.cancel(correlation_id);
+                // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
                 return Err(e);
             }
         } else {
@@ -925,7 +936,7 @@ impl<T> ConnectionHandle<T> {
                 .write_header_and_payload_ask_inline(header, 16, body.freeze())
                 .await
             {
-                self.correlation.cancel(correlation_id);
+                // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
                 return Err(e);
             }
         }
@@ -934,6 +945,9 @@ impl<T> ConnectionHandle<T> {
             .correlation
             .wait_for_response(correlation_id, timeout)
             .await?;
+        // wait_for_response always cleans up slot state on terminal returns
+        // (Ok / Err); disarming skips the redundant Drop-time cancel CAS.
+        let _ = slot.disarm();
         Ok(response.into_bytes())
     }
 
@@ -943,7 +957,8 @@ impl<T> ConnectionHandle<T> {
         request: bytes::Bytes,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
 
         let header = framing::write_ask_response_header(
             crate::MessageType::Ask,
@@ -955,7 +970,7 @@ impl<T> ConnectionHandle<T> {
             .write_header_and_payload_ask_inline(header, 16, request)
             .await
         {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
 
@@ -963,6 +978,9 @@ impl<T> ConnectionHandle<T> {
             .correlation
             .wait_for_response(correlation_id, timeout)
             .await?;
+        // wait_for_response always cleans up slot state on terminal returns
+        // (Ok / Err); disarming skips the redundant Drop-time cancel CAS.
+        let _ = slot.disarm();
         Ok(response.into_bytes())
     }
 
@@ -977,14 +995,15 @@ impl<T> ConnectionHandle<T> {
         request: bytes::Bytes,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
 
         // Build DirectAsk header
         let header = framing::write_direct_ask_header(correlation_id, request.len());
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
 
@@ -992,19 +1011,23 @@ impl<T> ConnectionHandle<T> {
             .correlation
             .wait_for_response(correlation_id, timeout)
             .await?;
+        // wait_for_response always cleans up slot state on terminal returns
+        // (Ok / Err); disarming skips the redundant Drop-time cancel CAS.
+        let _ = slot.disarm();
         Ok(response.into_bytes())
     }
 
     /// Fast-path direct ask without timeout allocation (benchmarking/hot path).
     pub async fn ask_direct_no_timeout(&self, request: bytes::Bytes) -> Result<bytes::Bytes> {
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
 
         // Build DirectAsk header
         let header = framing::write_direct_ask_header(correlation_id, request.len());
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
 
@@ -1012,6 +1035,7 @@ impl<T> ConnectionHandle<T> {
             .correlation
             .wait_for_response_no_timeout(correlation_id)
             .await?;
+        let _ = slot.disarm();
         Ok(response.into_bytes())
     }
 
@@ -1049,7 +1073,8 @@ impl<T> ConnectionHandle<T> {
         let chunk_size = stream_handle.max_stream_chunk_size()?;
 
         // Allocate correlation ID for the response
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
 
         // Acquire streaming mode atomically
         while stream_handle
@@ -1137,7 +1162,7 @@ impl<T> ConnectionHandle<T> {
             .try_push(StreamingCommand::WriteBytes(start_msg))
             .is_err()
         {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(GossipError::WriteQueueFull);
         }
 
@@ -1175,7 +1200,7 @@ impl<T> ConnectionHandle<T> {
                 ]))
                 .is_err()
             {
-                self.correlation.cancel(correlation_id);
+                // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
                 return Err(GossipError::WriteQueueFull);
             }
 
@@ -1203,7 +1228,7 @@ impl<T> ConnectionHandle<T> {
             .try_push(StreamingCommand::WriteBytes(end_msg))
             .is_err()
         {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(GossipError::WriteQueueFull);
         }
         let _ = stream_handle
@@ -1220,6 +1245,9 @@ impl<T> ConnectionHandle<T> {
             .correlation
             .wait_for_response(correlation_id, timeout)
             .await?;
+        // wait_for_response always cleans up slot state on terminal returns
+        // (Ok / Err); disarming skips the redundant Drop-time cancel CAS.
+        let _ = slot.disarm();
         Ok(response.into_bytes())
     }
 
@@ -1240,7 +1268,8 @@ impl<T> ConnectionHandle<T> {
         request: bytes::Bytes,
         timeout: Duration,
     ) -> Result<PendingAsk> {
-        let correlation_id = self.correlation.allocate();
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
 
         let header = framing::write_ask_response_header(
             crate::MessageType::Ask,
@@ -1252,12 +1281,15 @@ impl<T> ConnectionHandle<T> {
             .write_header_and_payload_ask_inline(header, 16, request)
             .await
         {
-            self.correlation.cancel(correlation_id);
+            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
 
         Ok(PendingAsk {
-            correlation_id,
+            // Transfer slot ownership to PendingAsk: its own Drop becomes
+            // responsible for cancelling the reservation if the handle is
+            // dropped without being awaited.
+            correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
             timeout,
         })
@@ -1274,7 +1306,10 @@ impl<T> ConnectionHandle<T> {
             return Ok(Vec::new());
         }
 
-        let mut correlation_ids = Vec::with_capacity(requests.len());
+        // Hold each reservation in an RAII guard so a partial-batch failure
+        // (allocate err, write err, etc.) auto-cancels every slot we already
+        // claimed via `Vec<SlotGuard>` Drop.
+        let mut slots: Vec<SlotGuard<'_>> = Vec::with_capacity(requests.len());
 
         // Pre-calculate total message size to avoid growth reallocations.
         let total_size: usize = requests
@@ -1284,16 +1319,16 @@ impl<T> ConnectionHandle<T> {
         let mut batch_message = bytes::BytesMut::with_capacity(total_size);
 
         for request in requests {
-            let correlation_id = self.correlation.allocate();
-            correlation_ids.push(correlation_id);
+            let slot = self.correlation.allocate()?;
 
             let header = framing::write_ask_response_header(
                 crate::MessageType::Ask,
-                correlation_id,
+                slot.id(),
                 request.len(),
             );
             batch_message.extend_from_slice(&header); // ALLOW_COPY
             batch_message.extend_from_slice(request); // ALLOW_COPY
+            slots.push(slot);
         }
 
         let send_result = if let Some(stream_handle) = self.stream_handle.as_ref() {
@@ -1301,17 +1336,17 @@ impl<T> ConnectionHandle<T> {
         } else {
             self.write_bytes_control(batch_message.freeze()).await
         };
-        if let Err(e) = send_result {
-            for correlation_id in correlation_ids {
-                self.correlation.cancel(correlation_id);
-            }
-            return Err(e);
-        }
+        // Send-failure path: returning Err drops `slots`, which cancels every
+        // reservation. No explicit per-id cancel loop needed.
+        send_result?;
 
-        let handles = correlation_ids
+        let handles = slots
             .into_iter()
-            .map(|correlation_id| PendingAsk {
-                correlation_id,
+            .map(|slot| PendingAsk {
+                // Transfer slot ownership: PendingAsk's own Drop is now
+                // responsible for cancelling this reservation if the handle
+                // is abandoned without being awaited.
+                correlation_id: slot.disarm(),
                 correlation: self.correlation.clone(),
                 timeout,
             })

@@ -7,6 +7,12 @@ edition = "2024"
 test-helpers = []
 io_uring = ["tokio-uring", "io-uring"]
 strict-zero-copy = []
+# Enable verbose `trace!` logging from CorrelationTracker::allocate (success
+# and contention messages). Off by default because the dispatcher filter
+# check fires on every allocation on the hot path; gating the macro behind a
+# feature lets production strip it entirely. Bonus optimisation discovered
+# during the slot-leak forensic investigation 2026-05-09.
+trace-correlation = []
 
 [dependencies]
 crossbeam-queue = "0.3"
