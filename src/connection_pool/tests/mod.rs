@@ -214,6 +214,7 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     );
     let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
     connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(peer_id.clone());
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
@@ -229,6 +230,37 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
         pool.get_configured_peer_addr(&peer_id),
         Some(configured_addr)
     );
+}
+
+#[tokio::test]
+async fn get_connection_by_peer_id_rejects_alias_identity_mismatch() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let victim_peer_id = crate::KeyPair::new_for_testing("alias_victim_peer").peer_id();
+    let attacker_peer_id = crate::KeyPair::new_for_testing("alias_attacker_peer").peer_id();
+    let configured_addr: SocketAddr = "127.0.0.1:40560".parse().unwrap();
+    let alias_addr: SocketAddr = "127.0.0.1:50560".parse().unwrap();
+
+    pool.set_configured_peer_addr(&victim_peer_id, configured_addr);
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        alias_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(attacker_peer_id);
+    connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
+
+    pool.index_connection_by_addr(alias_addr, connection);
+    pool.add_addr_to_peer_id(alias_addr, victim_peer_id.clone());
+
+    assert!(pool.get_connection_by_peer_id(&victim_peer_id).is_none());
+    assert!(!pool.has_connection_by_peer_id(&victim_peer_id));
 }
 
 #[tokio::test]
