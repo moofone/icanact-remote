@@ -125,9 +125,10 @@ impl<T> GossipRegistryHandle<T> {
                 (Some(listener), None, actual_bind_addr)
             }
             TransportWireKind::UdpDatagram => {
-                let socket = bind_udp_with_reuseaddr(bind_addr)?;
-                let actual_bind_addr = socket.local_addr()?;
-                (None, Some(Arc::new(socket)), actual_bind_addr)
+                return Err(GossipError::InvalidConfig(
+                    "native UDP datagram transport is disabled until inbound datagrams are authenticated"
+                        .to_string(),
+                ));
             }
         };
 
@@ -596,6 +597,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, Default)]
     struct TestTlsBootstrap;
     struct TestNoopBootstrap;
+    struct TestUdpBootstrap;
     struct TestRecoveringBootstrap;
 
     impl RegistryTransportBootstrap for TestTlsBootstrap {
@@ -665,6 +667,32 @@ mod tests {
             _secret_key: crate::SecretKey,
         ) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl RegistryTransportBootstrap for TestUdpBootstrap {
+        fn stack_name(&self) -> &'static str {
+            "test+udp"
+        }
+
+        fn wire_kind(&self) -> TransportWireKind {
+            TransportWireKind::UdpDatagram
+        }
+
+        fn prepare_config(
+            &self,
+            secret_key: &crate::SecretKey,
+            config: &mut GossipConfig,
+        ) -> Result<()> {
+            TestNoopBootstrap.prepare_config(secret_key, config)
+        }
+
+        fn configure_registry(
+            &self,
+            registry: &mut crate::registry::GossipRegistry,
+            secret_key: crate::SecretKey,
+        ) -> Result<()> {
+            registry.enable_udp(secret_key)
         }
     }
 
@@ -773,6 +801,37 @@ mod tests {
         )
         .await?;
         handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_datagram_transport_is_rejected_until_authenticated() -> crate::Result<()> {
+        let keypair = KeyPair::new_for_testing("udp-disabled");
+        let mut config = test_cfg();
+        config.key_pair = Some(keypair.clone());
+
+        let err = match GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            keypair.to_secret_key(),
+            Some(config),
+            TestUdpBootstrap,
+        )
+        .await
+        {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await;
+                panic!("unauthenticated UDP bootstrap must not start");
+            }
+            Err(err) => err,
+        };
+
+        match err {
+            GossipError::InvalidConfig(message) => {
+                assert!(message.contains("disabled until inbound datagrams are authenticated"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
         Ok(())
     }
 
@@ -976,6 +1035,7 @@ pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> 
     TcpListener::from_std(std_listener).map_err(GossipError::Network)
 }
 
+#[allow(dead_code)]
 pub(crate) fn bind_udp_with_reuseaddr(bind_addr: SocketAddr) -> Result<UdpSocket> {
     use socket2::{Domain, Socket, Type};
 
