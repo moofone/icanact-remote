@@ -1,5 +1,4 @@
 pub mod aligned;
-mod ask_forwarder;
 mod ask_responder;
 pub mod config;
 pub(crate) mod connection_pool;
@@ -39,7 +38,6 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
-pub use ask_forwarder::{AskForwardObserver, AskForwarder};
 pub use ask_responder::{AskContext, AskResponder};
 pub use config::{ConnectionRecoveryPolicy, GossipConfig};
 pub use dns::{DnsResolver, TokioDnsResolver};
