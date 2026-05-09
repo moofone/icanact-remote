@@ -214,6 +214,7 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     );
     let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
     connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(peer_id.clone());
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
@@ -229,6 +230,37 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
         pool.get_configured_peer_addr(&peer_id),
         Some(configured_addr)
     );
+}
+
+#[tokio::test]
+async fn get_connection_by_peer_id_rejects_alias_identity_mismatch() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let victim_peer_id = crate::KeyPair::new_for_testing("alias_victim_peer").peer_id();
+    let attacker_peer_id = crate::KeyPair::new_for_testing("alias_attacker_peer").peer_id();
+    let configured_addr: SocketAddr = "127.0.0.1:40560".parse().unwrap();
+    let alias_addr: SocketAddr = "127.0.0.1:50560".parse().unwrap();
+
+    pool.set_configured_peer_addr(&victim_peer_id, configured_addr);
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        alias_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(attacker_peer_id);
+    connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
+
+    pool.index_connection_by_addr(alias_addr, connection);
+    pool.add_addr_to_peer_id(alias_addr, victim_peer_id.clone());
+
+    assert!(pool.get_connection_by_peer_id(&victim_peer_id).is_none());
+    assert!(!pool.has_connection_by_peer_id(&victim_peer_id));
 }
 
 #[tokio::test]
@@ -1186,9 +1218,12 @@ async fn test_task_tracker_replaces_old_handle() {
 async fn test_wait_for_response_returns_on_cancelled_slot() {
     let tracker = CorrelationTracker::new();
     // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+    // the test's manual complete()/wait_for_response()/cancel() lifecycle
+    // intact without leaking the slot.
+    let correlation_id = tracker
+        .allocate()
+        .expect("ring should not be exhausted in test")
+        .disarm();
 
     // Simulate a connection drop cancelling all pending requests.
     tracker.cancel_all();
@@ -2563,9 +2598,12 @@ fn correlation_tracker_throughput_bench() {
         let start = std::time::Instant::now();
         for _ in 0..iters {
             // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+            // the test's manual complete()/wait_for_response()/cancel() lifecycle
+            // intact without leaking the slot.
+            let correlation_id = tracker
+                .allocate()
+                .expect("ring should not be exhausted in test")
+                .disarm();
             let mut payload = Some(crate::AlignedBytes::from_pooled_slice(
                 b"pingpong",
                 Arc::clone(&pool),
@@ -2593,9 +2631,12 @@ fn correlation_tracker_throughput_bench() {
         let mut next = 0u64;
         while next < iters && pending.len() < inflight {
             // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+            // the test's manual complete()/wait_for_response()/cancel() lifecycle
+            // intact without leaking the slot.
+            let correlation_id = tracker
+                .allocate()
+                .expect("ring should not be exhausted in test")
+                .disarm();
             let tracker_clone = Arc::clone(&tracker);
             pending.push(Box::pin(async move {
                 tracker_clone
@@ -2614,9 +2655,12 @@ fn correlation_tracker_throughput_bench() {
             assert_eq!(reply.as_ref(), b"pingpong");
             if next < iters {
                 // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+                // the test's manual complete()/wait_for_response()/cancel() lifecycle
+                // intact without leaking the slot.
+                let correlation_id = tracker
+                    .allocate()
+                    .expect("ring should not be exhausted in test")
+                    .disarm();
                 let tracker_clone = Arc::clone(&tracker);
                 pending.push(Box::pin(async move {
                     tracker_clone
@@ -2683,10 +2727,7 @@ fn allocate_terminates_when_every_slot_is_already_waiting() {
         })
         .expect("spawn probe thread");
 
-    if rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .is_err()
-    {
+    if rx.recv_timeout(std::time::Duration::from_secs(3)).is_err() {
         panic!(
             "LIVELOCK: CorrelationTracker::allocate() did not return within 3s \
              after the ring was exhausted. The producer spins in user space \

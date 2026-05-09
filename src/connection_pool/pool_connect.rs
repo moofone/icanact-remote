@@ -284,6 +284,16 @@ impl<T> ConnectionPool<T> {
             .or_else(|| self.aliased_connection_by_peer_id(peer_id))
     }
 
+    fn connection_identity_matches_peer(
+        &self,
+        conn: &LockFreeConnection,
+        peer_id: &crate::PeerId,
+    ) -> bool {
+        conn.embedded_peer_id
+            .as_ref()
+            .is_some_and(|embedded_peer_id| embedded_peer_id == peer_id)
+    }
+
     fn aliased_connection_by_peer_id(
         &self,
         peer_id: &crate::PeerId,
@@ -300,6 +310,15 @@ impl<T> ConnectionPool<T> {
                 return true;
             };
             if !self.is_usable_connection(&conn) {
+                return true;
+            }
+            if !self.connection_identity_matches_peer(&conn, peer_id) {
+                warn!(
+                    requested_peer_id = %peer_id,
+                    actual_peer_id = ?conn.embedded_peer_id,
+                    addr = %addr,
+                    "CONNECTION POOL: Ignoring address alias with mismatched connection identity"
+                );
                 return true;
             }
 
