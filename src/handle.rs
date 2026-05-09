@@ -1660,18 +1660,27 @@ where
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
         }
-        Ok(MessageReadResult::Actor { actor_id, .. }) => {
-            // For actor messages received as the first message, we can't determine the sender
-            // Use a placeholder identifier
-            (format!("actor_sender_{}", actor_id), None, None)
+        Ok(MessageReadResult::Actor { .. }) => {
+            if let Some(node_id) = known_node_id {
+                (node_id.to_peer_id().to_hex(), None, None)
+            } else {
+                warn!(
+                    peer_addr = %peer_addr,
+                    "Actor frame arrived before peer NodeId is known"
+                );
+                return ConnectionCloseOutcome::Normal { node_id: None };
+            }
         }
-        Ok(MessageReadResult::Streaming { stream_header, .. }) => {
-            // For streaming messages received as the first message, use the actor ID
-            (
-                format!("stream_sender_{}", stream_header.actor_id),
-                None,
-                None,
-            )
+        Ok(MessageReadResult::Streaming { .. }) => {
+            if let Some(node_id) = known_node_id {
+                (node_id.to_peer_id().to_hex(), None, None)
+            } else {
+                warn!(
+                    peer_addr = %peer_addr,
+                    "Streaming frame arrived before peer NodeId is known"
+                );
+                return ConnectionCloseOutcome::Normal { node_id: None };
+            }
         }
         Ok(MessageReadResult::Raw(_)) => {
             if let Some(node_id) = known_node_id {
@@ -1714,7 +1723,25 @@ where
             return ConnectionCloseOutcome::Normal { node_id: None };
         }
     };
-    let node_id_opt = Some(peer_id.to_node_id());
+    let claimed_node_id = peer_id.to_node_id();
+    let Some(authenticated_node_id) = peer_node_id else {
+        warn!(
+            peer_addr = %peer_addr,
+            node_id = %sender_node_id,
+            "TLS client certificate is required before accepting a claimed peer identity"
+        );
+        return ConnectionCloseOutcome::Normal { node_id: None };
+    };
+    if claimed_node_id != authenticated_node_id {
+        warn!(
+            peer_addr = %peer_addr,
+            claimed_node_id = %claimed_node_id,
+            authenticated_node_id = %authenticated_node_id,
+            "TLS client certificate identity does not match claimed peer identity; dropping connection"
+        );
+        return ConnectionCloseOutcome::Normal { node_id: None };
+    }
+    let node_id_opt = Some(claimed_node_id);
 
     // Prefer the sender's advertised bind address (validated) and fall back
     // to any configured address, then the TCP source address.

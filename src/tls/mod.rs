@@ -197,7 +197,7 @@ impl ClientCertVerifier for NodeIdClientVerifier {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        false
+        true
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
