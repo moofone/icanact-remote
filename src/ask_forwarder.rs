@@ -51,7 +51,7 @@ impl AskForwarder {
     ) -> Self {
         let workers = workers.max(1);
         let capacity = capacity.max(128);
-        let max_inflight = capacity.min(MAX_INFLIGHT_PER_WORKER).max(1);
+        let max_inflight = capacity.clamp(1, MAX_INFLIGHT_PER_WORKER);
 
         let mut worker_senders = Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -78,7 +78,7 @@ impl AskForwarder {
                     }
 
                     tokio::select! {
-                        maybe_task = rx.recv(), if !rx_closed => {
+                        maybe_task = rx.recv(), if can_receive_more(rx_closed, inflight.len(), max_inflight) => {
                             match maybe_task {
                                 Some(task) => inflight.push(Box::pin(run_forward_task(task))),
                                 None => rx_closed = true,
@@ -191,6 +191,10 @@ struct CompletedForward {
     error_reply: Option<Bytes>,
 }
 
+fn can_receive_more(rx_closed: bool, inflight_len: usize, max_inflight: usize) -> bool {
+    !rx_closed && inflight_len < max_inflight
+}
+
 async fn run_forward_task(task: ForwardTask) -> CompletedForward {
     let response = match task.timeout {
         Some(timeout) if task.use_combined_timeout => {
@@ -251,5 +255,34 @@ fn handle_completed_forward(
                 let _ = completed.responder.try_reply_bytes(reply);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receive_guard_disables_reads_at_inflight_limit() {
+        assert!(can_receive_more(
+            false,
+            MAX_INFLIGHT_PER_WORKER - 1,
+            MAX_INFLIGHT_PER_WORKER
+        ));
+        assert!(!can_receive_more(
+            false,
+            MAX_INFLIGHT_PER_WORKER,
+            MAX_INFLIGHT_PER_WORKER
+        ));
+        assert!(!can_receive_more(
+            false,
+            MAX_INFLIGHT_PER_WORKER + 1,
+            MAX_INFLIGHT_PER_WORKER
+        ));
+    }
+
+    #[test]
+    fn receive_guard_disables_reads_after_channel_closes() {
+        assert!(!can_receive_more(true, 0, MAX_INFLIGHT_PER_WORKER));
     }
 }
