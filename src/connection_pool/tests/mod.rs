@@ -2787,6 +2787,34 @@ fn cancelled_wait_for_response_releases_slot_via_drop_guard() {
     });
 }
 
+#[test]
+fn cancelled_pending_ask_wait_releases_slot() {
+    run_multi_thread_test(async {
+        let tracker = CorrelationTracker::new();
+        let baseline_waiting = count_waiting_slots(&tracker);
+
+        for _ in 0..256 {
+            let slot = tracker.allocate().expect("ring should not be exhausted");
+            let pending = PendingAsk {
+                correlation_id: slot.disarm(),
+                correlation: Arc::clone(&tracker),
+                timeout: std::time::Duration::from_secs(60),
+                active: true,
+            };
+
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1), pending.wait()).await;
+        }
+
+        let leaked = count_waiting_slots(&tracker) - baseline_waiting;
+        assert_eq!(
+            leaked, 0,
+            "{leaked} slots leaked from cancelled PendingAsk::wait futures. \
+             PendingAsk Drop must remain armed while wait() is awaiting so \
+             externally cancelled DeferredAsk waits cannot exhaust the ring."
+        );
+    });
+}
+
 fn count_waiting_slots(tracker: &CorrelationTracker) -> usize {
     tracker
         .pending

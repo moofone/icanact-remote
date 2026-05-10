@@ -33,6 +33,7 @@ pub(crate) struct PendingAsk {
     correlation_id: u16,
     correlation: Arc<CorrelationTracker>,
     timeout: Duration,
+    active: bool,
 }
 
 impl PendingAsk {
@@ -40,21 +41,21 @@ impl PendingAsk {
         self.correlation_id
     }
 
-    pub(crate) async fn wait(self) -> Result<bytes::Bytes> {
-        let this = std::mem::ManuallyDrop::new(self);
-        let correlation_id = this.correlation_id;
-        let timeout = this.timeout;
-        // `wait(self)` consumes the handle, so a successful/terminal wait no longer needs
-        // the drop-time cancellation path that is only for abandoned pending asks.
-        let correlation = unsafe { std::ptr::read(&this.correlation) };
-        let response = correlation.wait_for_response(correlation_id, timeout).await?;
-        Ok(response.into_bytes())
+    pub(crate) async fn wait(mut self) -> Result<bytes::Bytes> {
+        let correlation_id = self.correlation_id;
+        let timeout = self.timeout;
+        let correlation = Arc::clone(&self.correlation);
+        let result = correlation.wait_for_response(correlation_id, timeout).await;
+        self.active = false;
+        result.map(crate::AlignedBytes::into_bytes)
     }
 }
 
 impl Drop for PendingAsk {
     fn drop(&mut self) {
-        self.correlation.cancel(self.correlation_id);
+        if self.active {
+            self.correlation.cancel(self.correlation_id);
+        }
     }
 }
 
@@ -728,6 +729,7 @@ impl<T> ConnectionHandle<T> {
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
             timeout,
+            active: true,
         })
     }
 
@@ -1292,6 +1294,7 @@ impl<T> ConnectionHandle<T> {
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
             timeout,
+            active: true,
         })
     }
 
@@ -1349,6 +1352,7 @@ impl<T> ConnectionHandle<T> {
                 correlation_id: slot.disarm(),
                 correlation: self.correlation.clone(),
                 timeout,
+                active: true,
             })
             .collect();
         Ok(handles)

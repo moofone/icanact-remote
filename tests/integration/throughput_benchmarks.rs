@@ -11,8 +11,7 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 #[cfg(any(feature = "test-helpers", debug_assertions))]
 use icanact_remote::wire_type;
 use icanact_remote::{
-    AlignedBytes, AskContext, GossipConfig, GossipRegistryHandle, KeyPair,
-    RemoteConnection,
+    AlignedBytes, AskContext, GossipConfig, GossipRegistryHandle, KeyPair, RemoteConnection,
     registry::{
         ActorAskHandlerSync, ActorAskImmediateHandlerSync, ActorMessageFuture, ActorMessageHandler,
         ActorMessageHandlerSync, ActorResponse, ActorTellHandlerSync, AskDisposition,
