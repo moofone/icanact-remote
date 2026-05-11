@@ -4797,20 +4797,65 @@ impl<T: 'static> GossipRegistry<T> {
         // The connection state is already updated, actors remain available
     }
 
-    /// Deduplicate changes, keeping only the most recent change for each actor
+    /// Deduplicate changes, keeping the causally-most-recent change for each actor.
+    ///
+    /// C7 fix: previously this function kept the *iteration-last* change per name, which
+    /// meant out-of-order arrival of `ActorAdded(seq=10)` and `ActorRemoved(seq=20)` for the
+    /// same actor could collapse to whichever happened to be inserted last, resurrecting
+    /// deleted actors when deltas arrived out of order.
+    ///
+    /// Resolution rule:
+    ///   - If candidate's vector clock happens-after existing: candidate wins.
+    ///   - If candidate happens-before existing: existing wins.
+    ///   - If concurrent or equal: **remove-wins** — `ActorRemoved` displaces `ActorAdded`,
+    ///     never the other way around. This is the standard CRDT tie-break for tombstones
+    ///     and ensures a stale `ActorAdded` cannot resurrect an actor that some peer has
+    ///     concurrently observed as removed.
     pub fn deduplicate_changes(changes: Vec<RegistryChange>) -> Vec<RegistryChange> {
         let mut actor_changes: HashMap<String, RegistryChange> = HashMap::new();
 
         for change in changes {
             let actor_name = Self::get_change_actor_name(&change);
-            // Simply keep the last change for each actor
-            actor_changes.insert(actor_name, change);
+            match actor_changes.entry(actor_name) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(change);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if Self::change_wins(&change, e.get()) {
+                        e.insert(change);
+                    }
+                }
+            }
         }
 
         // Stable ordering: avoid propagating hash iteration order into protocol-visible messages.
         let mut ordered: Vec<(String, RegistryChange)> = actor_changes.into_iter().collect();
         ordered.sort_by(|a, b| a.0.cmp(&b.0));
         ordered.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Causal-precedence + remove-wins comparator used by `deduplicate_changes`.
+    fn change_wins(candidate: &RegistryChange, existing: &RegistryChange) -> bool {
+        let cand_clock = Self::change_vector_clock(candidate);
+        let exist_clock = Self::change_vector_clock(existing);
+        match cand_clock.compare(exist_clock) {
+            crate::ClockOrdering::After => true,
+            crate::ClockOrdering::Before => false,
+            crate::ClockOrdering::Equal | crate::ClockOrdering::Concurrent => {
+                // Remove-wins: `ActorRemoved` displaces `ActorAdded`, never the
+                // reverse, on causal ties. Two `ActorRemoved` for the same name
+                // are kept stably (existing wins). Two `ActorAdded` likewise.
+                matches!(candidate, RegistryChange::ActorRemoved { .. })
+                    && !matches!(existing, RegistryChange::ActorRemoved { .. })
+            }
+        }
+    }
+
+    fn change_vector_clock(change: &RegistryChange) -> &crate::VectorClock {
+        match change {
+            RegistryChange::ActorAdded { location, .. } => &location.vector_clock,
+            RegistryChange::ActorRemoved { vector_clock, .. } => vector_clock,
+        }
     }
 
     /// Extract the actor name from a registry change
@@ -6323,6 +6368,92 @@ mod tests {
             })
             .collect();
         assert_eq!(actor1_changes.len(), 1);
+    }
+
+    /// C7 regression: when an `ActorRemoved` arrives before its
+    /// corresponding `ActorAdded` (e.g. delta reordering across peers),
+    /// the actor must not be resurrected. The causal comparison is
+    /// driven by vector clocks; on a causal tie, remove wins.
+    #[test]
+    fn test_deduplicate_changes_remove_wins_on_reorder() {
+        let node = test_peer_id("c7-node").to_node_id();
+        let location = test_location(test_addr(9001));
+        // Bump the `ActorAdded` vector clock once (representing the
+        // initial registration).
+        location.vector_clock.increment(node);
+
+        let add = RegistryChange::ActorAdded {
+            name: "x".to_string(),
+            location: location.clone(),
+            priority: RegistrationPriority::Normal,
+        };
+
+        // The remove was issued *after* the add — bump the same clock
+        // again so it causally happens-after.
+        let removal_clock = location.vector_clock.clone();
+        removal_clock.increment(node);
+        let remove = RegistryChange::ActorRemoved {
+            name: "x".to_string(),
+            vector_clock: removal_clock,
+            removing_node_id: node,
+            priority: RegistrationPriority::Immediate,
+        };
+
+        // Out-of-order arrival: remove first, then add. The legacy
+        // implementation kept whichever was inserted last (the add),
+        // resurrecting the deleted actor.
+        let reordered = vec![remove.clone(), add.clone()];
+        let deduped = GossipRegistry::<()>::deduplicate_changes(reordered);
+        assert_eq!(deduped.len(), 1, "should collapse same-name changes");
+        assert!(
+            matches!(deduped[0], RegistryChange::ActorRemoved { .. }),
+            "ActorRemoved must win over earlier ActorAdded regardless of \
+             iteration order (got {:?})",
+            deduped[0]
+        );
+
+        // Sanity: in-order arrival still produces ActorRemoved as the
+        // winner.
+        let in_order = vec![add, remove];
+        let deduped = GossipRegistry::<()>::deduplicate_changes(in_order);
+        assert_eq!(deduped.len(), 1);
+        assert!(matches!(deduped[0], RegistryChange::ActorRemoved { .. }));
+    }
+
+    /// C7 tie case: two concurrent changes (equal vector clocks) for
+    /// the same actor — one Add, one Remove — must resolve as Remove
+    /// (remove-wins on tie / tombstone preference).
+    #[test]
+    fn test_deduplicate_changes_concurrent_remove_wins() {
+        let node_a = test_peer_id("c7-node-a").to_node_id();
+        let node_b = test_peer_id("c7-node-b").to_node_id();
+        // Two clocks that are concurrent: each has incremented a
+        // different node, so neither happens-before the other.
+        let add_loc = test_location(test_addr(9002));
+        add_loc.vector_clock.increment(node_a);
+        let remove_clock = crate::VectorClock::new();
+        remove_clock.increment(node_b);
+
+        let add = RegistryChange::ActorAdded {
+            name: "y".to_string(),
+            location: add_loc,
+            priority: RegistrationPriority::Normal,
+        };
+        let remove = RegistryChange::ActorRemoved {
+            name: "y".to_string(),
+            vector_clock: remove_clock,
+            removing_node_id: node_b,
+            priority: RegistrationPriority::Immediate,
+        };
+
+        for order in [vec![add.clone(), remove.clone()], vec![remove, add]] {
+            let deduped = GossipRegistry::<()>::deduplicate_changes(order);
+            assert_eq!(deduped.len(), 1);
+            assert!(
+                matches!(deduped[0], RegistryChange::ActorRemoved { .. }),
+                "concurrent Add+Remove for same name must collapse to Remove"
+            );
+        }
     }
 
     #[test]
