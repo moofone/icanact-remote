@@ -519,6 +519,96 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
     })
 }
 
+/// C1 + C2 regression: when the socket-close path
+/// (`handle_peer_connection_failure`) fires, the registry must
+/// not only prune `known_actors` but also broadcast that fact to
+/// the cluster *immediately* — not on the next periodic gossip
+/// tick. We exercise the synchronous failure handler and assert
+/// that the urgent_changes queue has been drained by an immediate
+/// gossip round (and that the pending_changes queue still carries
+/// the ActorRemoved for retry).
+#[test]
+fn socket_close_triggers_immediate_gossip_broadcast() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(200),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let subscriber = create_node(config.clone()).await?;
+        let sub_addr = subscriber.registry.bind_addr;
+
+        connect_pair(&publisher, &subscriber).await;
+
+        subscriber
+            .registry
+            .register_actor_with_priority(
+                DEAD_ACTOR_NAME.to_string(),
+                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
+                RegistrationPriority::Immediate,
+            )
+            .await?;
+
+        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
+            .await
+            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
+
+        publisher
+            .registry
+            .handle_peer_connection_failure(sub_addr)
+            .await?;
+
+        // Local prune sanity (covered above): actor gone from
+        // publisher's known_actors.
+        assert!(
+            publisher
+                .registry
+                .lookup_actor(DEAD_ACTOR_NAME)
+                .await
+                .is_none(),
+            "precondition: local prune must have run"
+        );
+
+        // C1+C2 assertion: immediate gossip should have drained
+        // urgent_changes (sent them on the wire) and pending_changes
+        // should still carry the ActorRemoved as the retry record.
+        let state = publisher.registry.gossip_state.lock().await;
+        let pending_has_actor_removed = state.pending_changes.iter().any(|c| match c {
+            icanact_remote::registry::RegistryChange::ActorRemoved { name, .. } => {
+                name == DEAD_ACTOR_NAME
+            }
+            _ => false,
+        });
+        assert!(
+            pending_has_actor_removed,
+            "handle_peer_connection_failure should have enqueued an ActorRemoved \
+             for the dead peer's actor (pending_changes_len={}, urgent_changes_len={})",
+            state.pending_changes.len(),
+            state.urgent_changes.len()
+        );
+        // urgent_changes must be empty: trigger_immediate_gossip
+        // ran and drained them. (It may also re-extend pending
+        // with the same change for retry, which is fine — the
+        // existing convention.)
+        assert!(
+            state.urgent_changes.is_empty(),
+            "trigger_immediate_gossip should have drained urgent_changes \
+             after socket-close cleanup (urgent_changes_len={})",
+            state.urgent_changes.len()
+        );
+        drop(state);
+
+        publisher.shutdown().await;
+        subscriber.shutdown().await;
+        Ok(())
+    })
+}
+
 /// C3 regression: when `handle_peer_death` prunes a dead peer's
 /// entries from `known_actors`, it MUST also queue an
 /// `ActorRemoved` urgent gossip change for every pruned entry so

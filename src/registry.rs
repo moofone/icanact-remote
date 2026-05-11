@@ -4389,6 +4389,26 @@ impl<T: 'static> GossipRegistry<T> {
         // so `known_actors` and pool-state evictions are uniform.
         if crossed_threshold {
             self.handle_peer_death(failed_peer_addr).await;
+
+            // C1 + C2: socket-close observation must produce an
+            // immediate cluster-wide broadcast, not wait for the
+            // periodic gossip tick. `handle_peer_death` (after the
+            // C3 fix) enqueues an Immediate-priority `ActorRemoved`
+            // change for every pruned actor — kick a gossip round
+            // right now so indirect peers learn about the death in
+            // sub-millisecond time rather than `gossip_interval`.
+            //
+            // This path is NOT called from inside `apply_gossip_results`
+            // (which has its own re-entry concerns), so triggering
+            // immediate gossip here is safe.
+            if let Err(err) = self.trigger_immediate_gossip().await {
+                warn!(
+                    error = %err,
+                    failed_peer = %failed_peer_addr,
+                    "trigger_immediate_gossip after socket-close failed; \
+                     ActorRemoved deltas will go out on next periodic gossip"
+                );
+            }
         }
 
         // Now start consensus process for actor invalidation.
