@@ -390,20 +390,58 @@ impl RoutedPubSub {
                     .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
                     .collect()
             };
-            for next_hop in grouped.keys() {
-                if next_conns
-                    .get(next_hop)
-                    .map(|conn| conn.is_closed())
-                    .unwrap_or(true)
+
+            // Subscriptions are gated on the pool already holding a live
+            // connection to each next-hop. We deliberately do NOT call
+            // `client.lookup_peer` here: it goes through
+            // `pool.get_connection_to_peer` → `get_connection_by_peer_id`,
+            // which warn-logs the "No connection found for peer" pair on
+            // every miss (`connection_pool::pool_connect.rs:669-682`).
+            // With this refresh ticking at `CONTROL_PLANE_INTERVAL`
+            // (25 ms), an unreachable peer whose interest entry is being
+            // re-gossiped to us produces ~80 warn lines/sec — observed on
+            // `stratum-devnet-a` 2026-05-11.
+            //
+            // Connection lifecycle belongs to the gossip/peer-discovery
+            // layer (`peer_discovery.rs`), not to pubsub. We just
+            // observe pool state via the non-warning
+            // `lookup_connected_peer` and route only to next-hops the
+            // pool currently has a usable connection for. When a peer
+            // (re)connects, the next refresh tick picks it up. When a
+            // peer drops, the next refresh tick removes it — the user's
+            // "subscription terminates on disconnect; re-subscribes on
+            // reconnect" invariant.
+            let mut routable: HashMap<PeerId, Arc<[PeerId]>> = HashMap::new();
+            for (next_hop, destinations) in grouped {
+                let cached_live = next_conns
+                    .get(&next_hop)
+                    .map(|conn| !conn.is_closed())
+                    .unwrap_or(false);
+                if cached_live {
+                    routable.insert(next_hop, destinations);
+                    continue;
+                }
+                // Silent pre-check: only call into pool lookup paths
+                // (which warn on miss inside
+                // `get_connection_by_peer_id`) when the pool already
+                // holds a usable connection. `has_connection_by_peer_id`
+                // is the only non-warning peer-presence test on the pool.
+                if !self.registry.connection_pool.has_connection_by_peer_id(&next_hop) {
+                    next_conns.remove(&next_hop);
+                    continue;
+                }
+                if let Some(peer_ref) = self.client.lookup_connected_peer(&next_hop)
+                    && let Some(conn) = peer_ref.connection_ref()
                 {
-                    if let Ok(peer_ref) = self.client.lookup_peer(next_hop).await
-                        && let Some(conn) = peer_ref.connection_ref()
-                    {
-                        next_conns.insert(next_hop.clone(), conn);
-                    }
+                    next_conns.insert(next_hop.clone(), conn);
+                    routable.insert(next_hop, destinations);
+                } else {
+                    next_conns.remove(&next_hop);
                 }
             }
-            next_routes.insert(topic, Arc::new(grouped));
+            if !routable.is_empty() {
+                next_routes.insert(topic, Arc::new(routable));
+            }
         }
         self.route_groups.store(Arc::new(next_routes));
         self.conns.store(Arc::new(next_conns));
