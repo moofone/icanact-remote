@@ -825,6 +825,7 @@ impl<T: 'static> Peer<T> {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+                    last_response_received: current_time,
                 },
             );
             let peers_after = gossip_state.peers.len();
