@@ -518,3 +518,107 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
         Ok(())
     })
 }
+
+/// C3 regression: when `handle_peer_death` prunes a dead peer's
+/// entries from `known_actors`, it MUST also queue an
+/// `ActorRemoved` urgent gossip change for every pruned entry so
+/// downstream peers in the cluster learn about the death within one
+/// gossip tick instead of having to re-derive it from their own
+/// timeout path.
+///
+/// Pre-fix: `handle_peer_death` only mutates `known_actors`
+/// locally; `gossip_state.urgent_changes` / `pending_changes` see
+/// no entry. Indirect peers continue routing to the dead peer's
+/// actors until their own gossip rounds time out.
+///
+/// Post-fix: the same call enqueues an `ActorRemoved` per pruned
+/// actor and the next gossip round fans it out.
+#[test]
+fn peer_death_queues_actor_removed_for_gossip() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(200),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let subscriber = create_node(config.clone()).await?;
+        let sub_addr = subscriber.registry.bind_addr;
+
+        connect_pair(&publisher, &subscriber).await;
+
+        subscriber
+            .registry
+            .register_actor_with_priority(
+                DEAD_ACTOR_NAME.to_string(),
+                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
+                RegistrationPriority::Immediate,
+            )
+            .await?;
+
+        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
+            .await
+            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
+
+        let hard_err = icanact_remote::registry::GossipResult {
+            peer_addr: sub_addr,
+            sent_sequence: 0,
+            outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated peer socket termination",
+            ))),
+        };
+        publisher
+            .registry
+            .apply_gossip_results(vec![hard_err])
+            .await;
+
+        // Local prune already works (covered by the test above).
+        assert!(
+            publisher
+                .registry
+                .lookup_actor(DEAD_ACTOR_NAME)
+                .await
+                .is_none(),
+            "local prune precondition: subscriber's actor should be gone from publisher's \
+             known_actors"
+        );
+
+        // The C3 assertion: an ActorRemoved for the dead peer's
+        // actor must now be queued for gossip broadcast. The urgent
+        // queue may have been drained already by an interleaving
+        // `trigger_immediate_gossip` call; the pending queue is the
+        // durable record of the change, so we accept either.
+        let state = publisher.registry.gossip_state.lock().await;
+        let pending_has_actor_removed = state.pending_changes.iter().any(|c| match c {
+            icanact_remote::registry::RegistryChange::ActorRemoved { name, .. } => {
+                name == DEAD_ACTOR_NAME
+            }
+            _ => false,
+        });
+        let urgent_has_actor_removed = state.urgent_changes.iter().any(|c| match c {
+            icanact_remote::registry::RegistryChange::ActorRemoved { name, .. } => {
+                name == DEAD_ACTOR_NAME
+            }
+            _ => false,
+        });
+        assert!(
+            urgent_has_actor_removed || pending_has_actor_removed,
+            "handle_peer_death should enqueue an ActorRemoved gossip change for each \
+             pruned dead-peer actor (urgent_changes_len={}, \
+             urgent_has_actor_removed={}, pending_has_actor_removed={})",
+            state.urgent_changes.len(),
+            urgent_has_actor_removed,
+            pending_has_actor_removed
+        );
+        drop(state);
+
+        publisher.shutdown().await;
+        subscriber.shutdown().await;
+        Ok(())
+    })
+}

@@ -3639,15 +3639,19 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         };
 
-        // 1. Prune known_actors owned by this peer.
-        let mut to_remove: Vec<String> = Vec::new();
+        // 1. Prune known_actors owned by this peer, capturing each
+        //    pruned location so we can fan an ActorRemoved gossip
+        //    change out to the rest of the cluster (C3 — without
+        //    this, indirect peers keep routing to the dead peer's
+        //    actors until their own gossip rounds time out).
+        let mut to_remove: Vec<(String, RemoteActorLocation)> = Vec::new();
         self.actor_state.known_actors.iter_sync(|name, location| {
             if location.peer_id == dead_peer_id {
-                to_remove.push(name.clone());
+                to_remove.push((name.clone(), location.clone()));
             }
             true
         });
-        for name in &to_remove {
+        for (name, _) in &to_remove {
             let _ = self.actor_state.known_actors.remove_sync(name.as_str());
         }
 
@@ -3661,20 +3665,51 @@ impl<T: 'static> GossipRegistry<T> {
 
         // 3. Reset per-peer sequence + last_response_received so a
         //    recovering peer's next FullSync is accepted (mirrors the
-        //    DNS-change reset path at registry.rs ~1980).
+        //    DNS-change reset path at registry.rs ~1980), and enqueue
+        //    an Immediate-priority ActorRemoved for every pruned actor
+        //    so the next gossip round propagates the death cluster-wide.
+        let mut have_urgent = false;
         {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&dead_peer_addr) {
                 peer_info.last_sequence = 0;
                 peer_info.last_response_received = 0;
             }
+            let removing_node_id = self.peer_id.to_node_id();
+            for (name, location) in &to_remove {
+                let removal_clock = location.vector_clock.clone();
+                removal_clock.increment(removing_node_id);
+                let change = RegistryChange::ActorRemoved {
+                    name: name.clone(),
+                    vector_clock: removal_clock,
+                    removing_node_id,
+                    priority: RegistrationPriority::Immediate,
+                };
+                gossip_state.urgent_changes.push(change.clone());
+                gossip_state.pending_changes.push(change);
+                have_urgent = true;
+            }
         }
+
+        // 4. The urgent_changes queue will be drained by the next
+        //    gossip round (periodic or explicit). We deliberately do
+        //    NOT call `trigger_immediate_gossip` here because some
+        //    callers of `handle_peer_death` (notably
+        //    `apply_gossip_results`) are themselves inside the gossip
+        //    loop and an immediate re-entry would race with the
+        //    failure accounting they just performed. The queued
+        //    Immediate-priority changes will fan out on the next
+        //    tick, which is still within one `gossip_interval` —
+        //    several orders of magnitude faster than the peer
+        //    timeout window we used to depend on.
+        let _ = have_urgent;
 
         info!(
             peer_id = %dead_peer_id,
             peer_addr = %dead_peer_addr,
             pruned_actors = to_remove.len(),
-            "gossip declared peer dead — pruned known_actors, disconnected pool"
+            "gossip declared peer dead — pruned known_actors, disconnected pool, \
+             enqueued ActorRemoved gossip"
         );
     }
 
