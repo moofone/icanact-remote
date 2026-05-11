@@ -519,6 +519,110 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
     })
 }
 
+/// Regression: when `handle_peer_death` is reached via
+/// `apply_gossip_results` (the gossip-results threshold path),
+/// `urgent_changes` is populated but no `trigger_immediate_gossip`
+/// follows (that path is already inside a gossip round). Without
+/// folding urgent into `delta_history` during the next periodic
+/// `prepare_gossip_round`, the urgent entries would otherwise
+/// linger in the queue and `create_delta_from_state` would clone
+/// them onto every subsequent round forever.
+///
+/// After `prepare_gossip_round` runs once, `urgent_changes` must
+/// be empty and the entries must be present in `delta_history`.
+#[test]
+fn periodic_gossip_drains_urgent_changes_into_history() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(200),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let subscriber = create_node(config.clone()).await?;
+        let sub_addr = subscriber.registry.bind_addr;
+
+        connect_pair(&publisher, &subscriber).await;
+
+        subscriber
+            .registry
+            .register_actor_with_priority(
+                DEAD_ACTOR_NAME.to_string(),
+                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
+                RegistrationPriority::Immediate,
+            )
+            .await?;
+
+        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
+            .await
+            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+
+        // Drive the apply_gossip_results hard-error fast path — this
+        // is the caller that DOES NOT call trigger_immediate_gossip,
+        // so urgent_changes is left populated.
+        let hard_err = icanact_remote::registry::GossipResult {
+            peer_addr: sub_addr,
+            sent_sequence: 0,
+            outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated peer socket termination",
+            ))),
+        };
+        publisher
+            .registry
+            .apply_gossip_results(vec![hard_err])
+            .await;
+
+        // Sanity: urgent_changes carries the ActorRemoved.
+        {
+            let state = publisher.registry.gossip_state.lock().await;
+            let has_urgent_removed = state.urgent_changes.iter().any(|c| matches!(
+                c,
+                icanact_remote::registry::RegistryChange::ActorRemoved { name, .. }
+                    if name == DEAD_ACTOR_NAME
+            ));
+            assert!(
+                has_urgent_removed,
+                "precondition: handle_peer_death from apply_gossip_results should \
+                 have enqueued ActorRemoved into urgent_changes (urgent_len={})",
+                state.urgent_changes.len()
+            );
+        }
+
+        // One periodic gossip round must drain urgent_changes and
+        // fold them into delta_history (one-shot urgent broadcast).
+        let _tasks = publisher.registry.prepare_gossip_round().await?;
+
+        let state = publisher.registry.gossip_state.lock().await;
+        assert!(
+            state.urgent_changes.is_empty(),
+            "urgent_changes must be drained by the periodic gossip round \
+             (still {} entries — would be re-broadcast on every tick)",
+            state.urgent_changes.len()
+        );
+        let history_has_removed = state.delta_history.iter().flat_map(|d| d.changes.iter()).any(
+            |c| matches!(
+                c,
+                icanact_remote::registry::RegistryChange::ActorRemoved { name, .. }
+                    if name == DEAD_ACTOR_NAME
+            ),
+        );
+        assert!(
+            history_has_removed,
+            "drained urgent ActorRemoved entries must be folded into delta_history \
+             so peers can still receive them via the since_sequence path"
+        );
+        drop(state);
+
+        publisher.shutdown().await;
+        subscriber.shutdown().await;
+        Ok(())
+    })
+}
+
 /// C1 + C2 regression: when the socket-close path
 /// (`handle_peer_connection_failure`) fires, the registry must
 /// not only prune `known_actors` but also broadcast that fact to
