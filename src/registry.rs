@@ -29,6 +29,28 @@ use crate::{
     peer_discovery::{PeerDiscovery, PeerDiscoveryConfig},
 };
 
+/// Classify a `GossipError` as a hard transport failure that proves the
+/// remote socket is gone (BrokenPipe / ConnectionReset / ConnectionAborted
+/// / NotConnected / ConnectionRefused). Used by `apply_gossip_results` to
+/// fast-path the dead-peer cleanup hook on the same round instead of
+/// waiting for `max_peer_failures` separate rounds.
+///
+/// Soft errors (Timeout, decoding failures, application-level rejects)
+/// keep the existing one-failure-at-a-time accumulation so a transient
+/// blip cannot immediately evict a peer.
+fn is_hard_socket_error(err: &GossipError) -> bool {
+    match err {
+        GossipError::Network(io_err) => {
+            use std::io::ErrorKind::*;
+            matches!(
+                io_err.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | ConnectionRefused
+            )
+        }
+        _ => false,
+    }
+}
+
 #[inline]
 fn stable_concurrent_location_wins(
     candidate: &RemoteActorLocation,
@@ -822,6 +844,15 @@ pub struct PeerInfo {
     pub last_failure_time: Option<u64>,
     /// Last time we attempted a DNS refresh for this peer (rate limiting).
     pub last_dns_refresh_attempt: Option<u64>,
+    /// Last time we received a gossip response *payload* from this peer
+    /// (not merely sent to). Used by the response-asymmetry liveness
+    /// detector: if we keep sending and never see a response within
+    /// `config.peer_liveness_window`, treat the peer as failed even when
+    /// the persistent-connection write succeeds at the kernel level.
+    /// `0` means "no response observed yet" — treated as new-peer (no
+    /// stale verdict until either we get one or the configured grace
+    /// expires from `last_attempt`).
+    pub last_response_received: u64,
 }
 
 impl PeerInfo {
@@ -844,6 +875,7 @@ impl PeerInfo {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         }
     }
 
@@ -874,6 +906,7 @@ impl PeerInfo {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         }
     }
 
@@ -925,6 +958,7 @@ impl PeerInfo {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         })
     }
 }
@@ -1467,6 +1501,7 @@ impl<T: 'static> GossipRegistry<T> {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -1738,6 +1773,7 @@ impl<T: 'static> GossipRegistry<T> {
                             consecutive_deltas: 0,
                             last_failure_time: None,
                             last_dns_refresh_attempt: None,
+                            last_response_received: current_time,
                         },
                     );
 
@@ -3288,6 +3324,7 @@ impl<T: 'static> GossipRegistry<T> {
                         consecutive_deltas: 0,
                         last_failure_time: None,
                         last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -3392,32 +3429,88 @@ impl<T: 'static> GossipRegistry<T> {
     /// Apply results from gossip tasks
     pub async fn apply_gossip_results(&self, results: Vec<GossipResult>) {
         let current_time = current_timestamp();
+        let liveness_window_secs = self.config.peer_liveness_window.as_secs();
+
+        // Collect peers that crossed the death threshold in this batch; we
+        // fire `handle_peer_death` after dropping the `gossip_state` lock
+        // to avoid lock-ordering issues (it acquires the same lock to
+        // reset `last_sequence`).
+        let mut newly_dead: Vec<SocketAddr> = Vec::new();
 
         for result in results {
             match result.outcome {
                 Ok(response_opt) => {
-                    // Success case - we successfully sent a message
-                    // But with persistent connections, this doesn't mean the peer is alive
-                    // We'll only reset failures when we receive messages from the peer
+                    let mut crossed_threshold = false;
                     {
                         let mut gossip_state = self.gossip_state.lock().await;
                         if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
-                            // Don't reset failures here - only update attempt time
                             peer_info.last_attempt = current_time;
                             peer_info.last_sent_sequence = result.sent_sequence;
 
-                            // Only update last_success if we're not in a failed state
+                            // Only update last_success if we're not in a failed state.
+                            // Note: with persistent connections, `Ok(_)` doesn't prove
+                            // the peer is alive — only that our kernel buffer accepted
+                            // the bytes. Response-asymmetry detection below catches
+                            // the half-open / paused-peer case.
                             if peer_info.failures < self.config.max_peer_failures {
                                 peer_info.last_success = current_time;
+                            }
+
+                            // Response-asymmetry liveness check (Part 3b in the
+                            // gossip-protocol-native cleanup plan):
+                            //
+                            // If we haven't received any inbound payload from
+                            // this peer (delta response, full sync, etc.) for
+                            // `peer_liveness_window` seconds, treat the next
+                            // no-response round as a soft failure. This catches
+                            // "outbound writes succeed at the kernel level but
+                            // the peer isn't reading anymore" — the scenario
+                            // that kept `538a99…` alive on `stratum-devnet-a`
+                            // for 66 minutes.
+                            //
+                            // `last_response_received` is initialised to the
+                            // peer's creation time, so a brand-new peer doesn't
+                            // immediately look stale; it has at least one
+                            // `peer_liveness_window` to be observed responding.
+                            let silence_secs = current_time
+                                .saturating_sub(peer_info.last_response_received);
+                            if response_opt.is_none()
+                                && silence_secs > liveness_window_secs
+                                && peer_info.failures < self.config.max_peer_failures
+                            {
+                                peer_info.failures += 1;
+                                info!(
+                                    peer = %result.peer_addr,
+                                    silence_secs,
+                                    new_failures = peer_info.failures,
+                                    "no response within peer_liveness_window; \
+                                     incrementing failures"
+                                );
+                                if peer_info.failures == self.config.max_peer_failures {
+                                    peer_info.last_failure_time = Some(current_time);
+                                    crossed_threshold = true;
+                                    info!(peer = %result.peer_addr,
+                                          "peer reached max failures \
+                                           (response-asymmetry)");
+                                }
                             }
                         }
                     }
 
-                    // Record that this peer is active (we successfully communicated with it)
+                    if crossed_threshold {
+                        newly_dead.push(result.peer_addr);
+                    }
+
+                    // Record that this peer is active (we successfully sent to it).
                     self.record_peer_activity(result.peer_addr).await;
 
-                    // Process response if we got one
+                    // Process response if we got one. Note: receiving a response
+                    // updates `last_response_received` via the call below into
+                    // `handle_gossip_response` → `mark_response_received`, which
+                    // also resets `failures` to 0 via `record_peer_activity`.
                     if let Some(response) = response_opt {
+                        self.mark_response_received(result.peer_addr, current_time)
+                            .await;
                         if let Err(err) = self
                             .handle_gossip_response(result.peer_addr, response)
                             .await
@@ -3428,34 +3521,161 @@ impl<T: 'static> GossipRegistry<T> {
                 }
                 Err(err) => {
                     // Failure case
-                    warn!(peer = %result.peer_addr, error = %err, "failed to gossip to peer");
-                    let mut gossip_state = self.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
-                        // Only increment failures if not already at max
-                        // This prevents indefinite failure count growth
-                        if peer_info.failures < self.config.max_peer_failures {
-                            peer_info.failures += 1;
-                            info!(peer = %result.peer_addr,
-                                  new_failures = peer_info.failures,
-                                  max_failures = self.config.max_peer_failures,
-                                  "incremented peer failure count");
+                    let hard_socket_err = is_hard_socket_error(&err);
+                    warn!(peer = %result.peer_addr, error = %err,
+                          hard_socket_err,
+                          "failed to gossip to peer");
+                    let mut crossed_threshold = false;
+                    {
+                        let mut gossip_state = self.gossip_state.lock().await;
+                        if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
+                            // Hard socket termination (BrokenPipe, ConnectionReset,
+                            // ConnectionAborted, NotConnected, RefusedConnection) is
+                            // unambiguous evidence the peer is gone — jump straight
+                            // to threshold instead of waiting for `max_peer_failures`
+                            // separate gossip rounds.
+                            //
+                            // For other errors (Timeout, DecodingError, etc.) keep
+                            // the existing one-failure-at-a-time accumulation, so a
+                            // transient blip doesn't immediately evict a peer.
+                            if peer_info.failures < self.config.max_peer_failures {
+                                let increment = if hard_socket_err {
+                                    self.config.max_peer_failures - peer_info.failures
+                                } else {
+                                    1
+                                };
+                                peer_info.failures += increment;
+                                info!(peer = %result.peer_addr,
+                                      new_failures = peer_info.failures,
+                                      max_failures = self.config.max_peer_failures,
+                                      hard_socket_err,
+                                      "incremented peer failure count");
 
-                            // Mark failure time if this puts us at max failures
-                            if peer_info.failures == self.config.max_peer_failures {
-                                peer_info.last_failure_time = Some(current_time);
-                                info!(peer = %result.peer_addr, "peer reached max failures");
+                                // Mark failure time if this puts us at max failures
+                                if peer_info.failures >= self.config.max_peer_failures {
+                                    peer_info.last_failure_time = Some(current_time);
+                                    crossed_threshold = true;
+                                    info!(peer = %result.peer_addr,
+                                          hard_socket_err,
+                                          "peer reached max failures");
+                                }
+                            } else {
+                                // Already at max failures, just update attempt time
+                                debug!(peer = %result.peer_addr,
+                                       failures = peer_info.failures,
+                                       "peer already at max failures, not incrementing");
                             }
-                        } else {
-                            // Already at max failures, just update attempt time
-                            debug!(peer = %result.peer_addr,
-                                   failures = peer_info.failures,
-                                   "peer already at max failures, not incrementing");
+                            peer_info.last_attempt = current_time;
                         }
-                        peer_info.last_attempt = current_time;
+                    }
+                    if crossed_threshold {
+                        newly_dead.push(result.peer_addr);
                     }
                 }
             }
         }
+
+        // Fire the dead-peer cleanup hook outside the gossip_state lock.
+        // De-duplicate in case the same addr crossed threshold via both
+        // soft and hard paths in one batch.
+        newly_dead.sort_by_key(|a| (a.ip(), a.port()));
+        newly_dead.dedup();
+        for addr in newly_dead {
+            self.handle_peer_death(addr).await;
+        }
+    }
+
+    /// Record that we received a response payload from a peer. Updates
+    /// `last_response_received` so the response-asymmetry detector in
+    /// `apply_gossip_results` knows the peer is alive at the application
+    /// layer, not just the kernel-buffer-accepted layer.
+    async fn mark_response_received(&self, peer_addr: SocketAddr, now: u64) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
+            peer_info.last_response_received = now;
+        }
+    }
+
+    /// Cleanup hook fired when a peer's `failures` crosses
+    /// `max_peer_failures` for the first time (gossip protocol's verdict
+    /// that the peer is dead). Prunes the dead peer's `known_actors`
+    /// entries, force-disconnects its pool connection so it must
+    /// re-handshake on return, and resets its sequence counter so the
+    /// recovered peer's next FullSync is accepted instead of dropped as
+    /// a duplicate.
+    ///
+    /// Re-admission on recovery is automatic via existing paths:
+    /// `record_peer_activity` zeroes `failures` on inbound activity, and
+    /// the next FullSync repopulates `known_actors` through the existing
+    /// `merge_full_sync` / `apply_delta` paths.
+    async fn handle_peer_death(&self, dead_peer_addr: SocketAddr) {
+        // Two ways to learn this peer's PeerId:
+        //   1. The pool's addr→peer_id map (populated after a successful
+        //      connection handshake).
+        //   2. The gossip state's `node_id` field (set when we added the
+        //      peer, even before any handshake completes).
+        // Try both because a peer that died before/during initial
+        // connect may only be in the gossip-state map, while a peer that
+        // dropped mid-flight may have been evicted from the pool already.
+        let pool_lookup = self.connection_pool.get_peer_id_by_addr(&dead_peer_addr);
+        let dead_peer_id = if pool_lookup.is_some() {
+            pool_lookup
+        } else {
+            let state = self.gossip_state.lock().await;
+            state
+                .peers
+                .get(&dead_peer_addr)
+                .and_then(|p| p.node_id.as_ref().map(|n| n.to_peer_id()))
+        };
+        let Some(dead_peer_id) = dead_peer_id else {
+            // No PeerId resolvable for this address — nothing in
+            // `known_actors` is keyed against it. Still reset sequence
+            // for cleanliness.
+            let mut gossip_state = self.gossip_state.lock().await;
+            if let Some(peer_info) = gossip_state.peers.get_mut(&dead_peer_addr) {
+                peer_info.last_sequence = 0;
+                peer_info.last_response_received = 0;
+            }
+            return;
+        };
+
+        // 1. Prune known_actors owned by this peer.
+        let mut to_remove: Vec<String> = Vec::new();
+        self.actor_state.known_actors.iter_sync(|name, location| {
+            if location.peer_id == dead_peer_id {
+                to_remove.push(name.clone());
+            }
+            true
+        });
+        for name in &to_remove {
+            let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+        }
+
+        // 2. Force-disconnect the pool entry so the peer must re-handshake
+        //    when it returns. Prevents writes into a stale half-open
+        //    connection in the window between this prune and the pool's
+        //    own `cleanup_stale_connections` pass.
+        let _ = self
+            .connection_pool
+            .disconnect_connection_by_peer_id(&dead_peer_id);
+
+        // 3. Reset per-peer sequence + last_response_received so a
+        //    recovering peer's next FullSync is accepted (mirrors the
+        //    DNS-change reset path at registry.rs ~1980).
+        {
+            let mut gossip_state = self.gossip_state.lock().await;
+            if let Some(peer_info) = gossip_state.peers.get_mut(&dead_peer_addr) {
+                peer_info.last_sequence = 0;
+                peer_info.last_response_received = 0;
+            }
+        }
+
+        info!(
+            peer_id = %dead_peer_id,
+            peer_addr = %dead_peer_addr,
+            pruned_actors = to_remove.len(),
+            "gossip declared peer dead — pruned known_actors, disconnected pool"
+        );
     }
 
     /// Handle gossip response with vector clock updates
@@ -3478,10 +3698,15 @@ impl<T: 'static> GossipRegistry<T> {
                 self.apply_delta(delta).await?;
                 // Don't add peer here - peers are managed through handle_connection
 
+                let now = current_timestamp();
                 let mut gossip_state = self.gossip_state.lock().await;
                 if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
                     peer_info.last_sequence = delta_sequence;
                     peer_info.consecutive_deltas += 1;
+                    // Inbound payload from peer — proves app-level liveness.
+                    // Used by the response-asymmetry detector in
+                    // `apply_gossip_results`.
+                    peer_info.last_response_received = now;
                 }
                 gossip_state.delta_exchanges += 1;
             }
@@ -3517,10 +3742,13 @@ impl<T: 'static> GossipRegistry<T> {
                 )
                 .await;
 
+                let now = current_timestamp();
                 let mut gossip_state = self.gossip_state.lock().await;
                 if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
                     peer_info.consecutive_deltas = 0;
                     peer_info.last_sequence = sequence;
+                    // Inbound payload from peer — proves app-level liveness.
+                    peer_info.last_response_received = now;
                 }
                 gossip_state.full_sync_exchanges += 1;
             }
@@ -4103,18 +4331,29 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // IMMEDIATELY mark peer as failed in our local state
+        let mut crossed_threshold = false;
         {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
+                let was_below = peer_info.failures < self.config.max_peer_failures;
                 peer_info.failures = self.config.max_peer_failures;
                 peer_info.last_failure_time = Some(current_time);
                 peer_info.last_attempt = current_time; // Update last_attempt so retry happens after interval
+                crossed_threshold = was_below;
                 info!(
                     peer = %failed_peer_addr,
                     retry_after_secs = self.config.peer_retry_interval.as_secs(),
                     "marked peer as disconnected in local state, will retry after interval"
                 );
             }
+        }
+
+        // Gossip protocol's verdict: socket disconnect = peer is dead.
+        // Fire the cleanup hook on the same code path as the
+        // failures-incremented-to-threshold case in `apply_gossip_results`,
+        // so `known_actors` and pool-state evictions are uniform.
+        if crossed_threshold {
+            self.handle_peer_death(failed_peer_addr).await;
         }
 
         // Now start consensus process for actor invalidation.
@@ -4252,12 +4491,15 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // IMMEDIATELY mark peer as failed in our local state
+        let mut crossed_threshold = false;
         {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
+                let was_below = peer_info.failures < self.config.max_peer_failures;
                 peer_info.failures = self.config.max_peer_failures;
                 peer_info.last_failure_time = Some(current_time);
                 peer_info.last_attempt = current_time; // Update last_attempt so retry happens after interval
+                crossed_threshold = was_below;
                 info!(
                     peer = %failed_peer_addr,
                     node_id = %failed_peer_id,
@@ -4265,6 +4507,11 @@ impl<T: 'static> GossipRegistry<T> {
                     "marked peer as disconnected in local state, will retry after interval"
                 );
             }
+        }
+
+        // Gossip protocol's verdict: socket disconnect = peer is dead.
+        if crossed_threshold {
+            self.handle_peer_death(failed_peer_addr).await;
         }
 
         // Now start consensus process for actor invalidation (same as address-based method).
@@ -5652,6 +5899,7 @@ impl<T: 'static> GossipRegistry<T> {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -5972,6 +6220,7 @@ mod tests {
             consecutive_deltas: 3,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -6332,6 +6581,7 @@ mod tests {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -6351,6 +6601,7 @@ mod tests {
             consecutive_deltas: 10,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -6591,6 +6842,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp() - 100),
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7064,6 +7316,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7120,6 +7373,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7166,6 +7420,7 @@ mod tests {
             consecutive_deltas: 5,
             last_failure_time: Some(950),
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         };
 
         // Convert to gossip format
@@ -7450,6 +7705,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7588,6 +7844,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7628,6 +7885,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7668,6 +7926,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7721,6 +7980,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(now),
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -7781,6 +8041,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -7874,6 +8135,7 @@ mod tests {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -7929,6 +8191,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -8007,6 +8270,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -8072,6 +8336,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
@@ -8129,6 +8394,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+            last_response_received: crate::current_timestamp(),
                 },
             );
         }
