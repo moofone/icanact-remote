@@ -354,3 +354,167 @@ fn known_actors_owned_by_stale_peer_get_pruned() -> Result<(), DynError> {
         Ok(())
     })
 }
+
+// =============================================================================
+// Direct exercise of the drop-side detection paths.
+//
+// The end-to-end drop case (`known_actors_owned_by_dropped_peer_get_pruned`
+// above) is `#[ignore]`d because in-process loopback TCP keepalive doesn't
+// surface a hard-socket-error within a CI window. The two tests below close
+// that coverage gap by driving the production code paths directly:
+//
+//   * `disconnect_handler_invokes_peer_death_cleanup` — calls
+//     `handle_peer_connection_failure` (the function the connection-pool
+//     read-loop invokes when it observes a socket close) and asserts the
+//     cleanup chain runs end-to-end.
+//
+//   * `hard_socket_error_in_apply_gossip_results_triggers_cleanup` —
+//     constructs a `GossipResult` with `Err(BrokenPipe)` and feeds it
+//     directly to `apply_gossip_results`, exercising the hard-error
+//     fast-path classification + `handle_peer_death` invocation.
+//
+// These cover the same `handle_peer_death` hook the stale-peer test
+// exercises, but enter it via the production drop paths.
+// =============================================================================
+
+#[test]
+fn disconnect_handler_invokes_peer_death_cleanup() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(200),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let subscriber = create_node(config.clone()).await?;
+        let sub_addr = subscriber.registry.bind_addr;
+
+        connect_pair(&publisher, &subscriber).await;
+
+        subscriber
+            .registry
+            .register_actor_with_priority(
+                DEAD_ACTOR_NAME.to_string(),
+                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
+                RegistrationPriority::Immediate,
+            )
+            .await?;
+
+        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
+            .await
+            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+
+        // Sanity: peer is not failed yet.
+        assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
+
+        // Call the disconnect handler directly. In production this is
+        // fired by the transport's read-loop / ExitGuard when it
+        // observes a socket close (`handle_peer_connection_failure` in
+        // registry.rs:~4296). We're testing that THIS path triggers
+        // the cleanup hook regardless of whether the gossip-round
+        // failure-detection path also fires.
+        publisher
+            .registry
+            .handle_peer_connection_failure(sub_addr)
+            .await?;
+
+        // Failures should be jammed to `max_peer_failures` and cleanup
+        // should have run synchronously.
+        assert_eq!(
+            peer_failures(&publisher, sub_addr).await,
+            3,
+            "handle_peer_connection_failure should jump failures to max_peer_failures"
+        );
+        assert!(
+            publisher
+                .registry
+                .lookup_actor(DEAD_ACTOR_NAME)
+                .await
+                .is_none(),
+            "subscriber's actor should be pruned synchronously by handle_peer_death \
+             when the disconnect handler fires"
+        );
+
+        publisher.shutdown().await;
+        subscriber.shutdown().await;
+        Ok(())
+    })
+}
+
+#[test]
+fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(200),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let subscriber = create_node(config.clone()).await?;
+        let sub_addr = subscriber.registry.bind_addr;
+
+        connect_pair(&publisher, &subscriber).await;
+
+        subscriber
+            .registry
+            .register_actor_with_priority(
+                DEAD_ACTOR_NAME.to_string(),
+                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
+                RegistrationPriority::Immediate,
+            )
+            .await?;
+
+        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
+            .await
+            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
+
+        // Construct a single fake gossip-round result indicating a
+        // hard transport failure on the subscriber's address. In
+        // production this is what the gossip send task produces when
+        // the underlying TCP write returns `BrokenPipe`/`ConnectionReset`
+        // (kernel observed the FIN and the next write errored out).
+        // The `apply_gossip_results` hard-error fast path (added in
+        // moofone/icanact-remote#29) should jump failures straight to
+        // `max_peer_failures` and fire `handle_peer_death` on the same
+        // call — not wait for `max_peer_failures` separate rounds.
+        let hard_err = icanact_remote::registry::GossipResult {
+            peer_addr: sub_addr,
+            sent_sequence: 0,
+            outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated peer socket termination",
+            ))),
+        };
+        publisher
+            .registry
+            .apply_gossip_results(vec![hard_err])
+            .await;
+
+        assert_eq!(
+            peer_failures(&publisher, sub_addr).await,
+            3,
+            "hard-socket-error in a single gossip-round outcome should jump \
+             failures to max_peer_failures on the same call"
+        );
+        assert!(
+            publisher
+                .registry
+                .lookup_actor(DEAD_ACTOR_NAME)
+                .await
+                .is_none(),
+            "subscriber's actor should be pruned by handle_peer_death \
+             when the hard-error fast path fires"
+        );
+
+        publisher.shutdown().await;
+        subscriber.shutdown().await;
+        Ok(())
+    })
+}
