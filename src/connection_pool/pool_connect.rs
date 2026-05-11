@@ -666,20 +666,27 @@ impl<T> ConnectionPool<T> {
             return Some(conn);
         }
 
-        warn!(
-            "CONNECTION POOL: No connection found for peer '{}'",
-            peer_id
-        );
-        // Debug: show what nodes we do have connections for
-        let mut connected_nodes: Vec<String> = Vec::new();
-        self.connections_by_peer.iter_sync(|peer_id, _| {
-            connected_nodes.push(peer_id.to_hex());
-            true
-        });
-        warn!(
-            "CONNECTION POOL: Available node connections: {:?}",
-            connected_nodes
-        );
+        // `get_connection_by_peer_id` is a pure lookup primitive: a
+        // miss returns `None` and is *not* an error condition. It is
+        // called from many hot paths (`send_to_peer_id*`,
+        // `get_connection_to_peer`, control-plane refresh loops, gossip
+        // FullSync responses, worker-stats delivery, network ingress
+        // resolve, ...) and a miss is the normal case any time we are
+        // asked about a peer we have never connected to or whose
+        // connection has just dropped.
+        //
+        // The previous implementation logged a `warn!` pair on every
+        // miss AND did an O(n) scan of `connections_by_peer` to build
+        // the "Available node connections" list. On a stratum where one
+        // configured backend was offline and gossip kept re-announcing
+        // its interest entries, that fired at ~40 Hz × 2 lines = 80
+        // log lines/sec and drowned every real warning in the system
+        // (observed on stratum-devnet-a 2026-05-11).
+        //
+        // Diagnosing "peer X is down" belongs at the caller layer that
+        // knows whether the absence is expected (refresh tick, gossip
+        // sync) or actionable (a configured backend stayed down across
+        // N retries). This primitive just returns `None`.
         None
     }
 
@@ -818,7 +825,10 @@ impl<T> ConnectionPool<T> {
                 warn!(peer_id = %peer_id, "Connection found but no stream handle");
             }
         } else {
-            warn!(peer_id = %peer_id, "No connection found for peer");
+            // Caller already gets a `GossipError::Network(NotFound)`
+            // below; logging here was redundant and turned every send
+            // to an offline peer into a per-call warning (#root-cause).
+            debug!(peer_id = %peer_id, "send: no connection for peer");
         }
         Err(crate::GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -847,7 +857,10 @@ impl<T> ConnectionPool<T> {
                 warn!(peer_id = %peer_id, "Connection found but no stream handle");
             }
         } else {
-            warn!(peer_id = %peer_id, "No connection found for peer");
+            // Caller already gets a `GossipError::Network(NotFound)`
+            // below; logging here was redundant and turned every send
+            // to an offline peer into a per-call warning (#root-cause).
+            debug!(peer_id = %peer_id, "send: no connection for peer");
         }
         Err(crate::GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -876,7 +889,10 @@ impl<T> ConnectionPool<T> {
                 warn!(peer_id = %peer_id, "Connection found but no stream handle");
             }
         } else {
-            warn!(peer_id = %peer_id, "No connection found for peer");
+            // Caller already gets a `GossipError::Network(NotFound)`
+            // below; logging here was redundant and turned every send
+            // to an offline peer into a per-call warning (#root-cause).
+            debug!(peer_id = %peer_id, "send: no connection for peer");
         }
         Err(crate::GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::NotFound,
