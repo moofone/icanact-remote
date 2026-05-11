@@ -3157,18 +3157,35 @@ impl<T: 'static> GossipRegistry<T> {
                 return Err(GossipError::Shutdown);
             }
 
-            // Check if we have changes to commit
-            let had_changes = !gossip_state.pending_changes.is_empty();
+            // Check if we have changes to commit. We need to consider
+            // BOTH pending_changes and urgent_changes here: callers
+            // such as `handle_peer_death` from `apply_gossip_results`
+            // push into `urgent_changes` without a follow-up
+            // `trigger_immediate_gossip` (the gossip-results path is
+            // already inside a gossip round and re-entering would race
+            // failure accounting). Without urgent in this check + drain,
+            // those entries linger in `urgent_changes` and get
+            // re-broadcast on every periodic tick via
+            // `create_delta_from_state`'s clone, instead of being a
+            // one-shot urgent fan-out.
+            let had_changes = !gossip_state.pending_changes.is_empty()
+                || !gossip_state.urgent_changes.is_empty();
 
             // Increment sequence if we have changes
             if had_changes {
                 // Increment sequence number
                 gossip_state.gossip_sequence += 1;
 
-                // Commit pending changes to history
+                // Commit pending + urgent changes to history together.
+                // Urgent entries are folded into the same `HistoricalDelta`
+                // so subsequent rounds pull them from `delta_history` (the
+                // since_sequence-bounded path in `create_delta_from_state`)
+                // rather than re-cloning the urgent queue forever.
+                let mut combined = std::mem::take(&mut gossip_state.pending_changes);
+                combined.append(&mut gossip_state.urgent_changes);
                 let delta = HistoricalDelta {
                     sequence: gossip_state.gossip_sequence,
-                    changes: std::mem::take(&mut gossip_state.pending_changes),
+                    changes: combined,
                     wall_clock_time: current_timestamp(),
                 };
 
