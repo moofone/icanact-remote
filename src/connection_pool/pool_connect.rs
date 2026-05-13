@@ -1967,6 +1967,14 @@ pub(crate) fn handle_incoming_message(
                                 peer_info.last_failure_time = None;
                             }
                             peer_info.last_success = crate::current_timestamp();
+                            // Inbound payload from peer — proves app-level liveness.
+                            // The response-asymmetry detector in
+                            // `apply_gossip_results` reads this field to decide
+                            // whether outbound writes that returned `Ok(None)`
+                            // were actually heard by the peer's application
+                            // layer. Mirror the inline-response path in
+                            // `GossipRegistry::handle_gossip_response`.
+                            peer_info.last_response_received = crate::current_timestamp();
 
                             peer_info.last_sequence =
                                 std::cmp::max(peer_info.last_sequence, delta.current_sequence);
@@ -2133,6 +2141,10 @@ pub(crate) fn handle_incoming_message(
                             peer_info.last_failure_time = None;
                         }
                         peer_info.last_success = crate::current_timestamp();
+                        // Inbound payload from peer — proves app-level liveness.
+                        // See `handle_incoming_message::DeltaGossip` for the
+                        // full rationale.
+                        peer_info.last_response_received = crate::current_timestamp();
                         peer_info.consecutive_deltas = 0;
                     } else {
                         warn!(peer = %sender_socket_addr, "Peer not found in peer list when trying to reset failure state");
@@ -2478,6 +2490,10 @@ pub(crate) fn handle_incoming_message(
                             peer_info.last_failure_time = None;
                         }
                         peer_info.last_success = crate::current_timestamp();
+                        // Inbound payload from peer — proves app-level liveness.
+                        // See `handle_incoming_message::DeltaGossip` for the
+                        // full rationale.
+                        peer_info.last_response_received = crate::current_timestamp();
                         had_failures
                     } else {
                         false
