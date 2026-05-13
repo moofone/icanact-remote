@@ -2822,3 +2822,205 @@ fn count_waiting_slots(tracker: &CorrelationTracker) -> usize {
         .filter(|s| s.state.load(Ordering::Acquire) == SLOT_WAITING)
         .count()
 }
+
+/// Build a `PeerInfo` whose `last_response_received` is set to `stale_time`
+/// and that has the gossip protocol's response-asymmetry detector partway
+/// through tripping (one accumulated failure).
+fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerInfo {
+    crate::registry::PeerInfo {
+        address: addr,
+        peer_address: None,
+        inbound_observed: true,
+        outbound_dial_success: true,
+        node_id: None,
+        dns_name: None,
+        failures: 1,
+        last_attempt: crate::current_timestamp(),
+        last_success: stale_time,
+        last_sequence: 0,
+        last_sent_sequence: 0,
+        consecutive_deltas: 0,
+        last_failure_time: None,
+        last_dns_refresh_attempt: None,
+        last_response_received: stale_time,
+    }
+}
+
+// Regression test for the FullSyncResponse / DeltaGossip / FullSync inbound
+// reset paths in `handle_incoming_message`. These paths previously reset
+// `failures` and `last_success` when a peer sent us a message over the
+// persistent bidirectional connection, but forgot to refresh
+// `last_response_received`. Because `apply_gossip_results` uses
+// `last_response_received` as its application-layer liveness signal (the
+// response-asymmetry detector at registry.rs:3475), the omission caused a
+// permanent log-spam loop on peers whose responses only ever arrived via
+// the bidirectional path:
+//
+//   - outbound gossip round sees `Ok(None)` (no inline reply) and stale
+//     `last_response_received` → bumps `failures` from 0 to 1
+//   - FullSyncResponse arrives moments later over the persistent stream →
+//     resets `failures` back to 0
+//   - `last_response_received` never moves, so the next round repeats.
+//
+// These tests pin the post-fix invariant: any inbound payload from a peer
+// must update `last_response_received`, mirroring the inline response path
+// in `GossipRegistry::handle_gossip_response`.
+#[tokio::test]
+async fn full_sync_response_updates_last_response_received() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_full_sync_response_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_full_sync_response_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.63:9301".parse().unwrap();
+
+    let stale_time = crate::current_timestamp().saturating_sub(3600);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state.peers.insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let test_start = crate::current_timestamp();
+
+    let msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id,
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+    };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after FullSyncResponse");
+    assert_eq!(info.failures, 0, "failures should reset");
+    assert!(
+        info.last_response_received >= test_start,
+        "last_response_received must be refreshed after FullSyncResponse \
+         (got {}, test_start {}, stale_time {})",
+        info.last_response_received,
+        test_start,
+        stale_time,
+    );
+}
+
+#[tokio::test]
+async fn full_sync_updates_last_response_received() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_full_sync_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_full_sync_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.64:9301".parse().unwrap();
+
+    let stale_time = crate::current_timestamp().saturating_sub(3600);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state.peers.insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let test_start = crate::current_timestamp();
+
+    let msg = crate::registry::RegistryMessage::FullSync {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id,
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+    };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after FullSync");
+    assert_eq!(info.failures, 0, "failures should reset");
+    assert!(
+        info.last_response_received >= test_start,
+        "last_response_received must be refreshed after FullSync \
+         (got {}, test_start {}, stale_time {})",
+        info.last_response_received,
+        test_start,
+        stale_time,
+    );
+}
+
+#[tokio::test]
+async fn delta_gossip_updates_last_response_received() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.65:9301".parse().unwrap();
+
+    let stale_time = crate::current_timestamp().saturating_sub(3600);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state.peers.insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let test_start = crate::current_timestamp();
+
+    // Empty delta: no changes, just proves liveness.
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: peer_id,
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip { delta };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after DeltaGossip");
+    assert_eq!(info.failures, 0, "failures should reset");
+    assert!(
+        info.last_response_received >= test_start,
+        "last_response_received must be refreshed after DeltaGossip \
+         (got {}, test_start {}, stale_time {})",
+        info.last_response_received,
+        test_start,
+        stale_time,
+    );
+}
