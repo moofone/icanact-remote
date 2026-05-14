@@ -3732,7 +3732,9 @@ impl<T: 'static> GossipRegistry<T> {
                     priority: RegistrationPriority::Immediate,
                 };
                 gossip_state.urgent_changes.push(change.clone());
-                gossip_state.pending_changes.push(change);
+                gossip_state
+                    .pending_changes
+                    .push(Self::as_regular_gossip_change(&change));
                 have_urgent = true;
             }
         }
@@ -6739,6 +6741,42 @@ mod tests {
                 assert_eq!(*priority, RegistrationPriority::Normal);
             }
             other => panic!("expected ActorAdded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peer_death_removal_is_regularized_in_delta_history() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let dead_addr = test_addr(8081);
+        let dead_peer_id = test_peer_id("dead_peer");
+        let mut peer_info = PeerInfo::local(dead_addr);
+        peer_info.node_id = Some(dead_peer_id.to_node_id());
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(dead_addr, peer_info);
+        }
+        registry.actor_state.known_actors.upsert_sync(
+            "dead_peer_actor".to_string(),
+            RemoteActorLocation::new_with_peer(test_addr(9001), dead_peer_id),
+        );
+
+        registry.handle_peer_death(dead_addr).await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(gossip_state.urgent_changes.len(), 1);
+        assert_eq!(gossip_state.pending_changes.len(), 1);
+        match &gossip_state.urgent_changes[0] {
+            RegistryChange::ActorRemoved { priority, .. } => {
+                assert_eq!(*priority, RegistrationPriority::Immediate);
+            }
+            other => panic!("expected urgent ActorRemoved, got {other:?}"),
+        }
+        match &gossip_state.pending_changes[0] {
+            RegistryChange::ActorRemoved { priority, .. } => {
+                assert_eq!(*priority, RegistrationPriority::Normal);
+            }
+            other => panic!("expected regularized ActorRemoved, got {other:?}"),
         }
     }
 
