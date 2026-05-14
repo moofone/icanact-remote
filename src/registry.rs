@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use rand::seq::SliceRandom;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     GossipConfig, GossipError, NodeId, RegistrationPriority, RemoteActorLocation, Result,
@@ -2579,8 +2579,8 @@ impl<T: 'static> GossipRegistry<T> {
         });
 
         if has_immediate {
-            error!(
-                "🎯 RECEIVING IMMEDIATE CHANGES: {} total changes from {}",
+            trace!(
+                "receiving immediate changes: {} total changes from {}",
                 total_changes, sender_peer_id
             );
         }
@@ -2919,8 +2919,24 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // Include urgent changes first (they have higher priority)
-        changes.extend(gossip_state.urgent_changes.clone());
+        // Include urgent changes first (they have higher priority).
+        //
+        // Regularize the priority before embedding into a periodic delta.
+        // `prepare_gossip_round` drains `urgent_changes` into `delta_history`
+        // with priority demoted via `as_regular_gossip_change`, but releases
+        // the gossip lock between that drain and the call into
+        // `create_delta_from_state`. Concurrent producers
+        // (`register_actor_with_priority`, `handle_peer_death`) can push raw
+        // `Immediate` entries into `urgent_changes` in that window. Without
+        // regularizing here, those leak into the periodic delta path and
+        // arrive at peers tagged Immediate every gossip tick. The dedicated
+        // one-shot fan-out path is `trigger_immediate_gossip`, not this one.
+        changes.extend(
+            gossip_state
+                .urgent_changes
+                .iter()
+                .map(Self::as_regular_gossip_change),
+        );
 
         // Include pending changes from current round
         changes.extend(gossip_state.pending_changes.clone());
