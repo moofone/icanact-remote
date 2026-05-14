@@ -1,4 +1,4 @@
-use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
+use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, SecretKey};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Once;
@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
-type TlsHandle = GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>;
+pub type TlsHandle = GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>;
 
 static CRYPTO_INIT: Once = Once::new();
 
@@ -59,6 +59,122 @@ pub async fn create_tls_node(config: GossipConfig) -> Result<TlsHandle, DynError
             }
         }
     }
+}
+
+#[allow(dead_code)]
+pub fn fast_gossip_config() -> GossipConfig {
+    GossipConfig {
+        gossip_interval: Duration::from_millis(100),
+        cleanup_interval: Duration::from_millis(200),
+        peer_retry_interval: Duration::from_millis(50),
+        connection_timeout: Duration::from_millis(750),
+        response_timeout: Duration::from_millis(750),
+        ..Default::default()
+    }
+}
+
+#[allow(dead_code)]
+pub async fn create_tls_node_with_keypair(
+    keypair: KeyPair,
+    mut config: GossipConfig,
+) -> Result<TlsHandle, DynError> {
+    init_crypto();
+    config.key_pair = Some(keypair.clone());
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            std::env::var("ICANACT_TEST_EPERM_MAX_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+    let mut backoff = Duration::from_millis(25);
+
+    loop {
+        match GossipRegistryHandle::new_with_transport_stack(
+            bind_addr,
+            keypair.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        {
+            Ok(node) => return Ok(node),
+            Err(e) => {
+                let is_eperm = matches!(&e, icanact_remote::GossipError::Network(io) if io.raw_os_error() == Some(1));
+                if is_eperm && Instant::now() < deadline {
+                    sleep(backoff).await;
+                    backoff =
+                        std::cmp::min(backoff.saturating_mul(2), Duration::from_millis(1_000));
+                    continue;
+                }
+                return Err(Box::new(e));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn ordered_keypair_pair(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+    let first = KeyPair::new_for_testing(seed_a);
+    let second = KeyPair::new_for_testing(seed_b);
+    if first.peer_id().to_node_id().as_bytes() > second.peer_id().to_node_id().as_bytes() {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+#[allow(dead_code)]
+pub async fn create_ordered_tls_pair(
+    seed_a: &str,
+    seed_b: &str,
+) -> Result<(TlsHandle, TlsHandle), DynError> {
+    let (high, low) = ordered_keypair_pair(seed_a, seed_b);
+    let high = create_tls_node_with_keypair(high, fast_gossip_config()).await?;
+    let low = create_tls_node_with_keypair(low, fast_gossip_config()).await?;
+    assert!(
+        high.registry.peer_id.to_node_id().as_bytes()
+            > low.registry.peer_id.to_node_id().as_bytes(),
+        "ordered pair helper must return high-id node first"
+    );
+    Ok((high, low))
+}
+
+#[allow(dead_code)]
+pub async fn seed_peer(from: &TlsHandle, to: &TlsHandle) -> Result<(), DynError> {
+    from.add_peer(&to.registry.peer_id)
+        .await
+        .connect(&to.registry.bind_addr)
+        .await?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn wait_for_pair_connection(a: &TlsHandle, b: &TlsHandle, timeout: Duration) -> bool {
+    wait_for_condition(timeout, || async {
+        a.registry.has_connection_to_peer(&b.registry.peer_id).await
+            || b.registry.has_connection_to_peer(&a.registry.peer_id).await
+    })
+    .await
+}
+
+#[allow(dead_code)]
+pub async fn register_probe_and_wait_visible(
+    source: &TlsHandle,
+    sink: &TlsHandle,
+    name: &str,
+    timeout: Duration,
+) -> bool {
+    source
+        .register(name.to_string(), source.registry.bind_addr)
+        .await
+        .expect("probe actor registration");
+    wait_for_condition(timeout, || async move {
+        sink.registry.lookup_actor(name).await.is_some()
+    })
+    .await
 }
 
 #[allow(dead_code)]

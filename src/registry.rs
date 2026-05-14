@@ -22,7 +22,7 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    GossipConfig, GossipError, NodeId, RegistrationPriority, RemoteActorLocation, Result,
+    GossipConfig, GossipError, NodeId, PeerId, RegistrationPriority, RemoteActorLocation, Result,
     connection_pool::ConnectionPool,
     current_timestamp,
     handshake::PeerCapabilities,
@@ -110,6 +110,22 @@ fn stable_concurrent_removal_wins(
         Ordering::Less => false,
         Ordering::Equal => removing_node_id > &existing.node_id,
     }
+}
+
+#[inline]
+fn owner_recovery_wins_tombstone(
+    location: &RemoteActorLocation,
+    sender_peer_id: &PeerId,
+    tombstone: &crate::VectorClock,
+) -> bool {
+    // A peer-death tombstone is created by an observer. A direct authenticated
+    // announcement from the actor owner is the recovery signal after a
+    // transient disconnect, even when the actor itself did not re-register.
+    // Also allow owner-clock advancement, which older equality-only recovery
+    // checks rejected when the tombstone's observer component made the clocks
+    // concurrent.
+    location.peer_id == *sender_peer_id
+        && location.vector_clock.get(&location.node_id) >= tombstone.get(&location.node_id)
 }
 
 /// Resolve the effective peer address from sender_bind_addr with validation.
@@ -852,7 +868,7 @@ pub struct PeerInfo {
     /// `0` means "no response observed yet" — treated as new-peer (no
     /// stale verdict until either we get one or the configured grace
     /// expires from `last_attempt`).
-    pub last_response_received: u64,
+    pub last_response_received_ms: u64,
 }
 
 impl PeerInfo {
@@ -875,7 +891,7 @@ impl PeerInfo {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         }
     }
 
@@ -906,7 +922,7 @@ impl PeerInfo {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         }
     }
 
@@ -958,7 +974,7 @@ impl PeerInfo {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         })
     }
 }
@@ -1008,11 +1024,27 @@ pub struct GossipResult {
     pub outcome: Result<Option<RegistryMessage>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RemovedActorTombstone {
+    pub vector_clock: crate::VectorClock,
+    pub removed_at: u64,
+}
+
+impl RemovedActorTombstone {
+    fn new(vector_clock: crate::VectorClock) -> Self {
+        Self {
+            vector_clock,
+            removed_at: current_timestamp(),
+        }
+    }
+}
+
 /// Separated actor state for read-heavy operations (now with vector clocks)
 #[derive(Default)]
 pub struct ActorState {
     pub local_actors: SccHashMap<String, RemoteActorLocation>,
     pub known_actors: SccHashMap<String, RemoteActorLocation>,
+    pub removed_actors: SccHashMap<String, RemovedActorTombstone>,
 }
 
 /// Gossip coordination state for write-heavy operations
@@ -1522,7 +1554,7 @@ impl<T: 'static> GossipRegistry<T> {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -1777,6 +1809,7 @@ impl<T: 'static> GossipRegistry<T> {
                         .and_then(|p| p.dns_name.clone());
 
                     let current_time = current_timestamp();
+                    let current_time_ms = crate::current_timestamp_millis();
                     gossip_state.peers.insert(
                         peer_addr,
                         PeerInfo {
@@ -1794,7 +1827,7 @@ impl<T: 'static> GossipRegistry<T> {
                             consecutive_deltas: 0,
                             last_failure_time: None,
                             last_dns_refresh_attempt: None,
-                            last_response_received: current_time,
+                            last_response_received_ms: current_time_ms,
                         },
                     );
 
@@ -1980,11 +2013,13 @@ impl<T: 'static> GossipRegistry<T> {
         // This prevents inconsistent state if we migrate gossip_state but pool has collision
         {
             let pool = &self.connection_pool;
-            if let Some(existing_peer_id) =
-                pool.addr_to_peer_id.read_sync(&new_addr, |_, v| v.clone())
+            if let Some(existing_peer_id) = pool
+                .addr_to_peer_id
+                .read_sync(&new_addr, |_, peer_id| peer_id.clone())
             {
-                if let Some(old_peer_id) =
-                    pool.addr_to_peer_id.read_sync(&peer_addr, |_, v| v.clone())
+                if let Some(old_peer_id) = pool
+                    .addr_to_peer_id
+                    .read_sync(&peer_addr, |_, peer_id| peer_id.clone())
                 {
                     if existing_peer_id != old_peer_id {
                         warn!(
@@ -2285,7 +2320,7 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(loc) = self
             .actor_state
             .known_actors
-            .read_sync(name.as_str(), |_, v| v.clone())
+            .read_sync(name.as_str(), |_, location| location.clone())
         {
             if loc.node_id == self_node_id {
                 let _ = self.actor_state.known_actors.remove_sync(name.as_str());
@@ -2301,6 +2336,13 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // Increment vector clock before insertion for atomicity of "this write".
+        if let Some(tombstone) = self
+            .actor_state
+            .removed_actors
+            .read_sync(name.as_str(), |_, tombstone| tombstone.clone())
+        {
+            location.vector_clock.merge(&tombstone.vector_clock);
+        }
         location.vector_clock.increment(location.node_id);
 
         if self
@@ -2317,6 +2359,7 @@ impl<T: 'static> GossipRegistry<T> {
             let _ = self.actor_state.local_actors.remove_sync(name.as_str());
             return Err(GossipError::ActorAlreadyExists(name));
         }
+        let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
 
         // Update gossip state with pending change - choose queue based on priority
         let should_trigger_immediate = {
@@ -2394,7 +2437,7 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(loc) = self
             .actor_state
             .known_actors
-            .read_sync(name, |_, v| v.clone())
+            .read_sync(name, |_, location| location.clone())
         {
             if loc.node_id == self_node_id {
                 let _ = self.actor_state.known_actors.remove_sync(name);
@@ -2416,6 +2459,10 @@ impl<T: 'static> GossipRegistry<T> {
                 // Create a new vector clock for the removal with proper causality
                 let removal_clock = location.vector_clock.clone();
                 removal_clock.increment(self.peer_id.to_node_id());
+                let _ = self.actor_state.removed_actors.upsert_sync(
+                    name.to_string(),
+                    RemovedActorTombstone::new(removal_clock.clone()),
+                );
 
                 let change = RegistryChange::ActorRemoved {
                     name: name.to_string(),
@@ -2452,7 +2499,7 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(location) = self
             .actor_state
             .local_actors
-            .read_sync(name, |_, v| v.clone())
+            .read_sync(name, |_, location| location.clone())
         {
             debug!(actor_name = %name, location = "local", "actor found");
             return Some(location);
@@ -2462,7 +2509,7 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(location) = self
             .actor_state
             .known_actors
-            .read_sync(name, |_, v| v.clone())
+            .read_sync(name, |_, location| location.clone())
         {
             let now = current_timestamp();
             let age_secs = now.saturating_sub(location.wall_clock_time);
@@ -2626,6 +2673,38 @@ impl<T: 'static> GossipRegistry<T> {
                             continue;
                         }
 
+                        if let Some(tombstone) = self
+                            .actor_state
+                            .removed_actors
+                            .read_sync(name.as_str(), |_, tombstone| tombstone.vector_clock.clone())
+                        {
+                            match location.vector_clock.compare(&tombstone) {
+                                crate::ClockOrdering::After => {
+                                    let _ =
+                                        self.actor_state.removed_actors.remove_sync(name.as_str());
+                                }
+                                crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
+                                    if owner_recovery_wins_tombstone(
+                                        location,
+                                        &delta.sender_peer_id,
+                                        &tombstone,
+                                    ) =>
+                                {
+                                    let _ =
+                                        self.actor_state.removed_actors.remove_sync(name.as_str());
+                                }
+                                crate::ClockOrdering::Before
+                                | crate::ClockOrdering::Equal
+                                | crate::ClockOrdering::Concurrent => {
+                                    debug!(
+                                        actor_name = %name,
+                                        "skipping remote actor update - actor tombstone is newer or concurrent"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
                         // Check if we already know about this actor
                         let should_apply = self
                             .actor_state
@@ -2749,8 +2828,17 @@ impl<T: 'static> GossipRegistry<T> {
                                 }
                             })
                             .unwrap_or_else(|| {
-                                // Actor doesn't exist, nothing to remove
-                                debug!(actor_name = %name, "actor not found - ignoring removal");
+                                let _ = self
+                                    .actor_state
+                                    .removed_actors
+                                    .upsert_sync(
+                                        name.clone(),
+                                        RemovedActorTombstone::new(vector_clock.clone()),
+                                    );
+                                debug!(
+                                    actor_name = %name,
+                                    "actor not found - recorded removal tombstone"
+                                );
                                 false
                             });
 
@@ -2763,6 +2851,10 @@ impl<T: 'static> GossipRegistry<T> {
                         {
                             applied += 1;
                             peer_actors_removed.insert(name.clone());
+                            let _ = self.actor_state.removed_actors.upsert_sync(
+                                name.clone(),
+                                RemovedActorTombstone::new(vector_clock.clone()),
+                            );
                             debug!(actor_name = %name, "applied actor removal");
                         }
                     }
@@ -3209,8 +3301,8 @@ impl<T: 'static> GossipRegistry<T> {
             // re-broadcast on every periodic tick via
             // `create_delta_from_state`'s clone, instead of being a
             // one-shot urgent fan-out.
-            let had_changes = !gossip_state.pending_changes.is_empty()
-                || !gossip_state.urgent_changes.is_empty();
+            let had_changes =
+                !gossip_state.pending_changes.is_empty() || !gossip_state.urgent_changes.is_empty();
 
             // Increment sequence if we have changes
             if had_changes {
@@ -3386,7 +3478,7 @@ impl<T: 'static> GossipRegistry<T> {
                         consecutive_deltas: 0,
                         last_failure_time: None,
                         last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                        last_response_received_ms: crate::current_timestamp_millis(),
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -3491,7 +3583,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// Apply results from gossip tasks
     pub async fn apply_gossip_results(&self, results: Vec<GossipResult>) {
         let current_time = current_timestamp();
-        let liveness_window_secs = self.config.peer_liveness_window.as_secs();
+        let current_time_ms = crate::current_timestamp_millis();
+        let liveness_window_ms = self.config.peer_liveness_window.as_millis() as u64;
 
         // Collect peers that crossed the death threshold in this batch; we
         // fire `handle_peer_death` after dropping the `gossip_state` lock
@@ -3523,27 +3616,27 @@ impl<T: 'static> GossipRegistry<T> {
                             //
                             // If we haven't received any inbound payload from
                             // this peer (delta response, full sync, etc.) for
-                            // `peer_liveness_window` seconds, treat the next
+                            // `peer_liveness_window`, treat the next
                             // no-response round as a soft failure. This catches
                             // "outbound writes succeed at the kernel level but
                             // the peer isn't reading anymore" — the scenario
                             // that kept `538a99…` alive on `stratum-devnet-a`
                             // for 66 minutes.
                             //
-                            // `last_response_received` is initialised to the
+                            // `last_response_received_ms` is initialised to the
                             // peer's creation time, so a brand-new peer doesn't
                             // immediately look stale; it has at least one
                             // `peer_liveness_window` to be observed responding.
-                            let silence_secs = current_time
-                                .saturating_sub(peer_info.last_response_received);
+                            let silence_ms =
+                                current_time_ms.saturating_sub(peer_info.last_response_received_ms);
                             if response_opt.is_none()
-                                && silence_secs > liveness_window_secs
+                                && silence_ms > liveness_window_ms
                                 && peer_info.failures < self.config.max_peer_failures
                             {
                                 peer_info.failures += 1;
                                 info!(
                                     peer = %result.peer_addr,
-                                    silence_secs,
+                                    silence_ms,
                                     new_failures = peer_info.failures,
                                     "no response within peer_liveness_window; \
                                      incrementing failures"
@@ -3567,11 +3660,11 @@ impl<T: 'static> GossipRegistry<T> {
                     self.record_peer_activity(result.peer_addr).await;
 
                     // Process response if we got one. Note: receiving a response
-                    // updates `last_response_received` via the call below into
+                    // updates `last_response_received_ms` via the call below into
                     // `handle_gossip_response` → `mark_response_received`, which
                     // also resets `failures` to 0 via `record_peer_activity`.
                     if let Some(response) = response_opt {
-                        self.mark_response_received(result.peer_addr, current_time)
+                        self.mark_response_received(result.peer_addr, current_time_ms)
                             .await;
                         if let Err(err) = self
                             .handle_gossip_response(result.peer_addr, response)
@@ -3643,18 +3736,23 @@ impl<T: 'static> GossipRegistry<T> {
         newly_dead.sort_by_key(|a| (a.ip(), a.port()));
         newly_dead.dedup();
         for addr in newly_dead {
-            self.handle_peer_death(addr).await;
+            self.handle_peer_death(addr, None).await;
         }
     }
 
     /// Record that we received a response payload from a peer. Updates
-    /// `last_response_received` so the response-asymmetry detector in
+    /// `last_response_received_ms` so the response-asymmetry detector in
     /// `apply_gossip_results` knows the peer is alive at the application
     /// layer, not just the kernel-buffer-accepted layer.
     async fn mark_response_received(&self, peer_addr: SocketAddr, now: u64) {
         let mut gossip_state = self.gossip_state.lock().await;
         if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
-            peer_info.last_response_received = now;
+            peer_info.last_response_received_ms = now;
+            peer_info.last_success = current_timestamp();
+            if peer_info.failures > 0 {
+                peer_info.failures = 0;
+                peer_info.last_failure_time = None;
+            }
         }
     }
 
@@ -3670,7 +3768,11 @@ impl<T: 'static> GossipRegistry<T> {
     /// `record_peer_activity` zeroes `failures` on inbound activity, and
     /// the next FullSync repopulates `known_actors` through the existing
     /// `merge_full_sync` / `apply_delta` paths.
-    async fn handle_peer_death(&self, dead_peer_addr: SocketAddr) {
+    async fn handle_peer_death(
+        &self,
+        dead_peer_addr: SocketAddr,
+        resolved_peer_id: Option<crate::PeerId>,
+    ) {
         // Two ways to learn this peer's PeerId:
         //   1. The pool's addr→peer_id map (populated after a successful
         //      connection handshake).
@@ -3679,7 +3781,8 @@ impl<T: 'static> GossipRegistry<T> {
         // Try both because a peer that died before/during initial
         // connect may only be in the gossip-state map, while a peer that
         // dropped mid-flight may have been evicted from the pool already.
-        let pool_lookup = self.connection_pool.get_peer_id_by_addr(&dead_peer_addr);
+        let pool_lookup =
+            resolved_peer_id.or_else(|| self.connection_pool.get_peer_id_by_addr(&dead_peer_addr));
         let dead_peer_id = if pool_lookup.is_some() {
             pool_lookup
         } else {
@@ -3696,7 +3799,7 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&dead_peer_addr) {
                 peer_info.last_sequence = 0;
-                peer_info.last_response_received = 0;
+                peer_info.last_response_received_ms = 0;
             }
             return;
         };
@@ -3725,7 +3828,7 @@ impl<T: 'static> GossipRegistry<T> {
             .connection_pool
             .disconnect_connection_by_peer_id(&dead_peer_id);
 
-        // 3. Reset per-peer sequence + last_response_received so a
+        // 3. Reset per-peer sequence + last_response_received_ms so a
         //    recovering peer's next FullSync is accepted (mirrors the
         //    DNS-change reset path at registry.rs ~1980), and enqueue
         //    an Immediate-priority ActorRemoved for every pruned actor
@@ -3735,12 +3838,16 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&dead_peer_addr) {
                 peer_info.last_sequence = 0;
-                peer_info.last_response_received = 0;
+                peer_info.last_response_received_ms = 0;
             }
             let removing_node_id = self.peer_id.to_node_id();
             for (name, location) in &to_remove {
                 let removal_clock = location.vector_clock.clone();
                 removal_clock.increment(removing_node_id);
+                let _ = self.actor_state.removed_actors.upsert_sync(
+                    name.clone(),
+                    RemovedActorTombstone::new(removal_clock.clone()),
+                );
                 let change = RegistryChange::ActorRemoved {
                     name: name.clone(),
                     vector_clock: removal_clock,
@@ -3797,7 +3904,7 @@ impl<T: 'static> GossipRegistry<T> {
                 self.apply_delta(delta).await?;
                 // Don't add peer here - peers are managed through handle_connection
 
-                let now = current_timestamp();
+                let now = crate::current_timestamp_millis();
                 let mut gossip_state = self.gossip_state.lock().await;
                 if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
                     peer_info.last_sequence = delta_sequence;
@@ -3805,7 +3912,7 @@ impl<T: 'static> GossipRegistry<T> {
                     // Inbound payload from peer — proves app-level liveness.
                     // Used by the response-asymmetry detector in
                     // `apply_gossip_results`.
-                    peer_info.last_response_received = now;
+                    peer_info.last_response_received_ms = now;
                 }
                 gossip_state.delta_exchanges += 1;
             }
@@ -3841,13 +3948,13 @@ impl<T: 'static> GossipRegistry<T> {
                 )
                 .await;
 
-                let now = current_timestamp();
+                let now = crate::current_timestamp_millis();
                 let mut gossip_state = self.gossip_state.lock().await;
                 if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
                     peer_info.consecutive_deltas = 0;
                     peer_info.last_sequence = sequence;
                     // Inbound payload from peer — proves app-level liveness.
-                    peer_info.last_response_received = now;
+                    peer_info.last_response_received_ms = now;
                 }
                 gossip_state.full_sync_exchanges += 1;
             }
@@ -3910,7 +4017,44 @@ impl<T: 'static> GossipRegistry<T> {
         // Process remote local actors
         for (name, location) in remote_local {
             peer_actors.insert(name.clone());
+            if location.peer_id == self.peer_id {
+                debug!(
+                    actor_name = %name,
+                    "skipping full-sync actor update - change references this node as the host"
+                );
+                continue;
+            }
             if !local_actors.contains_key(&name) {
+                if let Some(tombstone) = self
+                    .actor_state
+                    .removed_actors
+                    .read_sync(name.as_str(), |_, tombstone| tombstone.vector_clock.clone())
+                {
+                    match location.vector_clock.compare(&tombstone) {
+                        crate::ClockOrdering::After => {
+                            let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
+                        }
+                        crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
+                            if owner_recovery_wins_tombstone(
+                                &location,
+                                &sender_peer_id,
+                                &tombstone,
+                            ) =>
+                        {
+                            let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
+                        }
+                        crate::ClockOrdering::Before
+                        | crate::ClockOrdering::Equal
+                        | crate::ClockOrdering::Concurrent => {
+                            debug!(
+                                actor_name = %name,
+                                "skipping full-sync actor update - actor tombstone is newer or concurrent"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
                 match known_actors.get(&name) {
                     Some(existing_location) => {
                         // Use vector clock for causal ordering
@@ -3923,13 +4067,13 @@ impl<T: 'static> GossipRegistry<T> {
                                 updates_to_apply.push((name.clone(), location));
                                 updated_actors += 1;
                             }
-                            crate::ClockOrdering::Concurrent => {
+                            crate::ClockOrdering::Concurrent | crate::ClockOrdering::Equal => {
                                 if stable_concurrent_location_wins(&location, existing_location) {
                                     updates_to_apply.push((name.clone(), location));
                                     updated_actors += 1;
                                 }
                             }
-                            _ => {} // Keep existing for Before or Equal
+                            crate::ClockOrdering::Before => {} // Keep existing
                         }
                     }
                     None => {
@@ -3942,8 +4086,45 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Process remote known actors
         for (name, location) in remote_known {
+            if location.peer_id == self.peer_id {
+                debug!(
+                    actor_name = %name,
+                    "skipping full-sync known actor update - change references this node as the host"
+                );
+                continue;
+            }
             if local_actors.contains_key(&name) {
                 continue; // Don't override local actors
+            }
+
+            if let Some(tombstone) = self
+                .actor_state
+                .removed_actors
+                .read_sync(name.as_str(), |_, tombstone| tombstone.vector_clock.clone())
+            {
+                match location.vector_clock.compare(&tombstone) {
+                    crate::ClockOrdering::After => {
+                        let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
+                    }
+                    crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
+                        if owner_recovery_wins_tombstone(
+                            &location,
+                            &sender_peer_id,
+                            &tombstone,
+                        ) =>
+                    {
+                        let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
+                    }
+                    crate::ClockOrdering::Before
+                    | crate::ClockOrdering::Equal
+                    | crate::ClockOrdering::Concurrent => {
+                        debug!(
+                            actor_name = %name,
+                            "skipping full-sync known actor update - actor tombstone is newer or concurrent"
+                        );
+                        continue;
+                    }
+                }
             }
 
             match known_actors.get(&name) {
@@ -3958,13 +4139,13 @@ impl<T: 'static> GossipRegistry<T> {
                             updates_to_apply.push((name, location));
                             updated_actors += 1;
                         }
-                        crate::ClockOrdering::Concurrent => {
+                        crate::ClockOrdering::Concurrent | crate::ClockOrdering::Equal => {
                             if stable_concurrent_location_wins(&location, existing_location) {
                                 updates_to_apply.push((name, location));
                                 updated_actors += 1;
                             }
                         }
-                        _ => {} // Keep existing for Before or Equal
+                        crate::ClockOrdering::Before => {} // Keep existing
                     }
                 }
                 None => {
@@ -4089,6 +4270,36 @@ impl<T: 'static> GossipRegistry<T> {
             let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
             if removed > 0 {
                 info!(removed_count = removed, "cleaned up stale actor entries");
+            }
+        }
+
+        // Bound peer-death/unregister tombstones. They only need to outlive
+        // ordinary gossip/vector-clock retention; after that, old actors may be
+        // re-created normally without carrying unbounded historical removals.
+        {
+            let before_count = self.actor_state.removed_actors.len();
+            let tombstone_ttl_secs = self.config.vector_clock_retention_period.as_secs();
+            let mut to_remove = Vec::new();
+
+            self.actor_state
+                .removed_actors
+                .iter_sync(|name, tombstone| {
+                    if now.saturating_sub(tombstone.removed_at) >= tombstone_ttl_secs {
+                        to_remove.push(name.clone());
+                    }
+                    true
+                });
+
+            for name in &to_remove {
+                let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
+            }
+
+            let removed = before_count.saturating_sub(self.actor_state.removed_actors.len());
+            if removed > 0 {
+                info!(
+                    removed_count = removed,
+                    "cleaned up expired actor tombstones"
+                );
             }
         }
 
@@ -4373,25 +4584,20 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Handle peer connection failure - start consensus process
     /// This is called for socket disconnections (not timeouts)
-    pub async fn handle_peer_connection_failure(&self, failed_peer_addr: SocketAddr) -> Result<()> {
+    pub async fn handle_peer_connection_failure(
+        &self,
+        observed_peer_addr: SocketAddr,
+    ) -> Result<()> {
+        let (failed_peer_addr, peer_id) = self
+            .resolve_failed_peer_state_addr(observed_peer_addr)
+            .await;
         info!(
             failed_peer = %failed_peer_addr,
+            observed_peer = %observed_peer_addr,
             "socket disconnection detected, marking connection as failed (actors remain available)"
         );
 
         let current_time = current_timestamp();
-        let mut peer_id = {
-            let pool = &self.connection_pool;
-            pool.get_peer_id_by_addr(&failed_peer_addr)
-        };
-        if peer_id.is_none() {
-            let gossip_state = self.gossip_state.lock().await;
-            peer_id = gossip_state
-                .peers
-                .get(&failed_peer_addr)
-                .and_then(|peer| peer.node_id)
-                .map(crate::PeerId::from);
-        }
 
         // IMMEDIATELY mark the connection as failed and remove from pool
         // Use disconnect_connection_by_peer_id when possible to clean up ALL address aliases
@@ -4416,6 +4622,15 @@ impl<T: 'static> GossipRegistry<T> {
                 // Fallback: no peer_id found, remove by address only
                 pool.remove_connection(failed_peer_addr);
                 info!(addr = %failed_peer_addr, "removed disconnected connection from pool (by address only)");
+            } else if observed_peer_addr != failed_peer_addr
+                && pool.has_connection(&observed_peer_addr)
+            {
+                pool.remove_connection(observed_peer_addr);
+                info!(
+                    observed_addr = %observed_peer_addr,
+                    canonical_addr = %failed_peer_addr,
+                    "removed disconnected connection from pool by observed address"
+                );
             }
         }
 
@@ -4452,7 +4667,8 @@ impl<T: 'static> GossipRegistry<T> {
         // failures-incremented-to-threshold case in `apply_gossip_results`,
         // so `known_actors` and pool-state evictions are uniform.
         if crossed_threshold {
-            self.handle_peer_death(failed_peer_addr).await;
+            self.handle_peer_death(failed_peer_addr, peer_id.clone())
+                .await;
 
             // C1 + C2: socket-close observation must produce an
             // immediate cluster-wide broadcast, not wait for the
@@ -4538,6 +4754,58 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         Ok(())
+    }
+
+    async fn resolve_failed_peer_state_addr(
+        &self,
+        observed_peer_addr: SocketAddr,
+    ) -> (SocketAddr, Option<crate::PeerId>) {
+        let pool = &self.connection_pool;
+        let mut peer_id = pool.get_peer_id_by_addr(&observed_peer_addr);
+
+        let state_match = {
+            let gossip_state = self.gossip_state.lock().await;
+
+            if let Some(info) = gossip_state.peers.get(&observed_peer_addr) {
+                Some((
+                    observed_peer_addr,
+                    info.node_id.as_ref().map(|node_id| node_id.to_peer_id()),
+                ))
+            } else {
+                gossip_state.peers.iter().find_map(|(addr, info)| {
+                    if info.peer_address == Some(observed_peer_addr) {
+                        Some((
+                            *addr,
+                            info.node_id.as_ref().map(|node_id| node_id.to_peer_id()),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            }
+        };
+
+        if peer_id.is_none() {
+            peer_id = state_match
+                .as_ref()
+                .and_then(|(_, peer_id)| peer_id.clone());
+        }
+
+        if let Some(peer_id) = peer_id.as_ref() {
+            if let Some(configured_addr) = pool.get_configured_peer_addr(peer_id) {
+                return (configured_addr, Some(peer_id.clone()));
+            }
+            if let Some(advertised_addr) = self.lookup_advertised_addr(&peer_id.to_node_id()).await
+            {
+                return (advertised_addr, Some(peer_id.clone()));
+            }
+        }
+
+        if let Some((addr, state_peer_id)) = state_match {
+            return (addr, peer_id.or(state_peer_id));
+        }
+
+        (observed_peer_addr, peer_id)
     }
 
     /// Handle a peer connection failure by peer ID instead of address
@@ -4630,7 +4898,8 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Gossip protocol's verdict: socket disconnect = peer is dead.
         if crossed_threshold {
-            self.handle_peer_death(failed_peer_addr).await;
+            self.handle_peer_death(failed_peer_addr, Some(failed_peer_id.clone()))
+                .await;
         }
 
         // Now start consensus process for actor invalidation (same as address-based method).
@@ -6077,7 +6346,7 @@ impl<T: 'static> GossipRegistry<T> {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -6398,7 +6667,7 @@ mod tests {
             consecutive_deltas: 3,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -6777,7 +7046,7 @@ mod tests {
             RemoteActorLocation::new_with_peer(test_addr(9001), dead_peer_id),
         );
 
-        registry.handle_peer_death(dead_addr).await;
+        registry.handle_peer_death(dead_addr, None).await;
 
         let gossip_state = registry.gossip_state.lock().await;
         assert_eq!(gossip_state.urgent_changes.len(), 1);
@@ -6957,7 +7226,7 @@ mod tests {
         let actor = registry
             .actor_state
             .local_actors
-            .read_sync("local_actor", |_, v| v.clone())
+            .read_sync("local_actor", |_, location| location.clone())
             .unwrap();
         assert_eq!(actor.socket_addr().unwrap(), test_addr(9001)); // Still local address
     }
@@ -6984,7 +7253,7 @@ mod tests {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -7004,7 +7273,7 @@ mod tests {
             consecutive_deltas: 10,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -7219,6 +7488,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_stale_actors_expires_old_tombstones() {
+        let mut config = test_config();
+        config.vector_clock_retention_period = Duration::from_secs(10);
+        let registry = GossipRegistry::<()>::new(test_addr(8081), config);
+
+        let old_clock = crate::VectorClock::new();
+        old_clock.increment(registry.peer_id.to_node_id());
+        let fresh_clock = old_clock.clone();
+        fresh_clock.increment(registry.peer_id.to_node_id());
+
+        let _ = registry.actor_state.removed_actors.upsert_sync(
+            "old_tombstone".to_string(),
+            RemovedActorTombstone {
+                vector_clock: old_clock,
+                removed_at: current_timestamp().saturating_sub(11),
+            },
+        );
+        let _ = registry.actor_state.removed_actors.upsert_sync(
+            "fresh_tombstone".to_string(),
+            RemovedActorTombstone::new(fresh_clock),
+        );
+
+        registry.cleanup_stale_actors().await;
+
+        assert!(
+            !registry
+                .actor_state
+                .removed_actors
+                .contains_sync("old_tombstone")
+        );
+        assert!(
+            registry
+                .actor_state
+                .removed_actors
+                .contains_sync("fresh_tombstone")
+        );
+    }
+
+    #[tokio::test]
     async fn test_cleanup_dead_peers() {
         let mut config = test_config();
         config.dead_peer_timeout = Duration::from_millis(50);
@@ -7245,7 +7553,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp() - 100),
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -7344,15 +7652,12 @@ mod tests {
             registry.lookup_node_id(&test_addr(9002)).await,
             Some(test_peer_id("remote_actor2").to_node_id())
         );
-        assert_eq!(
-            registry.lookup_node_id(&test_addr(9003)).await,
-            Some(registry.peer_id.to_node_id())
-        );
+        assert_eq!(registry.lookup_node_id(&test_addr(9003)).await, None);
 
         let remote_actor1 = registry
             .actor_state
             .known_actors
-            .read_sync("remote_actor1", |_, v| v.clone())
+            .read_sync("remote_actor1", |_, location| location.clone())
             .expect("remote_actor1 location");
         let actor1_addr = registry
             .connection_pool
@@ -7740,7 +8045,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -7797,7 +8102,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -7844,7 +8149,7 @@ mod tests {
             consecutive_deltas: 5,
             last_failure_time: Some(950),
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         };
 
         // Convert to gossip format
@@ -7981,7 +8286,7 @@ mod tests {
         registry
             .actor_state
             .known_actors
-            .read_sync(name, |_, v| v.clone())
+            .read_sync(name, |_, location| location.clone())
     }
 
     #[tokio::test]
@@ -8052,6 +8357,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_full_sync_equal_clock_add_add_is_order_independent() {
+        let config = test_config();
+        let reg1 = GossipRegistry::<()>::new(test_addr(7021), config.clone());
+        let reg2 = GossipRegistry::<()>::new(test_addr(7022), config.clone());
+
+        let actor = "actor.fullsync.equal-clock";
+        let peer_a = test_peer_id("fullsync_peer_a");
+        let peer_b = test_peer_id("fullsync_peer_b");
+
+        let mut loc_a = RemoteActorLocation::new_with_peer(test_addr(9021), peer_a.clone());
+        let mut loc_b = RemoteActorLocation::new_with_peer(test_addr(9022), peer_b.clone());
+
+        // Force equal vector-clock comparison and stable non-clock tie-breaks.
+        loc_a.wall_clock_time = 123;
+        loc_b.wall_clock_time = 123;
+        loc_a.metadata = vec![4, 5, 6];
+        loc_b.metadata = vec![4, 5, 6];
+        loc_a.local_registration_time = 0;
+        loc_b.local_registration_time = 0;
+
+        let expected = if stable_concurrent_location_wins(&loc_a, &loc_b) {
+            loc_a.clone()
+        } else {
+            loc_b.clone()
+        };
+
+        let mut sync_a = HashMap::new();
+        sync_a.insert(actor.to_string(), loc_a.clone());
+        let mut sync_b = HashMap::new();
+        sync_b.insert(actor.to_string(), loc_b.clone());
+
+        reg1.merge_full_sync(
+            sync_a.clone(),
+            HashMap::new(),
+            peer_a.clone(),
+            test_addr(7023),
+            1,
+            0,
+        )
+        .await;
+        reg1.merge_full_sync(
+            sync_b.clone(),
+            HashMap::new(),
+            peer_b.clone(),
+            test_addr(7024),
+            1,
+            0,
+        )
+        .await;
+        let got1 = read_known_actor(&reg1, actor).expect("actor should exist");
+
+        reg2.merge_full_sync(sync_b, HashMap::new(), peer_b, test_addr(7025), 1, 0)
+            .await;
+        reg2.merge_full_sync(sync_a, HashMap::new(), peer_a, test_addr(7026), 1, 0)
+            .await;
+        let got2 = read_known_actor(&reg2, actor).expect("actor should exist");
+
+        assert_eq!(got1, got2);
+        assert_eq!(got1, expected);
+    }
+
+    #[tokio::test]
     async fn test_apply_delta_stale_self_announcement_is_ignored() {
         let reg = GossipRegistry::<()>::new(test_addr(7003), test_config());
         let actor = "actor.self";
@@ -8105,6 +8472,404 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_gossip_response_clears_accumulated_soft_failures() {
+        let reg = GossipRegistry::<()>::new(test_addr(7050), test_config());
+        let peer_addr = test_addr(7051);
+        let peer_id = test_peer_id("soft-failure-peer");
+        {
+            let mut state = reg.gossip_state.lock().await;
+            state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: true,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 2,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(1),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis()
+                        .saturating_sub(10_000),
+                },
+            );
+        }
+
+        let response = RegistryMessage::DeltaGossipResponse {
+            delta: RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: Vec::new(),
+                sender_peer_id: peer_id,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+        };
+        reg.apply_gossip_results(vec![GossipResult {
+            peer_addr,
+            sent_sequence: 1,
+            outcome: Ok(Some(response)),
+        }])
+        .await;
+
+        let state = reg.gossip_state.lock().await;
+        let peer = state.peers.get(&peer_addr).expect("peer remains tracked");
+        assert_eq!(
+            peer.failures, 0,
+            "an application-level response must clear soft no-response failures"
+        );
+        assert!(peer.last_failure_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_delta_records_tombstone_when_remove_arrives_before_add() {
+        let reg = GossipRegistry::<()>::new(test_addr(7052), test_config());
+        let actor = "actor.remove.before.add";
+        let peer = test_peer_id("remove-before-add-peer");
+        let node = peer.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9252), peer.clone());
+        loc.vector_clock.increment(node);
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(node);
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 2,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: removal_clock,
+                removing_node_id: node,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: peer.clone(),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: loc,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: peer,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "stale add must not resurrect an actor whose remove arrived first"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_full_sync_respects_actor_tombstones() {
+        let reg = GossipRegistry::<()>::new(test_addr(7053), test_config());
+        let actor = "actor.fullsync.tombstone";
+        let peer = test_peer_id("fullsync-tombstone-peer");
+        let node = peer.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9253), peer.clone());
+        loc.vector_clock.increment(node);
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        let mut remote_local = HashMap::new();
+        remote_local.insert(actor.to_string(), loc);
+        reg.merge_full_sync(remote_local, HashMap::new(), peer, test_addr(7054), 1, 0)
+            .await;
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "stale full sync must not resurrect a tombstoned actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_full_sync_rejects_third_party_replay_after_peer_death_tombstone() {
+        let reg = GossipRegistry::<()>::new(test_addr(7055), test_config());
+        let actor = "actor.fullsync.third-party-replay";
+        let peer = test_peer_id("fullsync-third-party-replay-peer");
+        let reflector = test_peer_id("fullsync-third-party-reflector");
+        let owner_node = peer.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9255), peer.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        let mut remote_known = HashMap::new();
+        remote_known.insert(actor.to_string(), loc);
+        reg.merge_full_sync(
+            HashMap::new(),
+            remote_known,
+            reflector,
+            test_addr(7056),
+            1,
+            0,
+        )
+        .await;
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "third-party full sync must not clear a peer-death tombstone for \
+             an actor owned by another peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_full_sync_allows_direct_owner_recovery_after_transient_disconnect() {
+        let reg = GossipRegistry::<()>::new(test_addr(7057), test_config());
+        let actor = "actor.fullsync.stale-direct-owner";
+        let peer = test_peer_id("fullsync-stale-direct-owner-peer");
+        let owner_node = peer.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9257), peer.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        let mut remote_local = HashMap::new();
+        remote_local.insert(actor.to_string(), loc);
+        reg.merge_full_sync(remote_local, HashMap::new(), peer, test_addr(7058), 1, 0)
+            .await;
+
+        assert!(
+            read_known_actor(&reg, actor).is_some(),
+            "direct owner full sync must recover from a peer-death tombstone after \
+             an authenticated reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_full_sync_allows_direct_owner_recovery_after_owner_clock_advances() {
+        let reg = GossipRegistry::<()>::new(test_addr(7059), test_config());
+        let actor = "actor.fullsync.recovered-owner";
+        let peer = test_peer_id("fullsync-recovered-owner-peer");
+        let owner_node = peer.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9259), peer.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        loc.vector_clock.increment(owner_node);
+        let mut remote_local = HashMap::new();
+        remote_local.insert(actor.to_string(), loc);
+        reg.merge_full_sync(remote_local, HashMap::new(), peer, test_addr(7060), 1, 0)
+            .await;
+
+        assert!(
+            read_known_actor(&reg, actor).is_some(),
+            "direct owner full sync may recover after the owner publishes a newer actor version"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_delta_rejects_third_party_replay_after_peer_death_tombstone() {
+        let reg = GossipRegistry::<()>::new(test_addr(7061), test_config());
+        let actor = "actor.delta.third-party-replay";
+        let peer = test_peer_id("delta-third-party-replay-peer");
+        let reflector = test_peer_id("delta-third-party-reflector");
+        let owner_node = peer.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9259), peer.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: loc,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: reflector,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "third-party delta must not clear a peer-death tombstone for \
+            an actor owned by another peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_rejects_forged_delta_sender_peer_id() {
+        let reg = Arc::new(GossipRegistry::<()>::new(test_addr(7064), test_config()));
+        let actor = "actor.delta.forged-sender";
+        let owner = test_peer_id("delta-forged-owner");
+        let attacker = test_peer_id("delta-forged-attacker");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9264), owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        let mut streaming_state = crate::protocol::StreamingState::new();
+        crate::protocol::process_read_result(
+            crate::handle::MessageReadResult::Gossip(
+                RegistryMessage::DeltaGossip {
+                    delta: RegistryDelta {
+                        since_sequence: 0,
+                        current_sequence: 1,
+                        changes: vec![RegistryChange::ActorAdded {
+                            name: actor.to_string(),
+                            location: loc,
+                            priority: RegistrationPriority::Normal,
+                        }],
+                        sender_peer_id: owner,
+                        wall_clock_time: 0,
+                        precise_timing_nanos: 0,
+                    },
+                },
+                None,
+            ),
+            &mut streaming_state,
+            &reg,
+            test_addr(7065),
+            None,
+            None,
+            Some(&attacker),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "authenticated attacker must not clear another peer's tombstone by \
+             forging delta.sender_peer_id"
+        );
+        assert!(reg.actor_state.removed_actors.contains_sync(actor));
+    }
+
+    #[tokio::test]
+    async fn apply_delta_allows_direct_owner_recovery_after_transient_disconnect() {
+        let reg = GossipRegistry::<()>::new(test_addr(7062), test_config());
+        let actor = "actor.delta.stale-direct-owner";
+        let peer = test_peer_id("delta-stale-direct-owner-peer");
+        let owner_node = peer.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9262), peer.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: loc,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: peer,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_some(),
+            "direct owner delta must recover from a peer-death tombstone after \
+             authenticated owner traffic resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_delta_allows_direct_owner_recovery_after_owner_clock_advances() {
+        let reg = GossipRegistry::<()>::new(test_addr(7063), test_config());
+        let actor = "actor.delta.recovered-owner";
+        let peer = test_peer_id("delta-recovered-owner-peer");
+        let owner_node = peer.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9263), peer.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        loc.vector_clock.increment(owner_node);
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: loc,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: peer,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_some(),
+            "direct owner delta may recover after the owner publishes a newer actor version"
+        );
+    }
+
+    #[tokio::test]
     async fn test_merge_full_sync_ignores_stale_sequence() {
         let reg = GossipRegistry::<()>::new(test_addr(7005), test_config());
         let sender_addr = test_addr(7006);
@@ -8129,7 +8894,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8268,7 +9033,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8309,7 +9074,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8350,7 +9115,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8404,7 +9169,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(now),
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8465,7 +9230,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -8559,7 +9324,7 @@ mod tests {
             consecutive_deltas: 0,
             last_failure_time: None,
             last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+            last_response_received_ms: crate::current_timestamp_millis(),
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -8615,7 +9380,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8694,7 +9459,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8760,7 +9525,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }
@@ -8818,7 +9583,7 @@ mod tests {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
-            last_response_received: crate::current_timestamp(),
+                    last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
         }

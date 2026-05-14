@@ -20,7 +20,12 @@ type TypeHash = u64;
 type SubscriberKey = (TopicKey, TypeHash);
 type Subscriber = Arc<dyn Fn(Bytes) + Send + Sync + 'static>;
 type TypeSubscriber = Arc<dyn Fn(u64, Bytes) + Send + Sync + 'static>;
-type SubscriberMap = HashMap<SubscriberKey, Arc<[Subscriber]>>;
+#[derive(Clone)]
+struct SubscriberEntry {
+    id: u64,
+    callback: Subscriber,
+}
+type SubscriberMap = HashMap<SubscriberKey, Arc<[SubscriberEntry]>>;
 type TypeSubscriberMap = HashMap<TypeHash, Arc<[TypeSubscriber]>>;
 type RouteGroups = HashMap<PeerId, Arc<[PeerId]>>;
 type TopicRouteGroups = HashMap<TopicKey, Arc<RouteGroups>>;
@@ -166,13 +171,19 @@ pub struct PubSubSubscription {
     id: u64,
 }
 
+#[derive(Default)]
+struct InterestState {
+    local_counts: HashMap<TopicKey, usize>,
+    generations: HashMap<TopicKey, u64>,
+}
+
 pub struct RoutedPubSub {
     registry: Arc<crate::registry::GossipRegistry>,
     client: crate::GossipClient,
     local_peer_id: PeerId,
     subscribers: ArcSwap<SubscriberMap>,
     type_subscribers: ArcSwap<TypeSubscriberMap>,
-    local_counts: Mutex<HashMap<TopicKey, usize>>,
+    interest_state: Arc<Mutex<InterestState>>,
     route_groups: ArcSwap<TopicRouteGroups>,
     conns: ArcSwap<HashMap<PeerId, crate::RemoteConnection>>,
     seen: Mutex<Vec<(PeerId, u128)>>,
@@ -190,7 +201,7 @@ impl RoutedPubSub {
             registry,
             subscribers: ArcSwap::from_pointee(HashMap::new()),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
-            local_counts: Mutex::new(HashMap::new()),
+            interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             conns: ArcSwap::from_pointee(HashMap::new()),
             seen: Mutex::new(Vec::with_capacity(DEFAULT_SEEN_CAPACITY)),
@@ -224,7 +235,10 @@ impl RoutedPubSub {
         let key = (topic_key, type_hash);
         let mut next = (*self.subscribers.load_full()).clone();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
-        topic_subs.push(Arc::new(deliver));
+        topic_subs.push(SubscriberEntry {
+            id,
+            callback: Arc::new(deliver),
+        });
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
         self.note_interest(topic_key, true);
@@ -263,7 +277,10 @@ impl RoutedPubSub {
         }
         let mut next = current.as_ref().clone();
         let mut topic_subs = existing.to_vec();
-        topic_subs.pop();
+        let Some(pos) = topic_subs.iter().position(|entry| entry.id == sub.id) else {
+            return false;
+        };
+        topic_subs.remove(pos);
         if topic_subs.is_empty() {
             next.remove(&key);
         } else {
@@ -426,7 +443,11 @@ impl RoutedPubSub {
                 // `get_connection_by_peer_id`) when the pool already
                 // holds a usable connection. `has_connection_by_peer_id`
                 // is the only non-warning peer-presence test on the pool.
-                if !self.registry.connection_pool.has_connection_by_peer_id(&next_hop) {
+                if !self
+                    .registry
+                    .connection_pool
+                    .has_connection_by_peer_id(&next_hop)
+                {
                     next_conns.remove(&next_hop);
                     continue;
                 }
@@ -451,8 +472,8 @@ impl RoutedPubSub {
         let mut delivered = 0u32;
         let subscribers = self.subscribers.load();
         if let Some(callbacks) = subscribers.get(&(topic_key, type_hash)).cloned() {
-            for callback in callbacks.iter() {
-                callback(Bytes::clone(&payload));
+            for entry in callbacks.iter() {
+                (entry.callback)(Bytes::clone(&payload));
                 delivered = delivered.saturating_add(1);
             }
         }
@@ -503,40 +524,80 @@ impl RoutedPubSub {
     }
 
     fn note_interest(&self, topic_key: u64, present: bool) {
-        let mut counts = match self.local_counts.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
+        let (prev, _next, generation) = {
+            let mut state = match self.interest_state.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let prev = state.local_counts.get(&topic_key).copied().unwrap_or(0);
+            let next = if present {
+                prev.saturating_add(1)
+            } else {
+                prev.saturating_sub(1)
+            };
+            if next == 0 {
+                state.local_counts.remove(&topic_key);
+            } else {
+                state.local_counts.insert(topic_key, next);
+            }
+
+            let generation = if (present && prev == 0) || (!present && prev == 1) {
+                let next_generation = state
+                    .generations
+                    .get(&topic_key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                state.generations.insert(topic_key, next_generation);
+                next_generation
+            } else {
+                state.generations.get(&topic_key).copied().unwrap_or(0)
+            };
+            (prev, next, generation)
         };
-        let prev = counts.get(&topic_key).copied().unwrap_or(0);
-        let next = if present {
-            prev.saturating_add(1)
-        } else {
-            prev.saturating_sub(1)
-        };
-        if next == 0 {
-            counts.remove(&topic_key);
-        } else {
-            counts.insert(topic_key, next);
-        }
-        drop(counts);
 
         if (present && prev == 0) || (!present && prev == 1) {
             let registry = Arc::clone(&self.registry);
             let peer = self.local_peer_id.clone();
+            let interest_state = Arc::clone(&self.interest_state);
             tokio::spawn(async move {
+                let (current_present, current_generation) = {
+                    let state = match interest_state.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    (
+                        state.local_counts.get(&topic_key).copied().unwrap_or(0) > 0,
+                        state.generations.get(&topic_key).copied().unwrap_or(0),
+                    )
+                };
+                if current_present != present || current_generation != generation {
+                    return;
+                }
+
                 let name = interest_name(topic_key, &peer);
-                if present {
+                let result = if present {
                     let mut location = RemoteActorLocation::new_with_peer(registry.bind_addr, peer);
                     location.priority = RegistrationPriority::Immediate;
-                    let _ = registry
+                    registry
                         .register_actor_with_priority(
                             name,
                             location,
                             RegistrationPriority::Immediate,
                         )
-                        .await;
+                        .await
+                        .map(|_| ())
                 } else {
-                    let _ = registry.unregister_actor(&name).await;
+                    registry.unregister_actor(&name).await.map(|_| ())
+                };
+                if let Err(err) = result {
+                    warn!(
+                        topic_key,
+                        present,
+                        generation,
+                        error = %err,
+                        "failed to update pubsub interest actor"
+                    );
                 }
             });
         }
@@ -738,7 +799,7 @@ mod tests {
             registry,
             subscribers: ArcSwap::from_pointee(HashMap::new()),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
-            local_counts: Mutex::new(HashMap::new()),
+            interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             conns: ArcSwap::from_pointee(HashMap::new()),
             seen: Mutex::new(Vec::with_capacity(DEFAULT_SEEN_CAPACITY)),
@@ -760,7 +821,13 @@ mod tests {
         let mut next = (*pubsub.subscribers.load_full()).clone();
         next.insert(
             (topic, type_hash),
-            Arc::from(vec![deliver].into_boxed_slice()),
+            Arc::from(
+                vec![SubscriberEntry {
+                    id: 1,
+                    callback: deliver,
+                }]
+                .into_boxed_slice(),
+            ),
         );
         pubsub.subscribers.store(Arc::new(next));
     }
@@ -865,6 +932,50 @@ mod tests {
         let deliveries = delivered.lock().unwrap();
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].as_ref(), b"legitimate");
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_removes_the_requested_subscription_not_last_in_vector() {
+        let pubsub = test_pubsub("pubsub-unsubscribe-by-id");
+        let topic = topic_key("unsubscribe-by-id");
+        let type_hash = 202;
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+
+        let delivered_first = Arc::clone(&delivered);
+        let first = pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            delivered_first.lock().unwrap().push("first");
+        });
+        let delivered_second = Arc::clone(&delivered);
+        let second = pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            delivered_second.lock().unwrap().push("second");
+        });
+
+        assert!(pubsub.unsubscribe(first));
+        pubsub
+            .publish_bytes(
+                topic,
+                type_hash,
+                Bytes::from_static(b"payload"),
+                PubSubScope::LocalOnly,
+                PubSubDeliveryPolicy::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            delivered.lock().unwrap().as_slice(),
+            &["second"],
+            "non-LIFO unsubscribe must remove the subscription identified by id"
+        );
+        assert!(pubsub.unsubscribe(second));
+        assert!(
+            !pubsub
+                .interest_state
+                .lock()
+                .unwrap()
+                .local_counts
+                .contains_key(&topic),
+            "interest count must be removed after the final unsubscribe"
+        );
     }
 
     #[test]

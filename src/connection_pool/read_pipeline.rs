@@ -1312,6 +1312,7 @@ async fn process_read_result_io<S>(
     streaming_state: &mut crate::protocol::StreamingState,
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
+    authenticated_peer_id: Option<&crate::PeerId>,
     response_correlation: Option<&CorrelationTracker>,
     sync_actor_handler: Option<&crate::registry::ActorMessageHandlerSyncCell>,
     stream: &mut S,
@@ -1447,7 +1448,7 @@ where
                 peer_addr,
                 response_correlation,
                 None,
-                None,
+                authenticated_peer_id,
             )
             .await
         }

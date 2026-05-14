@@ -128,7 +128,7 @@ impl<T> ConnectionPool<T> {
                     remote = %remote_peer_id,
                     addr = %addr,
                     timeout_ms = connection_timeout.as_millis(),
-                    "outbound_connect_suppressed_wait_inbound"
+                    "outbound_connect_wait_preferred_inbound"
                 );
                 crate::lifecycle::record_transport_event(
                     crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedWaitInbound {
@@ -150,7 +150,7 @@ impl<T> ConnectionPool<T> {
                         attempt_id,
                         remote = %remote_peer_id,
                         addr = %handle.addr,
-                        "outbound_connect_suppressed_inbound_ready"
+                        "outbound_connect_preferred_inbound_ready"
                     );
                     crate::lifecycle::record_transport_event(
                         crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedInboundReady {
@@ -166,7 +166,7 @@ impl<T> ConnectionPool<T> {
                     attempt_id,
                     remote = %remote_peer_id,
                     addr = %addr,
-                    "outbound_connect_suppressed_inbound_timeout"
+                    "outbound_connect_preferred_inbound_timeout_fallback_dial"
                 );
                 crate::lifecycle::record_transport_event(
                     crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedInboundTimeout {
@@ -175,10 +175,6 @@ impl<T> ConnectionPool<T> {
                         attempt_id,
                     },
                 );
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timed out waiting for preferred inbound connection",
-                )));
             }
         }
 
