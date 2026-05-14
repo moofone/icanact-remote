@@ -5915,23 +5915,31 @@ impl<T: 'static> GossipRegistry<T> {
         None
     }
 
-    /// Lookup NodeId for a given address (active peers first, then known_peers)
+    /// Lookup NodeId for a given address (active peers first, then known_peers, then
+    /// direct routing configuration).
     pub async fn lookup_node_id(&self, addr: &SocketAddr) -> Option<crate::NodeId> {
         let mut gossip_state = self.gossip_state.lock().await;
 
-        if let Some(peer_info) = gossip_state.peers.get(addr) {
-            if let Some(node_id) = peer_info.node_id {
-                return Some(node_id);
-            }
+        if let Some(peer_info) = gossip_state.peers.get(addr)
+            && let Some(node_id) = peer_info.node_id
+        {
+            return Some(node_id);
         }
 
-        if let Some(peer_info) = gossip_state.known_peers.get(addr) {
-            if let Some(node_id) = peer_info.node_id {
-                return Some(node_id);
-            }
+        if let Some(peer_info) = gossip_state.known_peers.get(addr)
+            && let Some(node_id) = peer_info.node_id
+        {
+            return Some(node_id);
         }
 
-        None
+        drop(gossip_state);
+
+        // Full-sync actor locations are configured as direct routes rather than
+        // gossip peers. Still derive the expected NodeId from that pinned PeerId
+        // so address-based TLS dials cannot fall back to placeholder SNI.
+        self.connection_pool
+            .get_peer_id_by_addr(addr)
+            .map(|peer_id| peer_id.to_node_id())
     }
 
     /// Connect-on-demand for actor messaging (Phase 4)
@@ -7190,6 +7198,10 @@ mod tests {
             "remote_actor2".to_string(),
             RemoteActorLocation::new_with_peer(test_addr(9002), test_peer_id("remote_actor2")),
         );
+        remote_known.insert(
+            "forged_local_actor".to_string(),
+            RemoteActorLocation::new_with_peer(test_addr(9003), registry.peer_id.clone()),
+        );
 
         registry
             .merge_full_sync(
@@ -7222,7 +7234,24 @@ mod tests {
         let gossip_state = registry.gossip_state.lock().await;
         assert!(!gossip_state.peers.contains_key(&test_addr(9001)));
         assert!(!gossip_state.peers.contains_key(&test_addr(9002)));
+        assert!(!gossip_state.peers.contains_key(&test_addr(9003)));
         drop(gossip_state);
+
+        // Direct routes still pin the expected NodeId for TLS verification.
+        // This prevents address-based actor lookups from using placeholder SNI
+        // when a full-sync actor location claims a specific PeerId.
+        assert_eq!(
+            registry.lookup_node_id(&test_addr(9001)).await,
+            Some(test_peer_id("remote_actor1").to_node_id())
+        );
+        assert_eq!(
+            registry.lookup_node_id(&test_addr(9002)).await,
+            Some(test_peer_id("remote_actor2").to_node_id())
+        );
+        assert_eq!(
+            registry.lookup_node_id(&test_addr(9003)).await,
+            Some(registry.peer_id.to_node_id())
+        );
 
         let remote_actor1 = registry
             .actor_state
