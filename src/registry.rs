@@ -1174,6 +1174,27 @@ pub struct StreamAssemblyResult {
 }
 
 impl<T: 'static> GossipRegistry<T> {
+    fn as_regular_gossip_change(change: &RegistryChange) -> RegistryChange {
+        match change {
+            RegistryChange::ActorAdded { name, location, .. } => RegistryChange::ActorAdded {
+                name: name.clone(),
+                location: location.clone(),
+                priority: RegistrationPriority::Normal,
+            },
+            RegistryChange::ActorRemoved {
+                name,
+                vector_clock,
+                removing_node_id,
+                ..
+            } => RegistryChange::ActorRemoved {
+                name: name.clone(),
+                vector_clock: vector_clock.clone(),
+                removing_node_id: *removing_node_id,
+                priority: RegistrationPriority::Normal,
+            },
+        }
+    }
+
     /// Create a new gossip registry
     pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
         // Use public key from config (required for TLS identity)
@@ -2314,7 +2335,9 @@ impl<T: 'static> GossipRegistry<T> {
 
             if priority.should_trigger_immediate_gossip() {
                 gossip_state.urgent_changes.push(change.clone());
-                gossip_state.pending_changes.push(change);
+                gossip_state
+                    .pending_changes
+                    .push(Self::as_regular_gossip_change(&change));
                 true
             } else {
                 gossip_state.pending_changes.push(change);
@@ -2403,7 +2426,9 @@ impl<T: 'static> GossipRegistry<T> {
 
                 if location.priority.should_trigger_immediate_gossip() {
                     gossip_state.urgent_changes.push(change.clone());
-                    gossip_state.pending_changes.push(change);
+                    gossip_state
+                        .pending_changes
+                        .push(Self::as_regular_gossip_change(&change));
                     true
                 } else {
                     gossip_state.pending_changes.push(change);
@@ -2877,7 +2902,7 @@ impl<T: 'static> GossipRegistry<T> {
                 changes.push(RegistryChange::ActorAdded {
                     name: name.clone(),
                     location: location.clone(),
-                    priority: location.priority,
+                    priority: RegistrationPriority::Normal,
                 });
             }
 
@@ -2889,7 +2914,7 @@ impl<T: 'static> GossipRegistry<T> {
                 changes.push(RegistryChange::ActorAdded {
                     name: name.clone(),
                     location: location.clone(),
-                    priority: location.priority,
+                    priority: RegistrationPriority::Normal,
                 });
             }
         }
@@ -5045,7 +5070,9 @@ impl<T: 'static> GossipRegistry<T> {
 
         if critical_peers.is_empty() {
             let mut gossip_state = self.gossip_state.lock().await;
-            gossip_state.pending_changes.extend(urgent_changes);
+            gossip_state
+                .pending_changes
+                .extend(urgent_changes.iter().map(Self::as_regular_gossip_change));
             return Ok(());
         }
 
@@ -5183,9 +5210,11 @@ impl<T: 'static> GossipRegistry<T> {
 
         if peer_connections.is_empty() {
             let mut gossip_state = self.gossip_state.lock().await;
-            gossip_state
-                .pending_changes
-                .extend(urgent_changes_for_retry);
+            gossip_state.pending_changes.extend(
+                urgent_changes_for_retry
+                    .iter()
+                    .map(Self::as_regular_gossip_change),
+            );
             return Ok(());
         }
 
@@ -5243,9 +5272,11 @@ impl<T: 'static> GossipRegistry<T> {
                 "immediate gossip encountered send failures - scheduling retry via regular gossip"
             );
         }
-        gossip_state
-            .pending_changes
-            .extend(urgent_changes_for_retry);
+        gossip_state.pending_changes.extend(
+            urgent_changes_for_retry
+                .iter()
+                .map(Self::as_regular_gossip_change),
+        );
 
         Ok(())
     }
@@ -6591,9 +6622,74 @@ mod tests {
         // Verify urgent change was created (not cleared since immediate propagation is disabled)
         let gossip_state = registry.gossip_state.lock().await;
         assert_eq!(gossip_state.urgent_changes.len(), 1);
-        // Urgent registrations also live in pending_changes so the next scheduled gossip round still
-        // carries them even when immediate propagation is disabled.
+        // Regular gossip carries the same state change without transport urgency.
         assert_eq!(gossip_state.pending_changes.len(), 1);
+        match &gossip_state.pending_changes[0] {
+            RegistryChange::ActorAdded { priority, .. } => {
+                assert_eq!(*priority, RegistrationPriority::Normal);
+            }
+            other => panic!("expected ActorAdded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_immediate_priority_does_not_leak_into_regular_delta_bootstrap() {
+        let mut config = test_config();
+        config.immediate_propagation_enabled = false;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+
+        registry.add_peer(test_addr(8081)).await;
+        registry
+            .register_actor_with_priority(
+                "urgent_actor".to_string(),
+                test_location(test_addr(9001)),
+                RegistrationPriority::Immediate,
+            )
+            .await
+            .unwrap();
+
+        let tasks = registry.prepare_gossip_round().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        match &tasks[0].message {
+            RegistryMessage::DeltaGossip { delta } => {
+                assert!(
+                    !delta.changes.iter().any(|change| match change {
+                        RegistryChange::ActorAdded { priority, .. }
+                        | RegistryChange::ActorRemoved { priority, .. } =>
+                            priority.should_trigger_immediate_gossip(),
+                    }),
+                    "scheduled gossip must not re-emit one-shot immediate priority: {:?}",
+                    delta.changes
+                );
+            }
+            other => panic!("expected delta gossip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_immediate_actor_snapshot_is_rebroadcast_as_regular_gossip() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let mut location = test_location(test_addr(9001));
+        location.priority = RegistrationPriority::Immediate;
+        registry
+            .actor_state
+            .known_actors
+            .upsert_sync("remote_urgent_actor".to_string(), location);
+
+        let (local_actors, known_actors) = registry.snapshot_actor_maps();
+        let gossip_state = registry.gossip_state.lock().await;
+        let delta = registry
+            .create_delta_from_state(&gossip_state, &local_actors, &known_actors, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(delta.changes.len(), 1);
+        match &delta.changes[0] {
+            RegistryChange::ActorAdded { priority, .. } => {
+                assert_eq!(*priority, RegistrationPriority::Normal);
+            }
+            other => panic!("expected ActorAdded, got {other:?}"),
+        }
     }
 
     #[tokio::test]
