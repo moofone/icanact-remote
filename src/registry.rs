@@ -3207,7 +3207,11 @@ impl<T: 'static> GossipRegistry<T> {
                 // since_sequence-bounded path in `create_delta_from_state`)
                 // rather than re-cloning the urgent queue forever.
                 let mut combined = std::mem::take(&mut gossip_state.pending_changes);
-                combined.append(&mut gossip_state.urgent_changes);
+                combined.extend(
+                    std::mem::take(&mut gossip_state.urgent_changes)
+                        .iter()
+                        .map(Self::as_regular_gossip_change),
+                );
                 let delta = HistoricalDelta {
                     sequence: gossip_state.gossip_sequence,
                     changes: combined,
@@ -6669,6 +6673,44 @@ mod tests {
                     "scheduled gossip must not re-emit one-shot immediate priority: {:?}",
                     delta.changes
                 );
+            }
+            other => panic!("expected delta gossip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lingering_urgent_change_commits_to_regular_delta_history() {
+        let mut config = test_config();
+        config.small_cluster_threshold = 0;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+        registry.add_peer(test_addr(8081)).await;
+        let mut location = test_location(test_addr(9001));
+        location.priority = RegistrationPriority::Immediate;
+        location.vector_clock.increment(location.node_id);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.gossip_sequence = 1;
+            gossip_state
+                .urgent_changes
+                .push(RegistryChange::ActorAdded {
+                    name: "urgent_only_actor".to_string(),
+                    location,
+                    priority: RegistrationPriority::Immediate,
+                });
+        }
+
+        let tasks = registry.prepare_gossip_round().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        match &tasks[0].message {
+            RegistryMessage::DeltaGossip { delta } => {
+                assert_eq!(delta.changes.len(), 1);
+                match &delta.changes[0] {
+                    RegistryChange::ActorAdded { priority, .. } => {
+                        assert_eq!(*priority, RegistrationPriority::Normal);
+                    }
+                    other => panic!("expected ActorAdded, got {other:?}"),
+                }
             }
             other => panic!("expected delta gossip, got {other:?}"),
         }
