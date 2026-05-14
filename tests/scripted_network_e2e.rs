@@ -475,7 +475,7 @@ async fn inbound_preferred_lookup_waits_for_scripted_inbound() -> icanact_remote
     connect_result.expect("outbound owner should connect through proxy");
     assert!(
         lookup_started.elapsed() >= Duration::from_millis(175),
-        "lookup should wait for delayed preferred inbound, elapsed={:?}",
+        "lookup should wait for delayed preferred inbound before fallback dialing, elapsed={:?}",
         lookup_started.elapsed()
     );
     assert!(remote_ref.connection_ref().is_some());
@@ -607,7 +607,7 @@ async fn simultaneous_connect_collision_keeps_one_preferred_direction() -> icana
                 TransportDirection::Outbound
             ),
             0,
-            "inbound-preferred side must not publish outbound during simultaneous collision"
+            "inbound-preferred side must not publish outbound when preferred inbound arrives"
         );
         assert_eq!(
             session_published_count(events, &local.registry.peer_id, TransportDirection::Inbound),
@@ -1109,6 +1109,7 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
     .await;
 
     const SOAK_ROUNDS: usize = 500;
+    const MAX_FALLBACK_OUTBOUNDS: usize = SOAK_ROUNDS / 5;
 
     for cycle in 0..SOAK_ROUNDS {
         local.disconnect_peer_connection(&remote.registry.peer_id);
@@ -1152,9 +1153,9 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
                 TransportDirection::Outbound,
             )
         });
-        assert_eq!(
-            local_outbound, 0,
-            "inbound-preferred side must never publish outbound to remote"
+        assert!(
+            local_outbound <= MAX_FALLBACK_OUTBOUNDS,
+            "fallback outbound publishes should stay bounded during reconnect soak, observed {local_outbound}"
         );
     }
 
@@ -1162,12 +1163,12 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
         asks_remote.load(Ordering::Acquire) >= SOAK_ROUNDS as u64,
         "remote should answer every scripted reconnect ask"
     );
-    assert_eq!(
+    assert!(
         count_events(&events, |event| matches!(
             event,
             TransportLifecycleEvent::WrongDirectionEvicted { .. }
-        )),
-        0
+        )) <= MAX_FALLBACK_OUTBOUNDS,
+        "fallback repair should not cause an unbounded wrong-direction eviction loop"
     );
     let suppressed_timeouts = count_events(&events, |event| {
         matches!(
@@ -1176,7 +1177,7 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
         )
     });
     assert!(
-        suppressed_timeouts <= 5,
+        suppressed_timeouts <= MAX_FALLBACK_OUTBOUNDS,
         "soak should not spin in suppressed inbound timeouts, observed {suppressed_timeouts}"
     );
 

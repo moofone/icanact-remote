@@ -1290,9 +1290,9 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     let vector_clock_gc_interval = registry.config.vector_clock_gc_frequency;
     let peer_gossip_interval = registry.config.peer_gossip_interval;
     let mut udp_failure_timer = if registry.udp_mode {
-        Some(interval(
-            registry.udp_failure_detector_config.health_probe_interval,
-        ))
+        let mut t = interval(registry.udp_failure_detector_config.health_probe_interval);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(t)
     } else {
         None
     };
@@ -1307,10 +1307,16 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     let jitter = Duration::from_millis(jitter_ms);
     let mut next_gossip_tick = Instant::now() + gossip_interval + jitter;
     let mut cleanup_timer = interval(cleanup_interval);
+    cleanup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut vector_clock_gc_timer = interval(vector_clock_gc_interval);
+    vector_clock_gc_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Peer gossip timer - only if peer discovery is enabled
-    let mut peer_gossip_timer = peer_gossip_interval.map(|i| interval(i));
+    let mut peer_gossip_timer = peer_gossip_interval.map(|i| {
+        let mut t = interval(i);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    });
 
     debug!(
         gossip_interval_ms = gossip_interval.as_millis(),

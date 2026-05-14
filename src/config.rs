@@ -183,7 +183,7 @@ pub struct GossipConfig {
     /// outbound write returned successfully — but on a persistent
     /// connection that may just mean the kernel buffered the bytes for
     /// a peer that has since stopped reading. The response-asymmetry
-    /// detector compares `current_time - last_response_received` to
+    /// detector compares `current_time - last_response_received_ms` to
     /// this window: if we've been writing into a black hole for longer
     /// than this window without ever seeing an inbound response, the
     /// next no-response round increments `failures`, eventually

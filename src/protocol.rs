@@ -266,6 +266,22 @@ impl Default for StreamingState {
     }
 }
 
+fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
+    match msg {
+        RegistryMessage::DeltaGossip { delta } | RegistryMessage::DeltaGossipResponse { delta } => {
+            Some(&delta.sender_peer_id)
+        }
+        RegistryMessage::FullSyncRequest { sender_peer_id, .. }
+        | RegistryMessage::FullSync { sender_peer_id, .. }
+        | RegistryMessage::FullSyncResponse { sender_peer_id, .. } => Some(sender_peer_id),
+        RegistryMessage::PeerHealthReport { reporter, .. } => Some(reporter),
+        RegistryMessage::PeerHealthQuery { sender, .. } => Some(sender),
+        RegistryMessage::ImmediateAck { .. }
+        | RegistryMessage::ActorMessage { .. }
+        | RegistryMessage::PeerListGossip { .. } => None,
+    }
+}
+
 /// Process a single read result result using the shared protocol logic.
 ///
 /// This handles:
@@ -289,6 +305,21 @@ pub(crate) async fn process_read_result(
                 warn!(
                     peer = %peer_addr,
                     "Registry ActorMessage is no longer supported in v3; use ActorTell/ActorAsk frames"
+                );
+                return Ok(());
+            }
+
+            let authenticated_peer_id = authenticated_peer_id
+                .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));
+            if let (Some(authenticated), Some(claimed)) =
+                (authenticated_peer_id, registry_message_sender_peer_id(&msg))
+                && claimed != authenticated
+            {
+                warn!(
+                    peer = %peer_addr,
+                    authenticated_peer_id = %authenticated,
+                    claimed_peer_id = %claimed,
+                    "Dropping gossip message with mismatched authenticated peer identity"
                 );
                 return Ok(());
             }

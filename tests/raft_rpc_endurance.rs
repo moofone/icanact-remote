@@ -183,8 +183,7 @@ fn parse_env_u64(name: &str, default: u64) -> u64 {
 ///   - timer / task accounting drift over thousands of cycles
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "long-running endurance harness; invoke manually with --ignored"]
-async fn endurance_alternating_ask_and_drop_cycles_remain_healthy()
--> icanact_remote::Result<()> {
+async fn endurance_alternating_ask_and_drop_cycles_remain_healthy() -> icanact_remote::Result<()> {
     let total_seconds = parse_env_u64("RAFT_RPC_ENDURANCE_SECONDS", 300);
     let drop_interval_ms = parse_env_u64("RAFT_RPC_ENDURANCE_DROP_INTERVAL_MS", 250);
     let ask_interval_ms = parse_env_u64("RAFT_RPC_ENDURANCE_ASK_INTERVAL_MS", 50);

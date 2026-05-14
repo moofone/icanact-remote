@@ -1815,6 +1815,8 @@ impl<T> ConnectionPool<T> {
             match msg_result {
                 Ok(result) => {
                     if let Some(registry) = registry_weak.as_ref().and_then(|w| w.upgrade()) {
+                        let authenticated_peer_id =
+                            registry.connection_pool.get_peer_id_by_addr(&peer_addr);
                         if let Err(e) = crate::protocol::process_read_result(
                             result,
                             &mut streaming_state,
@@ -1822,7 +1824,7 @@ impl<T> ConnectionPool<T> {
                             peer_addr,
                             None,
                             None,
-                            None,
+                            authenticated_peer_id.as_ref(),
                         )
                         .await
                         {
@@ -1914,6 +1916,7 @@ pub(crate) fn handle_incoming_message(
                             gossip_state.peers.entry(sender_socket_addr)
                         {
                             let current_time = crate::current_timestamp();
+                            let current_time_ms = crate::current_timestamp_millis();
                             e.insert(crate::registry::PeerInfo {
                                 address: sender_socket_addr,
                                 peer_address: None,
@@ -1929,7 +1932,7 @@ pub(crate) fn handle_incoming_message(
                                 consecutive_deltas: 0,
                                 last_failure_time: None,
                                 last_dns_refresh_attempt: None,
-                                last_response_received: current_time,
+                                last_response_received_ms: current_time_ms,
                             });
                         }
                     }
@@ -1974,7 +1977,7 @@ pub(crate) fn handle_incoming_message(
                             // were actually heard by the peer's application
                             // layer. Mirror the inline-response path in
                             // `GossipRegistry::handle_gossip_response`.
-                            peer_info.last_response_received = crate::current_timestamp();
+                            peer_info.last_response_received_ms = crate::current_timestamp_millis();
 
                             peer_info.last_sequence =
                                 std::cmp::max(peer_info.last_sequence, delta.current_sequence);
@@ -2095,6 +2098,7 @@ pub(crate) fn handle_incoming_message(
                         {
                             info!(peer = %sender_socket_addr, "Adding new peer from FullSync");
                             let current_time = crate::current_timestamp();
+                            let current_time_ms = crate::current_timestamp_millis();
                             e.insert(crate::registry::PeerInfo {
                                 address: sender_socket_addr,
                                 peer_address: Some(_peer_addr), // Remember the actual connection address
@@ -2110,7 +2114,7 @@ pub(crate) fn handle_incoming_message(
                                 consecutive_deltas: 0,
                                 last_failure_time: None,
                                 last_dns_refresh_attempt: None,
-                                last_response_received: current_time,
+                                last_response_received_ms: current_time_ms,
                             });
                         }
                     }
@@ -2144,7 +2148,7 @@ pub(crate) fn handle_incoming_message(
                         // Inbound payload from peer — proves app-level liveness.
                         // See `handle_incoming_message::DeltaGossip` for the
                         // full rationale.
-                        peer_info.last_response_received = crate::current_timestamp();
+                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
                         peer_info.consecutive_deltas = 0;
                     } else {
                         warn!(peer = %sender_socket_addr, "Peer not found in peer list when trying to reset failure state");
@@ -2493,7 +2497,7 @@ pub(crate) fn handle_incoming_message(
                         // Inbound payload from peer — proves app-level liveness.
                         // See `handle_incoming_message::DeltaGossip` for the
                         // full rationale.
-                        peer_info.last_response_received = crate::current_timestamp();
+                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
                         had_failures
                     } else {
                         false

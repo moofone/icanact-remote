@@ -73,8 +73,8 @@ impl ActorMessageHandlerSync for ScriptedHandler {
 fn raft_rpc_cfg() -> GossipConfig {
     GossipConfig {
         gossip_interval: Duration::from_millis(50),
-        connection_timeout: Duration::from_millis(125),
-        response_timeout: Duration::from_millis(125),
+        connection_timeout: APPEND_ASK_TIMEOUT,
+        response_timeout: APPEND_ASK_TIMEOUT,
         max_peer_failures: 1,
         peer_retry_interval: Duration::from_millis(25),
         max_gossip_peers: 2,
@@ -116,15 +116,21 @@ async fn connect_pair(left: &TlsHandle, right: &TlsHandle) -> icanact_remote::Re
         .configure_peer(left.registry.peer_id.clone(), left.registry.bind_addr)
         .await;
 
-    left.add_peer(&right.registry.peer_id)
-        .await
-        .connect(&right.registry.bind_addr)
-        .await?;
-    right
-        .add_peer(&left.registry.peer_id)
-        .await
-        .connect(&left.registry.bind_addr)
-        .await?;
+    if left
+        .registry
+        .should_keep_connection(&right.registry.peer_id, true)
+    {
+        left.add_peer(&right.registry.peer_id)
+            .await
+            .connect(&right.registry.bind_addr)
+            .await?;
+    } else {
+        right
+            .add_peer(&left.registry.peer_id)
+            .await
+            .connect(&left.registry.bind_addr)
+            .await?;
+    }
     Ok(())
 }
 

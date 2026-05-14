@@ -1389,6 +1389,7 @@ impl LockFreeStreamHandle {
                                     streaming_state,
                                     &registry,
                                     ctx.peer_addr,
+                                    ctx.peer_id.as_ref(),
                                     ctx.response_correlation.as_ref().map(|c| c.as_ref()),
                                     ctx.sync_actor_handler.as_ref().map(|v| &**v),
                                     &mut stream,
@@ -1500,7 +1501,7 @@ impl LockFreeStreamHandle {
                             }
 
                             if let Some(result) = read_result.result {
-                                let Some(result) = try_handle_fast_io(
+                                if let Some(result) = try_handle_fast_io(
                                     result,
                                     ctx,
                                     &mut stream,
@@ -1519,39 +1520,38 @@ impl LockFreeStreamHandle {
                                         "Failed to process fast IO message"
                                     );
                                     None
-                                }) else {
-                                    continue;
-                                };
-                                if let Some(registry) = ctx.registry_weak.upgrade() {
-                                    if let Err(e) = process_read_result_io(
-                                        result,
-                                        streaming_state,
-                                        &registry,
-                                        ctx.peer_addr,
-                                        ctx.response_correlation.as_ref().map(|c| c.as_ref()),
-                                        ctx.sync_actor_handler.as_ref().map(|v| &**v),
-                                        &mut stream,
-                                        &bytes_written_counter,
-                                        &mut bytes_since_flush,
-                                        &mut response_batch,
-                                        &mut direct_response_batch,
-                                        perf,
-                                    )
-                                    .await
-                                    {
+                                }) {
+                                    if let Some(registry) = ctx.registry_weak.upgrade() {
+                                        if let Err(e) = process_read_result_io(
+                                            result,
+                                            streaming_state,
+                                            &registry,
+                                            ctx.peer_addr,
+                                            ctx.peer_id.as_ref(),
+                                            ctx.response_correlation.as_ref().map(|c| c.as_ref()),
+                                            ctx.sync_actor_handler.as_ref().map(|v| &**v),
+                                            &mut stream,
+                                            &bytes_written_counter,
+                                            &mut bytes_since_flush,
+                                            &mut response_batch,
+                                            &mut direct_response_batch,
+                                            perf,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                peer = %ctx.peer_addr,
+                                                error = %e,
+                                                "Failed to process message on IO task"
+                                            );
+                                        }
+                                    } else {
                                         warn!(
                                             peer = %ctx.peer_addr,
-                                            error = %e,
-                                            "Failed to process message on IO task"
+                                            "Registry dropped, stopping IO task"
                                         );
+                                        return;
                                     }
-
-                                } else {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        "Registry dropped, stopping IO task"
-                                    );
-                                    return;
                                 }
                             }
 
@@ -1617,6 +1617,7 @@ impl LockFreeStreamHandle {
                                             streaming_state,
                                             &registry,
                                             ctx.peer_addr,
+                                            ctx.peer_id.as_ref(),
                                             ctx.response_correlation.as_ref().map(|c| c.as_ref()),
                                             ctx.sync_actor_handler.as_ref().map(|v| &**v),
                                             &mut stream,
@@ -1662,6 +1663,7 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
+                                wrote_actor_responses = true;
                             }
                             if !direct_response_batch.is_empty() {
                                 if let Err(e) = write_direct_response_batch(
@@ -1679,15 +1681,20 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
+                                wrote_fast_responses = true;
                             }
-                            // Ensure actor responses don't sit in the kernel/TLS buffers indefinitely
-                            // on links that are primarily request->response (server-side).
-                            if should_flush(
-                                bytes_since_flush,
-                                last_flush.elapsed(),
-                                FLUSH_THRESHOLD,
-                                WRITER_MAX_LATENCY,
-                            ) {
+                            // Ensure request/response traffic does not sit in TLS buffers on
+                            // quiet links. The idle branch has no outer fast-flush checkpoint
+                            // after this select arm, so flush direct/actor responses here.
+                            if ((wrote_actor_responses || wrote_fast_responses)
+                                || should_flush(
+                                    bytes_since_flush,
+                                    last_flush.elapsed(),
+                                    FLUSH_THRESHOLD,
+                                    WRITER_MAX_LATENCY,
+                                ))
+                                && bytes_since_flush > 0
+                            {
                                 let _ = stream.flush().await;
                                 bytes_since_flush = 0;
                                 last_flush = std::time::Instant::now();

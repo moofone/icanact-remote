@@ -111,15 +111,21 @@ async fn connect_pair(left: &TlsHandle, right: &TlsHandle) -> icanact_remote::Re
         .configure_peer(left.registry.peer_id.clone(), left.registry.bind_addr)
         .await;
 
-    left.add_peer(&right.registry.peer_id)
-        .await
-        .connect(&right.registry.bind_addr)
-        .await?;
-    right
-        .add_peer(&left.registry.peer_id)
-        .await
-        .connect(&left.registry.bind_addr)
-        .await?;
+    if left
+        .registry
+        .should_keep_connection(&right.registry.peer_id, true)
+    {
+        left.add_peer(&right.registry.peer_id)
+            .await
+            .connect(&right.registry.bind_addr)
+            .await?;
+    } else {
+        right
+            .add_peer(&left.registry.peer_id)
+            .await
+            .connect(&left.registry.bind_addr)
+            .await?;
+    }
     Ok(())
 }
 
@@ -325,7 +331,8 @@ async fn timeout_storm_then_quiet_recovers_without_wedge() -> icanact_remote::Re
     assert!(wait_connected(&a, &b.registry.peer_id, Duration::from_secs(2)).await);
 
     // Fire a burst of asks during the storm. Tight ask budget guarantees each
-    // one times out; we just need the transport to remain responsive.
+    // one fails either by ask timeout or by explicit connection drop while the
+    // response is pending; we just need the transport to remain responsive.
     let storm_budget = Duration::from_millis(150);
     let mut storm_results = Vec::new();
     for i in 0..5u32 {
@@ -349,10 +356,7 @@ async fn timeout_storm_then_quiet_recovers_without_wedge() -> icanact_remote::Re
     }
 
     // Every storm ask must have errored — none can have raced through.
-    let timed_out = storm_results
-        .iter()
-        .filter(|r| r.is_err())
-        .count();
+    let timed_out = storm_results.iter().filter(|r| r.is_err()).count();
     assert!(
         timed_out >= 4,
         "expected most/all storm asks to time out, got {} timeouts of 5",
@@ -362,8 +366,10 @@ async fn timeout_storm_then_quiet_recovers_without_wedge() -> icanact_remote::Re
         if let Err(err) = result {
             let lowered = err.to_ascii_lowercase();
             assert!(
-                lowered.contains("timeout") || lowered.contains("timed out"),
-                "storm error must be a timeout, got: {err}"
+                lowered.contains("timeout")
+                    || lowered.contains("timed out")
+                    || lowered.contains("connection dropped"),
+                "storm error must be an explicit timeout/drop, got: {err}"
             );
         }
     }
@@ -371,7 +377,7 @@ async fn timeout_storm_then_quiet_recovers_without_wedge() -> icanact_remote::Re
     // Quiet phase: shrink server delay below the budget, transport must
     // recover without an explicit reconnect.
     delay_b.store(20, Ordering::Release);
-    sleep(Duration::from_millis(50)).await;
+    sleep(Duration::from_millis(1_000)).await;
 
     let response = raft_rpc_lookup_then_ask(
         &a,
@@ -400,13 +406,7 @@ async fn bursty_mixed_drop_and_ask_traffic_is_consistent() -> icanact_remote::Re
     let delay_b = Arc::new(AtomicU64::new(0));
 
     let a = node("raft-rpc-chaos-burst-a", "a", asks_a, delay_a).await?;
-    let b = node(
-        "raft-rpc-chaos-burst-b",
-        "b",
-        asks_b.clone(),
-        delay_b,
-    )
-    .await?;
+    let b = node("raft-rpc-chaos-burst-b", "b", asks_b.clone(), delay_b).await?;
     connect_pair(&a, &b).await?;
     assert!(wait_connected(&a, &b.registry.peer_id, Duration::from_secs(2)).await);
 
@@ -463,9 +463,7 @@ async fn bursty_mixed_drop_and_ask_traffic_is_consistent() -> icanact_remote::Re
         if i % 2 == 1 {
             a.disconnect_peer_connection(&b.registry.peer_id);
             b.disconnect_peer_connection(&a.registry.peer_id);
-            assert!(
-                wait_disconnected(&a, &b.registry.peer_id, Duration::from_millis(750)).await
-            );
+            assert!(wait_disconnected(&a, &b.registry.peer_id, Duration::from_millis(750)).await);
             a.add_peer(&b.registry.peer_id)
                 .await
                 .connect(&b.registry.bind_addr)
@@ -474,9 +472,7 @@ async fn bursty_mixed_drop_and_ask_traffic_is_consistent() -> icanact_remote::Re
                 .await
                 .connect(&a.registry.bind_addr)
                 .await?;
-            assert!(
-                wait_connected(&a, &b.registry.peer_id, Duration::from_millis(750)).await
-            );
+            assert!(wait_connected(&a, &b.registry.peer_id, Duration::from_millis(750)).await);
         }
     }
 

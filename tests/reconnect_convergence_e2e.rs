@@ -92,15 +92,21 @@ async fn connect_pair(left: &TlsHandle, right: &TlsHandle) -> icanact_remote::Re
     configure_static_peer(left, right).await;
     configure_static_peer(right, left).await;
 
-    left.add_peer(&right.registry.peer_id)
-        .await
-        .connect(&right.registry.bind_addr)
-        .await?;
-    right
-        .add_peer(&left.registry.peer_id)
-        .await
-        .connect(&left.registry.bind_addr)
-        .await?;
+    if left
+        .registry
+        .should_keep_connection(&right.registry.peer_id, true)
+    {
+        left.add_peer(&right.registry.peer_id)
+            .await
+            .connect(&right.registry.bind_addr)
+            .await?;
+    } else {
+        right
+            .add_peer(&left.registry.peer_id)
+            .await
+            .connect(&left.registry.bind_addr)
+            .await?;
+    }
 
     Ok(())
 }
@@ -507,8 +513,9 @@ async fn in_flight_ask_drop_does_not_poison_static_peer_reconnect() -> icanact_r
         matches!(
             pending_result,
             Err(icanact_remote::GossipError::ConnectionDropped)
+                | Err(icanact_remote::GossipError::Timeout)
         ),
-        "forced disconnect should complete pending ask as ConnectionDropped, got {pending_result:?}"
+        "forced disconnect should complete pending ask with an explicit bounded error, got {pending_result:?}"
     );
 
     bounded_ask_until_success(

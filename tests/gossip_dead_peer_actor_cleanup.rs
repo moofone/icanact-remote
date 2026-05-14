@@ -52,7 +52,8 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use icanact_remote::{
-    GossipConfig, GossipRegistryHandle, RegistrationPriority, RemoteActorLocation, SecretKey,
+    GossipConfig, GossipRegistryHandle, PeerId, RegistrationPriority, RemoteActorLocation,
+    SecretKey,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
@@ -92,7 +93,7 @@ where
         .expect("failed to spawn test thread")
         .join()
         .expect("test thread panicked")
-    }
+}
 
 async fn create_node(config: GossipConfig) -> Result<GossipRegistryHandle, DynError> {
     init_crypto();
@@ -137,11 +138,7 @@ async fn wait_for_actor(
     None
 }
 
-async fn wait_for_actor_gone(
-    node: &GossipRegistryHandle,
-    name: &str,
-    timeout: Duration,
-) -> bool {
+async fn wait_for_actor_gone(node: &GossipRegistryHandle, name: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if node.registry.lookup_actor(name).await.is_none() {
@@ -157,18 +154,41 @@ async fn peer_failures(node: &GossipRegistryHandle, addr: std::net::SocketAddr) 
     state.peers.get(&addr).map(|p| p.failures).unwrap_or(0)
 }
 
+async fn seed_known_actor_for_synthetic_peer(
+    node: &GossipRegistryHandle,
+    actor_name: &str,
+) -> Result<(std::net::SocketAddr, PeerId), DynError> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let peer_addr = listener.local_addr()?;
+    drop(listener);
+
+    let peer_id = SecretKey::generate().to_keypair().peer_id();
+    node.registry
+        .add_peer_with_node_id(peer_addr, Some(peer_id.to_node_id()))
+        .await;
+    node.registry.actor_state.known_actors.upsert_sync(
+        actor_name.to_string(),
+        RemoteActorLocation::new_with_peer(peer_addr, peer_id.clone()),
+    );
+
+    Ok((peer_addr, peer_id))
+}
+
 async fn diagnose_peer(node: &GossipRegistryHandle, addr: std::net::SocketAddr) -> String {
     let state = node.registry.gossip_state.lock().await;
     match state.peers.get(&addr) {
         Some(p) => format!(
-            "failures={} last_attempt={} last_success={} last_response_received={} peer_count={}",
+            "failures={} last_attempt={} last_success={} last_response_received_ms={} peer_count={}",
             p.failures,
             p.last_attempt,
             p.last_success,
-            p.last_response_received,
+            p.last_response_received_ms,
             state.peers.len()
         ),
-        None => format!("peer ABSENT from gossip_state; peer_count={}", state.peers.len()),
+        None => format!(
+            "peer ABSENT from gossip_state; peer_count={}",
+            state.peers.len()
+        ),
     }
 }
 
@@ -221,6 +241,8 @@ fn known_actors_owned_by_dropped_peer_get_pruned() -> Result<(), DynError> {
             // Default retry_interval is 5 s, which makes "three failed
             // rounds" take ~10 s. Shrink so the test finishes quickly.
             peer_retry_interval: Duration::from_millis(200),
+            connection_timeout: Duration::from_millis(250),
+            response_timeout: Duration::from_millis(250),
             // Default liveness window is 10 s; tighten for deterministic
             // response-asymmetry detection in CI.
             peer_liveness_window: Duration::from_millis(500),
@@ -243,10 +265,9 @@ fn known_actors_owned_by_dropped_peer_get_pruned() -> Result<(), DynError> {
             )
             .await?;
 
-        let loc =
-            wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
-                .await
-                .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        let loc = wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
+            .await
+            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
         assert_eq!(loc.peer_id, subscriber.registry.peer_id);
 
         // Subscriber goes offline ungracefully (port becomes refused).
@@ -280,12 +301,11 @@ fn known_actors_owned_by_dropped_peer_get_pruned() -> Result<(), DynError> {
 /// Case 2: peer's TCP stays accepting but it never processes incoming
 /// gossip frames (deadlocked, paused, app-level hang).
 ///
-/// We simulate this by shutting down the subscriber's gossip server
-/// while *keeping its bind addr alive* via a bare `TcpListener` that
-/// accepts and immediately drops connections. Gossip rounds on the
-/// publisher side see "connection accepted but no response" / timeout
-/// behavior and the same `failures++` path fires. Same assertion as
-/// case 1.
+/// We simulate this by applying successful send results with no gossip
+/// response while `last_response_received_ms` is already outside the liveness
+/// window. Gossip rounds on the publisher side see "kernel accepted write,
+/// but the peer gave no app-level response" and the same `failures++` path
+/// fires. Same assertion as case 1.
 #[test]
 fn known_actors_owned_by_stale_peer_get_pruned() -> Result<(), DynError> {
     run_gossip_test(async {
@@ -297,57 +317,99 @@ fn known_actors_owned_by_stale_peer_get_pruned() -> Result<(), DynError> {
             // Default liveness window is 10 s; tighten for deterministic
             // response-asymmetry detection in CI.
             peer_liveness_window: Duration::from_millis(500),
+            // Default dial timeout is 10 s; tighten so each failed
+            // redial to the accept-and-drop dummy listener completes
+            // within a gossip interval. Under multi-binary parallel test
+            // runs the 15-s assertion window otherwise catches only one
+            // or two rounds.
+            connection_timeout: Duration::from_millis(300),
             max_peer_failures: 3,
             ..Default::default()
         };
 
         let publisher = create_node(config.clone()).await?;
-        let subscriber = create_node(config.clone()).await?;
-        let sub_addr = subscriber.registry.bind_addr;
-        let sub_peer_id = subscriber.registry.peer_id.clone();
+        let (sub_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
 
-        connect_pair(&publisher, &subscriber).await;
+        {
+            let mut state = publisher.registry.gossip_state.lock().await;
+            let stale_cutoff = 60;
+            state
+                .peers
+                .get_mut(&sub_addr)
+                .expect("synthetic peer must be present")
+                .last_response_received_ms =
+                icanact_remote::current_timestamp_millis().saturating_sub(stale_cutoff * 1000);
+        }
 
-        subscriber
-            .registry
-            .register_actor_with_priority(
-                DEAD_ACTOR_NAME.to_string(),
-                RemoteActorLocation::new_with_peer(sub_addr, sub_peer_id.clone()),
-                RegistrationPriority::Immediate,
-            )
-            .await?;
+        for sequence in 0..config.max_peer_failures {
+            publisher
+                .registry
+                .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    peer_addr: sub_addr,
+                    sent_sequence: sequence as u64,
+                    outcome: Ok(None),
+                }])
+                .await;
+        }
 
-        let _ = wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
-            .await
-            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
-
-        // Stop the subscriber's gossip server but keep the port from
-        // being immediately rebindable. Replace it with a passive
-        // listener that accepts and drops, simulating an app-level
-        // hang.
-        subscriber.shutdown().await;
-        let dummy_listener = TcpListener::bind(sub_addr).await.map_err(|e| -> DynError {
-            format!("failed to rebind sub_addr as dummy listener: {e}").into()
-        })?;
-        let _accept_task = tokio::spawn(async move {
-            loop {
-                match dummy_listener.accept().await {
-                    Ok((stream, _)) => drop(stream),
-                    Err(_) => break,
-                }
-            }
-        });
-
-        assert!(
-            wait_for_peer_dead(&publisher, sub_addr, 3, Duration::from_secs(15)).await,
+        assert_eq!(
+            peer_failures(&publisher, sub_addr).await,
+            config.max_peer_failures,
             "publisher's gossip should mark stale subscriber dead after \
-             3 failed rounds (TCP accept-then-drop should count as failed exchange)"
+             max_peer_failures no-response rounds"
         );
 
         assert!(
             wait_for_actor_gone(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(5)).await,
             "stale subscriber's actor should be pruned from publisher's \
              known_actors after peer crossed max_peer_failures"
+        );
+
+        publisher.shutdown().await;
+        Ok(())
+    })
+}
+
+#[test]
+fn subsecond_liveness_window_counts_no_response() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(200),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let (sub_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
+
+        {
+            let mut state = publisher.registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&sub_addr)
+                .expect("synthetic peer must be present")
+                .last_response_received_ms =
+                icanact_remote::current_timestamp_millis().saturating_sub(600);
+        }
+
+        publisher
+            .registry
+            .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                peer_addr: sub_addr,
+                sent_sequence: 0,
+                outcome: Ok(None),
+            }])
+            .await;
+
+        assert_eq!(
+            peer_failures(&publisher, sub_addr).await,
+            1,
+            "a 500ms peer_liveness_window must be evaluated in milliseconds, \
+             not rounded down to a whole-second boundary"
         );
 
         publisher.shutdown().await;
@@ -384,28 +446,23 @@ fn disconnect_handler_invokes_peer_death_cleanup() -> Result<(), DynError> {
             gossip_interval: Duration::from_millis(100),
             peer_retry_interval: Duration::from_millis(200),
             peer_liveness_window: Duration::from_millis(500),
+            connection_timeout: Duration::from_millis(300),
             max_peer_failures: 3,
             ..Default::default()
         };
 
         let publisher = create_node(config.clone()).await?;
-        let subscriber = create_node(config.clone()).await?;
-        let sub_addr = subscriber.registry.bind_addr;
+        let (sub_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
 
-        connect_pair(&publisher, &subscriber).await;
-
-        subscriber
-            .registry
-            .register_actor_with_priority(
-                DEAD_ACTOR_NAME.to_string(),
-                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
-                RegistrationPriority::Immediate,
-            )
-            .await?;
-
-        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
-            .await
-            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        assert!(
+            publisher
+                .registry
+                .lookup_actor(DEAD_ACTOR_NAME)
+                .await
+                .is_some(),
+            "test precondition: synthetic peer actor should be present"
+        );
 
         // Sanity: peer is not failed yet.
         assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
@@ -439,7 +496,61 @@ fn disconnect_handler_invokes_peer_death_cleanup() -> Result<(), DynError> {
         );
 
         publisher.shutdown().await;
-        subscriber.shutdown().await;
+        Ok(())
+    })
+}
+
+#[test]
+fn disconnect_handler_canonicalizes_ephemeral_source_addr_before_cleanup() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(200),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let (sub_addr, sub_peer_id) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
+        let ephemeral_source_addr: std::net::SocketAddr = "127.0.0.1:49152".parse()?;
+
+        publisher
+            .registry
+            .connection_pool
+            .add_addr_to_peer_id(ephemeral_source_addr, sub_peer_id);
+        {
+            let mut state = publisher.registry.gossip_state.lock().await;
+            let peer = state
+                .peers
+                .get_mut(&sub_addr)
+                .expect("synthetic peer must be present");
+            peer.node_id = None;
+            peer.peer_address = Some(ephemeral_source_addr);
+        }
+
+        publisher
+            .registry
+            .handle_peer_connection_failure(ephemeral_source_addr)
+            .await?;
+
+        assert_eq!(
+            peer_failures(&publisher, sub_addr).await,
+            config.max_peer_failures,
+            "disconnects observed on an inbound TCP source alias must mark the \
+             configured peer address dead"
+        );
+        assert!(
+            publisher
+                .registry
+                .lookup_actor(DEAD_ACTOR_NAME)
+                .await
+                .is_none(),
+            "alias-normalized disconnect should prune actors owned by the dead peer"
+        );
+
+        publisher.shutdown().await;
         Ok(())
     })
 }
@@ -456,23 +567,16 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
         };
 
         let publisher = create_node(config.clone()).await?;
-        let subscriber = create_node(config.clone()).await?;
-        let sub_addr = subscriber.registry.bind_addr;
-
-        connect_pair(&publisher, &subscriber).await;
-
-        subscriber
-            .registry
-            .register_actor_with_priority(
-                DEAD_ACTOR_NAME.to_string(),
-                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
-                RegistrationPriority::Immediate,
-            )
-            .await?;
-
-        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
-            .await
-            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        let (sub_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
+        assert!(
+            publisher
+                .registry
+                .lookup_actor(DEAD_ACTOR_NAME)
+                .await
+                .is_some(),
+            "test precondition: synthetic peer actor should be present"
+        );
         assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
 
         // Construct a single fake gossip-round result indicating a
@@ -514,7 +618,6 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
         );
 
         publisher.shutdown().await;
-        subscriber.shutdown().await;
         Ok(())
     })
 }
@@ -542,23 +645,8 @@ fn periodic_gossip_drains_urgent_changes_into_history() -> Result<(), DynError> 
         };
 
         let publisher = create_node(config.clone()).await?;
-        let subscriber = create_node(config.clone()).await?;
-        let sub_addr = subscriber.registry.bind_addr;
-
-        connect_pair(&publisher, &subscriber).await;
-
-        subscriber
-            .registry
-            .register_actor_with_priority(
-                DEAD_ACTOR_NAME.to_string(),
-                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
-                RegistrationPriority::Immediate,
-            )
-            .await?;
-
-        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
-            .await
-            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        let (sub_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
 
         // Drive the apply_gossip_results hard-error fast path — this
         // is the caller that DOES NOT call trigger_immediate_gossip,
@@ -579,11 +667,13 @@ fn periodic_gossip_drains_urgent_changes_into_history() -> Result<(), DynError> 
         // Sanity: urgent_changes carries the ActorRemoved.
         {
             let state = publisher.registry.gossip_state.lock().await;
-            let has_urgent_removed = state.urgent_changes.iter().any(|c| matches!(
-                c,
-                icanact_remote::registry::RegistryChange::ActorRemoved { name, .. }
-                    if name == DEAD_ACTOR_NAME
-            ));
+            let has_urgent_removed = state.urgent_changes.iter().any(|c| {
+                matches!(
+                    c,
+                    icanact_remote::registry::RegistryChange::ActorRemoved { name, .. }
+                        if name == DEAD_ACTOR_NAME
+                )
+            });
             assert!(
                 has_urgent_removed,
                 "precondition: handle_peer_death from apply_gossip_results should \
@@ -603,13 +693,17 @@ fn periodic_gossip_drains_urgent_changes_into_history() -> Result<(), DynError> 
              (still {} entries — would be re-broadcast on every tick)",
             state.urgent_changes.len()
         );
-        let history_has_removed = state.delta_history.iter().flat_map(|d| d.changes.iter()).any(
-            |c| matches!(
-                c,
-                icanact_remote::registry::RegistryChange::ActorRemoved { name, .. }
-                    if name == DEAD_ACTOR_NAME
-            ),
-        );
+        let history_has_removed = state
+            .delta_history
+            .iter()
+            .flat_map(|d| d.changes.iter())
+            .any(|c| {
+                matches!(
+                    c,
+                    icanact_remote::registry::RegistryChange::ActorRemoved { name, .. }
+                        if name == DEAD_ACTOR_NAME
+                )
+            });
         assert!(
             history_has_removed,
             "drained urgent ActorRemoved entries must be folded into delta_history \
@@ -618,7 +712,6 @@ fn periodic_gossip_drains_urgent_changes_into_history() -> Result<(), DynError> 
         drop(state);
 
         publisher.shutdown().await;
-        subscriber.shutdown().await;
         Ok(())
     })
 }
@@ -643,23 +736,8 @@ fn socket_close_triggers_immediate_gossip_broadcast() -> Result<(), DynError> {
         };
 
         let publisher = create_node(config.clone()).await?;
-        let subscriber = create_node(config.clone()).await?;
-        let sub_addr = subscriber.registry.bind_addr;
-
-        connect_pair(&publisher, &subscriber).await;
-
-        subscriber
-            .registry
-            .register_actor_with_priority(
-                DEAD_ACTOR_NAME.to_string(),
-                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
-                RegistrationPriority::Immediate,
-            )
-            .await?;
-
-        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
-            .await
-            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        let (sub_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
         assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
 
         publisher
@@ -679,8 +757,10 @@ fn socket_close_triggers_immediate_gossip_broadcast() -> Result<(), DynError> {
         );
 
         // C1+C2 assertion: immediate gossip should have drained
-        // urgent_changes (sent them on the wire) and pending_changes
-        // should still carry the ActorRemoved as the retry record.
+        // urgent_changes (sent them on the wire). Depending on whether
+        // the immediate round had peers to send to, the ActorRemoved
+        // can remain in pending_changes or already be folded into
+        // delta_history.
         let state = publisher.registry.gossip_state.lock().await;
         let pending_has_actor_removed = state.pending_changes.iter().any(|c| match c {
             icanact_remote::registry::RegistryChange::ActorRemoved { name, .. } => {
@@ -688,11 +768,23 @@ fn socket_close_triggers_immediate_gossip_broadcast() -> Result<(), DynError> {
             }
             _ => false,
         });
+        let history_has_actor_removed = state
+            .delta_history
+            .iter()
+            .flat_map(|d| d.changes.iter())
+            .any(|c| match c {
+                icanact_remote::registry::RegistryChange::ActorRemoved { name, .. } => {
+                    name == DEAD_ACTOR_NAME
+                }
+                _ => false,
+            });
         assert!(
-            pending_has_actor_removed,
+            pending_has_actor_removed || history_has_actor_removed,
             "handle_peer_connection_failure should have enqueued an ActorRemoved \
-             for the dead peer's actor (pending_changes_len={}, urgent_changes_len={})",
+             for the dead peer's actor (pending_changes_len={}, \
+             history_has_actor_removed={}, urgent_changes_len={})",
             state.pending_changes.len(),
+            history_has_actor_removed,
             state.urgent_changes.len()
         );
         // urgent_changes must be empty: trigger_immediate_gossip
@@ -708,7 +800,6 @@ fn socket_close_triggers_immediate_gossip_broadcast() -> Result<(), DynError> {
         drop(state);
 
         publisher.shutdown().await;
-        subscriber.shutdown().await;
         Ok(())
     })
 }
@@ -739,23 +830,8 @@ fn peer_death_queues_actor_removed_for_gossip() -> Result<(), DynError> {
         };
 
         let publisher = create_node(config.clone()).await?;
-        let subscriber = create_node(config.clone()).await?;
-        let sub_addr = subscriber.registry.bind_addr;
-
-        connect_pair(&publisher, &subscriber).await;
-
-        subscriber
-            .registry
-            .register_actor_with_priority(
-                DEAD_ACTOR_NAME.to_string(),
-                RemoteActorLocation::new_with_peer(sub_addr, subscriber.registry.peer_id.clone()),
-                RegistrationPriority::Immediate,
-            )
-            .await?;
-
-        wait_for_actor(&publisher, DEAD_ACTOR_NAME, Duration::from_secs(3))
-            .await
-            .ok_or_else::<DynError, _>(|| "subscriber's actor never propagated".into())?;
+        let (sub_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
         assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
 
         let hard_err = icanact_remote::registry::GossipResult {
@@ -812,7 +888,6 @@ fn peer_death_queues_actor_removed_for_gossip() -> Result<(), DynError> {
         drop(state);
 
         publisher.shutdown().await;
-        subscriber.shutdown().await;
         Ok(())
     })
 }
