@@ -317,6 +317,12 @@ fn known_actors_owned_by_stale_peer_get_pruned() -> Result<(), DynError> {
             // Default liveness window is 10 s; tighten for deterministic
             // response-asymmetry detection in CI.
             peer_liveness_window: Duration::from_millis(500),
+            // Default dial timeout is 10 s; tighten so each failed
+            // redial to the accept-and-drop dummy listener completes
+            // within a gossip interval. Under multi-binary parallel test
+            // runs the 15-s assertion window otherwise catches only one
+            // or two rounds.
+            connection_timeout: Duration::from_millis(300),
             max_peer_failures: 3,
             ..Default::default()
         };
@@ -440,6 +446,7 @@ fn disconnect_handler_invokes_peer_death_cleanup() -> Result<(), DynError> {
             gossip_interval: Duration::from_millis(100),
             peer_retry_interval: Duration::from_millis(200),
             peer_liveness_window: Duration::from_millis(500),
+            connection_timeout: Duration::from_millis(300),
             max_peer_failures: 3,
             ..Default::default()
         };
