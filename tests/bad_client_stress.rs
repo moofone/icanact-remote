@@ -103,7 +103,6 @@ async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
         let frame = tokio::time::timeout(remaining, read_length_prefixed_frame(stream))
             .await
             .expect("timeout");
-        let frame = frame;
         if frame.first().copied() == Some(icanact_remote::MessageType::DirectResponse as u8) {
             let got_corr = u16::from_be_bytes([frame[1], frame[2]]);
             if got_corr == correlation_id {

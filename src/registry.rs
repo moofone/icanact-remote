@@ -1138,6 +1138,14 @@ pub struct GossipRegistry<T = ()> {
 
     // Stream assembly state (lock-free map).
     pub stream_assemblies: Arc<SccHashMap<u64, StreamAssembly>>,
+    /// Per-peer in-flight stream count. CAS-style counter so the
+    /// per-peer cap (`MAX_INFLIGHT_STREAMS_PER_PEER`) is enforced
+    /// atomically — count-then-insert lets N concurrent admissions
+    /// all pass the check before any insert. Decremented on
+    /// `complete_stream_assembly`, `cleanup_stale_stream_assemblies`,
+    /// and `evict_peer_side_tables`.
+    pub inflight_streams_per_peer:
+        Arc<SccHashMap<std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>>>,
 
     // Pending ACKs for synchronous registrations (bounded, lock-free map).
     pub pending_acks: Arc<SccHashMap<String, Arc<PendingAck>>>,
@@ -1332,6 +1340,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_disconnect_handler: Arc::new(ArcSwapOption::empty()),
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
             stream_assemblies: Arc::new(SccHashMap::default()),
+            inflight_streams_per_peer: Arc::new(SccHashMap::default()),
             pending_acks: Arc::new(SccHashMap::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
             dns_resolver: Arc::new(tokio::sync::RwLock::new(Arc::new(
@@ -2349,6 +2358,14 @@ impl<T: 'static> GossipRegistry<T> {
         mut location: RemoteActorLocation,
         priority: RegistrationPriority,
     ) -> Result<()> {
+        // Cheap atomic short-circuit before any allocation or
+        // contention on `gossip_state`. Mirrors `prepare_gossip_round`'s
+        // pre-check so a registration storm during shutdown doesn't
+        // pile up on the big lock.
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(GossipError::Shutdown);
+        }
+
         let register_start_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2380,11 +2397,11 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // Increment vector clock before insertion for atomicity of "this write".
-        if let Some(tombstone) = self
+        let previous_tombstone = self
             .actor_state
             .removed_actors
-            .read_sync(name.as_str(), |_, tombstone| tombstone.clone())
-        {
+            .read_sync(name.as_str(), |_, tombstone| tombstone.clone());
+        if let Some(tombstone) = previous_tombstone.as_ref() {
             location.vector_clock.merge(&tombstone.vector_clock);
         }
         location.vector_clock.increment(location.node_id);
@@ -2409,8 +2426,18 @@ impl<T: 'static> GossipRegistry<T> {
         let should_trigger_immediate = {
             let mut gossip_state = self.gossip_state.lock().await;
 
-            // Check shutdown
-            if gossip_state.shutdown {
+            // Re-check shutdown under the lock — the atomic is the
+            // canonical source of truth (see `shutdown()`); the
+            // legacy mutex bool is a redundant cache that lags the
+            // atomic, so trust the atomic.
+            if self.shutdown.load(Ordering::Acquire) {
+                let _ = self.actor_state.local_actors.remove_sync(name.as_str());
+                if let Some(tombstone) = previous_tombstone.clone() {
+                    let _ = self
+                        .actor_state
+                        .removed_actors
+                        .upsert_sync(name.clone(), tombstone);
+                }
                 return Err(GossipError::Shutdown);
             }
 
@@ -2468,6 +2495,11 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Unregister a local actor
     pub async fn unregister_actor(&self, name: &str) -> Result<Option<RemoteActorLocation>> {
+        // Cheap atomic short-circuit before touching any state.
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(GossipError::Shutdown);
+        }
+
         // Remove from actor state
         let removed = self
             .actor_state
@@ -2495,8 +2527,12 @@ impl<T: 'static> GossipRegistry<T> {
             let should_trigger_immediate = {
                 let mut gossip_state = self.gossip_state.lock().await;
 
-                // Check shutdown
-                if gossip_state.shutdown {
+                // Re-check shutdown under the lock — see register_actor_with_priority.
+                if self.shutdown.load(Ordering::Acquire) {
+                    let _ = self
+                        .actor_state
+                        .local_actors
+                        .upsert_sync(name.to_string(), location.clone());
                     return Err(GossipError::Shutdown);
                 }
 
@@ -2682,202 +2718,6 @@ impl<T: 'static> GossipRegistry<T> {
             .unwrap()
             .as_nanos();
 
-        // First pass: decide what to apply WITHOUT mutating any shared
-        // state. Vector-clock comparisons are pure reads of
-        // `known_actors` / `removed_actors` and survive a concurrent
-        // `cleanup_dead_peers` pass; the actual writes happen later
-        // under the gossip_state lock so the two side tables can be
-        // updated atomically. See test
-        // `test_apply_delta_and_cleanup_dead_peers_preserve_invariant`
-        // for the race this guards against.
-        enum Plan {
-            Add {
-                name: String,
-                location: RemoteActorLocation,
-                clear_tombstone: bool,
-            },
-            Remove {
-                name: String,
-                vector_clock: crate::VectorClock,
-                tombstone_only: bool,
-            },
-            LogAdd {
-                name: String,
-                location: RemoteActorLocation,
-            },
-        }
-        let mut plans: Vec<Plan> = Vec::with_capacity(total_changes);
-
-        for change in delta.changes {
-            match &change {
-                RegistryChange::ActorAdded {
-                    name,
-                    location,
-                    priority: _,
-                } => {
-                    // Ignore stale self-announcements coming back from peers.
-                    if location.peer_id == self.peer_id {
-                        debug!(
-                            actor_name = %name,
-                            "skipping remote actor update - change references this node as the host"
-                        );
-                        continue;
-                    }
-
-                    // Don't override local actors.
-                    if self.actor_state.local_actors.contains_sync(name.as_str()) {
-                        debug!(
-                            actor_name = %name,
-                            "skipping remote actor update - actor is local"
-                        );
-                        continue;
-                    }
-
-                    let mut clear_tombstone = false;
-                    if let Some(tombstone) = self
-                        .actor_state
-                        .removed_actors
-                        .read_sync(name.as_str(), |_, tombstone| tombstone.vector_clock.clone())
-                    {
-                        match location.vector_clock.compare(&tombstone) {
-                            crate::ClockOrdering::After => {
-                                clear_tombstone = true;
-                            }
-                            crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
-                                if owner_recovery_wins_tombstone(
-                                    location,
-                                    &delta.sender_peer_id,
-                                    &tombstone,
-                                ) =>
-                            {
-                                clear_tombstone = true;
-                            }
-                            crate::ClockOrdering::Before
-                            | crate::ClockOrdering::Equal
-                            | crate::ClockOrdering::Concurrent => {
-                                debug!(
-                                    actor_name = %name,
-                                    "skipping remote actor update - actor tombstone is newer or concurrent"
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    let should_apply = self
-                        .actor_state
-                        .known_actors
-                        .read_sync(name.as_str(), |_, existing_location| {
-                            match location
-                                .vector_clock
-                                .compare(&existing_location.vector_clock)
-                            {
-                                crate::ClockOrdering::After => true,
-                                crate::ClockOrdering::Concurrent
-                                | crate::ClockOrdering::Equal => {
-                                    stable_concurrent_location_wins(location, existing_location)
-                                }
-                                crate::ClockOrdering::Before => false,
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            debug!(actor_name = %name, "applying new actor");
-                            true
-                        });
-
-                    if should_apply {
-                        plans.push(Plan::Add {
-                            name: name.clone(),
-                            location: location.clone(),
-                            clear_tombstone,
-                        });
-                        if tracing::enabled!(tracing::Level::INFO) {
-                            plans.push(Plan::LogAdd {
-                                name: name.clone(),
-                                location: location.clone(),
-                            });
-                        }
-                    }
-                }
-                RegistryChange::ActorRemoved {
-                    name,
-                    vector_clock,
-                    removing_node_id,
-                    priority: _,
-                } => {
-                    if self.actor_state.local_actors.contains_sync(name.as_str()) {
-                        debug!(
-                            actor_name = %name,
-                            "skipping actor removal - actor is local"
-                        );
-                        continue;
-                    }
-
-                    let should_remove = self
-                        .actor_state
-                        .known_actors
-                        .read_sync(name.as_str(), |_, existing_location| {
-                            match vector_clock.compare(&existing_location.vector_clock) {
-                                crate::ClockOrdering::After => {
-                                    debug!(
-                                        actor_name = %name,
-                                        "removal is causally after current state - applying"
-                                    );
-                                    true
-                                }
-                                crate::ClockOrdering::Concurrent => {
-                                    let should_apply = stable_concurrent_removal_wins(
-                                        removing_node_id,
-                                        vector_clock,
-                                        existing_location,
-                                    );
-                                    debug!(
-                                        actor_name = %name,
-                                        removing_node = %removing_node_id.fmt_short(),
-                                        existing_node = %existing_location.node_id.fmt_short(),
-                                        should_apply = should_apply,
-                                        "removal is concurrent with current state - using node_id tiebreaker"
-                                    );
-                                    should_apply
-                                }
-                                _ => {
-                                    debug!(
-                                        actor_name = %name,
-                                        "removal is outdated - ignoring"
-                                    );
-                                    false
-                                }
-                            }
-                        });
-
-                    match should_remove {
-                        Some(true) => {
-                            plans.push(Plan::Remove {
-                                name: name.clone(),
-                                vector_clock: vector_clock.clone(),
-                                tombstone_only: false,
-                            });
-                        }
-                        Some(false) => {}
-                        None => {
-                            // Actor not in known_actors; still record a
-                            // tombstone so future re-adds with this
-                            // clock are suppressed.
-                            plans.push(Plan::Remove {
-                                name: name.clone(),
-                                vector_clock: vector_clock.clone(),
-                                tombstone_only: true,
-                            });
-                            debug!(
-                                actor_name = %name,
-                                "actor not found - will record removal tombstone"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
         // Resolve the sender's address before taking the lock so the
         // lock section is short.
         let sender_addr = {
@@ -2898,31 +2738,46 @@ impl<T: 'static> GossipRegistry<T> {
         let log_adds: Vec<(String, RemoteActorLocation)> = {
             let mut gossip_state = self.gossip_state.lock().await;
             let mut log_adds = Vec::new();
-            for plan in plans {
-                match plan {
-                    Plan::Add {
+            for change in delta.changes {
+                match change {
+                    RegistryChange::ActorAdded {
                         name,
                         location,
-                        clear_tombstone,
+                        priority: _,
                     } => {
+                        let Some((clear_tombstone, _is_update)) = self.current_actor_upsert_plan(
+                            name.as_str(),
+                            &location,
+                            &sender_peer_id,
+                        ) else {
+                            continue;
+                        };
                         if clear_tombstone {
-                            let _ = self
-                                .actor_state
-                                .removed_actors
-                                .remove_sync(name.as_str());
+                            let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                         }
                         let _ = self
                             .actor_state
                             .known_actors
-                            .upsert_sync(name.clone(), location);
-                        peer_actors_added.insert(name);
+                            .upsert_sync(name.clone(), location.clone());
+                        peer_actors_added.insert(name.clone());
                         applied_count += 1;
+                        if tracing::enabled!(tracing::Level::INFO) {
+                            log_adds.push((name, location));
+                        }
                     }
-                    Plan::Remove {
+                    RegistryChange::ActorRemoved {
                         name,
                         vector_clock,
-                        tombstone_only,
+                        removing_node_id,
+                        priority: _,
                     } => {
+                        let Some(tombstone_only) = self.current_actor_removal_plan(
+                            name.as_str(),
+                            &vector_clock,
+                            &removing_node_id,
+                        ) else {
+                            continue;
+                        };
                         if tombstone_only {
                             let _ = self.actor_state.removed_actors.upsert_sync(
                                 name.clone(),
@@ -2938,14 +2793,11 @@ impl<T: 'static> GossipRegistry<T> {
                         {
                             peer_actors_removed.insert(name.clone());
                             applied_count += 1;
-                            let _ = self.actor_state.removed_actors.upsert_sync(
-                                name,
-                                RemovedActorTombstone::new(vector_clock),
-                            );
+                            let _ = self
+                                .actor_state
+                                .removed_actors
+                                .upsert_sync(name, RemovedActorTombstone::new(vector_clock));
                         }
-                    }
-                    Plan::LogAdd { name, location } => {
-                        log_adds.push((name, location));
                     }
                 }
             }
@@ -2972,15 +2824,12 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Emit per-actor timing logs outside the critical section.
         for (name, location) in log_adds {
-            let propagation_time_nanos =
-                received_timestamp - location.local_registration_time;
+            let propagation_time_nanos = received_timestamp - location.local_registration_time;
             let propagation_time_ms = propagation_time_nanos as f64 / 1_000_000.0;
             let network_processing_time_nanos =
                 received_timestamp - delta.precise_timing_nanos as u128;
-            let network_processing_time_ms =
-                network_processing_time_nanos as f64 / 1_000_000.0;
-            let processing_only_time_ms =
-                propagation_time_ms - network_processing_time_ms;
+            let network_processing_time_ms = network_processing_time_nanos as f64 / 1_000_000.0;
+            let processing_only_time_ms = propagation_time_ms - network_processing_time_ms;
             info!(
                 actor_name = %name,
                 priority = ?location.priority,
@@ -3255,6 +3104,143 @@ impl<T: 'static> GossipRegistry<T> {
         });
 
         (local, known)
+    }
+
+    fn current_actor_upsert_plan(
+        &self,
+        name: &str,
+        location: &RemoteActorLocation,
+        sender_peer_id: &PeerId,
+    ) -> Option<(bool, bool)> {
+        if location.peer_id == self.peer_id {
+            debug!(
+                actor_name = %name,
+                "skipping remote actor update - change references this node as the host"
+            );
+            return None;
+        }
+
+        if self.actor_state.local_actors.contains_sync(name) {
+            debug!(
+                actor_name = %name,
+                "skipping remote actor update - actor is local"
+            );
+            return None;
+        }
+
+        let mut clear_tombstone = false;
+        if let Some(tombstone) = self
+            .actor_state
+            .removed_actors
+            .read_sync(name, |_, tombstone| tombstone.vector_clock.clone())
+        {
+            match location.vector_clock.compare(&tombstone) {
+                crate::ClockOrdering::After => {
+                    clear_tombstone = true;
+                }
+                crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
+                    if owner_recovery_wins_tombstone(location, sender_peer_id, &tombstone) =>
+                {
+                    clear_tombstone = true;
+                }
+                crate::ClockOrdering::Before
+                | crate::ClockOrdering::Equal
+                | crate::ClockOrdering::Concurrent => {
+                    debug!(
+                        actor_name = %name,
+                        "skipping remote actor update - actor tombstone is newer or concurrent"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let is_update = self
+            .actor_state
+            .known_actors
+            .read_sync(name, |_, existing_location| {
+                match location
+                    .vector_clock
+                    .compare(&existing_location.vector_clock)
+                {
+                    crate::ClockOrdering::After => Some(true),
+                    crate::ClockOrdering::Concurrent | crate::ClockOrdering::Equal => {
+                        stable_concurrent_location_wins(location, existing_location).then_some(true)
+                    }
+                    crate::ClockOrdering::Before => None,
+                }
+            });
+
+        match is_update {
+            Some(Some(true)) => Some((clear_tombstone, true)),
+            Some(Some(false)) | Some(None) => None,
+            None => {
+                debug!(actor_name = %name, "applying new actor");
+                Some((clear_tombstone, false))
+            }
+        }
+    }
+
+    fn current_actor_removal_plan(
+        &self,
+        name: &str,
+        vector_clock: &crate::VectorClock,
+        removing_node_id: &crate::NodeId,
+    ) -> Option<bool> {
+        if self.actor_state.local_actors.contains_sync(name) {
+            debug!(
+                actor_name = %name,
+                "skipping actor removal - actor is local"
+            );
+            return None;
+        }
+
+        let should_remove = self.actor_state.known_actors.read_sync(
+            name,
+            |_, existing_location| match vector_clock.compare(&existing_location.vector_clock) {
+                crate::ClockOrdering::After => {
+                    debug!(
+                        actor_name = %name,
+                        "removal is causally after current state - applying"
+                    );
+                    Some(false)
+                }
+                crate::ClockOrdering::Concurrent => {
+                    let should_apply = stable_concurrent_removal_wins(
+                        removing_node_id,
+                        vector_clock,
+                        existing_location,
+                    );
+                    debug!(
+                        actor_name = %name,
+                        removing_node = %removing_node_id.fmt_short(),
+                        existing_node = %existing_location.node_id.fmt_short(),
+                        should_apply = should_apply,
+                        "removal is concurrent with current state - using node_id tiebreaker"
+                    );
+                    should_apply.then_some(false)
+                }
+                _ => {
+                    debug!(
+                        actor_name = %name,
+                        "removal is outdated - ignoring"
+                    );
+                    None
+                }
+            },
+        );
+
+        match should_remove {
+            Some(Some(tombstone_only)) => Some(tombstone_only),
+            Some(None) => None,
+            None => {
+                debug!(
+                    actor_name = %name,
+                    "actor not found - will record removal tombstone"
+                );
+                Some(true)
+            }
+        }
     }
 
     pub(crate) fn snapshot_actor_pairs(
@@ -3866,8 +3852,7 @@ impl<T: 'static> GossipRegistry<T> {
             // inbound response may have already advanced these fields.
             // Take the max so concurrent writes never roll the value
             // backwards.
-            peer_info.last_response_received_ms =
-                peer_info.last_response_received_ms.max(now);
+            peer_info.last_response_received_ms = peer_info.last_response_received_ms.max(now);
             peer_info.last_success = peer_info.last_success.max(current_timestamp());
             // Keep the death verdict sticky: once a peer has crossed
             // max_peer_failures, only a fresh handshake (via
@@ -3931,6 +3916,36 @@ impl<T: 'static> GossipRegistry<T> {
                 discovery.on_peer_disconnected(dead_peer_addr);
             }
         }
+
+        // In-flight stream assemblies pinned to the dead peer would
+        // otherwise hold their `PooledAlignedBuffer`s until the 60s
+        // `STREAM_ASSEMBLY_TIMEOUT` sweep, costing up to
+        // MAX_INFLIGHT_STREAMS_PER_PEER × MAX_STREAM_SIZE of pooled
+        // memory per dead peer under churn. Drop them at detection
+        // time and zero the per-peer admission counter so a recovering
+        // peer doesn't start out at-cap.
+        let mut dead_streams: Vec<u64> = Vec::new();
+        self.stream_assemblies.iter_sync(|stream_id, assembly| {
+            if assembly.peer_addr == Some(dead_peer_addr) {
+                dead_streams.push(*stream_id);
+            }
+            true
+        });
+        if !dead_streams.is_empty() {
+            let n = dead_streams.len();
+            for stream_id in dead_streams {
+                let _ = self.stream_assemblies.remove_sync(&stream_id);
+            }
+            debug!(
+                peer = %dead_peer_addr,
+                dropped = n,
+                "dropped in-flight stream assemblies for dead peer"
+            );
+        }
+        // Zero the per-peer admission counter entirely. Any concurrent
+        // `start_stream_assembly` on this address races with our death
+        // verdict — it will re-create the counter at zero on next entry.
+        let _ = self.inflight_streams_per_peer.remove_sync(&dead_peer_addr);
     }
 
     /// Cleanup hook fired when a peer's `failures` crosses
@@ -3942,11 +3957,14 @@ impl<T: 'static> GossipRegistry<T> {
     /// a duplicate.
     ///
     /// Re-admission on recovery requires an actual new connection
-    /// (`mark_peer_connected` on a fresh handshake) — `record_peer_activity`
-    /// only decays failures while the peer is still below threshold, so
-    /// a dying peer's late responses cannot resurrect it. The next
-    /// FullSync after reconnection repopulates `known_actors` via the
-    /// existing `merge_full_sync` / `apply_delta` paths.
+    /// (`mark_peer_connected` or `mark_inbound_connection_observed` on
+    /// a fresh handshake). Those paths clear `failures` unconditionally,
+    /// so a real reconnect always resurrects the peer. Softer signals
+    /// (`record_peer_activity`, `mark_response_received`) keep the
+    /// sticky `< max_peer_failures` gate, so a dying peer's late
+    /// responses cannot resurrect it. The next FullSync after
+    /// reconnection repopulates `known_actors` via the existing
+    /// `merge_full_sync` / `apply_delta` paths.
     async fn handle_peer_death(
         &self,
         dead_peer_addr: SocketAddr,
@@ -3980,11 +3998,12 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         };
 
-        // 1. Prune known_actors owned by this peer, capturing each
-        //    pruned location so we can fan an ActorRemoved gossip
-        //    change out to the rest of the cluster (C3 — without
-        //    this, indirect peers keep routing to the dead peer's
-        //    actors until their own gossip rounds time out).
+        // 1. Plan-then-execute: scan `known_actors` lock-free to
+        //    collect the peer's actor names + locations. The actual
+        //    removal happens inside the gossip_state critical section
+        //    in step 3 so prune and tombstone-write are atomic against
+        //    a concurrent `apply_delta` that might otherwise re-insert
+        //    one of these names between the prune and the tombstone.
         let mut to_remove: Vec<(String, RemoteActorLocation)> = Vec::new();
         self.actor_state.known_actors.iter_sync(|name, location| {
             if location.peer_id == dead_peer_id {
@@ -3992,9 +4011,6 @@ impl<T: 'static> GossipRegistry<T> {
             }
             true
         });
-        for (name, _) in &to_remove {
-            let _ = self.actor_state.known_actors.remove_sync(name.as_str());
-        }
 
         // 2. Force-disconnect the pool entry so the peer must re-handshake
         //    when it returns. Prevents writes into a stale half-open
@@ -4004,11 +4020,15 @@ impl<T: 'static> GossipRegistry<T> {
             .connection_pool
             .disconnect_connection_by_peer_id(&dead_peer_id);
 
-        // 3. Reset per-peer sequence + last_response_received_ms so a
-        //    recovering peer's next FullSync is accepted (mirrors the
-        //    DNS-change reset path at registry.rs ~1980), and enqueue
-        //    an Immediate-priority ActorRemoved for every pruned actor
-        //    so the next gossip round propagates the death cluster-wide.
+        // 3. Atomic prune + tombstone + urgent-change enqueue under the
+        //    gossip_state lock. Combining the `known_actors.remove_sync`
+        //    with the `removed_actors.upsert_sync` write under the same
+        //    lock closes the window where a concurrent `apply_delta`
+        //    could re-insert the just-pruned actor name (it would see
+        //    no tombstone, then we'd write the tombstone afterward and
+        //    leave a stale `known_actors` entry pointing at the dead
+        //    peer). Also resets per-peer sequence + response timestamp
+        //    so a recovering peer's next FullSync is accepted.
         let mut have_urgent = false;
         {
             let mut gossip_state = self.gossip_state.lock().await;
@@ -4017,9 +4037,31 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_info.last_response_received_ms = 0;
             }
             let removing_node_id = self.peer_id.to_node_id();
-            for (name, location) in &to_remove {
+            for (name, scanned_location) in &to_remove {
+                let Some(location) = self
+                    .actor_state
+                    .known_actors
+                    .read_sync(name.as_str(), |_, location| location.clone())
+                else {
+                    continue;
+                };
+                if location.peer_id != dead_peer_id {
+                    debug!(
+                        actor_name = %name,
+                        scanned_peer = %scanned_location.peer_id,
+                        current_peer = %location.peer_id,
+                        dead_peer = %dead_peer_id,
+                        "skipping peer-death actor prune; actor moved after scan"
+                    );
+                    continue;
+                }
                 let removal_clock = location.vector_clock.clone();
                 removal_clock.increment(removing_node_id);
+                // Remove + tombstone-write are now back-to-back under
+                // the gossip_state lock — apply_delta's execute phase
+                // takes the same lock, so it cannot interleave between
+                // them.
+                let _ = self.actor_state.known_actors.remove_sync(name.as_str());
                 let _ = self.actor_state.removed_actors.upsert_sync(
                     name.clone(),
                     RemovedActorTombstone::new(removal_clock.clone()),
@@ -4198,13 +4240,13 @@ impl<T: 'static> GossipRegistry<T> {
         let mut updated_actors = 0;
         let mut peer_actors = std::collections::HashSet::new();
 
-        // Pre-compute all updates outside the lock to minimize lock hold time
+        // Collect wire candidates outside the lock; validate current state while applying.
         let mut updates_to_apply = Vec::new();
 
-        // STEP 1: Read current state snapshot.
-        let (local_actors, known_actors) = self.snapshot_actor_maps();
-
-        // STEP 2: Compute all updates outside any lock (fast, pure computation)
+        // STEP 1: Collect candidate updates outside the gossip_state
+        // lock. The current actor/tombstone checks happen in the
+        // critical section below so stale pre-lock snapshots cannot
+        // overwrite newer gossip.
         // Process remote local actors
         for (name, location) in remote_local {
             peer_actors.insert(name.clone());
@@ -4215,64 +4257,7 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
-            if !local_actors.contains_key(&name) {
-                if let Some(tombstone) = self
-                    .actor_state
-                    .removed_actors
-                    .read_sync(name.as_str(), |_, tombstone| tombstone.vector_clock.clone())
-                {
-                    match location.vector_clock.compare(&tombstone) {
-                        crate::ClockOrdering::After => {
-                            let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
-                        }
-                        crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
-                            if owner_recovery_wins_tombstone(
-                                &location,
-                                &sender_peer_id,
-                                &tombstone,
-                            ) =>
-                        {
-                            let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
-                        }
-                        crate::ClockOrdering::Before
-                        | crate::ClockOrdering::Equal
-                        | crate::ClockOrdering::Concurrent => {
-                            debug!(
-                                actor_name = %name,
-                                "skipping full-sync actor update - actor tombstone is newer or concurrent"
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                match known_actors.get(&name) {
-                    Some(existing_location) => {
-                        // Use vector clock for causal ordering
-                        match location
-                            .vector_clock
-                            .compare(&existing_location.vector_clock)
-                        {
-                            crate::ClockOrdering::After => {
-                                // New location is causally after existing
-                                updates_to_apply.push((name.clone(), location));
-                                updated_actors += 1;
-                            }
-                            crate::ClockOrdering::Concurrent | crate::ClockOrdering::Equal => {
-                                if stable_concurrent_location_wins(&location, existing_location) {
-                                    updates_to_apply.push((name.clone(), location));
-                                    updated_actors += 1;
-                                }
-                            }
-                            crate::ClockOrdering::Before => {} // Keep existing
-                        }
-                    }
-                    None => {
-                        updates_to_apply.push((name.clone(), location));
-                        new_actors += 1;
-                    }
-                }
-            }
+            updates_to_apply.push((name, location));
         }
 
         // Process remote known actors
@@ -4284,95 +4269,44 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
-            if local_actors.contains_key(&name) {
-                continue; // Don't override local actors
-            }
-
-            if let Some(tombstone) = self
-                .actor_state
-                .removed_actors
-                .read_sync(name.as_str(), |_, tombstone| tombstone.vector_clock.clone())
-            {
-                match location.vector_clock.compare(&tombstone) {
-                    crate::ClockOrdering::After => {
-                        let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
-                    }
-                    crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
-                        if owner_recovery_wins_tombstone(
-                            &location,
-                            &sender_peer_id,
-                            &tombstone,
-                        ) =>
-                    {
-                        let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
-                    }
-                    crate::ClockOrdering::Before
-                    | crate::ClockOrdering::Equal
-                    | crate::ClockOrdering::Concurrent => {
-                        debug!(
-                            actor_name = %name,
-                            "skipping full-sync known actor update - actor tombstone is newer or concurrent"
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            match known_actors.get(&name) {
-                Some(existing_location) => {
-                    // Use vector clock for causal ordering
-                    match location
-                        .vector_clock
-                        .compare(&existing_location.vector_clock)
-                    {
-                        crate::ClockOrdering::After => {
-                            // New location is causally after existing
-                            updates_to_apply.push((name, location));
-                            updated_actors += 1;
-                        }
-                        crate::ClockOrdering::Concurrent | crate::ClockOrdering::Equal => {
-                            if stable_concurrent_location_wins(&location, existing_location) {
-                                updates_to_apply.push((name, location));
-                                updated_actors += 1;
-                            }
-                        }
-                        crate::ClockOrdering::Before => {} // Keep existing
-                    }
-                }
-                None => {
-                    updates_to_apply.push((name, location));
-                    new_actors += 1;
-                }
-            }
+            updates_to_apply.push((name, location));
         }
 
-        // STEP 3: Apply all updates to the lock-free map.
-        if !updates_to_apply.is_empty() {
-            for (name, location) in &updates_to_apply {
-                // Actor locations learned through full sync are routing targets, not
-                // necessarily gossip seeds. Configure the TLS peer-id mapping for direct
-                // sends without enrolling every learned actor host into periodic gossip.
-                if let Ok(addr) = location.address.parse::<SocketAddr>() {
-                    self.configure_peer(location.peer_id.clone(), addr).await;
-                    debug!(
-                        actor = %name,
-                        peer_addr = %addr,
-                        "Configured direct route for actor's host"
-                    );
-                }
+        // STEP 2: Apply known_actors upserts, peer_to_actors update,
+        // and stale-actor removal under a SINGLE gossip_state lock so
+        // the "every name in peer_to_actors[sender] is in known_actors"
+        // invariant survives a concurrent `cleanup_dead_peers` /
+        // `apply_delta` / `handle_peer_death` pass. This mirrors the
+        // plan-then-execute fix on `apply_delta`. See test
+        // `test_apply_delta_and_cleanup_dead_peers_preserve_invariant`.
+        let mut routes_to_configure: Vec<(String, crate::PeerId, SocketAddr)> = Vec::new();
+        {
+            let mut gossip_state = self.gossip_state.lock().await;
 
+            for (name, location) in &updates_to_apply {
+                let Some((clear_tombstone, is_update)) =
+                    self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id)
+                else {
+                    continue;
+                };
+                if clear_tombstone {
+                    let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
+                }
                 let _ = self
                     .actor_state
                     .known_actors
                     .upsert_sync(name.clone(), location.clone());
+                if is_update {
+                    updated_actors += 1;
+                } else {
+                    new_actors += 1;
+                }
+                if let Ok(addr) = location.address.parse::<SocketAddr>() {
+                    routes_to_configure.push((name.clone(), location.peer_id.clone(), addr));
+                }
             }
-        }
 
-        // Update peer-to-actors mapping for failure tracking and detect actors the peer
-        // no longer advertises so we can prune stale entries deterministically.
-        let removed_peer_actors = {
-            let mut gossip_state = self.gossip_state.lock().await;
-            match gossip_state
+            let removed_now: Vec<String> = match gossip_state
                 .peer_to_actors
                 .insert(sender_addr, peer_actors.clone())
             {
@@ -4381,11 +4315,15 @@ impl<T: 'static> GossipRegistry<T> {
                     .cloned()
                     .collect::<Vec<_>>(),
                 None => Vec::new(),
-            }
-        };
+            };
 
-        if !removed_peer_actors.is_empty() {
-            for actor_name in removed_peer_actors {
+            // Prune stale known_actors entries the peer no longer
+            // advertises — but only if the actor is still attributed
+            // to the sender (otherwise a different owner has taken it
+            // and we'd be racing them). All under the same lock so a
+            // concurrent apply_delta cannot squeeze between the
+            // attribution check and the remove.
+            for actor_name in &removed_now {
                 if self
                     .actor_state
                     .local_actors
@@ -4393,10 +4331,6 @@ impl<T: 'static> GossipRegistry<T> {
                 {
                     continue;
                 }
-
-                // Safety: only remove an omitted actor if it is still attributed to the sender.
-                // Under reordering/churn, a peer can omit an actor that has already moved to a
-                // different host. Removing it here would be deterministic but incorrect.
                 let still_from_sender = self
                     .actor_state
                     .known_actors
@@ -4412,7 +4346,6 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                     continue;
                 }
-
                 if self
                     .actor_state
                     .known_actors
@@ -4426,6 +4359,19 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
             }
+            // _gossip_state guard drops here.
+            let _ = gossip_state;
+        }
+
+        // STEP 3: Configure direct routes outside the lock (these
+        // invoke user handlers and may not be held under gossip_state).
+        for (name, peer_id, addr) in routes_to_configure {
+            self.configure_peer(peer_id, addr).await;
+            debug!(
+                actor = %name,
+                peer_addr = %addr,
+                "Configured direct route for actor's host"
+            );
         }
 
         debug!(
@@ -4523,6 +4469,11 @@ impl<T: 'static> GossipRegistry<T> {
 
         let before_count = self.stream_assemblies.len();
 
+        // Collect victims first so we can decrement the per-peer
+        // counter outside the retain callback. retain_sync holds the
+        // bucket lock while invoking the predicate; calling the
+        // decrement helper inside would re-enter the same map shape.
+        let mut victims: Vec<std::net::SocketAddr> = Vec::new();
         self.stream_assemblies.retain_sync(|stream_id, assembly| {
             let age = assembly.started_at.elapsed();
             if age > STREAM_ASSEMBLY_TIMEOUT {
@@ -4534,10 +4485,16 @@ impl<T: 'static> GossipRegistry<T> {
                     chunks_received = assembly.received_indices.len(),
                     "Cleaning up stale stream assembly - StreamEnd never arrived"
                 );
+                if let Some(p) = assembly.peer_addr {
+                    victims.push(p);
+                }
                 return false;
             }
             true
         });
+        for peer in victims {
+            self.decrement_inflight_streams(peer);
+        }
 
         let removed = before_count.saturating_sub(self.stream_assemblies.len());
         if removed > 0 {
@@ -5995,28 +5952,39 @@ impl<T: 'static> GossipRegistry<T> {
         // Per-peer assembly cap. Without this, a single misbehaving peer
         // can hold up to MAX_INFLIGHT_STREAMS_PER_PEER × MAX_STREAM_SIZE
         // in pooled buffers for the full 60s stale-assembly TTL.
-        if let Some(peer) = peer_addr {
-            let mut count: usize = 0;
-            self.stream_assemblies.iter_sync(|_, assembly| {
-                if assembly.peer_addr == Some(peer) {
-                    count += 1;
-                }
-                true
-            });
-            if count >= Self::MAX_INFLIGHT_STREAMS_PER_PEER {
+        //
+        // Atomic CAS-style admission: fetch_add the per-peer counter
+        // and roll back on overrun. This closes the count-then-insert
+        // TOCTOU window where N concurrent admissions could all read
+        // count < cap before any of them inserted.
+        let admitted_peer = if let Some(peer) = peer_addr {
+            let counter = {
+                let entry = self
+                    .inflight_streams_per_peer
+                    .entry_sync(peer)
+                    .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+                entry.get().clone()
+            };
+            let prev = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if prev >= Self::MAX_INFLIGHT_STREAMS_PER_PEER {
+                counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 warn!(
                     peer = %peer,
                     stream_id = header.stream_id,
-                    inflight = count,
+                    inflight = prev,
                     cap = Self::MAX_INFLIGHT_STREAMS_PER_PEER,
                     "rejecting stream assembly: per-peer cap reached"
                 );
                 return;
             }
-        }
+            Some(peer)
+        } else {
+            None
+        };
 
-        let _ = self.stream_assemblies.upsert_sync(
-            header.stream_id,
+        let stream_id = header.stream_id;
+        let insert_result = self.stream_assemblies.insert_sync(
+            stream_id,
             StreamAssembly {
                 header,
                 received_indices: std::collections::BTreeSet::new(),
@@ -6028,12 +5996,46 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_addr,
             },
         );
+        if insert_result.is_err() {
+            // A stream with this id already exists. Roll back the
+            // reservation so we don't leak count against the cap.
+            if let Some(peer) = admitted_peer {
+                self.decrement_inflight_streams(peer);
+            }
+            warn!(
+                stream_id = stream_id,
+                "Stream assembly already in progress for stream_id"
+            );
+            return;
+        }
         debug!(
-            stream_id = header.stream_id,
+            stream_id = stream_id,
             ?correlation_id,
             ?peer_addr,
             "Started stream assembly"
         );
+    }
+
+    /// Decrement the per-peer in-flight stream counter and drop the
+    /// map entry if it reaches zero. Called from every removal path
+    /// (`complete_stream_assembly`, `cleanup_stale_stream_assemblies`,
+    /// `evict_peer_side_tables`).
+    fn decrement_inflight_streams(&self, peer: std::net::SocketAddr) {
+        if let Some(entry) = self
+            .inflight_streams_per_peer
+            .read_sync(&peer, |_, v| v.clone())
+        {
+            let prev = entry.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            debug_assert!(prev > 0, "inflight stream counter underflow for {peer}");
+            if prev == 1 {
+                // Best-effort GC: only drop when still observably 0.
+                // A concurrent admission may have re-incremented; the
+                // CAS-protected entry_sync re-creates the slot if so.
+                let _ = self
+                    .inflight_streams_per_peer
+                    .remove_if_sync(&peer, |v| v.load(std::sync::atomic::Ordering::Acquire) == 0);
+            }
+        }
     }
 
     /// Add a chunk to stream assembly
@@ -6094,6 +6096,13 @@ impl<T: 'static> GossipRegistry<T> {
     /// Complete stream assembly and return the complete message with metadata
     pub async fn complete_stream_assembly(&self, stream_id: u64) -> Option<StreamAssemblyResult> {
         if let Some((_, assembly)) = self.stream_assemblies.remove_sync(&stream_id) {
+            // Release the per-peer admission slot regardless of
+            // whether the assembly is complete (incomplete completions
+            // still consumed admission at start_stream_assembly).
+            if let Some(peer) = assembly.peer_addr {
+                self.decrement_inflight_streams(peer);
+            }
+
             // Verify we have all chunks with proper gap detection
             if !assembly.is_complete() {
                 warn!(
@@ -6608,34 +6617,30 @@ impl<T: 'static> GossipRegistry<T> {
     /// Mark a peer connection as established (clears failure state)
     pub async fn mark_peer_connected(&self, addr: SocketAddr) {
         let now = current_timestamp();
-        let max_failures = self.config.max_peer_failures;
         {
             let mut gossip_state = self.gossip_state.lock().await;
 
-            // Update the main peers map. Only reset `failures` if the
-            // peer is below the death threshold — a peer past
-            // `max_peer_failures` is considered dead by the gossip
-            // protocol's verdict, and a half-open accept-and-drop
-            // listener can still produce a "connected" callback without
-            // the peer actually being alive. Resurrecting requires
-            // continued positive evidence; `record_peer_activity` /
-            // `mark_response_received` decay failures for `< max`.
+            // A fresh connection was established and verified by the
+            // caller (post-handshake / first framed message received).
+            // Clear the death verdict unconditionally: softer evidence
+            // paths (`record_peer_activity`, `mark_response_received`)
+            // keep their `< max_peer_failures` gate so a stray response
+            // cannot resurrect a peer, but a *real* reconnect must
+            // recover one — otherwise a single death verdict welds the
+            // peer out of the active set until the process restarts.
             if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
-                if peer_info.failures < max_failures {
-                    peer_info.failures = 0;
-                    peer_info.last_failure_time = None;
-                }
+                peer_info.failures = 0;
+                peer_info.last_failure_time = None;
                 peer_info.last_success = peer_info.last_success.max(now);
-                peer_info.last_response_received_ms =
-                    peer_info.last_response_received_ms.max(crate::current_timestamp_millis());
+                peer_info.last_response_received_ms = peer_info
+                    .last_response_received_ms
+                    .max(crate::current_timestamp_millis());
             }
 
             // Update known_peers
             if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
-                if peer_info.failures < max_failures {
-                    peer_info.failures = 0;
-                    peer_info.last_failure_time = None;
-                }
+                peer_info.failures = 0;
+                peer_info.last_failure_time = None;
                 peer_info.last_success = now;
                 if let Some(node_id) = peer_info.node_id {
                     let _ = self.peer_capability_addr_to_node.upsert_sync(addr, node_id);
@@ -6648,21 +6653,7 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             }
 
-            // Update peer_discovery
-            let should_track_mesh_time = self.config.mesh_formation_target > 0
-                && gossip_state.mesh_formation_time_ms.is_none();
-
-            if let Some(ref mut discovery) = gossip_state.peer_discovery {
-                discovery.on_peer_connected(addr);
-
-                if should_track_mesh_time {
-                    let target = self.config.mesh_formation_target;
-                    if discovery.connected_peer_count() >= target {
-                        let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
-                        gossip_state.mesh_formation_time_ms = Some(elapsed_ms);
-                    }
-                }
-            }
+            self.record_peer_discovery_connected(&mut gossip_state, addr);
 
             debug!(addr = %addr, "marked peer as connected");
         }
@@ -6684,7 +6675,6 @@ impl<T: 'static> GossipRegistry<T> {
     ) {
         let now = current_timestamp();
         let now_ms = crate::current_timestamp_millis();
-        let max_failures = self.config.max_peer_failures;
         let mut gossip_state = self.gossip_state.lock().await;
         let peer = gossip_state.peers.entry(peer_addr).or_insert(PeerInfo {
             address: peer_addr,
@@ -6708,13 +6698,30 @@ impl<T: 'static> GossipRegistry<T> {
             peer.peer_address = Some(source);
         }
         peer.last_success = peer.last_success.max(now);
-        // Inbound payload is real liveness evidence; refresh the
-        // response-asymmetry timestamp and decay accumulating failures —
-        // but keep the death verdict sticky (mirrors mark_peer_connected).
+        // Inbound payload is real liveness evidence — the framing layer
+        // has decoded and dispatched at least one valid message on this
+        // socket. Refresh the response-asymmetry timestamp and clear
+        // the death verdict unconditionally (mirrors mark_peer_connected;
+        // softer signals like record_peer_activity stay gated).
         peer.last_response_received_ms = peer.last_response_received_ms.max(now_ms);
-        if peer.failures < max_failures {
-            peer.failures = 0;
-            peer.last_failure_time = None;
+        peer.failures = 0;
+        peer.last_failure_time = None;
+        self.record_peer_discovery_connected(&mut gossip_state, peer_addr);
+    }
+
+    fn record_peer_discovery_connected(&self, gossip_state: &mut GossipState, addr: SocketAddr) {
+        let should_track_mesh_time =
+            self.config.mesh_formation_target > 0 && gossip_state.mesh_formation_time_ms.is_none();
+
+        if let Some(ref mut discovery) = gossip_state.peer_discovery {
+            discovery.on_peer_connected(addr);
+
+            if should_track_mesh_time
+                && discovery.connected_peer_count() >= self.config.mesh_formation_target
+            {
+                gossip_state.mesh_formation_time_ms =
+                    Some(self.start_instant.elapsed().as_millis() as u64);
+            }
         }
     }
 
@@ -8108,10 +8115,7 @@ mod tests {
             .get(&sender_addr)
             .map(|s| s.contains(actor_name))
             .unwrap_or(false);
-        let in_known = registry
-            .actor_state
-            .known_actors
-            .contains_sync(actor_name);
+        let in_known = registry.actor_state.known_actors.contains_sync(actor_name);
         assert!(
             listed,
             "two-phase pattern should leave peer_to_actors referencing the actor"
@@ -8211,7 +8215,9 @@ mod tests {
         let mut new_location =
             RemoteActorLocation::new_with_peer(sender_addr, sender_peer_id.clone());
         new_location.vector_clock = prior_location.vector_clock.clone();
-        new_location.vector_clock.increment(sender_peer_id.to_node_id());
+        new_location
+            .vector_clock
+            .increment(sender_peer_id.to_node_id());
         let delta = RegistryDelta {
             since_sequence: 0,
             current_sequence: 1,
@@ -8284,6 +8290,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn apply_delta_revalidates_current_actor_before_upsert() {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7120), test_config()));
+        let actor_name = "actor.delta.revalidate";
+        let stale_peer = test_peer_id("stale-delta-owner");
+        let fresh_peer = test_peer_id("fresh-delta-owner");
+
+        let stale = RemoteActorLocation::new_with_peer(test_addr(7121), stale_peer.clone());
+        stale.vector_clock.increment(stale_peer.to_node_id());
+        let mut fresh = RemoteActorLocation::new_with_peer(test_addr(7122), fresh_peer.clone());
+        fresh.vector_clock = stale.vector_clock.clone();
+        fresh.vector_clock.increment(fresh_peer.to_node_id());
+
+        let delta = RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor_name.to_string(),
+                location: stale,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: stale_peer,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        };
+
+        let held = registry.gossip_state.lock().await;
+        let r_apply = Arc::clone(&registry);
+        let apply_handle = tokio::spawn(async move {
+            r_apply.apply_delta(delta).await.unwrap();
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), fresh.clone());
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(2), apply_handle)
+            .await
+            .expect("apply_delta did not finish in time")
+            .unwrap();
+
+        let got = read_known_actor(&registry, actor_name).expect("actor should remain present");
+        assert_eq!(
+            got.peer_id, fresh.peer_id,
+            "stale delta must not overwrite actor ownership that changed while it waited for gossip_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_peer_death_does_not_prune_actor_that_moved_after_scan() {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7130), test_config()));
+        let actor_name = "actor.peerdeath.moved";
+        let dead_peer = test_peer_id("dead-peer");
+        let live_peer = test_peer_id("live-peer");
+        let dead_addr = test_addr(7131);
+
+        let dead_location = RemoteActorLocation::new_with_peer(dead_addr, dead_peer.clone());
+        let live_location = RemoteActorLocation::new_with_peer(test_addr(7132), live_peer.clone());
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), dead_location);
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(
+                dead_addr,
+                PeerInfo {
+                    address: dead_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(dead_peer.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 1,
+                    last_sent_sequence: 1,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp()),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+        }
+
+        let held = registry.gossip_state.lock().await;
+        let r_death = Arc::clone(&registry);
+        let death_handle = tokio::spawn(async move {
+            r_death.handle_peer_death(dead_addr, Some(dead_peer)).await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), live_location.clone());
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(2), death_handle)
+            .await
+            .expect("handle_peer_death did not finish in time")
+            .unwrap();
+
+        let got = read_known_actor(&registry, actor_name).expect("moved actor must survive");
+        assert_eq!(
+            got.peer_id, live_location.peer_id,
+            "peer death cleanup must re-check current ownership before pruning"
+        );
+        assert!(
+            !registry
+                .actor_state
+                .removed_actors
+                .contains_sync(actor_name),
+            "peer death cleanup must not tombstone an actor that already moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_actor_rolls_back_if_shutdown_wins_second_check() {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7140), test_config()));
+        let actor_name = "actor.shutdown.rollback";
+        let held = registry.gossip_state.lock().await;
+        let r_register = Arc::clone(&registry);
+        let register_handle = tokio::spawn(async move {
+            r_register
+                .register_actor_with_priority(
+                    actor_name.to_string(),
+                    test_location(test_addr(7141)),
+                    RegistrationPriority::Normal,
+                )
+                .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        registry.shutdown.store(true, Ordering::Release);
+        drop(held);
+
+        let err = tokio::time::timeout(Duration::from_secs(2), register_handle)
+            .await
+            .expect("register did not finish in time")
+            .unwrap()
+            .expect_err("registration should observe shutdown");
+        assert!(matches!(err, GossipError::Shutdown));
+        assert!(
+            !registry.actor_state.local_actors.contains_sync(actor_name),
+            "failed registration must not leave a local actor behind"
+        );
     }
 
     #[tokio::test]

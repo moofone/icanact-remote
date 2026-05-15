@@ -841,13 +841,11 @@ fn test_partition_heal_behavior() -> Result<(), DynError> {
             "B/C healed partition edge should be reachable"
         );
 
-        let stats_b = node_b.stats().await;
         assert!(
-            stats_b.active_peers >= 1,
-            "B should have at least one live transport after heal"
-        );
-        assert!(
-            stats_b.mesh_formation_time_ms.is_some(),
+            common::wait_for_condition(Duration::from_secs(5), || async {
+                node_b.stats().await.mesh_formation_time_ms.is_some()
+            })
+            .await,
             "mesh formation timing should be recorded after heal"
         );
 

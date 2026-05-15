@@ -181,8 +181,8 @@ async fn setup(
     let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
     let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
 
-    let key_pair_a = KeyPair::new_for_testing(&format!("realistic_{tag}_a"));
-    let key_pair_b = KeyPair::new_for_testing(&format!("realistic_{tag}_b"));
+    let key_pair_a = KeyPair::new_for_testing(format!("realistic_{tag}_a"));
+    let key_pair_b = KeyPair::new_for_testing(format!("realistic_{tag}_b"));
     let peer_id_a = key_pair_a.peer_id();
     let peer_id_b = key_pair_b.peer_id();
 
