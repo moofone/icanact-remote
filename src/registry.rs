@@ -129,27 +129,28 @@ fn owner_recovery_wins_tombstone(
 }
 
 /// Resolve the effective peer address from sender_bind_addr with validation.
-/// Falls back to tcp_source_addr if sender_bind_addr is None, invalid, unspecified (0.0.0.0),
-/// or loopback when the TCP source is not loopback.
+/// Falls back to tcp_source_addr if sender_bind_addr is None or invalid.
+/// Uses the TCP source IP plus advertised port for unspecified binds (`0.0.0.0:PORT`).
+/// Returns None for advertised addresses that are known to be non-dialable from here.
 ///
 /// # Arguments
 /// * `sender_bind_addr` - Optional bind address from the message
 /// * `tcp_source_addr` - The TCP source address (fallback)
 ///
 /// # Returns
-/// A valid routable SocketAddr
-pub fn resolve_peer_addr(
+/// A valid routable SocketAddr, or None when the sender advertised a non-dialable bind address.
+pub fn resolve_peer_addr_checked(
     sender_bind_addr: Option<&str>,
     tcp_source_addr: SocketAddr,
-) -> SocketAddr {
+) -> Option<SocketAddr> {
     if let Some(bind_addr_str) = sender_bind_addr {
         if let Ok(bind_addr) = bind_addr_str.parse::<SocketAddr>() {
             if bind_addr.port() == 0 {
-                debug!(
-                    "sender_bind_addr {} has port 0, falling back to TCP source {}",
+                warn!(
+                    "sender_bind_addr {} has port 0, ignoring non-dialable advertised bind from TCP source {}",
                     bind_addr, tcp_source_addr
                 );
-                return tcp_source_addr;
+                return None;
             }
 
             let ip = bind_addr.ip();
@@ -163,22 +164,22 @@ pub fn resolve_peer_addr(
                     tcp_source_addr.ip(),
                     bind_addr.port()
                 );
-                return SocketAddr::new(tcp_source_addr.ip(), bind_addr.port());
+                return Some(SocketAddr::new(tcp_source_addr.ip(), bind_addr.port()));
             }
 
             // Validate: reject loopback (127.0.0.1, ::1) when TCP source is not loopback
-            // A remote peer advertising loopback is unreachable from outside
+            // A remote peer advertising loopback is unreachable from outside. Do not synthesize
+            // remote-ip:loopback-port or remote-ip:ephemeral-port; both poison peer discovery.
             if ip.is_loopback() && !tcp_source_addr.ip().is_loopback() {
                 warn!(
-                    "sender_bind_addr {} is loopback but TCP source {} is not, using TCP source IP with bind port {}",
+                    "sender_bind_addr {} is loopback but TCP source {} is not; ignoring non-dialable advertised bind",
                     bind_addr,
-                    tcp_source_addr,
-                    bind_addr.port()
+                    tcp_source_addr
                 );
-                return SocketAddr::new(tcp_source_addr.ip(), bind_addr.port());
+                return None;
             }
 
-            return bind_addr;
+            return Some(bind_addr);
         } else {
             warn!(
                 "Failed to parse sender_bind_addr '{}', falling back to TCP source {}",
@@ -187,7 +188,18 @@ pub fn resolve_peer_addr(
         }
     }
     // Fallback to TCP source address
-    tcp_source_addr
+    Some(tcp_source_addr)
+}
+
+/// Backwards-compatible peer address resolver for callers that can tolerate
+/// falling back to the TCP source. New gossip-directory paths should use
+/// `resolve_peer_addr_checked` so non-dialable advertised binds do not poison
+/// the peer table.
+pub fn resolve_peer_addr(
+    sender_bind_addr: Option<&str>,
+    tcp_source_addr: SocketAddr,
+) -> SocketAddr {
+    resolve_peer_addr_checked(sender_bind_addr, tcp_source_addr).unwrap_or(tcp_source_addr)
 }
 
 /// Response payload for actor asks.
@@ -741,6 +753,12 @@ impl PendingAck {
             _ => Poll::Pending,
         }
     }
+}
+
+fn nanos_since_ms(later_nanos: u128, earlier_nanos: u128) -> Option<f64> {
+    later_nanos
+        .checked_sub(earlier_nanos)
+        .map(|nanos| nanos as f64 / 1_000_000.0)
 }
 
 /// RAII drop guard for a `pending_acks` entry. Ensures the entry is
@@ -2824,18 +2842,32 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Emit per-actor timing logs outside the critical section.
         for (name, location) in log_adds {
-            let propagation_time_nanos = received_timestamp - location.local_registration_time;
-            let propagation_time_ms = propagation_time_nanos as f64 / 1_000_000.0;
-            let network_processing_time_nanos =
-                received_timestamp - delta.precise_timing_nanos as u128;
-            let network_processing_time_ms = network_processing_time_nanos as f64 / 1_000_000.0;
-            let processing_only_time_ms = propagation_time_ms - network_processing_time_ms;
+            let propagation_time_ms =
+                nanos_since_ms(received_timestamp, location.local_registration_time);
+            let network_processing_time_ms = if delta.precise_timing_nanos == 0 {
+                None
+            } else {
+                nanos_since_ms(received_timestamp, delta.precise_timing_nanos as u128)
+            };
+            let processing_only_time_ms = match (propagation_time_ms, network_processing_time_ms) {
+                (Some(propagation), Some(network)) if propagation >= network => {
+                    Some(propagation - network)
+                }
+                _ => None,
+            };
+            let timing_valid = propagation_time_ms.is_some()
+                && network_processing_time_ms.is_some()
+                && processing_only_time_ms.is_some();
+            let sender_clock_ahead_nanos =
+                (delta.precise_timing_nanos as u128).saturating_sub(received_timestamp);
             info!(
                 actor_name = %name,
                 priority = ?location.priority,
-                propagation_time_ms = propagation_time_ms,
-                network_processing_time_ms = network_processing_time_ms,
-                processing_only_time_ms = processing_only_time_ms,
+                propagation_time_ms = propagation_time_ms.unwrap_or(0.0),
+                network_processing_time_ms = network_processing_time_ms.unwrap_or(0.0),
+                processing_only_time_ms = processing_only_time_ms.unwrap_or(0.0),
+                timing_valid = timing_valid,
+                sender_clock_ahead_nanos = sender_clock_ahead_nanos,
                 "RECEIVED_ACTOR"
             );
         }
@@ -4157,7 +4189,17 @@ impl<T: 'static> GossipRegistry<T> {
                 wall_clock_time,
             } => {
                 // Use resolve_peer_addr for safe address resolution with validation
-                let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), addr);
+                let Some(sender_socket_addr) =
+                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), addr)
+                else {
+                    warn!(
+                        tcp_source = %addr,
+                        sender = %sender_peer_id,
+                        sender_bind_addr = ?sender_bind_addr,
+                        "Ignoring full sync response from peer with non-dialable advertised bind address"
+                    );
+                    return Ok(());
+                };
 
                 info!(
                     tcp_source = %addr,
@@ -7021,6 +7063,12 @@ mod tests {
     }
 
     #[test]
+    fn timing_metric_uses_checked_subtraction() {
+        assert_eq!(nanos_since_ms(2_500_000, 1_000_000), Some(1.5));
+        assert_eq!(nanos_since_ms(1_000_000, 2_500_000), None);
+    }
+
+    #[test]
     fn test_peer_info() {
         let mut peer = PeerInfo {
             address: test_addr(8080),
@@ -9112,11 +9160,12 @@ mod tests {
 
     #[test]
     fn test_resolve_peer_addr_loopback_from_remote() {
-        // If peer claims loopback (127.0.0.1) but TCP source is remote, reject it
+        // If peer claims loopback (127.0.0.1) but TCP source is remote, reject it.
+        // Synthesizing remote-ip:loopback-port creates unreachable peer entries.
         let tcp_source: SocketAddr = "192.168.1.100:54321".parse().unwrap();
-        let result = super::resolve_peer_addr(Some("127.0.0.1:9000"), tcp_source);
-        // Should use TCP source IP (192.168.1.100) with bind_addr port (9000)
-        assert_eq!(result, "192.168.1.100:9000".parse::<SocketAddr>().unwrap());
+        let result = super::resolve_peer_addr_checked(Some("127.0.0.1:9000"), tcp_source);
+        assert_eq!(result, None);
+        assert_eq!(super::resolve_peer_addr(Some("127.0.0.1:9000"), tcp_source), tcp_source);
     }
 
     #[test]
@@ -9132,9 +9181,9 @@ mod tests {
     fn test_resolve_peer_addr_ipv6_loopback_from_remote() {
         // IPv6 loopback from remote should also be rejected
         let tcp_source: SocketAddr = "[2001:db8::1]:54321".parse().unwrap();
-        let result = super::resolve_peer_addr(Some("[::1]:9000"), tcp_source);
-        // Should use TCP source IP with bind_addr port
-        assert_eq!(result, "[2001:db8::1]:9000".parse::<SocketAddr>().unwrap());
+        let result = super::resolve_peer_addr_checked(Some("[::1]:9000"), tcp_source);
+        assert_eq!(result, None);
+        assert_eq!(super::resolve_peer_addr(Some("[::1]:9000"), tcp_source), tcp_source);
     }
 
     #[test]

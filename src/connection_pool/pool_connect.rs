@@ -2056,9 +2056,20 @@ pub(crate) fn handle_incoming_message(
                 sequence,
                 wall_clock_time,
             } => {
-                // Use resolve_peer_addr for safe address resolution with validation
-                // This handles: None, invalid addresses, 0.0.0.0, and falls back to TCP source
-                let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), _peer_addr);
+                // Use the peer's advertised listening address when it is dialable.
+                // Remote loopback binds are local-only and must not be rewritten into
+                // remote-ip:ephemeral-port peer entries.
+                let Some(sender_socket_addr) =
+                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
+                else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        sender_bind_addr = ?sender_bind_addr,
+                        "Ignoring FullSync from peer with non-dialable advertised bind address"
+                    );
+                    return Ok(());
+                };
 
                 // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
                 debug!(
@@ -2405,8 +2416,17 @@ pub(crate) fn handle_incoming_message(
                 sequence,
                 wall_clock_time,
             } => {
-                // Use resolve_peer_addr for safe address resolution with validation
-                let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), _peer_addr);
+                let Some(sender_socket_addr) =
+                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
+                else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        sender_bind_addr = ?sender_bind_addr,
+                        "Ignoring FullSyncResponse from peer with non-dialable advertised bind address"
+                    );
+                    return Ok(());
+                };
 
                 debug!(
                     sender = %sender_peer_id,
