@@ -3527,29 +3527,46 @@ impl<T: 'static> GossipRegistry<T> {
                 );
             }
 
-            let available_peers: Vec<SocketAddr> = gossip_state
-                .peers
-                .iter()
-                .filter_map(|(peer_addr, peer)| {
-                    let retry_window_open = peer.failures < self.config.max_peer_failures
-                        || (current_time.saturating_sub(peer.last_attempt))
-                            > self.config.peer_retry_interval.as_secs();
-                    if !retry_window_open {
-                        return None;
-                    }
-                    if self.should_suppress_outbound_retry_for_peer(peer) {
-                        debug!(
-                            peer = %peer_addr,
-                            inbound_observed = peer.inbound_observed,
-                            outbound_dial_success = peer.outbound_dial_success,
-                            peer_addr_key = %peer.address,
-                            "Suppressing outbound retry for inbound-only undialable peer"
-                        );
-                        return None;
-                    }
-                    Some(*peer_addr)
-                })
-                .collect();
+            // Filter to retry-eligible, non-suppressed peers and deduplicate
+            // by stable identity (NodeId) so a physical peer that is tracked
+            // under multiple SocketAddr keys — ephemeral TCP-source still
+            // present alongside its migrated bind address, dual-stack
+            // IPv4/IPv6 aliases, DNS-resolved hostnames — receives one
+            // delivery per round. Peers whose NodeId is not yet known
+            // continue to be keyed by SocketAddr.
+            #[derive(Hash, Eq, PartialEq)]
+            enum DispatchKey {
+                Node(crate::NodeId),
+                Addr(SocketAddr),
+            }
+            let mut seen: std::collections::HashSet<DispatchKey> =
+                std::collections::HashSet::new();
+            let mut available_peers: Vec<SocketAddr> = Vec::new();
+            for (peer_addr, peer) in gossip_state.peers.iter() {
+                let retry_window_open = peer.failures < self.config.max_peer_failures
+                    || (current_time.saturating_sub(peer.last_attempt))
+                        > self.config.peer_retry_interval.as_secs();
+                if !retry_window_open {
+                    continue;
+                }
+                if self.should_suppress_outbound_retry_for_peer(peer) {
+                    debug!(
+                        peer = %peer_addr,
+                        inbound_observed = peer.inbound_observed,
+                        outbound_dial_success = peer.outbound_dial_success,
+                        peer_addr_key = %peer.address,
+                        "Suppressing outbound retry for inbound-only undialable peer"
+                    );
+                    continue;
+                }
+                let key = peer
+                    .node_id
+                    .map(DispatchKey::Node)
+                    .unwrap_or(DispatchKey::Addr(*peer_addr));
+                if seen.insert(key) {
+                    available_peers.push(*peer_addr);
+                }
+            }
 
             if available_peers.is_empty() {
                 info!(
@@ -5627,6 +5644,56 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
+    /// Choose peer addresses to fan an immediate-priority broadcast out to.
+    ///
+    /// Healthy entries (`failures < max_peer_failures`) are deduplicated by
+    /// stable identity before the `urgent_gossip_fanout` cap is applied, so
+    /// a physical peer that appears in `peers` under multiple `SocketAddr`
+    /// keys (e.g. ephemeral TCP-source plus migrated bind address, dual-stack
+    /// aliases) counts once. Peers whose `node_id` is not yet known are
+    /// keyed by address — a pre-handshake peer can't be confused with any
+    /// other peer record.
+    fn select_immediate_gossip_peers(
+        peers: &HashMap<SocketAddr, PeerInfo>,
+        max_peer_failures: usize,
+        fanout: usize,
+    ) -> Vec<SocketAddr> {
+        #[derive(Hash, Eq, PartialEq)]
+        enum DispatchKey {
+            Node(crate::NodeId),
+            Addr(SocketAddr),
+        }
+
+        let mut seen: std::collections::HashSet<DispatchKey> = std::collections::HashSet::new();
+        let mut selected: Vec<SocketAddr> = Vec::new();
+        for (addr, peer) in peers.iter() {
+            if peer.failures >= max_peer_failures {
+                continue;
+            }
+            let key = peer
+                .node_id
+                .map(DispatchKey::Node)
+                .unwrap_or(DispatchKey::Addr(*addr));
+            if seen.insert(key) {
+                selected.push(*addr);
+                if selected.len() >= fanout {
+                    break;
+                }
+            }
+        }
+        selected
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn select_immediate_gossip_peers_for_test(&self) -> Vec<SocketAddr> {
+        let state = self.gossip_state.lock().await;
+        Self::select_immediate_gossip_peers(
+            &state.peers,
+            self.config.max_peer_failures,
+            self.config.urgent_gossip_fanout,
+        )
+    }
+
     /// Trigger immediate gossip for urgent changes - optimized for speed
     pub async fn trigger_immediate_gossip(&self) -> Result<()> {
         if !self.config.immediate_propagation_enabled {
@@ -5644,14 +5711,17 @@ impl<T: 'static> GossipRegistry<T> {
             // Take all urgent changes for immediate propagation (avoid clone)
             let changes = std::mem::take(&mut gossip_state.urgent_changes);
 
-            // Get healthy peers quickly - just take the first few healthy ones
-            let peers: Vec<_> = gossip_state
-                .peers
-                .iter()
-                .filter(|(_, peer)| peer.failures < self.config.max_peer_failures)
-                .take(self.config.urgent_gossip_fanout)
-                .map(|(addr, _)| *addr)
-                .collect();
+            // Select target peers, deduplicating by stable identity so a
+            // single physical peer that appears under multiple SocketAddr
+            // aliases (ephemeral TCP source still present alongside its
+            // migrated bind address, dual-stack IPv4/IPv6, DNS-resolved
+            // hostnames mapped to several addresses, etc.) receives one
+            // delivery rather than `aliases × peers` deliveries.
+            let peers = Self::select_immediate_gossip_peers(
+                &gossip_state.peers,
+                self.config.max_peer_failures,
+                self.config.urgent_gossip_fanout,
+            );
 
             (changes, peers)
         };
@@ -7289,6 +7359,143 @@ mod tests {
         let gossip_state = registry.gossip_state.lock().await;
         assert_eq!(gossip_state.peers.len(), 1);
         assert!(gossip_state.peers.contains_key(&test_addr(8081)));
+    }
+
+    /// Build a `PeerInfo` rooted at `addr` and pre-bound to `node_id`.
+    /// Used by the duplicate-broadcast regression tests to manufacture the
+    /// "two SocketAddr aliases for the same physical peer" state that the
+    /// devnet stratum trace surfaced for sender `f4061522…`.
+    fn peer_info_with_node_id(addr: SocketAddr, node_id: crate::NodeId) -> PeerInfo {
+        let now = crate::current_timestamp();
+        let now_ms = crate::current_timestamp_millis();
+        PeerInfo {
+            address: addr,
+            peer_address: None,
+            inbound_observed: true,
+            outbound_dial_success: true,
+            node_id: Some(node_id),
+            dns_name: None,
+            failures: 0,
+            last_attempt: now,
+            last_success: now,
+            last_sequence: 0,
+            last_sent_sequence: 0,
+            consecutive_deltas: 0,
+            last_failure_time: None,
+            last_dns_refresh_attempt: None,
+            last_response_received_ms: now_ms,
+        }
+    }
+
+    /// Regression for the devnet f4061522 trace: when the same physical peer
+    /// appears in `gossip_state.peers` under two distinct `SocketAddr` keys
+    /// (e.g. ephemeral TCP-source address still present alongside the
+    /// migrated bind address, or DNS-resolved IPv4/IPv6 aliases), the
+    /// periodic gossip round must emit **one** task per stable peer identity
+    /// rather than one task per address alias. Without dedup the same delta
+    /// is delivered N times to the same socket, which is what produced the
+    /// 3× "RECEIVING IMMEDIATE CHANGES" burst from f4061522 in 130μs.
+    #[tokio::test]
+    async fn prepare_gossip_round_deduplicates_peer_aliases_by_node_id() {
+        let mut config = test_config();
+        config.small_cluster_threshold = 0;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+
+        let shared_peer_id = test_peer_id("shared_remote");
+        let shared_node_id = shared_peer_id.to_node_id();
+
+        // Two SocketAddr aliases for the same physical peer.
+        let alias_a = test_addr(9101);
+        let alias_b = test_addr(9102);
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(
+                alias_a,
+                peer_info_with_node_id(alias_a, shared_node_id),
+            );
+            state.peers.insert(
+                alias_b,
+                peer_info_with_node_id(alias_b, shared_node_id),
+            );
+        }
+
+        registry
+            .register_actor(
+                "shared_target_actor".to_string(),
+                test_location(test_addr(7777)),
+            )
+            .await
+            .unwrap();
+
+        let tasks = registry.prepare_gossip_round().await.unwrap();
+
+        let aliases_targeted = tasks
+            .iter()
+            .filter(|t| t.peer_addr == alias_a || t.peer_addr == alias_b)
+            .count();
+        assert_eq!(
+            aliases_targeted, 1,
+            "expected exactly one gossip task for the shared NodeId across \
+             aliases {alias_a} and {alias_b}, got {aliases_targeted} (tasks: {:?})",
+            tasks.iter().map(|t| t.peer_addr).collect::<Vec<_>>()
+        );
+    }
+
+    /// Mirror of the above for the urgent fan-out path
+    /// (`trigger_immediate_gossip`): a single immediate-priority registration
+    /// must produce at most one DeltaGossip per physical peer, regardless of
+    /// how many SocketAddr aliases share its NodeId.
+    #[tokio::test]
+    async fn trigger_immediate_gossip_deduplicates_peer_aliases_by_node_id() {
+        let mut config = test_config();
+        config.urgent_gossip_fanout = 8;
+        config.immediate_propagation_enabled = true;
+        let registry = std::sync::Arc::new(GossipRegistry::<()>::new(test_addr(8080), config));
+
+        let shared_peer_id = test_peer_id("shared_remote_urgent");
+        let shared_node_id = shared_peer_id.to_node_id();
+        let alias_a = test_addr(9201);
+        let alias_b = test_addr(9202);
+        let alias_c = test_addr(9203);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            for addr in [alias_a, alias_b, alias_c] {
+                state
+                    .peers
+                    .insert(addr, peer_info_with_node_id(addr, shared_node_id));
+            }
+        }
+
+        // Push an urgent change directly so we don't depend on the
+        // outbound-connection path (`trigger_immediate_gossip` early-exits
+        // when no live connections exist, but it still selects peers first
+        // — and that selection is the point we're asserting on).
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let change = RegistryChange::ActorAdded {
+                name: "urgent_target".to_string(),
+                location: {
+                    let mut loc = test_location(test_addr(7778));
+                    loc.priority = RegistrationPriority::Immediate;
+                    loc
+                },
+                priority: RegistrationPriority::Immediate,
+            };
+            state.urgent_changes.push(change);
+        }
+
+        let selected = registry.select_immediate_gossip_peers_for_test().await;
+        let aliases_selected = selected
+            .iter()
+            .filter(|addr| **addr == alias_a || **addr == alias_b || **addr == alias_c)
+            .count();
+        assert_eq!(
+            aliases_selected, 1,
+            "expected exactly one immediate-gossip target for shared NodeId across \
+             aliases {alias_a},{alias_b},{alias_c}, got {aliases_selected} (selected: {:?})",
+            selected
+        );
     }
 
     #[tokio::test]
