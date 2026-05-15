@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    DynError, connect_bidirectional, create_tls_node, force_disconnect, wait_for_condition,
+    DynError, TlsHandle, connect_bidirectional, create_tls_node, force_disconnect,
+    wait_for_condition,
 };
 use icanact_remote::{GossipConfig, RegistrationPriority};
 use std::time::Duration;
@@ -135,10 +136,61 @@ async fn test_gossip_matrix_convergence_line_topology_inner() -> Result<(), DynE
         "all nodes should converge on all actors in line topology"
     );
 
+    let removed = node_b.unregister("actor.b").await?;
+    assert!(
+        removed.is_some(),
+        "node B should unregister its local actor"
+    );
+
+    assert!(
+        wait_for_condition(Duration::from_secs(12), || async {
+            nodes.iter().all(|node| !has_actor(node, "actor.b"))
+        })
+        .await,
+        "actor removal should converge across the whole line topology"
+    );
+
+    let recovered_addr = "127.0.0.1:9402".parse()?;
+    node_b
+        .register_urgent(
+            "actor.b".to_string(),
+            recovered_addr,
+            RegistrationPriority::Immediate,
+        )
+        .await?;
+
+    assert!(
+        wait_for_condition(Duration::from_secs(12), || async {
+            nodes
+                .iter()
+                .all(|node| actor_address(node, "actor.b").as_deref() == Some("127.0.0.1:9402"))
+        })
+        .await,
+        "same-owner re-registration after removal should converge with the new address"
+    );
+
     node_a.shutdown().await;
     node_b.shutdown().await;
     node_c.shutdown().await;
     node_d.shutdown().await;
 
     Ok(())
+}
+
+fn has_actor(node: &TlsHandle, actor: &str) -> bool {
+    node.registry.actor_state.local_actors.contains_sync(actor)
+        || node.registry.actor_state.known_actors.contains_sync(actor)
+}
+
+fn actor_address(node: &TlsHandle, actor: &str) -> Option<String> {
+    node.registry
+        .actor_state
+        .local_actors
+        .read_sync(actor, |_, location| location.address.clone())
+        .or_else(|| {
+            node.registry
+                .actor_state
+                .known_actors
+                .read_sync(actor, |_, location| location.address.clone())
+        })
 }

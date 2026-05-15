@@ -40,7 +40,6 @@ fn has_actor(node: &icanact_remote::GossipRegistryHandle, actor: &str) -> bool {
 }
 
 #[test]
-#[ignore = "topology-sensitive invariant; run explicitly when validating partition behavior"]
 fn test_partition_heal_preserves_eventual_propagation_without_lookup_dials() -> Result<(), DynError>
 {
     run_partition_test(async move {
