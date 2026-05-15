@@ -1831,6 +1831,13 @@ impl<T: 'static> GossipRegistry<T> {
         node_id: Option<crate::NodeId>,
     ) {
         debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
+        if peer_addr.ip().is_unspecified() || peer_addr.port() == 0 {
+            debug!(
+                peer = %peer_addr,
+                "refusing to add peer with unspecified address or zero port"
+            );
+            return;
+        }
         if peer_addr != self.bind_addr {
             {
                 let mut gossip_state = self.gossip_state.lock().await;
@@ -2690,8 +2697,14 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// Apply delta changes from a peer
-    pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<()> {
+    /// Apply delta changes from a peer.
+    ///
+    /// Returns the names of immediate-priority `ActorAdded` changes that were
+    /// actually applied (i.e. passed vector-clock conflict resolution). Used
+    /// by the receive path to decide whether to send `ImmediateAck`: a
+    /// duplicate delta whose contents were all suppressed must not generate
+    /// fresh acks.
+    pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<Vec<String>> {
         let total_changes = delta.changes.len();
         let sender_peer_id = delta.sender_peer_id.clone();
 
@@ -2735,6 +2748,7 @@ impl<T: 'static> GossipRegistry<T> {
         let mut applied_count = 0usize;
         let mut peer_actors_added = std::collections::HashSet::new();
         let mut peer_actors_removed = std::collections::HashSet::new();
+        let mut applied_immediate: Vec<String> = Vec::new();
         let log_adds: Vec<(String, RemoteActorLocation)> = {
             let mut gossip_state = self.gossip_state.lock().await;
             let mut log_adds = Vec::new();
@@ -2743,7 +2757,7 @@ impl<T: 'static> GossipRegistry<T> {
                     RegistryChange::ActorAdded {
                         name,
                         location,
-                        priority: _,
+                        priority,
                     } => {
                         let Some((clear_tombstone, _is_update)) = self.current_actor_upsert_plan(
                             name.as_str(),
@@ -2761,6 +2775,9 @@ impl<T: 'static> GossipRegistry<T> {
                             .upsert_sync(name.clone(), location.clone());
                         peer_actors_added.insert(name.clone());
                         applied_count += 1;
+                        if priority.should_trigger_immediate_gossip() {
+                            applied_immediate.push(name.clone());
+                        }
                         if tracing::enabled!(tracing::Level::INFO) {
                             log_adds.push((name, location));
                         }
@@ -2838,19 +2855,29 @@ impl<T: 'static> GossipRegistry<T> {
         };
 
         // Emit per-actor timing logs outside the critical section.
+        //
+        // All three timestamps are sourced from `SystemTime::now()` on
+        // different machines, so clock skew between sender and receiver can
+        // make `received_timestamp` less than either reference, which would
+        // wrap a `u128` subtraction to ~2^128 and produce nonsense values
+        // (e.g. ~3.4e32 ms). Compute as `i128` to detect skew, clamp negative
+        // values to zero, and annotate the log so dashboards can filter.
         for (name, location) in log_adds {
-            let propagation_time_nanos = received_timestamp - location.local_registration_time;
-            let propagation_time_ms = propagation_time_nanos as f64 / 1_000_000.0;
-            let network_processing_time_nanos =
-                received_timestamp - delta.precise_timing_nanos as u128;
-            let network_processing_time_ms = network_processing_time_nanos as f64 / 1_000_000.0;
-            let processing_only_time_ms = propagation_time_ms - network_processing_time_ms;
+            let propagation_delta_ns =
+                received_timestamp as i128 - location.local_registration_time as i128;
+            let network_delta_ns = received_timestamp as i128 - delta.precise_timing_nanos as i128;
+            let clock_skew = propagation_delta_ns < 0 || network_delta_ns < 0;
+            let propagation_time_ms = propagation_delta_ns.max(0) as f64 / 1_000_000.0;
+            let network_processing_time_ms = network_delta_ns.max(0) as f64 / 1_000_000.0;
+            let processing_only_time_ms =
+                (propagation_time_ms - network_processing_time_ms).max(0.0);
             info!(
                 actor_name = %name,
                 priority = ?location.priority,
                 propagation_time_ms = propagation_time_ms,
                 network_processing_time_ms = network_processing_time_ms,
                 processing_only_time_ms = processing_only_time_ms,
+                clock_skew = clock_skew,
                 "RECEIVED_ACTOR"
             );
         }
@@ -2865,7 +2892,7 @@ impl<T: 'static> GossipRegistry<T> {
             "completed delta application with vector clock conflict resolution"
         );
 
-        Ok(())
+        Ok(applied_immediate)
     }
 
     /// Determine whether to use delta or full sync for a peer
@@ -7593,6 +7620,72 @@ mod tests {
                 .actor_state
                 .known_actors
                 .contains_sync("remote_actor")
+        );
+    }
+
+    /// Duplicate immediate deltas must not produce repeat `ImmediateAck`
+    /// frames. Regression for the devnet stratum trace where a single batch
+    /// from sender `f4061522…` was delivered three times in ~130μs; the
+    /// first delivery returned the immediate-priority names, the next two
+    /// returned an empty list so the connection handler skipped the redundant
+    /// acks.
+    #[tokio::test]
+    async fn apply_delta_returns_immediate_names_only_when_mutating_state() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+
+        let location = test_location(test_addr(9001));
+        let make_delta = || RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 0,
+            changes: vec![RegistryChange::ActorAdded {
+                name: "urgent_actor".to_string(),
+                location: location.clone(),
+                priority: RegistrationPriority::Immediate,
+            }],
+            sender_peer_id: test_peer_id("node_b"),
+            wall_clock_time: current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        };
+
+        let first = registry.apply_delta(make_delta()).await.unwrap();
+        assert_eq!(first, vec!["urgent_actor".to_string()]);
+
+        let second = registry.apply_delta(make_delta()).await.unwrap();
+        assert!(
+            second.is_empty(),
+            "duplicate immediate delta must not re-emit ack names, got {second:?}"
+        );
+
+        let third = registry.apply_delta(make_delta()).await.unwrap();
+        assert!(third.is_empty());
+    }
+
+    /// Normal-priority adds never appear in the immediate-ack return value,
+    /// even on the first delivery.
+    #[tokio::test]
+    async fn apply_delta_excludes_non_immediate_priority_from_ack_list() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+
+        let delta = RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: "normal_actor".to_string(),
+                location: test_location(test_addr(9001)),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: test_peer_id("node_b"),
+            wall_clock_time: current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        };
+
+        let acks = registry.apply_delta(delta).await.unwrap();
+        assert!(acks.is_empty(), "normal priority must not be acked: {acks:?}");
+        assert!(
+            registry
+                .actor_state
+                .known_actors
+                .contains_sync("normal_actor")
         );
     }
 

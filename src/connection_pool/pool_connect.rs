@@ -1161,8 +1161,10 @@ impl<T> ConnectionPool<T> {
             self.clear_current_peer_connection(peer_id);
             // Preserve the configured peer address so reconnect logic keeps a stable destination.
 
-            // Remove ALL addr_to_peer_id entries for this peer
-            // (may have multiple due to reindexing keeping both ephemeral and bind addresses)
+            // Remove every address alias for this peer. Do not rely only
+            // on `addr_to_peer_id`: older/reindexed sessions may still be
+            // reachable through `connections_by_addr` at the configured
+            // bind address even if that alias row is missing.
             let mut addrs_to_remove: Vec<SocketAddr> = Vec::new();
             self.addr_to_peer_id.iter_sync(|addr, pid| {
                 if pid == peer_id {
@@ -1170,6 +1172,14 @@ impl<T> ConnectionPool<T> {
                 }
                 true
             });
+            if !addrs_to_remove.contains(&connection.addr) {
+                addrs_to_remove.push(connection.addr);
+            }
+            if let Some(configured_addr) = self.get_configured_peer_addr(peer_id)
+                && !addrs_to_remove.contains(&configured_addr)
+            {
+                addrs_to_remove.push(configured_addr);
+            }
 
             for addr in &addrs_to_remove {
                 let _ = self.addr_to_peer_id.remove_sync(addr);
@@ -1997,23 +2007,17 @@ pub(crate) fn handle_incoming_message(
                     gossip_state.delta_exchanges += 1;
                 }
 
-                // Collect immediate actors for ACK before consuming delta.
-                let mut immediate_actors = Vec::new();
-                for change in &delta.changes {
-                    if let crate::registry::RegistryChange::ActorAdded { name, priority, .. } =
-                        change
-                    {
-                        if priority.should_trigger_immediate_gossip() {
-                            immediate_actors.push(name.clone());
-                        }
-                    }
-                }
-
                 // Apply the delta using the canonical registry logic (vector clocks +
                 // deterministic tiebreakers). The previous "inline apply" fast-path had
                 // multiple conflict-resolution implementations depending on lock contention,
                 // which could cause nodes to diverge.
-                registry.apply_delta(delta).await?;
+                //
+                // Only ACK immediate-priority actor additions that actually
+                // mutated local state. Duplicate deltas (same vector clock or
+                // already-tombstoned) return an empty list, so we don't emit
+                // redundant `ImmediateAck` frames for senders that broadcast
+                // the same change more than once.
+                let immediate_actors = registry.apply_delta(delta).await?;
 
                 // NEW: Send ACK back for immediate registrations
                 if !immediate_actors.is_empty() {
