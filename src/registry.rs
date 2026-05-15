@@ -3906,13 +3906,19 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // Fire the dead-peer cleanup hook outside the gossip_state lock.
-        // De-duplicate in case the same addr crossed threshold via both
-        // soft and hard paths in one batch.
+        // Crossing the failure threshold is a transport-local verdict,
+        // not an actor-liveness verdict. Keep remote actors available
+        // for reconnect/failover and let `cleanup_dead_peers` reclaim
+        // them only after the dead-peer timeout. This keeps the gossip
+        // table stable during short disconnects and avoids publishing
+        // ActorRemoved tombstones before the consensus path has even run.
         newly_dead.sort_by_key(|a| (a.ip(), a.port()));
         newly_dead.dedup();
         for addr in newly_dead {
-            self.handle_peer_death(addr, None).await;
+            info!(
+                peer = %addr,
+                "peer reached failure threshold; retaining actors for reconnection"
+            );
         }
     }
 
@@ -4945,33 +4951,11 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // Gossip protocol's verdict: socket disconnect = peer is dead.
-        // Fire the cleanup hook on the same code path as the
-        // failures-incremented-to-threshold case in `apply_gossip_results`,
-        // so `known_actors` and pool-state evictions are uniform.
         if crossed_threshold {
-            self.handle_peer_death(failed_peer_addr, peer_id.clone())
-                .await;
-
-            // C1 + C2: socket-close observation must produce an
-            // immediate cluster-wide broadcast, not wait for the
-            // periodic gossip tick. `handle_peer_death` (after the
-            // C3 fix) enqueues an Immediate-priority `ActorRemoved`
-            // change for every pruned actor — kick a gossip round
-            // right now so indirect peers learn about the death in
-            // sub-millisecond time rather than `gossip_interval`.
-            //
-            // This path is NOT called from inside `apply_gossip_results`
-            // (which has its own re-entry concerns), so triggering
-            // immediate gossip here is safe.
-            if let Err(err) = self.trigger_immediate_gossip().await {
-                warn!(
-                    error = %err,
-                    failed_peer = %failed_peer_addr,
-                    "trigger_immediate_gossip after socket-close failed; \
-                     ActorRemoved deltas will go out on next periodic gossip"
-                );
-            }
+            info!(
+                failed_peer = %failed_peer_addr,
+                "socket-close crossed failure threshold; retaining actors until consensus/timeout"
+            );
         }
 
         // Now start consensus process for actor invalidation.
@@ -5188,10 +5172,12 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // Gossip protocol's verdict: socket disconnect = peer is dead.
         if crossed_threshold {
-            self.handle_peer_death(failed_peer_addr, Some(failed_peer_id.clone()))
-                .await;
+            info!(
+                failed_peer = %failed_peer_addr,
+                node_id = %failed_peer_id,
+                "socket-close crossed failure threshold; retaining actors until consensus/timeout"
+            );
         }
 
         // Now start consensus process for actor invalidation (same as address-based method).
@@ -8056,6 +8042,65 @@ mod tests {
         let peer = gossip_state.peers.get(&test_addr(8081)).unwrap();
         assert_eq!(peer.failures, registry.config.max_peer_failures);
         assert!(peer.last_failure_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn peer_connection_failure_retains_remote_actors_for_reconnection() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let peer_addr = test_addr(8081);
+        let peer_id = test_peer_id("reconnectable_peer");
+        let actor_name = "remote_reconnectable_actor";
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer_info = PeerInfo::local(peer_addr);
+            peer_info.node_id = Some(peer_id.to_node_id());
+            gossip_state.peers.insert(peer_addr, peer_info);
+
+            let mut actors = HashSet::new();
+            actors.insert(actor_name.to_string());
+            gossip_state.peer_to_actors.insert(peer_addr, actors);
+        }
+
+        registry.actor_state.known_actors.upsert_sync(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(peer_addr, peer_id.clone()),
+        );
+
+        registry
+            .handle_peer_connection_failure(peer_addr)
+            .await
+            .unwrap();
+
+        assert!(
+            registry.actor_state.known_actors.contains_sync(actor_name),
+            "transport failure must not prune remote actors before timeout"
+        );
+        assert!(
+            !registry
+                .actor_state
+                .removed_actors
+                .contains_sync(actor_name),
+            "transport failure must not create ActorRemoved tombstones"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state.peer_to_actors.contains_key(&peer_addr),
+            "actor attribution must remain so reconnect/full-sync can repair cleanly"
+        );
+        assert!(
+            gossip_state.pending_peer_failures.contains_key(&peer_addr),
+            "failure should still enter the consensus/timeout path"
+        );
+        assert!(
+            gossip_state.urgent_changes.is_empty(),
+            "transport failure must not broadcast immediate ActorRemoved"
+        );
+        assert!(
+            gossip_state.pending_changes.is_empty(),
+            "transport failure must not enqueue regularized ActorRemoved"
+        );
     }
 
     #[tokio::test]
