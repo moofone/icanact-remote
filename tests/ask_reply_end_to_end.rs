@@ -119,8 +119,10 @@ fn test_end_to_end_ask_reply() {
 
         // Keep the gossip timer from creating opportunistic outbound connections during
         // the ask/reply assertions (tie-breakers can invalidate the connection mid-ask).
-        let mut config = GossipConfig::default();
-        config.gossip_interval = Duration::from_secs(3600);
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(3600),
+            ..Default::default()
+        };
         let handle_a = create_tls_node(config.clone()).await.unwrap();
         let handle_b = create_tls_node(config).await.unwrap();
         handle_b
@@ -356,7 +358,7 @@ fn test_end_to_end_ask_reply() {
             let addr_missing: SocketAddr = listener.local_addr().unwrap();
             drop(listener);
             let missing_peer_id = (0..100)
-                .map(|idx| KeyPair::new_for_testing(&format!("node_missing_{idx}")).peer_id())
+                .map(|idx| KeyPair::new_for_testing(format!("node_missing_{idx}")).peer_id())
                 .find(|peer_id| handle_a.registry.should_keep_connection(peer_id, true))
                 .expect("find outbound-preferred missing peer id");
             let missing_peer = handle_a.add_peer(&missing_peer_id).await;

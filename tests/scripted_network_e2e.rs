@@ -45,8 +45,10 @@ impl ActorMessageHandlerSync for EchoHandler {
         }
 
         self.asks.fetch_add(1, Ordering::AcqRel);
-        if self.slow_payload_delay.is_some() && payload.as_ref() == b"slow" {
-            thread::sleep(self.slow_payload_delay.expect("slow payload delay"));
+        if let Some(delay) = self.slow_payload_delay
+            && payload.as_ref() == b"slow"
+        {
+            thread::sleep(delay);
         }
         Ok(Some(ActorResponse::from(
             format!(
@@ -285,6 +287,43 @@ async fn ask_once(from: &TlsHandle, to: &PeerId, payload: &'static [u8], expecte
         .await
         .expect("actor ask");
     assert_eq!(reply.as_ref(), expected);
+}
+
+async fn wait_for_successful_ask(
+    from: &TlsHandle,
+    to: &PeerId,
+    payload: &'static [u8],
+    expected: &'static [u8],
+) -> icanact_remote::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        let remote = from.lookup_peer(to).await?;
+        match remote
+            .ask_actor_frame(
+                TEST_ACTOR_ID,
+                TEST_TYPE_HASH,
+                Bytes::from_static(payload),
+                Duration::from_millis(750),
+            )
+            .await
+        {
+            Ok(reply) if reply.as_ref() == expected => return Ok(()),
+            Ok(reply) => {
+                return Err(icanact_remote::GossipError::Network(std::io::Error::other(
+                    format!("unexpected reply: {reply:?}"),
+                )));
+            }
+            Err(err @ icanact_remote::GossipError::ConnectionDropped)
+            | Err(err @ icanact_remote::GossipError::ActorNotFound(_))
+            | Err(err @ icanact_remote::GossipError::Timeout) => {
+                last_err = Some(err);
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or(icanact_remote::GossipError::Timeout))
 }
 
 async fn wait_until_connected(handle: &TlsHandle, peer_id: &PeerId) -> icanact_remote::Result<()> {
@@ -971,7 +1010,8 @@ async fn dropped_transport_during_actor_ask_clears_connected_lookup_and_reconnec
     )
     .await;
     connect_preferred_direction(&local, &remote, &remote_to_local).await?;
-    ask_once(&local, &remote.registry.peer_id, b"after", b"remote:after").await;
+    wait_until_connected(&local, &remote.registry.peer_id).await?;
+    wait_for_successful_ask(&local, &remote.registry.peer_id, b"after", b"remote:after").await?;
 
     with_events(&events, |events| {
         assert!(

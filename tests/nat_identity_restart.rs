@@ -4,7 +4,7 @@ use tokio::time::sleep;
 
 fn key_pair_greater_than_all(seed_prefix: &str, lower: &[&KeyPair]) -> KeyPair {
     (0..100)
-        .map(|idx| KeyPair::new_for_testing(&format!("{seed_prefix}_{idx}")))
+        .map(|idx| KeyPair::new_for_testing(format!("{seed_prefix}_{idx}")))
         .find(|candidate| {
             lower.iter().all(|keypair| {
                 keypair

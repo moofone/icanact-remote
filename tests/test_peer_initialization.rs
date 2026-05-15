@@ -235,5 +235,5 @@ async fn test_peer_initialization_with_names_inner() {
 
 #[test]
 fn test_peer_initialization_with_names() {
-    run_peer_init_test("with-names", || test_peer_initialization_with_names_inner());
+    run_peer_init_test("with-names", test_peer_initialization_with_names_inner);
 }
