@@ -2769,20 +2769,32 @@ impl<T: 'static> GossipRegistry<T> {
                         name,
                         vector_clock,
                         removing_node_id,
-                        priority: _,
+                        priority,
                     } => {
-                        let Some(tombstone_only) = self.current_actor_removal_plan(
-                            name.as_str(),
-                            &vector_clock,
-                            &removing_node_id,
-                        ) else {
+                        let Some((removal_clock, tombstone_only)) = self
+                            .current_actor_removal_plan(
+                                name.as_str(),
+                                &vector_clock,
+                                &removing_node_id,
+                            )
+                        else {
                             continue;
+                        };
+
+                        let forwarded = RegistryChange::ActorRemoved {
+                            name: name.clone(),
+                            vector_clock: removal_clock.clone(),
+                            removing_node_id,
+                            priority,
                         };
                         if tombstone_only {
                             let _ = self.actor_state.removed_actors.upsert_sync(
                                 name.clone(),
-                                RemovedActorTombstone::new(vector_clock),
+                                RemovedActorTombstone::new(removal_clock),
                             );
+                            gossip_state
+                                .pending_changes
+                                .push(Self::as_regular_gossip_change(&forwarded));
                             continue;
                         }
                         if self
@@ -2796,7 +2808,10 @@ impl<T: 'static> GossipRegistry<T> {
                             let _ = self
                                 .actor_state
                                 .removed_actors
-                                .upsert_sync(name, RemovedActorTombstone::new(vector_clock));
+                                .upsert_sync(name, RemovedActorTombstone::new(removal_clock));
+                            gossip_state
+                                .pending_changes
+                                .push(Self::as_regular_gossip_change(&forwarded));
                         }
                     }
                 }
@@ -3186,7 +3201,7 @@ impl<T: 'static> GossipRegistry<T> {
         name: &str,
         vector_clock: &crate::VectorClock,
         removing_node_id: &crate::NodeId,
-    ) -> Option<bool> {
+    ) -> Option<(crate::VectorClock, bool)> {
         if self.actor_state.local_actors.contains_sync(name) {
             debug!(
                 actor_name = %name,
@@ -3231,14 +3246,31 @@ impl<T: 'static> GossipRegistry<T> {
         );
 
         match should_remove {
-            Some(Some(tombstone_only)) => Some(tombstone_only),
+            Some(Some(tombstone_only)) => Some((vector_clock.clone(), tombstone_only)),
             Some(None) => None,
             None => {
+                let tombstone_clock = vector_clock.clone();
+                if let Some(existing_tombstone) = self
+                    .actor_state
+                    .removed_actors
+                    .read_sync(name, |_, tombstone| tombstone.vector_clock.clone())
+                {
+                    match vector_clock.compare(&existing_tombstone) {
+                        crate::ClockOrdering::Before | crate::ClockOrdering::Equal => {
+                            return None;
+                        }
+                        crate::ClockOrdering::After => {}
+                        crate::ClockOrdering::Concurrent => {
+                            tombstone_clock.merge(&existing_tombstone);
+                        }
+                    }
+                }
+
                 debug!(
                     actor_name = %name,
                     "actor not found - will record removal tombstone"
                 );
-                Some(true)
+                Some((tombstone_clock, true))
             }
         }
     }
