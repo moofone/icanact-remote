@@ -810,6 +810,15 @@ impl<T: 'static> Peer<T> {
                 format!("Invalid port 0 for peer {}", self.peer_id),
             )));
         }
+        if addr.ip().is_unspecified() {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to connect peer {} via unspecified address {}",
+                    self.peer_id, addr
+                ),
+            )));
+        }
 
         // First configure the address for this peer
         {

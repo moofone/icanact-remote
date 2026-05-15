@@ -167,6 +167,44 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
 }
 
 #[tokio::test]
+async fn disconnect_by_peer_id_removes_configured_addr_connection_without_alias_row() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("configured_addr_disconnect").peer_id();
+    let addr: SocketAddr = "127.0.0.1:40557".parse().unwrap();
+
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
+
+    let _ = pool.addr_to_peer_id.remove_sync(&addr);
+    pool.clear_current_peer_connection(&peer_id);
+    assert!(
+        pool.get_connection_by_peer_id(&peer_id).is_some(),
+        "test setup: configured-address fallback must be able to find the connection"
+    );
+
+    pool.disconnect_connection_by_peer_id(&peer_id)
+        .expect("expected connection to be removed");
+
+    assert!(
+        pool.get_connection_by_peer_id(&peer_id).is_none(),
+        "disconnect must not leave a stale connection reachable by configured-address fallback"
+    );
+    assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
+}
+
+#[tokio::test]
 async fn get_connection_by_peer_id_uses_session_current_connection() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer_id = crate::KeyPair::new_for_testing("session_current_connection").peer_id();
