@@ -279,13 +279,13 @@ impl LockFreeStreamHandle {
             match result {
                 ReadIoResult::DirectAsk { .. } => ASK_READ_BATCH_LIMIT,
                 ReadIoResult::ActorAsk { .. } => ASK_READ_BATCH_LIMIT,
-                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor { msg_type, .. })
-                    if *msg_type == crate::MessageType::ActorAsk as u8 =>
-                {
-                    ASK_READ_BATCH_LIMIT
-                }
+                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+                    msg_type, ..
+                }) if *msg_type == crate::MessageType::ActorAsk as u8 => ASK_READ_BATCH_LIMIT,
                 ReadIoResult::Generic(crate::handle::MessageReadResult::DirectAsk { .. })
-                | ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse { .. })
+                | ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
+                    ..
+                })
                 | ReadIoResult::Generic(crate::handle::MessageReadResult::Response { .. }) => {
                     ASK_READ_BATCH_LIMIT
                 }
@@ -418,10 +418,8 @@ impl LockFreeStreamHandle {
         const OWNER_BATCH_SIZE: usize = 64;
         const READ_BATCH_LIMIT: usize = 2048;
         const ASK_READ_BATCH_LIMIT: usize = 8192;
-        const FLUSH_THRESHOLD: usize = 64 * 1024; // Favor batching on tell; ask has its own fast flush path
 
         let mut bytes_since_flush = 0;
-        let mut last_flush = std::time::Instant::now();
 
         // Pre-allocate reusable buffers to avoid allocations in the hot loop
         let mut write_chunks: Vec<bytes::Bytes> = Vec::with_capacity(OWNER_BATCH_SIZE * 2);
@@ -464,7 +462,6 @@ impl LockFreeStreamHandle {
                     StreamingCommand::Flush => {
                         let _ = stream.flush().await;
                         flush_pending.store(false, Ordering::Release);
-                        last_flush = std::time::Instant::now();
                         bytes_since_flush = 0;
                     }
                     StreamingCommand::VectoredWrite(cmd) => {
@@ -612,12 +609,11 @@ impl LockFreeStreamHandle {
                                 payload
                             }
                         };
-                        let ask_write_start =
-                            if is_ask_payload && perf.is_some() {
-                                Some(Instant::now())
-                            } else {
-                                None
-                            };
+                        let ask_write_start = if is_ask_payload && perf.is_some() {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
                         if !matches!(&payload, WritePayload::DirectAskInline { .. })
                             && !direct_ask_headers.is_empty()
                         {
@@ -1210,12 +1206,15 @@ impl LockFreeStreamHandle {
                             }
                             WritePayload::DirectAskInline { header, payload } => {
                                 if !write_chunks.is_empty() {
-                                    let bytes_written =
-                                        match write_chunks_batched(&mut stream, &write_chunks).await
-                                        {
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
+                                    let bytes_written = match write_chunks_batched(
+                                        &mut stream,
+                                        &write_chunks,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
                                     bytes_written_counter
                                         .fetch_add(bytes_written, Ordering::Relaxed);
                                     total_bytes_written += bytes_written;
@@ -1306,17 +1305,9 @@ impl LockFreeStreamHandle {
             }
 
             bytes_since_flush += total_bytes_written;
-            let elapsed = last_flush.elapsed();
-
-            if should_flush(
-                bytes_since_flush,
-                elapsed,
-                FLUSH_THRESHOLD,
-                WRITER_MAX_LATENCY,
-            ) {
+            if bytes_since_flush > 0 {
                 let _ = stream.flush().await;
                 bytes_since_flush = 0;
-                last_flush = std::time::Instant::now();
                 flush_pending.store(false, Ordering::Release);
             }
 
@@ -1359,8 +1350,7 @@ impl LockFreeStreamHandle {
 
                         if let Some(result) = read_result.result {
                             reads += 1;
-                            read_batch_limit =
-                                read_batch_limit.max(read_batch_limit_for(&result));
+                            read_batch_limit = read_batch_limit.max(read_batch_limit_for(&result));
                             let Some(result) = try_handle_fast_io(
                                 result,
                                 ctx,
@@ -1464,7 +1454,6 @@ impl LockFreeStreamHandle {
             {
                 let _ = stream.flush().await;
                 bytes_since_flush = 0;
-                last_flush = std::time::Instant::now();
                 flush_pending.store(false, Ordering::Release);
             }
 
@@ -1663,7 +1652,6 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
-                                wrote_actor_responses = true;
                             }
                             if !direct_response_batch.is_empty() {
                                 if let Err(e) = write_direct_response_batch(
@@ -1681,23 +1669,13 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
-                                wrote_fast_responses = true;
                             }
                             // Ensure request/response traffic does not sit in TLS buffers on
                             // quiet links. The idle branch has no outer fast-flush checkpoint
                             // after this select arm, so flush direct/actor responses here.
-                            if ((wrote_actor_responses || wrote_fast_responses)
-                                || should_flush(
-                                    bytes_since_flush,
-                                    last_flush.elapsed(),
-                                    FLUSH_THRESHOLD,
-                                    WRITER_MAX_LATENCY,
-                                ))
-                                && bytes_since_flush > 0
-                            {
+                            if bytes_since_flush > 0 {
                                 let _ = stream.flush().await;
                                 bytes_since_flush = 0;
-                                last_flush = std::time::Instant::now();
                                 flush_pending.store(false, Ordering::Release);
                             }
                         }
@@ -1713,7 +1691,6 @@ impl LockFreeStreamHandle {
                         _ = streaming_queue.data_notify.notified() => {
                             // Wake on streaming commands; drained at the top of the loop.
                         }
-                        _ = tokio::time::sleep(WRITER_MAX_LATENCY) => {}
                     }
                 } else {
                     tokio::select! {
@@ -1726,7 +1703,6 @@ impl LockFreeStreamHandle {
                         _ = write_queue.space_notify.notified() => {
                             // Producer wakeup only; no action needed.
                         }
-                        _ = tokio::time::sleep(WRITER_MAX_LATENCY) => {}
                     }
                 }
             }
@@ -1742,8 +1718,7 @@ impl LockFreeStreamHandle {
                         write_ns,
                         ask_write_calls,
                         ask_write_ns,
-                    ) =
-                        perf.snapshot_and_reset();
+                    ) = perf.snapshot_and_reset();
                     let read_us = read_ns as f64 / 1000.0;
                     let handle_us = handle_ns as f64 / 1000.0;
                     let write_us = write_ns as f64 / 1000.0;
