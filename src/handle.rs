@@ -321,6 +321,17 @@ impl<T> GossipRegistryHandle<T> {
             .is_some()
     }
 
+    pub fn peer_clock_snapshot(
+        &self,
+        peer_addr: &std::net::SocketAddr,
+    ) -> Option<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshot(peer_addr)
+    }
+
+    pub fn peer_clock_snapshots(&self) -> Vec<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshots()
+    }
+
     /// Get registry statistics including vector clock metrics
     pub async fn stats(&self) -> RegistryStats {
         self.registry.get_stats().await
@@ -564,6 +575,17 @@ impl<T> GossipClient<T> {
             .connection_pool
             .disconnect_connection_by_peer_id(peer_id)
             .is_some()
+    }
+
+    pub fn peer_clock_snapshot(
+        &self,
+        peer_addr: &std::net::SocketAddr,
+    ) -> Option<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshot(peer_addr)
+    }
+
+    pub fn peer_clock_snapshots(&self) -> Vec<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshots()
     }
 
     /// Lookup a peer and return a RemoteActorRef for communicating with it.
@@ -1648,7 +1670,7 @@ where
     let (sender_node_id, _initial_correlation_id, sender_bind_addr_opt) = match &msg_result {
         Ok(MessageReadResult::Gossip(msg, correlation_id)) => {
             let (node_id, bind_addr) = match msg {
-                RegistryMessage::DeltaGossip { delta } => (delta.sender_peer_id.to_hex(), None),
+                RegistryMessage::DeltaGossip { delta, .. } => (delta.sender_peer_id.to_hex(), None),
                 RegistryMessage::FullSync {
                     sender_peer_id,
                     sender_bind_addr,
@@ -1664,7 +1686,7 @@ where
                     sender_bind_addr,
                     ..
                 } => (sender_peer_id.to_hex(), sender_bind_addr.clone()),
-                RegistryMessage::DeltaGossipResponse { delta } => {
+                RegistryMessage::DeltaGossipResponse { delta, .. } => {
                     (delta.sender_peer_id.to_hex(), None)
                 }
                 RegistryMessage::PeerHealthQuery { sender, .. } => (sender.to_hex(), None),
@@ -3196,7 +3218,7 @@ async fn send_gossip_message_zero_copy(
     let current_time_nanos = crate::current_timestamp_nanos();
 
     // Debug: Check if there's a delay in the task creation vs sending
-    if let crate::registry::RegistryMessage::DeltaGossip { delta } = &task.message {
+    if let crate::registry::RegistryMessage::DeltaGossip { delta, .. } = &task.message {
         for change in &delta.changes {
             if let crate::registry::RegistryChange::ActorAdded { location, .. } = change {
                 let creation_time_nanos = location.wall_clock_time as u128 * 1_000_000_000;
@@ -3208,7 +3230,7 @@ async fn send_gossip_message_zero_copy(
     }
 
     match &mut task.message {
-        crate::registry::RegistryMessage::DeltaGossip { delta } => {
+        crate::registry::RegistryMessage::DeltaGossip { delta, extensions } => {
             delta.precise_timing_nanos = current_time_nanos;
             // Update wall_clock_time in all changes to current time for accurate propagation measurement
             for change in &mut delta.changes {
@@ -3222,9 +3244,14 @@ async fn send_gossip_message_zero_copy(
                     }
                 }
             }
+            *extensions = registry
+                .gossip_extensions_for_outbound(task.peer_addr, current_time_nanos)
+                .await;
         }
-        crate::registry::RegistryMessage::FullSync { .. } => {
-            // Full sync doesn't use precise timing
+        crate::registry::RegistryMessage::FullSync { extensions, .. } => {
+            *extensions = registry
+                .gossip_extensions_for_outbound(task.peer_addr, current_time_nanos)
+                .await;
         }
         _ => {}
     }

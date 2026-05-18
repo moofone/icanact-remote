@@ -2937,6 +2937,7 @@ async fn full_sync_response_updates_last_response_received_ms() {
         sender_bind_addr: Some(peer_addr.to_string()),
         sequence: 1,
         wall_clock_time: crate::current_timestamp(),
+        extensions: None,
     };
 
     super::handle_incoming_message(registry.clone(), peer_addr, msg)
@@ -2991,6 +2992,7 @@ async fn full_sync_updates_last_response_received_ms() {
         sender_bind_addr: Some(peer_addr.to_string()),
         sequence: 1,
         wall_clock_time: crate::current_timestamp(),
+        extensions: None,
     };
 
     super::handle_incoming_message(registry.clone(), peer_addr, msg)
@@ -3047,7 +3049,10 @@ async fn delta_gossip_updates_last_response_received_ms() {
         wall_clock_time: crate::current_timestamp(),
         precise_timing_nanos: crate::current_timestamp_nanos(),
     };
-    let msg = crate::registry::RegistryMessage::DeltaGossip { delta };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
 
     super::handle_incoming_message(registry.clone(), peer_addr, msg)
         .await

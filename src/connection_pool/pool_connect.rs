@@ -451,6 +451,7 @@ impl<T> ConnectionPool<T> {
                     sender_bind_addr: Some(registry_arc.bind_addr.to_string()),
                     sequence: gossip_state.gossip_sequence,
                     wall_clock_time: crate::current_timestamp(),
+                    extensions: None,
                 }
             };
 
@@ -1606,6 +1607,7 @@ impl<T> ConnectionPool<T> {
                     sender_bind_addr: Some(registry_arc.bind_addr.to_string()), // Use our listening address, not ephemeral port
                     sequence: gossip_state.gossip_sequence,
                     wall_clock_time: crate::current_timestamp(),
+                    extensions: None,
                 }
             };
 
@@ -1904,7 +1906,7 @@ pub(crate) fn handle_incoming_message(
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
         match msg {
-            RegistryMessage::DeltaGossip { delta } => {
+            RegistryMessage::DeltaGossip { delta, extensions } => {
                 debug!(
                     sender = %delta.sender_peer_id,
                     since_sequence = delta.since_sequence,
@@ -1915,6 +1917,11 @@ pub(crate) fn handle_incoming_message(
                 let sender_socket_addr =
                     resolve_peer_state_addr(&registry, Some(&delta.sender_peer_id), _peer_addr)
                         .await;
+                registry.record_inbound_gossip_extensions(
+                    sender_socket_addr,
+                    extensions,
+                    crate::current_timestamp_nanos(),
+                );
 
                 // OPTIMIZATION: Do all peer management in one lock acquisition
                 {
@@ -2059,10 +2066,16 @@ pub(crate) fn handle_incoming_message(
                 sender_bind_addr,
                 sequence,
                 wall_clock_time,
+                extensions,
             } => {
                 // Use resolve_peer_addr for safe address resolution with validation
                 // This handles: None, invalid addresses, 0.0.0.0, and falls back to TCP source
                 let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), _peer_addr);
+                registry.record_inbound_gossip_extensions(
+                    sender_socket_addr,
+                    extensions,
+                    crate::current_timestamp_nanos(),
+                );
 
                 // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
                 debug!(
@@ -2234,6 +2247,12 @@ pub(crate) fn handle_incoming_message(
                         sender_bind_addr: Some(registry.bind_addr.to_string()), // Our listening address
                         sequence: our_sequence,
                         wall_clock_time: crate::current_timestamp(),
+                        extensions: registry
+                            .gossip_extensions_for_outbound(
+                                sender_socket_addr,
+                                crate::current_timestamp_nanos(),
+                            )
+                            .await,
                     };
 
                     // Send the response back through existing connection
@@ -2386,11 +2405,19 @@ pub(crate) fn handle_incoming_message(
                 Ok(())
             }
             // Handle response messages (these can arrive on incoming connections too)
-            RegistryMessage::DeltaGossipResponse { delta } => {
+            RegistryMessage::DeltaGossipResponse { delta, extensions } => {
                 debug!(
                     sender = %delta.sender_peer_id,
                     changes = delta.changes.len(),
                     "received delta gossip response on bidirectional connection"
+                );
+                let sender_socket_addr =
+                    resolve_peer_state_addr(&registry, Some(&delta.sender_peer_id), _peer_addr)
+                        .await;
+                registry.record_inbound_gossip_extensions(
+                    sender_socket_addr,
+                    extensions,
+                    crate::current_timestamp_nanos(),
                 );
 
                 if let Err(err) = registry.apply_delta(delta).await {
@@ -2408,9 +2435,15 @@ pub(crate) fn handle_incoming_message(
                 sender_bind_addr,
                 sequence,
                 wall_clock_time,
+                extensions,
             } => {
                 // Use resolve_peer_addr for safe address resolution with validation
                 let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), _peer_addr);
+                registry.record_inbound_gossip_extensions(
+                    sender_socket_addr,
+                    extensions,
+                    crate::current_timestamp_nanos(),
+                );
 
                 debug!(
                     sender = %sender_peer_id,
