@@ -690,7 +690,8 @@ impl RoutedPubSub {
                     .queue_full_drops
                     .fetch_add(1, Ordering::Relaxed);
             }
-            Err(_) => {
+            Err(err) => {
+                tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub send failed");
                 stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1)
             }
         }
@@ -854,7 +855,16 @@ impl RoutedPubSub {
 
     fn try_send_next_hop(&self, next_hop: &PeerId, frame: Bytes) -> Result<()> {
         let conns = self.conns.load();
-        let Some(conn) = conns.get(next_hop) else {
+        let conn = if let Some(conn) = conns.get(next_hop) {
+            conn.clone()
+        } else if let Some(peer_ref) = self.client.lookup_connected_peer(next_hop)
+            && let Some(conn) = peer_ref.connection_ref()
+        {
+            let mut next = (**conns).clone();
+            next.insert(next_hop.clone(), conn.clone());
+            self.conns.store(Arc::new(next));
+            conn
+        } else {
             self.counters
                 .route_miss_drops
                 .fetch_add(1, Ordering::Relaxed);
@@ -871,7 +881,16 @@ impl RoutedPubSub {
         payload_len: usize,
     ) -> Result<()> {
         let conns = self.conns.load();
-        let Some(conn) = conns.get(next_hop) else {
+        let conn = if let Some(conn) = conns.get(next_hop) {
+            conn.clone()
+        } else if let Some(peer_ref) = self.client.lookup_connected_peer(next_hop)
+            && let Some(conn) = peer_ref.connection_ref()
+        {
+            let mut next = (**conns).clone();
+            next.insert(next_hop.clone(), conn.clone());
+            self.conns.store(Arc::new(next));
+            conn
+        } else {
             self.counters
                 .route_miss_drops
                 .fetch_add(1, Ordering::Relaxed);

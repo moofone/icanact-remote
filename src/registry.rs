@@ -1527,15 +1527,19 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Enable UDP datagram transport mode with transport-neutral liveness detection.
     ///
-    /// Native UDP datagrams are currently rejected because the datagram receive path
-    /// has no handshake or message authentication boundary. Keeping this API as an
-    /// explicit error prevents deployments from accidentally exposing unauthenticated
-    /// gossip and actor dispatch over UDP.
-    pub fn enable_udp(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
-        Err(GossipError::InvalidConfig(
-            "native UDP datagram transport is disabled until inbound datagrams are authenticated"
-                .to_string(),
-        ))
+    /// UDP data-plane frames are plaintext framed bytes. Peer identity is taken
+    /// from the peer/address association established by the control plane, not
+    /// from a per-datagram signature or encryption envelope.
+    pub fn enable_udp(&mut self, secret_key: crate::SecretKey) -> Result<()> {
+        let keypair = secret_key.to_keypair();
+        if keypair.peer_id() != self.peer_id {
+            return Err(GossipError::InvalidKeyPair(
+                "UDP transport keypair does not match registry peer id".to_string(),
+            ));
+        }
+        self.udp_mode = true;
+        self.tls_config = None;
+        Ok(())
     }
 
     fn udp_now_ms(&self) -> u64 {
@@ -7283,20 +7287,18 @@ mod tests {
     }
 
     #[test]
-    fn enable_udp_rejects_unauthenticated_datagram_mode() {
+    fn enable_udp_enables_plaintext_datagram_mode() {
         let keypair = KeyPair::new_for_testing("udp-disabled-registry");
-        let mut registry = GossipRegistry::<()>::new(test_addr(0), test_config());
+        let mut config = test_config();
+        config.key_pair = Some(keypair.clone());
+        let mut registry = GossipRegistry::<()>::new(test_addr(0), config);
 
-        let err = registry
+        registry
             .enable_udp(keypair.to_secret_key())
-            .expect_err("unauthenticated UDP mode must remain disabled");
+            .expect("UDP mode should enable plaintext datagrams");
 
-        match err {
-            GossipError::InvalidConfig(message) => {
-                assert!(message.contains("disabled until inbound datagrams are authenticated"));
-            }
-            other => panic!("expected InvalidConfig, got {other:?}"),
-        }
+        assert!(registry.udp_mode);
+        assert!(registry.tls_config.is_none());
     }
 
     #[test]

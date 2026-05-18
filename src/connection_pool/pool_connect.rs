@@ -434,8 +434,9 @@ impl<T> ConnectionPool<T> {
         if let Some(peer_id) = peer_id_opt.clone() {
             let _ = self
                 .connections_by_peer
-                .upsert_sync(peer_id.clone(), connection_arc);
-            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id);
+                .upsert_sync(peer_id.clone(), connection_arc.clone());
+            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+            self.publish_current_peer_connection(&peer_id, connection_arc.clone());
         }
 
         // Keep startup identity exchange parity with stream transports.
