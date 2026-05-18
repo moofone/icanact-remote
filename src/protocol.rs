@@ -268,9 +268,8 @@ impl Default for StreamingState {
 
 fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
     match msg {
-        RegistryMessage::DeltaGossip { delta } | RegistryMessage::DeltaGossipResponse { delta } => {
-            Some(&delta.sender_peer_id)
-        }
+        RegistryMessage::DeltaGossip { delta, .. }
+        | RegistryMessage::DeltaGossipResponse { delta, .. } => Some(&delta.sender_peer_id),
         RegistryMessage::FullSyncRequest { sender_peer_id, .. }
         | RegistryMessage::FullSync { sender_peer_id, .. }
         | RegistryMessage::FullSyncResponse { sender_peer_id, .. } => Some(sender_peer_id),

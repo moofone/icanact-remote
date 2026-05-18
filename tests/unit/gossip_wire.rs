@@ -52,6 +52,7 @@ fn registry_message_rkyv_roundtrip_delta_gossip() {
             wall_clock_time: 0,
             precise_timing_nanos: 0,
         },
+        extensions: None,
     };
 
     let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap(); // ALLOW_RKYV_TO_BYTES
@@ -59,7 +60,7 @@ fn registry_message_rkyv_roundtrip_delta_gossip() {
         rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&serialized).unwrap(); // ALLOW_RKYV_FROM_BYTES
 
     match deserialized {
-        RegistryMessage::DeltaGossip { delta } => {
+        RegistryMessage::DeltaGossip { delta, .. } => {
             assert_eq!(delta.current_sequence, 1);
             assert_eq!(delta.changes.len(), 1);
         }

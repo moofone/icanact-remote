@@ -13,7 +13,7 @@ use futures::task::AtomicWaker;
 use lru::LruCache;
 use scc::HashMap as SccHashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::Mutex;
 
@@ -28,6 +28,10 @@ use crate::{
     handshake::PeerCapabilities,
     peer_discovery::{PeerDiscovery, PeerDiscoveryConfig},
 };
+
+pub const CLOCK_CALIBRATION_INTERVAL_NS: u64 = 60_000_000_000;
+pub const CLOCK_CALIBRATION_PROBE_TIMEOUT_NS: u64 = 1_000_000_000;
+pub const CLOCK_CALIBRATION_STALE_AFTER_NS: u64 = 180_000_000_000;
 
 /// Classify a `GossipError` as a hard transport failure that proves the
 /// remote socket is gone (BrokenPipe / ConnectionReset / ConnectionAborted
@@ -126,6 +130,22 @@ fn owner_recovery_wins_tombstone(
     // concurrent.
     location.peer_id == *sender_peer_id
         && location.vector_clock.get(&location.node_id) >= tombstone.get(&location.node_id)
+}
+
+#[inline]
+fn actor_location_belongs_to_peer(
+    location: &RemoteActorLocation,
+    peer_addr: SocketAddr,
+    peer_info: Option<&PeerInfo>,
+) -> bool {
+    if let Some(node_id) = peer_info.and_then(|info| info.node_id.as_ref()) {
+        return location.node_id == *node_id || location.peer_id.to_node_id() == *node_id;
+    }
+
+    location
+        .address
+        .parse::<SocketAddr>()
+        .is_ok_and(|addr| addr == peer_addr)
 }
 
 /// Resolve the effective peer address from sender_bind_addr with validation.
@@ -649,6 +669,95 @@ pub struct RegistryDelta {
     pub precise_timing_nanos: u64,     // High precision timing for latency measurements
 }
 
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockProbeV1 {
+    pub sample_id: u64,
+    pub sender_wall_ns: u64,
+}
+
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockEchoV1 {
+    pub sample_id: u64,
+    pub origin_sender_wall_ns: u64,
+    pub responder_recv_wall_ns: u64,
+    pub responder_send_wall_ns: u64,
+}
+
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GossipExtensionsV1 {
+    pub clock_probe: Option<ClockProbeV1>,
+    pub clock_echo: Option<ClockEchoV1>,
+}
+
+impl GossipExtensionsV1 {
+    pub fn is_empty(&self) -> bool {
+        self.clock_probe.is_none() && self.clock_echo.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerClockSnapshot {
+    pub peer_addr: SocketAddr,
+    pub sample_id: u64,
+    pub offset_ns: i64,
+    pub rtt_ns: u64,
+    pub error_bound_ns: u64,
+    pub sampled_at_wall_ns: u64,
+    pub sample_count: u64,
+}
+
+impl PeerClockSnapshot {
+    pub fn sample_age_ns(&self, now_wall_ns: u64) -> u64 {
+        now_wall_ns.saturating_sub(self.sampled_at_wall_ns)
+    }
+
+    pub fn is_stale_at(&self, now_wall_ns: u64) -> bool {
+        self.sample_age_ns(now_wall_ns) > CLOCK_CALIBRATION_STALE_AFTER_NS
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingClockProbe {
+    peer_addr: SocketAddr,
+    sender_wall_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingClockEcho {
+    sample_id: u64,
+    origin_sender_wall_ns: u64,
+    responder_recv_wall_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerClockProbeState {
+    last_probe_sent_wall_ns: u64,
+}
+
+fn compute_clock_sample(
+    origin_send_wall_ns: u64,
+    responder_recv_wall_ns: u64,
+    responder_send_wall_ns: u64,
+    origin_recv_wall_ns: u64,
+) -> Option<(i64, u64, u64)> {
+    if origin_recv_wall_ns < origin_send_wall_ns || responder_send_wall_ns < responder_recv_wall_ns
+    {
+        return None;
+    }
+
+    let outbound = responder_recv_wall_ns as i128 - origin_send_wall_ns as i128;
+    let inbound = responder_send_wall_ns as i128 - origin_recv_wall_ns as i128;
+    let offset = (outbound + inbound) / 2;
+    if offset < i64::MIN as i128 || offset > i64::MAX as i128 {
+        return None;
+    }
+
+    let origin_elapsed = origin_recv_wall_ns.saturating_sub(origin_send_wall_ns);
+    let responder_elapsed = responder_send_wall_ns.saturating_sub(responder_recv_wall_ns);
+    let rtt = origin_elapsed.saturating_sub(responder_elapsed);
+    Some((offset as i64, rtt, rtt / 2))
+}
+
 /// Peer health status from a reporter's perspective
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct PeerHealthStatus {
@@ -768,9 +877,15 @@ impl Drop for PendingAckGuard {
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub enum RegistryMessage {
     /// Delta gossip message containing only changes
-    DeltaGossip { delta: RegistryDelta },
+    DeltaGossip {
+        delta: RegistryDelta,
+        extensions: Option<GossipExtensionsV1>,
+    },
     /// Response to delta gossip with our own delta
-    DeltaGossipResponse { delta: RegistryDelta },
+    DeltaGossipResponse {
+        delta: RegistryDelta,
+        extensions: Option<GossipExtensionsV1>,
+    },
     /// Request for full sync (fallback when deltas are unavailable)
     FullSyncRequest {
         sender_peer_id: crate::PeerId,    // Peer's unique identifier
@@ -786,6 +901,7 @@ pub enum RegistryMessage {
         sender_bind_addr: Option<String>, // Sender's listening address (optional for backwards compat)
         sequence: u64,
         wall_clock_time: u64,
+        extensions: Option<GossipExtensionsV1>,
     },
     /// Response to full sync
     FullSyncResponse {
@@ -795,6 +911,7 @@ pub enum RegistryMessage {
         sender_bind_addr: Option<String>, // Sender's listening address (optional for backwards compat)
         sequence: u64,
         wall_clock_time: u64,
+        extensions: Option<GossipExtensionsV1>,
     },
     /// Peer health status report
     PeerHealthReport {
@@ -1125,6 +1242,11 @@ pub struct GossipRegistry<T = ()> {
     pub peer_capabilities_by_node:
         Arc<SccHashMap<crate::NodeId, crate::handshake::PeerCapabilities>>,
     pub peer_capability_addr_to_node: Arc<SccHashMap<SocketAddr, crate::NodeId>>,
+    clock_probe_state: Arc<SccHashMap<SocketAddr, PeerClockProbeState>>,
+    pending_clock_probes: Arc<SccHashMap<u64, PendingClockProbe>>,
+    pending_clock_echoes: Arc<SccHashMap<SocketAddr, PendingClockEcho>>,
+    peer_clock_snapshots: Arc<SccHashMap<SocketAddr, PeerClockSnapshot>>,
+    next_clock_sample_id: Arc<AtomicU64>,
 
     // Actor message handler callback
     pub actor_message_handler: Arc<ArcSwapOption<ActorMessageHandlerCell>>,
@@ -1331,6 +1453,11 @@ impl<T: 'static> GossipRegistry<T> {
             peer_capabilities: peer_capabilities.clone(),
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
             peer_capability_addr_to_node: Arc::new(SccHashMap::default()),
+            clock_probe_state: Arc::new(SccHashMap::default()),
+            pending_clock_probes: Arc::new(SccHashMap::default()),
+            pending_clock_echoes: Arc::new(SccHashMap::default()),
+            peer_clock_snapshots: Arc::new(SccHashMap::default()),
+            next_clock_sample_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             actor_message_handler: Arc::new(ArcSwapOption::empty()),
             actor_tell_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_ask_immediate_handler_sync: Arc::new(ArcSwapOption::empty()),
@@ -1570,6 +1697,202 @@ impl<T: 'static> GossipRegistry<T> {
             true
         });
         found.load(Ordering::Relaxed)
+    }
+
+    pub async fn peer_supports_clock_calibration(&self, addr: &SocketAddr) -> bool {
+        if let Some(caps) = self.peer_capabilities.read_sync(addr, |_, v| *v) {
+            return caps.can_calibrate_clock();
+        }
+
+        let node_id = self.peer_capability_addr_to_node.read_sync(addr, |_, v| *v);
+        if let Some(node_id) = node_id
+            && let Some(caps) = self
+                .peer_capabilities_by_node
+                .read_sync(&node_id, |_, v| *v)
+        {
+            return caps.can_calibrate_clock();
+        }
+
+        if let Some(node_id) = self.lookup_node_id(addr).await {
+            let _ = self
+                .peer_capability_addr_to_node
+                .upsert_sync(*addr, node_id);
+            if let Some(caps) = self
+                .peer_capabilities_by_node
+                .read_sync(&node_id, |_, v| *v)
+            {
+                return caps.can_calibrate_clock();
+            }
+        }
+
+        let found = AtomicBool::new(false);
+        let want_ip = addr.ip();
+        self.peer_capabilities.iter_sync(|k, v| {
+            if k.ip() == want_ip && v.can_calibrate_clock() {
+                found.store(true, Ordering::Relaxed);
+                return false;
+            }
+            true
+        });
+        found.load(Ordering::Relaxed)
+    }
+
+    pub fn peer_clock_snapshot(&self, addr: &SocketAddr) -> Option<PeerClockSnapshot> {
+        self.peer_clock_snapshots.read_sync(addr, |_, v| *v)
+    }
+
+    pub fn peer_clock_snapshots(&self) -> Vec<PeerClockSnapshot> {
+        let mut out = Vec::new();
+        self.peer_clock_snapshots.iter_sync(|_, v| {
+            out.push(*v);
+            true
+        });
+        out.sort_by_key(|s| s.peer_addr);
+        out
+    }
+
+    pub async fn gossip_extensions_for_outbound(
+        &self,
+        peer_addr: SocketAddr,
+        send_wall_ns: u64,
+    ) -> Option<GossipExtensionsV1> {
+        if !self.peer_supports_clock_calibration(&peer_addr).await {
+            return None;
+        }
+
+        let mut extensions = GossipExtensionsV1::default();
+
+        if let Some((_, pending)) = self.pending_clock_echoes.remove_sync(&peer_addr) {
+            extensions.clock_echo = Some(ClockEchoV1 {
+                sample_id: pending.sample_id,
+                origin_sender_wall_ns: pending.origin_sender_wall_ns,
+                responder_recv_wall_ns: pending.responder_recv_wall_ns,
+                responder_send_wall_ns: send_wall_ns,
+            });
+        }
+
+        let mut expired_probe_ids = Vec::new();
+        let has_live_pending_probe = AtomicBool::new(false);
+        self.pending_clock_probes.iter_sync(|sample_id, pending| {
+            if pending.peer_addr == peer_addr {
+                if send_wall_ns.saturating_sub(pending.sender_wall_ns)
+                    >= CLOCK_CALIBRATION_PROBE_TIMEOUT_NS
+                {
+                    expired_probe_ids.push(*sample_id);
+                } else {
+                    has_live_pending_probe.store(true, Ordering::Relaxed);
+                }
+            }
+            true
+        });
+        let had_expired_probe = !expired_probe_ids.is_empty();
+        for sample_id in expired_probe_ids {
+            let _ = self.pending_clock_probes.remove_sync(&sample_id);
+        }
+
+        let has_snapshot = self.peer_clock_snapshots.contains_sync(&peer_addr);
+        let interval_elapsed = self
+            .clock_probe_state
+            .read_sync(&peer_addr, |_, state| {
+                send_wall_ns.saturating_sub(state.last_probe_sent_wall_ns)
+                    >= CLOCK_CALIBRATION_INTERVAL_NS
+            })
+            .unwrap_or(true);
+
+        let should_probe = !has_live_pending_probe.load(Ordering::Relaxed)
+            && (interval_elapsed || (had_expired_probe && !has_snapshot));
+
+        if should_probe {
+            let sample_id = self.next_clock_sample_id.fetch_add(1, Ordering::Relaxed);
+            let _ = self.clock_probe_state.upsert_sync(
+                peer_addr,
+                PeerClockProbeState {
+                    last_probe_sent_wall_ns: send_wall_ns,
+                },
+            );
+            let _ = self.pending_clock_probes.upsert_sync(
+                sample_id,
+                PendingClockProbe {
+                    peer_addr,
+                    sender_wall_ns: send_wall_ns,
+                },
+            );
+            extensions.clock_probe = Some(ClockProbeV1 {
+                sample_id,
+                sender_wall_ns: send_wall_ns,
+            });
+        }
+
+        (!extensions.is_empty()).then_some(extensions)
+    }
+
+    pub fn record_inbound_gossip_extensions(
+        &self,
+        peer_addr: SocketAddr,
+        extensions: Option<GossipExtensionsV1>,
+        recv_wall_ns: u64,
+    ) {
+        let Some(extensions) = extensions else {
+            return;
+        };
+
+        if let Some(probe) = extensions.clock_probe {
+            let _ = self.pending_clock_echoes.upsert_sync(
+                peer_addr,
+                PendingClockEcho {
+                    sample_id: probe.sample_id,
+                    origin_sender_wall_ns: probe.sender_wall_ns,
+                    responder_recv_wall_ns: recv_wall_ns,
+                },
+            );
+        }
+
+        if let Some(echo) = extensions.clock_echo {
+            self.record_clock_echo(peer_addr, echo, recv_wall_ns);
+        }
+    }
+
+    fn record_clock_echo(
+        &self,
+        peer_addr: SocketAddr,
+        echo: ClockEchoV1,
+        origin_recv_wall_ns: u64,
+    ) {
+        let Some((_, pending)) = self.pending_clock_probes.remove_sync(&echo.sample_id) else {
+            return;
+        };
+        if pending.peer_addr != peer_addr || pending.sender_wall_ns != echo.origin_sender_wall_ns {
+            return;
+        }
+
+        let Some((offset_ns, rtt_ns, error_bound_ns)) = compute_clock_sample(
+            pending.sender_wall_ns,
+            echo.responder_recv_wall_ns,
+            echo.responder_send_wall_ns,
+            origin_recv_wall_ns,
+        ) else {
+            return;
+        };
+
+        let sample_count = self
+            .peer_clock_snapshots
+            .read_sync(&peer_addr, |_, snapshot| {
+                snapshot.sample_count.saturating_add(1)
+            })
+            .unwrap_or(1);
+
+        let _ = self.peer_clock_snapshots.upsert_sync(
+            peer_addr,
+            PeerClockSnapshot {
+                peer_addr,
+                sample_id: echo.sample_id,
+                offset_ns,
+                rtt_ns,
+                error_bound_ns,
+                sampled_at_wall_ns: origin_recv_wall_ns,
+                sample_count,
+            },
+        );
     }
 
     async fn propagate_node_id_to_known_addresses(&self, addr: SocketAddr, node_id: NodeId) {
@@ -3080,6 +3403,7 @@ impl<T: 'static> GossipRegistry<T> {
             sender_bind_addr: Some(self.bind_addr.to_string()), // Use our listening address, not ephemeral port
             sequence,
             wall_clock_time: current_timestamp(),
+            extensions: None,
         }
     }
 
@@ -3110,6 +3434,7 @@ impl<T: 'static> GossipRegistry<T> {
             sender_bind_addr: Some(self.bind_addr.to_string()), // Use our listening address, not ephemeral port
             sequence,
             wall_clock_time: current_timestamp(),
+            extensions: None,
         }
     }
 
@@ -3124,7 +3449,10 @@ impl<T: 'static> GossipRegistry<T> {
         let delta = self
             .create_delta_from_state(gossip_state, local_actors, known_actors, since_sequence)
             .await?;
-        Ok(RegistryMessage::DeltaGossipResponse { delta })
+        Ok(RegistryMessage::DeltaGossipResponse {
+            delta,
+            extensions: None,
+        })
     }
 
     fn snapshot_actor_maps(
@@ -3539,8 +3867,7 @@ impl<T: 'static> GossipRegistry<T> {
                 Node(crate::NodeId),
                 Addr(SocketAddr),
             }
-            let mut seen: std::collections::HashSet<DispatchKey> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<DispatchKey> = std::collections::HashSet::new();
             let mut available_peers: Vec<SocketAddr> = Vec::new();
             for (peer_addr, peer) in gossip_state.peers.iter() {
                 let retry_window_open = peer.failures < self.config.max_peer_failures
@@ -3666,7 +3993,10 @@ impl<T: 'static> GossipRegistry<T> {
                             .await
                         {
                             Ok(delta) => {
-                                let message = RegistryMessage::DeltaGossip { delta };
+                                let message = RegistryMessage::DeltaGossip {
+                                    delta,
+                                    extensions: None,
+                                };
                                 delta_messages.insert(peer_info.last_sequence, message.clone());
                                 message
                             }
@@ -3947,253 +4277,6 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// Remove address-keyed entries that accumulate per peer and reset
-    /// the surviving `peers` row so a recovering peer's next FullSync is
-    /// accepted. Called from every peer-death path so cleanup happens at
-    /// detection time rather than at the deferred `cleanup_dead_peers`
-    /// pass.
-    async fn evict_peer_side_tables(&self, dead_peer_addr: SocketAddr) {
-        // Capability triples (addr → caps, addr → node_id, node_id →
-        // caps). Outside the gossip_state lock — uses scc::HashMap.
-        self.clear_peer_capabilities(&dead_peer_addr);
-
-        // UDP liveness entry.
-        if self.udp_mode {
-            let mut liveness = self.udp_liveness.lock().await;
-            liveness.remove(&dead_peer_addr);
-        }
-
-        // Gossip-state-owned tables.
-        {
-            let mut gossip_state = self.gossip_state.lock().await;
-
-            // Reset the surviving `peers` row so the recovered peer's
-            // next FullSync is accepted and `last_response_received_ms`
-            // doesn't suppress the response-asymmetry detector.
-            if let Some(peer_info) = gossip_state.peers.get_mut(&dead_peer_addr) {
-                peer_info.last_sequence = 0;
-                peer_info.last_response_received_ms = 0;
-            }
-
-            // Peer-keyed actor index — was previously deferred to
-            // `cleanup_dead_peers` (gated on `dead_peer_timeout`),
-            // leaving a stale HashSet pinned for the whole timeout
-            // window.
-            gossip_state.peer_to_actors.remove(&dead_peer_addr);
-
-            // Pending-failure consensus state for this peer.
-            gossip_state.pending_peer_failures.remove(&dead_peer_addr);
-
-            // peer_health_reports has two leak shapes: the outer entry
-            // (subject) and inner entries (reporter). Clear both at once.
-            gossip_state.peer_health_reports.remove(&dead_peer_addr);
-            for inner in gossip_state.peer_health_reports.values_mut() {
-                inner.remove(&dead_peer_addr);
-            }
-
-            // peer_discovery's Connected state — its TTL cleanup only
-            // purges Pending/Failed, so without this call entries leak
-            // forever.
-            if let Some(ref mut discovery) = gossip_state.peer_discovery {
-                discovery.on_peer_disconnected(dead_peer_addr);
-            }
-        }
-
-        // In-flight stream assemblies pinned to the dead peer would
-        // otherwise hold their `PooledAlignedBuffer`s until the 60s
-        // `STREAM_ASSEMBLY_TIMEOUT` sweep, costing up to
-        // MAX_INFLIGHT_STREAMS_PER_PEER × MAX_STREAM_SIZE of pooled
-        // memory per dead peer under churn. Drop them at detection
-        // time and zero the per-peer admission counter so a recovering
-        // peer doesn't start out at-cap.
-        let mut dead_streams: Vec<u64> = Vec::new();
-        self.stream_assemblies.iter_sync(|stream_id, assembly| {
-            if assembly.peer_addr == Some(dead_peer_addr) {
-                dead_streams.push(*stream_id);
-            }
-            true
-        });
-        if !dead_streams.is_empty() {
-            let n = dead_streams.len();
-            for stream_id in dead_streams {
-                let _ = self.stream_assemblies.remove_sync(&stream_id);
-            }
-            debug!(
-                peer = %dead_peer_addr,
-                dropped = n,
-                "dropped in-flight stream assemblies for dead peer"
-            );
-        }
-        // Zero the per-peer admission counter entirely. Any concurrent
-        // `start_stream_assembly` on this address races with our death
-        // verdict — it will re-create the counter at zero on next entry.
-        let _ = self.inflight_streams_per_peer.remove_sync(&dead_peer_addr);
-    }
-
-    /// Cleanup hook fired when a peer's `failures` crosses
-    /// `max_peer_failures` for the first time (gossip protocol's verdict
-    /// that the peer is dead). Prunes the dead peer's `known_actors`
-    /// entries, force-disconnects its pool connection so it must
-    /// re-handshake on return, and resets its sequence counter so the
-    /// recovered peer's next FullSync is accepted instead of dropped as
-    /// a duplicate.
-    ///
-    /// Re-admission on recovery requires an actual new connection
-    /// (`mark_peer_connected` or `mark_inbound_connection_observed` on
-    /// a fresh handshake). Those paths clear `failures` unconditionally,
-    /// so a real reconnect always resurrects the peer. Softer signals
-    /// (`record_peer_activity`, `mark_response_received`) keep the
-    /// sticky `< max_peer_failures` gate, so a dying peer's late
-    /// responses cannot resurrect it. The next FullSync after
-    /// reconnection repopulates `known_actors` via the existing
-    /// `merge_full_sync` / `apply_delta` paths.
-    async fn handle_peer_death(
-        &self,
-        dead_peer_addr: SocketAddr,
-        resolved_peer_id: Option<crate::PeerId>,
-    ) {
-        // Two ways to learn this peer's PeerId:
-        //   1. The pool's addr→peer_id map (populated after a successful
-        //      connection handshake).
-        //   2. The gossip state's `node_id` field (set when we added the
-        //      peer, even before any handshake completes).
-        // Try both because a peer that died before/during initial
-        // connect may only be in the gossip-state map, while a peer that
-        // dropped mid-flight may have been evicted from the pool already.
-        let pool_lookup =
-            resolved_peer_id.or_else(|| self.connection_pool.get_peer_id_by_addr(&dead_peer_addr));
-        let dead_peer_id = if pool_lookup.is_some() {
-            pool_lookup
-        } else {
-            let state = self.gossip_state.lock().await;
-            state
-                .peers
-                .get(&dead_peer_addr)
-                .and_then(|p| p.node_id.as_ref().map(|n| n.to_peer_id()))
-        };
-        let Some(dead_peer_id) = dead_peer_id else {
-            // No PeerId resolvable for this address — nothing in
-            // `known_actors` is keyed against it. Still prune the
-            // address-keyed side tables and reset sequence so a
-            // recovering peer at this address starts clean.
-            self.evict_peer_side_tables(dead_peer_addr).await;
-            return;
-        };
-
-        // 1. Plan-then-execute: scan `known_actors` lock-free to
-        //    collect the peer's actor names + locations. The actual
-        //    removal happens inside the gossip_state critical section
-        //    in step 3 so prune and tombstone-write are atomic against
-        //    a concurrent `apply_delta` that might otherwise re-insert
-        //    one of these names between the prune and the tombstone.
-        let mut to_remove: Vec<(String, RemoteActorLocation)> = Vec::new();
-        self.actor_state.known_actors.iter_sync(|name, location| {
-            if location.peer_id == dead_peer_id {
-                to_remove.push((name.clone(), location.clone()));
-            }
-            true
-        });
-
-        // 2. Force-disconnect the pool entry so the peer must re-handshake
-        //    when it returns. Prevents writes into a stale half-open
-        //    connection in the window between this prune and the pool's
-        //    own `cleanup_stale_connections` pass.
-        let _ = self
-            .connection_pool
-            .disconnect_connection_by_peer_id(&dead_peer_id);
-
-        // 3. Atomic prune + tombstone + urgent-change enqueue under the
-        //    gossip_state lock. Combining the `known_actors.remove_sync`
-        //    with the `removed_actors.upsert_sync` write under the same
-        //    lock closes the window where a concurrent `apply_delta`
-        //    could re-insert the just-pruned actor name (it would see
-        //    no tombstone, then we'd write the tombstone afterward and
-        //    leave a stale `known_actors` entry pointing at the dead
-        //    peer). Also resets per-peer sequence + response timestamp
-        //    so a recovering peer's next FullSync is accepted.
-        let mut have_urgent = false;
-        {
-            let mut gossip_state = self.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get_mut(&dead_peer_addr) {
-                peer_info.last_sequence = 0;
-                peer_info.last_response_received_ms = 0;
-            }
-            let removing_node_id = self.peer_id.to_node_id();
-            for (name, scanned_location) in &to_remove {
-                let Some(location) = self
-                    .actor_state
-                    .known_actors
-                    .read_sync(name.as_str(), |_, location| location.clone())
-                else {
-                    continue;
-                };
-                if location.peer_id != dead_peer_id {
-                    debug!(
-                        actor_name = %name,
-                        scanned_peer = %scanned_location.peer_id,
-                        current_peer = %location.peer_id,
-                        dead_peer = %dead_peer_id,
-                        "skipping peer-death actor prune; actor moved after scan"
-                    );
-                    continue;
-                }
-                let removal_clock = location.vector_clock.clone();
-                removal_clock.increment(removing_node_id);
-                // Remove + tombstone-write are now back-to-back under
-                // the gossip_state lock — apply_delta's execute phase
-                // takes the same lock, so it cannot interleave between
-                // them.
-                let _ = self.actor_state.known_actors.remove_sync(name.as_str());
-                let _ = self.actor_state.removed_actors.upsert_sync(
-                    name.clone(),
-                    RemovedActorTombstone::new(removal_clock.clone()),
-                );
-                let change = RegistryChange::ActorRemoved {
-                    name: name.clone(),
-                    vector_clock: removal_clock,
-                    removing_node_id,
-                    priority: RegistrationPriority::Immediate,
-                };
-                gossip_state.urgent_changes.push(change.clone());
-                gossip_state
-                    .pending_changes
-                    .push(Self::as_regular_gossip_change(&change));
-                have_urgent = true;
-            }
-        }
-
-        // 4. The urgent_changes queue will be drained by the next
-        //    gossip round (periodic or explicit). We deliberately do
-        //    NOT call `trigger_immediate_gossip` here because some
-        //    callers of `handle_peer_death` (notably
-        //    `apply_gossip_results`) are themselves inside the gossip
-        //    loop and an immediate re-entry would race with the
-        //    failure accounting they just performed. The queued
-        //    Immediate-priority changes will fan out on the next
-        //    tick, which is still within one `gossip_interval` —
-        //    several orders of magnitude faster than the peer
-        //    timeout window we used to depend on.
-        let _ = have_urgent;
-
-        // 5. Sweep all address-keyed side tables (capabilities, UDP
-        //    liveness, peer_to_actors, peer_health_reports inner+outer,
-        //    peer_discovery Connected entry) and reset per-peer state.
-        //    Deferring this work to `cleanup_dead_peers` (which only
-        //    runs after `dead_peer_timeout`) used to leave stale
-        //    capability/health/liveness entries pinned in memory for
-        //    the whole timeout window, growing monotonically under peer
-        //    churn.
-        self.evict_peer_side_tables(dead_peer_addr).await;
-
-        info!(
-            peer_id = %dead_peer_id,
-            peer_addr = %dead_peer_addr,
-            pruned_actors = to_remove.len(),
-            "gossip declared peer dead — pruned known_actors, disconnected pool, \
-             enqueued ActorRemoved gossip"
-        );
-    }
-
     /// Handle gossip response with vector clock updates
     pub async fn handle_gossip_response(
         &self,
@@ -4201,7 +4284,12 @@ impl<T: 'static> GossipRegistry<T> {
         response: RegistryMessage,
     ) -> Result<()> {
         match response {
-            RegistryMessage::DeltaGossipResponse { delta } => {
+            RegistryMessage::DeltaGossipResponse { delta, extensions } => {
+                self.record_inbound_gossip_extensions(
+                    addr,
+                    extensions,
+                    crate::current_timestamp_nanos(),
+                );
                 info!(
                     peer = %addr,
                     sender = %delta.sender_peer_id,
@@ -4237,7 +4325,13 @@ impl<T: 'static> GossipRegistry<T> {
                 sender_bind_addr,
                 sequence,
                 wall_clock_time,
+                extensions,
             } => {
+                self.record_inbound_gossip_extensions(
+                    addr,
+                    extensions,
+                    crate::current_timestamp_nanos(),
+                );
                 // Use resolve_peer_addr for safe address resolution with validation
                 let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), addr);
 
@@ -4619,19 +4713,36 @@ impl<T: 'static> GossipRegistry<T> {
                 // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
                 // This allows us to reconnect when the peer comes back online
 
-                // Remove peer's actors from known_actors to free memory
+                // Remove peer's actors from known_actors to free memory. Re-check
+                // current ownership first because peer_to_actors is a side table and
+                // may still contain a stale entry after the actor moved to another peer.
                 if let Some(actor_names) = gossip_state.peer_to_actors.get(peer_addr).cloned() {
+                    let peer_info = gossip_state.peers.get(peer_addr);
+                    let mut actors_removed = 0usize;
                     for actor_name in &actor_names {
-                        let _ = self
-                            .actor_state
-                            .known_actors
-                            .remove_sync(actor_name.as_str());
+                        let should_remove = self.actor_state.known_actors.read_sync(
+                            actor_name.as_str(),
+                            |_, location| {
+                                actor_location_belongs_to_peer(location, *peer_addr, peer_info)
+                            },
+                        );
+
+                        if should_remove.unwrap_or(false)
+                            && self
+                                .actor_state
+                                .known_actors
+                                .remove_sync(actor_name.as_str())
+                                .is_some()
+                        {
+                            actors_removed += 1;
+                        }
                     }
                     gossip_state.peer_to_actors.remove(peer_addr);
 
                     info!(
                         peer = %peer_addr,
-                        actors_removed = actor_names.len(),
+                        actors_removed,
+                        stale_side_table_entries = actor_names.len().saturating_sub(actors_removed),
                         timeout_minutes = dead_peer_timeout_secs / 60,
                         "cleaned up actors from long-disconnected peer (peer retained for reconnection)"
                     );
@@ -5776,6 +5887,7 @@ impl<T: 'static> GossipRegistry<T> {
                     wall_clock_time,
                     precise_timing_nanos,
                 },
+                extensions: None,
             };
             let serialized =
                 bytes::Bytes::from_owner(rkyv::to_bytes::<rkyv::rancor::Error>(&message)?);
@@ -5796,6 +5908,7 @@ impl<T: 'static> GossipRegistry<T> {
                         wall_clock_time,
                         precise_timing_nanos,
                     },
+                    extensions: None,
                 };
                 current_serialized = Some(bytes::Bytes::from_owner(rkyv::to_bytes::<
                     rkyv::rancor::Error,
@@ -6133,8 +6246,7 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Decrement the per-peer in-flight stream counter and drop the
     /// map entry if it reaches zero. Called from every removal path
-    /// (`complete_stream_assembly`, `cleanup_stale_stream_assemblies`,
-    /// `evict_peer_side_tables`).
+    /// (`complete_stream_assembly`, `cleanup_stale_stream_assemblies`).
     fn decrement_inflight_streams(&self, peer: std::net::SocketAddr) {
         if let Some(entry) = self
             .inflight_streams_per_peer
@@ -6962,6 +7074,191 @@ mod tests {
         }
     }
 
+    fn clock_caps() -> crate::handshake::PeerCapabilities {
+        crate::handshake::PeerCapabilities::from_hello_exchange(
+            &crate::handshake::Hello::with_features(vec![
+                crate::handshake::Feature::ClockCalibration,
+            ]),
+            &crate::handshake::Hello::with_features(vec![
+                crate::handshake::Feature::ClockCalibration,
+            ]),
+        )
+    }
+
+    #[test]
+    fn clock_sample_math_uses_ntp_four_timestamp_formula() {
+        let t1 = 1_000;
+        let t2 = 2_550;
+        let t3 = 2_570;
+        let t4 = 1_120;
+
+        let (offset_ns, rtt_ns, error_bound_ns) =
+            compute_clock_sample(t1, t2, t3, t4).expect("valid sample");
+
+        assert_eq!(offset_ns, 1_500);
+        assert_eq!(rtt_ns, 100);
+        assert_eq!(error_bound_ns, 50);
+    }
+
+    #[test]
+    fn clock_sample_rejects_reversed_local_or_remote_time() {
+        assert!(compute_clock_sample(2, 10, 11, 1).is_none());
+        assert!(compute_clock_sample(1, 20, 19, 30).is_none());
+    }
+
+    #[tokio::test]
+    async fn clock_probe_is_gated_per_peer_without_extra_gossip_tasks() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let peer = test_addr(8081);
+        registry.set_peer_capabilities(peer, clock_caps());
+
+        let first = registry
+            .gossip_extensions_for_outbound(peer, 1_000_000_000)
+            .await
+            .expect("first sample should attach");
+        let first_probe = first.clock_probe.expect("probe");
+
+        registry.record_inbound_gossip_extensions(
+            peer,
+            Some(GossipExtensionsV1 {
+                clock_probe: None,
+                clock_echo: Some(ClockEchoV1 {
+                    sample_id: first_probe.sample_id,
+                    origin_sender_wall_ns: first_probe.sender_wall_ns,
+                    responder_recv_wall_ns: first_probe.sender_wall_ns + 10,
+                    responder_send_wall_ns: first_probe.sender_wall_ns + 20,
+                }),
+            }),
+            first_probe.sender_wall_ns + 30,
+        );
+
+        let second = registry
+            .gossip_extensions_for_outbound(peer, 1_000_000_000 + 59_000_000_000)
+            .await;
+        assert!(
+            second.is_none(),
+            "probe should not create work before the 60s gate"
+        );
+
+        let third = registry
+            .gossip_extensions_for_outbound(peer, 1_000_000_000 + 60_000_000_000)
+            .await
+            .expect("sample at the 60s gate should attach");
+        assert!(third.clock_probe.is_some());
+    }
+
+    #[tokio::test]
+    async fn clock_probe_retries_lost_initial_sample_after_timeout() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let peer = test_addr(8081);
+        registry.set_peer_capabilities(peer, clock_caps());
+
+        let first = registry
+            .gossip_extensions_for_outbound(peer, 1_000_000_000)
+            .await
+            .expect("first sample should attach");
+        assert!(first.clock_probe.is_some());
+
+        let duplicate = registry
+            .gossip_extensions_for_outbound(
+                peer,
+                1_000_000_000 + CLOCK_CALIBRATION_PROBE_TIMEOUT_NS - 1,
+            )
+            .await;
+        assert!(
+            duplicate.is_none(),
+            "live pending probe should suppress duplicate work"
+        );
+
+        let retry = registry
+            .gossip_extensions_for_outbound(
+                peer,
+                1_000_000_000 + CLOCK_CALIBRATION_PROBE_TIMEOUT_NS,
+            )
+            .await
+            .expect("lost pending probe should be retried");
+        assert!(retry.clock_probe.is_some());
+    }
+
+    #[tokio::test]
+    async fn clock_probe_is_not_attached_without_negotiated_feature() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let peer = test_addr(8081);
+
+        let extensions = registry.gossip_extensions_for_outbound(peer, 1_000).await;
+
+        assert!(extensions.is_none());
+        assert!(registry.pending_clock_probes.is_empty());
+        assert!(registry.peer_clock_snapshot(&peer).is_none());
+    }
+
+    #[tokio::test]
+    async fn clock_echo_roundtrip_records_peer_snapshot() {
+        let origin = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let responder = GossipRegistry::<()>::new(test_addr(8081), test_config());
+        let peer = test_addr(8081);
+        origin.set_peer_capabilities(peer, clock_caps());
+        responder.set_peer_capabilities(peer, clock_caps());
+
+        let probe_ext = origin
+            .gossip_extensions_for_outbound(peer, 1_000)
+            .await
+            .expect("origin attaches probe");
+
+        responder.record_inbound_gossip_extensions(peer, Some(probe_ext), 2_550);
+        let echo_ext = responder
+            .gossip_extensions_for_outbound(peer, 2_570)
+            .await
+            .expect("responder attaches echo");
+        assert!(echo_ext.clock_echo.is_some());
+
+        origin.record_inbound_gossip_extensions(peer, Some(echo_ext), 1_120);
+        let snapshot = origin
+            .peer_clock_snapshot(&peer)
+            .expect("origin records calibration snapshot");
+
+        assert_eq!(snapshot.offset_ns, 1_500);
+        assert_eq!(snapshot.rtt_ns, 100);
+        assert_eq!(snapshot.error_bound_ns, 50);
+        assert_eq!(snapshot.sample_count, 1);
+        assert!(!snapshot.is_stale_at(snapshot.sampled_at_wall_ns + 10));
+        assert!(
+            snapshot
+                .is_stale_at(snapshot.sampled_at_wall_ns + CLOCK_CALIBRATION_STALE_AFTER_NS + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn clock_calibration_does_not_touch_vector_clock_or_delta_state() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let peer = test_addr(8081);
+        registry.set_peer_capabilities(peer, clock_caps());
+
+        let location = test_location(test_addr(9000));
+        location.vector_clock.increment(location.node_id);
+        let before = location.vector_clock.clone();
+        let sequence_before = {
+            let state = registry.gossip_state.lock().await;
+            (state.gossip_sequence, state.delta_history.len())
+        };
+
+        let probe = registry
+            .gossip_extensions_for_outbound(peer, 10_000)
+            .await
+            .expect("probe");
+        registry.record_inbound_gossip_extensions(peer, Some(probe), 10_100);
+
+        assert_eq!(
+            location.vector_clock.compare(&before),
+            crate::ClockOrdering::Equal
+        );
+        let sequence_after = {
+            let state = registry.gossip_state.lock().await;
+            (state.gossip_sequence, state.delta_history.len())
+        };
+        assert_eq!(sequence_after, sequence_before);
+    }
+
     #[test]
     fn enable_udp_rejects_unauthenticated_datagram_mode() {
         let keypair = KeyPair::new_for_testing("udp-disabled-registry");
@@ -7044,7 +7341,10 @@ mod tests {
             wall_clock_time: 1000,
             precise_timing_nanos: 1_000_000_000_000, // 1000 seconds in nanoseconds
         };
-        let msg = RegistryMessage::DeltaGossip { delta };
+        let msg = RegistryMessage::DeltaGossip {
+            delta,
+            extensions: None,
+        };
         let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
         let deserialized: RegistryMessage =
             rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(&serialized).unwrap(); // ALLOW_RKYV_FROM_BYTES
@@ -7101,7 +7401,7 @@ mod tests {
         let digest = hex::encode(hasher.finalize());
         assert_eq!(
             digest,
-            "a5e348bd7402159dd18e6422c7f6a13f99093f857c922bab66b3ebfd2b98a1ad"
+            "a5718d29d55eace0a7d5782622f04270358729cf3af11a07a3741755561c520f"
         );
     }
 
@@ -7395,14 +7695,12 @@ mod tests {
         let alias_b = test_addr(9102);
         {
             let mut state = registry.gossip_state.lock().await;
-            state.peers.insert(
-                alias_a,
-                peer_info_with_node_id(alias_a, shared_node_id),
-            );
-            state.peers.insert(
-                alias_b,
-                peer_info_with_node_id(alias_b, shared_node_id),
-            );
+            state
+                .peers
+                .insert(alias_a, peer_info_with_node_id(alias_a, shared_node_id));
+            state
+                .peers
+                .insert(alias_b, peer_info_with_node_id(alias_b, shared_node_id));
         }
 
         registry
@@ -7420,7 +7718,8 @@ mod tests {
             .filter(|t| t.peer_addr == alias_a || t.peer_addr == alias_b)
             .count();
         assert_eq!(
-            aliases_targeted, 1,
+            aliases_targeted,
+            1,
             "expected exactly one gossip task for the shared NodeId across \
              aliases {alias_a} and {alias_b}, got {aliases_targeted} (tasks: {:?})",
             tasks.iter().map(|t| t.peer_addr).collect::<Vec<_>>()
@@ -7572,7 +7871,7 @@ mod tests {
         let tasks = registry.prepare_gossip_round().await.unwrap();
         assert_eq!(tasks.len(), 1);
         match &tasks[0].message {
-            RegistryMessage::DeltaGossip { delta } => {
+            RegistryMessage::DeltaGossip { delta, .. } => {
                 assert!(
                     !delta.changes.iter().any(|change| match change {
                         RegistryChange::ActorAdded { priority, .. }
@@ -7612,7 +7911,7 @@ mod tests {
         let tasks = registry.prepare_gossip_round().await.unwrap();
         assert_eq!(tasks.len(), 1);
         match &tasks[0].message {
-            RegistryMessage::DeltaGossip { delta } => {
+            RegistryMessage::DeltaGossip { delta, .. } => {
                 assert_eq!(delta.changes.len(), 1);
                 match &delta.changes[0] {
                     RegistryChange::ActorAdded { priority, .. } => {
@@ -7648,42 +7947,6 @@ mod tests {
                 assert_eq!(*priority, RegistrationPriority::Normal);
             }
             other => panic!("expected ActorAdded, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_peer_death_removal_is_regularized_in_delta_history() {
-        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
-        let dead_addr = test_addr(8081);
-        let dead_peer_id = test_peer_id("dead_peer");
-        let mut peer_info = PeerInfo::local(dead_addr);
-        peer_info.node_id = Some(dead_peer_id.to_node_id());
-
-        {
-            let mut gossip_state = registry.gossip_state.lock().await;
-            gossip_state.peers.insert(dead_addr, peer_info);
-        }
-        registry.actor_state.known_actors.upsert_sync(
-            "dead_peer_actor".to_string(),
-            RemoteActorLocation::new_with_peer(test_addr(9001), dead_peer_id),
-        );
-
-        registry.handle_peer_death(dead_addr, None).await;
-
-        let gossip_state = registry.gossip_state.lock().await;
-        assert_eq!(gossip_state.urgent_changes.len(), 1);
-        assert_eq!(gossip_state.pending_changes.len(), 1);
-        match &gossip_state.urgent_changes[0] {
-            RegistryChange::ActorRemoved { priority, .. } => {
-                assert_eq!(*priority, RegistrationPriority::Immediate);
-            }
-            other => panic!("expected urgent ActorRemoved, got {other:?}"),
-        }
-        match &gossip_state.pending_changes[0] {
-            RegistryChange::ActorRemoved { priority, .. } => {
-                assert_eq!(*priority, RegistrationPriority::Normal);
-            }
-            other => panic!("expected regularized ActorRemoved, got {other:?}"),
         }
     }
 
@@ -7873,7 +8136,10 @@ mod tests {
         };
 
         let acks = registry.apply_delta(delta).await.unwrap();
-        assert!(acks.is_empty(), "normal priority must not be acked: {acks:?}");
+        assert!(
+            acks.is_empty(),
+            "normal priority must not be acked: {acks:?}"
+        );
         assert!(
             registry
                 .actor_state
@@ -8355,18 +8621,20 @@ mod tests {
         config.dead_peer_timeout = Duration::from_millis(50);
         config.max_peer_failures = 3;
         let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+        let peer_addr = test_addr(8081);
+        let peer_id = test_peer_id("cleanup-dead-peer");
 
         // Add a failed peer with old failure time
         {
             let mut gossip_state = registry.gossip_state.lock().await;
             gossip_state.peers.insert(
-                test_addr(8081),
+                peer_addr,
                 PeerInfo {
-                    address: test_addr(8081),
+                    address: peer_addr,
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
-                    node_id: None,
+                    node_id: Some(peer_id.to_node_id()),
                     dns_name: None,
                     failures: 3,
                     last_attempt: 0,
@@ -8383,23 +8651,23 @@ mod tests {
 
         // Add some actors from the failed peer
         {
-            let _ = registry
-                .actor_state
-                .known_actors
-                .upsert_sync("peer_actor".to_string(), test_location(test_addr(9001)));
+            let _ = registry.actor_state.known_actors.upsert_sync(
+                "peer_actor".to_string(),
+                RemoteActorLocation::new_with_peer(peer_addr, peer_id),
+            );
 
             let mut gossip_state = registry.gossip_state.lock().await;
             let mut actors = HashSet::new();
             actors.insert("peer_actor".to_string());
-            gossip_state.peer_to_actors.insert(test_addr(8081), actors);
+            gossip_state.peer_to_actors.insert(peer_addr, actors);
         }
 
         registry.cleanup_dead_peers().await;
 
         // Verify peer is KEPT but its actors were removed
         let gossip_state = registry.gossip_state.lock().await;
-        assert!(gossip_state.peers.contains_key(&test_addr(8081))); // Peer is still there!
-        assert!(!gossip_state.peer_to_actors.contains_key(&test_addr(8081))); // But actors mapping is gone
+        assert!(gossip_state.peers.contains_key(&peer_addr)); // Peer is still there!
+        assert!(!gossip_state.peer_to_actors.contains_key(&peer_addr)); // But actors mapping is gone
 
         drop(gossip_state);
         assert!(
@@ -8723,8 +8991,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_peer_death_does_not_prune_actor_that_moved_after_scan() {
-        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7130), test_config()));
+    async fn cleanup_dead_peers_does_not_prune_actor_that_moved_to_another_peer() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7130), config));
         let actor_name = "actor.peerdeath.moved";
         let dead_peer = test_peer_id("dead-peer");
         let live_peer = test_peer_id("live-peer");
@@ -8753,44 +9024,39 @@ mod tests {
                     last_sequence: 1,
                     last_sent_sequence: 1,
                     consecutive_deltas: 0,
-                    last_failure_time: Some(current_timestamp()),
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                 },
             );
-        }
-
-        let held = registry.gossip_state.lock().await;
-        let r_death = Arc::clone(&registry);
-        let death_handle = tokio::spawn(async move {
-            r_death.handle_peer_death(dead_addr, Some(dead_peer)).await;
-        });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
+            let mut actors = HashSet::new();
+            actors.insert(actor_name.to_string());
+            state.peer_to_actors.insert(dead_addr, actors);
         }
 
         let _ = registry
             .actor_state
             .known_actors
             .upsert_sync(actor_name.to_string(), live_location.clone());
-        drop(held);
 
-        tokio::time::timeout(Duration::from_secs(2), death_handle)
-            .await
-            .expect("handle_peer_death did not finish in time")
-            .unwrap();
+        registry.cleanup_dead_peers().await;
 
         let got = read_known_actor(&registry, actor_name).expect("moved actor must survive");
         assert_eq!(
             got.peer_id, live_location.peer_id,
-            "peer death cleanup must re-check current ownership before pruning"
+            "timeout cleanup must re-check current ownership before pruning stale side-table entries"
         );
         assert!(
             !registry
                 .actor_state
                 .removed_actors
                 .contains_sync(actor_name),
-            "peer death cleanup must not tombstone an actor that already moved"
+            "timeout cleanup must not tombstone an actor that already moved"
+        );
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            !state.peer_to_actors.contains_key(&dead_addr),
+            "timeout cleanup should still clear the stale peer_to_actors side table"
         );
     }
 
@@ -9751,6 +10017,7 @@ mod tests {
                 wall_clock_time: 0,
                 precise_timing_nanos: 0,
             },
+            extensions: None,
         };
         reg.apply_gossip_results(vec![GossipResult {
             peer_addr,
@@ -10011,6 +10278,7 @@ mod tests {
                         wall_clock_time: 0,
                         precise_timing_nanos: 0,
                     },
+                    extensions: None,
                 },
                 None,
             ),
@@ -10502,8 +10770,8 @@ mod tests {
 
     fn normalized_registry_message_for_wire_compare(mut msg: RegistryMessage) -> RegistryMessage {
         match &mut msg {
-            RegistryMessage::DeltaGossip { delta }
-            | RegistryMessage::DeltaGossipResponse { delta } => {
+            RegistryMessage::DeltaGossip { delta, .. }
+            | RegistryMessage::DeltaGossipResponse { delta, .. } => {
                 delta.wall_clock_time = 0;
                 delta.precise_timing_nanos = 0;
             }
@@ -10894,10 +11162,10 @@ mod tests {
         // The delta response includes high-resolution timing fields, so raw bytes are expected
         // to differ between subsequent calls. What must be stable is the ordering/content of
         // the snapshot changes produced for bootstrap (`since_sequence == 0`).
-        let RegistryMessage::DeltaGossipResponse { delta: d1 } = msg1 else {
+        let RegistryMessage::DeltaGossipResponse { delta: d1, .. } = msg1 else {
             panic!("expected delta gossip response");
         };
-        let RegistryMessage::DeltaGossipResponse { delta: d2 } = msg2 else {
+        let RegistryMessage::DeltaGossipResponse { delta: d2, .. } = msg2 else {
             panic!("expected delta gossip response");
         };
 
