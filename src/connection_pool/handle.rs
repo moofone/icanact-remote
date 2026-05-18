@@ -633,7 +633,10 @@ impl<T> ConnectionHandle<T> {
             schema_hash,
             payload.len(),
         );
-        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
+        if let Err(e) = self
+            .write_header_and_payload_ask_inline32(header, payload)
+            .await
+        {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             warn!(
                 addr = %self.addr,
@@ -722,7 +725,10 @@ impl<T> ConnectionHandle<T> {
             payload.len(),
         );
 
-        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
+        if let Err(e) = self
+            .write_header_and_payload_ask_inline32(header, payload)
+            .await
+        {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
@@ -755,7 +761,10 @@ impl<T> ConnectionHandle<T> {
             payload.len(),
         );
 
-        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
+        if let Err(e) = self
+            .write_header_and_payload_ask_inline32(header, payload)
+            .await
+        {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }

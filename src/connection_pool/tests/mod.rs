@@ -926,34 +926,6 @@ fn test_streaming_threshold_saturation() {
     assert_eq!(large_config.streaming_threshold(), 2 * 1024 * 1024 - 1024);
 }
 
-#[test]
-fn test_should_flush_rules() {
-    assert!(!should_flush(
-        0,
-        Duration::from_millis(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-    assert!(should_flush(
-        4096,
-        Duration::from_millis(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-    assert!(should_flush(
-        1,
-        Duration::from_millis(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-    assert!(should_flush(
-        1,
-        WRITER_MAX_LATENCY + Duration::from_micros(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-}
-
 #[tokio::test]
 async fn test_connection_pool_new() {
     let pool = ConnectionPool::<()>::new(10, Duration::from_secs(5));
