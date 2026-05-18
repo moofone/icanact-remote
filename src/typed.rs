@@ -134,7 +134,7 @@ impl PooledPayload {
         self.len == 0
     }
 
-    pub(crate) fn try_from_pooled_bytes(
+    pub fn try_from_pooled_bytes(
         min_capacity: usize,
         fill: impl FnOnce(&mut Vec<u8>),
     ) -> Option<Self> {

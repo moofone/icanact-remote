@@ -342,6 +342,54 @@ pub struct RoutedPubSub {
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
 }
 
+/// Pre-resolved PubSub sender for a single peer.
+///
+/// This bypasses per-publish route grouping and peer lookup. The caller owns
+/// when to refresh/rebuild the sender after reconnect.
+pub struct PubSubPeerSender {
+    local_peer_id: PeerId,
+    destination_peer_id: PeerId,
+    conn: crate::RemoteConnection,
+    next_msg_id: AtomicU64,
+}
+
+impl PubSubPeerSender {
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.conn.is_closed()
+    }
+
+    pub fn try_publish_bytes_with_metadata(
+        &self,
+        topic_key: u64,
+        type_hash: u64,
+        payload: &[u8],
+        policy: PubSubDeliveryPolicy,
+        metadata: PubSubFrameMetadata,
+    ) -> Result<()> {
+        if policy.hops_limit == 0 {
+            return Ok(());
+        }
+        let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed) as u128;
+        let Some((frame, prefix, payload_len)) = encode_fast_frame_pooled(
+            topic_key,
+            type_hash,
+            msg_id,
+            &self.local_peer_id,
+            &self.local_peer_id,
+            policy.hops_limit,
+            policy.mode,
+            metadata,
+            std::slice::from_ref(&self.destination_peer_id),
+            payload,
+        ) else {
+            return Err(GossipError::WriteQueueFull);
+        };
+        self.conn
+            .try_pubsub_frame_pooled(frame, prefix, payload_len)
+    }
+}
+
 impl RoutedPubSub {
     pub async fn install(registry: Arc<crate::registry::GossipRegistry>) -> Arc<Self> {
         crate::typed::prewarm_pooled_byte_buffers(
@@ -373,6 +421,16 @@ impl RoutedPubSub {
 
     pub fn set_route_provider(&self, provider: Arc<dyn PubSubRouteProvider>) {
         self.route_provider.store(Arc::new(Some(provider)));
+    }
+
+    pub fn peer_sender(&self, peer_id: &PeerId) -> Option<PubSubPeerSender> {
+        let conn = self.client.lookup_connected_connection(peer_id)?;
+        Some(PubSubPeerSender {
+            local_peer_id: self.local_peer_id.clone(),
+            destination_peer_id: peer_id.clone(),
+            conn,
+            next_msg_id: AtomicU64::new(1),
+        })
     }
 
     pub fn stats(&self) -> PubSubIngressStats {

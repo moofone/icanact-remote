@@ -400,25 +400,12 @@ impl<T> ConnectionHandle<T> {
                 payload,
             )
         } else if let Some(udp_writer) = self.udp_writer() {
-            let mut chunks = Vec::with_capacity(3);
-            chunks.push(bytes::Bytes::copy_from_slice(
-                &header[..crate::framing::PUBSUB_FRAME_HEADER_LEN],
-            ));
-            if let Some(prefix) = prefix {
-                chunks.push(bytes::Bytes::copy_from_slice(
-                    &prefix[..usize::from(prefix_len)],
-                ));
-            }
-            let mut payload = payload;
-            let mut payload_bytes = BytesMut::with_capacity(payload.remaining());
-            while payload.has_remaining() {
-                let chunk = payload.chunk();
-                payload_bytes.extend_from_slice(chunk);
-                let len = chunk.len();
-                payload.advance(len);
-            }
-            chunks.push(payload_bytes.freeze());
-            udp_writer.try_send_chunks(chunks.as_slice())
+            udp_writer.try_send_header_prefix_pooled(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                prefix,
+                payload,
+            )
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
