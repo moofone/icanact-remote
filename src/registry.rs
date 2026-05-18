@@ -240,7 +240,9 @@ pub struct ActorMessageHandlerCell {
 
 #[derive(Clone)]
 pub struct PubSubIngressHandlerCell {
-    handler: Arc<dyn crate::pubsub::PubSubIngressHandler>,
+    owner: Arc<dyn crate::pubsub::PubSubIngressHandler>,
+    ptr: usize,
+    call: unsafe fn(usize, &crate::PeerId, crate::AlignedBytes) -> Result<()>,
 }
 
 #[derive(Clone)]
@@ -460,8 +462,29 @@ impl ActorMessageHandlerSyncCell {
 }
 
 impl PubSubIngressHandlerCell {
-    pub(crate) fn new(handler: Arc<dyn crate::pubsub::PubSubIngressHandler>) -> Self {
-        Self { handler }
+    pub(crate) fn new<H>(handler: Arc<H>) -> Self
+    where
+        H: crate::pubsub::PubSubIngressHandler + 'static,
+    {
+        unsafe fn call_impl<H>(
+            ptr: usize,
+            authenticated_source_peer_id: &crate::PeerId,
+            payload: crate::AlignedBytes,
+        ) -> Result<()>
+        where
+            H: crate::pubsub::PubSubIngressHandler + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.handle_pubsub_frame(authenticated_source_peer_id, payload)
+        }
+
+        let ptr = Arc::as_ptr(&handler) as usize;
+        let owner: Arc<dyn crate::pubsub::PubSubIngressHandler> = handler;
+        Self {
+            owner,
+            ptr,
+            call: call_impl::<H>,
+        }
     }
 
     #[inline]
@@ -470,8 +493,8 @@ impl PubSubIngressHandlerCell {
         authenticated_source_peer_id: &crate::PeerId,
         payload: crate::AlignedBytes,
     ) -> Result<()> {
-        self.handler
-            .handle_pubsub_frame(authenticated_source_peer_id, payload)
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, authenticated_source_peer_id, payload) }
     }
 }
 
@@ -1977,10 +2000,10 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Register the routed PubSub ingress handler.
-    pub async fn set_pubsub_ingress_handler(
-        &self,
-        handler: Arc<dyn crate::pubsub::PubSubIngressHandler>,
-    ) {
+    pub async fn set_pubsub_ingress_handler<H>(&self, handler: Arc<H>)
+    where
+        H: crate::pubsub::PubSubIngressHandler + 'static,
+    {
         self.pubsub_ingress_handler
             .store(Some(Arc::new(PubSubIngressHandlerCell::new(handler))));
         info!("pubsub ingress handler registered");
