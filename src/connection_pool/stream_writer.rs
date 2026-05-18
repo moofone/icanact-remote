@@ -1991,6 +1991,23 @@ impl LockFreeStreamHandle {
         .await
     }
 
+    pub fn write_pooled_control_inline_nonblocking(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        prefix: Option<[u8; 16]>,
+        prefix_len: u8,
+        payload: crate::typed::PooledPayload,
+    ) -> Result<()> {
+        self.enqueue_write_nonblocking(WritePayload::HeaderInlinePooled {
+            header,
+            header_len,
+            prefix,
+            prefix_len,
+            payload,
+        })
+    }
+
     pub async fn write_pooled_ask(
         &self,
         header: bytes::Bytes,

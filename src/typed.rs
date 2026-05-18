@@ -1,11 +1,15 @@
 use crate::{GossipError, Result};
 use bytes::{Buf, Bytes};
+use crossbeam_queue::ArrayQueue;
 use std::cell::RefCell;
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 const SERIALIZER_POOL_SIZE: usize = 64;
 const MAX_POOLED_BUFFER_CAPACITY: usize = 1024 * 1024; // 1MB
 const MAX_POOLED_ARENA_CAPACITY: usize = 1024 * 1024; // 1MB
+const BYTE_PAYLOAD_POOL_SIZE: usize = 4096;
+const MAX_POOLED_BYTE_CAPACITY: usize = 1024 * 1024; // 1MB
 
 struct SerializerCtx {
     writer: rkyv::util::AlignedVec,
@@ -29,6 +33,12 @@ thread_local! {
         }
         pool
     });
+}
+
+static BYTE_PAYLOAD_POOL: OnceLock<ArrayQueue<Vec<u8>>> = OnceLock::new();
+
+fn byte_payload_pool() -> &'static ArrayQueue<Vec<u8>> {
+    BYTE_PAYLOAD_POOL.get_or_init(|| ArrayQueue::new(BYTE_PAYLOAD_POOL_SIZE))
 }
 
 fn acquire_ctx() -> Box<SerializerCtx> {
@@ -58,6 +68,35 @@ fn release_ctx(mut ctx: Box<SerializerCtx>) {
     });
 }
 
+fn try_acquire_byte_buffer(min_capacity: usize) -> Option<Vec<u8>> {
+    let buffer = byte_payload_pool().pop()?;
+    if buffer.capacity() < min_capacity {
+        release_byte_buffer(buffer);
+        return None;
+    }
+    Some(buffer)
+}
+
+fn release_byte_buffer(mut buffer: Vec<u8>) {
+    buffer.clear();
+    if buffer.capacity() > MAX_POOLED_BYTE_CAPACITY {
+        return;
+    }
+    let _ = byte_payload_pool().push(buffer);
+}
+
+pub(crate) fn prewarm_pooled_byte_buffers(count: usize, capacity: usize) {
+    let pool = byte_payload_pool();
+    for _ in 0..count {
+        if pool.is_full() {
+            return;
+        }
+        if pool.push(Vec::with_capacity(capacity)).is_err() {
+            return;
+        }
+    }
+}
+
 fn encode_typed_in<T>(value: &T, ctx: &mut SerializerCtx) -> Result<usize>
 where
     T: WireEncode,
@@ -76,9 +115,14 @@ where
 
 /// Pooled payload that implements bytes::Buf without copying.
 pub struct PooledPayload {
-    ctx: Option<Box<SerializerCtx>>,
+    inner: Option<PooledPayloadInner>,
     len: usize,
     pos: usize,
+}
+
+enum PooledPayloadInner {
+    Serializer(Box<SerializerCtx>),
+    Bytes(Vec<u8>),
 }
 
 impl PooledPayload {
@@ -89,6 +133,21 @@ impl PooledPayload {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    pub(crate) fn try_from_pooled_bytes(
+        min_capacity: usize,
+        fill: impl FnOnce(&mut Vec<u8>),
+    ) -> Option<Self> {
+        let mut buffer = try_acquire_byte_buffer(min_capacity)?;
+        buffer.clear();
+        fill(&mut buffer);
+        let len = buffer.len();
+        Some(Self {
+            inner: Some(PooledPayloadInner::Bytes(buffer)),
+            len,
+            pos: 0,
+        })
+    }
 }
 
 impl Buf for PooledPayload {
@@ -97,10 +156,10 @@ impl Buf for PooledPayload {
     }
 
     fn chunk(&self) -> &[u8] {
-        if let Some(ctx) = self.ctx.as_ref() {
-            &ctx.writer[self.pos..self.len]
-        } else {
-            &[]
+        match self.inner.as_ref() {
+            Some(PooledPayloadInner::Serializer(ctx)) => &ctx.writer[self.pos..self.len],
+            Some(PooledPayloadInner::Bytes(buffer)) => &buffer[self.pos..self.len],
+            None => &[],
         }
     }
 
@@ -113,8 +172,10 @@ impl Buf for PooledPayload {
 
 impl Drop for PooledPayload {
     fn drop(&mut self) {
-        if let Some(ctx) = self.ctx.take() {
-            release_ctx(ctx);
+        match self.inner.take() {
+            Some(PooledPayloadInner::Serializer(ctx)) => release_ctx(ctx),
+            Some(PooledPayloadInner::Bytes(buffer)) => release_byte_buffer(buffer),
+            None => {}
         }
     }
 }
@@ -242,7 +303,7 @@ where
     let len = encode_typed_in(value, &mut ctx)?;
 
     Ok(PooledPayload {
-        ctx: Some(ctx),
+        inner: Some(PooledPayloadInner::Serializer(ctx)),
         len,
         pos: 0,
     })

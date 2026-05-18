@@ -175,6 +175,26 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    fn write_pooled_control_inline_nonblocking(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        prefix: Option<[u8; 16]>,
+        prefix_len: u8,
+        payload: crate::typed::PooledPayload,
+    ) -> Result<()> {
+        if let Some(stream_handle) = self.stream_handle.as_ref() {
+            stream_handle.write_pooled_control_inline_nonblocking(
+                header, header_len, prefix, prefix_len, payload,
+            )
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "pooled control writes require stream transport",
+            )))
+        }
+    }
+
     async fn write_header_and_payload_control_inline32(
         &self,
         header: [u8; 32],
@@ -365,6 +385,24 @@ impl<T> ConnectionHandle<T> {
         self.write_header_and_payload_control_inline_nonblocking(
             header,
             crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+            payload,
+        )
+    }
+
+    /// Try to send a routed PubSub payload from a pooled buffer without allocating.
+    pub fn try_send_pubsub_payload_pooled(
+        &self,
+        payload: crate::typed::PooledPayload,
+        prefix: Option<[u8; 16]>,
+        payload_len: usize,
+    ) -> Result<()> {
+        let header = framing::write_pubsub_frame_prefix(payload_len);
+        let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
+        self.write_pooled_control_inline_nonblocking(
+            header,
+            crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+            prefix,
+            prefix_len,
             payload,
         )
     }
