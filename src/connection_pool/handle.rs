@@ -175,26 +175,6 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
-    fn write_pooled_control_inline_nonblocking(
-        &self,
-        header: [u8; 16],
-        header_len: u8,
-        prefix: Option<[u8; 16]>,
-        prefix_len: u8,
-        payload: crate::typed::PooledPayload,
-    ) -> Result<()> {
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle.write_pooled_control_inline_nonblocking(
-                header, header_len, prefix, prefix_len, payload,
-            )
-        } else {
-            Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "pooled control writes require stream transport",
-            )))
-        }
-    }
-
     async fn write_header_and_payload_control_inline32(
         &self,
         header: [u8; 32],
@@ -382,11 +362,24 @@ impl<T> ConnectionHandle<T> {
     /// Try to send a routed PubSub payload without awaiting on the write queue.
     pub fn try_send_pubsub_payload(&self, payload: bytes::Bytes) -> Result<()> {
         let header = framing::write_pubsub_frame_prefix(payload.len());
-        self.write_header_and_payload_control_inline_nonblocking(
-            header,
-            crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
-            payload,
-        )
+        if let Some(stream_handle) = self.stream_handle.as_ref() {
+            stream_handle.write_header_and_payload_control_inline_immediate_nonblocking(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                payload,
+            )
+        } else if let Some(udp_writer) = self.udp_writer() {
+            udp_writer.try_send_header_and_payload16(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                payload,
+            )
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no writer path", self.addr),
+            )))
+        }
     }
 
     /// Try to send a routed PubSub payload from a pooled buffer without allocating.
@@ -398,13 +391,40 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<()> {
         let header = framing::write_pubsub_frame_prefix(payload_len);
         let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
-        self.write_pooled_control_inline_nonblocking(
-            header,
-            crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
-            prefix,
-            prefix_len,
-            payload,
-        )
+        if let Some(stream_handle) = self.stream_handle.as_ref() {
+            stream_handle.write_pooled_control_inline_immediate_nonblocking(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                prefix,
+                prefix_len,
+                payload,
+            )
+        } else if let Some(udp_writer) = self.udp_writer() {
+            let mut chunks = Vec::with_capacity(3);
+            chunks.push(bytes::Bytes::copy_from_slice(
+                &header[..crate::framing::PUBSUB_FRAME_HEADER_LEN],
+            ));
+            if let Some(prefix) = prefix {
+                chunks.push(bytes::Bytes::copy_from_slice(
+                    &prefix[..usize::from(prefix_len)],
+                ));
+            }
+            let mut payload = payload;
+            let mut payload_bytes = BytesMut::with_capacity(payload.remaining());
+            while payload.has_remaining() {
+                let chunk = payload.chunk();
+                payload_bytes.extend_from_slice(chunk);
+                let len = chunk.len();
+                payload.advance(len);
+            }
+            chunks.push(payload_bytes.freeze());
+            udp_writer.try_send_chunks(chunks.as_slice())
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no writer path", self.addr),
+            )))
+        }
     }
 
     /// Send a response using the inline write queue (never streaming).

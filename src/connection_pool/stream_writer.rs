@@ -602,8 +602,10 @@ impl LockFreeStreamHandle {
                     for command in owner_batch.drain(..) {
                         write_queue.notify_space();
                         let is_ask_payload = matches!(&command, WriteCommand::AskPayload(_));
+                        let is_immediate_payload =
+                            matches!(&command, WriteCommand::ImmediatePayload(_));
                         let payload = match command {
-                            WriteCommand::Payload(payload) => payload,
+                            WriteCommand::Payload(payload) | WriteCommand::ImmediatePayload(payload) => payload,
                             WriteCommand::AskPayload(payload) => {
                                 wrote_ask_payload = true;
                                 payload
@@ -1259,6 +1261,11 @@ impl LockFreeStreamHandle {
                             perf.ask_write_ns
                                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
+                        if is_immediate_payload && total_bytes_written > 0 {
+                            let _ = stream.flush().await;
+                            total_bytes_written = 0;
+                            flush_pending.store(false, Ordering::Release);
+                        }
                     }
                 }
 
@@ -1797,6 +1804,26 @@ impl LockFreeStreamHandle {
         }
     }
 
+    fn enqueue_immediate_write_nonblocking(&self, payload: WritePayload) -> Result<()> {
+        if self.exit_flag.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
+        if self.shutdown_signal.load(Ordering::Acquire) {
+            return Err(GossipError::Shutdown);
+        }
+        self.sequence_counter.fetch_add(1, Ordering::Relaxed);
+        match self
+            .write_queue
+            .try_push(WriteCommand::ImmediatePayload(payload))
+        {
+            Ok(()) => {
+                self.write_queue.notify_data_if_empty_to_non_empty();
+                Ok(())
+            }
+            Err(_) => Err(GossipError::WriteQueueFull),
+        }
+    }
+
     pub async fn write_bytes_ask(&self, data: bytes::Bytes) -> Result<()> {
         self.enqueue_ask_write(WritePayload::Single(data)).await
     }
@@ -1873,6 +1900,19 @@ impl LockFreeStreamHandle {
         payload: bytes::Bytes,
     ) -> Result<()> {
         self.enqueue_write_nonblocking(WritePayload::HeaderInline {
+            header,
+            header_len,
+            payload,
+        })
+    }
+
+    pub fn write_header_and_payload_control_inline_immediate_nonblocking(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        payload: bytes::Bytes,
+    ) -> Result<()> {
+        self.enqueue_immediate_write_nonblocking(WritePayload::HeaderInline {
             header,
             header_len,
             payload,
@@ -1975,6 +2015,23 @@ impl LockFreeStreamHandle {
         payload: crate::typed::PooledPayload,
     ) -> Result<()> {
         self.enqueue_write_nonblocking(WritePayload::HeaderInlinePooled {
+            header,
+            header_len,
+            prefix,
+            prefix_len,
+            payload,
+        })
+    }
+
+    pub fn write_pooled_control_inline_immediate_nonblocking(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        prefix: Option<[u8; 16]>,
+        prefix_len: u8,
+        payload: crate::typed::PooledPayload,
+    ) -> Result<()> {
+        self.enqueue_immediate_write_nonblocking(WritePayload::HeaderInlinePooled {
             header,
             header_len,
             prefix,

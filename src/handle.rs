@@ -125,10 +125,9 @@ impl<T> GossipRegistryHandle<T> {
                 (Some(listener), None, actual_bind_addr)
             }
             TransportWireKind::UdpDatagram => {
-                return Err(GossipError::InvalidConfig(
-                    "native UDP datagram transport is disabled until inbound datagrams are authenticated"
-                        .to_string(),
-                ));
+                let socket = bind_udp_with_reuseaddr(bind_addr)?;
+                let actual_bind_addr = socket.local_addr()?;
+                (None, Some(Arc::new(socket)), actual_bind_addr)
             }
         };
 
@@ -827,33 +826,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_datagram_transport_is_rejected_until_authenticated() -> crate::Result<()> {
-        let keypair = KeyPair::new_for_testing("udp-disabled");
+    async fn udp_datagram_transport_starts_plaintext_after_peer_association() -> crate::Result<()> {
+        let keypair = KeyPair::new_for_testing("udp-enabled");
         let mut config = test_cfg();
         config.key_pair = Some(keypair.clone());
 
-        let err = match GossipRegistryHandle::new_with_transport_stack(
+        let handle = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             keypair.to_secret_key(),
             Some(config),
             TestUdpBootstrap,
         )
-        .await
-        {
-            Ok(handle) => {
-                handle.shutdown_and_wait().await;
-                panic!("unauthenticated UDP bootstrap must not start");
-            }
-            Err(err) => err,
-        };
+        .await?;
 
-        match err {
-            GossipError::InvalidConfig(message) => {
-                assert!(message.contains("disabled until inbound datagrams are authenticated"));
-            }
-            other => panic!("expected InvalidConfig, got {other:?}"),
-        }
-
+        assert!(handle.registry.udp_mode);
+        assert_eq!(
+            handle.registry.bind_addr.ip(),
+            std::net::IpAddr::from([127, 0, 0, 1])
+        );
+        handle.shutdown_and_wait().await;
         Ok(())
     }
 
@@ -1137,6 +1128,15 @@ async fn process_udp_datagram_native(
             .await?;
         response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
     }
+    let authenticated_peer_id = response_connection
+        .as_ref()
+        .and_then(|conn| conn.embedded_peer_id.clone())
+        .or_else(|| registry.connection_pool.get_peer_id_by_addr(&peer_addr))
+        .ok_or_else(|| {
+            GossipError::InvalidConfig(format!(
+                "UDP datagram from {peer_addr} has no established peer association"
+            ))
+        })?;
     let response_correlation = response_connection
         .as_ref()
         .and_then(|conn| conn.correlation.clone());
@@ -1156,7 +1156,6 @@ async fn process_udp_datagram_native(
     let frame_len = crate::framing::LENGTH_PREFIX_LEN + msg_len;
 
     // Common case: one framed message per datagram.
-    // Keep the datagram-owned aligned buffer and parse directly without frame copy.
     if frame_len == datagram_len {
         datagram.truncate(frame_len);
         let parsed = parse_message_from_pooled_buffer(datagram, msg_len)?;
@@ -1167,9 +1166,7 @@ async fn process_udp_datagram_native(
             peer_addr,
             response_correlation.as_deref(),
             response_connection.as_ref(),
-            response_connection
-                .as_ref()
-                .and_then(|conn| conn.embedded_peer_id.as_ref()),
+            Some(&authenticated_peer_id),
         )
         .await?;
         return Ok(());
@@ -1218,9 +1215,7 @@ async fn process_udp_datagram_native(
             peer_addr,
             response_correlation.as_deref(),
             response_connection.as_ref(),
-            response_connection
-                .as_ref()
-                .and_then(|conn| conn.embedded_peer_id.as_ref()),
+            Some(&authenticated_peer_id),
         )
         .await?;
 
