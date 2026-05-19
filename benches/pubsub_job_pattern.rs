@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use criterion::{Criterion, criterion_group, criterion_main};
 use icanact_remote::{
     BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PubSubDeliveryPolicy,
@@ -156,7 +156,7 @@ async fn setup_mesh(decode_on_receive: bool) -> Arc<BenchMesh> {
 }
 
 fn encoded_job_payload() -> Bytes {
-    icanact_remote::encode_typed(&JobBroadcastV1 {
+    let payload = icanact_remote::typed::encode_typed_pooled(&JobBroadcastV1 {
         coin_id: 2_201_068_882,
         algo_id: 1,
         epoch: 42,
@@ -170,7 +170,16 @@ fn encoded_job_payload() -> Bytes {
         proxy_observed_at_ns: 999_990_000,
         proxy_published_at_ns: 1_000_000_000,
     })
-    .unwrap()
+    .unwrap();
+    let (mut payload, prefix, payload_len) =
+        icanact_remote::typed::typed_payload_parts::<JobBroadcastV1>(payload);
+    let mut wire = bytes::BytesMut::with_capacity(payload_len);
+    if let Some(prefix) = prefix {
+        wire.extend_from_slice(&prefix);
+    }
+    let payload_bytes = payload.copy_to_bytes(payload.remaining());
+    wire.extend_from_slice(payload_bytes.as_ref());
+    wire.freeze()
 }
 
 async fn wait_for_pubsub_route(mesh: &Arc<BenchMesh>, payload: Bytes) {

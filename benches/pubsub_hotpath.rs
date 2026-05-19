@@ -1,3 +1,4 @@
+use bytes::Buf;
 use criterion::{Criterion, criterion_group, criterion_main};
 use icanact_remote::{
     GossipConfig, KeyPair, PubSubDeliveryPolicy, PubSubScope, RoutedPubSub, WireType, topic_key,
@@ -30,18 +31,33 @@ async fn setup() -> Arc<RoutedPubSub> {
     RoutedPubSub::install(registry).await
 }
 
+fn encode_bench_msg(msg: &BenchMsg) -> bytes::Bytes {
+    let payload = icanact_remote::typed::encode_typed_pooled(msg).unwrap();
+    let (mut payload, prefix, payload_len) =
+        icanact_remote::typed::typed_payload_parts::<BenchMsg>(payload);
+    let mut wire = bytes::BytesMut::with_capacity(payload_len);
+    if let Some(prefix) = prefix {
+        wire.extend_from_slice(&prefix);
+    }
+    let payload_bytes = payload.copy_to_bytes(payload.remaining());
+    wire.extend_from_slice(payload_bytes.as_ref());
+    wire.freeze()
+}
+
 fn bench_pubsub_hotpath(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let pubsub = runtime.block_on(setup());
     let topic = topic_key("bench.pubsub.hotpath");
     let policy = PubSubDeliveryPolicy::default();
+    let payload = encode_bench_msg(&BenchMsg { v: 1 });
 
     c.bench_function("pubsub_no_interest_short_circuit", |b| {
         b.iter(|| {
             let stats = pubsub
-                .publish_typed(
+                .publish_bytes(
                     black_box(topic),
-                    black_box(&BenchMsg { v: 1 }),
+                    BenchMsg::TYPE_HASH,
+                    black_box(payload.clone()),
                     PubSubScope::AutoExternal,
                     policy,
                 )
@@ -61,9 +77,10 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
     c.bench_function("pubsub_local_type_delivery", |b| {
         b.iter(|| {
             let stats = pubsub
-                .publish_typed(
+                .publish_bytes(
                     black_box(topic),
-                    black_box(&BenchMsg { v: 1 }),
+                    BenchMsg::TYPE_HASH,
+                    black_box(payload.clone()),
                     PubSubScope::LocalOnly,
                     policy,
                 )
@@ -76,9 +93,10 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
     c.bench_function("pubsub_selected_peer_route_miss", |b| {
         b.iter(|| {
             let stats = pubsub
-                .publish_typed(
+                .publish_bytes(
                     black_box(topic),
-                    black_box(&BenchMsg { v: 1 }),
+                    BenchMsg::TYPE_HASH,
+                    black_box(payload.clone()),
                     PubSubScope::SelectedPeers(vec![missing_peer.clone()]),
                     policy,
                 )

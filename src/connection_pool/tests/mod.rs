@@ -1317,10 +1317,13 @@ async fn test_pooled_typed_send_matches_wire_bytes() {
     );
 
     let msg = WireMsg { value: 99 };
-    let expected = crate::typed::encode_typed(&msg).expect("encode_typed");
-
     let pooled = crate::typed::encode_typed_pooled(&msg).expect("encode_typed_pooled");
     let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<WireMsg>(pooled);
+    let mut expected = Vec::with_capacity(payload_len);
+    if let Some(prefix) = prefix.as_ref() {
+        expected.extend_from_slice(prefix);
+    }
+    expected.extend_from_slice(payload.chunk());
     let mut header = [0u8; 16];
     header[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
     let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
@@ -1339,7 +1342,7 @@ async fn test_pooled_typed_send_matches_wire_bytes() {
         .await
         .unwrap();
 
-    assert_eq!(payload, expected.as_ref());
+    assert_eq!(payload.as_slice(), expected.as_slice());
     handle.shutdown();
 }
 
