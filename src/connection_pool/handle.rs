@@ -426,6 +426,10 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    pub fn supports_pooled_datagram(&self) -> bool {
+        self.udp_writer().is_some()
+    }
+
     /// Send a response using the inline write queue (never streaming).
     pub async fn send_response_auto(
         &self,

@@ -88,6 +88,10 @@ impl RemoteConnection {
         self.inner.try_send_pooled_datagram(payload)
     }
 
+    pub fn supports_pooled_datagram(&self) -> bool {
+        self.inner.supports_pooled_datagram()
+    }
+
     pub async fn ask_actor_frame(
         &self,
         actor_id: u64,

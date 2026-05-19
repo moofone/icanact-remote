@@ -372,73 +372,6 @@ pub struct RoutedPubSub {
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
 }
 
-/// Pre-resolved PubSub sender for a single peer.
-///
-/// This bypasses per-publish route grouping and peer lookup. The caller owns
-/// when to refresh/rebuild the sender after reconnect.
-pub struct PubSubPeerSender {
-    local_peer_id: PeerId,
-    destination_peer_id: PeerId,
-    conn: crate::RemoteConnection,
-    next_msg_id: AtomicU64,
-}
-
-impl PubSubPeerSender {
-    #[inline]
-    pub fn is_closed(&self) -> bool {
-        self.conn.is_closed()
-    }
-
-    pub fn try_publish_bytes_with_metadata(
-        &self,
-        topic_key: u64,
-        type_hash: u64,
-        payload: &[u8],
-        policy: PubSubDeliveryPolicy,
-        metadata: PubSubFrameMetadata,
-    ) -> Result<()> {
-        if policy.hops_limit == 0 {
-            return Ok(());
-        }
-        let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed) as u128;
-        if let Some(datagram) = encode_fast_pubsub_datagram_pooled(
-            topic_key,
-            type_hash,
-            msg_id,
-            &self.local_peer_id,
-            &self.local_peer_id,
-            policy.hops_limit,
-            policy.mode,
-            metadata,
-            std::slice::from_ref(&self.destination_peer_id),
-            payload,
-        ) {
-            match self.conn.try_pooled_datagram(datagram) {
-                Ok(()) => return Ok(()),
-                Err(GossipError::Network(err))
-                    if err.kind() == std::io::ErrorKind::NotConnected => {}
-                Err(err) => return Err(err),
-            }
-        }
-        let Some((frame, prefix, payload_len)) = encode_fast_frame_pooled(
-            topic_key,
-            type_hash,
-            msg_id,
-            &self.local_peer_id,
-            &self.local_peer_id,
-            policy.hops_limit,
-            policy.mode,
-            metadata,
-            std::slice::from_ref(&self.destination_peer_id),
-            payload,
-        ) else {
-            return Err(GossipError::WriteQueueFull);
-        };
-        self.conn
-            .try_pubsub_frame_pooled(frame, prefix, payload_len)
-    }
-}
-
 impl RoutedPubSub {
     pub async fn install(registry: Arc<crate::registry::GossipRegistry>) -> Arc<Self> {
         crate::typed::prewarm_pooled_byte_buffers(
@@ -471,16 +404,6 @@ impl RoutedPubSub {
 
     pub fn set_route_provider(&self, provider: Arc<dyn PubSubRouteProvider>) {
         self.route_provider.store(Arc::new(Some(provider)));
-    }
-
-    pub fn peer_sender(&self, peer_id: &PeerId) -> Option<PubSubPeerSender> {
-        let conn = self.client.lookup_connected_connection(peer_id)?;
-        Some(PubSubPeerSender {
-            local_peer_id: self.local_peer_id.clone(),
-            destination_peer_id: peer_id.clone(),
-            conn,
-            next_msg_id: AtomicU64::new(1),
-        })
     }
 
     pub fn stats(&self) -> PubSubIngressStats {
@@ -779,6 +702,55 @@ impl RoutedPubSub {
         metadata: PubSubFrameMetadata,
         stats: &mut PubSubPublishStats,
     ) {
+        let conn = match self.lookup_next_hop_conn(next_hop) {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub route lookup failed");
+                stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1);
+                return;
+            }
+        };
+        stats.remote_attempted = stats.remote_attempted.saturating_add(1);
+
+        if conn.supports_pooled_datagram() {
+            let Some(datagram) = encode_fast_pubsub_datagram_pooled(
+                topic_key,
+                type_hash,
+                msg_id,
+                &self.local_peer_id,
+                &self.local_peer_id,
+                policy.hops_limit,
+                policy.mode,
+                metadata,
+                destinations,
+                payload,
+            ) else {
+                stats.remote_full = stats.remote_full.saturating_add(1);
+                self.counters
+                    .queue_full_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            match conn.try_pooled_datagram(datagram) {
+                Ok(()) => {
+                    stats.remote_enqueued = stats.remote_enqueued.saturating_add(1);
+                    return;
+                }
+                Err(GossipError::WriteQueueFull) => {
+                    stats.remote_full = stats.remote_full.saturating_add(1);
+                    self.counters
+                        .queue_full_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(err) => {
+                    tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub UDP datagram send failed");
+                    stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1);
+                    return;
+                }
+            }
+        }
+
         let Some((frame, prefix, payload_len)) = encode_fast_frame_pooled(
             topic_key,
             type_hash,
@@ -797,8 +769,7 @@ impl RoutedPubSub {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         };
-        stats.remote_attempted = stats.remote_attempted.saturating_add(1);
-        match self.try_send_next_hop_pooled(next_hop, frame, prefix, payload_len) {
+        match conn.try_pubsub_frame_pooled(frame, prefix, payload_len) {
             Ok(()) => stats.remote_enqueued = stats.remote_enqueued.saturating_add(1),
             Err(GossipError::WriteQueueFull) => {
                 stats.remote_full = stats.remote_full.saturating_add(1);
@@ -992,24 +963,27 @@ impl RoutedPubSub {
         }
     }
 
-    fn try_send_next_hop(&self, next_hop: &PeerId, frame: Bytes) -> Result<()> {
+    fn lookup_next_hop_conn(&self, next_hop: &PeerId) -> Result<crate::RemoteConnection> {
         let conns = self.conns.load();
-        let conn = if let Some(conn) = conns.get(next_hop) {
-            conn.clone()
-        } else if let Some(peer_ref) = self.client.lookup_connected_peer(next_hop)
+        if let Some(conn) = conns.get(next_hop) {
+            return Ok(conn.clone());
+        }
+        if let Some(peer_ref) = self.client.lookup_connected_peer(next_hop)
             && let Some(conn) = peer_ref.connection_ref()
         {
             let mut next = (**conns).clone();
             next.insert(next_hop.clone(), conn.clone());
             self.conns.store(Arc::new(next));
-            conn
-        } else {
-            self.counters
-                .route_miss_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(GossipError::ActorNotFound("missing pubsub next-hop".into()));
-        };
-        conn.try_pubsub_frame(frame)
+            return Ok(conn);
+        }
+        self.counters
+            .route_miss_drops
+            .fetch_add(1, Ordering::Relaxed);
+        Err(GossipError::ActorNotFound("missing pubsub next-hop".into()))
+    }
+
+    fn try_send_next_hop(&self, next_hop: &PeerId, frame: Bytes) -> Result<()> {
+        self.lookup_next_hop_conn(next_hop)?.try_pubsub_frame(frame)
     }
 
     fn try_send_next_hop_pooled(
@@ -1019,23 +993,8 @@ impl RoutedPubSub {
         prefix: Option<[u8; 16]>,
         payload_len: usize,
     ) -> Result<()> {
-        let conns = self.conns.load();
-        let conn = if let Some(conn) = conns.get(next_hop) {
-            conn.clone()
-        } else if let Some(peer_ref) = self.client.lookup_connected_peer(next_hop)
-            && let Some(conn) = peer_ref.connection_ref()
-        {
-            let mut next = (**conns).clone();
-            next.insert(next_hop.clone(), conn.clone());
-            self.conns.store(Arc::new(next));
-            conn
-        } else {
-            self.counters
-                .route_miss_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(GossipError::ActorNotFound("missing pubsub next-hop".into()));
-        };
-        conn.try_pubsub_frame_pooled(frame, prefix, payload_len)
+        self.lookup_next_hop_conn(next_hop)?
+            .try_pubsub_frame_pooled(frame, prefix, payload_len)
     }
 
     fn note_interest(&self, topic_key: u64, present: bool) {
