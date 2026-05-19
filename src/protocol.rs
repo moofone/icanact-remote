@@ -353,7 +353,7 @@ pub(crate) async fn process_read_result(
             let authenticated_peer_id = authenticated_peer_id
                 .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));
             if let Some(authenticated_peer_id) = authenticated_peer_id {
-                if let Some(handler) = registry.pubsub_ingress_handler.load_full() {
+                if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
                     if let Err(e) = handler.handle(authenticated_peer_id, payload) {
                         warn!(peer = %peer_addr, error = %e, "Failed to process PubSub frame");
                     }

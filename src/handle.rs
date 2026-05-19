@@ -1118,7 +1118,7 @@ async fn process_udp_datagram_native(
     peer_addr: SocketAddr,
     mut datagram: crate::PooledAlignedBuffer,
     datagram_len: usize,
-    streaming_state: &mut crate::protocol::StreamingState,
+    streaming_states: &mut HashMap<SocketAddr, crate::protocol::StreamingState>,
     peer_context: &mut Option<UdpPeerContext>,
 ) -> Result<()> {
     if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
@@ -1166,11 +1166,6 @@ async fn process_udp_datagram_native(
         .filter(|ctx| ctx.addr == peer_addr)
         .map(|ctx| ctx.authenticated_peer_id.clone())
         .unwrap_or(authenticated_peer_id);
-    let response_correlation = response_connection
-        .as_ref()
-        .and_then(|conn| conn.correlation.clone());
-    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
-
     let msg_len = u32::from_be_bytes(
         datagram.as_ref()[..crate::framing::LENGTH_PREFIX_LEN]
             .try_into()
@@ -1186,8 +1181,33 @@ async fn process_udp_datagram_native(
 
     // Common case: one framed message per datagram.
     if frame_len == datagram_len {
+        if msg_len >= crate::framing::PUBSUB_HEADER_LEN {
+            let msg_data = &datagram.as_ref()
+                [crate::framing::LENGTH_PREFIX_LEN..crate::framing::LENGTH_PREFIX_LEN + msg_len];
+            if msg_data[0] == crate::MessageType::PubSub as u8 {
+                let payload_len = msg_len - crate::framing::PUBSUB_HEADER_LEN;
+                let payload_offset =
+                    crate::framing::LENGTH_PREFIX_LEN + crate::framing::PUBSUB_HEADER_LEN;
+                let payload = AlignedBytes::from_pooled_buffer_range(
+                    datagram,
+                    payload_offset,
+                    payload_len,
+                )?;
+                if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
+                    if let Err(e) = handler.handle(&authenticated_peer_id, payload) {
+                        warn!(peer = %peer_addr, error = %e, "Failed to process UDP PubSub frame");
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        let response_correlation = response_connection
+            .as_ref()
+            .and_then(|conn| conn.correlation.clone());
         datagram.truncate(frame_len);
         let parsed = parse_message_from_pooled_buffer(datagram, msg_len)?;
+        let streaming_state = streaming_states.entry(peer_addr).or_default();
         crate::protocol::process_read_result(
             parsed,
             streaming_state,
@@ -1201,6 +1221,7 @@ async fn process_udp_datagram_native(
         return Ok(());
     }
 
+    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
     let datagram_bytes = Bytes::from_owner(datagram);
     let datagram_slice = &datagram_bytes.as_ref()[..datagram_len];
     let mut offset = 0usize;
@@ -1231,12 +1252,16 @@ async fn process_udp_datagram_native(
             break;
         }
 
+        let response_correlation = response_connection
+            .as_ref()
+            .and_then(|conn| conn.correlation.clone());
         let mut frame =
             unsafe { crate::PooledAlignedBuffer::with_len_uninit(frame_len, aligned_pool.clone()) };
         frame
             .as_mut_slice()
             .copy_from_slice(&datagram_slice[offset..offset + frame_len]);
         let parsed = parse_message_from_pooled_buffer(frame, msg_len)?;
+        let streaming_state = streaming_states.entry(peer_addr).or_default();
         crate::protocol::process_read_result(
             parsed,
             streaming_state,
@@ -1279,13 +1304,12 @@ async fn start_gossip_server_with_udp_socket(
         match socket.recv_from(datagram.as_mut_slice()).await {
             Ok((len, peer_addr)) => {
                 if len >= crate::framing::LENGTH_PREFIX_LEN {
-                    let state = streaming_states.entry(peer_addr).or_default();
                     if let Err(err) = process_udp_datagram_native(
                         &registry,
                         peer_addr,
                         datagram,
                         len,
-                        state,
+                        &mut streaming_states,
                         &mut peer_context,
                     )
                     .await
@@ -1309,13 +1333,12 @@ async fn start_gossip_server_with_udp_socket(
                             if len < crate::framing::LENGTH_PREFIX_LEN {
                                 continue;
                             }
-                            let state = streaming_states.entry(peer_addr).or_default();
                             if let Err(err) = process_udp_datagram_native(
                                 &registry,
                                 peer_addr,
                                 datagram,
                                 len,
-                                state,
+                                &mut streaming_states,
                                 &mut peer_context,
                             )
                             .await
