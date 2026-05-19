@@ -533,6 +533,28 @@ impl<T> GossipRegistryHandle<T> {
         // Final cleanup after all background tasks are canceled.
         self.registry.shutdown().await;
     }
+
+    /// Drop the bootstrap type parameter marker.
+    ///
+    /// All `GossipRegistryHandle<T>` instances are functionally identical regardless of `T` —
+    /// the type parameter is `PhantomData` only. Use this when you need to store handles
+    /// constructed with different bootstrap types in the same field or container.
+    pub fn forget_bootstrap(self) -> GossipRegistryHandle {
+        // Use ManuallyDrop to suppress T's Drop impl while we move the fields
+        // to a new GossipRegistryHandle with a different (erased) type parameter.
+        // SAFETY: every field is moved into the returned handle which takes
+        // ownership and whose Drop impl will run normally.
+        let this = std::mem::ManuallyDrop::new(self);
+        unsafe {
+            GossipRegistryHandle {
+                registry: std::ptr::read(&this.registry),
+                _server_handle: std::ptr::read(&this._server_handle),
+                _timer_handle: std::ptr::read(&this._timer_handle),
+                _monitor_handle: std::ptr::read(&this._monitor_handle),
+                _marker: PhantomData,
+            }
+        }
+    }
 }
 
 impl<T> GossipClient<T> {
