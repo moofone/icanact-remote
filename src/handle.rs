@@ -1292,8 +1292,6 @@ async fn start_gossip_server_with_udp_socket(
         (registry.config.max_message_size + crate::framing::LENGTH_PREFIX_LEN).min(65_507);
     let datagram_capacity = max_datagram_size.max(2048);
     let aligned_pool = registry.connection_pool.aligned_bytes_pool();
-    // Mirror TCP read-loop batching behavior to reduce per-packet wakeups and dispatcher overhead.
-    const UDP_RECV_BATCH_LIMIT: usize = 512;
     let mut streaming_states = HashMap::<SocketAddr, crate::protocol::StreamingState>::new();
     let mut peer_context: Option<UdpPeerContext> = None;
 
@@ -1315,42 +1313,6 @@ async fn start_gossip_server_with_udp_socket(
                     .await
                     {
                         warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
-                    }
-                }
-
-                // Drain immediately available datagrams in one wake-up, similar to TCP read batching.
-                let mut drained = 0usize;
-                while drained < UDP_RECV_BATCH_LIMIT {
-                    let mut datagram = unsafe {
-                        crate::PooledAlignedBuffer::with_len_uninit(
-                            datagram_capacity,
-                            aligned_pool.clone(),
-                        )
-                    };
-                    match socket.try_recv_from(datagram.as_mut_slice()) {
-                        Ok((len, peer_addr)) => {
-                            drained += 1;
-                            if len < crate::framing::LENGTH_PREFIX_LEN {
-                                continue;
-                            }
-                            if let Err(err) = process_udp_datagram_native(
-                                &registry,
-                                peer_addr,
-                                datagram,
-                                len,
-                                &mut streaming_states,
-                                &mut peer_context,
-                            )
-                            .await
-                            {
-                                warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
-                            }
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(err) => {
-                            warn!(error = %err, "failed to drain udp datagram batch");
-                            break;
-                        }
                     }
                 }
             }
