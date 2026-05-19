@@ -90,7 +90,7 @@ pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
 pub use transport::{
     AuthContext, PeerAuthenticator, RegistryTransportBootstrap, RemoteAddrMeta, TargetAddr,
-    TransportConnector, TransportListener, TransportStack,
+    TransportConnector, TransportListener, TransportStack, TransportWireKind,
 };
 pub use typed::{
     ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,

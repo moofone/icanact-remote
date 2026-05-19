@@ -60,6 +60,12 @@ impl<T> ConnectionPool<T> {
         })
     }
 
+    /// Returns the shared UDP socket without error — `None` if UDP transport is not configured.
+    /// Used by the ask responder to reply to UDP asks without a connection-pool lookup.
+    pub(crate) fn udp_socket_opt(&self) -> Option<Arc<UdpSocket>> {
+        self.udp_socket.load_full()
+    }
+
     fn is_udp_transport_enabled(&self) -> bool {
         self.registry
             .load()
