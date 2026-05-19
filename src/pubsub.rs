@@ -331,62 +331,10 @@ struct InterestState {
     generations: HashMap<TopicKey, u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoutedPubSubMode {
-    Routed,
-    DirectOnly,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RoutedPubSubOptions {
-    pub mode: RoutedPubSubMode,
-}
-
-impl RoutedPubSubOptions {
-    pub const fn routed() -> Self {
-        Self {
-            mode: RoutedPubSubMode::Routed,
-        }
-    }
-
-    pub const fn direct_only() -> Self {
-        Self {
-            mode: RoutedPubSubMode::DirectOnly,
-        }
-    }
-
-    #[inline]
-    fn control_plane_enabled(self) -> bool {
-        matches!(self.mode, RoutedPubSubMode::Routed)
-    }
-
-    #[inline]
-    fn forwarding_enabled(self) -> bool {
-        matches!(self.mode, RoutedPubSubMode::Routed)
-    }
-
-    #[inline]
-    fn direct_duplicate_tracking(self) -> bool {
-        matches!(self.mode, RoutedPubSubMode::DirectOnly)
-    }
-
-    #[inline]
-    fn hot_borrowed_subscriber_enabled(self) -> bool {
-        matches!(self.mode, RoutedPubSubMode::DirectOnly)
-    }
-}
-
-impl Default for RoutedPubSubOptions {
-    fn default() -> Self {
-        Self::routed()
-    }
-}
-
 #[derive(Default)]
 struct SeenState {
     entries: HashSet<(PeerId, u128)>,
     order: VecDeque<(PeerId, u128)>,
-    direct_last_by_origin: HashMap<PeerId, u128>,
 }
 
 impl SeenState {
@@ -404,26 +352,12 @@ impl SeenState {
         true
     }
 
-    fn accept_direct(&mut self, origin: &PeerId, msg_id: u128) -> bool {
-        match self.direct_last_by_origin.get_mut(origin) {
-            Some(last) if msg_id <= *last => false,
-            Some(last) => {
-                *last = msg_id;
-                true
-            }
-            None => {
-                self.direct_last_by_origin.insert(origin.clone(), msg_id);
-                true
-            }
-        }
-    }
 }
 
 pub struct RoutedPubSub {
     registry: Arc<crate::registry::GossipRegistry>,
     client: crate::GossipClient,
     local_peer_id: PeerId,
-    options: RoutedPubSubOptions,
     subscribers: ArcSwap<SubscriberMap>,
     borrowed_subscribers: ArcSwap<BorrowedSubscriberMap>,
     hot_borrowed_subscriber: ArcSwapOption<HotBorrowedSubscriber>,
@@ -507,13 +441,6 @@ impl PubSubPeerSender {
 
 impl RoutedPubSub {
     pub async fn install(registry: Arc<crate::registry::GossipRegistry>) -> Arc<Self> {
-        Self::install_with_options(registry, RoutedPubSubOptions::default()).await
-    }
-
-    pub async fn install_with_options(
-        registry: Arc<crate::registry::GossipRegistry>,
-        options: RoutedPubSubOptions,
-    ) -> Arc<Self> {
         crate::typed::prewarm_pooled_byte_buffers(
             FAST_FRAME_POOL_BUFFERS,
             FAST_FRAME_POOL_BUFFER_CAPACITY,
@@ -522,7 +449,6 @@ impl RoutedPubSub {
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
             registry,
-            options,
             subscribers: ArcSwap::from_pointee(HashMap::new()),
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
             hot_borrowed_subscriber: ArcSwapOption::empty(),
@@ -539,9 +465,7 @@ impl RoutedPubSub {
         this.registry
             .set_pubsub_ingress_handler(Arc::clone(&this))
             .await;
-        if options.control_plane_enabled() {
-            Self::spawn_control_plane(&this);
-        }
+        Self::spawn_control_plane(&this);
         this
     }
 
@@ -576,9 +500,7 @@ impl RoutedPubSub {
         topic_subs.push(SubscriberEntry::new(id, deliver));
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
-        if self.options.control_plane_enabled() {
-            self.note_interest(topic_key, true);
-        }
+        self.note_interest(topic_key, true);
         PubSubSubscription {
             topic_key,
             type_hash,
@@ -601,9 +523,7 @@ impl RoutedPubSub {
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
-        if self.options.control_plane_enabled() {
-            self.note_interest(topic_key, true);
-        }
+        self.note_interest(topic_key, true);
         PubSubBorrowedSubscription {
             topic_key,
             type_hash,
@@ -626,9 +546,7 @@ impl RoutedPubSub {
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
-        if self.options.control_plane_enabled() {
-            self.note_interest(topic_key, true);
-        }
+        self.note_interest(topic_key, true);
         PubSubBorrowedSubscription {
             topic_key,
             type_hash,
@@ -674,9 +592,7 @@ impl RoutedPubSub {
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
         self.subscribers.store(Arc::new(next));
-        if self.options.control_plane_enabled() {
-            self.note_interest(sub.topic_key, false);
-        }
+        self.note_interest(sub.topic_key, false);
         true
     }
 
@@ -705,9 +621,7 @@ impl RoutedPubSub {
             self.refresh_hot_borrowed_subscriber(key, &[]);
         }
         self.borrowed_subscribers.store(Arc::new(next));
-        if self.options.control_plane_enabled() {
-            self.note_interest(sub.topic_key, false);
-        }
+        self.note_interest(sub.topic_key, false);
         true
     }
 
@@ -1024,8 +938,7 @@ impl RoutedPubSub {
         payload: &[u8],
         metadata: PubSubFrameMetadata,
     ) -> u32 {
-        if self.options.hot_borrowed_subscriber_enabled()
-            && let Some(hot) = self.hot_borrowed_subscriber.load_full()
+        if let Some(hot) = self.hot_borrowed_subscriber.load_full()
             && hot.key == (topic_key, type_hash)
         {
             hot.entry.deliver(payload, metadata);
@@ -1068,9 +981,6 @@ impl RoutedPubSub {
         key: SubscriberKey,
         entries: &[BorrowedSubscriberEntry],
     ) {
-        if !self.options.hot_borrowed_subscriber_enabled() {
-            return;
-        }
         if entries.len() == 1 {
             self.hot_borrowed_subscriber
                 .store(Some(Arc::new(HotBorrowedSubscriber {
@@ -1227,11 +1137,7 @@ impl RoutedPubSub {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        if self.options.direct_duplicate_tracking() {
-            seen.accept_direct(origin, msg_id)
-        } else {
-            seen.accept_routed(origin, msg_id)
-        }
+        seen.accept_routed(origin, msg_id)
     }
 }
 
@@ -1293,9 +1199,6 @@ impl PubSubIngressHandler for RoutedPubSub {
         }
 
         if frame.hops_remaining <= 1 {
-            return Ok(());
-        }
-        if !self.options.forwarding_enabled() {
             return Ok(());
         }
         let remaining: Vec<PeerId> = frame
@@ -1412,9 +1315,6 @@ impl RoutedPubSub {
         }
 
         if decoded.hops_remaining <= 1 || !has_remaining {
-            return Ok(());
-        }
-        if !self.options.forwarding_enabled() {
             return Ok(());
         }
 
@@ -1704,13 +1604,6 @@ mod tests {
     use super::*;
 
     fn test_pubsub(registry_peer_seed: &str) -> RoutedPubSub {
-        test_pubsub_with_options(registry_peer_seed, RoutedPubSubOptions::default())
-    }
-
-    fn test_pubsub_with_options(
-        registry_peer_seed: &str,
-        options: RoutedPubSubOptions,
-    ) -> RoutedPubSub {
         let mut config = crate::GossipConfig::default();
         config.key_pair = Some(crate::KeyPair::new_for_testing(registry_peer_seed));
         let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -1721,7 +1614,6 @@ mod tests {
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
             registry,
-            options,
             subscribers: ArcSwap::from_pointee(HashMap::new()),
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
             hot_borrowed_subscriber: ArcSwapOption::empty(),
@@ -1846,86 +1738,6 @@ mod tests {
         let deliveries = delivered.lock().unwrap();
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].as_ref(), b"legitimate");
-    }
-
-    #[test]
-    fn direct_only_pubsub_delivers_without_forwarding() {
-        let pubsub = test_pubsub_with_options(
-            "pubsub-direct-only-no-forward",
-            RoutedPubSubOptions::direct_only(),
-        );
-        let origin = crate::KeyPair::new_for_testing("pubsub-direct-origin").peer_id();
-        let other = crate::KeyPair::new_for_testing("pubsub-direct-other").peer_id();
-        let topic = topic_key("direct-only-no-forward");
-        let type_hash = 301;
-        let delivered = Arc::new(AtomicU64::new(0));
-        let delivered_for_sub = Arc::clone(&delivered);
-        pubsub.subscribe_borrowed_bytes_with_metadata(topic, type_hash, move |payload, _| {
-            assert_eq!(payload, b"payload");
-            delivered_for_sub.fetch_add(1, Ordering::Relaxed);
-        });
-
-        let frame = encode_frame(
-            topic,
-            type_hash,
-            1,
-            origin.clone(),
-            origin.clone(),
-            2,
-            PubSubDeliveryMode::AtMostOnce,
-            &[pubsub.local_peer_id.clone(), other],
-            b"payload",
-        )
-        .unwrap();
-
-        pubsub
-            .handle_pubsub_frame(&origin, aligned_frame(frame))
-            .unwrap();
-
-        assert_eq!(delivered.load(Ordering::Relaxed), 1);
-        let stats = pubsub.stats();
-        assert_eq!(stats.delivered_local, 1);
-        assert_eq!(stats.forwarded_frames, 0);
-        assert_eq!(stats.route_miss_drops, 0);
-    }
-
-    #[test]
-    fn direct_only_duplicate_tracking_rejects_non_increasing_msg_ids() {
-        let pubsub = test_pubsub_with_options(
-            "pubsub-direct-only-duplicates",
-            RoutedPubSubOptions::direct_only(),
-        );
-        let origin = crate::KeyPair::new_for_testing("pubsub-direct-dupe-origin").peer_id();
-        let topic = topic_key("direct-only-duplicates");
-        let type_hash = 302;
-        let delivered = Arc::new(AtomicU64::new(0));
-        let delivered_for_sub = Arc::clone(&delivered);
-        pubsub.subscribe_borrowed_bytes(topic, type_hash, move |_| {
-            delivered_for_sub.fetch_add(1, Ordering::Relaxed);
-        });
-
-        for msg_id in [7u128, 7, 6, 8] {
-            let frame = encode_frame(
-                topic,
-                type_hash,
-                msg_id,
-                origin.clone(),
-                origin.clone(),
-                1,
-                PubSubDeliveryMode::AtMostOnce,
-                std::slice::from_ref(&pubsub.local_peer_id),
-                b"payload",
-            )
-            .unwrap();
-            pubsub
-                .handle_pubsub_frame(&origin, aligned_frame(frame))
-                .unwrap();
-        }
-
-        assert_eq!(delivered.load(Ordering::Relaxed), 2);
-        let stats = pubsub.stats();
-        assert_eq!(stats.accepted, 2);
-        assert_eq!(stats.duplicate_drops, 2);
     }
 
     #[tokio::test]
