@@ -58,7 +58,15 @@ struct HotBorrowedSubscriber {
 #[derive(Clone)]
 struct HotRouteGroups {
     topic_key: TopicKey,
-    groups: Arc<RouteGroups>,
+    entries: Arc<[HotRouteEntry]>,
+}
+
+#[derive(Clone)]
+struct HotRouteEntry {
+    next_hop: PeerId,
+    destinations: Arc<[PeerId]>,
+    conn: crate::RemoteConnection,
+    supports_pooled_datagram: bool,
 }
 
 impl SubscriberEntry {
@@ -642,13 +650,16 @@ impl RoutedPubSub {
         match scope {
             PubSubScope::LocalOnly => Ok(()),
             PubSubScope::AutoExternal | PubSubScope::ClusterWide => {
-                if let Some(hot) = self.hot_route_groups.load_full()
+                let hot_routes = self.hot_route_groups.load();
+                if let Some(hot) = hot_routes.as_ref()
                     && hot.topic_key == topic_key
                 {
-                    for (next_hop, destinations) in hot.groups.iter() {
-                        self.publish_frame_to_next_hop(
-                            next_hop,
-                            destinations.as_ref(),
+                    for entry in hot.entries.iter() {
+                        self.publish_frame_to_conn(
+                            &entry.next_hop,
+                            &entry.conn,
+                            entry.supports_pooled_datagram,
+                            entry.destinations.as_ref(),
                             topic_key,
                             type_hash,
                             msg_id,
@@ -660,6 +671,7 @@ impl RoutedPubSub {
                     }
                     return Ok(());
                 }
+                drop(hot_routes);
 
                 let groups = self.route_groups.load();
                 let Some(groups) = groups.get(&topic_key) else {
@@ -728,9 +740,38 @@ impl RoutedPubSub {
                 return;
             }
         };
+        self.publish_frame_to_conn(
+            next_hop,
+            &conn,
+            conn.supports_pooled_datagram(),
+            destinations,
+            topic_key,
+            type_hash,
+            msg_id,
+            payload,
+            policy,
+            metadata,
+            stats,
+        );
+    }
+
+    fn publish_frame_to_conn(
+        &self,
+        next_hop: &PeerId,
+        conn: &crate::RemoteConnection,
+        supports_pooled_datagram: bool,
+        destinations: &[PeerId],
+        topic_key: u64,
+        type_hash: u64,
+        msg_id: u128,
+        payload: &[u8],
+        policy: PubSubDeliveryPolicy,
+        metadata: PubSubFrameMetadata,
+        stats: &mut PubSubPublishStats,
+    ) {
         stats.remote_attempted = stats.remote_attempted.saturating_add(1);
 
-        if conn.supports_pooled_datagram() {
+        if supports_pooled_datagram {
             let Some(datagram) = encode_fast_pubsub_datagram_pooled(
                 topic_key,
                 type_hash,
@@ -886,19 +927,35 @@ impl RoutedPubSub {
                 next_routes.insert(topic, Arc::new(routable));
             }
         }
+        self.refresh_hot_route_groups(&next_routes, &next_conns);
         self.route_groups.store(Arc::new(next_routes));
-        self.refresh_hot_route_groups();
         self.conns.store(Arc::new(next_conns));
     }
 
-    fn refresh_hot_route_groups(&self) {
-        let routes = self.route_groups.load();
+    fn refresh_hot_route_groups(
+        &self,
+        routes: &HashMap<TopicKey, Arc<RouteGroups>>,
+        conns: &HashMap<PeerId, crate::RemoteConnection>,
+    ) {
         if routes.len() == 1
             && let Some((&topic_key, groups)) = routes.iter().next()
         {
+            let mut entries = Vec::with_capacity(groups.len());
+            for (next_hop, destinations) in groups.iter() {
+                let Some(conn) = conns.get(next_hop) else {
+                    self.hot_route_groups.store(None);
+                    return;
+                };
+                entries.push(HotRouteEntry {
+                    next_hop: next_hop.clone(),
+                    destinations: Arc::clone(destinations),
+                    conn: conn.clone(),
+                    supports_pooled_datagram: conn.supports_pooled_datagram(),
+                });
+            }
             self.hot_route_groups.store(Some(Arc::new(HotRouteGroups {
                 topic_key,
-                groups: Arc::clone(groups),
+                entries: entries.into_boxed_slice().into(),
             })));
         } else {
             self.hot_route_groups.store(None);
@@ -942,12 +999,14 @@ impl RoutedPubSub {
         payload: &[u8],
         metadata: PubSubFrameMetadata,
     ) -> u32 {
-        if let Some(hot) = self.hot_borrowed_subscriber.load_full()
+        let hot_subscriber = self.hot_borrowed_subscriber.load();
+        if let Some(hot) = hot_subscriber.as_ref()
             && hot.key == (topic_key, type_hash)
         {
             hot.entry.deliver(payload, metadata);
             return 1;
         }
+        drop(hot_subscriber);
 
         let mut delivered = 0u32;
         let borrowed_subscribers = self.borrowed_subscribers.load();

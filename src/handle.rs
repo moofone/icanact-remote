@@ -1125,47 +1125,39 @@ async fn process_udp_datagram_native(
         return Ok(());
     }
 
-    // Fast path: reuse existing per-peer connection state.
-    // Slow path: initialize it once on first packet for this peer.
-    let mut response_connection = peer_context
+    let cached_peer_ready = peer_context
         .as_ref()
-        .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
-        .map(|ctx| Arc::clone(&ctx.connection))
-        .or_else(|| registry.connection_pool.get_connection_by_addr(&peer_addr));
-    if response_connection.is_none() {
-        registry
-            .connection_pool
-            .ensure_udp_peer_connection(peer_addr)
-            .await?;
-        response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
-    }
-    let authenticated_peer_id = response_connection
-        .as_ref()
-        .and_then(|conn| conn.embedded_peer_id.clone())
-        .or_else(|| registry.connection_pool.get_peer_id_by_addr(&peer_addr))
-        .ok_or_else(|| {
+        .map(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+        .unwrap_or(false);
+    if !cached_peer_ready {
+        let mut response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
+        if response_connection.is_none() {
+            registry
+                .connection_pool
+                .ensure_udp_peer_connection(peer_addr)
+                .await?;
+            response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
+        }
+        let response_connection = response_connection.ok_or_else(|| {
             GossipError::InvalidConfig(format!(
-                "UDP datagram from {peer_addr} has no established peer association"
+                "UDP datagram from {peer_addr} has no established connection"
             ))
         })?;
-    if let Some(conn) = response_connection.as_ref() {
-        let should_refresh_cache = peer_context
-            .as_ref()
-            .map(|ctx| ctx.addr != peer_addr || !Arc::ptr_eq(&ctx.connection, conn))
-            .unwrap_or(true);
-        if should_refresh_cache {
-            *peer_context = Some(UdpPeerContext {
-                addr: peer_addr,
-                connection: Arc::clone(conn),
-                authenticated_peer_id: authenticated_peer_id.clone(),
-            });
-        }
+        let authenticated_peer_id = response_connection
+            .embedded_peer_id
+            .clone()
+            .or_else(|| registry.connection_pool.get_peer_id_by_addr(&peer_addr))
+            .ok_or_else(|| {
+                GossipError::InvalidConfig(format!(
+                    "UDP datagram from {peer_addr} has no established peer association"
+                ))
+            })?;
+        *peer_context = Some(UdpPeerContext {
+            addr: peer_addr,
+            connection: response_connection,
+            authenticated_peer_id,
+        });
     }
-    let authenticated_peer_id = peer_context
-        .as_ref()
-        .filter(|ctx| ctx.addr == peer_addr)
-        .map(|ctx| ctx.authenticated_peer_id.clone())
-        .unwrap_or(authenticated_peer_id);
     let msg_len = u32::from_be_bytes(
         datagram.as_ref()[..crate::framing::LENGTH_PREFIX_LEN]
             .try_into()
@@ -1189,8 +1181,17 @@ async fn process_udp_datagram_native(
                 let payload_offset =
                     crate::framing::LENGTH_PREFIX_LEN + crate::framing::PUBSUB_HEADER_LEN;
                 let payload = &datagram.as_ref()[payload_offset..payload_offset + payload_len];
+                let authenticated_peer_id = &peer_context
+                    .as_ref()
+                    .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+                    .ok_or_else(|| {
+                        GossipError::InvalidConfig(format!(
+                            "UDP datagram from {peer_addr} has no established peer context"
+                        ))
+                    })?
+                    .authenticated_peer_id;
                 if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
-                    if let Err(e) = handler.handle_borrowed(&authenticated_peer_id, payload) {
+                    if let Err(e) = handler.handle_borrowed(authenticated_peer_id, payload) {
                         warn!(peer = %peer_addr, error = %e, "Failed to process UDP PubSub frame");
                     }
                 }
@@ -1198,9 +1199,17 @@ async fn process_udp_datagram_native(
             }
         }
 
-        let response_correlation = response_connection
+        let peer_context = peer_context
             .as_ref()
-            .and_then(|conn| conn.correlation.clone());
+            .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+            .ok_or_else(|| {
+                GossipError::InvalidConfig(format!(
+                    "UDP datagram from {peer_addr} has no established peer context"
+                ))
+            })?;
+        let response_connection = Arc::clone(&peer_context.connection);
+        let authenticated_peer_id = peer_context.authenticated_peer_id.clone();
+        let response_correlation = response_connection.correlation.clone();
         datagram.truncate(frame_len);
         let parsed = parse_message_from_pooled_buffer(datagram, msg_len)?;
         let streaming_state = streaming_states.entry(peer_addr).or_default();
@@ -1210,7 +1219,7 @@ async fn process_udp_datagram_native(
             registry,
             peer_addr,
             response_correlation.as_deref(),
-            response_connection.as_ref(),
+            Some(&response_connection),
             Some(&authenticated_peer_id),
         )
         .await?;
@@ -1221,6 +1230,16 @@ async fn process_udp_datagram_native(
     let datagram_bytes = Bytes::from_owner(datagram);
     let datagram_slice = &datagram_bytes.as_ref()[..datagram_len];
     let mut offset = 0usize;
+    let peer_context = peer_context
+        .as_ref()
+        .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+        .ok_or_else(|| {
+            GossipError::InvalidConfig(format!(
+                "UDP datagram from {peer_addr} has no established peer context"
+            ))
+        })?;
+    let response_connection = Arc::clone(&peer_context.connection);
+    let authenticated_peer_id = peer_context.authenticated_peer_id.clone();
     while offset + crate::framing::LENGTH_PREFIX_LEN <= datagram_len {
         let msg_len = u32::from_be_bytes(
             datagram_slice[offset..offset + crate::framing::LENGTH_PREFIX_LEN]
@@ -1248,9 +1267,7 @@ async fn process_udp_datagram_native(
             break;
         }
 
-        let response_correlation = response_connection
-            .as_ref()
-            .and_then(|conn| conn.correlation.clone());
+        let response_correlation = response_connection.correlation.clone();
         let mut frame =
             unsafe { crate::PooledAlignedBuffer::with_len_uninit(frame_len, aligned_pool.clone()) };
         frame
@@ -1264,7 +1281,7 @@ async fn process_udp_datagram_native(
             registry,
             peer_addr,
             response_correlation.as_deref(),
-            response_connection.as_ref(),
+            Some(&response_connection),
             Some(&authenticated_peer_id),
         )
         .await?;
