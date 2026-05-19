@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +12,7 @@ use crate::{GossipError, PeerId, RegistrationPriority, RemoteActorLocation, Resu
 
 const CONTROL_PLANE_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_TTL: u8 = 8;
-const DEFAULT_SEEN_CAPACITY: usize = 16_384;
+const SEEN_FINGERPRINT_SLOTS: usize = 16_384;
 const INTEREST_PREFIX: &str = "icanact/pubsub/interest/v1";
 const FAST_FRAME_MAGIC: &[u8; 4] = b"PSF1";
 const FAST_FRAME_HEADER_LEN: usize = 120;
@@ -53,6 +53,12 @@ type TopicRouteGroups = HashMap<TopicKey, Arc<RouteGroups>>;
 struct HotBorrowedSubscriber {
     key: SubscriberKey,
     entry: BorrowedSubscriberEntry,
+}
+
+#[derive(Clone)]
+struct HotRouteGroups {
+    topic_key: TopicKey,
+    groups: Arc<RouteGroups>,
 }
 
 impl SubscriberEntry {
@@ -331,29 +337,6 @@ struct InterestState {
     generations: HashMap<TopicKey, u64>,
 }
 
-#[derive(Default)]
-struct SeenState {
-    entries: HashSet<(PeerId, u128)>,
-    order: VecDeque<(PeerId, u128)>,
-}
-
-impl SeenState {
-    fn accept_routed(&mut self, origin: &PeerId, msg_id: u128) -> bool {
-        let key = (origin.clone(), msg_id);
-        if !self.entries.insert(key.clone()) {
-            return false;
-        }
-        self.order.push_back(key);
-        if self.order.len() > DEFAULT_SEEN_CAPACITY
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.entries.remove(&evicted);
-        }
-        true
-    }
-
-}
-
 pub struct RoutedPubSub {
     registry: Arc<crate::registry::GossipRegistry>,
     client: crate::GossipClient,
@@ -364,8 +347,9 @@ pub struct RoutedPubSub {
     type_subscribers: ArcSwap<TypeSubscriberMap>,
     interest_state: Arc<Mutex<InterestState>>,
     route_groups: ArcSwap<TopicRouteGroups>,
+    hot_route_groups: ArcSwapOption<HotRouteGroups>,
     conns: ArcSwap<HashMap<PeerId, crate::RemoteConnection>>,
-    seen: Mutex<SeenState>,
+    seen_fingerprints: Box<[AtomicU64]>,
     counters: PubSubIngressCounters,
     next_sub_id: AtomicU64,
     next_msg_id: AtomicU64,
@@ -388,8 +372,9 @@ impl RoutedPubSub {
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
+            hot_route_groups: ArcSwapOption::empty(),
             conns: ArcSwap::from_pointee(HashMap::new()),
-            seen: Mutex::new(SeenState::default()),
+            seen_fingerprints: new_seen_fingerprints(),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
             next_msg_id: AtomicU64::new(1),
@@ -643,6 +628,25 @@ impl RoutedPubSub {
         match scope {
             PubSubScope::LocalOnly => Ok(()),
             PubSubScope::AutoExternal | PubSubScope::ClusterWide => {
+                if let Some(hot) = self.hot_route_groups.load_full()
+                    && hot.topic_key == topic_key
+                {
+                    for (next_hop, destinations) in hot.groups.iter() {
+                        self.publish_frame_to_next_hop(
+                            next_hop,
+                            destinations.as_ref(),
+                            topic_key,
+                            type_hash,
+                            msg_id,
+                            payload.as_ref(),
+                            policy,
+                            metadata,
+                            stats,
+                        );
+                    }
+                    return Ok(());
+                }
+
                 let groups = self.route_groups.load();
                 let Some(groups) = groups.get(&topic_key) else {
                     return Ok(());
@@ -869,7 +873,22 @@ impl RoutedPubSub {
             }
         }
         self.route_groups.store(Arc::new(next_routes));
+        self.refresh_hot_route_groups();
         self.conns.store(Arc::new(next_conns));
+    }
+
+    fn refresh_hot_route_groups(&self) {
+        let routes = self.route_groups.load();
+        if routes.len() == 1
+            && let Some((&topic_key, groups)) = routes.iter().next()
+        {
+            self.hot_route_groups.store(Some(Arc::new(HotRouteGroups {
+                topic_key,
+                groups: Arc::clone(groups),
+            })));
+        } else {
+            self.hot_route_groups.store(None);
+        }
     }
 
     fn deliver_local(&self, topic_key: u64, type_hash: u64, payload: Bytes) -> u32 {
@@ -1092,11 +1111,24 @@ impl RoutedPubSub {
     }
 
     fn accept_seen(&self, origin: &PeerId, msg_id: u128) -> bool {
-        let mut seen = match self.seen.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        seen.accept_routed(origin, msg_id)
+        let fingerprint = seen_fingerprint(origin, msg_id);
+        let slot =
+            &self.seen_fingerprints[(fingerprint as usize) & (self.seen_fingerprints.len() - 1)];
+        let mut current = slot.load(Ordering::Relaxed);
+        loop {
+            if current == fingerprint {
+                return false;
+            }
+            match slot.compare_exchange_weak(
+                current,
+                fingerprint,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(next) => current = next,
+            }
+        }
     }
 }
 
@@ -1435,6 +1467,31 @@ fn decode_delivery_mode(mode: u8) -> Option<PubSubDeliveryMode> {
     }
 }
 
+fn new_seen_fingerprints() -> Box<[AtomicU64]> {
+    debug_assert!(SEEN_FINGERPRINT_SLOTS.is_power_of_two());
+    (0..SEEN_FINGERPRINT_SLOTS)
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn seen_fingerprint(origin: &PeerId, msg_id: u128) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    #[inline]
+    fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    let hash = mix(mix(FNV_OFFSET, origin.as_bytes()), &msg_id.to_be_bytes());
+    if hash == 0 { 1 } else { hash }
+}
+
 fn encode_fast_frame_pooled(
     topic_key: u64,
     type_hash: u64,
@@ -1579,8 +1636,9 @@ mod tests {
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
+            hot_route_groups: ArcSwapOption::empty(),
             conns: ArcSwap::from_pointee(HashMap::new()),
-            seen: Mutex::new(SeenState::default()),
+            seen_fingerprints: new_seen_fingerprints(),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
             next_msg_id: AtomicU64::new(1),
