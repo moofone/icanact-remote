@@ -154,6 +154,8 @@ pub trait TransportDatagramWriter {
         payload: crate::typed::PooledPayload,
     ) -> Result<()>;
 
+    fn try_send_pooled_datagram(&self, datagram: crate::typed::PooledPayload) -> Result<()>;
+
     fn send_bytes_vectored(
         &self,
         header: bytes::Bytes,
@@ -271,6 +273,10 @@ impl TransportDatagramWriter for UnconfiguredDatagramWriter {
         _prefix: Option<[u8; 16]>,
         _payload: crate::typed::PooledPayload,
     ) -> Result<()> {
+        Err(datagram_runtime_not_installed_error())
+    }
+
+    fn try_send_pooled_datagram(&self, _datagram: crate::typed::PooledPayload) -> Result<()> {
         Err(datagram_runtime_not_installed_error())
     }
 

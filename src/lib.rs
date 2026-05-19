@@ -82,7 +82,8 @@ pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use pubsub::{
     PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameMetadata, PubSubFrameV1,
     PubSubIngressHandler, PubSubIngressStats, PubSubPeerSender, PubSubPublishStats,
-    PubSubRouteProvider, PubSubScope, PubSubSubscription, RoutedPubSub, topic_key,
+    PubSubRouteProvider, PubSubScope, PubSubSubscription, RoutedPubSub, RoutedPubSubMode,
+    RoutedPubSubOptions, topic_key,
 };
 pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;

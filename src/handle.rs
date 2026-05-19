@@ -1107,12 +1107,19 @@ async fn start_gossip_server_with_listener(
 /// A single UDP datagram may contain one or more framed messages. This path keeps UDP receive
 /// native (no channel bridge) while reusing the same parser/dispatcher logic
 /// used by the other transport stacks.
+struct UdpPeerContext {
+    addr: SocketAddr,
+    connection: Arc<crate::connection_pool::LockFreeConnection>,
+    authenticated_peer_id: crate::PeerId,
+}
+
 async fn process_udp_datagram_native(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
     mut datagram: crate::PooledAlignedBuffer,
     datagram_len: usize,
     streaming_state: &mut crate::protocol::StreamingState,
+    peer_context: &mut Option<UdpPeerContext>,
 ) -> Result<()> {
     if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
         return Ok(());
@@ -1120,7 +1127,11 @@ async fn process_udp_datagram_native(
 
     // Fast path: reuse existing per-peer connection state.
     // Slow path: initialize it once on first packet for this peer.
-    let mut response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
+    let mut response_connection = peer_context
+        .as_ref()
+        .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+        .map(|ctx| Arc::clone(&ctx.connection))
+        .or_else(|| registry.connection_pool.get_connection_by_addr(&peer_addr));
     if response_connection.is_none() {
         registry
             .connection_pool
@@ -1137,6 +1148,24 @@ async fn process_udp_datagram_native(
                 "UDP datagram from {peer_addr} has no established peer association"
             ))
         })?;
+    if let Some(conn) = response_connection.as_ref() {
+        let should_refresh_cache = peer_context
+            .as_ref()
+            .map(|ctx| ctx.addr != peer_addr || !Arc::ptr_eq(&ctx.connection, conn))
+            .unwrap_or(true);
+        if should_refresh_cache {
+            *peer_context = Some(UdpPeerContext {
+                addr: peer_addr,
+                connection: Arc::clone(conn),
+                authenticated_peer_id: authenticated_peer_id.clone(),
+            });
+        }
+    }
+    let authenticated_peer_id = peer_context
+        .as_ref()
+        .filter(|ctx| ctx.addr == peer_addr)
+        .map(|ctx| ctx.authenticated_peer_id.clone())
+        .unwrap_or(authenticated_peer_id);
     let response_correlation = response_connection
         .as_ref()
         .and_then(|conn| conn.correlation.clone());
@@ -1241,6 +1270,7 @@ async fn start_gossip_server_with_udp_socket(
     // Mirror TCP read-loop batching behavior to reduce per-packet wakeups and dispatcher overhead.
     const UDP_RECV_BATCH_LIMIT: usize = 512;
     let mut streaming_states = HashMap::<SocketAddr, crate::protocol::StreamingState>::new();
+    let mut peer_context: Option<UdpPeerContext> = None;
 
     loop {
         let mut datagram = unsafe {
@@ -1250,9 +1280,15 @@ async fn start_gossip_server_with_udp_socket(
             Ok((len, peer_addr)) => {
                 if len >= crate::framing::LENGTH_PREFIX_LEN {
                     let state = streaming_states.entry(peer_addr).or_default();
-                    if let Err(err) =
-                        process_udp_datagram_native(&registry, peer_addr, datagram, len, state)
-                            .await
+                    if let Err(err) = process_udp_datagram_native(
+                        &registry,
+                        peer_addr,
+                        datagram,
+                        len,
+                        state,
+                        &mut peer_context,
+                    )
+                    .await
                     {
                         warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
                     }
@@ -1275,7 +1311,12 @@ async fn start_gossip_server_with_udp_socket(
                             }
                             let state = streaming_states.entry(peer_addr).or_default();
                             if let Err(err) = process_udp_datagram_native(
-                                &registry, peer_addr, datagram, len, state,
+                                &registry,
+                                peer_addr,
+                                datagram,
+                                len,
+                                state,
+                                &mut peer_context,
                             )
                             .await
                             {

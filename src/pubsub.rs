@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::warn;
@@ -48,6 +48,12 @@ type BorrowedSubscriberMap = HashMap<SubscriberKey, Arc<[BorrowedSubscriberEntry
 type TypeSubscriberMap = HashMap<TypeHash, Arc<[TypeSubscriberEntry]>>;
 type RouteGroups = HashMap<PeerId, Arc<[PeerId]>>;
 type TopicRouteGroups = HashMap<TopicKey, Arc<RouteGroups>>;
+
+#[derive(Clone)]
+struct HotBorrowedSubscriber {
+    key: SubscriberKey,
+    entry: BorrowedSubscriberEntry,
+}
 
 impl SubscriberEntry {
     fn new<F>(id: u64, deliver: F) -> Self
@@ -325,17 +331,107 @@ struct InterestState {
     generations: HashMap<TopicKey, u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutedPubSubMode {
+    Routed,
+    DirectOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoutedPubSubOptions {
+    pub mode: RoutedPubSubMode,
+}
+
+impl RoutedPubSubOptions {
+    pub const fn routed() -> Self {
+        Self {
+            mode: RoutedPubSubMode::Routed,
+        }
+    }
+
+    pub const fn direct_only() -> Self {
+        Self {
+            mode: RoutedPubSubMode::DirectOnly,
+        }
+    }
+
+    #[inline]
+    fn control_plane_enabled(self) -> bool {
+        matches!(self.mode, RoutedPubSubMode::Routed)
+    }
+
+    #[inline]
+    fn forwarding_enabled(self) -> bool {
+        matches!(self.mode, RoutedPubSubMode::Routed)
+    }
+
+    #[inline]
+    fn direct_duplicate_tracking(self) -> bool {
+        matches!(self.mode, RoutedPubSubMode::DirectOnly)
+    }
+
+    #[inline]
+    fn hot_borrowed_subscriber_enabled(self) -> bool {
+        matches!(self.mode, RoutedPubSubMode::DirectOnly)
+    }
+}
+
+impl Default for RoutedPubSubOptions {
+    fn default() -> Self {
+        Self::routed()
+    }
+}
+
+#[derive(Default)]
+struct SeenState {
+    entries: HashSet<(PeerId, u128)>,
+    order: VecDeque<(PeerId, u128)>,
+    direct_last_by_origin: HashMap<PeerId, u128>,
+}
+
+impl SeenState {
+    fn accept_routed(&mut self, origin: &PeerId, msg_id: u128) -> bool {
+        let key = (origin.clone(), msg_id);
+        if !self.entries.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > DEFAULT_SEEN_CAPACITY
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.entries.remove(&evicted);
+        }
+        true
+    }
+
+    fn accept_direct(&mut self, origin: &PeerId, msg_id: u128) -> bool {
+        match self.direct_last_by_origin.get_mut(origin) {
+            Some(last) if msg_id <= *last => false,
+            Some(last) => {
+                *last = msg_id;
+                true
+            }
+            None => {
+                self.direct_last_by_origin.insert(origin.clone(), msg_id);
+                true
+            }
+        }
+    }
+}
+
 pub struct RoutedPubSub {
     registry: Arc<crate::registry::GossipRegistry>,
     client: crate::GossipClient,
     local_peer_id: PeerId,
+    options: RoutedPubSubOptions,
     subscribers: ArcSwap<SubscriberMap>,
     borrowed_subscribers: ArcSwap<BorrowedSubscriberMap>,
+    hot_borrowed_subscriber: ArcSwapOption<HotBorrowedSubscriber>,
     type_subscribers: ArcSwap<TypeSubscriberMap>,
     interest_state: Arc<Mutex<InterestState>>,
     route_groups: ArcSwap<TopicRouteGroups>,
     conns: ArcSwap<HashMap<PeerId, crate::RemoteConnection>>,
-    seen: Mutex<Vec<(PeerId, u128)>>,
+    seen: Mutex<SeenState>,
     counters: PubSubIngressCounters,
     next_sub_id: AtomicU64,
     next_msg_id: AtomicU64,
@@ -371,6 +467,25 @@ impl PubSubPeerSender {
             return Ok(());
         }
         let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed) as u128;
+        if let Some(datagram) = encode_fast_pubsub_datagram_pooled(
+            topic_key,
+            type_hash,
+            msg_id,
+            &self.local_peer_id,
+            &self.local_peer_id,
+            policy.hops_limit,
+            policy.mode,
+            metadata,
+            std::slice::from_ref(&self.destination_peer_id),
+            payload,
+        ) {
+            match self.conn.try_pooled_datagram(datagram) {
+                Ok(()) => return Ok(()),
+                Err(GossipError::Network(err))
+                    if err.kind() == std::io::ErrorKind::NotConnected => {}
+                Err(err) => return Err(err),
+            }
+        }
         let Some((frame, prefix, payload_len)) = encode_fast_frame_pooled(
             topic_key,
             type_hash,
@@ -392,6 +507,13 @@ impl PubSubPeerSender {
 
 impl RoutedPubSub {
     pub async fn install(registry: Arc<crate::registry::GossipRegistry>) -> Arc<Self> {
+        Self::install_with_options(registry, RoutedPubSubOptions::default()).await
+    }
+
+    pub async fn install_with_options(
+        registry: Arc<crate::registry::GossipRegistry>,
+        options: RoutedPubSubOptions,
+    ) -> Arc<Self> {
         crate::typed::prewarm_pooled_byte_buffers(
             FAST_FRAME_POOL_BUFFERS,
             FAST_FRAME_POOL_BUFFER_CAPACITY,
@@ -400,13 +522,15 @@ impl RoutedPubSub {
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
             registry,
+            options,
             subscribers: ArcSwap::from_pointee(HashMap::new()),
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             conns: ArcSwap::from_pointee(HashMap::new()),
-            seen: Mutex::new(Vec::with_capacity(DEFAULT_SEEN_CAPACITY)),
+            seen: Mutex::new(SeenState::default()),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
             next_msg_id: AtomicU64::new(1),
@@ -415,7 +539,9 @@ impl RoutedPubSub {
         this.registry
             .set_pubsub_ingress_handler(Arc::clone(&this))
             .await;
-        Self::spawn_control_plane(&this);
+        if options.control_plane_enabled() {
+            Self::spawn_control_plane(&this);
+        }
         this
     }
 
@@ -450,7 +576,9 @@ impl RoutedPubSub {
         topic_subs.push(SubscriberEntry::new(id, deliver));
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
-        self.note_interest(topic_key, true);
+        if self.options.control_plane_enabled() {
+            self.note_interest(topic_key, true);
+        }
         PubSubSubscription {
             topic_key,
             type_hash,
@@ -468,10 +596,14 @@ impl RoutedPubSub {
         let key = (topic_key, type_hash);
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
-        topic_subs.push(BorrowedSubscriberEntry::new(id, deliver));
+        let entry = BorrowedSubscriberEntry::new(id, deliver);
+        topic_subs.push(entry);
+        self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
-        self.note_interest(topic_key, true);
+        if self.options.control_plane_enabled() {
+            self.note_interest(topic_key, true);
+        }
         PubSubBorrowedSubscription {
             topic_key,
             type_hash,
@@ -489,10 +621,14 @@ impl RoutedPubSub {
         let key = (topic_key, type_hash);
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
-        topic_subs.push(BorrowedSubscriberEntry::new_with_metadata(id, deliver));
+        let entry = BorrowedSubscriberEntry::new_with_metadata(id, deliver);
+        topic_subs.push(entry);
+        self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
-        self.note_interest(topic_key, true);
+        if self.options.control_plane_enabled() {
+            self.note_interest(topic_key, true);
+        }
         PubSubBorrowedSubscription {
             topic_key,
             type_hash,
@@ -538,7 +674,9 @@ impl RoutedPubSub {
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
         self.subscribers.store(Arc::new(next));
-        self.note_interest(sub.topic_key, false);
+        if self.options.control_plane_enabled() {
+            self.note_interest(sub.topic_key, false);
+        }
         true
     }
 
@@ -560,10 +698,16 @@ impl RoutedPubSub {
         if topic_subs.is_empty() {
             next.remove(&key);
         } else {
+            self.refresh_hot_borrowed_subscriber(key, &topic_subs);
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
+        if !next.contains_key(&key) {
+            self.refresh_hot_borrowed_subscriber(key, &[]);
+        }
         self.borrowed_subscribers.store(Arc::new(next));
-        self.note_interest(sub.topic_key, false);
+        if self.options.control_plane_enabled() {
+            self.note_interest(sub.topic_key, false);
+        }
         true
     }
 
@@ -880,6 +1024,14 @@ impl RoutedPubSub {
         payload: &[u8],
         metadata: PubSubFrameMetadata,
     ) -> u32 {
+        if self.options.hot_borrowed_subscriber_enabled()
+            && let Some(hot) = self.hot_borrowed_subscriber.load_full()
+            && hot.key == (topic_key, type_hash)
+        {
+            hot.entry.deliver(payload, metadata);
+            return 1;
+        }
+
         let mut delivered = 0u32;
         let borrowed_subscribers = self.borrowed_subscribers.load();
         if let Some(callbacks) = borrowed_subscribers.get(&(topic_key, type_hash)).cloned() {
@@ -909,6 +1061,25 @@ impl RoutedPubSub {
             }
         }
         delivered
+    }
+
+    fn refresh_hot_borrowed_subscriber(
+        &self,
+        key: SubscriberKey,
+        entries: &[BorrowedSubscriberEntry],
+    ) {
+        if !self.options.hot_borrowed_subscriber_enabled() {
+            return;
+        }
+        if entries.len() == 1 {
+            self.hot_borrowed_subscriber
+                .store(Some(Arc::new(HotBorrowedSubscriber {
+                    key,
+                    entry: entries[0].clone(),
+                })));
+        } else {
+            self.hot_borrowed_subscriber.store(None);
+        }
     }
 
     fn try_send_next_hop(&self, next_hop: &PeerId, frame: Bytes) -> Result<()> {
@@ -1056,17 +1227,11 @@ impl RoutedPubSub {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        if seen
-            .iter()
-            .any(|entry| entry.0 == *origin && entry.1 == msg_id)
-        {
-            return false;
+        if self.options.direct_duplicate_tracking() {
+            seen.accept_direct(origin, msg_id)
+        } else {
+            seen.accept_routed(origin, msg_id)
         }
-        if seen.len() >= DEFAULT_SEEN_CAPACITY {
-            seen.remove(0);
-        }
-        seen.push((origin.clone(), msg_id));
-        true
     }
 }
 
@@ -1128,6 +1293,9 @@ impl PubSubIngressHandler for RoutedPubSub {
         }
 
         if frame.hops_remaining <= 1 {
+            return Ok(());
+        }
+        if !self.options.forwarding_enabled() {
             return Ok(());
         }
         let remaining: Vec<PeerId> = frame
@@ -1244,6 +1412,9 @@ impl RoutedPubSub {
         }
 
         if decoded.hops_remaining <= 1 || !has_remaining {
+            return Ok(());
+        }
+        if !self.options.forwarding_enabled() {
             return Ok(());
         }
 
@@ -1417,32 +1588,99 @@ fn encode_fast_frame_pooled(
     destination_peers: &[PeerId],
     payload: &[u8],
 ) -> Option<(crate::typed::PooledPayload, Option<[u8; 16]>, usize)> {
-    let destinations_len = destination_peers
-        .len()
-        .saturating_mul(FAST_FRAME_DEST_PEER_LEN);
-    let payload_len = FAST_FRAME_HEADER_LEN
-        .saturating_add(destinations_len)
-        .saturating_add(payload.len());
+    let payload_len = fast_frame_len(destination_peers, payload);
     let pooled = crate::typed::PooledPayload::try_from_pooled_bytes(payload_len, |out| {
-        out.extend_from_slice(FAST_FRAME_MAGIC);
-        out.push(1);
-        out.push(encode_delivery_mode(mode));
-        out.push(hops_remaining);
-        out.push(0);
-        out.extend_from_slice(&topic_key.to_be_bytes());
-        out.extend_from_slice(&type_hash.to_be_bytes());
-        out.extend_from_slice(&msg_id.to_be_bytes());
-        out.extend_from_slice(origin_peer_id.as_bytes());
-        out.extend_from_slice(source_peer_id.as_bytes());
-        out.extend_from_slice(&(destination_peers.len() as u16).to_be_bytes());
-        out.extend_from_slice(&[0u8; 6]);
-        out.extend_from_slice(&metadata.publisher_enqueued_ns.to_be_bytes());
-        for peer in destination_peers {
-            out.extend_from_slice(peer.as_bytes());
-        }
-        out.extend_from_slice(payload);
+        write_fast_frame(
+            out,
+            topic_key,
+            type_hash,
+            msg_id,
+            origin_peer_id,
+            source_peer_id,
+            hops_remaining,
+            mode,
+            metadata,
+            destination_peers,
+            payload,
+        );
     })?;
     Some((pooled, None, payload_len))
+}
+
+fn encode_fast_pubsub_datagram_pooled(
+    topic_key: u64,
+    type_hash: u64,
+    msg_id: u128,
+    origin_peer_id: &PeerId,
+    source_peer_id: &PeerId,
+    hops_remaining: u8,
+    mode: PubSubDeliveryMode,
+    metadata: PubSubFrameMetadata,
+    destination_peers: &[PeerId],
+    payload: &[u8],
+) -> Option<crate::typed::PooledPayload> {
+    let payload_len = fast_frame_len(destination_peers, payload);
+    let header = crate::framing::write_pubsub_frame_prefix(payload_len);
+    let datagram_len = header.len().saturating_add(payload_len);
+    crate::typed::PooledPayload::try_from_pooled_bytes(datagram_len, |out| {
+        out.extend_from_slice(&header);
+        write_fast_frame(
+            out,
+            topic_key,
+            type_hash,
+            msg_id,
+            origin_peer_id,
+            source_peer_id,
+            hops_remaining,
+            mode,
+            metadata,
+            destination_peers,
+            payload,
+        );
+    })
+}
+
+fn fast_frame_len(destination_peers: &[PeerId], payload: &[u8]) -> usize {
+    FAST_FRAME_HEADER_LEN
+        .saturating_add(
+            destination_peers
+                .len()
+                .saturating_mul(FAST_FRAME_DEST_PEER_LEN),
+        )
+        .saturating_add(payload.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_fast_frame(
+    out: &mut Vec<u8>,
+    topic_key: u64,
+    type_hash: u64,
+    msg_id: u128,
+    origin_peer_id: &PeerId,
+    source_peer_id: &PeerId,
+    hops_remaining: u8,
+    mode: PubSubDeliveryMode,
+    metadata: PubSubFrameMetadata,
+    destination_peers: &[PeerId],
+    payload: &[u8],
+) {
+    out.extend_from_slice(FAST_FRAME_MAGIC);
+    out.push(1);
+    out.push(encode_delivery_mode(mode));
+    out.push(hops_remaining);
+    out.push(0);
+    out.extend_from_slice(&topic_key.to_be_bytes());
+    out.extend_from_slice(&type_hash.to_be_bytes());
+    out.extend_from_slice(&msg_id.to_be_bytes());
+    out.extend_from_slice(origin_peer_id.as_bytes());
+    out.extend_from_slice(source_peer_id.as_bytes());
+    out.extend_from_slice(&(destination_peers.len() as u16).to_be_bytes());
+    out.extend_from_slice(&[0u8; 6]);
+    out.extend_from_slice(&metadata.publisher_enqueued_ns.to_be_bytes());
+    for peer in destination_peers {
+        out.extend_from_slice(peer.as_bytes());
+    }
+    out.extend_from_slice(payload);
 }
 
 pub fn topic_key(topic: &str) -> u64 {
@@ -1466,6 +1704,13 @@ mod tests {
     use super::*;
 
     fn test_pubsub(registry_peer_seed: &str) -> RoutedPubSub {
+        test_pubsub_with_options(registry_peer_seed, RoutedPubSubOptions::default())
+    }
+
+    fn test_pubsub_with_options(
+        registry_peer_seed: &str,
+        options: RoutedPubSubOptions,
+    ) -> RoutedPubSub {
         let mut config = crate::GossipConfig::default();
         config.key_pair = Some(crate::KeyPair::new_for_testing(registry_peer_seed));
         let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -1476,13 +1721,15 @@ mod tests {
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
             registry,
+            options,
             subscribers: ArcSwap::from_pointee(HashMap::new()),
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             conns: ArcSwap::from_pointee(HashMap::new()),
-            seen: Mutex::new(Vec::with_capacity(DEFAULT_SEEN_CAPACITY)),
+            seen: Mutex::new(SeenState::default()),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
             next_msg_id: AtomicU64::new(1),
@@ -1599,6 +1846,86 @@ mod tests {
         let deliveries = delivered.lock().unwrap();
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].as_ref(), b"legitimate");
+    }
+
+    #[test]
+    fn direct_only_pubsub_delivers_without_forwarding() {
+        let pubsub = test_pubsub_with_options(
+            "pubsub-direct-only-no-forward",
+            RoutedPubSubOptions::direct_only(),
+        );
+        let origin = crate::KeyPair::new_for_testing("pubsub-direct-origin").peer_id();
+        let other = crate::KeyPair::new_for_testing("pubsub-direct-other").peer_id();
+        let topic = topic_key("direct-only-no-forward");
+        let type_hash = 301;
+        let delivered = Arc::new(AtomicU64::new(0));
+        let delivered_for_sub = Arc::clone(&delivered);
+        pubsub.subscribe_borrowed_bytes_with_metadata(topic, type_hash, move |payload, _| {
+            assert_eq!(payload, b"payload");
+            delivered_for_sub.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let frame = encode_frame(
+            topic,
+            type_hash,
+            1,
+            origin.clone(),
+            origin.clone(),
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            &[pubsub.local_peer_id.clone(), other],
+            b"payload",
+        )
+        .unwrap();
+
+        pubsub
+            .handle_pubsub_frame(&origin, aligned_frame(frame))
+            .unwrap();
+
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+        let stats = pubsub.stats();
+        assert_eq!(stats.delivered_local, 1);
+        assert_eq!(stats.forwarded_frames, 0);
+        assert_eq!(stats.route_miss_drops, 0);
+    }
+
+    #[test]
+    fn direct_only_duplicate_tracking_rejects_non_increasing_msg_ids() {
+        let pubsub = test_pubsub_with_options(
+            "pubsub-direct-only-duplicates",
+            RoutedPubSubOptions::direct_only(),
+        );
+        let origin = crate::KeyPair::new_for_testing("pubsub-direct-dupe-origin").peer_id();
+        let topic = topic_key("direct-only-duplicates");
+        let type_hash = 302;
+        let delivered = Arc::new(AtomicU64::new(0));
+        let delivered_for_sub = Arc::clone(&delivered);
+        pubsub.subscribe_borrowed_bytes(topic, type_hash, move |_| {
+            delivered_for_sub.fetch_add(1, Ordering::Relaxed);
+        });
+
+        for msg_id in [7u128, 7, 6, 8] {
+            let frame = encode_frame(
+                topic,
+                type_hash,
+                msg_id,
+                origin.clone(),
+                origin.clone(),
+                1,
+                PubSubDeliveryMode::AtMostOnce,
+                std::slice::from_ref(&pubsub.local_peer_id),
+                b"payload",
+            )
+            .unwrap();
+            pubsub
+                .handle_pubsub_frame(&origin, aligned_frame(frame))
+                .unwrap();
+        }
+
+        assert_eq!(delivered.load(Ordering::Relaxed), 2);
+        let stats = pubsub.stats();
+        assert_eq!(stats.accepted, 2);
+        assert_eq!(stats.duplicate_drops, 2);
     }
 
     #[tokio::test]

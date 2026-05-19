@@ -414,6 +414,18 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    /// Try to send a complete UDP datagram that already contains the outer frame header.
+    pub fn try_send_pooled_datagram(&self, payload: crate::typed::PooledPayload) -> Result<()> {
+        if let Some(udp_writer) = self.udp_writer() {
+            udp_writer.try_send_pooled_datagram(payload)
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no UDP writer path", self.addr),
+            )))
+        }
+    }
+
     /// Send a response using the inline write queue (never streaming).
     pub async fn send_response_auto(
         &self,
