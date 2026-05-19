@@ -2,7 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use tokio::net::UdpSocket;
 
 use crate::{GossipError, Result, connection_pool::LockFreeStreamHandle, framing};
 
@@ -10,6 +11,10 @@ use crate::{GossipError, Result, connection_pool::LockFreeStreamHandle, framing}
 enum AskResponseSink {
     StreamHandle(Arc<LockFreeStreamHandle>),
     DeferredWriter(Arc<ResponseWriter>),
+    Udp {
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+    },
 }
 
 impl AskResponseSink {
@@ -22,6 +27,22 @@ impl AskResponseSink {
             }
             Self::DeferredWriter(writer) => {
                 writer.send_response_bytes(correlation_id, payload).await
+            }
+            Self::Udp { socket, peer_addr } => {
+                let header = framing::write_ask_response_header(
+                    crate::MessageType::Response,
+                    correlation_id,
+                    payload.len(),
+                );
+                // UDP requires a single contiguous datagram; one BytesMut concat is unavoidable.
+                let mut datagram = bytes::BytesMut::with_capacity(16 + payload.len());
+                datagram.extend_from_slice(&header);
+                datagram.extend_from_slice(&payload);
+                socket
+                    .send_to(&datagram, *peer_addr)
+                    .await
+                    .map(|_| ())
+                    .map_err(GossipError::Network)
             }
         }
     }
@@ -38,6 +59,20 @@ impl AskResponseSink {
                     .write_header_and_payload_control_inline_nonblocking(header, 16, payload)
             }
             Self::DeferredWriter(writer) => writer.try_send_response_bytes(correlation_id, payload),
+            Self::Udp { socket, peer_addr } => {
+                let header = framing::write_ask_response_header(
+                    crate::MessageType::Response,
+                    correlation_id,
+                    payload.len(),
+                );
+                let mut datagram = bytes::BytesMut::with_capacity(16 + payload.len());
+                datagram.extend_from_slice(&header);
+                datagram.extend_from_slice(&payload);
+                socket
+                    .try_send_to(&datagram, *peer_addr)
+                    .map(|_| ())
+                    .map_err(GossipError::Network)
+            }
         }
     }
 
@@ -65,6 +100,32 @@ impl AskResponseSink {
                     .send_response_pooled(correlation_id, payload, prefix, payload_len)
                     .await
             }
+            Self::Udp { socket, peer_addr } => {
+                let header = framing::write_ask_response_header(
+                    crate::MessageType::Response,
+                    correlation_id,
+                    payload_len,
+                );
+                let prefix_bytes = prefix.as_ref().map_or(0, |_| 16);
+                let mut datagram =
+                    bytes::BytesMut::with_capacity(16 + prefix_bytes + payload_len);
+                datagram.extend_from_slice(&header);
+                if let Some(p) = prefix {
+                    datagram.extend_from_slice(&p);
+                }
+                let mut payload = payload;
+                while payload.has_remaining() {
+                    let chunk = payload.chunk();
+                    let len = chunk.len();
+                    datagram.extend_from_slice(chunk);
+                    payload.advance(len);
+                }
+                socket
+                    .send_to(&datagram, *peer_addr)
+                    .await
+                    .map(|_| ())
+                    .map_err(GossipError::Network)
+            }
         }
     }
 }
@@ -72,6 +133,10 @@ impl AskResponseSink {
 enum AskContextSink<'a> {
     StreamHandle(&'a Arc<LockFreeStreamHandle>),
     DeferredWriter(&'a Arc<ResponseWriter>),
+    Udp {
+        socket: &'a Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+    },
 }
 
 pub struct AskContext<'a> {
@@ -97,6 +162,17 @@ impl<'a> AskContext<'a> {
         }
     }
 
+    pub(crate) fn from_udp(
+        correlation_id: u16,
+        peer_addr: SocketAddr,
+        socket: &'a Arc<UdpSocket>,
+    ) -> Self {
+        Self {
+            correlation_id,
+            sink: AskContextSink::Udp { socket, peer_addr },
+        }
+    }
+
     pub fn correlation_id(&self) -> u16 {
         self.correlation_id
     }
@@ -108,6 +184,9 @@ impl<'a> AskContext<'a> {
             }
             AskContextSink::DeferredWriter(writer) => {
                 AskResponder::from_writer(self.correlation_id, (*writer).clone())
+            }
+            AskContextSink::Udp { socket, peer_addr } => {
+                AskResponder::from_udp(self.correlation_id, *peer_addr, Arc::clone(socket))
             }
         }
     }
@@ -134,6 +213,17 @@ impl AskResponder {
         Self {
             correlation_id,
             sink: AskResponseSink::DeferredWriter(writer),
+        }
+    }
+
+    pub(crate) fn from_udp(
+        correlation_id: u16,
+        peer_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+    ) -> Self {
+        Self {
+            correlation_id,
+            sink: AskResponseSink::Udp { socket, peer_addr },
         }
     }
 
