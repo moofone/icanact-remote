@@ -1185,6 +1185,15 @@ impl RoutedPubSub {
 
     fn accept_seen(&self, origin: &PeerId, msg_id: u128) -> bool {
         let fingerprint = seen_fingerprint(origin, msg_id);
+        self.accept_seen_fingerprint(fingerprint)
+    }
+
+    fn accept_seen_bytes(&self, origin: &[u8; 32], msg_id: u128) -> bool {
+        let fingerprint = seen_fingerprint_bytes(origin, msg_id);
+        self.accept_seen_fingerprint(fingerprint)
+    }
+
+    fn accept_seen_fingerprint(&self, fingerprint: u64) -> bool {
         let slot =
             &self.seen_fingerprints[(fingerprint as usize) & (self.seen_fingerprints.len() - 1)];
         let mut current = slot.load(Ordering::Relaxed);
@@ -1346,21 +1355,20 @@ impl RoutedPubSub {
             self.counters.ttl_drops.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        if decoded.source_peer_id != *authenticated_source_peer_id {
+        if decoded.source_peer_id != *authenticated_source_peer_id.as_bytes() {
             self.counters
                 .reflection_drops
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        if decoded.origin_peer_id == self.local_peer_id
-            || decoded.source_peer_id == self.local_peer_id
-        {
+        let local_peer_id = self.local_peer_id.as_bytes();
+        if decoded.origin_peer_id == *local_peer_id || decoded.source_peer_id == *local_peer_id {
             self.counters
                 .reflection_drops
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        if !self.accept_seen(&decoded.origin_peer_id, decoded.msg_id) {
+        if !self.accept_seen_bytes(&decoded.origin_peer_id, decoded.msg_id) {
             self.counters
                 .duplicate_drops
                 .fetch_add(1, Ordering::Relaxed);
@@ -1371,11 +1379,11 @@ impl RoutedPubSub {
         let mut should_deliver_local = false;
         let mut has_remaining = false;
         for index in 0..decoded.destination_count {
-            let Some(peer) = decoded.destination_peer_at(index) else {
+            let Some(peer) = decoded.destination_peer_bytes_at(index) else {
                 self.counters.decode_drops.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             };
-            if peer == self.local_peer_id {
+            if peer == local_peer_id {
                 should_deliver_local = true;
             } else {
                 has_remaining = true;
@@ -1398,9 +1406,16 @@ impl RoutedPubSub {
             return Ok(());
         }
 
+        let origin_peer_id = match PeerId::from_bytes(&decoded.origin_peer_id) {
+            Ok(peer_id) => peer_id,
+            Err(err) => {
+                self.counters.decode_drops.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
         let remaining: Vec<PeerId> = decoded
             .destination_peer_iter()
-            .filter(|peer| *peer != self.local_peer_id)
+            .filter(|peer| peer.as_bytes() != local_peer_id)
             .collect();
         let grouped = if let Some(provider) = self.route_provider.load().as_ref() {
             provider.group_destinations(decoded.topic_key, &remaining)
@@ -1415,7 +1430,7 @@ impl RoutedPubSub {
                 decoded.topic_key,
                 decoded.type_hash,
                 decoded.msg_id,
-                &decoded.origin_peer_id,
+                &origin_peer_id,
                 &self.local_peer_id,
                 decoded.hops_remaining.saturating_sub(1),
                 decoded.mode,
@@ -1477,8 +1492,8 @@ struct FastFrameView<'a> {
     topic_key: u64,
     type_hash: u64,
     msg_id: u128,
-    origin_peer_id: PeerId,
-    source_peer_id: PeerId,
+    origin_peer_id: [u8; 32],
+    source_peer_id: [u8; 32],
     hops_remaining: u8,
     mode: PubSubDeliveryMode,
     metadata: PubSubFrameMetadata,
@@ -1500,8 +1515,8 @@ impl<'a> FastFrameView<'a> {
         let topic_key = u64::from_be_bytes(frame[8..16].try_into().ok()?);
         let type_hash = u64::from_be_bytes(frame[16..24].try_into().ok()?);
         let msg_id = u128::from_be_bytes(frame[24..40].try_into().ok()?);
-        let origin_peer_id = PeerId::from_bytes(&frame[40..72]).ok()?;
-        let source_peer_id = PeerId::from_bytes(&frame[72..104]).ok()?;
+        let origin_peer_id = frame[40..72].try_into().ok()?;
+        let source_peer_id = frame[72..104].try_into().ok()?;
         let destination_count = u16::from_be_bytes(frame[104..106].try_into().ok()?) as usize;
         let metadata = PubSubFrameMetadata {
             publisher_enqueued_ns: u64::from_be_bytes(frame[112..120].try_into().ok()?),
@@ -1527,13 +1542,17 @@ impl<'a> FastFrameView<'a> {
         })
     }
 
-    fn destination_peer_at(&self, index: usize) -> Option<PeerId> {
+    fn destination_peer_bytes_at(&self, index: usize) -> Option<&'a [u8; 32]> {
         if index >= self.destination_count {
             return None;
         }
         let start = index.checked_mul(FAST_FRAME_DEST_PEER_LEN)?;
         let end = start.checked_add(FAST_FRAME_DEST_PEER_LEN)?;
-        PeerId::from_bytes(&self.destination_peers[start..end]).ok()
+        self.destination_peers[start..end].try_into().ok()
+    }
+
+    fn destination_peer_at(&self, index: usize) -> Option<PeerId> {
+        PeerId::from_bytes(self.destination_peer_bytes_at(index)?).ok()
     }
 
     fn destination_peer_iter(&self) -> impl Iterator<Item = PeerId> + '_ {
@@ -1565,6 +1584,10 @@ fn new_seen_fingerprints() -> Box<[AtomicU64]> {
 }
 
 fn seen_fingerprint(origin: &PeerId, msg_id: u128) -> u64 {
+    seen_fingerprint_bytes(origin.as_bytes(), msg_id)
+}
+
+fn seen_fingerprint_bytes(origin: &[u8; 32], msg_id: u128) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -1577,7 +1600,7 @@ fn seen_fingerprint(origin: &PeerId, msg_id: u128) -> u64 {
         hash
     }
 
-    let hash = mix(mix(FNV_OFFSET, origin.as_bytes()), &msg_id.to_be_bytes());
+    let hash = mix(mix(FNV_OFFSET, origin), &msg_id.to_be_bytes());
     if hash == 0 { 1 } else { hash }
 }
 
