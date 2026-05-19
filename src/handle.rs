@@ -1183,12 +1183,7 @@ async fn process_udp_datagram_native(
                 let payload = &datagram.as_ref()[payload_offset..payload_offset + payload_len];
                 let authenticated_peer_id = &peer_context
                     .as_ref()
-                    .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
-                    .ok_or_else(|| {
-                        GossipError::InvalidConfig(format!(
-                            "UDP datagram from {peer_addr} has no established peer context"
-                        ))
-                    })?
+                    .expect("UDP peer context is initialized before parsing datagram")
                     .authenticated_peer_id;
                 if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
                     if let Err(e) = handler.handle_borrowed(authenticated_peer_id, payload) {
