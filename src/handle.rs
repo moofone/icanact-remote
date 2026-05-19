@@ -1188,13 +1188,9 @@ async fn process_udp_datagram_native(
                 let payload_len = msg_len - crate::framing::PUBSUB_HEADER_LEN;
                 let payload_offset =
                     crate::framing::LENGTH_PREFIX_LEN + crate::framing::PUBSUB_HEADER_LEN;
-                let payload = AlignedBytes::from_pooled_buffer_range(
-                    datagram,
-                    payload_offset,
-                    payload_len,
-                )?;
+                let payload = &datagram.as_ref()[payload_offset..payload_offset + payload_len];
                 if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
-                    if let Err(e) = handler.handle(&authenticated_peer_id, payload) {
+                    if let Err(e) = handler.handle_borrowed(&authenticated_peer_id, payload) {
                         warn!(peer = %peer_addr, error = %e, "Failed to process UDP PubSub frame");
                     }
                 }

@@ -307,6 +307,20 @@ pub trait PubSubIngressHandler: Send + Sync {
         authenticated_source_peer_id: &PeerId,
         payload: crate::AlignedBytes,
     ) -> Result<()>;
+
+    fn handle_pubsub_frame_borrowed(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.handle_pubsub_frame(
+            authenticated_source_peer_id,
+            crate::AlignedBytes::from_pooled_slice(
+                payload,
+                Arc::new(crate::AlignedBytesPool::default()),
+            ),
+        )
+    }
 }
 
 pub trait PubSubRouteProvider: Send + Sync {
@@ -1133,6 +1147,22 @@ impl RoutedPubSub {
 }
 
 impl PubSubIngressHandler for RoutedPubSub {
+    fn handle_pubsub_frame_borrowed(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: &[u8],
+    ) -> Result<()> {
+        if payload.starts_with(FAST_FRAME_MAGIC) {
+            return self.handle_fast_pubsub_frame(authenticated_source_peer_id, payload);
+        }
+
+        let owned = crate::AlignedBytes::from_pooled_slice(
+            payload,
+            Arc::new(crate::AlignedBytesPool::default()),
+        );
+        self.handle_pubsub_frame(authenticated_source_peer_id, owned)
+    }
+
     fn handle_pubsub_frame(
         &self,
         authenticated_source_peer_id: &PeerId,

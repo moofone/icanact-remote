@@ -243,6 +243,7 @@ pub struct PubSubIngressHandlerCell {
     owner: Arc<dyn crate::pubsub::PubSubIngressHandler>,
     ptr: usize,
     call: unsafe fn(usize, &crate::PeerId, crate::AlignedBytes) -> Result<()>,
+    call_borrowed: unsafe fn(usize, &crate::PeerId, &[u8]) -> Result<()>,
 }
 
 #[derive(Clone)]
@@ -478,12 +479,25 @@ impl PubSubIngressHandlerCell {
             handler.handle_pubsub_frame(authenticated_source_peer_id, payload)
         }
 
+        unsafe fn call_borrowed_impl<H>(
+            ptr: usize,
+            authenticated_source_peer_id: &crate::PeerId,
+            payload: &[u8],
+        ) -> Result<()>
+        where
+            H: crate::pubsub::PubSubIngressHandler + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.handle_pubsub_frame_borrowed(authenticated_source_peer_id, payload)
+        }
+
         let ptr = Arc::as_ptr(&handler) as usize;
         let owner: Arc<dyn crate::pubsub::PubSubIngressHandler> = handler;
         Self {
             owner,
             ptr,
             call: call_impl::<H>,
+            call_borrowed: call_borrowed_impl::<H>,
         }
     }
 
@@ -495,6 +509,16 @@ impl PubSubIngressHandlerCell {
     ) -> Result<()> {
         let _keepalive = &self.owner;
         unsafe { (self.call)(self.ptr, authenticated_source_peer_id, payload) }
+    }
+
+    #[inline]
+    pub(crate) fn handle_borrowed(
+        &self,
+        authenticated_source_peer_id: &crate::PeerId,
+        payload: &[u8],
+    ) -> Result<()> {
+        let _keepalive = &self.owner;
+        unsafe { (self.call_borrowed)(self.ptr, authenticated_source_peer_id, payload) }
     }
 }
 
