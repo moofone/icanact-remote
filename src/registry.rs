@@ -1525,11 +1525,11 @@ impl<T: 'static> GossipRegistry<T> {
         Ok(())
     }
 
-    /// Enable UDP datagram transport mode with transport-neutral liveness detection.
+    /// Enable UDP datagram transport mode.
     ///
-    /// UDP data-plane frames are plaintext framed bytes. Peer identity is taken
-    /// from the peer/address association established by the control plane, not
-    /// from a per-datagram signature or encryption envelope.
+    /// Native UDP datagrams are currently disabled because a source socket
+    /// address is not a cryptographic peer identity. Re-enable this only after
+    /// adding per-datagram authentication and replay protection.
     pub fn enable_udp(&mut self, secret_key: crate::SecretKey) -> Result<()> {
         let keypair = secret_key.to_keypair();
         if keypair.peer_id() != self.peer_id {
@@ -1537,9 +1537,10 @@ impl<T: 'static> GossipRegistry<T> {
                 "UDP transport keypair does not match registry peer id".to_string(),
             ));
         }
-        self.udp_mode = true;
-        self.tls_config = None;
-        Ok(())
+        Err(GossipError::InvalidConfig(
+            "UDP datagram transport is disabled because plaintext datagrams cannot authenticate peer identity"
+                .to_string(),
+        ))
     }
 
     fn udp_now_ms(&self) -> u64 {
@@ -7287,17 +7288,22 @@ mod tests {
     }
 
     #[test]
-    fn enable_udp_enables_plaintext_datagram_mode() {
+    fn enable_udp_rejects_plaintext_datagram_mode() {
         let keypair = KeyPair::new_for_testing("udp-disabled-registry");
         let mut config = test_config();
         config.key_pair = Some(keypair.clone());
         let mut registry = GossipRegistry::<()>::new(test_addr(0), config);
 
-        registry
+        let err = registry
             .enable_udp(keypair.to_secret_key())
-            .expect("UDP mode should enable plaintext datagrams");
+            .expect_err("UDP mode must remain disabled without datagram authentication");
 
-        assert!(registry.udp_mode);
+        assert!(
+            err.to_string()
+                .contains("UDP datagram transport is disabled"),
+            "unexpected error: {err}"
+        );
+        assert!(!registry.udp_mode);
         assert!(registry.tls_config.is_none());
     }
 

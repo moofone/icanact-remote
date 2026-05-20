@@ -506,17 +506,17 @@ impl PeerDiscovery {
         // Check unified peer_states for expired entries
         for (addr, state) in self.peer_states.iter() {
             match state {
-                PeerState::Pending { since } if pending_ttl > 0 => {
-                    if now.saturating_sub(*since) > pending_ttl {
-                        to_remove.push(*addr);
-                        stats.pending_removed += 1;
-                    }
+                PeerState::Pending { since }
+                    if pending_ttl > 0 && now.saturating_sub(*since) > pending_ttl =>
+                {
+                    to_remove.push(*addr);
+                    stats.pending_removed += 1;
                 }
-                PeerState::Failed { since, .. } if fail_ttl > 0 => {
-                    if now.saturating_sub(*since) > fail_ttl {
-                        to_remove.push(*addr);
-                        stats.failed_removed += 1;
-                    }
+                PeerState::Failed { since, .. }
+                    if fail_ttl > 0 && now.saturating_sub(*since) > fail_ttl =>
+                {
+                    to_remove.push(*addr);
+                    stats.failed_removed += 1;
                 }
                 _ => {}
             }

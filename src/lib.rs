@@ -442,7 +442,7 @@ impl VectorClock {
 
             // Collect all entries and sort by clock value desc (drop small entries first).
             let mut entries: Vec<(NodeId, u64)> = current.iter().map(|(k, v)| (*k, *v)).collect();
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             entries.truncate(max_size);
 
             let mut next = BTreeMap::new();
