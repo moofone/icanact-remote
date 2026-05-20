@@ -1003,8 +1003,22 @@ impl RoutedPubSub {
         if let Some(hot) = hot_subscriber.as_ref()
             && hot.key == (topic_key, type_hash)
         {
-            hot.entry.deliver(payload, metadata);
-            return 1;
+            let subscribers = self.subscribers.load();
+            let has_owned_subscribers = subscribers
+                .get(&(topic_key, type_hash))
+                .is_some_and(|callbacks| !callbacks.is_empty());
+            drop(subscribers);
+
+            let type_subscribers = self.type_subscribers.load();
+            let has_type_subscribers = type_subscribers
+                .get(&type_hash)
+                .is_some_and(|callbacks| !callbacks.is_empty());
+            drop(type_subscribers);
+
+            if !has_owned_subscribers && !has_type_subscribers {
+                hot.entry.deliver(payload, metadata);
+                return 1;
+            }
         }
         drop(hot_subscriber);
 
