@@ -80,16 +80,17 @@ pub use lifecycle::{
 };
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use pubsub::{
-    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameV1, PubSubIngressHandler,
-    PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope, PubSubSubscription,
-    RoutedPubSub, topic_key,
+    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameMetadata, PubSubFrameV1,
+    PubSubIngressHandler, PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope,
+    PubSubSubscription, RoutedPubSub, topic_key,
 };
+pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
 pub use transport::{
     AuthContext, PeerAuthenticator, RegistryTransportBootstrap, RemoteAddrMeta, TargetAddr,
-    TransportConnector, TransportListener, TransportStack,
+    TransportConnector, TransportListener, TransportStack, TransportWireKind,
 };
 pub use typed::{
     ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,
@@ -441,7 +442,7 @@ impl VectorClock {
 
             // Collect all entries and sort by clock value desc (drop small entries first).
             let mut entries: Vec<(NodeId, u64)> = current.iter().map(|(k, v)| (*k, *v)).collect();
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             entries.truncate(max_size);
 
             let mut next = BTreeMap::new();
@@ -706,6 +707,10 @@ impl std::fmt::Debug for KeyPair {
 pub struct PeerId([u8; 32]);
 
 impl PeerId {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Create a PeerId from a verifying key
     pub fn from_verifying_key(key: VerifyingKey) -> Self {
         Self(key.to_bytes())
@@ -803,11 +808,29 @@ pub struct Peer<T = ()> {
 impl<T: 'static> Peer<T> {
     /// Connect to this peer at the specified address
     pub async fn connect(&self, addr: &SocketAddr) -> Result<()> {
+        if self.peer_id == self.registry.peer_id {
+            tracing::warn!(
+                peer_id = %self.peer_id,
+                addr = %addr,
+                "refusing to dial local registry identity as a remote peer"
+            );
+            return Ok(());
+        }
+
         // Validate the address
         if addr.port() == 0 {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("Invalid port 0 for peer {}", self.peer_id),
+            )));
+        }
+        if addr.ip().is_unspecified() {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to connect peer {} via unspecified address {}",
+                    self.peer_id, addr
+                ),
             )));
         }
 
@@ -1674,6 +1697,48 @@ mod tests {
             .await
             .expect_err("outbound-preferred side should still attempt the socket dial");
         assert!(matches!(err, GossipError::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn peer_connect_refuses_self_peer_without_configuring_or_dialing() {
+        let local_key = KeyPair::new_for_testing("self-peer-connect-guard");
+        let local_peer_id = local_key.peer_id();
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41004".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(local_key),
+                connection_timeout: Duration::from_millis(10),
+                ..GossipConfig::default()
+            },
+        ));
+        let peer = Peer {
+            peer_id: local_peer_id.clone(),
+            registry: registry.clone(),
+        };
+
+        peer.connect(&registry.bind_addr)
+            .await
+            .expect("self peer connect should be a harmless no-op");
+
+        assert_eq!(
+            registry
+                .connection_pool
+                .get_configured_peer_addr(&local_peer_id),
+            None,
+            "self peers must not be configured as remote dial targets"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .get_connection_by_peer_id(&local_peer_id)
+                .is_none(),
+            "self peers must not create pooled remote connections"
+        );
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.peers.contains_key(&registry.bind_addr),
+            "self peers must not enter gossip peer state"
+        );
     }
 
     fn inbound_preferred_key_pair() -> (KeyPair, KeyPair) {

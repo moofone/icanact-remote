@@ -222,6 +222,7 @@ async fn connect_tls(
         sender_bind_addr: None,
         sequence: 0,
         wall_clock_time: icanact_remote::current_timestamp(),
+        extensions: None,
     };
     let serialized =
         rkyv::to_bytes::<rkyv::rancor::Error>(&full_sync).expect("serialize full sync");

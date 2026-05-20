@@ -29,6 +29,11 @@ const REGISTRY_MESSAGE_ALIGNMENT: usize = {
 type RegistryAlignedVec = rkyv::util::AlignedVec<{ REGISTRY_MESSAGE_ALIGNMENT }>;
 
 #[inline]
+fn next_gossip_deadline(now: Instant, gossip_interval: Duration, jitter: Duration) -> Instant {
+    now + gossip_interval + jitter
+}
+
+#[inline]
 fn decode_registry_message(
     payload: &[u8],
 ) -> std::result::Result<RegistryMessage, rkyv::rancor::Error> {
@@ -126,7 +131,7 @@ impl<T> GossipRegistryHandle<T> {
             }
             TransportWireKind::UdpDatagram => {
                 return Err(GossipError::InvalidConfig(
-                    "native UDP datagram transport is disabled until inbound datagrams are authenticated"
+                    "UDP datagram transport is disabled because plaintext datagrams cannot authenticate peer identity"
                         .to_string(),
                 ));
             }
@@ -321,6 +326,17 @@ impl<T> GossipRegistryHandle<T> {
             .is_some()
     }
 
+    pub fn peer_clock_snapshot(
+        &self,
+        peer_addr: &std::net::SocketAddr,
+    ) -> Option<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshot(peer_addr)
+    }
+
+    pub fn peer_clock_snapshots(&self) -> Vec<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshots()
+    }
+
     /// Get registry statistics including vector clock metrics
     pub async fn stats(&self) -> RegistryStats {
         self.registry.get_stats().await
@@ -328,6 +344,17 @@ impl<T> GossipRegistryHandle<T> {
 
     /// Add a peer to the gossip network
     pub async fn add_peer(&self, peer_id: &crate::PeerId) -> crate::Peer {
+        if peer_id == &self.registry.peer_id {
+            tracing::warn!(
+                peer_id = %peer_id,
+                "refusing to configure local registry identity as a remote peer"
+            );
+            return crate::Peer {
+                peer_id: peer_id.clone(),
+                registry: self.registry.clone(),
+            };
+        }
+
         // Pre-configure the peer as allowed (address will be set when connect() is called)
         {
             let pool = &self.registry.connection_pool;
@@ -523,6 +550,28 @@ impl<T> GossipRegistryHandle<T> {
         // Final cleanup after all background tasks are canceled.
         self.registry.shutdown().await;
     }
+
+    /// Drop the bootstrap type parameter marker.
+    ///
+    /// All `GossipRegistryHandle<T>` instances are functionally identical regardless of `T` —
+    /// the type parameter is `PhantomData` only. Use this when you need to store handles
+    /// constructed with different bootstrap types in the same field or container.
+    pub fn forget_bootstrap(self) -> GossipRegistryHandle {
+        // Use ManuallyDrop to suppress T's Drop impl while we move the fields
+        // to a new GossipRegistryHandle with a different (erased) type parameter.
+        // SAFETY: every field is moved into the returned handle which takes
+        // ownership and whose Drop impl will run normally.
+        let this = std::mem::ManuallyDrop::new(self);
+        unsafe {
+            GossipRegistryHandle {
+                registry: std::ptr::read(&this.registry),
+                _server_handle: std::ptr::read(&this._server_handle),
+                _timer_handle: std::ptr::read(&this._timer_handle),
+                _monitor_handle: std::ptr::read(&this._monitor_handle),
+                _marker: PhantomData,
+            }
+        }
+    }
 }
 
 impl<T> GossipClient<T> {
@@ -564,6 +613,17 @@ impl<T> GossipClient<T> {
             .connection_pool
             .disconnect_connection_by_peer_id(peer_id)
             .is_some()
+    }
+
+    pub fn peer_clock_snapshot(
+        &self,
+        peer_addr: &std::net::SocketAddr,
+    ) -> Option<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshot(peer_addr)
+    }
+
+    pub fn peer_clock_snapshots(&self) -> Vec<crate::registry::PeerClockSnapshot> {
+        self.registry.peer_clock_snapshots()
     }
 
     /// Lookup a peer and return a RemoteActorRef for communicating with it.
@@ -730,6 +790,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gossip_deadline_reschedules_from_now_after_runtime_delay() {
+        let old_tick = Instant::now() - Duration::from_secs(30);
+        let delayed_now = Instant::now();
+        let next = next_gossip_deadline(
+            delayed_now,
+            Duration::from_millis(250),
+            Duration::from_millis(10),
+        );
+
+        assert!(
+            next > delayed_now,
+            "next gossip tick must be in the future after a delayed runtime wake"
+        );
+        assert!(
+            next > old_tick + Duration::from_secs(30),
+            "next gossip tick must not replay a stale missed-tick schedule"
+        );
+    }
+
     async fn new_registry(
         bind: SocketAddr,
         seed: &str,
@@ -744,6 +824,178 @@ mod tests {
             TestNoopBootstrap,
         )
         .await
+    }
+
+    async fn write_initial_gossip(
+        writer: &mut tokio::io::DuplexStream,
+        msg: &crate::registry::RegistryMessage,
+    ) {
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(msg).expect("serialize gossip");
+        let header = crate::framing::write_gossip_frame_prefix(data.len());
+        tokio::io::AsyncWriteExt::write_all(writer, &header)
+            .await
+            .expect("write gossip header");
+        tokio::io::AsyncWriteExt::write_all(writer, data.as_ref())
+            .await
+            .expect("write gossip payload");
+        tokio::io::AsyncWriteExt::flush(writer)
+            .await
+            .expect("flush gossip");
+    }
+
+    fn ordered_keypairs(local_seed: &str, remote_seed: &str) -> (crate::KeyPair, crate::KeyPair) {
+        let first = crate::KeyPair::new_for_testing(local_seed);
+        let second = crate::KeyPair::new_for_testing(remote_seed);
+        if first.peer_id().to_node_id().as_bytes() < second.peer_id().to_node_id().as_bytes() {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_duplicate_rejects_non_preferred_inbound_replacement() -> crate::Result<()> {
+        let (local_keypair, remote_keypair) = ordered_keypairs(
+            "inbound-duplicate-local-lower-a",
+            "inbound-duplicate-remote-higher-b",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            !handle
+                .registry
+                .should_keep_connection(&remote_peer_id, false),
+            "the lower local NodeId must not prefer inbound connections from the higher remote NodeId"
+        );
+
+        let existing_addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let (existing_io, _existing_peer) = tokio::io::duplex(1024);
+        let (existing_stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                existing_io,
+                existing_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut existing = crate::connection_pool::LockFreeConnection::new(
+            existing_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        existing.stream_handle = Some(Arc::new(existing_stream_handle));
+        existing.set_state(crate::connection_pool::ConnectionState::Connected);
+        let existing = Arc::new(existing);
+        assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            existing_addr,
+            existing.clone(),
+        ));
+
+        let attacker_addr: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: remote_peer_id.clone(),
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            attacker_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_keypair.peer_id().to_node_id()),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ConnectionCloseOutcome::DroppedByTieBreaker
+        ));
+        let resolved = handle
+            .registry
+            .connection_pool
+            .get_connection_by_peer_id(&remote_peer_id)
+            .expect("existing connection must remain indexed by peer id");
+        assert!(
+            Arc::ptr_eq(&resolved, &existing),
+            "non-preferred duplicate inbound connection must not replace the live existing connection"
+        );
+        assert_eq!(resolved.addr, existing_addr);
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_existing_connection(attacker_addr)
+                .is_none(),
+            "rejected duplicate must not be indexed by its ephemeral address"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_gossip_rejects_sender_not_bound_to_tls_certificate() -> crate::Result<()> {
+        let (local_keypair, claimed_keypair) =
+            ordered_keypairs("inbound-identity-local-a", "inbound-identity-claimed-b");
+        let imposter_keypair = crate::KeyPair::new_for_testing("inbound-identity-imposter");
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        let claimed_peer_id = claimed_keypair.peer_id();
+        let attacker_addr: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: claimed_peer_id.clone(),
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            attacker_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(imposter_keypair.peer_id().to_node_id()),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ConnectionCloseOutcome::Normal { node_id: None }
+        ));
+        assert!(
+            !handle
+                .registry
+                .connection_pool
+                .has_connection_by_peer_id(&claimed_peer_id),
+            "a gossip sender that does not match the TLS client certificate must not be registered"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -805,34 +1057,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_datagram_transport_is_rejected_until_authenticated() -> crate::Result<()> {
+    async fn udp_datagram_transport_is_rejected_without_datagram_authentication() {
         let keypair = KeyPair::new_for_testing("udp-disabled");
         let mut config = test_cfg();
         config.key_pair = Some(keypair.clone());
 
-        let err = match GossipRegistryHandle::new_with_transport_stack(
+        let result = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             keypair.to_secret_key(),
             Some(config),
             TestUdpBootstrap,
         )
-        .await
-        {
+        .await;
+        let err = match result {
             Ok(handle) => {
                 handle.shutdown_and_wait().await;
-                panic!("unauthenticated UDP bootstrap must not start");
+                panic!("UDP datagram transport must not start without datagram authentication");
             }
             Err(err) => err,
         };
 
-        match err {
-            GossipError::InvalidConfig(message) => {
-                assert!(message.contains("disabled until inbound datagrams are authenticated"));
-            }
-            other => panic!("expected InvalidConfig, got {other:?}"),
-        }
-
-        Ok(())
+        assert!(
+            err.to_string()
+                .contains("UDP datagram transport is disabled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1094,32 +1343,57 @@ async fn start_gossip_server_with_listener(
 /// A single UDP datagram may contain one or more framed messages. This path keeps UDP receive
 /// native (no channel bridge) while reusing the same parser/dispatcher logic
 /// used by the other transport stacks.
+struct UdpPeerContext {
+    addr: SocketAddr,
+    connection: Arc<crate::connection_pool::LockFreeConnection>,
+    authenticated_peer_id: crate::PeerId,
+}
+
 async fn process_udp_datagram_native(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
     mut datagram: crate::PooledAlignedBuffer,
     datagram_len: usize,
-    streaming_state: &mut crate::protocol::StreamingState,
+    streaming_states: &mut HashMap<SocketAddr, crate::protocol::StreamingState>,
+    peer_context: &mut Option<UdpPeerContext>,
 ) -> Result<()> {
     if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
         return Ok(());
     }
 
-    // Fast path: reuse existing per-peer connection state.
-    // Slow path: initialize it once on first packet for this peer.
-    let mut response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
-    if response_connection.is_none() {
-        registry
-            .connection_pool
-            .ensure_udp_peer_connection(peer_addr)
-            .await?;
-        response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
-    }
-    let response_correlation = response_connection
+    let cached_peer_ready = peer_context
         .as_ref()
-        .and_then(|conn| conn.correlation.clone());
-    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
-
+        .map(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+        .unwrap_or(false);
+    if !cached_peer_ready {
+        let mut response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
+        if response_connection.is_none() {
+            registry
+                .connection_pool
+                .ensure_udp_peer_connection(peer_addr)
+                .await?;
+            response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
+        }
+        let response_connection = response_connection.ok_or_else(|| {
+            GossipError::InvalidConfig(format!(
+                "UDP datagram from {peer_addr} has no established connection"
+            ))
+        })?;
+        let authenticated_peer_id = response_connection
+            .embedded_peer_id
+            .clone()
+            .or_else(|| registry.connection_pool.get_peer_id_by_addr(&peer_addr))
+            .ok_or_else(|| {
+                GossipError::InvalidConfig(format!(
+                    "UDP datagram from {peer_addr} has no established peer association"
+                ))
+            })?;
+        *peer_context = Some(UdpPeerContext {
+            addr: peer_addr,
+            connection: response_connection,
+            authenticated_peer_id,
+        });
+    }
     let msg_len = u32::from_be_bytes(
         datagram.as_ref()[..crate::framing::LENGTH_PREFIX_LEN]
             .try_into()
@@ -1134,28 +1408,69 @@ async fn process_udp_datagram_native(
     let frame_len = crate::framing::LENGTH_PREFIX_LEN + msg_len;
 
     // Common case: one framed message per datagram.
-    // Keep the datagram-owned aligned buffer and parse directly without frame copy.
     if frame_len == datagram_len {
+        if msg_len >= crate::framing::PUBSUB_HEADER_LEN {
+            let msg_data = &datagram.as_ref()
+                [crate::framing::LENGTH_PREFIX_LEN..crate::framing::LENGTH_PREFIX_LEN + msg_len];
+            if msg_data[0] == crate::MessageType::PubSub as u8 {
+                let payload_len = msg_len - crate::framing::PUBSUB_HEADER_LEN;
+                let payload_offset =
+                    crate::framing::LENGTH_PREFIX_LEN + crate::framing::PUBSUB_HEADER_LEN;
+                let payload = &datagram.as_ref()[payload_offset..payload_offset + payload_len];
+                let authenticated_peer_id = &peer_context
+                    .as_ref()
+                    .expect("UDP peer context is initialized before parsing datagram")
+                    .authenticated_peer_id;
+                if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
+                    if let Err(e) = handler.handle_borrowed(authenticated_peer_id, payload) {
+                        warn!(peer = %peer_addr, error = %e, "Failed to process UDP PubSub frame");
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        let peer_context = peer_context
+            .as_ref()
+            .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+            .ok_or_else(|| {
+                GossipError::InvalidConfig(format!(
+                    "UDP datagram from {peer_addr} has no established peer context"
+                ))
+            })?;
+        let response_connection = Arc::clone(&peer_context.connection);
+        let authenticated_peer_id = peer_context.authenticated_peer_id.clone();
+        let response_correlation = response_connection.correlation.clone();
         datagram.truncate(frame_len);
         let parsed = parse_message_from_pooled_buffer(datagram, msg_len)?;
+        let streaming_state = streaming_states.entry(peer_addr).or_default();
         crate::protocol::process_read_result(
             parsed,
             streaming_state,
             registry,
             peer_addr,
             response_correlation.as_deref(),
-            response_connection.as_ref(),
-            response_connection
-                .as_ref()
-                .and_then(|conn| conn.embedded_peer_id.as_ref()),
+            Some(&response_connection),
+            Some(&authenticated_peer_id),
         )
         .await?;
         return Ok(());
     }
 
+    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
     let datagram_bytes = Bytes::from_owner(datagram);
     let datagram_slice = &datagram_bytes.as_ref()[..datagram_len];
     let mut offset = 0usize;
+    let peer_context = peer_context
+        .as_ref()
+        .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
+        .ok_or_else(|| {
+            GossipError::InvalidConfig(format!(
+                "UDP datagram from {peer_addr} has no established peer context"
+            ))
+        })?;
+    let response_connection = Arc::clone(&peer_context.connection);
+    let authenticated_peer_id = peer_context.authenticated_peer_id.clone();
     while offset + crate::framing::LENGTH_PREFIX_LEN <= datagram_len {
         let msg_len = u32::from_be_bytes(
             datagram_slice[offset..offset + crate::framing::LENGTH_PREFIX_LEN]
@@ -1183,22 +1498,22 @@ async fn process_udp_datagram_native(
             break;
         }
 
+        let response_correlation = response_connection.correlation.clone();
         let mut frame =
             unsafe { crate::PooledAlignedBuffer::with_len_uninit(frame_len, aligned_pool.clone()) };
         frame
             .as_mut_slice()
             .copy_from_slice(&datagram_slice[offset..offset + frame_len]);
         let parsed = parse_message_from_pooled_buffer(frame, msg_len)?;
+        let streaming_state = streaming_states.entry(peer_addr).or_default();
         crate::protocol::process_read_result(
             parsed,
             streaming_state,
             registry,
             peer_addr,
             response_correlation.as_deref(),
-            response_connection.as_ref(),
-            response_connection
-                .as_ref()
-                .and_then(|conn| conn.embedded_peer_id.as_ref()),
+            Some(&response_connection),
+            Some(&authenticated_peer_id),
         )
         .await?;
 
@@ -1221,9 +1536,8 @@ async fn start_gossip_server_with_udp_socket(
         (registry.config.max_message_size + crate::framing::LENGTH_PREFIX_LEN).min(65_507);
     let datagram_capacity = max_datagram_size.max(2048);
     let aligned_pool = registry.connection_pool.aligned_bytes_pool();
-    // Mirror TCP read-loop batching behavior to reduce per-packet wakeups and dispatcher overhead.
-    const UDP_RECV_BATCH_LIMIT: usize = 512;
     let mut streaming_states = HashMap::<SocketAddr, crate::protocol::StreamingState>::new();
+    let mut peer_context: Option<UdpPeerContext> = None;
 
     loop {
         let mut datagram = unsafe {
@@ -1232,44 +1546,17 @@ async fn start_gossip_server_with_udp_socket(
         match socket.recv_from(datagram.as_mut_slice()).await {
             Ok((len, peer_addr)) => {
                 if len >= crate::framing::LENGTH_PREFIX_LEN {
-                    let state = streaming_states.entry(peer_addr).or_default();
-                    if let Err(err) =
-                        process_udp_datagram_native(&registry, peer_addr, datagram, len, state)
-                            .await
+                    if let Err(err) = process_udp_datagram_native(
+                        &registry,
+                        peer_addr,
+                        datagram,
+                        len,
+                        &mut streaming_states,
+                        &mut peer_context,
+                    )
+                    .await
                     {
                         warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
-                    }
-                }
-
-                // Drain immediately available datagrams in one wake-up, similar to TCP read batching.
-                let mut drained = 0usize;
-                while drained < UDP_RECV_BATCH_LIMIT {
-                    let mut datagram = unsafe {
-                        crate::PooledAlignedBuffer::with_len_uninit(
-                            datagram_capacity,
-                            aligned_pool.clone(),
-                        )
-                    };
-                    match socket.try_recv_from(datagram.as_mut_slice()) {
-                        Ok((len, peer_addr)) => {
-                            drained += 1;
-                            if len < crate::framing::LENGTH_PREFIX_LEN {
-                                continue;
-                            }
-                            let state = streaming_states.entry(peer_addr).or_default();
-                            if let Err(err) = process_udp_datagram_native(
-                                &registry, peer_addr, datagram, len, state,
-                            )
-                            .await
-                            {
-                                warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
-                            }
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(err) => {
-                            warn!(error = %err, "failed to drain udp datagram batch");
-                            break;
-                        }
                     }
                 }
             }
@@ -1305,7 +1592,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         rand::random::<u64>() % max_ms
     };
     let jitter = Duration::from_millis(jitter_ms);
-    let mut next_gossip_tick = Instant::now() + gossip_interval + jitter;
+    let mut next_gossip_tick = next_gossip_deadline(Instant::now(), gossip_interval, jitter);
     let mut cleanup_timer = interval(cleanup_interval);
     cleanup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut vector_clock_gc_timer = interval(vector_clock_gc_interval);
@@ -1337,7 +1624,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                     rand::random::<u64>() % max_ms
                 };
                 let jitter = Duration::from_millis(jitter_ms);
-                next_gossip_tick += gossip_interval + jitter;
+                next_gossip_tick = next_gossip_deadline(Instant::now(), gossip_interval, jitter);
 
                 // Step 1: Prepare gossip tasks while holding the lock briefly
                 let tasks = {
@@ -1648,7 +1935,7 @@ where
     let (sender_node_id, _initial_correlation_id, sender_bind_addr_opt) = match &msg_result {
         Ok(MessageReadResult::Gossip(msg, correlation_id)) => {
             let (node_id, bind_addr) = match msg {
-                RegistryMessage::DeltaGossip { delta } => (delta.sender_peer_id.to_hex(), None),
+                RegistryMessage::DeltaGossip { delta, .. } => (delta.sender_peer_id.to_hex(), None),
                 RegistryMessage::FullSync {
                     sender_peer_id,
                     sender_bind_addr,
@@ -1664,7 +1951,7 @@ where
                     sender_bind_addr,
                     ..
                 } => (sender_peer_id.to_hex(), sender_bind_addr.clone()),
-                RegistryMessage::DeltaGossipResponse { delta } => {
+                RegistryMessage::DeltaGossipResponse { delta, .. } => {
                     (delta.sender_peer_id.to_hex(), None)
                 }
                 RegistryMessage::PeerHealthQuery { sender, .. } => (sender.to_hex(), None),
@@ -1802,6 +2089,14 @@ where
             return ConnectionCloseOutcome::Normal { node_id: None };
         }
     };
+    if peer_id == registry.peer_id {
+        warn!(
+            peer_addr = %peer_addr,
+            peer_id = %peer_id,
+            "dropping inbound connection from local registry identity"
+        );
+        return ConnectionCloseOutcome::Normal { node_id: None };
+    }
     let sender_node_id_from_message = peer_id.to_node_id();
     if !inbound_tls_sender_is_authenticated(peer_node_id, sender_node_id_from_message) {
         match peer_node_id {
@@ -1950,6 +2245,7 @@ where
                         existing_conn.direction
                             == crate::connection_pool::ConnectionDirection::Outbound,
                     );
+                let keep_new_inbound = registry.should_keep_connection(&peer_id, false);
 
                 if !existing_usable {
                     info!(
@@ -1960,13 +2256,24 @@ where
                         "inbound_tiebreak_evict_stale"
                     );
                     let _ = pool.disconnect_connection_by_peer_id(&peer_id);
-                    pool.add_connection_by_peer_id(
-                        peer_id.clone(),
-                        peer_state_addr,
-                        connection_arc.clone(),
-                    );
-                    true
-                } else if !keep_existing {
+                    if keep_new_inbound {
+                        pool.add_connection_by_peer_id(
+                            peer_id.clone(),
+                            peer_state_addr,
+                            connection_arc.clone(),
+                        );
+                        true
+                    } else {
+                        info!(
+                            target: "icanact_remote_lifecycle",
+                            peer_id = %peer_id,
+                            peer_state_addr = %peer_state_addr,
+                            "inbound_tiebreak_reject_non_preferred_inbound"
+                        );
+                        registry.clear_peer_capabilities(&peer_addr);
+                        false
+                    }
+                } else if !keep_existing && keep_new_inbound {
                     info!(
                         target: "icanact_remote_lifecycle",
                         peer_id = %peer_id,
@@ -2502,27 +2809,28 @@ pub(crate) fn parse_message_from_pooled_buffer(
             // Check if it's a known message type
             if let Some(msg_type) = crate::MessageType::from_byte(first_byte) {
                 match msg_type {
-                    crate::MessageType::Gossip => {
+                    crate::MessageType::Gossip
+                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN =>
+                    {
                         // This is a gossip message with type prefix, skip the type byte
-                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN {
-                            let payload_offset = crate::framing::LENGTH_PREFIX_LEN
-                                + crate::framing::GOSSIP_HEADER_LEN;
-                            let payload_slice = &buffer.as_ref()[payload_offset..];
-                            match decode_registry_message(payload_slice) {
-                                Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
-                                Err(err) => {
-                                    // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
-                                    trace!(
-                                        payload_len = payload_slice.len(),
-                                        "Failed to decode gossip payload"
-                                    );
-                                    let _ = err;
-                                    return Ok(raw(buffer));
-                                }
+                        let payload_offset =
+                            crate::framing::LENGTH_PREFIX_LEN + crate::framing::GOSSIP_HEADER_LEN;
+                        let payload_slice = &buffer.as_ref()[payload_offset..];
+                        match decode_registry_message(payload_slice) {
+                            Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
+                            Err(err) => {
+                                // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
+                                trace!(
+                                    payload_len = payload_slice.len(),
+                                    "Failed to decode gossip payload"
+                                );
+                                let _ = err;
+                                return Ok(raw(buffer));
                             }
-                        } else {
-                            return Ok(raw(buffer));
                         }
+                    }
+                    crate::MessageType::Gossip => {
+                        return Ok(raw(buffer));
                     }
                     crate::MessageType::ActorTell | crate::MessageType::ActorAsk => {
                         // This is an actor message with envelope format:
@@ -2824,26 +3132,27 @@ where
             // Check if it's a known message type
             if let Some(msg_type) = crate::MessageType::from_byte(first_byte) {
                 match msg_type {
-                    crate::MessageType::Gossip => {
+                    crate::MessageType::Gossip
+                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN =>
+                    {
                         // This is a gossip message with type prefix, skip the type byte
-                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN {
-                            // Create a properly aligned buffer for the payload
-                            let payload = msg_data.slice(crate::framing::GOSSIP_HEADER_LEN..);
-                            match decode_registry_message(payload.as_ref()) {
-                                Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
-                                Err(err) => {
-                                    // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
-                                    trace!(
-                                        payload_len = payload.len(),
-                                        "Failed to decode gossip payload"
-                                    );
-                                    let _ = err;
-                                    return Ok(MessageReadResult::Raw(msg_data));
-                                }
+                        // Create a properly aligned buffer for the payload
+                        let payload = msg_data.slice(crate::framing::GOSSIP_HEADER_LEN..);
+                        match decode_registry_message(payload.as_ref()) {
+                            Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
+                            Err(err) => {
+                                // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
+                                trace!(
+                                    payload_len = payload.len(),
+                                    "Failed to decode gossip payload"
+                                );
+                                let _ = err;
+                                return Ok(MessageReadResult::Raw(msg_data));
                             }
-                        } else {
-                            return Ok(MessageReadResult::Raw(msg_data));
                         }
+                    }
+                    crate::MessageType::Gossip => {
+                        return Ok(MessageReadResult::Raw(msg_data));
                     }
                     crate::MessageType::ActorTell | crate::MessageType::ActorAsk => {
                         // This is an actor message with envelope format:
@@ -3196,7 +3505,7 @@ async fn send_gossip_message_zero_copy(
     let current_time_nanos = crate::current_timestamp_nanos();
 
     // Debug: Check if there's a delay in the task creation vs sending
-    if let crate::registry::RegistryMessage::DeltaGossip { delta } = &task.message {
+    if let crate::registry::RegistryMessage::DeltaGossip { delta, .. } = &task.message {
         for change in &delta.changes {
             if let crate::registry::RegistryChange::ActorAdded { location, .. } = change {
                 let creation_time_nanos = location.wall_clock_time as u128 * 1_000_000_000;
@@ -3208,7 +3517,7 @@ async fn send_gossip_message_zero_copy(
     }
 
     match &mut task.message {
-        crate::registry::RegistryMessage::DeltaGossip { delta } => {
+        crate::registry::RegistryMessage::DeltaGossip { delta, extensions } => {
             delta.precise_timing_nanos = current_time_nanos;
             // Update wall_clock_time in all changes to current time for accurate propagation measurement
             for change in &mut delta.changes {
@@ -3222,9 +3531,14 @@ async fn send_gossip_message_zero_copy(
                     }
                 }
             }
+            *extensions = registry
+                .gossip_extensions_for_outbound(task.peer_addr, current_time_nanos)
+                .await;
         }
-        crate::registry::RegistryMessage::FullSync { .. } => {
-            // Full sync doesn't use precise timing
+        crate::registry::RegistryMessage::FullSync { extensions, .. } => {
+            *extensions = registry
+                .gossip_extensions_for_outbound(task.peer_addr, current_time_nanos)
+                .await;
         }
         _ => {}
     }

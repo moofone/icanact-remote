@@ -65,6 +65,7 @@ async fn send_fullsync<S: tokio::io::AsyncWrite + Unpin>(
         sender_bind_addr: None,
         sequence: 0,
         wall_clock_time: icanact_remote::current_timestamp(),
+        extensions: None,
     };
 
     let data = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).expect("serialize fullsync");

@@ -4,6 +4,8 @@ pub struct ConnectionHandle<T = ()> {
     pub addr: SocketAddr,
     // Stream-based writer path (TCP/TLS/Noise/QUIC stream transports).
     stream_handle: Option<Arc<LockFreeStreamHandle>>,
+    // Concrete UDP socket for direct non-queued datagram sends.
+    udp_socket: Option<Arc<UdpSocket>>,
     // Native UDP datagram writer path.
     udp_writer: Option<UdpTransportWriter>,
     schema_hash: Option<u64>,
@@ -17,6 +19,7 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
         f.debug_struct("ConnectionHandle")
             .field("addr", &self.addr)
             .field("stream_handle", &self.stream_handle)
+            .field("udp_socket", &self.udp_socket.as_ref().map(|_| "configured"))
             .field("udp_writer", &self.udp_writer)
             .field("schema_hash", &self.schema_hash)
             .finish()
@@ -78,6 +81,7 @@ impl<T> ConnectionHandle<T> {
         Self {
             addr,
             stream_handle: Some(stream_handle),
+            udp_socket: None,
             udp_writer: None,
             schema_hash,
             correlation,
@@ -95,6 +99,7 @@ impl<T> ConnectionHandle<T> {
         Self {
             addr,
             stream_handle: None,
+            udp_socket: Some(Arc::clone(&udp_socket)),
             udp_writer: Some(crate::transport::make_datagram_writer(
                 udp_socket,
                 addr,
@@ -362,11 +367,78 @@ impl<T> ConnectionHandle<T> {
     /// Try to send a routed PubSub payload without awaiting on the write queue.
     pub fn try_send_pubsub_payload(&self, payload: bytes::Bytes) -> Result<()> {
         let header = framing::write_pubsub_frame_prefix(payload.len());
-        self.write_header_and_payload_control_inline_nonblocking(
-            header,
-            crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
-            payload,
-        )
+        if let Some(stream_handle) = self.stream_handle.as_ref() {
+            stream_handle.write_header_and_payload_control_inline_immediate_nonblocking(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                payload,
+            )
+        } else if let Some(udp_writer) = self.udp_writer() {
+            udp_writer.try_send_header_and_payload16(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                payload,
+            )
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no writer path", self.addr),
+            )))
+        }
+    }
+
+    /// Try to send a routed PubSub payload from a pooled buffer without allocating.
+    pub fn try_send_pubsub_payload_pooled(
+        &self,
+        payload: crate::typed::PooledPayload,
+        prefix: Option<[u8; 16]>,
+        payload_len: usize,
+    ) -> Result<()> {
+        let header = framing::write_pubsub_frame_prefix(payload_len);
+        let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
+        if let Some(stream_handle) = self.stream_handle.as_ref() {
+            stream_handle.write_pooled_control_inline_immediate_nonblocking(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                prefix,
+                prefix_len,
+                payload,
+            )
+        } else if let Some(udp_writer) = self.udp_writer() {
+            udp_writer.try_send_header_prefix_pooled(
+                header,
+                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
+                prefix,
+                payload,
+            )
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no writer path", self.addr),
+            )))
+        }
+    }
+
+    /// Try to send a complete UDP datagram that already contains the outer frame header.
+    pub fn try_send_pooled_datagram(&self, payload: crate::typed::PooledPayload) -> Result<()> {
+        if let Some(socket) = self.udp_socket.as_ref() {
+            return socket
+                .try_send_to(payload.chunk(), self.addr)
+                .map(|_| ())
+                .map_err(GossipError::Network);
+        }
+        if let Some(udp_writer) = self.udp_writer() {
+            udp_writer.try_send_pooled_datagram(payload)
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no UDP writer path", self.addr),
+            )))
+        }
+    }
+
+    pub fn supports_pooled_datagram(&self) -> bool {
+        self.udp_socket.is_some() || self.udp_writer().is_some()
     }
 
     /// Send a response using the inline write queue (never streaming).
@@ -595,7 +667,10 @@ impl<T> ConnectionHandle<T> {
             schema_hash,
             payload.len(),
         );
-        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
+        if let Err(e) = self
+            .write_header_and_payload_ask_inline32(header, payload)
+            .await
+        {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             warn!(
                 addr = %self.addr,
@@ -684,7 +759,10 @@ impl<T> ConnectionHandle<T> {
             payload.len(),
         );
 
-        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
+        if let Err(e) = self
+            .write_header_and_payload_ask_inline32(header, payload)
+            .await
+        {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }
@@ -717,7 +795,10 @@ impl<T> ConnectionHandle<T> {
             payload.len(),
         );
 
-        if let Err(e) = self.write_header_and_payload_ask_inline32(header, payload).await {
+        if let Err(e) = self
+            .write_header_and_payload_ask_inline32(header, payload)
+            .await
+        {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             return Err(e);
         }

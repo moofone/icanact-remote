@@ -268,9 +268,8 @@ impl Default for StreamingState {
 
 fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
     match msg {
-        RegistryMessage::DeltaGossip { delta } | RegistryMessage::DeltaGossipResponse { delta } => {
-            Some(&delta.sender_peer_id)
-        }
+        RegistryMessage::DeltaGossip { delta, .. }
+        | RegistryMessage::DeltaGossipResponse { delta, .. } => Some(&delta.sender_peer_id),
         RegistryMessage::FullSyncRequest { sender_peer_id, .. }
         | RegistryMessage::FullSync { sender_peer_id, .. }
         | RegistryMessage::FullSyncResponse { sender_peer_id, .. } => Some(sender_peer_id),
@@ -354,7 +353,7 @@ pub(crate) async fn process_read_result(
             let authenticated_peer_id = authenticated_peer_id
                 .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));
             if let Some(authenticated_peer_id) = authenticated_peer_id {
-                if let Some(handler) = registry.pubsub_ingress_handler.load_full() {
+                if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
                     if let Err(e) = handler.handle(authenticated_peer_id, payload) {
                         warn!(peer = %peer_addr, error = %e, "Failed to process PubSub frame");
                     }
@@ -678,6 +677,30 @@ async fn handle_assembled_message(
                         }),
                         crate::registry::AskDisposition::Deferred => None,
                     })
+            } else if let Some(udp_socket) = registry.connection_pool.udp_socket_opt() {
+                // UDP deferred ask: peer_addr is the datagram source; socket is the shared
+                // registry UDP socket. No connection-pool lookup on the reply path.
+                let context = crate::AskContext::from_udp(corr_id, peer_addr, &udp_socket);
+                cell.handle(actor_id, type_hash, complete_data, context)
+                    .map(|disposition| match disposition {
+                        crate::registry::AskDisposition::Immediate(r) => Some(r),
+                        crate::registry::AskDisposition::ImmediateBytes(r) => {
+                            Some(ActorResponse::Bytes(r))
+                        }
+                        crate::registry::AskDisposition::ImmediateAligned(r) => {
+                            Some(ActorResponse::Aligned(r))
+                        }
+                        crate::registry::AskDisposition::ImmediatePooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        } => Some(ActorResponse::Pooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        }),
+                        crate::registry::AskDisposition::Deferred => None,
+                    })
             } else {
                 registry
                     .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
@@ -701,6 +724,30 @@ async fn handle_assembled_message(
                     }
                     crate::registry::AskDisposition::ImmediateAligned(response) => {
                         Some(ActorResponse::Aligned(response))
+                    }
+                    crate::registry::AskDisposition::ImmediatePooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    } => Some(ActorResponse::Pooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    }),
+                    crate::registry::AskDisposition::Deferred => None,
+                })
+        } else if let Some(udp_socket) = registry.connection_pool.udp_socket_opt() {
+            // UDP deferred ask: peer_addr is the datagram source; socket is the shared
+            // registry UDP socket. No connection-pool lookup on the reply path.
+            let context = crate::AskContext::from_udp(corr_id, peer_addr, &udp_socket);
+            cell.handle(actor_id, type_hash, complete_data, context)
+                .map(|disposition| match disposition {
+                    crate::registry::AskDisposition::Immediate(r) => Some(r),
+                    crate::registry::AskDisposition::ImmediateBytes(r) => {
+                        Some(ActorResponse::Bytes(r))
+                    }
+                    crate::registry::AskDisposition::ImmediateAligned(r) => {
+                        Some(ActorResponse::Aligned(r))
                     }
                     crate::registry::AskDisposition::ImmediatePooled {
                         payload,

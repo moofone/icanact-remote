@@ -25,12 +25,15 @@ pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
 pub enum Feature {
     /// Peer list gossip for automatic peer discovery
     PeerListGossip,
+    /// Optional pairwise clock calibration piggybacked on normal gossip frames.
+    ClockCalibration,
 }
 
 impl Feature {
     const fn bit(self) -> u64 {
         match self {
             Feature::PeerListGossip => 1u64 << 0,
+            Feature::ClockCalibration => 1u64 << 1,
         }
     }
 }
@@ -49,7 +52,7 @@ impl Hello {
     pub fn new() -> Self {
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            features: vec![Feature::PeerListGossip],
+            features: vec![Feature::PeerListGossip, Feature::ClockCalibration],
         }
     }
 
@@ -66,6 +69,14 @@ impl Default for Hello {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn hello_for_config(enable_peer_discovery: bool) -> Hello {
+    let mut features = vec![Feature::ClockCalibration];
+    if enable_peer_discovery {
+        features.push(Feature::PeerListGossip);
+    }
+    Hello::with_features(features)
 }
 
 /// Negotiated peer capabilities after Hello exchange
@@ -97,6 +108,11 @@ impl PeerCapabilities {
     /// Check if we can send peer list gossip to this peer
     pub fn can_send_peer_list(&self) -> bool {
         self.version >= PROTOCOL_VERSION_V3 && self.supports_feature(Feature::PeerListGossip)
+    }
+
+    /// Check if we can piggyback clock calibration on gossip frames with this peer.
+    pub fn can_calibrate_clock(&self) -> bool {
+        self.version >= PROTOCOL_VERSION_V3 && self.supports_feature(Feature::ClockCalibration)
     }
 
     /// Check if a specific feature is supported
@@ -182,11 +198,7 @@ where
         )));
     }
 
-    let local_hello = if enable_peer_discovery {
-        Hello::new()
-    } else {
-        Hello::with_features(Vec::new())
-    };
+    let local_hello = hello_for_config(enable_peer_discovery);
     send_hello_message(stream, &local_hello).await?;
     let remote_hello = read_hello_message(stream).await?;
     if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
@@ -199,6 +211,7 @@ where
     debug!(
         negotiated_version = caps.version,
         peer_list = caps.can_send_peer_list(),
+        clock_calibration = caps.can_calibrate_clock(),
         "Hello handshake negotiated capabilities"
     );
     Ok(caps)
@@ -214,11 +227,7 @@ pub async fn perform_hello_handshake_no_alpn<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let local_hello = if enable_peer_discovery {
-        Hello::new()
-    } else {
-        Hello::with_features(Vec::new())
-    };
+    let local_hello = hello_for_config(enable_peer_discovery);
     send_hello_message(stream, &local_hello).await?;
     let remote_hello = read_hello_message(stream).await?;
     if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
@@ -231,6 +240,7 @@ where
     debug!(
         negotiated_version = caps.version,
         peer_list = caps.can_send_peer_list(),
+        clock_calibration = caps.can_calibrate_clock(),
         "Hello handshake negotiated capabilities"
     );
     Ok(caps)
@@ -245,6 +255,7 @@ mod tests {
         let hello = Hello::new();
         assert_eq!(hello.protocol_version, CURRENT_PROTOCOL_VERSION);
         assert!(hello.features.contains(&Feature::PeerListGossip));
+        assert!(hello.features.contains(&Feature::ClockCalibration));
     }
 
     #[test]
@@ -261,6 +272,7 @@ mod tests {
         assert_eq!(deserialized.protocol_version, hello.protocol_version);
         assert_eq!(deserialized.features.len(), hello.features.len());
         assert!(deserialized.features.contains(&Feature::PeerListGossip));
+        assert!(deserialized.features.contains(&Feature::ClockCalibration));
     }
 
     #[test]
@@ -272,7 +284,20 @@ mod tests {
 
         assert_eq!(caps.version, PROTOCOL_VERSION_V3);
         assert!(caps.supports_feature(Feature::PeerListGossip));
+        assert!(caps.supports_feature(Feature::ClockCalibration));
         assert!(caps.can_send_peer_list());
+        assert!(caps.can_calibrate_clock());
+    }
+
+    #[test]
+    fn test_clock_calibration_negotiates_when_peer_discovery_disabled() {
+        let local = hello_for_config(false);
+        let remote = hello_for_config(false);
+
+        let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
+
+        assert!(!caps.can_send_peer_list());
+        assert!(caps.can_calibrate_clock());
     }
 
     #[test]
@@ -295,6 +320,7 @@ mod tests {
         let caps = PeerCapabilities::from_hello_exchange(&Hello::new(), &Hello::new());
 
         assert!(caps.supports_feature(Feature::PeerListGossip));
+        assert!(caps.supports_feature(Feature::ClockCalibration));
     }
 
     #[test]

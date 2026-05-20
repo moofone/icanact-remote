@@ -64,6 +64,27 @@ fn snapshot_known_map(reg: &GossipRegistry) -> HashMap<String, RemoteActorLocati
     out
 }
 
+fn known_actor(reg: &GossipRegistry, actor: &str) -> Option<RemoteActorLocation> {
+    reg.actor_state
+        .known_actors
+        .read_sync(actor, |_, location| location.clone())
+}
+
+fn delta(
+    sender: icanact_remote::PeerId,
+    current_sequence: u64,
+    changes: Vec<RegistryChange>,
+) -> RegistryDelta {
+    RegistryDelta {
+        since_sequence: current_sequence.saturating_sub(1),
+        current_sequence,
+        changes,
+        sender_peer_id: sender,
+        wall_clock_time: 0,
+        precise_timing_nanos: 0,
+    }
+}
+
 fn concurrent_locations(loc1: &mut RemoteActorLocation, loc2: &mut RemoteActorLocation) {
     // Force deterministic tie-break in concurrent case: same wall clock, same metadata, etc.
     loc1.wall_clock_time = 123;
@@ -139,6 +160,185 @@ async fn test_gossip_scheduler_concurrent_conflict_converges_across_seeds() {
             None => reference = Some(snap),
             Some(r) => assert_eq!(&snap, r, "seed {seed} must converge identically"),
         }
+    }
+}
+
+#[tokio::test]
+async fn test_gossip_scheduler_remove_add_reorder_keeps_tombstone_until_owner_recovers() {
+    let actor = "actor.remove.add.reorder";
+    let owner = KeyPair::new_for_testing("reorder-owner").peer_id();
+    let owner_node = owner.to_node_id();
+
+    let stale_loc = RemoteActorLocation::new_with_peer(test_addr(9301), owner.clone());
+    stale_loc.vector_clock.increment(owner_node);
+
+    let removal_clock = stale_loc.vector_clock.clone();
+    removal_clock.increment(owner_node);
+
+    let recovered_loc = RemoteActorLocation::new_with_peer(test_addr(9302), owner.clone());
+    recovered_loc.vector_clock.merge(&removal_clock);
+    recovered_loc.vector_clock.increment(owner_node);
+
+    let stale_add = delta(
+        owner.clone(),
+        1,
+        vec![RegistryChange::ActorAdded {
+            name: actor.to_string(),
+            location: stale_loc,
+            priority: RegistrationPriority::Normal,
+        }],
+    );
+    let remove = delta(
+        owner.clone(),
+        2,
+        vec![RegistryChange::ActorRemoved {
+            name: actor.to_string(),
+            vector_clock: removal_clock,
+            removing_node_id: owner_node,
+            priority: RegistrationPriority::Normal,
+        }],
+    );
+    let recover = delta(
+        owner.clone(),
+        3,
+        vec![RegistryChange::ActorAdded {
+            name: actor.to_string(),
+            location: recovered_loc,
+            priority: RegistrationPriority::Normal,
+        }],
+    );
+
+    for seed in 0u64..25 {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(8400 + seed as u16),
+            test_config("remove_add_reorder"),
+        );
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut events = vec![stale_add.clone(), remove.clone()];
+        if rng.random_bool(0.75) {
+            events.push(stale_add.clone());
+        }
+        if rng.random_bool(0.75) {
+            events.push(remove.clone());
+        }
+        events.shuffle(&mut rng);
+
+        for event in events {
+            reg.apply_delta(event).await.unwrap();
+        }
+
+        assert!(
+            known_actor(&reg, actor).is_none(),
+            "seed {seed}: stale add must not survive remove/add reordering"
+        );
+        assert!(
+            reg.actor_state.removed_actors.contains_sync(actor),
+            "seed {seed}: remove must leave a tombstone for later stale replays"
+        );
+
+        reg.apply_delta(recover.clone()).await.unwrap();
+        let recovered = known_actor(&reg, actor)
+            .unwrap_or_else(|| panic!("seed {seed}: direct owner recovery should restore actor"));
+        assert_eq!(recovered.address, "127.0.0.1:9302");
+        assert!(
+            !reg.actor_state.removed_actors.contains_sync(actor),
+            "seed {seed}: direct owner recovery should clear the tombstone"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_gossip_scheduler_full_sync_omission_prunes_only_sender_owned_actor() {
+    let sender = KeyPair::new_for_testing("omission-sender").peer_id();
+    let sender_addr = test_addr(8501);
+    let moved_owner = KeyPair::new_for_testing("omission-moved-owner").peer_id();
+
+    for seed in 0u64..20 {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(8510 + seed as u16),
+            test_config("full_sync_omission"),
+        );
+        let actor = format!("actor.fullsync.omitted.{seed}");
+        let moved = format!("actor.fullsync.moved.{seed}");
+
+        let sender_loc = RemoteActorLocation::new_with_peer(test_addr(9501), sender.clone());
+        let mut first_sync = HashMap::new();
+        first_sync.insert(actor.clone(), sender_loc);
+        reg.merge_full_sync(
+            first_sync,
+            HashMap::new(),
+            sender.clone(),
+            sender_addr,
+            1,
+            0,
+        )
+        .await;
+        assert!(
+            known_actor(&reg, &actor).is_some(),
+            "seed {seed}: first full sync should install sender-owned actor"
+        );
+
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            sender.clone(),
+            sender_addr,
+            2,
+            0,
+        )
+        .await;
+        assert!(
+            known_actor(&reg, &actor).is_none(),
+            "seed {seed}: later full sync omission should prune sender-owned actor"
+        );
+
+        let original = RemoteActorLocation::new_with_peer(test_addr(9502), sender.clone());
+        let mut sender_sync = HashMap::new();
+        sender_sync.insert(moved.clone(), original.clone());
+        reg.merge_full_sync(
+            sender_sync,
+            HashMap::new(),
+            sender.clone(),
+            sender_addr,
+            3,
+            0,
+        )
+        .await;
+
+        let moved_loc = RemoteActorLocation::new_with_peer(test_addr(9503), moved_owner.clone());
+        moved_loc.vector_clock.merge(&original.vector_clock);
+        moved_loc.vector_clock.increment(moved_owner.to_node_id());
+        reg.apply_delta(delta(
+            moved_owner.clone(),
+            4,
+            vec![RegistryChange::ActorAdded {
+                name: moved.clone(),
+                location: moved_loc,
+                priority: RegistrationPriority::Normal,
+            }],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            known_actor(&reg, &moved).map(|loc| loc.peer_id),
+            Some(moved_owner.clone()),
+            "seed {seed}: actor move should be visible before sender omission"
+        );
+
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            sender.clone(),
+            sender_addr,
+            5,
+            0,
+        )
+        .await;
+        assert_eq!(
+            known_actor(&reg, &moved).map(|loc| loc.peer_id),
+            Some(moved_owner.clone()),
+            "seed {seed}: sender omission must not prune an actor now owned by a different peer"
+        );
     }
 }
 

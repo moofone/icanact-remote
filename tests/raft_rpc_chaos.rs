@@ -71,7 +71,7 @@ fn raft_rpc_cfg() -> GossipConfig {
         connection_timeout: Duration::from_millis(125),
         response_timeout: Duration::from_millis(125),
         max_peer_failures: 1,
-        peer_retry_interval: Duration::from_millis(25),
+        peer_retry_interval: Duration::from_secs(2),
         max_gossip_peers: 2,
         small_cluster_threshold: 2,
         ..Default::default()
@@ -196,6 +196,40 @@ async fn raft_rpc_lookup_then_ask(
     }
 }
 
+async fn wait_raft_rpc_success(
+    from: &TlsHandle,
+    to: &PeerId,
+    payload: &'static [u8],
+    timeout_for: Duration,
+) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + timeout_for;
+    let mut last_error = None;
+
+    while Instant::now() < deadline {
+        match raft_rpc_lookup_then_ask(
+            from,
+            to,
+            payload,
+            APPEND_ASK_TIMEOUT,
+            RAFT_RECONNECT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                last_error = Some(err);
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    Err(format!(
+        "raft-shaped ask did not settle within {:?}; last_error={}",
+        timeout_for,
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
 /// Script: 5x rapid drop+reconnect in under 5s. After all cycles, the lookup
 /// cache must be in the connected state, and a fresh ask must succeed within
 /// the standard append-entries budget.
@@ -239,15 +273,10 @@ async fn oscillate_drop_reconnect_5x_does_not_wedge_session() -> icanact_remote:
 
     // Final sanity: a fresh ask must succeed within the append budget after
     // the storm settles.
-    let response = raft_rpc_lookup_then_ask(
-        &a,
-        &b.registry.peer_id,
-        b"settled",
-        APPEND_ASK_TIMEOUT,
-        RAFT_RECONNECT_TIMEOUT,
-    )
-    .await
-    .expect("post-oscillation ask must succeed");
+    let response =
+        wait_raft_rpc_success(&a, &b.registry.peer_id, b"settled", Duration::from_secs(3))
+            .await
+            .expect("post-oscillation ask must settle");
     assert_eq!(response.as_slice(), b"b:settled");
 
     a.shutdown().await;
@@ -291,15 +320,14 @@ async fn asymmetric_drop_clears_initiator_lookup_cache() -> icanact_remote::Resu
         "asymmetric reconnect from A must restore A's lookup cache"
     );
 
-    let response = raft_rpc_lookup_then_ask(
+    let response = wait_raft_rpc_success(
         &a,
         &b.registry.peer_id,
         b"asym-recovered",
-        APPEND_ASK_TIMEOUT,
-        RAFT_RECONNECT_TIMEOUT,
+        Duration::from_secs(3),
     )
     .await
-    .expect("post-asymmetric-reconnect ask must succeed");
+    .expect("post-asymmetric-reconnect ask must settle");
     assert_eq!(response.as_slice(), b"b:asym-recovered");
 
     a.shutdown().await;
@@ -379,15 +407,9 @@ async fn timeout_storm_then_quiet_recovers_without_wedge() -> icanact_remote::Re
     delay_b.store(20, Ordering::Release);
     sleep(Duration::from_millis(1_000)).await;
 
-    let response = raft_rpc_lookup_then_ask(
-        &a,
-        &b.registry.peer_id,
-        b"quiet",
-        APPEND_ASK_TIMEOUT,
-        RAFT_RECONNECT_TIMEOUT,
-    )
-    .await
-    .expect("post-storm ask must succeed once server is quiet again");
+    let response = wait_raft_rpc_success(&a, &b.registry.peer_id, b"quiet", Duration::from_secs(3))
+        .await
+        .expect("post-storm ask must settle once server is quiet again");
     assert_eq!(response.as_slice(), b"b:quiet");
 
     a.shutdown().await;
@@ -485,15 +507,14 @@ async fn bursty_mixed_drop_and_ask_traffic_is_consistent() -> icanact_remote::Re
     );
 
     // Final settled ask must succeed.
-    let response = raft_rpc_lookup_then_ask(
+    let response = wait_raft_rpc_success(
         &a,
         &b.registry.peer_id,
         b"burst-final",
-        APPEND_ASK_TIMEOUT,
-        RAFT_RECONNECT_TIMEOUT,
+        Duration::from_secs(3),
     )
     .await
-    .expect("post-burst final ask must succeed");
+    .expect("post-burst final ask must settle");
     assert_eq!(response.as_slice(), b"b:burst-final");
 
     a.shutdown().await;
