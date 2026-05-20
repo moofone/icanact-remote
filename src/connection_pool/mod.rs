@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     GossipError, Result, current_timestamp, framing,
-    registry::{GossipRegistry, RegistryMessage, resolve_peer_addr},
+    registry::{GossipRegistry, RegistryMessage, resolve_peer_addr_checked},
 };
 
 include!("constants.rs");

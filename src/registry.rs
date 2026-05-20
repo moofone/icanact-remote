@@ -149,27 +149,28 @@ fn actor_location_belongs_to_peer(
 }
 
 /// Resolve the effective peer address from sender_bind_addr with validation.
-/// Falls back to tcp_source_addr if sender_bind_addr is None, invalid, unspecified (0.0.0.0),
-/// or loopback when the TCP source is not loopback.
+/// Falls back to tcp_source_addr if sender_bind_addr is None or invalid.
+/// Uses the TCP source IP plus advertised port for unspecified binds (`0.0.0.0:PORT`).
+/// Returns None for advertised addresses that are known to be non-dialable from here.
 ///
 /// # Arguments
 /// * `sender_bind_addr` - Optional bind address from the message
 /// * `tcp_source_addr` - The TCP source address (fallback)
 ///
 /// # Returns
-/// A valid routable SocketAddr
-pub fn resolve_peer_addr(
+/// A valid routable SocketAddr, or None when the sender advertised a non-dialable bind address.
+pub fn resolve_peer_addr_checked(
     sender_bind_addr: Option<&str>,
     tcp_source_addr: SocketAddr,
-) -> SocketAddr {
+) -> Option<SocketAddr> {
     if let Some(bind_addr_str) = sender_bind_addr {
         if let Ok(bind_addr) = bind_addr_str.parse::<SocketAddr>() {
             if bind_addr.port() == 0 {
-                debug!(
-                    "sender_bind_addr {} has port 0, falling back to TCP source {}",
+                warn!(
+                    "sender_bind_addr {} has port 0, ignoring non-dialable advertised bind from TCP source {}",
                     bind_addr, tcp_source_addr
                 );
-                return tcp_source_addr;
+                return None;
             }
 
             let ip = bind_addr.ip();
@@ -183,22 +184,21 @@ pub fn resolve_peer_addr(
                     tcp_source_addr.ip(),
                     bind_addr.port()
                 );
-                return SocketAddr::new(tcp_source_addr.ip(), bind_addr.port());
+                return Some(SocketAddr::new(tcp_source_addr.ip(), bind_addr.port()));
             }
 
             // Validate: reject loopback (127.0.0.1, ::1) when TCP source is not loopback
-            // A remote peer advertising loopback is unreachable from outside
+            // A remote peer advertising loopback is unreachable from outside. Do not synthesize
+            // remote-ip:loopback-port or remote-ip:ephemeral-port; both poison peer discovery.
             if ip.is_loopback() && !tcp_source_addr.ip().is_loopback() {
                 warn!(
-                    "sender_bind_addr {} is loopback but TCP source {} is not, using TCP source IP with bind port {}",
-                    bind_addr,
-                    tcp_source_addr,
-                    bind_addr.port()
+                    "sender_bind_addr {} is loopback but TCP source {} is not; ignoring non-dialable advertised bind",
+                    bind_addr, tcp_source_addr
                 );
-                return SocketAddr::new(tcp_source_addr.ip(), bind_addr.port());
+                return None;
             }
 
-            return bind_addr;
+            return Some(bind_addr);
         } else {
             warn!(
                 "Failed to parse sender_bind_addr '{}', falling back to TCP source {}",
@@ -207,7 +207,18 @@ pub fn resolve_peer_addr(
         }
     }
     // Fallback to TCP source address
-    tcp_source_addr
+    Some(tcp_source_addr)
+}
+
+/// Backwards-compatible peer address resolver for callers that can tolerate
+/// falling back to the TCP source. Gossip-directory paths that mutate peer
+/// state should use `resolve_peer_addr_checked` so non-dialable advertised
+/// binds do not poison the peer table.
+pub fn resolve_peer_addr(
+    sender_bind_addr: Option<&str>,
+    tcp_source_addr: SocketAddr,
+) -> SocketAddr {
+    resolve_peer_addr_checked(sender_bind_addr, tcp_source_addr).unwrap_or(tcp_source_addr)
 }
 
 /// Response payload for actor asks.
@@ -4412,7 +4423,17 @@ impl<T: 'static> GossipRegistry<T> {
                     crate::current_timestamp_nanos(),
                 );
                 // Use resolve_peer_addr for safe address resolution with validation
-                let sender_socket_addr = resolve_peer_addr(sender_bind_addr.as_deref(), addr);
+                let Some(sender_socket_addr) =
+                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), addr)
+                else {
+                    warn!(
+                        tcp_source = %addr,
+                        sender = %sender_peer_id,
+                        sender_bind_addr = ?sender_bind_addr,
+                        "Ignoring full sync response from peer with non-dialable advertised bind address"
+                    );
+                    return Ok(());
+                };
 
                 info!(
                     tcp_source = %addr,
@@ -9848,8 +9869,10 @@ mod tests {
         // If peer claims loopback (127.0.0.1) but TCP source is remote, reject it
         let tcp_source: SocketAddr = "192.168.1.100:54321".parse().unwrap();
         let result = super::resolve_peer_addr(Some("127.0.0.1:9000"), tcp_source);
-        // Should use TCP source IP (192.168.1.100) with bind_addr port (9000)
-        assert_eq!(result, "192.168.1.100:9000".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            result, tcp_source,
+            "remote loopback bind must not be synthesized into tcp-source-ip:bind-port"
+        );
     }
 
     #[test]
@@ -9866,8 +9889,10 @@ mod tests {
         // IPv6 loopback from remote should also be rejected
         let tcp_source: SocketAddr = "[2001:db8::1]:54321".parse().unwrap();
         let result = super::resolve_peer_addr(Some("[::1]:9000"), tcp_source);
-        // Should use TCP source IP with bind_addr port
-        assert_eq!(result, "[2001:db8::1]:9000".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            result, tcp_source,
+            "remote IPv6 loopback bind must not be synthesized into tcp-source-ip:bind-port"
+        );
     }
 
     #[test]
@@ -9877,6 +9902,44 @@ mod tests {
         let result = super::resolve_peer_addr(None, tcp_source);
         // Should fall back to TCP source
         assert_eq!(result, tcp_source);
+    }
+
+    #[tokio::test]
+    async fn handle_gossip_response_rejects_remote_loopback_full_sync_response() {
+        let registry = GossipRegistry::<()>::new("10.77.0.40:9501".parse().unwrap(), test_config());
+        let peer_id = test_peer_id("remote-loopback-handle-response");
+        let tcp_source: SocketAddr = "10.77.0.40:49152".parse().unwrap();
+        let synthesized_self_host_addr: SocketAddr = "10.77.0.40:7777".parse().unwrap();
+        let actor_name = "poisoned/handle-gossip-response";
+        let poisoned_actor =
+            RemoteActorLocation::new_with_peer(synthesized_self_host_addr, peer_id.clone());
+
+        let msg = RegistryMessage::FullSyncResponse {
+            local_actors: vec![(actor_name.to_string(), poisoned_actor)],
+            known_actors: Vec::new(),
+            sender_peer_id: peer_id,
+            sender_bind_addr: Some("127.0.0.1:7777".to_string()),
+            sequence: 1,
+            wall_clock_time: current_timestamp(),
+            extensions: None,
+        };
+
+        registry
+            .handle_gossip_response(tcp_source, msg)
+            .await
+            .expect("non-dialable response should be ignored without crashing");
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            !state.peers.contains_key(&synthesized_self_host_addr),
+            "remote loopback response bind must not synthesize a same-host peer entry"
+        );
+        drop(state);
+
+        assert!(
+            registry.lookup_actor(actor_name).await.is_none(),
+            "actors from a non-dialable FullSyncResponse must not be merged"
+        );
     }
 
     fn read_known_actor(registry: &GossipRegistry, name: &str) -> Option<RemoteActorLocation> {
