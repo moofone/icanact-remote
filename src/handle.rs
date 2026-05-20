@@ -130,9 +130,10 @@ impl<T> GossipRegistryHandle<T> {
                 (Some(listener), None, actual_bind_addr)
             }
             TransportWireKind::UdpDatagram => {
-                let socket = bind_udp_with_reuseaddr(bind_addr)?;
-                let actual_bind_addr = socket.local_addr()?;
-                (None, Some(Arc::new(socket)), actual_bind_addr)
+                return Err(GossipError::InvalidConfig(
+                    "UDP datagram transport is disabled because plaintext datagrams cannot authenticate peer identity"
+                        .to_string(),
+                ));
             }
         };
 
@@ -873,26 +874,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_datagram_transport_starts_plaintext_after_peer_association() -> crate::Result<()> {
-        let keypair = KeyPair::new_for_testing("udp-enabled");
+    async fn udp_datagram_transport_is_rejected_without_datagram_authentication() {
+        let keypair = KeyPair::new_for_testing("udp-disabled");
         let mut config = test_cfg();
         config.key_pair = Some(keypair.clone());
 
-        let handle = GossipRegistryHandle::new_with_transport_stack(
+        let result = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             keypair.to_secret_key(),
             Some(config),
             TestUdpBootstrap,
         )
-        .await?;
+        .await;
+        let err = match result {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await;
+                panic!("UDP datagram transport must not start without datagram authentication");
+            }
+            Err(err) => err,
+        };
 
-        assert!(handle.registry.udp_mode);
-        assert_eq!(
-            handle.registry.bind_addr.ip(),
-            std::net::IpAddr::from([127, 0, 0, 1])
+        assert!(
+            err.to_string()
+                .contains("UDP datagram transport is disabled"),
+            "unexpected error: {err}"
         );
-        handle.shutdown_and_wait().await;
-        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2600,27 +2606,28 @@ pub(crate) fn parse_message_from_pooled_buffer(
             // Check if it's a known message type
             if let Some(msg_type) = crate::MessageType::from_byte(first_byte) {
                 match msg_type {
-                    crate::MessageType::Gossip => {
+                    crate::MessageType::Gossip
+                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN =>
+                    {
                         // This is a gossip message with type prefix, skip the type byte
-                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN {
-                            let payload_offset = crate::framing::LENGTH_PREFIX_LEN
-                                + crate::framing::GOSSIP_HEADER_LEN;
-                            let payload_slice = &buffer.as_ref()[payload_offset..];
-                            match decode_registry_message(payload_slice) {
-                                Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
-                                Err(err) => {
-                                    // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
-                                    trace!(
-                                        payload_len = payload_slice.len(),
-                                        "Failed to decode gossip payload"
-                                    );
-                                    let _ = err;
-                                    return Ok(raw(buffer));
-                                }
+                        let payload_offset =
+                            crate::framing::LENGTH_PREFIX_LEN + crate::framing::GOSSIP_HEADER_LEN;
+                        let payload_slice = &buffer.as_ref()[payload_offset..];
+                        match decode_registry_message(payload_slice) {
+                            Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
+                            Err(err) => {
+                                // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
+                                trace!(
+                                    payload_len = payload_slice.len(),
+                                    "Failed to decode gossip payload"
+                                );
+                                let _ = err;
+                                return Ok(raw(buffer));
                             }
-                        } else {
-                            return Ok(raw(buffer));
                         }
+                    }
+                    crate::MessageType::Gossip => {
+                        return Ok(raw(buffer));
                     }
                     crate::MessageType::ActorTell | crate::MessageType::ActorAsk => {
                         // This is an actor message with envelope format:
@@ -2922,26 +2929,27 @@ where
             // Check if it's a known message type
             if let Some(msg_type) = crate::MessageType::from_byte(first_byte) {
                 match msg_type {
-                    crate::MessageType::Gossip => {
+                    crate::MessageType::Gossip
+                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN =>
+                    {
                         // This is a gossip message with type prefix, skip the type byte
-                        if msg_data.len() >= crate::framing::GOSSIP_HEADER_LEN {
-                            // Create a properly aligned buffer for the payload
-                            let payload = msg_data.slice(crate::framing::GOSSIP_HEADER_LEN..);
-                            match decode_registry_message(payload.as_ref()) {
-                                Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
-                                Err(err) => {
-                                    // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
-                                    trace!(
-                                        payload_len = payload.len(),
-                                        "Failed to decode gossip payload"
-                                    );
-                                    let _ = err;
-                                    return Ok(MessageReadResult::Raw(msg_data));
-                                }
+                        // Create a properly aligned buffer for the payload
+                        let payload = msg_data.slice(crate::framing::GOSSIP_HEADER_LEN..);
+                        match decode_registry_message(payload.as_ref()) {
+                            Ok(msg) => return Ok(MessageReadResult::Gossip(msg, None)),
+                            Err(err) => {
+                                // Avoid spamming logs with rkyv error strings (can be very noisy in stress tests).
+                                trace!(
+                                    payload_len = payload.len(),
+                                    "Failed to decode gossip payload"
+                                );
+                                let _ = err;
+                                return Ok(MessageReadResult::Raw(msg_data));
                             }
-                        } else {
-                            return Ok(MessageReadResult::Raw(msg_data));
                         }
+                    }
+                    crate::MessageType::Gossip => {
+                        return Ok(MessageReadResult::Raw(msg_data));
                     }
                     crate::MessageType::ActorTell | crate::MessageType::ActorAsk => {
                         // This is an actor message with envelope format:
