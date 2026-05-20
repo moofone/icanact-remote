@@ -107,8 +107,7 @@ impl AskResponseSink {
                     payload_len,
                 );
                 let prefix_bytes = prefix.as_ref().map_or(0, |_| 16);
-                let mut datagram =
-                    bytes::BytesMut::with_capacity(16 + prefix_bytes + payload_len);
+                let mut datagram = bytes::BytesMut::with_capacity(16 + prefix_bytes + payload_len);
                 datagram.extend_from_slice(&header);
                 if let Some(p) = prefix {
                     datagram.extend_from_slice(&p);

@@ -160,7 +160,11 @@ impl TransportDatagramWriter for TokioUdpWriter {
         &self,
         datagram: icanact_remote::typed::PooledPayload,
     ) -> icanact_remote::Result<()> {
-        Self::try_send_bytes(&self.socket, self.peer_addr, Bytes::copy_from_slice(datagram.chunk()))
+        Self::try_send_bytes(
+            &self.socket,
+            self.peer_addr,
+            Bytes::copy_from_slice(datagram.chunk()),
+        )
     }
 
     fn send_bytes_vectored(
@@ -535,8 +539,7 @@ fn udp_ask_forwarder_actor_roundtrip() {
         let node_b = create_udp_node(fast_cfg()).await;
 
         // Spawn the "actor" task that processes ask messages.
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<(u64, AskResponder)>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AskResponder)>();
         tokio::spawn(async move {
             while let Some((val, responder)) = rx.recv().await {
                 let reply = Bytes::from((val * 7).to_le_bytes().to_vec());
@@ -558,7 +561,12 @@ fn udp_ask_forwarder_actor_roundtrip() {
                 .await
                 .unwrap_or_else(|e| panic!("ask failed for val={val}: {e}"));
             let reply = u64::from_le_bytes(resp[..8].try_into().unwrap());
-            assert_eq!(reply, val * 7, "expected {val} * 7 = {}, got {reply}", val * 7);
+            assert_eq!(
+                reply,
+                val * 7,
+                "expected {val} * 7 = {}, got {reply}",
+                val * 7
+            );
         }
 
         node_a.shutdown().await;
