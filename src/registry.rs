@@ -8137,6 +8137,9 @@ mod tests {
             .await
             .unwrap();
         registry.add_peer(test_addr(8081)).await;
+        registry
+            .mark_inbound_connection_observed(test_addr(8081), test_addr(8081))
+            .await;
 
         let stats = registry.get_stats().await;
         assert_eq!(stats.local_actors, 1);
