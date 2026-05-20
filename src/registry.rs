@@ -1561,10 +1561,6 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Enable UDP datagram transport mode.
-    ///
-    /// Native UDP datagrams are currently disabled because a source socket
-    /// address is not a cryptographic peer identity. Re-enable this only after
-    /// adding per-datagram authentication and replay protection.
     pub fn enable_udp(&mut self, secret_key: crate::SecretKey) -> Result<()> {
         let keypair = secret_key.to_keypair();
         if keypair.peer_id() != self.peer_id {
@@ -1572,10 +1568,9 @@ impl<T: 'static> GossipRegistry<T> {
                 "UDP transport keypair does not match registry peer id".to_string(),
             ));
         }
-        Err(GossipError::InvalidConfig(
-            "UDP datagram transport is disabled because plaintext datagrams cannot authenticate peer identity"
-                .to_string(),
-        ))
+        self.udp_mode = true;
+        self.tls_config = None;
+        Ok(())
     }
 
     fn udp_now_ms(&self) -> u64 {
@@ -7368,22 +7363,17 @@ mod tests {
     }
 
     #[test]
-    fn enable_udp_rejects_plaintext_datagram_mode() {
-        let keypair = KeyPair::new_for_testing("udp-disabled-registry");
+    fn enable_udp_sets_udp_mode_for_matching_keypair() {
+        let keypair = KeyPair::new_for_testing("udp-enabled-registry");
         let mut config = test_config();
         config.key_pair = Some(keypair.clone());
         let mut registry = GossipRegistry::<()>::new(test_addr(0), config);
 
-        let err = registry
+        registry
             .enable_udp(keypair.to_secret_key())
-            .expect_err("UDP mode must remain disabled without datagram authentication");
+            .expect("matching UDP keypair should enable datagram mode");
 
-        assert!(
-            err.to_string()
-                .contains("UDP datagram transport is disabled"),
-            "unexpected error: {err}"
-        );
-        assert!(!registry.udp_mode);
+        assert!(registry.udp_mode);
         assert!(registry.tls_config.is_none());
     }
 

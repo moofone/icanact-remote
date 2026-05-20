@@ -130,10 +130,9 @@ impl<T> GossipRegistryHandle<T> {
                 (Some(listener), None, actual_bind_addr)
             }
             TransportWireKind::UdpDatagram => {
-                return Err(GossipError::InvalidConfig(
-                    "UDP datagram transport is disabled because plaintext datagrams cannot authenticate peer identity"
-                        .to_string(),
-                ));
+                let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+                let actual_bind_addr = socket.local_addr()?;
+                (None, Some(socket), actual_bind_addr)
             }
         };
 
@@ -1057,29 +1056,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_datagram_transport_is_rejected_without_datagram_authentication() {
-        let keypair = KeyPair::new_for_testing("udp-disabled");
+    async fn udp_datagram_transport_starts_with_core_datagram_authentication() {
+        let keypair = KeyPair::new_for_testing("udp-enabled");
         let mut config = test_cfg();
         config.key_pair = Some(keypair.clone());
 
-        let result = GossipRegistryHandle::new_with_transport_stack(
+        let handle = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             keypair.to_secret_key(),
             Some(config),
             TestUdpBootstrap,
         )
+        .await
+        .expect("UDP datagram transport should start with matching keypair");
+
+        assert!(handle.registry.udp_mode);
+        handle.shutdown_and_wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_datagram_transport_rejects_mismatched_keypair() {
+        let keypair = KeyPair::new_for_testing("udp-mismatch-config");
+        let mut config = test_cfg();
+        config.key_pair = Some(keypair);
+        let secret_key = KeyPair::new_for_testing("udp-mismatch-secret").to_secret_key();
+
+        let err = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            secret_key,
+            Some(config),
+            TestUdpBootstrap,
+        )
         .await;
-        let err = match result {
+        let err = match err {
             Ok(handle) => {
                 handle.shutdown_and_wait().await;
-                panic!("UDP datagram transport must not start without datagram authentication");
+                panic!("UDP datagram transport must reject mismatched keypairs");
             }
             Err(err) => err,
         };
 
         assert!(
-            err.to_string()
-                .contains("UDP datagram transport is disabled"),
+            err.to_string().contains("does not match"),
             "unexpected error: {err}"
         );
     }
