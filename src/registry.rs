@@ -2622,9 +2622,33 @@ impl<T: 'static> GossipRegistry<T> {
     /// Connect to a configured peer by peer ID
     pub async fn connect_to_peer(&self, peer_id: &crate::PeerId) -> Result<()> {
         let pool = &self.connection_pool;
-        pool.get_connection_to_peer(peer_id).await?;
-        info!(peer_id = %peer_id, "Connected to peer");
-        Ok(())
+        let configured_addr = pool.get_configured_peer_addr(peer_id);
+        match pool.get_connection_to_peer(peer_id).await {
+            Ok(_) => {
+                if let Some(addr) = configured_addr {
+                    let mut gossip_state = self.gossip_state.lock().await;
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                        peer_info.failures = 0;
+                        peer_info.outbound_dial_success = true;
+                        peer_info.last_success = current_timestamp();
+                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
+                        peer_info.last_failure_time = None;
+                    }
+                }
+                info!(peer_id = %peer_id, "Connected to peer");
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(addr) = configured_addr {
+                    let mut gossip_state = self.gossip_state.lock().await;
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                        peer_info.failures = self.config.max_peer_failures;
+                        peer_info.last_failure_time = Some(current_timestamp());
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Register a local actor (fast path - minimal locking) with vector clock increment
@@ -3011,7 +3035,10 @@ impl<T: 'static> GossipRegistry<T> {
             let active_peers = gossip_state
                 .peers
                 .values()
-                .filter(|p| p.failures < self.config.max_peer_failures)
+                .filter(|p| {
+                    p.failures < self.config.max_peer_failures
+                        && (p.outbound_dial_success || p.inbound_observed)
+                })
                 .count();
             let failed_peers = gossip_state.peers.len() - active_peers;
 
@@ -7072,6 +7099,14 @@ impl<T: 'static> GossipRegistry<T> {
         remote_peer_id: &crate::PeerId,
         is_outbound: bool,
     ) -> bool {
+        if remote_peer_id == &self.peer_id {
+            warn!(
+                peer_id = %remote_peer_id,
+                "rejecting duplicate connection for local registry identity"
+            );
+            return false;
+        }
+
         let local_id = self.peer_id.to_node_id();
         let remote_id = remote_peer_id.to_node_id();
 
@@ -7081,7 +7116,7 @@ impl<T: 'static> GossipRegistry<T> {
             std::cmp::Ordering::Equal => {
                 // Same node ID shouldn't happen in practice
                 warn!(local = %local_id, remote = %remote_id, "duplicate connection from same NodeId");
-                true
+                false
             }
         }
     }

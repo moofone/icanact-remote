@@ -344,6 +344,17 @@ impl<T> GossipRegistryHandle<T> {
 
     /// Add a peer to the gossip network
     pub async fn add_peer(&self, peer_id: &crate::PeerId) -> crate::Peer {
+        if peer_id == &self.registry.peer_id {
+            tracing::warn!(
+                peer_id = %peer_id,
+                "refusing to configure local registry identity as a remote peer"
+            );
+            return crate::Peer {
+                peer_id: peer_id.clone(),
+                registry: self.registry.clone(),
+            };
+        }
+
         // Pre-configure the peer as allowed (address will be set when connect() is called)
         {
             let pool = &self.registry.connection_pool;
@@ -2078,6 +2089,14 @@ where
             return ConnectionCloseOutcome::Normal { node_id: None };
         }
     };
+    if peer_id == registry.peer_id {
+        warn!(
+            peer_addr = %peer_addr,
+            peer_id = %peer_id,
+            "dropping inbound connection from local registry identity"
+        );
+        return ConnectionCloseOutcome::Normal { node_id: None };
+    }
     let sender_node_id_from_message = peer_id.to_node_id();
     if !inbound_tls_sender_is_authenticated(peer_node_id, sender_node_id_from_message) {
         match peer_node_id {

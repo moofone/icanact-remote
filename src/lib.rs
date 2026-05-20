@@ -808,6 +808,15 @@ pub struct Peer<T = ()> {
 impl<T: 'static> Peer<T> {
     /// Connect to this peer at the specified address
     pub async fn connect(&self, addr: &SocketAddr) -> Result<()> {
+        if self.peer_id == self.registry.peer_id {
+            tracing::warn!(
+                peer_id = %self.peer_id,
+                addr = %addr,
+                "refusing to dial local registry identity as a remote peer"
+            );
+            return Ok(());
+        }
+
         // Validate the address
         if addr.port() == 0 {
             return Err(GossipError::Network(std::io::Error::new(
@@ -1688,6 +1697,48 @@ mod tests {
             .await
             .expect_err("outbound-preferred side should still attempt the socket dial");
         assert!(matches!(err, GossipError::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn peer_connect_refuses_self_peer_without_configuring_or_dialing() {
+        let local_key = KeyPair::new_for_testing("self-peer-connect-guard");
+        let local_peer_id = local_key.peer_id();
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41004".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(local_key),
+                connection_timeout: Duration::from_millis(10),
+                ..GossipConfig::default()
+            },
+        ));
+        let peer = Peer {
+            peer_id: local_peer_id.clone(),
+            registry: registry.clone(),
+        };
+
+        peer.connect(&registry.bind_addr)
+            .await
+            .expect("self peer connect should be a harmless no-op");
+
+        assert_eq!(
+            registry
+                .connection_pool
+                .get_configured_peer_addr(&local_peer_id),
+            None,
+            "self peers must not be configured as remote dial targets"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .get_connection_by_peer_id(&local_peer_id)
+                .is_none(),
+            "self peers must not create pooled remote connections"
+        );
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.peers.contains_key(&registry.bind_addr),
+            "self peers must not enter gossip peer state"
+        );
     }
 
     fn inbound_preferred_key_pair() -> (KeyPair, KeyPair) {
