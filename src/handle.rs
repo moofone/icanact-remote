@@ -1410,7 +1410,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                     rand::random::<u64>() % max_ms
                 };
                 let jitter = Duration::from_millis(jitter_ms);
-                next_gossip_tick += gossip_interval + jitter;
+                next_gossip_tick = Instant::now() + gossip_interval + jitter;
 
                 // Step 1: Prepare gossip tasks while holding the lock briefly
                 let tasks = {
