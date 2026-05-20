@@ -70,3 +70,7 @@ harness = false
 [[bench]]
 name = "pubsub_hotpath"
 harness = false
+
+[[bench]]
+name = "pubsub_job_pattern"
+harness = false

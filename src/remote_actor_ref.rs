@@ -74,6 +74,24 @@ impl RemoteConnection {
         self.inner.try_send_pubsub_payload(payload)
     }
 
+    pub fn try_pubsub_frame_pooled(
+        &self,
+        payload: crate::typed::PooledPayload,
+        prefix: Option<[u8; 16]>,
+        payload_len: usize,
+    ) -> crate::Result<()> {
+        self.inner
+            .try_send_pubsub_payload_pooled(payload, prefix, payload_len)
+    }
+
+    pub fn try_pooled_datagram(&self, payload: crate::typed::PooledPayload) -> crate::Result<()> {
+        self.inner.try_send_pooled_datagram(payload)
+    }
+
+    pub fn supports_pooled_datagram(&self) -> bool {
+        self.inner.supports_pooled_datagram()
+    }
+
     pub async fn ask_actor_frame(
         &self,
         actor_id: u64,

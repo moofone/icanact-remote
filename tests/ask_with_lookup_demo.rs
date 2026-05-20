@@ -314,9 +314,7 @@ fn test_ask_with_lookup_and_performance() {
             // Send request and wait for response (uses cached connection, zero lookups)
             // Add retry logic to handle "not listening yet" transient errors during initial connection
             let response = {
-                let mut result = Err(GossipError::ActorNotFound(
-                    "Initial error".to_string().into(),
-                ));
+                let mut result = Err(GossipError::ActorNotFound("Initial error".to_string()));
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(5) {
                     match actor

@@ -176,6 +176,23 @@ pub struct GossipConfig {
     /// When set, this DNS name is included in gossip messages so peers can re-resolve
     /// the address if the underlying IP changes (e.g., Kubernetes pod restarts)
     pub advertise_dns: Option<String>,
+    /// How long to keep writing to a peer that never sends responses
+    /// back before treating subsequent rounds as failures.
+    ///
+    /// `apply_gossip_results` records a round as `Ok(_)` whenever the
+    /// outbound write returned successfully — but on a persistent
+    /// connection that may just mean the kernel buffered the bytes for
+    /// a peer that has since stopped reading. The response-asymmetry
+    /// detector compares `current_time - last_response_received_ms` to
+    /// this window: if we've been writing into a black hole for longer
+    /// than this window without ever seeing an inbound response, the
+    /// next no-response round increments `failures`, eventually
+    /// tripping `max_peer_failures` and firing the dead-peer cleanup
+    /// hook in `registry::handle_peer_death`.
+    ///
+    /// Default: 10 s. Set very small (e.g., 500 ms) in tests for
+    /// determinism.
+    pub peer_liveness_window: Duration,
 }
 
 impl Default for GossipConfig {
@@ -257,6 +274,7 @@ impl Default for GossipConfig {
             // Read advertise_dns from environment for Kubernetes-style deployments
             // Example: ICANACT_ADVERTISE_DNS=data-feeder.default.svc.cluster.local:9400
             advertise_dns: std::env::var("ICANACT_ADVERTISE_DNS").ok(),
+            peer_liveness_window: Duration::from_secs(10),
         }
     }
 }

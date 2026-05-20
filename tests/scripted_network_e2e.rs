@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use icanact_remote::registry::{ActorMessageHandlerSync, ActorResponse};
+use icanact_remote::registry::{ActorMessageHandlerSync, ActorResponse, PeerInfoGossip};
 use icanact_remote::{
     AlignedBytes, BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PeerId,
     TransportDirection, TransportLifecycleEvent, set_transport_lifecycle_recorder,
@@ -45,8 +45,10 @@ impl ActorMessageHandlerSync for EchoHandler {
         }
 
         self.asks.fetch_add(1, Ordering::AcqRel);
-        if self.slow_payload_delay.is_some() && payload.as_ref() == b"slow" {
-            thread::sleep(self.slow_payload_delay.expect("slow payload delay"));
+        if let Some(delay) = self.slow_payload_delay
+            && payload.as_ref() == b"slow"
+        {
+            thread::sleep(delay);
         }
         Ok(Some(ActorResponse::from(
             format!(
@@ -215,10 +217,30 @@ async fn node_with_slow_payload(
     asks: Arc<AtomicU64>,
     slow_payload_delay: Option<Duration>,
 ) -> icanact_remote::Result<TlsHandle> {
+    node_with_config_and_slow_payload(key_pair, label, asks, slow_payload_delay, static_mesh_cfg())
+        .await
+}
+
+async fn node_with_config(
+    key_pair: KeyPair,
+    label: &'static str,
+    asks: Arc<AtomicU64>,
+    config: GossipConfig,
+) -> icanact_remote::Result<TlsHandle> {
+    node_with_config_and_slow_payload(key_pair, label, asks, None, config).await
+}
+
+async fn node_with_config_and_slow_payload(
+    key_pair: KeyPair,
+    label: &'static str,
+    asks: Arc<AtomicU64>,
+    slow_payload_delay: Option<Duration>,
+    config: GossipConfig,
+) -> icanact_remote::Result<TlsHandle> {
     let handle = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
         key_pair.to_secret_key(),
-        Some(static_mesh_cfg()),
+        Some(config),
         BuilderTlsBootstrap,
     )
     .await?;
@@ -265,6 +287,56 @@ async fn ask_once(from: &TlsHandle, to: &PeerId, payload: &'static [u8], expecte
         .await
         .expect("actor ask");
     assert_eq!(reply.as_ref(), expected);
+}
+
+async fn wait_for_successful_ask(
+    from: &TlsHandle,
+    to: &PeerId,
+    payload: &'static [u8],
+    expected: &'static [u8],
+) -> icanact_remote::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        let remote = from.lookup_peer(to).await?;
+        match remote
+            .ask_actor_frame(
+                TEST_ACTOR_ID,
+                TEST_TYPE_HASH,
+                Bytes::from_static(payload),
+                Duration::from_millis(750),
+            )
+            .await
+        {
+            Ok(reply) if reply.as_ref() == expected => return Ok(()),
+            Ok(reply) => {
+                return Err(icanact_remote::GossipError::Network(std::io::Error::other(
+                    format!("unexpected reply: {reply:?}"),
+                )));
+            }
+            Err(err @ icanact_remote::GossipError::ConnectionDropped)
+            | Err(err @ icanact_remote::GossipError::ActorNotFound(_))
+            | Err(err @ icanact_remote::GossipError::Timeout) => {
+                last_err = Some(err);
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or(icanact_remote::GossipError::Timeout))
+}
+
+async fn wait_until_connected(handle: &TlsHandle, peer_id: &PeerId) -> icanact_remote::Result<()> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if handle.client().lookup_connected_peer(peer_id).is_some() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| icanact_remote::GossipError::Timeout)?
 }
 
 fn install_recorder() -> Arc<Mutex<Vec<TransportLifecycleEvent>>> {
@@ -442,7 +514,7 @@ async fn inbound_preferred_lookup_waits_for_scripted_inbound() -> icanact_remote
     connect_result.expect("outbound owner should connect through proxy");
     assert!(
         lookup_started.elapsed() >= Duration::from_millis(175),
-        "lookup should wait for delayed preferred inbound, elapsed={:?}",
+        "lookup should wait for delayed preferred inbound before fallback dialing, elapsed={:?}",
         lookup_started.elapsed()
     );
     assert!(remote_ref.connection_ref().is_some());
@@ -574,7 +646,7 @@ async fn simultaneous_connect_collision_keeps_one_preferred_direction() -> icana
                 TransportDirection::Outbound
             ),
             0,
-            "inbound-preferred side must not publish outbound during simultaneous collision"
+            "inbound-preferred side must not publish outbound when preferred inbound arrives"
         );
         assert_eq!(
             session_published_count(events, &local.registry.peer_id, TransportDirection::Inbound),
@@ -858,6 +930,195 @@ async fn half_open_reset_evicts_dead_session_but_actor_timeout_does_not()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_transport_during_actor_ask_clears_connected_lookup_and_reconnects()
+-> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let events = install_recorder();
+
+    let (local_key, remote_key) = inbound_preferred_key_pair();
+    let asks_local = Arc::new(AtomicU64::new(0));
+    let asks_remote = Arc::new(AtomicU64::new(0));
+    let local = node(local_key, "local", Arc::clone(&asks_local)).await?;
+    let remote = node_with_slow_payload(
+        remote_key,
+        "remote",
+        Arc::clone(&asks_remote),
+        Some(Duration::from_millis(1_500)),
+    )
+    .await?;
+
+    let remote_to_local = ScriptedProxy::with_plan(
+        local.registry.bind_addr,
+        ProxyPlan {
+            close_after: Some(Duration::from_millis(500)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
+    configure_static_peer(
+        &local,
+        remote.registry.peer_id.clone(),
+        local_to_remote.listen_addr,
+    )
+    .await;
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        remote_to_local.listen_addr,
+    )
+    .await;
+    connect_preferred_direction(&local, &remote, &remote_to_local).await?;
+    wait_until_connected(&local, &remote.registry.peer_id).await?;
+
+    let remote_ref = local.lookup_peer(&remote.registry.peer_id).await?;
+    let dropped = remote_ref
+        .ask_actor_frame(
+            TEST_ACTOR_ID,
+            TEST_TYPE_HASH,
+            Bytes::from_static(b"slow"),
+            Duration::from_secs(3),
+        )
+        .await;
+    assert!(
+        matches!(dropped, Err(icanact_remote::GossipError::ConnectionDropped)),
+        "transport close while waiting for actor ask should surface ConnectionDropped, got {dropped:?}"
+    );
+
+    assert!(
+        wait_for_disconnected_lookup(&local, &remote.registry.peer_id).await,
+        "lookup_connected_peer must stop returning a stale handle after transport drop"
+    );
+
+    drop(remote_to_local);
+    drop(local_to_remote);
+    let remote_to_local = ScriptedProxy::new(local.registry.bind_addr, Duration::ZERO).await;
+    let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
+    configure_static_peer(
+        &local,
+        remote.registry.peer_id.clone(),
+        local_to_remote.listen_addr,
+    )
+    .await;
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        remote_to_local.listen_addr,
+    )
+    .await;
+    connect_preferred_direction(&local, &remote, &remote_to_local).await?;
+    wait_until_connected(&local, &remote.registry.peer_id).await?;
+    wait_for_successful_ask(&local, &remote.registry.peer_id, b"after", b"remote:after").await?;
+
+    with_events(&events, |events| {
+        assert!(
+            session_removed_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Inbound,
+            ) >= 1,
+            "dropped ask transport should remove the dead inbound session"
+        );
+        assert!(
+            session_published_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Inbound,
+            ) >= 2,
+            "peer should publish a fresh inbound session after reconnect"
+        );
+    });
+
+    shutdown_pair(local, remote).await;
+    Ok(())
+}
+
+async fn wait_for_disconnected_lookup(handle: &TlsHandle, peer_id: &PeerId) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if handle.client().lookup_connected_peer(peer_id).is_none() {
+            return true;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_discovered_addr_does_not_override_configured_peer_connection()
+-> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    let (local_key, remote_key) = inbound_preferred_key_pair();
+    let asks_local = Arc::new(AtomicU64::new(0));
+    let asks_remote = Arc::new(AtomicU64::new(0));
+    let mut cfg = static_mesh_cfg();
+    cfg.enable_peer_discovery = true;
+    cfg.allow_loopback_discovery = true;
+    let local = node_with_config(local_key, "local", Arc::clone(&asks_local), cfg.clone()).await?;
+    let remote = node_with_config(remote_key, "remote", Arc::clone(&asks_remote), cfg).await?;
+
+    let stale_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let now = icanact_remote::current_timestamp();
+    let candidates = local
+        .registry
+        .on_peer_list_gossip(
+            vec![PeerInfoGossip {
+                address: stale_addr.to_string(),
+                peer_address: None,
+                node_id: Some(remote.registry.peer_id.to_node_id()),
+                failures: 0,
+                last_attempt: now,
+                last_success: now,
+                dns_name: None,
+            }],
+            "127.0.0.1:5000",
+            now,
+        )
+        .await;
+    assert_eq!(candidates, vec![stale_addr]);
+
+    let remote_to_local = ScriptedProxy::new(local.registry.bind_addr, Duration::ZERO).await;
+    let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
+    configure_static_peer(
+        &local,
+        remote.registry.peer_id.clone(),
+        local_to_remote.listen_addr,
+    )
+    .await;
+    configure_static_peer(
+        &remote,
+        local.registry.peer_id.clone(),
+        remote_to_local.listen_addr,
+    )
+    .await;
+
+    connect_preferred_direction(&local, &remote, &remote_to_local).await?;
+    let remote_ref = local.lookup_peer(&remote.registry.peer_id).await?;
+    assert_ne!(
+        remote_ref.location.address,
+        stale_addr.to_string(),
+        "lookup_peer must use the configured peer address, not stale peer-discovery state"
+    );
+    ask_once(
+        &local,
+        &remote.registry.peer_id,
+        b"configured",
+        b"remote:configured",
+    )
+    .await;
+
+    shutdown_pair(local, remote).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sessions()
 -> icanact_remote::Result<()> {
     let _guard = TEST_LOCK
@@ -888,6 +1149,7 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
     .await;
 
     const SOAK_ROUNDS: usize = 500;
+    const MAX_FALLBACK_OUTBOUNDS: usize = SOAK_ROUNDS / 5;
 
     for cycle in 0..SOAK_ROUNDS {
         local.disconnect_peer_connection(&remote.registry.peer_id);
@@ -931,9 +1193,9 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
                 TransportDirection::Outbound,
             )
         });
-        assert_eq!(
-            local_outbound, 0,
-            "inbound-preferred side must never publish outbound to remote"
+        assert!(
+            local_outbound <= MAX_FALLBACK_OUTBOUNDS,
+            "fallback outbound publishes should stay bounded during reconnect soak, observed {local_outbound}"
         );
     }
 
@@ -941,12 +1203,12 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
         asks_remote.load(Ordering::Acquire) >= SOAK_ROUNDS as u64,
         "remote should answer every scripted reconnect ask"
     );
-    assert_eq!(
+    assert!(
         count_events(&events, |event| matches!(
             event,
             TransportLifecycleEvent::WrongDirectionEvicted { .. }
-        )),
-        0
+        )) <= MAX_FALLBACK_OUTBOUNDS,
+        "fallback repair should not cause an unbounded wrong-direction eviction loop"
     );
     let suppressed_timeouts = count_events(&events, |event| {
         matches!(
@@ -955,7 +1217,7 @@ async fn high_frequency_scripted_reconnects_do_not_preserve_wrong_direction_sess
         )
     });
     assert!(
-        suppressed_timeouts <= 5,
+        suppressed_timeouts <= MAX_FALLBACK_OUTBOUNDS,
         "soak should not spin in suppressed inbound timeouts, observed {suppressed_timeouts}"
     );
 

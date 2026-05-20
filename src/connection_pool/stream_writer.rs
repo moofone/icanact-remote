@@ -279,13 +279,13 @@ impl LockFreeStreamHandle {
             match result {
                 ReadIoResult::DirectAsk { .. } => ASK_READ_BATCH_LIMIT,
                 ReadIoResult::ActorAsk { .. } => ASK_READ_BATCH_LIMIT,
-                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor { msg_type, .. })
-                    if *msg_type == crate::MessageType::ActorAsk as u8 =>
-                {
-                    ASK_READ_BATCH_LIMIT
-                }
+                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+                    msg_type, ..
+                }) if *msg_type == crate::MessageType::ActorAsk as u8 => ASK_READ_BATCH_LIMIT,
                 ReadIoResult::Generic(crate::handle::MessageReadResult::DirectAsk { .. })
-                | ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse { .. })
+                | ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
+                    ..
+                })
                 | ReadIoResult::Generic(crate::handle::MessageReadResult::Response { .. }) => {
                     ASK_READ_BATCH_LIMIT
                 }
@@ -418,10 +418,8 @@ impl LockFreeStreamHandle {
         const OWNER_BATCH_SIZE: usize = 64;
         const READ_BATCH_LIMIT: usize = 2048;
         const ASK_READ_BATCH_LIMIT: usize = 8192;
-        const FLUSH_THRESHOLD: usize = 64 * 1024; // Favor batching on tell; ask has its own fast flush path
 
         let mut bytes_since_flush = 0;
-        let mut last_flush = std::time::Instant::now();
 
         // Pre-allocate reusable buffers to avoid allocations in the hot loop
         let mut write_chunks: Vec<bytes::Bytes> = Vec::with_capacity(OWNER_BATCH_SIZE * 2);
@@ -464,7 +462,6 @@ impl LockFreeStreamHandle {
                     StreamingCommand::Flush => {
                         let _ = stream.flush().await;
                         flush_pending.store(false, Ordering::Release);
-                        last_flush = std::time::Instant::now();
                         bytes_since_flush = 0;
                     }
                     StreamingCommand::VectoredWrite(cmd) => {
@@ -605,19 +602,20 @@ impl LockFreeStreamHandle {
                     for command in owner_batch.drain(..) {
                         write_queue.notify_space();
                         let is_ask_payload = matches!(&command, WriteCommand::AskPayload(_));
+                        let is_immediate_payload =
+                            matches!(&command, WriteCommand::ImmediatePayload(_));
                         let payload = match command {
-                            WriteCommand::Payload(payload) => payload,
+                            WriteCommand::Payload(payload) | WriteCommand::ImmediatePayload(payload) => payload,
                             WriteCommand::AskPayload(payload) => {
                                 wrote_ask_payload = true;
                                 payload
                             }
                         };
-                        let ask_write_start =
-                            if is_ask_payload && perf.is_some() {
-                                Some(Instant::now())
-                            } else {
-                                None
-                            };
+                        let ask_write_start = if is_ask_payload && perf.is_some() {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
                         if !matches!(&payload, WritePayload::DirectAskInline { .. })
                             && !direct_ask_headers.is_empty()
                         {
@@ -1210,12 +1208,15 @@ impl LockFreeStreamHandle {
                             }
                             WritePayload::DirectAskInline { header, payload } => {
                                 if !write_chunks.is_empty() {
-                                    let bytes_written =
-                                        match write_chunks_batched(&mut stream, &write_chunks).await
-                                        {
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
+                                    let bytes_written = match write_chunks_batched(
+                                        &mut stream,
+                                        &write_chunks,
+                                    )
+                                    .await
+                                    {
+                                        Ok(n) => n,
+                                        Err(_) => return,
+                                    };
                                     bytes_written_counter
                                         .fetch_add(bytes_written, Ordering::Relaxed);
                                     total_bytes_written += bytes_written;
@@ -1259,6 +1260,11 @@ impl LockFreeStreamHandle {
                             perf.ask_write_calls.fetch_add(1, Ordering::Relaxed);
                             perf.ask_write_ns
                                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+                        if is_immediate_payload && total_bytes_written > 0 {
+                            let _ = stream.flush().await;
+                            total_bytes_written = 0;
+                            flush_pending.store(false, Ordering::Release);
                         }
                     }
                 }
@@ -1306,17 +1312,9 @@ impl LockFreeStreamHandle {
             }
 
             bytes_since_flush += total_bytes_written;
-            let elapsed = last_flush.elapsed();
-
-            if should_flush(
-                bytes_since_flush,
-                elapsed,
-                FLUSH_THRESHOLD,
-                WRITER_MAX_LATENCY,
-            ) {
+            if bytes_since_flush > 0 {
                 let _ = stream.flush().await;
                 bytes_since_flush = 0;
-                last_flush = std::time::Instant::now();
                 flush_pending.store(false, Ordering::Release);
             }
 
@@ -1359,8 +1357,7 @@ impl LockFreeStreamHandle {
 
                         if let Some(result) = read_result.result {
                             reads += 1;
-                            read_batch_limit =
-                                read_batch_limit.max(read_batch_limit_for(&result));
+                            read_batch_limit = read_batch_limit.max(read_batch_limit_for(&result));
                             let Some(result) = try_handle_fast_io(
                                 result,
                                 ctx,
@@ -1389,6 +1386,7 @@ impl LockFreeStreamHandle {
                                     streaming_state,
                                     &registry,
                                     ctx.peer_addr,
+                                    ctx.peer_id.as_ref(),
                                     ctx.response_correlation.as_ref().map(|c| c.as_ref()),
                                     ctx.sync_actor_handler.as_ref().map(|v| &**v),
                                     &mut stream,
@@ -1463,7 +1461,6 @@ impl LockFreeStreamHandle {
             {
                 let _ = stream.flush().await;
                 bytes_since_flush = 0;
-                last_flush = std::time::Instant::now();
                 flush_pending.store(false, Ordering::Release);
             }
 
@@ -1500,7 +1497,7 @@ impl LockFreeStreamHandle {
                             }
 
                             if let Some(result) = read_result.result {
-                                let Some(result) = try_handle_fast_io(
+                                if let Some(result) = try_handle_fast_io(
                                     result,
                                     ctx,
                                     &mut stream,
@@ -1519,39 +1516,38 @@ impl LockFreeStreamHandle {
                                         "Failed to process fast IO message"
                                     );
                                     None
-                                }) else {
-                                    continue;
-                                };
-                                if let Some(registry) = ctx.registry_weak.upgrade() {
-                                    if let Err(e) = process_read_result_io(
-                                        result,
-                                        streaming_state,
-                                        &registry,
-                                        ctx.peer_addr,
-                                        ctx.response_correlation.as_ref().map(|c| c.as_ref()),
-                                        ctx.sync_actor_handler.as_ref().map(|v| &**v),
-                                        &mut stream,
-                                        &bytes_written_counter,
-                                        &mut bytes_since_flush,
-                                        &mut response_batch,
-                                        &mut direct_response_batch,
-                                        perf,
-                                    )
-                                    .await
-                                    {
+                                }) {
+                                    if let Some(registry) = ctx.registry_weak.upgrade() {
+                                        if let Err(e) = process_read_result_io(
+                                            result,
+                                            streaming_state,
+                                            &registry,
+                                            ctx.peer_addr,
+                                            ctx.peer_id.as_ref(),
+                                            ctx.response_correlation.as_ref().map(|c| c.as_ref()),
+                                            ctx.sync_actor_handler.as_ref().map(|v| &**v),
+                                            &mut stream,
+                                            &bytes_written_counter,
+                                            &mut bytes_since_flush,
+                                            &mut response_batch,
+                                            &mut direct_response_batch,
+                                            perf,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                peer = %ctx.peer_addr,
+                                                error = %e,
+                                                "Failed to process message on IO task"
+                                            );
+                                        }
+                                    } else {
                                         warn!(
                                             peer = %ctx.peer_addr,
-                                            error = %e,
-                                            "Failed to process message on IO task"
+                                            "Registry dropped, stopping IO task"
                                         );
+                                        return;
                                     }
-
-                                } else {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        "Registry dropped, stopping IO task"
-                                    );
-                                    return;
                                 }
                             }
 
@@ -1617,6 +1613,7 @@ impl LockFreeStreamHandle {
                                             streaming_state,
                                             &registry,
                                             ctx.peer_addr,
+                                            ctx.peer_id.as_ref(),
                                             ctx.response_correlation.as_ref().map(|c| c.as_ref()),
                                             ctx.sync_actor_handler.as_ref().map(|v| &**v),
                                             &mut stream,
@@ -1680,17 +1677,12 @@ impl LockFreeStreamHandle {
                                     return;
                                 }
                             }
-                            // Ensure actor responses don't sit in the kernel/TLS buffers indefinitely
-                            // on links that are primarily request->response (server-side).
-                            if should_flush(
-                                bytes_since_flush,
-                                last_flush.elapsed(),
-                                FLUSH_THRESHOLD,
-                                WRITER_MAX_LATENCY,
-                            ) {
+                            // Ensure request/response traffic does not sit in TLS buffers on
+                            // quiet links. The idle branch has no outer fast-flush checkpoint
+                            // after this select arm, so flush direct/actor responses here.
+                            if bytes_since_flush > 0 {
                                 let _ = stream.flush().await;
                                 bytes_since_flush = 0;
-                                last_flush = std::time::Instant::now();
                                 flush_pending.store(false, Ordering::Release);
                             }
                         }
@@ -1706,7 +1698,6 @@ impl LockFreeStreamHandle {
                         _ = streaming_queue.data_notify.notified() => {
                             // Wake on streaming commands; drained at the top of the loop.
                         }
-                        _ = tokio::time::sleep(WRITER_MAX_LATENCY) => {}
                     }
                 } else {
                     tokio::select! {
@@ -1719,7 +1710,6 @@ impl LockFreeStreamHandle {
                         _ = write_queue.space_notify.notified() => {
                             // Producer wakeup only; no action needed.
                         }
-                        _ = tokio::time::sleep(WRITER_MAX_LATENCY) => {}
                     }
                 }
             }
@@ -1735,8 +1725,7 @@ impl LockFreeStreamHandle {
                         write_ns,
                         ask_write_calls,
                         ask_write_ns,
-                    ) =
-                        perf.snapshot_and_reset();
+                    ) = perf.snapshot_and_reset();
                     let read_us = read_ns as f64 / 1000.0;
                     let handle_us = handle_ns as f64 / 1000.0;
                     let write_us = write_ns as f64 / 1000.0;
@@ -1807,6 +1796,26 @@ impl LockFreeStreamHandle {
         }
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         match self.write_queue.try_push(WriteCommand::Payload(payload)) {
+            Ok(()) => {
+                self.write_queue.notify_data_if_empty_to_non_empty();
+                Ok(())
+            }
+            Err(_) => Err(GossipError::WriteQueueFull),
+        }
+    }
+
+    fn enqueue_immediate_write_nonblocking(&self, payload: WritePayload) -> Result<()> {
+        if self.exit_flag.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
+        if self.shutdown_signal.load(Ordering::Acquire) {
+            return Err(GossipError::Shutdown);
+        }
+        self.sequence_counter.fetch_add(1, Ordering::Relaxed);
+        match self
+            .write_queue
+            .try_push(WriteCommand::ImmediatePayload(payload))
+        {
             Ok(()) => {
                 self.write_queue.notify_data_if_empty_to_non_empty();
                 Ok(())
@@ -1891,6 +1900,19 @@ impl LockFreeStreamHandle {
         payload: bytes::Bytes,
     ) -> Result<()> {
         self.enqueue_write_nonblocking(WritePayload::HeaderInline {
+            header,
+            header_len,
+            payload,
+        })
+    }
+
+    pub fn write_header_and_payload_control_inline_immediate_nonblocking(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        payload: bytes::Bytes,
+    ) -> Result<()> {
+        self.enqueue_immediate_write_nonblocking(WritePayload::HeaderInline {
             header,
             header_len,
             payload,
@@ -1982,6 +2004,40 @@ impl LockFreeStreamHandle {
             payload,
         })
         .await
+    }
+
+    pub fn write_pooled_control_inline_nonblocking(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        prefix: Option<[u8; 16]>,
+        prefix_len: u8,
+        payload: crate::typed::PooledPayload,
+    ) -> Result<()> {
+        self.enqueue_write_nonblocking(WritePayload::HeaderInlinePooled {
+            header,
+            header_len,
+            prefix,
+            prefix_len,
+            payload,
+        })
+    }
+
+    pub fn write_pooled_control_inline_immediate_nonblocking(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        prefix: Option<[u8; 16]>,
+        prefix_len: u8,
+        payload: crate::typed::PooledPayload,
+    ) -> Result<()> {
+        self.enqueue_immediate_write_nonblocking(WritePayload::HeaderInlinePooled {
+            header,
+            header_len,
+            prefix,
+            prefix_len,
+            payload,
+        })
     }
 
     pub async fn write_pooled_ask(

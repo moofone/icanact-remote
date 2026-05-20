@@ -1,4 +1,9 @@
 use std::net::SocketAddr;
+
+use futures::{
+    FutureExt,
+    stream::{FuturesUnordered, StreamExt},
+};
 use tokio::time::{Duration, sleep};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -292,25 +297,43 @@ async fn run_test_ask_high_throughput() {
     let num_requests = 1000;
     let start = std::time::Instant::now();
 
-    // Send many concurrent asks with actual responses from the other node
-    let mut handles = Vec::new();
-    for i in 0..num_requests {
-        let conn_clone = conn.clone();
-        let handle = tokio::spawn(async move {
-            // Use ECHO to verify the request is transmitted correctly
-            let request = format!("ECHO:High throughput request {}", i).into_bytes();
-            let response = conn_clone.ask(bytes::Bytes::from(request)).await.unwrap();
+    let max_in_flight = 64usize;
+    let mut pending = FuturesUnordered::new();
+    let mut next_request = 0usize;
 
-            // Verify we got the correct echoed response
-            let expected = format!("ECHOED:High throughput request {}", i).into_bytes();
-            assert_eq!(response, expected);
-        });
-        handles.push(handle);
+    while next_request < num_requests && pending.len() < max_in_flight {
+        let conn_clone = conn.clone();
+        let request_id = next_request;
+        pending.push(
+            async move {
+                let request = format!("ECHO:High throughput request {}", request_id).into_bytes();
+                let response = conn_clone.ask(bytes::Bytes::from(request)).await?;
+                Ok::<_, icanact_remote::GossipError>((request_id, response))
+            }
+            .boxed(),
+        );
+        next_request += 1;
     }
 
-    // Wait for all to complete
-    for handle in handles {
-        handle.await.unwrap();
+    while let Some(result) = pending.next().await {
+        let (request_id, response) = result.unwrap();
+        let expected = format!("ECHOED:High throughput request {}", request_id).into_bytes();
+        assert_eq!(response, expected);
+
+        if next_request < num_requests {
+            let conn_clone = conn.clone();
+            let request_id = next_request;
+            pending.push(
+                async move {
+                    let request =
+                        format!("ECHO:High throughput request {}", request_id).into_bytes();
+                    let response = conn_clone.ask(bytes::Bytes::from(request)).await?;
+                    Ok::<_, icanact_remote::GossipError>((request_id, response))
+                }
+                .boxed(),
+            );
+            next_request += 1;
+        }
     }
 
     let elapsed = start.elapsed();

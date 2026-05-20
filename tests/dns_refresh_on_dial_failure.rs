@@ -55,10 +55,12 @@ async fn new_registry_with_keypair(
     bind: SocketAddr,
     keypair: KeyPair,
 ) -> icanact_remote::Result<GossipRegistryHandle> {
-    let mut cfg = GossipConfig::default();
-    cfg.key_pair = Some(keypair.clone());
-    cfg.allow_loopback_discovery = true; // tests use 127.0.0.1
-    cfg.connection_timeout = Duration::from_millis(150);
+    let cfg = GossipConfig {
+        key_pair: Some(keypair.clone()),
+        allow_loopback_discovery: true, // tests use 127.0.0.1
+        connection_timeout: Duration::from_millis(150),
+        ..Default::default()
+    };
     GossipRegistryHandle::new_with_transport_stack(
         bind,
         keypair.to_secret_key(),

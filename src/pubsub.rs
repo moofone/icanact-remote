@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::warn;
@@ -12,18 +12,177 @@ use crate::{GossipError, PeerId, RegistrationPriority, RemoteActorLocation, Resu
 
 const CONTROL_PLANE_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_TTL: u8 = 8;
-const DEFAULT_SEEN_CAPACITY: usize = 16_384;
+const SEEN_FINGERPRINT_SLOTS: usize = 16_384;
 const INTEREST_PREFIX: &str = "icanact/pubsub/interest/v1";
+const FAST_FRAME_MAGIC: &[u8; 4] = b"PSF1";
+const FAST_FRAME_HEADER_LEN: usize = 120;
+const FAST_FRAME_DEST_PEER_LEN: usize = 32;
+const FAST_FRAME_POOL_BUFFERS: usize = 4096;
+const FAST_FRAME_POOL_BUFFER_CAPACITY: usize = 4096;
 
 type TopicKey = u64;
 type TypeHash = u64;
 type SubscriberKey = (TopicKey, TypeHash);
-type Subscriber = Arc<dyn Fn(Bytes) + Send + Sync + 'static>;
-type TypeSubscriber = Arc<dyn Fn(u64, Bytes) + Send + Sync + 'static>;
-type SubscriberMap = HashMap<SubscriberKey, Arc<[Subscriber]>>;
-type TypeSubscriberMap = HashMap<TypeHash, Arc<[TypeSubscriber]>>;
+#[derive(Clone)]
+struct SubscriberEntry {
+    id: u64,
+    owner: Arc<dyn Send + Sync + 'static>,
+    ptr: usize,
+    call: unsafe fn(usize, Bytes),
+}
+#[derive(Clone)]
+struct BorrowedSubscriberEntry {
+    id: u64,
+    owner: Arc<dyn Send + Sync + 'static>,
+    ptr: usize,
+    call: unsafe fn(usize, &[u8], PubSubFrameMetadata),
+}
+#[derive(Clone)]
+struct TypeSubscriberEntry {
+    owner: Arc<dyn Send + Sync + 'static>,
+    ptr: usize,
+    call: unsafe fn(usize, u64, Bytes),
+}
+type SubscriberMap = HashMap<SubscriberKey, Arc<[SubscriberEntry]>>;
+type BorrowedSubscriberMap = HashMap<SubscriberKey, Arc<[BorrowedSubscriberEntry]>>;
+type TypeSubscriberMap = HashMap<TypeHash, Arc<[TypeSubscriberEntry]>>;
 type RouteGroups = HashMap<PeerId, Arc<[PeerId]>>;
 type TopicRouteGroups = HashMap<TopicKey, Arc<RouteGroups>>;
+
+#[derive(Clone)]
+struct HotBorrowedSubscriber {
+    key: SubscriberKey,
+    entry: BorrowedSubscriberEntry,
+}
+
+#[derive(Clone)]
+struct HotRouteGroups {
+    topic_key: TopicKey,
+    entries: Arc<[HotRouteEntry]>,
+}
+
+#[derive(Clone)]
+struct HotRouteEntry {
+    next_hop: PeerId,
+    destinations: Arc<[PeerId]>,
+    conn: crate::RemoteConnection,
+    supports_pooled_datagram: bool,
+}
+
+impl SubscriberEntry {
+    fn new<F>(id: u64, deliver: F) -> Self
+    where
+        F: Fn(Bytes) + Send + Sync + 'static,
+    {
+        unsafe fn call_impl<F>(ptr: usize, payload: Bytes)
+        where
+            F: Fn(Bytes) + Send + Sync + 'static,
+        {
+            let deliver = unsafe { &*(ptr as *const F) };
+            deliver(payload);
+        }
+
+        let owner = Arc::new(deliver);
+        let ptr = Arc::as_ptr(&owner) as usize;
+        let owner: Arc<dyn Send + Sync + 'static> = owner;
+        Self {
+            id,
+            owner,
+            ptr,
+            call: call_impl::<F>,
+        }
+    }
+
+    #[inline]
+    fn deliver(&self, payload: Bytes) {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, payload) }
+    }
+}
+
+impl BorrowedSubscriberEntry {
+    fn new<F>(id: u64, deliver: F) -> Self
+    where
+        F: Fn(&[u8]) + Send + Sync + 'static,
+    {
+        unsafe fn call_impl<F>(ptr: usize, payload: &[u8], _metadata: PubSubFrameMetadata)
+        where
+            F: Fn(&[u8]) + Send + Sync + 'static,
+        {
+            let deliver = unsafe { &*(ptr as *const F) };
+            deliver(payload);
+        }
+
+        let owner = Arc::new(deliver);
+        let ptr = Arc::as_ptr(&owner) as usize;
+        let owner: Arc<dyn Send + Sync + 'static> = owner;
+        Self {
+            id,
+            owner,
+            ptr,
+            call: call_impl::<F>,
+        }
+    }
+
+    fn new_with_metadata<F>(id: u64, deliver: F) -> Self
+    where
+        F: Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
+    {
+        unsafe fn call_impl<F>(ptr: usize, payload: &[u8], metadata: PubSubFrameMetadata)
+        where
+            F: Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
+        {
+            let deliver = unsafe { &*(ptr as *const F) };
+            deliver(payload, metadata);
+        }
+
+        let owner = Arc::new(deliver);
+        let ptr = Arc::as_ptr(&owner) as usize;
+        let owner: Arc<dyn Send + Sync + 'static> = owner;
+        Self {
+            id,
+            owner,
+            ptr,
+            call: call_impl::<F>,
+        }
+    }
+
+    #[inline]
+    fn deliver(&self, payload: &[u8], metadata: PubSubFrameMetadata) {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, payload, metadata) }
+    }
+}
+
+impl TypeSubscriberEntry {
+    fn new<F>(deliver: F) -> Self
+    where
+        F: Fn(u64, Bytes) + Send + Sync + 'static,
+    {
+        unsafe fn call_impl<F>(ptr: usize, topic_key: u64, payload: Bytes)
+        where
+            F: Fn(u64, Bytes) + Send + Sync + 'static,
+        {
+            let deliver = unsafe { &*(ptr as *const F) };
+            deliver(topic_key, payload);
+        }
+
+        let owner = Arc::new(deliver);
+        let ptr = Arc::as_ptr(&owner) as usize;
+        let owner: Arc<dyn Send + Sync + 'static> = owner;
+        Self {
+            owner,
+            ptr,
+            call: call_impl::<F>,
+        }
+    }
+
+    #[inline]
+    fn deliver(&self, topic_key: u64, payload: Bytes) {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, topic_key, payload) }
+    }
+}
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PubSubDeliveryMode {
@@ -63,6 +222,13 @@ pub struct PubSubPublishStats {
     pub remote_full: u32,
     pub remote_route_miss: u32,
     pub remote_transport_errors: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PubSubFrameMetadata {
+    /// Sender-side Unix nanoseconds stamped immediately before the frame is
+    /// enqueued to the routed PubSub transport. 0 = not provided.
+    pub publisher_enqueued_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -144,7 +310,25 @@ impl<'a> crate::WireType for PubSubFrameV1Encode<'a> {
 }
 
 pub trait PubSubIngressHandler: Send + Sync {
-    fn handle_pubsub_frame(&self, payload: crate::AlignedBytes) -> Result<()>;
+    fn handle_pubsub_frame(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: crate::AlignedBytes,
+    ) -> Result<()>;
+
+    fn handle_pubsub_frame_borrowed(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.handle_pubsub_frame(
+            authenticated_source_peer_id,
+            crate::AlignedBytes::from_pooled_slice(
+                payload,
+                Arc::new(crate::AlignedBytesPool::default()),
+            ),
+        )
+    }
 }
 
 pub trait PubSubRouteProvider: Send + Sync {
@@ -162,16 +346,32 @@ pub struct PubSubSubscription {
     id: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PubSubBorrowedSubscription {
+    topic_key: u64,
+    type_hash: u64,
+    id: u64,
+}
+
+#[derive(Default)]
+struct InterestState {
+    local_counts: HashMap<TopicKey, usize>,
+    generations: HashMap<TopicKey, u64>,
+}
+
 pub struct RoutedPubSub {
     registry: Arc<crate::registry::GossipRegistry>,
     client: crate::GossipClient,
     local_peer_id: PeerId,
     subscribers: ArcSwap<SubscriberMap>,
+    borrowed_subscribers: ArcSwap<BorrowedSubscriberMap>,
+    hot_borrowed_subscriber: ArcSwapOption<HotBorrowedSubscriber>,
     type_subscribers: ArcSwap<TypeSubscriberMap>,
-    local_counts: Mutex<HashMap<TopicKey, usize>>,
+    interest_state: Arc<Mutex<InterestState>>,
     route_groups: ArcSwap<TopicRouteGroups>,
+    hot_route_groups: ArcSwapOption<HotRouteGroups>,
     conns: ArcSwap<HashMap<PeerId, crate::RemoteConnection>>,
-    seen: Mutex<Vec<(PeerId, u128)>>,
+    seen_fingerprints: Box<[AtomicU64]>,
     counters: PubSubIngressCounters,
     next_sub_id: AtomicU64,
     next_msg_id: AtomicU64,
@@ -180,23 +380,30 @@ pub struct RoutedPubSub {
 
 impl RoutedPubSub {
     pub async fn install(registry: Arc<crate::registry::GossipRegistry>) -> Arc<Self> {
+        crate::typed::prewarm_pooled_byte_buffers(
+            FAST_FRAME_POOL_BUFFERS,
+            FAST_FRAME_POOL_BUFFER_CAPACITY,
+        );
         let this = Arc::new(Self {
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
             registry,
             subscribers: ArcSwap::from_pointee(HashMap::new()),
+            borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
-            local_counts: Mutex::new(HashMap::new()),
+            interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
+            hot_route_groups: ArcSwapOption::empty(),
             conns: ArcSwap::from_pointee(HashMap::new()),
-            seen: Mutex::new(Vec::with_capacity(DEFAULT_SEEN_CAPACITY)),
+            seen_fingerprints: new_seen_fingerprints(),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
         });
         this.registry
-            .set_pubsub_ingress_handler(Arc::clone(&this) as Arc<dyn PubSubIngressHandler>)
+            .set_pubsub_ingress_handler(Arc::clone(&this))
             .await;
         Self::spawn_control_plane(&this);
         this
@@ -220,11 +427,57 @@ impl RoutedPubSub {
         let key = (topic_key, type_hash);
         let mut next = (*self.subscribers.load_full()).clone();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
-        topic_subs.push(Arc::new(deliver));
+        topic_subs.push(SubscriberEntry::new(id, deliver));
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
         self.note_interest(topic_key, true);
         PubSubSubscription {
+            topic_key,
+            type_hash,
+            id,
+        }
+    }
+
+    pub fn subscribe_borrowed_bytes(
+        &self,
+        topic_key: u64,
+        type_hash: u64,
+        deliver: impl Fn(&[u8]) + Send + Sync + 'static,
+    ) -> PubSubBorrowedSubscription {
+        let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        let key = (topic_key, type_hash);
+        let mut next = (*self.borrowed_subscribers.load_full()).clone();
+        let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
+        let entry = BorrowedSubscriberEntry::new(id, deliver);
+        topic_subs.push(entry);
+        self.refresh_hot_borrowed_subscriber(key, &topic_subs);
+        next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
+        self.borrowed_subscribers.store(Arc::new(next));
+        self.note_interest(topic_key, true);
+        PubSubBorrowedSubscription {
+            topic_key,
+            type_hash,
+            id,
+        }
+    }
+
+    pub fn subscribe_borrowed_bytes_with_metadata(
+        &self,
+        topic_key: u64,
+        type_hash: u64,
+        deliver: impl Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
+    ) -> PubSubBorrowedSubscription {
+        let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        let key = (topic_key, type_hash);
+        let mut next = (*self.borrowed_subscribers.load_full()).clone();
+        let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
+        let entry = BorrowedSubscriberEntry::new_with_metadata(id, deliver);
+        topic_subs.push(entry);
+        self.refresh_hot_borrowed_subscriber(key, &topic_subs);
+        next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
+        self.borrowed_subscribers.store(Arc::new(next));
+        self.note_interest(topic_key, true);
+        PubSubBorrowedSubscription {
             topic_key,
             type_hash,
             id,
@@ -242,7 +495,7 @@ impl RoutedPubSub {
             .get(&type_hash)
             .map(|subs| subs.to_vec())
             .unwrap_or_default();
-        subs.push(Arc::new(deliver));
+        subs.push(TypeSubscriberEntry::new(deliver));
         next.insert(type_hash, Arc::from(subs.into_boxed_slice()));
         self.type_subscribers.store(Arc::new(next));
         id
@@ -259,13 +512,45 @@ impl RoutedPubSub {
         }
         let mut next = current.as_ref().clone();
         let mut topic_subs = existing.to_vec();
-        topic_subs.pop();
+        let Some(pos) = topic_subs.iter().position(|entry| entry.id == sub.id) else {
+            return false;
+        };
+        topic_subs.remove(pos);
         if topic_subs.is_empty() {
             next.remove(&key);
         } else {
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
         self.subscribers.store(Arc::new(next));
+        self.note_interest(sub.topic_key, false);
+        true
+    }
+
+    pub fn unsubscribe_borrowed(&self, sub: PubSubBorrowedSubscription) -> bool {
+        let key = (sub.topic_key, sub.type_hash);
+        let current = self.borrowed_subscribers.load_full();
+        let Some(existing) = current.get(&key) else {
+            return false;
+        };
+        if existing.is_empty() {
+            return false;
+        }
+        let mut next = current.as_ref().clone();
+        let mut topic_subs = existing.to_vec();
+        let Some(pos) = topic_subs.iter().position(|entry| entry.id == sub.id) else {
+            return false;
+        };
+        topic_subs.remove(pos);
+        if topic_subs.is_empty() {
+            next.remove(&key);
+        } else {
+            self.refresh_hot_borrowed_subscriber(key, &topic_subs);
+            next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
+        }
+        if !next.contains_key(&key) {
+            self.refresh_hot_borrowed_subscriber(key, &[]);
+        }
+        self.borrowed_subscribers.store(Arc::new(next));
         self.note_interest(sub.topic_key, false);
         true
     }
@@ -311,6 +596,22 @@ impl RoutedPubSub {
         Ok(stats)
     }
 
+    pub fn publish_remote_bytes_with_metadata(
+        &self,
+        topic_key: u64,
+        type_hash: u64,
+        payload: Bytes,
+        scope: PubSubScope,
+        policy: PubSubDeliveryPolicy,
+        metadata: PubSubFrameMetadata,
+    ) -> Result<PubSubPublishStats> {
+        let mut stats = PubSubPublishStats::default();
+        self.publish_remote_bytes_inner_with_metadata(
+            topic_key, type_hash, payload, scope, policy, metadata, &mut stats,
+        )?;
+        Ok(stats)
+    }
+
     fn publish_remote_bytes_inner(
         &self,
         topic_key: u64,
@@ -320,43 +621,226 @@ impl RoutedPubSub {
         policy: PubSubDeliveryPolicy,
         stats: &mut PubSubPublishStats,
     ) -> Result<()> {
+        self.publish_remote_bytes_inner_with_metadata(
+            topic_key,
+            type_hash,
+            payload,
+            scope,
+            policy,
+            PubSubFrameMetadata::default(),
+            stats,
+        )
+    }
+
+    fn publish_remote_bytes_inner_with_metadata(
+        &self,
+        topic_key: u64,
+        type_hash: u64,
+        payload: Bytes,
+        scope: PubSubScope,
+        policy: PubSubDeliveryPolicy,
+        metadata: PubSubFrameMetadata,
+        stats: &mut PubSubPublishStats,
+    ) -> Result<()> {
         if matches!(scope, PubSubScope::LocalOnly) || policy.hops_limit == 0 {
             return Ok(());
         }
 
-        let groups = self.groups_for_scope(topic_key, scope);
-        if groups.is_empty() {
-            return Ok(());
-        }
-
         let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed) as u128;
-        for (next_hop, destinations) in groups {
-            let frame = encode_frame(
+        match scope {
+            PubSubScope::LocalOnly => Ok(()),
+            PubSubScope::AutoExternal | PubSubScope::ClusterWide => {
+                let hot_routes = self.hot_route_groups.load();
+                if let Some(hot) = hot_routes.as_ref()
+                    && hot.topic_key == topic_key
+                {
+                    for entry in hot.entries.iter() {
+                        self.publish_frame_to_conn(
+                            &entry.next_hop,
+                            &entry.conn,
+                            entry.supports_pooled_datagram,
+                            entry.destinations.as_ref(),
+                            topic_key,
+                            type_hash,
+                            msg_id,
+                            payload.as_ref(),
+                            policy,
+                            metadata,
+                            stats,
+                        );
+                    }
+                    return Ok(());
+                }
+                drop(hot_routes);
+
+                let groups = self.route_groups.load();
+                let Some(groups) = groups.get(&topic_key) else {
+                    return Ok(());
+                };
+                for (next_hop, destinations) in groups.iter() {
+                    self.publish_frame_to_next_hop(
+                        next_hop,
+                        destinations.as_ref(),
+                        topic_key,
+                        type_hash,
+                        msg_id,
+                        payload.as_ref(),
+                        policy,
+                        metadata,
+                        stats,
+                    );
+                }
+                Ok(())
+            }
+            PubSubScope::SelectedPeers(peers) => {
+                let groups = if let Some(provider) = self.route_provider.load().as_ref() {
+                    provider.group_destinations(topic_key, &peers)
+                } else {
+                    peers
+                        .into_iter()
+                        .filter(|peer| peer != &self.local_peer_id)
+                        .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                        .collect()
+                };
+                for (next_hop, destinations) in &groups {
+                    self.publish_frame_to_next_hop(
+                        next_hop,
+                        destinations.as_ref(),
+                        topic_key,
+                        type_hash,
+                        msg_id,
+                        payload.as_ref(),
+                        policy,
+                        metadata,
+                        stats,
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn publish_frame_to_next_hop(
+        &self,
+        next_hop: &PeerId,
+        destinations: &[PeerId],
+        topic_key: u64,
+        type_hash: u64,
+        msg_id: u128,
+        payload: &[u8],
+        policy: PubSubDeliveryPolicy,
+        metadata: PubSubFrameMetadata,
+        stats: &mut PubSubPublishStats,
+    ) {
+        let conn = match self.lookup_next_hop_conn(next_hop) {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub route lookup failed");
+                stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1);
+                return;
+            }
+        };
+        self.publish_frame_to_conn(
+            next_hop,
+            &conn,
+            conn.supports_pooled_datagram(),
+            destinations,
+            topic_key,
+            type_hash,
+            msg_id,
+            payload,
+            policy,
+            metadata,
+            stats,
+        );
+    }
+
+    fn publish_frame_to_conn(
+        &self,
+        next_hop: &PeerId,
+        conn: &crate::RemoteConnection,
+        supports_pooled_datagram: bool,
+        destinations: &[PeerId],
+        topic_key: u64,
+        type_hash: u64,
+        msg_id: u128,
+        payload: &[u8],
+        policy: PubSubDeliveryPolicy,
+        metadata: PubSubFrameMetadata,
+        stats: &mut PubSubPublishStats,
+    ) {
+        stats.remote_attempted = stats.remote_attempted.saturating_add(1);
+
+        if supports_pooled_datagram {
+            let Some(datagram) = encode_fast_pubsub_datagram_pooled(
                 topic_key,
                 type_hash,
                 msg_id,
-                self.local_peer_id.clone(),
-                self.local_peer_id.clone(),
+                &self.local_peer_id,
+                &self.local_peer_id,
                 policy.hops_limit,
                 policy.mode,
-                destinations.as_ref(),
-                payload.as_ref(),
-            )?;
-            stats.remote_attempted = stats.remote_attempted.saturating_add(1);
-            match self.try_send_next_hop(&next_hop, frame) {
-                Ok(()) => stats.remote_enqueued = stats.remote_enqueued.saturating_add(1),
+                metadata,
+                destinations,
+                payload,
+            ) else {
+                stats.remote_full = stats.remote_full.saturating_add(1);
+                self.counters
+                    .queue_full_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            match conn.try_pooled_datagram(datagram) {
+                Ok(()) => {
+                    stats.remote_enqueued = stats.remote_enqueued.saturating_add(1);
+                    return;
+                }
                 Err(GossipError::WriteQueueFull) => {
                     stats.remote_full = stats.remote_full.saturating_add(1);
                     self.counters
                         .queue_full_drops
                         .fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
-                Err(_) => {
-                    stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1)
+                Err(err) => {
+                    tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub UDP datagram send failed");
+                    stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1);
+                    return;
                 }
             }
         }
-        Ok(())
+
+        let Some((frame, prefix, payload_len)) = encode_fast_frame_pooled(
+            topic_key,
+            type_hash,
+            msg_id,
+            &self.local_peer_id,
+            &self.local_peer_id,
+            policy.hops_limit,
+            policy.mode,
+            metadata,
+            destinations,
+            payload,
+        ) else {
+            stats.remote_full = stats.remote_full.saturating_add(1);
+            self.counters
+                .queue_full_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        match conn.try_pubsub_frame_pooled(frame, prefix, payload_len) {
+            Ok(()) => stats.remote_enqueued = stats.remote_enqueued.saturating_add(1),
+            Err(GossipError::WriteQueueFull) => {
+                stats.remote_full = stats.remote_full.saturating_add(1);
+                self.counters
+                    .queue_full_drops
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub send failed");
+                stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1)
+            }
+        }
     }
 
     pub async fn refresh_control_plane(&self) {
@@ -386,31 +870,113 @@ impl RoutedPubSub {
                     .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
                     .collect()
             };
-            for next_hop in grouped.keys() {
-                if next_conns
-                    .get(next_hop)
-                    .map(|conn| conn.is_closed())
-                    .unwrap_or(true)
+
+            // Subscriptions are gated on the pool already holding a live
+            // connection to each next-hop. We deliberately do NOT call
+            // `client.lookup_peer` here: it goes through
+            // `pool.get_connection_to_peer` → `get_connection_by_peer_id`,
+            // which warn-logs the "No connection found for peer" pair on
+            // every miss (`connection_pool::pool_connect.rs:669-682`).
+            // With this refresh ticking at `CONTROL_PLANE_INTERVAL`
+            // (25 ms), an unreachable peer whose interest entry is being
+            // re-gossiped to us produces ~80 warn lines/sec — observed on
+            // `stratum-devnet-a` 2026-05-11.
+            //
+            // Connection lifecycle belongs to the gossip/peer-discovery
+            // layer (`peer_discovery.rs`), not to pubsub. We just
+            // observe pool state via the non-warning
+            // `lookup_connected_peer` and route only to next-hops the
+            // pool currently has a usable connection for. When a peer
+            // (re)connects, the next refresh tick picks it up. When a
+            // peer drops, the next refresh tick removes it — the user's
+            // "subscription terminates on disconnect; re-subscribes on
+            // reconnect" invariant.
+            let mut routable: HashMap<PeerId, Arc<[PeerId]>> = HashMap::new();
+            for (next_hop, destinations) in grouped {
+                let cached_live = next_conns
+                    .get(&next_hop)
+                    .map(|conn| !conn.is_closed())
+                    .unwrap_or(false);
+                if cached_live {
+                    routable.insert(next_hop, destinations);
+                    continue;
+                }
+                // Silent pre-check: only call into pool lookup paths
+                // (which warn on miss inside
+                // `get_connection_by_peer_id`) when the pool already
+                // holds a usable connection. `has_connection_by_peer_id`
+                // is the only non-warning peer-presence test on the pool.
+                if !self
+                    .registry
+                    .connection_pool
+                    .has_connection_by_peer_id(&next_hop)
                 {
-                    if let Ok(peer_ref) = self.client.lookup_peer(next_hop).await
-                        && let Some(conn) = peer_ref.connection_ref()
-                    {
-                        next_conns.insert(next_hop.clone(), conn);
-                    }
+                    next_conns.remove(&next_hop);
+                    continue;
+                }
+                if let Some(peer_ref) = self.client.lookup_connected_peer(&next_hop)
+                    && let Some(conn) = peer_ref.connection_ref()
+                {
+                    next_conns.insert(next_hop.clone(), conn);
+                    routable.insert(next_hop, destinations);
+                } else {
+                    next_conns.remove(&next_hop);
                 }
             }
-            next_routes.insert(topic, Arc::new(grouped));
+            if !routable.is_empty() {
+                next_routes.insert(topic, Arc::new(routable));
+            }
         }
+        self.refresh_hot_route_groups(&next_routes, &next_conns);
         self.route_groups.store(Arc::new(next_routes));
         self.conns.store(Arc::new(next_conns));
     }
 
+    fn refresh_hot_route_groups(
+        &self,
+        routes: &HashMap<TopicKey, Arc<RouteGroups>>,
+        conns: &HashMap<PeerId, crate::RemoteConnection>,
+    ) {
+        if routes.len() == 1
+            && let Some((&topic_key, groups)) = routes.iter().next()
+        {
+            let mut entries = Vec::with_capacity(groups.len());
+            for (next_hop, destinations) in groups.iter() {
+                let Some(conn) = conns.get(next_hop) else {
+                    self.hot_route_groups.store(None);
+                    return;
+                };
+                entries.push(HotRouteEntry {
+                    next_hop: next_hop.clone(),
+                    destinations: Arc::clone(destinations),
+                    conn: conn.clone(),
+                    supports_pooled_datagram: conn.supports_pooled_datagram(),
+                });
+            }
+            self.hot_route_groups.store(Some(Arc::new(HotRouteGroups {
+                topic_key,
+                entries: entries.into_boxed_slice().into(),
+            })));
+        } else {
+            self.hot_route_groups.store(None);
+        }
+    }
+
     fn deliver_local(&self, topic_key: u64, type_hash: u64, payload: Bytes) -> u32 {
         let mut delivered = 0u32;
+        let borrowed_subscribers = self.borrowed_subscribers.load();
+        if let Some(callbacks) = borrowed_subscribers.get(&(topic_key, type_hash)).cloned() {
+            for entry in callbacks.iter() {
+                entry.deliver(payload.as_ref(), PubSubFrameMetadata::default());
+                delivered = delivered.saturating_add(1);
+            }
+        }
+        drop(borrowed_subscribers);
+
         let subscribers = self.subscribers.load();
         if let Some(callbacks) = subscribers.get(&(topic_key, type_hash)).cloned() {
-            for callback in callbacks.iter() {
-                callback(Bytes::clone(&payload));
+            for entry in callbacks.iter() {
+                entry.deliver(Bytes::clone(&payload));
                 delivered = delivered.saturating_add(1);
             }
         }
@@ -419,82 +985,185 @@ impl RoutedPubSub {
         let type_subscribers = self.type_subscribers.load();
         if let Some(callbacks) = type_subscribers.get(&type_hash).cloned() {
             for callback in callbacks.iter() {
-                callback(topic_key, Bytes::clone(&payload));
+                callback.deliver(topic_key, Bytes::clone(&payload));
                 delivered = delivered.saturating_add(1);
             }
         }
         delivered
     }
 
-    fn groups_for_scope(&self, topic_key: u64, scope: PubSubScope) -> RouteGroups {
-        match scope {
-            PubSubScope::LocalOnly => HashMap::new(),
-            PubSubScope::AutoExternal | PubSubScope::ClusterWide => self
-                .route_groups
-                .load()
-                .get(&topic_key)
-                .map(|groups| groups.as_ref().clone())
-                .unwrap_or_default(),
-            PubSubScope::SelectedPeers(peers) => {
-                if let Some(provider) = self.route_provider.load().as_ref() {
-                    provider.group_destinations(topic_key, &peers)
-                } else {
-                    peers
-                        .into_iter()
-                        .filter(|peer| peer != &self.local_peer_id)
-                        .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                        .collect()
-                }
+    fn deliver_local_borrowed(
+        &self,
+        topic_key: u64,
+        type_hash: u64,
+        payload: &[u8],
+        metadata: PubSubFrameMetadata,
+    ) -> u32 {
+        let hot_subscriber = self.hot_borrowed_subscriber.load();
+        if let Some(hot) = hot_subscriber.as_ref()
+            && hot.key == (topic_key, type_hash)
+        {
+            hot.entry.deliver(payload, metadata);
+            return 1;
+        }
+        drop(hot_subscriber);
+
+        let mut delivered = 0u32;
+        let borrowed_subscribers = self.borrowed_subscribers.load();
+        if let Some(callbacks) = borrowed_subscribers.get(&(topic_key, type_hash)).cloned() {
+            for entry in callbacks.iter() {
+                entry.deliver(payload, metadata);
+                delivered = delivered.saturating_add(1);
             }
         }
+        drop(borrowed_subscribers);
+
+        let subscribers = self.subscribers.load();
+        if let Some(callbacks) = subscribers.get(&(topic_key, type_hash)).cloned() {
+            let owned = Bytes::copy_from_slice(payload);
+            for entry in callbacks.iter() {
+                entry.deliver(Bytes::clone(&owned));
+                delivered = delivered.saturating_add(1);
+            }
+        }
+        drop(subscribers);
+
+        let type_subscribers = self.type_subscribers.load();
+        if let Some(callbacks) = type_subscribers.get(&type_hash).cloned() {
+            let owned = Bytes::copy_from_slice(payload);
+            for callback in callbacks.iter() {
+                callback.deliver(topic_key, Bytes::clone(&owned));
+                delivered = delivered.saturating_add(1);
+            }
+        }
+        delivered
+    }
+
+    fn refresh_hot_borrowed_subscriber(
+        &self,
+        key: SubscriberKey,
+        entries: &[BorrowedSubscriberEntry],
+    ) {
+        if entries.len() == 1 {
+            self.hot_borrowed_subscriber
+                .store(Some(Arc::new(HotBorrowedSubscriber {
+                    key,
+                    entry: entries[0].clone(),
+                })));
+        } else {
+            self.hot_borrowed_subscriber.store(None);
+        }
+    }
+
+    fn lookup_next_hop_conn(&self, next_hop: &PeerId) -> Result<crate::RemoteConnection> {
+        let conns = self.conns.load();
+        if let Some(conn) = conns.get(next_hop) {
+            return Ok(conn.clone());
+        }
+        if let Some(peer_ref) = self.client.lookup_connected_peer(next_hop)
+            && let Some(conn) = peer_ref.connection_ref()
+        {
+            let mut next = (**conns).clone();
+            next.insert(next_hop.clone(), conn.clone());
+            self.conns.store(Arc::new(next));
+            return Ok(conn);
+        }
+        self.counters
+            .route_miss_drops
+            .fetch_add(1, Ordering::Relaxed);
+        Err(GossipError::ActorNotFound("missing pubsub next-hop".into()))
     }
 
     fn try_send_next_hop(&self, next_hop: &PeerId, frame: Bytes) -> Result<()> {
-        let conns = self.conns.load();
-        let Some(conn) = conns.get(next_hop) else {
-            self.counters
-                .route_miss_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(GossipError::ActorNotFound("missing pubsub next-hop".into()));
-        };
-        conn.try_pubsub_frame(frame)
+        self.lookup_next_hop_conn(next_hop)?.try_pubsub_frame(frame)
+    }
+
+    fn try_send_next_hop_pooled(
+        &self,
+        next_hop: &PeerId,
+        frame: crate::typed::PooledPayload,
+        prefix: Option<[u8; 16]>,
+        payload_len: usize,
+    ) -> Result<()> {
+        self.lookup_next_hop_conn(next_hop)?
+            .try_pubsub_frame_pooled(frame, prefix, payload_len)
     }
 
     fn note_interest(&self, topic_key: u64, present: bool) {
-        let mut counts = match self.local_counts.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
+        let (prev, _next, generation) = {
+            let mut state = match self.interest_state.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let prev = state.local_counts.get(&topic_key).copied().unwrap_or(0);
+            let next = if present {
+                prev.saturating_add(1)
+            } else {
+                prev.saturating_sub(1)
+            };
+            if next == 0 {
+                state.local_counts.remove(&topic_key);
+            } else {
+                state.local_counts.insert(topic_key, next);
+            }
+
+            let generation = if (present && prev == 0) || (!present && prev == 1) {
+                let next_generation = state
+                    .generations
+                    .get(&topic_key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                state.generations.insert(topic_key, next_generation);
+                next_generation
+            } else {
+                state.generations.get(&topic_key).copied().unwrap_or(0)
+            };
+            (prev, next, generation)
         };
-        let prev = counts.get(&topic_key).copied().unwrap_or(0);
-        let next = if present {
-            prev.saturating_add(1)
-        } else {
-            prev.saturating_sub(1)
-        };
-        if next == 0 {
-            counts.remove(&topic_key);
-        } else {
-            counts.insert(topic_key, next);
-        }
-        drop(counts);
 
         if (present && prev == 0) || (!present && prev == 1) {
             let registry = Arc::clone(&self.registry);
             let peer = self.local_peer_id.clone();
+            let interest_state = Arc::clone(&self.interest_state);
             tokio::spawn(async move {
+                let (current_present, current_generation) = {
+                    let state = match interest_state.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    (
+                        state.local_counts.get(&topic_key).copied().unwrap_or(0) > 0,
+                        state.generations.get(&topic_key).copied().unwrap_or(0),
+                    )
+                };
+                if current_present != present || current_generation != generation {
+                    return;
+                }
+
                 let name = interest_name(topic_key, &peer);
-                if present {
+                let result = if present {
                     let mut location = RemoteActorLocation::new_with_peer(registry.bind_addr, peer);
                     location.priority = RegistrationPriority::Immediate;
-                    let _ = registry
+                    registry
                         .register_actor_with_priority(
                             name,
                             location,
                             RegistrationPriority::Immediate,
                         )
-                        .await;
+                        .await
+                        .map(|_| ())
                 } else {
-                    let _ = registry.unregister_actor(&name).await;
+                    registry.unregister_actor(&name).await.map(|_| ())
+                };
+                if let Err(err) = result {
+                    warn!(
+                        topic_key,
+                        present,
+                        generation,
+                        error = %err,
+                        "failed to update pubsub interest actor"
+                    );
                 }
             });
         }
@@ -515,26 +1184,62 @@ impl RoutedPubSub {
     }
 
     fn accept_seen(&self, origin: &PeerId, msg_id: u128) -> bool {
-        let mut seen = match self.seen.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        if seen
-            .iter()
-            .any(|entry| entry.0 == *origin && entry.1 == msg_id)
-        {
-            return false;
+        let fingerprint = seen_fingerprint(origin, msg_id);
+        self.accept_seen_fingerprint(fingerprint)
+    }
+
+    fn accept_seen_bytes(&self, origin: &[u8; 32], msg_id: u128) -> bool {
+        let fingerprint = seen_fingerprint_bytes(origin, msg_id);
+        self.accept_seen_fingerprint(fingerprint)
+    }
+
+    fn accept_seen_fingerprint(&self, fingerprint: u64) -> bool {
+        let slot =
+            &self.seen_fingerprints[(fingerprint as usize) & (self.seen_fingerprints.len() - 1)];
+        let mut current = slot.load(Ordering::Relaxed);
+        loop {
+            if current == fingerprint {
+                return false;
+            }
+            match slot.compare_exchange_weak(
+                current,
+                fingerprint,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(next) => current = next,
+            }
         }
-        if seen.len() >= DEFAULT_SEEN_CAPACITY {
-            seen.remove(0);
-        }
-        seen.push((origin.clone(), msg_id));
-        true
     }
 }
 
 impl PubSubIngressHandler for RoutedPubSub {
-    fn handle_pubsub_frame(&self, payload: crate::AlignedBytes) -> Result<()> {
+    fn handle_pubsub_frame_borrowed(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: &[u8],
+    ) -> Result<()> {
+        if payload.starts_with(FAST_FRAME_MAGIC) {
+            return self.handle_fast_pubsub_frame(authenticated_source_peer_id, payload);
+        }
+
+        let owned = crate::AlignedBytes::from_pooled_slice(
+            payload,
+            Arc::new(crate::AlignedBytesPool::default()),
+        );
+        self.handle_pubsub_frame(authenticated_source_peer_id, owned)
+    }
+
+    fn handle_pubsub_frame(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        payload: crate::AlignedBytes,
+    ) -> Result<()> {
+        if payload.as_ref().starts_with(FAST_FRAME_MAGIC) {
+            return self.handle_fast_pubsub_frame(authenticated_source_peer_id, payload.as_ref());
+        }
+
         let frame = match crate::decode_typed::<PubSubFrameV1>(payload.as_ref()) {
             Ok(frame) => frame,
             Err(err) => {
@@ -544,6 +1249,12 @@ impl PubSubIngressHandler for RoutedPubSub {
         };
         if frame.hops_remaining == 0 {
             self.counters.ttl_drops.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if frame.source_peer_id != *authenticated_source_peer_id {
+            self.counters
+                .reflection_drops
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         if frame.origin_peer_id == self.local_peer_id || frame.source_peer_id == self.local_peer_id
@@ -628,6 +1339,130 @@ impl PubSubIngressHandler for RoutedPubSub {
     }
 }
 
+impl RoutedPubSub {
+    fn handle_fast_pubsub_frame(
+        &self,
+        authenticated_source_peer_id: &PeerId,
+        frame: &[u8],
+    ) -> Result<()> {
+        let Some(decoded) = FastFrameView::parse(frame) else {
+            self.counters.decode_drops.fetch_add(1, Ordering::Relaxed);
+            return Err(GossipError::InvalidConfig(
+                "malformed fast pubsub frame".into(),
+            ));
+        };
+        if decoded.hops_remaining == 0 {
+            self.counters.ttl_drops.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if decoded.source_peer_id != *authenticated_source_peer_id.as_bytes() {
+            self.counters
+                .reflection_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let local_peer_id = self.local_peer_id.as_bytes();
+        if decoded.origin_peer_id == *local_peer_id || decoded.source_peer_id == *local_peer_id {
+            self.counters
+                .reflection_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if !self.accept_seen_bytes(&decoded.origin_peer_id, decoded.msg_id) {
+            self.counters
+                .duplicate_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.counters.accepted.fetch_add(1, Ordering::Relaxed);
+
+        let mut should_deliver_local = false;
+        let mut has_remaining = false;
+        for index in 0..decoded.destination_count {
+            let Some(peer) = decoded.destination_peer_bytes_at(index) else {
+                self.counters.decode_drops.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            };
+            if peer == local_peer_id {
+                should_deliver_local = true;
+            } else {
+                has_remaining = true;
+            }
+        }
+
+        if should_deliver_local {
+            let delivered = self.deliver_local_borrowed(
+                decoded.topic_key,
+                decoded.type_hash,
+                decoded.payload,
+                decoded.metadata,
+            );
+            self.counters
+                .delivered_local
+                .fetch_add(delivered as u64, Ordering::Relaxed);
+        }
+
+        if decoded.hops_remaining <= 1 || !has_remaining {
+            return Ok(());
+        }
+
+        let origin_peer_id = match PeerId::from_bytes(&decoded.origin_peer_id) {
+            Ok(peer_id) => peer_id,
+            Err(err) => {
+                self.counters.decode_drops.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
+        let remaining: Vec<PeerId> = decoded
+            .destination_peer_iter()
+            .filter(|peer| peer.as_bytes() != local_peer_id)
+            .collect();
+        let grouped = if let Some(provider) = self.route_provider.load().as_ref() {
+            provider.group_destinations(decoded.topic_key, &remaining)
+        } else {
+            remaining
+                .into_iter()
+                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                .collect()
+        };
+        for (next_hop, peers) in grouped {
+            let Some((encoded, prefix, payload_len)) = encode_fast_frame_pooled(
+                decoded.topic_key,
+                decoded.type_hash,
+                decoded.msg_id,
+                &origin_peer_id,
+                &self.local_peer_id,
+                decoded.hops_remaining.saturating_sub(1),
+                decoded.mode,
+                decoded.metadata,
+                peers.as_ref(),
+                decoded.payload,
+            ) else {
+                self.counters
+                    .queue_full_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            match self.try_send_next_hop_pooled(&next_hop, encoded, prefix, payload_len) {
+                Ok(()) => {
+                    self.counters
+                        .forwarded_frames
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(GossipError::WriteQueueFull) => {
+                    self.counters
+                        .queue_full_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to forward fast routed pubsub frame");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn encode_frame(
     topic_key: u64,
     type_hash: u64,
@@ -653,6 +1488,229 @@ fn encode_frame(
     crate::encode_typed(&frame)
 }
 
+struct FastFrameView<'a> {
+    topic_key: u64,
+    type_hash: u64,
+    msg_id: u128,
+    origin_peer_id: [u8; 32],
+    source_peer_id: [u8; 32],
+    hops_remaining: u8,
+    mode: PubSubDeliveryMode,
+    metadata: PubSubFrameMetadata,
+    destination_peers: &'a [u8],
+    destination_count: usize,
+    payload: &'a [u8],
+}
+
+impl<'a> FastFrameView<'a> {
+    fn parse(frame: &'a [u8]) -> Option<Self> {
+        if frame.len() < FAST_FRAME_HEADER_LEN || &frame[..4] != FAST_FRAME_MAGIC {
+            return None;
+        }
+        if frame[4] != 1 {
+            return None;
+        }
+        let mode = decode_delivery_mode(frame[5])?;
+        let hops_remaining = frame[6];
+        let topic_key = u64::from_be_bytes(frame[8..16].try_into().ok()?);
+        let type_hash = u64::from_be_bytes(frame[16..24].try_into().ok()?);
+        let msg_id = u128::from_be_bytes(frame[24..40].try_into().ok()?);
+        let origin_peer_id = frame[40..72].try_into().ok()?;
+        let source_peer_id = frame[72..104].try_into().ok()?;
+        let destination_count = u16::from_be_bytes(frame[104..106].try_into().ok()?) as usize;
+        let metadata = PubSubFrameMetadata {
+            publisher_enqueued_ns: u64::from_be_bytes(frame[112..120].try_into().ok()?),
+        };
+        let destinations_len = destination_count.checked_mul(FAST_FRAME_DEST_PEER_LEN)?;
+        let payload_offset = FAST_FRAME_HEADER_LEN.checked_add(destinations_len)?;
+        if payload_offset > frame.len() {
+            return None;
+        }
+        let destination_peers = &frame[FAST_FRAME_HEADER_LEN..payload_offset];
+        Some(Self {
+            topic_key,
+            type_hash,
+            msg_id,
+            origin_peer_id,
+            source_peer_id,
+            hops_remaining,
+            mode,
+            metadata,
+            destination_peers,
+            destination_count,
+            payload: &frame[payload_offset..],
+        })
+    }
+
+    fn destination_peer_bytes_at(&self, index: usize) -> Option<&'a [u8; 32]> {
+        if index >= self.destination_count {
+            return None;
+        }
+        let start = index.checked_mul(FAST_FRAME_DEST_PEER_LEN)?;
+        let end = start.checked_add(FAST_FRAME_DEST_PEER_LEN)?;
+        self.destination_peers[start..end].try_into().ok()
+    }
+
+    fn destination_peer_at(&self, index: usize) -> Option<PeerId> {
+        PeerId::from_bytes(self.destination_peer_bytes_at(index)?).ok()
+    }
+
+    fn destination_peer_iter(&self) -> impl Iterator<Item = PeerId> + '_ {
+        (0..self.destination_count).filter_map(|index| self.destination_peer_at(index))
+    }
+}
+
+fn encode_delivery_mode(mode: PubSubDeliveryMode) -> u8 {
+    match mode {
+        PubSubDeliveryMode::AtMostOnce => 0,
+        PubSubDeliveryMode::AtLeastOnceHopAck => 1,
+    }
+}
+
+fn decode_delivery_mode(mode: u8) -> Option<PubSubDeliveryMode> {
+    match mode {
+        0 => Some(PubSubDeliveryMode::AtMostOnce),
+        1 => Some(PubSubDeliveryMode::AtLeastOnceHopAck),
+        _ => None,
+    }
+}
+
+fn new_seen_fingerprints() -> Box<[AtomicU64]> {
+    debug_assert!(SEEN_FINGERPRINT_SLOTS.is_power_of_two());
+    (0..SEEN_FINGERPRINT_SLOTS)
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn seen_fingerprint(origin: &PeerId, msg_id: u128) -> u64 {
+    seen_fingerprint_bytes(origin.as_bytes(), msg_id)
+}
+
+fn seen_fingerprint_bytes(origin: &[u8; 32], msg_id: u128) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    #[inline]
+    fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    let hash = mix(mix(FNV_OFFSET, origin), &msg_id.to_be_bytes());
+    if hash == 0 { 1 } else { hash }
+}
+
+fn encode_fast_frame_pooled(
+    topic_key: u64,
+    type_hash: u64,
+    msg_id: u128,
+    origin_peer_id: &PeerId,
+    source_peer_id: &PeerId,
+    hops_remaining: u8,
+    mode: PubSubDeliveryMode,
+    metadata: PubSubFrameMetadata,
+    destination_peers: &[PeerId],
+    payload: &[u8],
+) -> Option<(crate::typed::PooledPayload, Option<[u8; 16]>, usize)> {
+    let payload_len = fast_frame_len(destination_peers, payload);
+    let pooled = crate::typed::PooledPayload::try_from_pooled_bytes(payload_len, |out| {
+        write_fast_frame(
+            out,
+            topic_key,
+            type_hash,
+            msg_id,
+            origin_peer_id,
+            source_peer_id,
+            hops_remaining,
+            mode,
+            metadata,
+            destination_peers,
+            payload,
+        );
+    })?;
+    Some((pooled, None, payload_len))
+}
+
+fn encode_fast_pubsub_datagram_pooled(
+    topic_key: u64,
+    type_hash: u64,
+    msg_id: u128,
+    origin_peer_id: &PeerId,
+    source_peer_id: &PeerId,
+    hops_remaining: u8,
+    mode: PubSubDeliveryMode,
+    metadata: PubSubFrameMetadata,
+    destination_peers: &[PeerId],
+    payload: &[u8],
+) -> Option<crate::typed::PooledPayload> {
+    let payload_len = fast_frame_len(destination_peers, payload);
+    let header = crate::framing::write_pubsub_frame_prefix(payload_len);
+    let datagram_len = header.len().saturating_add(payload_len);
+    crate::typed::PooledPayload::try_from_pooled_bytes(datagram_len, |out| {
+        out.extend_from_slice(&header);
+        write_fast_frame(
+            out,
+            topic_key,
+            type_hash,
+            msg_id,
+            origin_peer_id,
+            source_peer_id,
+            hops_remaining,
+            mode,
+            metadata,
+            destination_peers,
+            payload,
+        );
+    })
+}
+
+fn fast_frame_len(destination_peers: &[PeerId], payload: &[u8]) -> usize {
+    FAST_FRAME_HEADER_LEN
+        .saturating_add(
+            destination_peers
+                .len()
+                .saturating_mul(FAST_FRAME_DEST_PEER_LEN),
+        )
+        .saturating_add(payload.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_fast_frame(
+    out: &mut Vec<u8>,
+    topic_key: u64,
+    type_hash: u64,
+    msg_id: u128,
+    origin_peer_id: &PeerId,
+    source_peer_id: &PeerId,
+    hops_remaining: u8,
+    mode: PubSubDeliveryMode,
+    metadata: PubSubFrameMetadata,
+    destination_peers: &[PeerId],
+    payload: &[u8],
+) {
+    out.extend_from_slice(FAST_FRAME_MAGIC);
+    out.push(1);
+    out.push(encode_delivery_mode(mode));
+    out.push(hops_remaining);
+    out.push(0);
+    out.extend_from_slice(&topic_key.to_be_bytes());
+    out.extend_from_slice(&type_hash.to_be_bytes());
+    out.extend_from_slice(&msg_id.to_be_bytes());
+    out.extend_from_slice(origin_peer_id.as_bytes());
+    out.extend_from_slice(source_peer_id.as_bytes());
+    out.extend_from_slice(&(destination_peers.len() as u16).to_be_bytes());
+    out.extend_from_slice(&[0u8; 6]);
+    out.extend_from_slice(&metadata.publisher_enqueued_ns.to_be_bytes());
+    for peer in destination_peers {
+        out.extend_from_slice(peer.as_bytes());
+    }
+    out.extend_from_slice(payload);
+}
+
 pub fn topic_key(topic: &str) -> u64 {
     crate::typed::fnv1a_hash(topic)
 }
@@ -672,6 +1730,189 @@ fn parse_interest_name(name: &str) -> Option<(u64, PeerId)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Buf;
+
+    fn test_pubsub(registry_peer_seed: &str) -> RoutedPubSub {
+        crate::typed::prewarm_pooled_byte_buffers(
+            FAST_FRAME_POOL_BUFFERS,
+            FAST_FRAME_POOL_BUFFER_CAPACITY,
+        );
+        let mut config = crate::GossipConfig::default();
+        config.key_pair = Some(crate::KeyPair::new_for_testing(registry_peer_seed));
+        let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+        ));
+        RoutedPubSub {
+            local_peer_id: registry.peer_id.clone(),
+            client: crate::GossipClient::from_registry(Arc::clone(&registry)),
+            registry,
+            subscribers: ArcSwap::from_pointee(HashMap::new()),
+            borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            hot_borrowed_subscriber: ArcSwapOption::empty(),
+            type_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            interest_state: Arc::new(Mutex::new(InterestState::default())),
+            route_groups: ArcSwap::from_pointee(HashMap::new()),
+            hot_route_groups: ArcSwapOption::empty(),
+            conns: ArcSwap::from_pointee(HashMap::new()),
+            seen_fingerprints: new_seen_fingerprints(),
+            counters: PubSubIngressCounters::default(),
+            next_sub_id: AtomicU64::new(1),
+            next_msg_id: AtomicU64::new(1),
+            route_provider: ArcSwap::from_pointee(None),
+        }
+    }
+
+    fn add_test_subscriber<F>(pubsub: &RoutedPubSub, topic: u64, type_hash: u64, deliver: F)
+    where
+        F: Fn(Bytes) + Send + Sync + 'static,
+    {
+        let mut next = (*pubsub.subscribers.load_full()).clone();
+        next.insert(
+            (topic, type_hash),
+            Arc::from(vec![SubscriberEntry::new(1, deliver)].into_boxed_slice()),
+        );
+        pubsub.subscribers.store(Arc::new(next));
+    }
+
+    #[test]
+    fn pubsub_rejects_source_peer_id_that_does_not_match_authenticated_peer() {
+        let pubsub = test_pubsub("pubsub-local-auth-mismatch");
+        let victim = crate::KeyPair::new_for_testing("pubsub-victim-auth-mismatch").peer_id();
+        let attacker = crate::KeyPair::new_for_testing("pubsub-attacker-auth-mismatch").peer_id();
+        let topic = topic_key("auth-mismatch");
+        let type_hash = 99;
+        let delivered = Arc::new(AtomicU64::new(0));
+        let delivered_for_sub = Arc::clone(&delivered);
+        add_test_subscriber(&pubsub, topic, type_hash, move |_| {
+            delivered_for_sub.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let (spoofed, _, _) = encode_fast_frame_pooled(
+            topic,
+            type_hash,
+            42,
+            &victim,
+            &attacker,
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
+            std::slice::from_ref(&pubsub.local_peer_id),
+            b"spoofed",
+        )
+        .unwrap();
+
+        pubsub
+            .handle_pubsub_frame_borrowed(&victim, spoofed.chunk())
+            .unwrap();
+
+        let stats = pubsub.stats();
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.delivered_local, 0);
+        assert_eq!(stats.reflection_drops, 1);
+        assert_eq!(delivered.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rejected_spoofed_pubsub_frame_does_not_poison_seen_entries() {
+        let pubsub = test_pubsub("pubsub-local-no-poison");
+        let victim = crate::KeyPair::new_for_testing("pubsub-victim-no-poison").peer_id();
+        let attacker = crate::KeyPair::new_for_testing("pubsub-attacker-no-poison").peer_id();
+        let topic = topic_key("no-poison");
+        let type_hash = 101;
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let delivered_for_sub = Arc::clone(&delivered);
+        add_test_subscriber(&pubsub, topic, type_hash, move |payload| {
+            delivered_for_sub.lock().unwrap().push(payload);
+        });
+
+        let (spoofed, _, _) = encode_fast_frame_pooled(
+            topic,
+            type_hash,
+            7,
+            &victim,
+            &attacker,
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
+            std::slice::from_ref(&pubsub.local_peer_id),
+            b"spoofed",
+        )
+        .unwrap();
+        pubsub
+            .handle_pubsub_frame_borrowed(&victim, spoofed.chunk())
+            .unwrap();
+
+        let (legitimate, _, _) = encode_fast_frame_pooled(
+            topic,
+            type_hash,
+            7,
+            &victim,
+            &victim,
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
+            std::slice::from_ref(&pubsub.local_peer_id),
+            b"legitimate",
+        )
+        .unwrap();
+        pubsub
+            .handle_pubsub_frame_borrowed(&victim, legitimate.chunk())
+            .unwrap();
+
+        let stats = pubsub.stats();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.delivered_local, 1);
+        assert_eq!(stats.duplicate_drops, 0);
+        assert_eq!(stats.reflection_drops, 1);
+        let deliveries = delivered.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].as_ref(), b"legitimate");
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_removes_the_requested_subscription_not_last_in_vector() {
+        let pubsub = test_pubsub("pubsub-unsubscribe-by-id");
+        let topic = topic_key("unsubscribe-by-id");
+        let type_hash = 202;
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+
+        let delivered_first = Arc::clone(&delivered);
+        let first = pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            delivered_first.lock().unwrap().push("first");
+        });
+        let delivered_second = Arc::clone(&delivered);
+        let second = pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            delivered_second.lock().unwrap().push("second");
+        });
+
+        assert!(pubsub.unsubscribe(first));
+        pubsub
+            .publish_bytes(
+                topic,
+                type_hash,
+                Bytes::from_static(b"payload"),
+                PubSubScope::LocalOnly,
+                PubSubDeliveryPolicy::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            delivered.lock().unwrap().as_slice(),
+            &["second"],
+            "non-LIFO unsubscribe must remove the subscription identified by id"
+        );
+        assert!(pubsub.unsubscribe(second));
+        assert!(
+            !pubsub
+                .interest_state
+                .lock()
+                .unwrap()
+                .local_counts
+                .contains_key(&topic),
+            "interest count must be removed after the final unsubscribe"
+        );
+    }
 
     #[test]
     fn interest_name_round_trips() {
@@ -681,6 +1922,10 @@ mod tests {
         assert_eq!(parse_interest_name(&name), Some((topic, peer)));
     }
 
+    #[cfg_attr(
+        feature = "strict-zero-copy",
+        ignore = "legacy copying encoder is rejected"
+    )]
     #[test]
     fn pubsub_frame_v1_borrowed_encoder_is_wire_compatible() {
         let peer = crate::KeyPair::new_for_testing("pubsub-frame").peer_id();

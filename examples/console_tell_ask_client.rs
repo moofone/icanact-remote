@@ -109,12 +109,16 @@ async fn main() -> Result<()> {
     println!("Client key: {}\n", client_key_path);
     println!("Actor Id: 0x{:016x}\n", ACTOR_ID);
 
-    let mut config = GossipConfig::default();
-    config.ask_window = ask_concurrency.max(1);
-    if !use_direct_timeout {
+    let config = GossipConfig {
+        ask_window: ask_concurrency.max(1),
         // Disable per-request timeouts to avoid timer allocations in the hot path.
-        config.response_timeout = Duration::ZERO;
-    }
+        response_timeout: if use_direct_timeout {
+            GossipConfig::default().response_timeout
+        } else {
+            Duration::ZERO
+        },
+        ..Default::default()
+    };
     // Bind to loopback by default to keep the 2-terminal benchmark self-contained.
     // (Some sandboxed environments disallow binding 0.0.0.0.)
     let registry = GossipRegistryHandle::new_with_transport_stack(
@@ -523,7 +527,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_args<I>(args: I) -> Result<(String, usize, usize, usize, bool, bool, bool, bool)>
+type ParsedArgs = (String, usize, usize, usize, bool, bool, bool, bool);
+
+fn parse_args<I>(args: I) -> Result<ParsedArgs>
 where
     I: IntoIterator<Item = String>,
 {
@@ -568,7 +574,7 @@ where
     }
 
     if !numeric_args.is_empty() {
-        tell_count = numeric_args.get(0).copied();
+        tell_count = numeric_args.first().copied();
         ask_count = numeric_args.get(1).copied();
         ask_concurrency = numeric_args.get(2).copied();
         if numeric_args.len() > 3 {

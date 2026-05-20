@@ -1,3 +1,29 @@
+#![allow(
+    clippy::items_after_test_module,
+    reason = "legacy lint debt outside the focused gossip QA fix"
+)]
+#![expect(
+    clippy::borrow_deref_ref,
+    clippy::collapsible_if,
+    clippy::default_constructed_unit_structs,
+    clippy::field_reassign_with_default,
+    clippy::manual_is_multiple_of,
+    clippy::map_entry,
+    clippy::missing_safety_doc,
+    clippy::needless_borrow,
+    clippy::needless_lifetimes,
+    clippy::needless_return,
+    clippy::new_without_default,
+    clippy::option_as_ref_deref,
+    clippy::question_mark,
+    clippy::redundant_pattern_matching,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::vec_box,
+    reason = "legacy lint debt outside the focused gossip QA fix"
+)]
+
 pub mod aligned;
 mod ask_forwarder;
 mod ask_responder;
@@ -54,16 +80,17 @@ pub use lifecycle::{
 };
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use pubsub::{
-    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameV1, PubSubIngressHandler,
-    PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope, PubSubSubscription,
-    RoutedPubSub, topic_key,
+    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameMetadata, PubSubFrameV1,
+    PubSubIngressHandler, PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope,
+    PubSubSubscription, RoutedPubSub, topic_key,
 };
+pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
 pub use reply_to::{ReplyTo, TimeoutReplyTo};
 pub use transport::{
     AuthContext, PeerAuthenticator, RegistryTransportBootstrap, RemoteAddrMeta, TargetAddr,
-    TransportConnector, TransportListener, TransportStack,
+    TransportConnector, TransportListener, TransportStack, TransportWireKind,
 };
 pub use typed::{
     ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,
@@ -415,7 +442,7 @@ impl VectorClock {
 
             // Collect all entries and sort by clock value desc (drop small entries first).
             let mut entries: Vec<(NodeId, u64)> = current.iter().map(|(k, v)| (*k, *v)).collect();
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             entries.truncate(max_size);
 
             let mut next = BTreeMap::new();
@@ -680,6 +707,10 @@ impl std::fmt::Debug for KeyPair {
 pub struct PeerId([u8; 32]);
 
 impl PeerId {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Create a PeerId from a verifying key
     pub fn from_verifying_key(key: VerifyingKey) -> Self {
         Self(key.to_bytes())
@@ -777,11 +808,29 @@ pub struct Peer<T = ()> {
 impl<T: 'static> Peer<T> {
     /// Connect to this peer at the specified address
     pub async fn connect(&self, addr: &SocketAddr) -> Result<()> {
+        if self.peer_id == self.registry.peer_id {
+            tracing::warn!(
+                peer_id = %self.peer_id,
+                addr = %addr,
+                "refusing to dial local registry identity as a remote peer"
+            );
+            return Ok(());
+        }
+
         // Validate the address
         if addr.port() == 0 {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("Invalid port 0 for peer {}", self.peer_id),
+            )));
+        }
+        if addr.ip().is_unspecified() {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to connect peer {} via unspecified address {}",
+                    self.peer_id, addr
+                ),
             )));
         }
 
@@ -800,6 +849,7 @@ impl<T: 'static> Peer<T> {
             );
             let mut gossip_state = self.registry.gossip_state.lock().await;
             let current_time = crate::current_timestamp();
+            let current_time_ms = crate::current_timestamp_millis();
             let peers_before = gossip_state.peers.len();
 
             // Convert PeerId to NodeId for TLS
@@ -825,6 +875,7 @@ impl<T: 'static> Peer<T> {
                     consecutive_deltas: 0,
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
+                    last_response_received_ms: current_time_ms,
                 },
             );
             let peers_after = gossip_state.peers.len();
@@ -837,58 +888,43 @@ impl<T: 'static> Peer<T> {
             );
         }
 
-        if !self.registry.should_keep_connection(&self.peer_id, true) {
-            if let Some(existing_conn) = self
+        if let Some(existing_conn) = self
+            .registry
+            .connection_pool
+            .get_connection_by_peer_id(&self.peer_id)
+        {
+            let existing_is_outbound =
+                existing_conn.direction == crate::connection_pool::ConnectionDirection::Outbound;
+            if !self
                 .registry
-                .connection_pool
-                .get_connection_by_peer_id(&self.peer_id)
+                .should_keep_connection(&self.peer_id, existing_is_outbound)
             {
-                let existing_is_outbound = existing_conn.direction
-                    == crate::connection_pool::ConnectionDirection::Outbound;
-                if !self
-                    .registry
-                    .should_keep_connection(&self.peer_id, existing_is_outbound)
-                {
-                    tracing::info!(
-                        target: "icanact_remote_lifecycle",
-                        peer_id = %self.peer_id,
-                        addr = %existing_conn.addr,
-                        existing_direction = ?existing_conn.direction,
-                        "outbound_connect_suppressed_drop_wrong_direction"
-                    );
-                    crate::lifecycle::record_transport_event(
-                        crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
-                            peer: self.peer_id.clone(),
-                            addr: existing_conn.addr,
-                            direction: match existing_conn.direction {
-                                crate::connection_pool::ConnectionDirection::Inbound => {
-                                    crate::lifecycle::TransportDirection::Inbound
-                                }
-                                crate::connection_pool::ConnectionDirection::Outbound => {
-                                    crate::lifecycle::TransportDirection::Outbound
-                                }
-                            },
+                tracing::info!(
+                    target: "icanact_remote_lifecycle",
+                    peer_id = %self.peer_id,
+                    addr = %existing_conn.addr,
+                    existing_direction = ?existing_conn.direction,
+                    "outbound_connect_drop_wrong_direction_before_redial"
+                );
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
+                        peer: self.peer_id.clone(),
+                        addr: existing_conn.addr,
+                        direction: match existing_conn.direction {
+                            crate::connection_pool::ConnectionDirection::Inbound => {
+                                crate::lifecycle::TransportDirection::Inbound
+                            }
+                            crate::connection_pool::ConnectionDirection::Outbound => {
+                                crate::lifecycle::TransportDirection::Outbound
+                            }
                         },
-                    );
-                    let _ = self
-                        .registry
-                        .connection_pool
-                        .disconnect_connection_by_peer_id(&self.peer_id);
-                }
+                    },
+                );
+                let _ = self
+                    .registry
+                    .connection_pool
+                    .disconnect_connection_by_peer_id(&self.peer_id);
             }
-            tracing::info!(
-                target: "icanact_remote_lifecycle",
-                peer_id = %self.peer_id,
-                addr = %addr,
-                "outbound_connect_suppressed_prefer_inbound"
-            );
-            crate::lifecycle::record_transport_event(
-                crate::lifecycle::TransportLifecycleEvent::OutboundSuppressedPreferInbound {
-                    peer: self.peer_id.clone(),
-                    addr: *addr,
-                },
-            );
-            return Ok(());
         }
 
         // Then attempt to connect with enhanced error context
@@ -899,6 +935,15 @@ impl<T: 'static> Peer<T> {
                     addr = %addr,
                     "Successfully connected to peer"
                 );
+                {
+                    let mut gossip_state = self.registry.gossip_state.lock().await;
+                    if let Some(peer_info) = gossip_state.peers.get_mut(addr) {
+                        peer_info.failures = 0;
+                        peer_info.last_failure_time = None;
+                        peer_info.last_success = crate::current_timestamp();
+                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
+                    }
+                }
                 // Trigger an immediate gossip round to sync
                 let _ = self.registry.trigger_immediate_gossip().await;
                 Ok(())
@@ -1378,6 +1423,14 @@ pub fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Get current timestamp in milliseconds.
+pub fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
 /// Get current timestamp in nanoseconds for high precision timing
 pub fn current_timestamp_nanos() -> u64 {
     SystemTime::now()
@@ -1512,7 +1565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_connect_suppresses_outbound_when_tiebreak_prefers_inbound() {
+    async fn peer_connect_dials_even_when_tiebreak_prefers_inbound() {
         let (local_key, remote_key) = inbound_preferred_key_pair();
         let local_peer_id = local_key.peer_id();
         let remote_peer_id = remote_key.peer_id();
@@ -1535,9 +1588,11 @@ mod tests {
             registry: registry.clone(),
         };
 
-        peer.connect(&addr)
+        let err = peer
+            .connect(&addr)
             .await
-            .expect("inbound-preferred side should configure peer without dialing");
+            .expect_err("inbound-preferred side must still attempt the socket dial");
+        assert!(matches!(err, GossipError::Network(_)));
 
         assert_eq!(
             registry
@@ -1550,12 +1605,12 @@ mod tests {
                 .connection_pool
                 .get_connection_by_peer_id(&remote_peer_id)
                 .is_none(),
-            "suppressed outbound path must not create a wrong-direction connection"
+            "failed dial must not create a wrong-direction connection"
         );
     }
 
     #[tokio::test]
-    async fn peer_connect_suppression_drops_existing_wrong_direction_outbound() {
+    async fn peer_connect_drops_existing_wrong_direction_outbound_before_redial() {
         let (local_key, remote_key) = inbound_preferred_key_pair();
         let remote_peer_id = remote_key.peer_id();
         let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
@@ -1602,16 +1657,18 @@ mod tests {
             peer_id: remote_peer_id.clone(),
             registry: registry.clone(),
         };
-        peer.connect(&"127.0.0.1:9".parse().unwrap())
+        let err = peer
+            .connect(&"127.0.0.1:9".parse().unwrap())
             .await
-            .expect("suppressed outbound path should not dial");
+            .expect_err("redial to closed port should report network failure");
+        assert!(matches!(err, GossipError::Network(_)));
 
         assert!(
             registry
                 .connection_pool
                 .get_connection_by_peer_id(&remote_peer_id)
                 .is_none(),
-            "suppressed outbound path must remove a live wrong-direction outbound"
+            "redial path must remove a live wrong-direction outbound before dialing"
         );
     }
 
@@ -1640,6 +1697,48 @@ mod tests {
             .await
             .expect_err("outbound-preferred side should still attempt the socket dial");
         assert!(matches!(err, GossipError::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn peer_connect_refuses_self_peer_without_configuring_or_dialing() {
+        let local_key = KeyPair::new_for_testing("self-peer-connect-guard");
+        let local_peer_id = local_key.peer_id();
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41004".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(local_key),
+                connection_timeout: Duration::from_millis(10),
+                ..GossipConfig::default()
+            },
+        ));
+        let peer = Peer {
+            peer_id: local_peer_id.clone(),
+            registry: registry.clone(),
+        };
+
+        peer.connect(&registry.bind_addr)
+            .await
+            .expect("self peer connect should be a harmless no-op");
+
+        assert_eq!(
+            registry
+                .connection_pool
+                .get_configured_peer_addr(&local_peer_id),
+            None,
+            "self peers must not be configured as remote dial targets"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .get_connection_by_peer_id(&local_peer_id)
+                .is_none(),
+            "self peers must not create pooled remote connections"
+        );
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.peers.contains_key(&registry.bind_addr),
+            "self peers must not enter gossip peer state"
+        );
     }
 
     fn inbound_preferred_key_pair() -> (KeyPair, KeyPair) {

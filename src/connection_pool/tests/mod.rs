@@ -167,6 +167,44 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
 }
 
 #[tokio::test]
+async fn disconnect_by_peer_id_removes_configured_addr_connection_without_alias_row() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("configured_addr_disconnect").peer_id();
+    let addr: SocketAddr = "127.0.0.1:40557".parse().unwrap();
+
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
+
+    let _ = pool.addr_to_peer_id.remove_sync(&addr);
+    pool.clear_current_peer_connection(&peer_id);
+    assert!(
+        pool.get_connection_by_peer_id(&peer_id).is_some(),
+        "test setup: configured-address fallback must be able to find the connection"
+    );
+
+    pool.disconnect_connection_by_peer_id(&peer_id)
+        .expect("expected connection to be removed");
+
+    assert!(
+        pool.get_connection_by_peer_id(&peer_id).is_none(),
+        "disconnect must not leave a stale connection reachable by configured-address fallback"
+    );
+    assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
+}
+
+#[tokio::test]
 async fn get_connection_by_peer_id_uses_session_current_connection() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer_id = crate::KeyPair::new_for_testing("session_current_connection").peer_id();
@@ -214,6 +252,7 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     );
     let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
     connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(peer_id.clone());
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
@@ -229,6 +268,37 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
         pool.get_configured_peer_addr(&peer_id),
         Some(configured_addr)
     );
+}
+
+#[tokio::test]
+async fn get_connection_by_peer_id_rejects_alias_identity_mismatch() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let victim_peer_id = crate::KeyPair::new_for_testing("alias_victim_peer").peer_id();
+    let attacker_peer_id = crate::KeyPair::new_for_testing("alias_attacker_peer").peer_id();
+    let configured_addr: SocketAddr = "127.0.0.1:40560".parse().unwrap();
+    let alias_addr: SocketAddr = "127.0.0.1:50560".parse().unwrap();
+
+    pool.set_configured_peer_addr(&victim_peer_id, configured_addr);
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        alias_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(alias_addr, ConnectionDirection::Inbound);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(attacker_peer_id);
+    connection.set_state(ConnectionState::Connected);
+    let connection = Arc::new(connection);
+
+    pool.index_connection_by_addr(alias_addr, connection);
+    pool.add_addr_to_peer_id(alias_addr, victim_peer_id.clone());
+
+    assert!(pool.get_connection_by_peer_id(&victim_peer_id).is_none());
+    assert!(!pool.has_connection_by_peer_id(&victim_peer_id));
 }
 
 #[tokio::test]
@@ -856,34 +926,6 @@ fn test_streaming_threshold_saturation() {
     assert_eq!(large_config.streaming_threshold(), 2 * 1024 * 1024 - 1024);
 }
 
-#[test]
-fn test_should_flush_rules() {
-    assert!(!should_flush(
-        0,
-        Duration::from_millis(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-    assert!(should_flush(
-        4096,
-        Duration::from_millis(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-    assert!(should_flush(
-        1,
-        Duration::from_millis(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-    assert!(should_flush(
-        1,
-        WRITER_MAX_LATENCY + Duration::from_micros(1),
-        4 * 1024,
-        WRITER_MAX_LATENCY
-    ));
-}
-
 #[tokio::test]
 async fn test_connection_pool_new() {
     let pool = ConnectionPool::<()>::new(10, Duration::from_secs(5));
@@ -1186,9 +1228,12 @@ async fn test_task_tracker_replaces_old_handle() {
 async fn test_wait_for_response_returns_on_cancelled_slot() {
     let tracker = CorrelationTracker::new();
     // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+    // the test's manual complete()/wait_for_response()/cancel() lifecycle
+    // intact without leaking the slot.
+    let correlation_id = tracker
+        .allocate()
+        .expect("ring should not be exhausted in test")
+        .disarm();
 
     // Simulate a connection drop cancelling all pending requests.
     tracker.cancel_all();
@@ -1272,10 +1317,13 @@ async fn test_pooled_typed_send_matches_wire_bytes() {
     );
 
     let msg = WireMsg { value: 99 };
-    let expected = crate::typed::encode_typed(&msg).expect("encode_typed");
-
     let pooled = crate::typed::encode_typed_pooled(&msg).expect("encode_typed_pooled");
     let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<WireMsg>(pooled);
+    let mut expected = Vec::with_capacity(payload_len);
+    if let Some(prefix) = prefix.as_ref() {
+        expected.extend_from_slice(prefix);
+    }
+    expected.extend_from_slice(payload.chunk());
     let mut header = [0u8; 16];
     header[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
     let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
@@ -1294,7 +1342,7 @@ async fn test_pooled_typed_send_matches_wire_bytes() {
         .await
         .unwrap();
 
-    assert_eq!(payload, expected.as_ref());
+    assert_eq!(payload.as_slice(), expected.as_slice());
     handle.shutdown();
 }
 
@@ -2563,9 +2611,12 @@ fn correlation_tracker_throughput_bench() {
         let start = std::time::Instant::now();
         for _ in 0..iters {
             // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+            // the test's manual complete()/wait_for_response()/cancel() lifecycle
+            // intact without leaking the slot.
+            let correlation_id = tracker
+                .allocate()
+                .expect("ring should not be exhausted in test")
+                .disarm();
             let mut payload = Some(crate::AlignedBytes::from_pooled_slice(
                 b"pingpong",
                 Arc::clone(&pool),
@@ -2593,9 +2644,12 @@ fn correlation_tracker_throughput_bench() {
         let mut next = 0u64;
         while next < iters && pending.len() < inflight {
             // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+            // the test's manual complete()/wait_for_response()/cancel() lifecycle
+            // intact without leaking the slot.
+            let correlation_id = tracker
+                .allocate()
+                .expect("ring should not be exhausted in test")
+                .disarm();
             let tracker_clone = Arc::clone(&tracker);
             pending.push(Box::pin(async move {
                 tracker_clone
@@ -2614,9 +2668,12 @@ fn correlation_tracker_throughput_bench() {
             assert_eq!(reply.as_ref(), b"pingpong");
             if next < iters {
                 // Existing tests pre-date the SlotGuard API. Disarming immediately keeps
-        // the test's manual complete()/wait_for_response()/cancel() lifecycle
-        // intact without leaking the slot.
-        let correlation_id = tracker.allocate().expect("ring should not be exhausted in test").disarm();
+                // the test's manual complete()/wait_for_response()/cancel() lifecycle
+                // intact without leaking the slot.
+                let correlation_id = tracker
+                    .allocate()
+                    .expect("ring should not be exhausted in test")
+                    .disarm();
                 let tracker_clone = Arc::clone(&tracker);
                 pending.push(Box::pin(async move {
                     tracker_clone
@@ -2683,10 +2740,7 @@ fn allocate_terminates_when_every_slot_is_already_waiting() {
         })
         .expect("spawn probe thread");
 
-    if rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .is_err()
-    {
+    if rx.recv_timeout(std::time::Duration::from_secs(3)).is_err() {
         panic!(
             "LIVELOCK: CorrelationTracker::allocate() did not return within 3s \
              after the ring was exhausted. The producer spins in user space \
@@ -2746,10 +2800,251 @@ fn cancelled_wait_for_response_releases_slot_via_drop_guard() {
     });
 }
 
+#[test]
+fn cancelled_pending_ask_wait_releases_slot() {
+    run_multi_thread_test(async {
+        let tracker = CorrelationTracker::new();
+        let baseline_waiting = count_waiting_slots(&tracker);
+
+        for _ in 0..256 {
+            let slot = tracker.allocate().expect("ring should not be exhausted");
+            let pending = PendingAsk {
+                correlation_id: slot.disarm(),
+                correlation: Arc::clone(&tracker),
+                timeout: std::time::Duration::from_secs(60),
+                active: true,
+            };
+
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1), pending.wait()).await;
+        }
+
+        let leaked = count_waiting_slots(&tracker) - baseline_waiting;
+        assert_eq!(
+            leaked, 0,
+            "{leaked} slots leaked from cancelled PendingAsk::wait futures. \
+             PendingAsk Drop must remain armed while wait() is awaiting so \
+             externally cancelled DeferredAsk waits cannot exhaust the ring."
+        );
+    });
+}
+
 fn count_waiting_slots(tracker: &CorrelationTracker) -> usize {
     tracker
         .pending
         .iter()
         .filter(|s| s.state.load(Ordering::Acquire) == SLOT_WAITING)
         .count()
+}
+
+/// Build a `PeerInfo` whose `last_response_received_ms` is set to `stale_time`
+/// and that has the gossip protocol's response-asymmetry detector partway
+/// through tripping (one accumulated failure).
+fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerInfo {
+    crate::registry::PeerInfo {
+        address: addr,
+        peer_address: None,
+        inbound_observed: true,
+        outbound_dial_success: true,
+        node_id: None,
+        dns_name: None,
+        failures: 1,
+        last_attempt: crate::current_timestamp(),
+        last_success: stale_time,
+        last_sequence: 0,
+        last_sent_sequence: 0,
+        consecutive_deltas: 0,
+        last_failure_time: None,
+        last_dns_refresh_attempt: None,
+        last_response_received_ms: stale_time,
+    }
+}
+
+// Regression test for the FullSyncResponse / DeltaGossip / FullSync inbound
+// reset paths in `handle_incoming_message`. These paths previously reset
+// `failures` and `last_success` when a peer sent us a message over the
+// persistent bidirectional connection, but forgot to refresh
+// `last_response_received_ms`. Because `apply_gossip_results` uses
+// `last_response_received_ms` as its application-layer liveness signal (the
+// response-asymmetry detector at registry.rs:3475), the omission caused a
+// permanent log-spam loop on peers whose responses only ever arrived via
+// the bidirectional path:
+//
+//   - outbound gossip round sees `Ok(None)` (no inline reply) and stale
+//     `last_response_received_ms` → bumps `failures` from 0 to 1
+//   - FullSyncResponse arrives moments later over the persistent stream →
+//     resets `failures` back to 0
+//   - `last_response_received_ms` never moves, so the next round repeats.
+//
+// These tests pin the post-fix invariant: any inbound payload from a peer
+// must update `last_response_received_ms`, mirroring the inline response path
+// in `GossipRegistry::handle_gossip_response`.
+#[tokio::test]
+async fn full_sync_response_updates_last_response_received_ms() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_full_sync_response_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_full_sync_response_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.63:9301".parse().unwrap();
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let test_start = crate::current_timestamp_millis();
+
+    let msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id,
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after FullSyncResponse");
+    assert_eq!(info.failures, 0, "failures should reset");
+    assert!(
+        info.last_response_received_ms >= test_start,
+        "last_response_received_ms must be refreshed after FullSyncResponse \
+         (got {}, test_start {}, stale_time {})",
+        info.last_response_received_ms,
+        test_start,
+        stale_time,
+    );
+}
+
+#[tokio::test]
+async fn full_sync_updates_last_response_received_ms() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_full_sync_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_full_sync_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.64:9301".parse().unwrap();
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let test_start = crate::current_timestamp_millis();
+
+    let msg = crate::registry::RegistryMessage::FullSync {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id,
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after FullSync");
+    assert_eq!(info.failures, 0, "failures should reset");
+    assert!(
+        info.last_response_received_ms >= test_start,
+        "last_response_received_ms must be refreshed after FullSync \
+         (got {}, test_start {}, stale_time {})",
+        info.last_response_received_ms,
+        test_start,
+        stale_time,
+    );
+}
+
+#[tokio::test]
+async fn delta_gossip_updates_last_response_received_ms() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.65:9301".parse().unwrap();
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let test_start = crate::current_timestamp_millis();
+
+    // Empty delta: no changes, just proves liveness.
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: peer_id,
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after DeltaGossip");
+    assert_eq!(info.failures, 0, "failures should reset");
+    assert!(
+        info.last_response_received_ms >= test_start,
+        "last_response_received_ms must be refreshed after DeltaGossip \
+         (got {}, test_start {}, stale_time {})",
+        info.last_response_received_ms,
+        test_start,
+        stale_time,
+    );
 }

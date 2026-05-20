@@ -17,7 +17,7 @@ async fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<
 
     for idx in 0..peer_count {
         let peer_addr: SocketAddr = format!("127.0.0.1:{}", 20_000 + idx).parse().unwrap();
-        let peer_id = KeyPair::new_for_testing(&format!("peer-{idx}")).peer_id();
+        let peer_id = KeyPair::new_for_testing(format!("peer-{idx}")).peer_id();
         registry
             .connection_pool
             .peer_id_to_addr
@@ -33,7 +33,7 @@ async fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<
         let actor_addr: SocketAddr = format!("127.0.0.1:{}", 30_000 + (idx % 10_000))
             .parse()
             .unwrap();
-        let peer_id = KeyPair::new_for_testing(&format!("actor-peer-{idx}")).peer_id();
+        let peer_id = KeyPair::new_for_testing(format!("actor-peer-{idx}")).peer_id();
         let mut location = RemoteActorLocation::new_with_peer(actor_addr, peer_id);
         location.priority = RegistrationPriority::Immediate;
         registry
@@ -49,7 +49,7 @@ async fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<
             let actor_addr: SocketAddr = format!("127.0.0.1:{}", 30_000 + (idx % 10_000))
                 .parse()
                 .unwrap();
-            let peer_id = KeyPair::new_for_testing(&format!("actor-peer-{idx}")).peer_id();
+            let peer_id = KeyPair::new_for_testing(format!("actor-peer-{idx}")).peer_id();
             let mut location = RemoteActorLocation::new_with_peer(actor_addr, peer_id);
             location.priority = RegistrationPriority::Immediate;
             gossip_state

@@ -3,6 +3,8 @@
 enum WriteCommand {
     /// Queued payload writes (tell/ask/control frames).
     Payload(WritePayload),
+    /// Latency-sensitive data-plane write; write and flush as soon as the IO owner sees it.
+    ImmediatePayload(WritePayload),
     /// Ask payload writes that should trigger low-latency ask flush behavior.
     AskPayload(WritePayload),
 }

@@ -38,6 +38,9 @@ impl ActorMessageHandlerSync for EchoHandler {
         }
 
         self.asks.fetch_add(1, Ordering::AcqRel);
+        if payload.as_ref() == b"slow-inflight" {
+            std::thread::sleep(Duration::from_millis(500));
+        }
         let response = format!(
             "{}:{}",
             self.label,
@@ -89,15 +92,21 @@ async fn connect_pair(left: &TlsHandle, right: &TlsHandle) -> icanact_remote::Re
     configure_static_peer(left, right).await;
     configure_static_peer(right, left).await;
 
-    left.add_peer(&right.registry.peer_id)
-        .await
-        .connect(&right.registry.bind_addr)
-        .await?;
-    right
-        .add_peer(&left.registry.peer_id)
-        .await
-        .connect(&left.registry.bind_addr)
-        .await?;
+    if left
+        .registry
+        .should_keep_connection(&right.registry.peer_id, true)
+    {
+        left.add_peer(&right.registry.peer_id)
+            .await
+            .connect(&right.registry.bind_addr)
+            .await?;
+    } else {
+        right
+            .add_peer(&left.registry.peer_id)
+            .await
+            .connect(&left.registry.bind_addr)
+            .await?;
+    }
 
     Ok(())
 }
@@ -177,6 +186,19 @@ async fn bounded_ask_until_success(
             RECONNECT_SLA, to
         )),
     }
+}
+
+async fn wait_no_connected_peer(handle: &TlsHandle, peer_id: &PeerId) -> bool {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.client().lookup_connected_peer(peer_id).is_none() {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 async fn ask_until_success_owned(
@@ -354,6 +376,170 @@ async fn isolated_static_peer_reconnect_converges_under_500ms() -> icanact_remot
     node_a.shutdown().await;
     node_b.shutdown().await;
     node_c.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_fast_path_handles_fail_closed_after_disconnect_and_fresh_lookup_recovers()
+-> icanact_remote::Result<()> {
+    let asks_a = Arc::new(AtomicU64::new(0));
+    let asks_b = Arc::new(AtomicU64::new(0));
+
+    let node_a = node("cached-fast-path-a", "a", Arc::clone(&asks_a)).await?;
+    let node_b = node("cached-fast-path-b", "b", Arc::clone(&asks_b)).await?;
+
+    connect_pair(&node_a, &node_b).await?;
+    wait_active_peers(&node_a, 1, Duration::from_secs(3)).await?;
+    wait_active_peers(&node_b, 1, Duration::from_secs(3)).await?;
+
+    let cached_ref = node_a.lookup_peer(&node_b.registry.peer_id).await?;
+    let cached_conn = cached_ref
+        .connection_ref()
+        .expect("lookup_peer should cache a connection for fast paths");
+
+    let baseline = cached_conn
+        .ask_actor_frame(
+            TEST_ACTOR_ID,
+            TEST_TYPE_HASH,
+            Bytes::from_static(b"cached-baseline"),
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("cached connection baseline ask should work");
+    assert_eq!(baseline.as_ref(), b"b:cached-baseline");
+
+    node_a.disconnect_peer_connection(&node_b.registry.peer_id);
+    node_b.disconnect_peer_connection(&node_a.registry.peer_id);
+
+    assert!(
+        wait_no_connected_peer(&node_a, &node_b.registry.peer_id).await,
+        "lookup_connected_peer must stop returning stale cached sessions after disconnect"
+    );
+    assert!(
+        cached_conn.is_closed(),
+        "cloned fast-path RemoteConnection should observe closure after pool disconnect"
+    );
+
+    let stale_conn_result = cached_conn
+        .ask_actor_frame(
+            TEST_ACTOR_ID,
+            TEST_TYPE_HASH,
+            Bytes::from_static(b"stale-conn"),
+            ASK_TIMEOUT,
+        )
+        .await;
+    assert!(
+        stale_conn_result.is_err(),
+        "stale cached RemoteConnection must fail closed, got {stale_conn_result:?}"
+    );
+
+    let stale_ref_result = cached_ref
+        .ask_actor_frame(
+            TEST_ACTOR_ID,
+            TEST_TYPE_HASH,
+            Bytes::from_static(b"stale-ref"),
+            ASK_TIMEOUT,
+        )
+        .await;
+    assert!(
+        stale_ref_result.is_err(),
+        "stale cached RemoteActorRef must fail closed, got {stale_ref_result:?}"
+    );
+
+    let (a_to_b, b_to_a) = tokio::join!(
+        bounded_ask_until_success(
+            &node_a,
+            &node_b.registry.peer_id,
+            b"fresh-after-stale",
+            b"b:fresh-after-stale",
+        ),
+        bounded_ask_until_success(
+            &node_b,
+            &node_a.registry.peer_id,
+            b"fresh-reverse-after-stale",
+            b"a:fresh-reverse-after-stale",
+        ),
+    );
+    a_to_b.expect("fresh lookup should reconnect after stale cached handles fail");
+    b_to_a.expect("reverse fresh lookup should reconnect after stale cached handles fail");
+
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_flight_ask_drop_does_not_poison_static_peer_reconnect() -> icanact_remote::Result<()> {
+    let asks_a = Arc::new(AtomicU64::new(0));
+    let asks_b = Arc::new(AtomicU64::new(0));
+
+    let node_a = node("inflight-drop-reconnect-a", "a", Arc::clone(&asks_a)).await?;
+    let node_b = node("inflight-drop-reconnect-b", "b", Arc::clone(&asks_b)).await?;
+
+    connect_pair(&node_a, &node_b).await?;
+    wait_active_peers(&node_a, 1, Duration::from_secs(3)).await?;
+    wait_active_peers(&node_b, 1, Duration::from_secs(3)).await?;
+
+    bounded_ask_until_success(
+        &node_a,
+        &node_b.registry.peer_id,
+        b"baseline",
+        b"b:baseline",
+    )
+    .await
+    .expect("baseline A->B ask");
+
+    let peer_ref = node_a.lookup_peer(&node_b.registry.peer_id).await?;
+    let pending = tokio::spawn(async move {
+        peer_ref
+            .ask_actor_frame(
+                TEST_ACTOR_ID,
+                TEST_TYPE_HASH,
+                Bytes::from_static(b"slow-inflight"),
+                Duration::from_millis(400),
+            )
+            .await
+    });
+
+    sleep(Duration::from_millis(5)).await;
+    node_a.disconnect_peer_connection(&node_b.registry.peer_id);
+    node_b.disconnect_peer_connection(&node_a.registry.peer_id);
+
+    let pending_result = timeout(Duration::from_secs(1), pending)
+        .await
+        .expect("in-flight ask task should finish after forced disconnect")
+        .expect("in-flight ask task should not panic");
+    assert!(
+        matches!(
+            pending_result,
+            Err(icanact_remote::GossipError::ConnectionDropped)
+                | Err(icanact_remote::GossipError::Timeout)
+        ),
+        "forced disconnect should complete pending ask with an explicit bounded error, got {pending_result:?}"
+    );
+
+    bounded_ask_until_success(
+        &node_a,
+        &node_b.registry.peer_id,
+        b"after-inflight-drop",
+        b"b:after-inflight-drop",
+    )
+    .await
+    .expect("static peer should reconnect after in-flight drop");
+    bounded_ask_until_success(
+        &node_b,
+        &node_a.registry.peer_id,
+        b"after-inflight-drop-reverse",
+        b"a:after-inflight-drop-reverse",
+    )
+    .await
+    .expect("reverse static peer should reconnect after in-flight drop");
+
+    wait_active_peers(&node_a, 1, Duration::from_secs(2)).await?;
+    wait_active_peers(&node_b, 1, Duration::from_secs(2)).await?;
+
+    node_a.shutdown().await;
+    node_b.shutdown().await;
     Ok(())
 }
 

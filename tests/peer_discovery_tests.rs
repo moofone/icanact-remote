@@ -608,10 +608,11 @@ fn test_failure_recovery_backoff() -> Result<(), DynError> {
         // Wait for failure detection
         sleep(Duration::from_secs(1)).await;
 
-        // A and B should still be connected (using robust wait)
+        // A and B should still be connected; the deterministic connection owner
+        // can be either side, so check pair lookup instead of A's local peer count.
         assert!(
-            wait_for_active_peers(&node_a, 1, Duration::from_secs(10)).await,
-            "A should still have B"
+            wait_for_pair_lookup(&node_a, &node_b, Duration::from_secs(10)).await,
+            "A/B should remain connected after C shuts down"
         );
 
         let stats_a_after = node_a.stats().await;
@@ -841,13 +842,11 @@ fn test_partition_heal_behavior() -> Result<(), DynError> {
             "B/C healed partition edge should be reachable"
         );
 
-        let stats_b = node_b.stats().await;
         assert!(
-            stats_b.active_peers >= 1,
-            "B should have at least one live transport after heal"
-        );
-        assert!(
-            stats_b.mesh_formation_time_ms.is_some(),
+            common::wait_for_condition(Duration::from_secs(5), || async {
+                node_b.stats().await.mesh_formation_time_ms.is_some()
+            })
+            .await,
             "mesh formation timing should be recorded after heal"
         );
 
