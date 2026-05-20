@@ -2859,6 +2859,124 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
     }
 }
 
+#[tokio::test]
+async fn full_sync_with_remote_loopback_bind_does_not_poison_peer_state() {
+    let bind_addr: SocketAddr = "10.77.0.31:9501".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "remote-loopback-full-sync-local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("remote-loopback-full-sync-remote");
+    let peer_id = peer_keypair.peer_id();
+    let tcp_source: SocketAddr = "10.77.0.31:38988".parse().unwrap();
+    let loopback_bind = "127.0.0.1:26157";
+    let synthesized_self_host_addr: SocketAddr = "10.77.0.31:26157".parse().unwrap();
+    let actor_name = "poisoned/full-sync/actor";
+    let poisoned_actor =
+        crate::RemoteActorLocation::new_with_peer(synthesized_self_host_addr, peer_id.clone());
+
+    let msg = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![(actor_name.to_string(), poisoned_actor)],
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some(loopback_bind.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, msg)
+        .await
+        .expect("non-dialable FullSync should be ignored without crashing");
+
+    let state = registry.gossip_state.lock().await;
+    assert!(
+        !state.peers.contains_key(&synthesized_self_host_addr),
+        "remote loopback bind must not be synthesized into a same-host peer entry"
+    );
+    assert!(
+        !state.peers.contains_key(&tcp_source),
+        "remote loopback bind must not fall back to the ephemeral TCP source as a peer"
+    );
+    drop(state);
+
+    assert!(
+        registry
+            .connection_pool
+            .peer_id_to_addr
+            .read_sync(&peer_id, |_, addr| *addr)
+            .is_none(),
+        "remote loopback bind must not install peer_id_to_addr mapping"
+    );
+    assert!(
+        registry.lookup_actor(actor_name).await.is_none(),
+        "actors from a non-dialable FullSync must not be merged into the registry"
+    );
+}
+
+#[tokio::test]
+async fn full_sync_response_with_remote_loopback_bind_does_not_reindex_connection() {
+    let bind_addr: SocketAddr = "10.77.0.32:9501".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "remote-loopback-full-sync-response-local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("remote-loopback-full-sync-response-remote");
+    let peer_id = peer_keypair.peer_id();
+    let tcp_source: SocketAddr = "10.77.0.32:47924".parse().unwrap();
+    let loopback_bind = "127.0.0.1:3883";
+    let synthesized_self_host_addr: SocketAddr = "10.77.0.32:3883".parse().unwrap();
+    let actor_name = "poisoned/full-sync-response/actor";
+    let poisoned_actor =
+        crate::RemoteActorLocation::new_with_peer(synthesized_self_host_addr, peer_id.clone());
+
+    let msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: vec![(actor_name.to_string(), poisoned_actor)],
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some(loopback_bind.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, msg)
+        .await
+        .expect("non-dialable FullSyncResponse should be ignored without crashing");
+
+    let state = registry.gossip_state.lock().await;
+    assert!(
+        !state.peers.contains_key(&synthesized_self_host_addr),
+        "remote loopback response bind must not be synthesized into a same-host peer entry"
+    );
+    drop(state);
+
+    assert!(
+        registry
+            .connection_pool
+            .peer_id_to_addr
+            .read_sync(&peer_id, |_, addr| *addr)
+            .is_none(),
+        "remote loopback response bind must not reindex peer_id_to_addr"
+    );
+    assert!(
+        registry.lookup_actor(actor_name).await.is_none(),
+        "actors from a non-dialable FullSyncResponse must not be merged into the registry"
+    );
+}
+
 // Regression test for the FullSyncResponse / DeltaGossip / FullSync inbound
 // reset paths in `handle_incoming_message`. These paths previously reset
 // `failures` and `last_success` when a peer sent us a message over the
