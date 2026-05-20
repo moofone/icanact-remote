@@ -1730,8 +1730,13 @@ fn parse_interest_name(name: &str) -> Option<(u64, PeerId)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Buf;
 
     fn test_pubsub(registry_peer_seed: &str) -> RoutedPubSub {
+        crate::typed::prewarm_pooled_byte_buffers(
+            FAST_FRAME_POOL_BUFFERS,
+            FAST_FRAME_POOL_BUFFER_CAPACITY,
+        );
         let mut config = crate::GossipConfig::default();
         config.key_pair = Some(crate::KeyPair::new_for_testing(registry_peer_seed));
         let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -1756,13 +1761,6 @@ mod tests {
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
         }
-    }
-
-    fn aligned_frame(bytes: Bytes) -> crate::AlignedBytes {
-        crate::AlignedBytes::from_pooled_slice(
-            bytes.as_ref(),
-            Arc::new(crate::AlignedBytesPool::default()),
-        )
     }
 
     fn add_test_subscriber<F>(pubsub: &RoutedPubSub, topic: u64, type_hash: u64, deliver: F)
@@ -1790,21 +1788,22 @@ mod tests {
             delivered_for_sub.fetch_add(1, Ordering::Relaxed);
         });
 
-        let spoofed = encode_frame(
+        let (spoofed, _, _) = encode_fast_frame_pooled(
             topic,
             type_hash,
             42,
-            victim.clone(),
-            attacker,
+            &victim,
+            &attacker,
             2,
             PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
             std::slice::from_ref(&pubsub.local_peer_id),
             b"spoofed",
         )
         .unwrap();
 
         pubsub
-            .handle_pubsub_frame(&victim, aligned_frame(spoofed))
+            .handle_pubsub_frame_borrowed(&victim, spoofed.chunk())
             .unwrap();
 
         let stats = pubsub.stats();
@@ -1827,36 +1826,38 @@ mod tests {
             delivered_for_sub.lock().unwrap().push(payload);
         });
 
-        let spoofed = encode_frame(
+        let (spoofed, _, _) = encode_fast_frame_pooled(
             topic,
             type_hash,
             7,
-            victim.clone(),
-            attacker,
+            &victim,
+            &attacker,
             2,
             PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
             std::slice::from_ref(&pubsub.local_peer_id),
             b"spoofed",
         )
         .unwrap();
         pubsub
-            .handle_pubsub_frame(&victim, aligned_frame(spoofed))
+            .handle_pubsub_frame_borrowed(&victim, spoofed.chunk())
             .unwrap();
 
-        let legitimate = encode_frame(
+        let (legitimate, _, _) = encode_fast_frame_pooled(
             topic,
             type_hash,
             7,
-            victim.clone(),
-            victim.clone(),
+            &victim,
+            &victim,
             2,
             PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
             std::slice::from_ref(&pubsub.local_peer_id),
             b"legitimate",
         )
         .unwrap();
         pubsub
-            .handle_pubsub_frame(&victim, aligned_frame(legitimate))
+            .handle_pubsub_frame_borrowed(&victim, legitimate.chunk())
             .unwrap();
 
         let stats = pubsub.stats();
@@ -1921,6 +1922,10 @@ mod tests {
         assert_eq!(parse_interest_name(&name), Some((topic, peer)));
     }
 
+    #[cfg_attr(
+        feature = "strict-zero-copy",
+        ignore = "legacy copying encoder is rejected"
+    )]
     #[test]
     fn pubsub_frame_v1_borrowed_encoder_is_wire_compatible() {
         let peer = crate::KeyPair::new_for_testing("pubsub-frame").peer_id();

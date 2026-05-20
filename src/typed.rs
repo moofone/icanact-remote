@@ -402,9 +402,15 @@ mod tests {
 
             // Encode (debug prefix included), then copy into an aligned receive buffer to
             // simulate the real receive path.
-            let payload = encode_typed(&AlignedTest { v: 7 }).unwrap();
+            let pooled = encode_typed_pooled(&AlignedTest { v: 7 }).unwrap();
+            let (payload, prefix, total_len) = typed_payload_parts::<AlignedTest>(pooled);
+            let mut encoded = Vec::with_capacity(total_len);
+            if let Some(prefix) = prefix {
+                encoded.extend_from_slice(&prefix);
+            }
+            encoded.extend_from_slice(payload.chunk());
             let pool = Arc::new(AlignedBytesPool::new(1));
-            let aligned = AlignedBytes::from_pooled_slice(payload.as_ref(), Arc::clone(&pool));
+            let aligned = AlignedBytes::from_pooled_slice(&encoded, Arc::clone(&pool));
             let bytes: Bytes = aligned.into();
 
             let archived = decode_typed_archived::<AlignedTest>(bytes).unwrap();

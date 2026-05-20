@@ -1,6 +1,7 @@
 #[cfg(debug_assertions)]
 mod tests {
-    use icanact_remote::{decode_typed, encode_typed, wire_type};
+    use bytes::Buf;
+    use icanact_remote::{decode_typed, typed, wire_type};
 
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, PartialEq)]
     struct Ping {
@@ -15,10 +16,25 @@ mod tests {
     wire_type!(Ping, "icanact.remote.Ping");
     wire_type!(Pong, "icanact.remote.Pong");
 
+    fn encode_wire_bytes<T>(msg: &T) -> bytes::Bytes
+    where
+        T: typed::WireEncode,
+    {
+        let payload = typed::encode_typed_pooled(msg).expect("encode_typed_pooled should succeed");
+        let (mut payload, prefix, payload_len) = typed::typed_payload_parts::<T>(payload);
+        let mut wire = bytes::BytesMut::with_capacity(payload_len);
+        if let Some(prefix) = prefix {
+            wire.extend_from_slice(&prefix);
+        }
+        let payload_bytes = payload.copy_to_bytes(payload.remaining());
+        wire.extend_from_slice(payload_bytes.as_ref());
+        wire.freeze()
+    }
+
     #[test]
     fn typed_roundtrip_ok() {
         let msg = Ping { id: 7 };
-        let payload = encode_typed(&msg).expect("encode_typed should succeed");
+        let payload = encode_wire_bytes(&msg);
         let decoded: Ping = decode_typed(payload.as_ref()).expect("decode_typed should succeed");
         assert_eq!(decoded, msg);
     }
@@ -26,7 +42,7 @@ mod tests {
     #[test]
     fn typed_hash_mismatch_errors_in_debug() {
         let msg = Ping { id: 42 };
-        let payload = encode_typed(&msg).expect("encode_typed should succeed");
+        let payload = encode_wire_bytes(&msg);
         let err = decode_typed::<Pong>(payload.as_ref()).unwrap_err();
         let err_str = err.to_string();
         assert!(
