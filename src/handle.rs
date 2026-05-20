@@ -815,6 +815,178 @@ mod tests {
         .await
     }
 
+    async fn write_initial_gossip(
+        writer: &mut tokio::io::DuplexStream,
+        msg: &crate::registry::RegistryMessage,
+    ) {
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(msg).expect("serialize gossip");
+        let header = crate::framing::write_gossip_frame_prefix(data.len());
+        tokio::io::AsyncWriteExt::write_all(writer, &header)
+            .await
+            .expect("write gossip header");
+        tokio::io::AsyncWriteExt::write_all(writer, data.as_ref())
+            .await
+            .expect("write gossip payload");
+        tokio::io::AsyncWriteExt::flush(writer)
+            .await
+            .expect("flush gossip");
+    }
+
+    fn ordered_keypairs(local_seed: &str, remote_seed: &str) -> (crate::KeyPair, crate::KeyPair) {
+        let first = crate::KeyPair::new_for_testing(local_seed);
+        let second = crate::KeyPair::new_for_testing(remote_seed);
+        if first.peer_id().to_node_id().as_bytes() < second.peer_id().to_node_id().as_bytes() {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_duplicate_rejects_non_preferred_inbound_replacement() -> crate::Result<()> {
+        let (local_keypair, remote_keypair) = ordered_keypairs(
+            "inbound-duplicate-local-lower-a",
+            "inbound-duplicate-remote-higher-b",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            !handle
+                .registry
+                .should_keep_connection(&remote_peer_id, false),
+            "the lower local NodeId must not prefer inbound connections from the higher remote NodeId"
+        );
+
+        let existing_addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let (existing_io, _existing_peer) = tokio::io::duplex(1024);
+        let (existing_stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                existing_io,
+                existing_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut existing = crate::connection_pool::LockFreeConnection::new(
+            existing_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        existing.stream_handle = Some(Arc::new(existing_stream_handle));
+        existing.set_state(crate::connection_pool::ConnectionState::Connected);
+        let existing = Arc::new(existing);
+        assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            existing_addr,
+            existing.clone(),
+        ));
+
+        let attacker_addr: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: remote_peer_id.clone(),
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            attacker_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_keypair.peer_id().to_node_id()),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ConnectionCloseOutcome::DroppedByTieBreaker
+        ));
+        let resolved = handle
+            .registry
+            .connection_pool
+            .get_connection_by_peer_id(&remote_peer_id)
+            .expect("existing connection must remain indexed by peer id");
+        assert!(
+            Arc::ptr_eq(&resolved, &existing),
+            "non-preferred duplicate inbound connection must not replace the live existing connection"
+        );
+        assert_eq!(resolved.addr, existing_addr);
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_existing_connection(attacker_addr)
+                .is_none(),
+            "rejected duplicate must not be indexed by its ephemeral address"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_gossip_rejects_sender_not_bound_to_tls_certificate() -> crate::Result<()> {
+        let (local_keypair, claimed_keypair) =
+            ordered_keypairs("inbound-identity-local-a", "inbound-identity-claimed-b");
+        let imposter_keypair = crate::KeyPair::new_for_testing("inbound-identity-imposter");
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        let claimed_peer_id = claimed_keypair.peer_id();
+        let attacker_addr: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: claimed_peer_id.clone(),
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            attacker_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(imposter_keypair.peer_id().to_node_id()),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ConnectionCloseOutcome::Normal { node_id: None }
+        ));
+        assert!(
+            !handle
+                .registry
+                .connection_pool
+                .has_connection_by_peer_id(&claimed_peer_id),
+            "a gossip sender that does not match the TLS client certificate must not be registered"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_known_actors_includes_local_and_known_and_is_sorted() -> crate::Result<()> {
         let h = new_registry("127.0.0.1:0".parse().unwrap(), "snap").await?;
@@ -2054,6 +2226,7 @@ where
                         existing_conn.direction
                             == crate::connection_pool::ConnectionDirection::Outbound,
                     );
+                let keep_new_inbound = registry.should_keep_connection(&peer_id, false);
 
                 if !existing_usable {
                     info!(
@@ -2064,13 +2237,24 @@ where
                         "inbound_tiebreak_evict_stale"
                     );
                     let _ = pool.disconnect_connection_by_peer_id(&peer_id);
-                    pool.add_connection_by_peer_id(
-                        peer_id.clone(),
-                        peer_state_addr,
-                        connection_arc.clone(),
-                    );
-                    true
-                } else if !keep_existing {
+                    if keep_new_inbound {
+                        pool.add_connection_by_peer_id(
+                            peer_id.clone(),
+                            peer_state_addr,
+                            connection_arc.clone(),
+                        );
+                        true
+                    } else {
+                        info!(
+                            target: "icanact_remote_lifecycle",
+                            peer_id = %peer_id,
+                            peer_state_addr = %peer_state_addr,
+                            "inbound_tiebreak_reject_non_preferred_inbound"
+                        );
+                        registry.clear_peer_capabilities(&peer_addr);
+                        false
+                    }
+                } else if !keep_existing && keep_new_inbound {
                     info!(
                         target: "icanact_remote_lifecycle",
                         peer_id = %peer_id,
