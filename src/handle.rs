@@ -29,6 +29,11 @@ const REGISTRY_MESSAGE_ALIGNMENT: usize = {
 type RegistryAlignedVec = rkyv::util::AlignedVec<{ REGISTRY_MESSAGE_ALIGNMENT }>;
 
 #[inline]
+fn next_gossip_deadline(now: Instant, gossip_interval: Duration, jitter: Duration) -> Instant {
+    now + gossip_interval + jitter
+}
+
+#[inline]
 fn decode_registry_message(
     payload: &[u8],
 ) -> std::result::Result<RegistryMessage, rkyv::rancor::Error> {
@@ -773,6 +778,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gossip_deadline_reschedules_from_now_after_runtime_delay() {
+        let old_tick = Instant::now() - Duration::from_secs(30);
+        let delayed_now = Instant::now();
+        let next = next_gossip_deadline(
+            delayed_now,
+            Duration::from_millis(250),
+            Duration::from_millis(10),
+        );
+
+        assert!(
+            next > delayed_now,
+            "next gossip tick must be in the future after a delayed runtime wake"
+        );
+        assert!(
+            next > old_tick + Duration::from_secs(30),
+            "next gossip tick must not replay a stale missed-tick schedule"
+        );
+    }
+
     async fn new_registry(
         bind: SocketAddr,
         seed: &str,
@@ -1378,7 +1403,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         rand::random::<u64>() % max_ms
     };
     let jitter = Duration::from_millis(jitter_ms);
-    let mut next_gossip_tick = Instant::now() + gossip_interval + jitter;
+    let mut next_gossip_tick = next_gossip_deadline(Instant::now(), gossip_interval, jitter);
     let mut cleanup_timer = interval(cleanup_interval);
     cleanup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut vector_clock_gc_timer = interval(vector_clock_gc_interval);
@@ -1410,7 +1435,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                     rand::random::<u64>() % max_ms
                 };
                 let jitter = Duration::from_millis(jitter_ms);
-                next_gossip_tick = Instant::now() + gossip_interval + jitter;
+                next_gossip_tick = next_gossip_deadline(Instant::now(), gossip_interval, jitter);
 
                 // Step 1: Prepare gossip tasks while holding the lock briefly
                 let tasks = {
