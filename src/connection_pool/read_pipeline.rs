@@ -14,6 +14,8 @@ pub struct ReadContext {
     pub(crate) response_correlation: Option<Arc<CorrelationTracker>>,
     pub(crate) response_writer: Option<Arc<crate::ask_responder::ResponseWriter>>,
     pub(crate) tell_handler_sync: Option<Arc<crate::registry::ActorTellHandlerSyncCell>>,
+    pub(crate) tell_handler_sync_context:
+        Option<Arc<crate::registry::ActorTellHandlerSyncContextCell>>,
     pub(crate) ask_immediate_handler_sync:
         Option<Arc<crate::registry::ActorAskImmediateHandlerSyncCell>>,
     pub(crate) ask_handler_sync: Option<Arc<crate::registry::ActorAskHandlerSyncCell>>,
@@ -745,7 +747,7 @@ fn ask_context_from_context(
 ) -> Option<crate::AskContext<'_>> {
     ctx.response_writer
         .as_ref()
-        .map(|writer| crate::AskContext::from_writer(correlation_id, writer))
+        .map(|writer| crate::AskContext::from_writer(correlation_id, writer, ctx.peer_id.as_ref()))
 }
 
 async fn write_ask_disposition_io<S>(
@@ -1355,6 +1357,23 @@ where
             };
             let correlation_opt = if corr_id == 0 { None } else { Some(corr_id) };
             if msg_type == crate::MessageType::ActorTell as u8
+                && let Some(cell) = registry.actor_tell_handler_sync_context.load_full()
+            {
+                let handle_start = perf.map(|_| Instant::now());
+                cell.handle(
+                    actor_id,
+                    type_hash,
+                    payload,
+                    crate::TellContext::new(authenticated_peer_id),
+                )?;
+                if let (Some(perf), Some(start)) = (perf, handle_start) {
+                    perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.actor_handle_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+            if msg_type == crate::MessageType::ActorTell as u8
                 && let Some(cell) = registry.actor_tell_handler_sync.load_full()
             {
                 let handle_start = perf.map(|_| Instant::now());
@@ -1393,6 +1412,7 @@ where
                     response_correlation: None,
                     response_writer: None,
                     tell_handler_sync: None,
+            tell_handler_sync_context: None,
                     ask_immediate_handler_sync: None,
                     ask_handler_sync: None,
                     sync_actor_handler: None,
@@ -1518,6 +1538,22 @@ where
         }
 
         if msg_type == crate::MessageType::ActorTell as u8 {
+            if let Some(cell) = ctx.tell_handler_sync_context.as_ref() {
+                let handle_start = perf.map(|_| Instant::now());
+                let result = cell.handle(
+                    actor_id,
+                    type_hash,
+                    payload,
+                    crate::TellContext::new(ctx.peer_id.as_ref()),
+                );
+                if let (Some(perf), Some(start)) = (perf, handle_start) {
+                    perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.actor_handle_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                result?;
+                return Ok(());
+            }
             if let Some(cell) = ctx.tell_handler_sync.as_ref() {
                 let handle_start = perf.map(|_| Instant::now());
                 let result = cell.handle(actor_id, type_hash, payload);
@@ -1678,8 +1714,9 @@ where
                 || (is_ask
                     && (ctx.ask_immediate_handler_sync.is_some()
                         || ctx.ask_handler_sync.is_some()));
+            let has_context_tell = is_tell && ctx.tell_handler_sync_context.is_some();
             let has_legacy = ctx.sync_actor_handler.is_some() && (is_tell || is_ask);
-            if !has_split && !has_legacy {
+            if !has_split && !has_context_tell && !has_legacy {
                 return Ok(Some(crate::handle::MessageReadResult::Actor {
                     msg_type,
                     correlation_id,

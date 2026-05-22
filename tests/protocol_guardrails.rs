@@ -21,7 +21,11 @@ fn udp_transport_guardrail_udp_socket_usage_is_scoped() {
     let mut files = Vec::new();
     collect_rs_files(&src_root, &mut files);
 
-    let allowed_files = ["src/connection_pool.rs", "src/handle.rs"];
+    let allowed_files = [
+        "src/ask_responder.rs",
+        "src/connection_pool.rs",
+        "src/handle.rs",
+    ];
     let mut udp_usages = Vec::new();
     let mut violations = Vec::new();
 

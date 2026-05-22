@@ -7,6 +7,22 @@ use tokio::net::UdpSocket;
 
 use crate::{GossipError, Result, connection_pool::LockFreeStreamHandle, framing};
 
+pub struct TellContext<'a> {
+    authenticated_peer_id: Option<&'a crate::PeerId>,
+}
+
+impl<'a> TellContext<'a> {
+    pub(crate) fn new(authenticated_peer_id: Option<&'a crate::PeerId>) -> Self {
+        Self {
+            authenticated_peer_id,
+        }
+    }
+
+    pub fn authenticated_peer_id(&self) -> Option<&crate::PeerId> {
+        self.authenticated_peer_id
+    }
+}
+
 #[derive(Clone)]
 enum AskResponseSink {
     StreamHandle(Arc<LockFreeStreamHandle>),
@@ -140,6 +156,7 @@ enum AskContextSink<'a> {
 
 pub struct AskContext<'a> {
     correlation_id: u16,
+    authenticated_peer_id: Option<&'a crate::PeerId>,
     sink: AskContextSink<'a>,
 }
 
@@ -147,16 +164,23 @@ impl<'a> AskContext<'a> {
     pub(crate) fn from_stream_handle(
         correlation_id: u16,
         stream_handle: &'a Arc<LockFreeStreamHandle>,
+        authenticated_peer_id: Option<&'a crate::PeerId>,
     ) -> Self {
         Self {
             correlation_id,
+            authenticated_peer_id,
             sink: AskContextSink::StreamHandle(stream_handle),
         }
     }
 
-    pub(crate) fn from_writer(correlation_id: u16, writer: &'a Arc<ResponseWriter>) -> Self {
+    pub(crate) fn from_writer(
+        correlation_id: u16,
+        writer: &'a Arc<ResponseWriter>,
+        authenticated_peer_id: Option<&'a crate::PeerId>,
+    ) -> Self {
         Self {
             correlation_id,
+            authenticated_peer_id,
             sink: AskContextSink::DeferredWriter(writer),
         }
     }
@@ -165,15 +189,21 @@ impl<'a> AskContext<'a> {
         correlation_id: u16,
         peer_addr: SocketAddr,
         socket: &'a Arc<UdpSocket>,
+        authenticated_peer_id: Option<&'a crate::PeerId>,
     ) -> Self {
         Self {
             correlation_id,
+            authenticated_peer_id,
             sink: AskContextSink::Udp { socket, peer_addr },
         }
     }
 
     pub fn correlation_id(&self) -> u16 {
         self.correlation_id
+    }
+
+    pub fn authenticated_peer_id(&self) -> Option<&crate::PeerId> {
+        self.authenticated_peer_id
     }
 
     pub fn responder(&self) -> AskResponder {
@@ -324,5 +354,28 @@ impl ResponseWriter {
         stream_handle
             .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ask_context_exposes_authenticated_peer_id() {
+        let peer_id = crate::KeyPair::new_for_testing("ask-context-peer").peer_id();
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12345".parse().unwrap()));
+        let context = AskContext::from_writer(7, &writer, Some(&peer_id));
+
+        assert_eq!(context.correlation_id(), 7);
+        assert_eq!(context.authenticated_peer_id(), Some(&peer_id));
+    }
+
+    #[test]
+    fn tell_context_exposes_authenticated_peer_id() {
+        let peer_id = crate::KeyPair::new_for_testing("tell-context-peer").peer_id();
+        let context = TellContext::new(Some(&peer_id));
+
+        assert_eq!(context.authenticated_peer_id(), Some(&peer_id));
     }
 }

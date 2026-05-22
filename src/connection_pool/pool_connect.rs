@@ -948,6 +948,7 @@ impl<T> ConnectionPool<T> {
                     response_correlation: Some(correlation_tracker.clone()),
                     response_writer: Some(response_writer.clone()),
                     tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
+                    tell_handler_sync_context: registry.actor_tell_handler_sync_context.load_full(),
                     ask_immediate_handler_sync: registry
                         .actor_ask_immediate_handler_sync
                         .load_full(),
@@ -1523,6 +1524,7 @@ impl<T> ConnectionPool<T> {
                     response_correlation: Some(correlation_tracker.clone()),
                     response_writer: Some(response_writer.clone()),
                     tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
+                    tell_handler_sync_context: registry.actor_tell_handler_sync_context.load_full(),
                     ask_immediate_handler_sync: registry
                         .actor_ask_immediate_handler_sync
                         .load_full(),
