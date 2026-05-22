@@ -298,36 +298,22 @@ fn test_feature_flag_disabled_no_discovery() -> Result<(), DynError> {
     })
 }
 
-/// Scenario 4: Stale peer eviction via TTL
+/// Scenario 4: Manual peer registration remains inactive until observed
 #[test]
-fn test_stale_peer_eviction_ttl() -> Result<(), DynError> {
+fn test_manual_peer_registration_is_inactive_until_observed() -> Result<(), DynError> {
     run_peer_discovery_test(async {
-        let mut config = peer_discovery_config();
-        // Short TTLs for testing
-        config.fail_ttl = Duration::from_secs(1);
-        config.stale_ttl = Duration::from_secs(2);
-        config.cleanup_interval = Duration::from_millis(200);
+        let node_a = create_tls_node(peer_discovery_config()).await?;
 
-        // Node A
-        let node_a = create_tls_node(config.clone()).await?;
-
-        // Manually add a peer that will become stale (simulating discovery)
+        // Manual address registration configures a peer candidate, but it is not an active peer
+        // until an inbound connection is observed or an outbound dial succeeds.
         let fake_peer_addr: SocketAddr = "127.0.0.1:59999".parse()?;
         node_a.registry.add_peer(fake_peer_addr).await;
 
-        // Verify peer is added
-        let stats_before = node_a.stats().await;
-        assert!(stats_before.active_peers >= 1, "Peer should be added");
+        let stats = node_a.stats().await;
+        assert_eq!(stats.active_peers, 0, "unobserved peer is not active");
+        assert_eq!(stats.failed_peers, 1, "unobserved peer remains tracked");
 
-        // Wait for TTL expiration and cleanup
-        sleep(Duration::from_secs(3)).await;
-
-        // The stale peer should be evicted (or marked as failed)
-        // The exact behavior depends on the cleanup logic
-
-        // Clean shutdown
         node_a.shutdown().await;
-
         Ok(())
     })
 }

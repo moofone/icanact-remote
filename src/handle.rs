@@ -1371,9 +1371,11 @@ fn udp_gossip_sender_peer_id(datagram: &[u8], datagram_len: usize) -> Option<cra
     if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
         return None;
     }
-    let msg_len =
-        u32::from_be_bytes(datagram[..crate::framing::LENGTH_PREFIX_LEN].try_into().ok()?)
-            as usize;
+    let msg_len = u32::from_be_bytes(
+        datagram[..crate::framing::LENGTH_PREFIX_LEN]
+            .try_into()
+            .ok()?,
+    ) as usize;
     let frame_len = crate::framing::LENGTH_PREFIX_LEN.checked_add(msg_len)?;
     if frame_len > datagram_len || msg_len < crate::framing::GOSSIP_HEADER_LEN {
         return None;
@@ -1424,8 +1426,7 @@ async fn process_udp_datagram_native(
             .connection_pool
             .get_peer_id_by_addr(&peer_addr)
             .is_none()
-            && let Some(peer_id) =
-                udp_gossip_sender_peer_id(datagram.as_ref(), datagram_len)
+            && let Some(peer_id) = udp_gossip_sender_peer_id(datagram.as_ref(), datagram_len)
         {
             registry
                 .connection_pool
@@ -2251,6 +2252,7 @@ where
             response_correlation: Some(correlation_tracker.clone()),
             response_writer: Some(response_writer.clone()),
             tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
+            tell_handler_sync_context: registry.actor_tell_handler_sync_context.load_full(),
             ask_immediate_handler_sync: registry.actor_ask_immediate_handler_sync.load_full(),
             ask_handler_sync: registry.actor_ask_handler_sync.load_full(),
             sync_actor_handler: registry.actor_message_handler_sync.load_full(),

@@ -264,6 +264,19 @@ pub struct ActorTellHandlerSyncCell {
     call: unsafe fn(usize, u64, u32, crate::aligned::AlignedBytes) -> Result<()>,
 }
 
+#[derive(Clone)]
+pub struct ActorTellHandlerSyncContextCell {
+    owner: Arc<dyn ActorTellHandlerSyncContext>,
+    ptr: usize,
+    call: for<'a> unsafe fn(
+        usize,
+        u64,
+        u32,
+        crate::aligned::AlignedBytes,
+        crate::TellContext<'a>,
+    ) -> Result<()>,
+}
+
 impl ActorTellHandlerSyncCell {
     pub(crate) fn new<H>(handler: Arc<H>) -> Self
     where
@@ -300,6 +313,47 @@ impl ActorTellHandlerSyncCell {
     ) -> Result<()> {
         let _keepalive = &self.owner;
         unsafe { (self.call)(self.ptr, actor_id, type_hash, payload) }
+    }
+}
+
+impl ActorTellHandlerSyncContextCell {
+    pub(crate) fn new<H>(handler: Arc<H>) -> Self
+    where
+        H: ActorTellHandlerSyncContext + 'static,
+    {
+        unsafe fn call_impl<H>(
+            ptr: usize,
+            actor_id: u64,
+            type_hash: u32,
+            payload: crate::aligned::AlignedBytes,
+            context: crate::TellContext<'_>,
+        ) -> Result<()>
+        where
+            H: ActorTellHandlerSyncContext + 'static,
+        {
+            let handler = unsafe { &*(ptr as *const H) };
+            handler.handle_actor_tell_sync_context(actor_id, type_hash, payload, context)
+        }
+
+        let ptr = Arc::as_ptr(&handler) as usize;
+        let owner: Arc<dyn ActorTellHandlerSyncContext> = handler;
+        Self {
+            owner,
+            ptr,
+            call: call_impl::<H>,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn handle(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+        context: crate::TellContext<'_>,
+    ) -> Result<()> {
+        let _keepalive = &self.owner;
+        unsafe { (self.call)(self.ptr, actor_id, type_hash, payload, context) }
     }
 }
 
@@ -643,6 +697,17 @@ pub trait ActorTellHandlerSync: Send + Sync {
         actor_id: u64,
         type_hash: u32,
         payload: crate::aligned::AlignedBytes,
+    ) -> Result<()>;
+}
+
+/// Synchronous tell handler that receives authenticated transport context.
+pub trait ActorTellHandlerSyncContext: Send + Sync {
+    fn handle_actor_tell_sync_context(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::aligned::AlignedBytes,
+        context: crate::TellContext<'_>,
     ) -> Result<()>;
 }
 
@@ -1309,6 +1374,7 @@ pub struct GossipRegistry<T = ()> {
     // Actor message handler callback
     pub actor_message_handler: Arc<ArcSwapOption<ActorMessageHandlerCell>>,
     pub actor_tell_handler_sync: Arc<ArcSwapOption<ActorTellHandlerSyncCell>>,
+    pub actor_tell_handler_sync_context: Arc<ArcSwapOption<ActorTellHandlerSyncContextCell>>,
     pub actor_ask_immediate_handler_sync: Arc<ArcSwapOption<ActorAskImmediateHandlerSyncCell>>,
     pub actor_ask_handler_sync: Arc<ArcSwapOption<ActorAskHandlerSyncCell>>,
     pub actor_message_handler_sync: Arc<ArcSwapOption<ActorMessageHandlerSyncCell>>,
@@ -1518,6 +1584,7 @@ impl<T: 'static> GossipRegistry<T> {
             next_clock_sample_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             actor_message_handler: Arc::new(ArcSwapOption::empty()),
             actor_tell_handler_sync: Arc::new(ArcSwapOption::empty()),
+            actor_tell_handler_sync_context: Arc::new(ArcSwapOption::empty()),
             actor_ask_immediate_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_ask_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_message_handler_sync: Arc::new(ArcSwapOption::empty()),
@@ -2003,6 +2070,17 @@ impl<T: 'static> GossipRegistry<T> {
         info!("actor tell handler sync registered");
     }
 
+    /// Register a synchronous tell handler callback with authenticated context.
+    pub async fn set_actor_tell_handler_sync_context<H>(&self, handler: Arc<H>)
+    where
+        H: ActorTellHandlerSyncContext + 'static,
+    {
+        self.actor_tell_handler_sync_context.store(Some(Arc::new(
+            ActorTellHandlerSyncContextCell::new(handler),
+        )));
+        info!("actor tell handler sync context registered");
+    }
+
     /// Register a synchronous immediate ask handler callback.
     pub async fn set_actor_ask_immediate_handler_sync<H>(&self, handler: Arc<H>)
     where
@@ -2054,6 +2132,12 @@ impl<T: 'static> GossipRegistry<T> {
     pub async fn clear_actor_tell_handler_sync(&self) {
         self.actor_tell_handler_sync.store(None);
         info!("actor tell handler sync cleared");
+    }
+
+    /// Remove the synchronous tell handler callback with authenticated context.
+    pub async fn clear_actor_tell_handler_sync_context(&self) {
+        self.actor_tell_handler_sync_context.store(None);
+        info!("actor tell handler sync context cleared");
     }
 
     /// Remove the synchronous immediate ask handler callback.

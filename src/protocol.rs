@@ -384,6 +384,9 @@ pub(crate) async fn process_read_result(
             handle_assembled_message(
                 registry,
                 peer_addr,
+                authenticated_peer_id.or_else(|| {
+                    response_connection.and_then(|conn| conn.embedded_peer_id.as_ref())
+                }),
                 actor_id,
                 type_hash,
                 payload,
@@ -449,6 +452,10 @@ pub(crate) async fn process_read_result(
                             handle_assembled_message(
                                 registry,
                                 peer_addr,
+                                authenticated_peer_id.or_else(|| {
+                                    response_connection
+                                        .and_then(|conn| conn.embedded_peer_id.as_ref())
+                                }),
                                 stream_header.actor_id,
                                 stream_header.type_hash,
                                 crate::AlignedBytes::from_bytes(complete_data)
@@ -470,6 +477,9 @@ pub(crate) async fn process_read_result(
                         handle_assembled_message(
                             registry,
                             peer_addr,
+                            authenticated_peer_id.or_else(|| {
+                                response_connection.and_then(|conn| conn.embedded_peer_id.as_ref())
+                            }),
                             stream_header.actor_id,
                             stream_header.type_hash,
                             crate::AlignedBytes::from_bytes(complete_data)
@@ -598,6 +608,7 @@ fn should_stream_response(
 async fn handle_assembled_message(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
+    authenticated_peer_id: Option<&PeerId>,
     actor_id: u64,
     type_hash: u32,
     complete_data: crate::AlignedBytes,
@@ -622,7 +633,15 @@ async fn handle_assembled_message(
         }
     }
     let response = if corr_id == 0 {
-        if let Some(cell) = registry.actor_tell_handler_sync.load_full() {
+        if let Some(cell) = registry.actor_tell_handler_sync_context.load_full() {
+            cell.handle(
+                actor_id,
+                type_hash,
+                complete_data,
+                crate::TellContext::new(authenticated_peer_id),
+            )
+            .map(|_| None)
+        } else if let Some(cell) = registry.actor_tell_handler_sync.load_full() {
             cell.handle(actor_id, type_hash, complete_data)
                 .map(|_| None)
         } else {
@@ -656,7 +675,11 @@ async fn handle_assembled_message(
             if let Some(stream_handle) =
                 response_connection.and_then(|conn| conn.stream_handle.as_ref().cloned())
             {
-                let context = crate::AskContext::from_stream_handle(corr_id, &stream_handle);
+                let context = crate::AskContext::from_stream_handle(
+                    corr_id,
+                    &stream_handle,
+                    authenticated_peer_id,
+                );
                 cell.handle(actor_id, type_hash, complete_data, context)
                     .map(|disposition| match disposition {
                         crate::registry::AskDisposition::Immediate(response) => Some(response),
@@ -680,7 +703,12 @@ async fn handle_assembled_message(
             } else if let Some(udp_socket) = registry.connection_pool.udp_socket_opt() {
                 // UDP deferred ask: peer_addr is the datagram source; socket is the shared
                 // registry UDP socket. No connection-pool lookup on the reply path.
-                let context = crate::AskContext::from_udp(corr_id, peer_addr, &udp_socket);
+                let context = crate::AskContext::from_udp(
+                    corr_id,
+                    peer_addr,
+                    &udp_socket,
+                    authenticated_peer_id,
+                );
                 cell.handle(actor_id, type_hash, complete_data, context)
                     .map(|disposition| match disposition {
                         crate::registry::AskDisposition::Immediate(r) => Some(r),
@@ -715,7 +743,11 @@ async fn handle_assembled_message(
         if let Some(stream_handle) =
             response_connection.and_then(|conn| conn.stream_handle.as_ref().cloned())
         {
-            let context = crate::AskContext::from_stream_handle(corr_id, &stream_handle);
+            let context = crate::AskContext::from_stream_handle(
+                corr_id,
+                &stream_handle,
+                authenticated_peer_id,
+            );
             cell.handle(actor_id, type_hash, complete_data, context)
                 .map(|disposition| match disposition {
                     crate::registry::AskDisposition::Immediate(response) => Some(response),
@@ -739,7 +771,8 @@ async fn handle_assembled_message(
         } else if let Some(udp_socket) = registry.connection_pool.udp_socket_opt() {
             // UDP deferred ask: peer_addr is the datagram source; socket is the shared
             // registry UDP socket. No connection-pool lookup on the reply path.
-            let context = crate::AskContext::from_udp(corr_id, peer_addr, &udp_socket);
+            let context =
+                crate::AskContext::from_udp(corr_id, peer_addr, &udp_socket, authenticated_peer_id);
             cell.handle(actor_id, type_hash, complete_data, context)
                 .map(|disposition| match disposition {
                     crate::registry::AskDisposition::Immediate(r) => Some(r),
@@ -966,6 +999,7 @@ mod tests {
         handle_assembled_message(
             &registry,
             "127.0.0.1:0".parse().unwrap(),
+            None,
             1,
             0xDEAD_BEEF,
             payload,
