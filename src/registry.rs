@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use rand::seq::SliceRandom;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     GossipConfig, GossipError, NodeId, PeerId, RegistrationPriority, RemoteActorLocation, Result,
@@ -5600,6 +5600,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let mut gossip_state = self.gossip_state.lock().await;
             let mut completed_failures = Vec::new();
+            let mut active_connection_recoveries = Vec::new();
 
             for (peer_addr, pending) in &gossip_state.pending_peer_failures {
                 // Check if we've reached the deadline or have enough reports
@@ -5637,29 +5638,34 @@ impl<T: 'static> GossipRegistry<T> {
                         if dead_count >= majority || current_time >= pending.consensus_deadline {
                             completed_failures.push(*peer_addr);
 
-                            // Check if we have an active connection to this peer
-                            let has_active_connection = {
-                                let pool = &self.connection_pool;
-                                pool.has_connection(peer_addr)
-                            };
+                            let has_active_connection = gossip_state
+                                .peers
+                                .get(peer_addr)
+                                .is_some_and(|peer| self.peer_has_live_connection(peer));
+
+                            if has_active_connection {
+                                active_connection_recoveries.push((
+                                    *peer_addr,
+                                    dead_count,
+                                    alive_count,
+                                ));
+                                info!(
+                                    peer = %peer_addr,
+                                    dead_votes = dead_count,
+                                    alive_votes = alive_count,
+                                    "consensus: local active connection wins, clearing stale pending failure"
+                                );
+                                continue;
+                            }
 
                             if dead_count > alive_count {
                                 // Majority says dead
-                                if has_active_connection {
-                                    error!(
-                                        peer = %peer_addr,
-                                        dead_votes = dead_count,
-                                        alive_votes = alive_count,
-                                        "🚨 CONSENSUS CONFLICT: Majority says peer is dead but we have an ACTIVE SOCKET CONNECTION! This should not happen!"
-                                    );
-                                } else {
-                                    info!(
-                                        peer = %peer_addr,
-                                        dead_votes = dead_count,
-                                        alive_votes = alive_count,
-                                        "consensus: majority says peer is dead, but keeping actors for reconnection"
-                                    );
-                                }
+                                info!(
+                                    peer = %peer_addr,
+                                    dead_votes = dead_count,
+                                    alive_votes = alive_count,
+                                    "consensus: majority says peer is dead, but keeping actors for reconnection"
+                                );
                             } else if alive_count > dead_count {
                                 // Majority says alive
                                 info!(
@@ -5670,20 +5676,29 @@ impl<T: 'static> GossipRegistry<T> {
                                 );
                             } else {
                                 // Tie or timeout
-                                if has_active_connection {
-                                    error!(
-                                        peer = %peer_addr,
-                                        "🚨 CONSENSUS CONFLICT: Consensus timeout/tie but we have an ACTIVE SOCKET CONNECTION!"
-                                    );
-                                } else {
-                                    info!(
-                                        peer = %peer_addr,
-                                        "consensus timeout or tie, keeping actors"
-                                    );
-                                }
+                                info!(
+                                    peer = %peer_addr,
+                                    "consensus timeout or tie, keeping actors"
+                                );
                             }
                         }
                     }
+                }
+            }
+
+            let now_ms = crate::current_timestamp_millis();
+            for (peer_addr, _, _) in &active_connection_recoveries {
+                if let Some(peer_info) = gossip_state.peers.get_mut(peer_addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_success = peer_info.last_success.max(current_time);
+                    peer_info.last_response_received_ms =
+                        peer_info.last_response_received_ms.max(now_ms);
+                }
+                if let Some(peer_info) = gossip_state.known_peers.get_mut(peer_addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_success = peer_info.last_success.max(current_time);
                 }
             }
 
