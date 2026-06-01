@@ -597,6 +597,11 @@ pub struct PeerConnectHandlerCell {
     handler: Arc<dyn PeerConnectHandler>,
 }
 
+#[derive(Clone)]
+pub struct PeerLivenessHandlerCell {
+    handler: Arc<dyn PeerLivenessHandler>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UdpFailureDetectorConfig {
     pub health_probe_interval: Duration,
@@ -760,6 +765,21 @@ pub trait PeerConnectHandler: Send + Sync {
         &self,
         peer_addr: SocketAddr,
         peer_id: Option<crate::PeerId>,
+    ) -> BoxFuture<'_, ()>;
+}
+
+/// Optional callback invoked by the p2p configured-peer supervisor when a
+/// required peer's *direct* connection transitions between reachable and
+/// unreachable. icanact already emits a default structured log/metric while a
+/// peer is unreachable; this hook is for services that want a custom signal
+/// (e.g. their own event code). Fired only on edges (reachable<->unreachable).
+pub trait PeerLivenessHandler: Send + Sync {
+    fn handle_peer_liveness(
+        &self,
+        peer_id: crate::PeerId,
+        addr: SocketAddr,
+        reachable: bool,
+        reason: String,
     ) -> BoxFuture<'_, ()>;
 }
 
@@ -1381,6 +1401,11 @@ pub struct GossipRegistry<T = ()> {
     pub pubsub_ingress_handler: Arc<ArcSwapOption<PubSubIngressHandlerCell>>,
     pub peer_disconnect_handler: Arc<ArcSwapOption<PeerDisconnectHandlerCell>>,
     pub peer_connect_handler: Arc<ArcSwapOption<PeerConnectHandlerCell>>,
+    /// Optional edge-triggered callback for the p2p configured-peer supervisor.
+    pub peer_liveness_handler: Arc<ArcSwapOption<PeerLivenessHandlerCell>>,
+    /// Last-known reachability per configured peer — used by the supervisor for
+    /// edge detection (handler + one-shot recovery log). Supervisor-owned.
+    peer_liveness_status: Arc<SccHashMap<crate::PeerId, bool>>,
 
     // Stream assembly state (lock-free map).
     pub stream_assemblies: Arc<SccHashMap<u64, StreamAssembly>>,
@@ -1591,6 +1616,8 @@ impl<T: 'static> GossipRegistry<T> {
             pubsub_ingress_handler: Arc::new(ArcSwapOption::empty()),
             peer_disconnect_handler: Arc::new(ArcSwapOption::empty()),
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
+            peer_liveness_handler: Arc::new(ArcSwapOption::empty()),
+            peer_liveness_status: Arc::new(SccHashMap::default()),
             stream_assemblies: Arc::new(SccHashMap::default()),
             inflight_streams_per_peer: Arc::new(SccHashMap::default()),
             pending_acks: Arc::new(SccHashMap::default()),
@@ -2184,6 +2211,19 @@ impl<T: 'static> GossipRegistry<T> {
         info!("peer connect handler cleared");
     }
 
+    /// Register a peer liveness handler callback (p2p configured-peer supervisor)
+    pub async fn set_peer_liveness_handler(&self, handler: Arc<dyn PeerLivenessHandler>) {
+        self.peer_liveness_handler
+            .store(Some(Arc::new(PeerLivenessHandlerCell { handler })));
+        info!("peer liveness handler registered");
+    }
+
+    /// Remove the peer liveness handler callback
+    pub async fn clear_peer_liveness_handler(&self) {
+        self.peer_liveness_handler.store(None);
+        info!("peer liveness handler cleared");
+    }
+
     /// Handle an incoming actor message by forwarding to the registered callback
     pub async fn handle_actor_message(
         &self,
@@ -2415,6 +2455,102 @@ impl<T: 'static> GossipRegistry<T> {
             cell.handler
                 .handle_peer_connect(connect_addr, Some(peer_id))
                 .await;
+        }
+    }
+
+    /// p2p configured-peer supervisor tick. For every configured (required)
+    /// peer, keep a *direct point-to-point* connection alive: dial only when it
+    /// is down (a no-op when already connected, via pooled reuse), and surface a
+    /// liveness signal from the connect result. Point-to-point only — no gossip,
+    /// no broadcast (≤ N connect-attempts per tick for N configured peers, ~0 in
+    /// steady state). Driven by the background timer at `peer_supervisor_interval`;
+    /// gossip independently and complementarily observes these connections.
+    pub async fn supervise_configured_peers(&self) {
+        let peers = self.connection_pool.list_configured_peers();
+        for (peer_id, addr) in peers {
+            // Already connected -> reachable. Leave the connection alone: do not
+            // re-dial (no storm) and do not reset liveness state (so gossip's own
+            // dead-peer detection still fires). Data flows over this connection
+            // (UDP) at full speed.
+            if self
+                .connection_pool
+                .get_connected_connection_to_peer(&peer_id)
+                .is_some()
+            {
+                self.note_peer_liveness(&peer_id, addr, true, "connected")
+                    .await;
+                continue;
+            }
+            // No connection -> actively *establish* one now. This is what makes a
+            // freshly-started peer connect immediately (rather than waiting for a
+            // lazy gossip round) and what reconnects after a connection is lost.
+            // `connect_to_peer` establishes over UDP or TCP, reuses a healthy
+            // pooled connection, and refreshes the gossip liveness state from the
+            // result. Bounded so the 1Hz cadence holds even when a peer is down.
+            let budget = self
+                .config
+                .connection_timeout
+                .min(Duration::from_millis(900));
+            match tokio::time::timeout(budget, self.connect_to_peer(&peer_id)).await {
+                Ok(Ok(())) => {
+                    self.note_peer_liveness(&peer_id, addr, true, "established")
+                        .await
+                }
+                Ok(Err(e)) => {
+                    self.note_peer_liveness(&peer_id, addr, false, &format!("connect failed: {e:?}"))
+                        .await
+                }
+                Err(_) => {
+                    self.note_peer_liveness(&peer_id, addr, false, "connect timed out")
+                        .await
+                }
+            }
+        }
+    }
+
+    /// Emit the supervisor liveness signal. While a required peer is unreachable
+    /// this logs a CRITICAL line every tick (continuous alert, greppable as
+    /// `not connected; retrying`); the recovery edge logs once. The optional
+    /// `PeerLivenessHandler` fires only on reachable<->unreachable edges.
+    async fn note_peer_liveness(
+        &self,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+        reachable: bool,
+        reason: &str,
+    ) {
+        let prev = self.peer_liveness_status.read_sync(peer_id, |_, v| *v);
+        let flipped = prev != Some(reachable);
+
+        if !reachable {
+            tracing::error!(
+                event_code = "icanact_peer_unreachable",
+                severity = "CRITICAL",
+                critical = true,
+                peer_id = %peer_id,
+                addr = %addr,
+                reason = %reason,
+                "configured peer is not connected; retrying"
+            );
+        } else if flipped && prev == Some(false) {
+            info!(
+                event_code = "icanact_peer_reachable",
+                peer_id = %peer_id,
+                addr = %addr,
+                "configured peer reconnected"
+            );
+        }
+
+        let _ = self
+            .peer_liveness_status
+            .upsert_sync(peer_id.clone(), reachable);
+
+        if flipped {
+            if let Some(cell) = self.peer_liveness_handler.load_full() {
+                cell.handler
+                    .handle_peer_liveness(peer_id.clone(), addr, reachable, reason.to_string())
+                    .await;
+            }
         }
     }
 

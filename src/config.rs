@@ -2,6 +2,7 @@ use std::time::Duration;
 
 /// Default retry interval for failed peer connections
 pub const DEFAULT_PEER_RETRY_SECONDS: u64 = 5;
+pub const DEFAULT_PEER_SUPERVISOR_SECONDS: u64 = 1;
 
 /// Default maximum failed connection attempts before marking peer as failed
 pub const DEFAULT_MAX_PEER_FAILURES: usize = 3;
@@ -95,6 +96,12 @@ pub struct GossipConfig {
     pub max_peer_failures: usize,
     /// Time to wait before retrying failed peers
     pub peer_retry_interval: Duration,
+    /// How often the p2p configured-peer supervisor runs: for every
+    /// `configure_peer`d (required) peer it ensures a direct point-to-point
+    /// connection (dials only when down, no-op when already connected) and
+    /// surfaces a liveness signal. Point-to-point only — no gossip, no
+    /// broadcast. Defaults to 1s.
+    pub peer_supervisor_interval: Duration,
     /// Maximum number of deltas to keep in history
     pub max_delta_history: usize,
     /// Force full sync after this many delta exchanges
@@ -230,6 +237,7 @@ impl Default for GossipConfig {
             schema_hash: None,
             max_peer_failures: DEFAULT_MAX_PEER_FAILURES,
             peer_retry_interval: Duration::from_secs(DEFAULT_PEER_RETRY_SECONDS),
+            peer_supervisor_interval: Duration::from_secs(DEFAULT_PEER_SUPERVISOR_SECONDS),
             max_delta_history: 100,
             full_sync_interval: 50,     // Force full sync every 50 deltas
             max_pooled_connections: 20, // Allow up to 20 pooled connections

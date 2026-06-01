@@ -174,6 +174,20 @@ impl<T> ConnectionPool<T> {
         self.set_session_configured_addr(peer_id, addr);
     }
 
+    /// Every peer that has a configured (desired) address — i.e. the "required
+    /// peers" the p2p configured-peer supervisor must keep a direct connection
+    /// to. Read-only snapshot; generates no network traffic.
+    pub(crate) fn list_configured_peers(&self) -> Vec<(crate::PeerId, SocketAddr)> {
+        let mut out = Vec::new();
+        self.peer_sessions.iter_sync(|peer_id, session| {
+            if let Some(addr) = session.configured_addr() {
+                out.push((peer_id.clone(), addr));
+            }
+            true
+        });
+        out
+    }
+
     pub(crate) fn set_current_peer_connection(
         &self,
         peer_id: &crate::PeerId,

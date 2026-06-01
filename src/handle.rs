@@ -1664,6 +1664,11 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     let mut vector_clock_gc_timer = interval(vector_clock_gc_interval);
     vector_clock_gc_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // p2p configured-peer supervisor: keep a direct point-to-point connection to
+    // every `configure_peer`d (required) peer alive + emit a liveness signal.
+    let mut peer_supervisor_timer = interval(registry.config.peer_supervisor_interval);
+    peer_supervisor_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Peer gossip timer - only if peer discovery is enabled
     let mut peer_gossip_timer = peer_gossip_interval.map(|i| {
         let mut t = interval(i);
@@ -1769,6 +1774,14 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                 }
                 // Run vector clock garbage collection
                 registry.run_vector_clock_gc().await;
+            }
+            _ = peer_supervisor_timer.tick() => {
+                if registry.is_shutdown().await {
+                    break;
+                }
+                // Keep a direct p2p connection to every required peer alive +
+                // emit liveness. Point-to-point only — no gossip, no broadcast.
+                registry.supervise_configured_peers().await;
             }
             // Peer gossip timer - for peer list gossip (Phase 4)
             _ = async {
