@@ -717,6 +717,139 @@ fn socket_close_does_not_trigger_actor_removed_broadcast() -> Result<(), DynErro
     })
 }
 
+/// Stale-connection teardown over a *real, still-open* pooled connection — the
+/// UDP black-hole regression guard.
+///
+/// The synthetic-peer tests above prove the failure-consensus *accounting*
+/// (failures++, actors retained, no premature tombstone) but they never
+/// establish a real transport connection, so they cannot observe the other half
+/// of the contract: when a connected peer crosses `max_peer_failures` via
+/// **response-asymmetry** (we keep sending, it stops answering) the now-stale
+/// pooled connection must be **torn down** so the next send/connect
+/// re-establishes a fresh one (self-correcting).
+///
+/// Why response-asymmetry specifically — and why the peer must stay *up*: over
+/// TCP a dead peer sends a FIN, the read-loop observes the close, and
+/// `handle_peer_connection_failure` tears the connection down on its own (the
+/// `#[ignore]`d drop test). **Over UDP there is no FIN** — the socket stays
+/// "usable" forever, the read-loop never fires, and the *only* signal that the
+/// peer is gone is that it stopped answering gossip. Before the fix that left
+/// the dead connection lingering in the pool for 90 s+, so `has_connection*`
+/// reported a dead peer as connected and jobs silently black-holed. To isolate
+/// that exact path this test keeps the subscriber **alive** (socket open, no
+/// FIN, connection stays usable) and quiets background gossip, so the
+/// response-asymmetry verdict in `apply_gossip_results` is the sole thing that
+/// can remove the connection.
+#[test]
+fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            // Quiet background gossip on BOTH nodes: no automatic round can
+            // reset `last_response_received_ms` (which would defeat the
+            // no-response simulation) or redial. The connection is established
+            // by an explicit bootstrap dial below, independent of this.
+            gossip_interval: Duration::from_secs(3600),
+            peer_retry_interval: Duration::from_secs(3600),
+            peer_liveness_window: Duration::from_millis(500),
+            connection_timeout: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let subscriber = create_node(config.clone()).await?;
+        let sub_addr = subscriber.registry.bind_addr;
+        let sub_peer_id = subscriber.registry.peer_id.clone();
+
+        // Establish a REAL connection by an explicit *blocking* dial (not
+        // gossip-driven, so it works even with gossip quiesced; and blocking, so
+        // it is deterministic under parallel-test handshake contention). The
+        // subscriber stays up for the whole test, so this connection never
+        // receives a FIN and the read-loop never tears it down — exactly the UDP
+        // "no close signal" condition.
+        publisher
+            .registry
+            .add_peer_with_node_id(sub_addr, Some(sub_peer_id.to_node_id()))
+            .await;
+        let pool = &publisher.registry.connection_pool;
+        let connected_before = {
+            let start = Instant::now();
+            loop {
+                let _ = publisher.registry.connect_to_peer(&sub_peer_id).await;
+                if pool.has_connection(&sub_addr) || pool.has_connection_by_peer_id(&sub_peer_id) {
+                    break true;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    break false;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        };
+        assert!(
+            connected_before,
+            "test precondition: publisher must hold a real, usable pooled connection to the \
+             (still-running) subscriber"
+        );
+
+        // Attribute a known actor to the real subscriber's addr/peer-id so the
+        // retained-actor half of the contract can be checked after teardown.
+        publisher.registry.actor_state.known_actors.upsert_sync(
+            DEAD_ACTOR_NAME.to_string(),
+            RemoteActorLocation::new_with_peer(sub_addr, sub_peer_id.clone()),
+        );
+        {
+            let mut state = publisher.registry.gossip_state.lock().await;
+            state
+                .peer_to_actors
+                .entry(sub_addr)
+                .or_default()
+                .insert(DEAD_ACTOR_NAME.to_string());
+            // Make the last response look stale so the no-response rounds below
+            // trip the response-asymmetry detector.
+            if let Some(peer) = state.peers.get_mut(&sub_addr) {
+                peer.last_response_received_ms =
+                    icanact_remote::current_timestamp_millis().saturating_sub(60 * 1000);
+            }
+        }
+
+        // Drive the verdict deterministically: the subscriber is alive at the
+        // socket level (connection stays "usable") but is treated as having
+        // stopped answering at the app level — the UDP black-hole shape.
+        for sequence in 0..config.max_peer_failures {
+            publisher
+                .registry
+                .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    peer_addr: sub_addr,
+                    sent_sequence: sequence as u64,
+                    outcome: Ok(None),
+                }])
+                .await;
+        }
+
+        assert!(
+            peer_failures(&publisher, sub_addr).await >= config.max_peer_failures,
+            "publisher should mark the silent subscriber failed after no-response rounds"
+        );
+
+        // First half of the contract: the stale connection is torn down even
+        // though the socket never closed. This is what fails on the pre-fix
+        // code (the connection lingered as "usable").
+        assert!(
+            !pool.has_connection(&sub_addr) && !pool.has_connection_by_peer_id(&sub_peer_id),
+            "stale connection to a peer past max_peer_failures must be torn down so the \
+             next send/connect self-corrects (UDP black-hole regression)"
+        );
+
+        // Second half (must still hold): tearing down the transport connection
+        // must NOT evict the peer's actors.
+        assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
+
+        publisher.shutdown().await;
+        subscriber.shutdown().await;
+        Ok(())
+    })
+}
+
 /// Transport-level peer death should not queue `ActorRemoved` for
 /// gossip. Actor removal is a higher-level consensus/timeout decision.
 #[test]
