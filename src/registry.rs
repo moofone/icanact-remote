@@ -4550,10 +4550,42 @@ impl<T: 'static> GossipRegistry<T> {
         newly_dead.sort_by_key(|a| (a.ip(), a.port()));
         newly_dead.dedup();
         for addr in newly_dead {
-            info!(
-                peer = %addr,
-                "peer reached failure threshold; retaining actors for reconnection"
-            );
+            // The peer crossed the failure threshold via response-asymmetry: we
+            // kept sending but received nothing back for `peer_liveness_window`.
+            // Tear down the now-stale connection so the very next send/connect
+            // re-establishes a fresh one (self-correcting), and so
+            // `get_connected_connection_to_peer` stops reporting a dead UDP peer as
+            // connected. Only the transport connection is removed — actor state is
+            // RETAINED so a reconnecting peer keeps its actors (a returning peer's
+            // re-negotiation handshake replaces the entry even sooner via
+            // `publish_current_peer_connection`).
+            let pool = &self.connection_pool;
+            let peer_id = pool.addr_to_peer_id.read_sync(&addr, |_, v| v.clone());
+            if let Some(peer_id) = peer_id {
+                if pool.disconnect_connection_by_peer_id(&peer_id).is_some() {
+                    info!(
+                        peer = %addr,
+                        %peer_id,
+                        "peer reached failure threshold; tore down stale connection \
+                         (actors retained for reconnection)"
+                    );
+                    continue;
+                }
+            }
+            if pool.has_connection(&addr) {
+                pool.remove_connection(addr);
+                info!(
+                    peer = %addr,
+                    "peer reached failure threshold; removed stale connection by address \
+                     (actors retained for reconnection)"
+                );
+            } else {
+                info!(
+                    peer = %addr,
+                    "peer reached failure threshold; no live connection to tear down \
+                     (actors retained for reconnection)"
+                );
+            }
         }
     }
 
