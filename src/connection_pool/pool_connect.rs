@@ -726,6 +726,25 @@ impl<T> ConnectionPool<T> {
         self.addr_to_peer_id.read_sync(addr, |_, v| v.clone())
     }
 
+    /// Reverse-lookup a configured peer id by its configured dial address.
+    ///
+    /// Unlike [`get_peer_id_by_addr`](Self::get_peer_id_by_addr) — which only
+    /// sees addresses we have already connected to (`addr_to_peer_id`) — this
+    /// consults the *configured* peer map (`peer_id_to_addr`). It lets the very
+    /// first TLS dial to a configured peer pin the expected NodeId in its SNI
+    /// rather than falling back to an unauthenticated placeholder.
+    pub(crate) fn configured_peer_id_for_addr(&self, addr: &SocketAddr) -> Option<crate::PeerId> {
+        let mut found = None;
+        self.peer_id_to_addr.iter_sync(|peer_id, peer_addr| {
+            if peer_addr == addr {
+                found = Some(peer_id.clone());
+                return false;
+            }
+            true
+        });
+        found
+    }
+
     /// Add an additional address mapping for a peer ID.
     /// Used when a peer connects from an ephemeral port that differs from their bind address.
     pub fn add_addr_to_peer_id(&self, addr: SocketAddr, peer_id: crate::PeerId) {
@@ -1136,7 +1155,7 @@ impl<T> ConnectionPool<T> {
                 );
             }
 
-            self.connection_counter.fetch_sub(1, Ordering::AcqRel);
+            self.decrement_connection_counter();
             self.clear_capabilities_for_addr(&addr);
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
@@ -1146,6 +1165,88 @@ impl<T> ConnectionPool<T> {
         } else {
             None
         }
+    }
+
+    /// Instance id of the live transport session currently indexed for a peer.
+    ///
+    /// Consumers capture this *before* an ask so they can later request an
+    /// instance-guarded eviction — see [`Self::note_peer_ask_streak_timeout`]
+    /// and [`Self::note_peer_ask_hard_fault`].
+    pub(crate) fn current_peer_connection_instance(&self, peer_id: &crate::PeerId) -> Option<u64> {
+        self.get_connection_by_peer_id(peer_id)
+            .and_then(|conn| conn.stream_handle.as_ref().map(|handle| handle.instance_id()))
+    }
+
+    /// Evict the peer's cached session, but only if the session currently
+    /// indexed is the same instance the caller's failing ask used. A `None`
+    /// expectation evicts unconditionally (caller had no instance to pin).
+    /// This is the instance guard that stops a timeout on an already-replaced
+    /// session from tearing down the freshly reconnected, healthy session.
+    fn evict_peer_session_if_instance(
+        &self,
+        peer_id: &crate::PeerId,
+        expected_instance: Option<u64>,
+    ) -> bool {
+        if let Some(expected) = expected_instance
+            && self.current_peer_connection_instance(peer_id) != Some(expected)
+        {
+            return false;
+        }
+        self.disconnect_connection_by_peer_id(peer_id).is_some()
+    }
+
+    /// Consumer-classified healthy ask outcome: reset the peer's streak.
+    pub(crate) fn note_peer_ask_success(&self, peer_id: &crate::PeerId) {
+        let _ = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| session.reset_ask_timeout_streak());
+    }
+
+    /// Consumer-classified streak-timeout: accrue toward the threshold and
+    /// evict (instance-guarded) once it is reached. Returns whether a session
+    /// was evicted. `threshold == 0` disables the mechanism.
+    pub(crate) fn note_peer_ask_streak_timeout(
+        &self,
+        peer_id: &crate::PeerId,
+        threshold: u8,
+        expected_instance: Option<u64>,
+    ) -> bool {
+        if threshold == 0 {
+            return false;
+        }
+        let session = self.get_or_create_peer_session(peer_id);
+        let count = session.record_ask_timeout();
+        if count < threshold {
+            return false;
+        }
+        let evicted = self.evict_peer_session_if_instance(peer_id, expected_instance);
+        if evicted {
+            // Only clear the streak once we actually tore the session down. If
+            // the instance guard blocked (the session was already replaced),
+            // leave the count so the next timeout on the live session still
+            // trips immediately.
+            session.reset_ask_timeout_streak();
+            warn!(
+                target: "icanact_remote_lifecycle",
+                peer_id = %peer_id,
+                consecutive_timeouts = count,
+                "ask_timeout_streak_evicting_peer_session"
+            );
+        }
+        evicted
+    }
+
+    /// Consumer-classified hard transport fault: evict immediately
+    /// (instance-guarded), bypassing the streak, and clear the counter.
+    pub(crate) fn note_peer_ask_hard_fault(
+        &self,
+        peer_id: &crate::PeerId,
+        expected_instance: Option<u64>,
+    ) -> bool {
+        let _ = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| session.reset_ask_timeout_streak());
+        self.evict_peer_session_if_instance(peer_id, expected_instance)
     }
 
     /// Disconnect and remove a connection by peer ID
@@ -1210,7 +1311,7 @@ impl<T> ConnectionPool<T> {
                 self.clear_capabilities_for_addr(addr);
             }
 
-            self.connection_counter.fetch_sub(1, Ordering::AcqRel);
+            self.decrement_connection_counter();
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
             connection.abort_tasks();
@@ -1219,6 +1320,52 @@ impl<T> ConnectionPool<T> {
         } else {
             None
         }
+    }
+
+    /// Choose the least-recently-used connection eligible for eviction when
+    /// the pool is at capacity.
+    ///
+    /// Connections belonging to a configured/required peer (one we hold a
+    /// stable dial address for) are never selected: evicting a live cluster
+    /// member to admit a new — often transient or discovered — dial would
+    /// disconnect the cluster. When every connection is a configured peer this
+    /// returns `None` and the soft pool cap is allowed to flex rather than
+    /// dropping a required link.
+    fn select_lru_eviction_victim(&self) -> Option<SocketAddr> {
+        let mut oldest: Option<(SocketAddr, usize)> = None;
+        self.connections_by_addr.iter_sync(|addr, conn| {
+            if let Some(peer_id) = self.addr_to_peer_id.read_sync(addr, |_, pid| pid.clone())
+                && self.get_configured_peer_addr(&peer_id).is_some()
+            {
+                // Required cluster peer — not an eviction candidate.
+                return true;
+            }
+            let last_used = conn.last_used.load(Ordering::Acquire);
+            match oldest {
+                None => oldest = Some((*addr, last_used)),
+                Some((_, best_last_used)) => {
+                    if last_used < best_last_used {
+                        oldest = Some((*addr, last_used));
+                    }
+                }
+            }
+            true
+        });
+        oldest.map(|(addr, _)| addr)
+    }
+
+    /// Decrement the connection counter without ever wrapping below zero.
+    ///
+    /// `AtomicUsize::fetch_sub` underflows to `usize::MAX` if the counter and
+    /// the real connection set ever drift apart; saturating here keeps the
+    /// admission gate (`add_lock_free_connection`) sane even under accounting
+    /// skew.
+    fn decrement_connection_counter(&self) {
+        let _ = self.connection_counter.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| Some(count.saturating_sub(1)),
+        );
     }
 
     /// Get connection count - lock-free operation
@@ -1608,6 +1755,10 @@ impl<T> ConnectionPool<T> {
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
             self.publish_current_peer_connection(peer_id, connection_arc.clone());
         }
+        // Count this connection exactly once, mirroring `add_connection_by_peer_id`.
+        // Without this the outbound path published a live connection that the
+        // teardown paths later decremented, underflowing `connection_counter`.
+        self.connection_counter.fetch_add(1, Ordering::AcqRel);
         debug!(
             "CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections",
             addr,

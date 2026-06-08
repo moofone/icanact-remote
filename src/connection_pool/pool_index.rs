@@ -34,6 +34,10 @@ struct PeerSession {
     configured_addr: std::sync::RwLock<Option<SocketAddr>>,
     correlation: Arc<CorrelationTracker>,
     current_connection: ArcSwapOption<LockFreeConnection>,
+    /// Consecutive consumer-classified streak-timeouts for this peer. Lives on
+    /// the session (which survives reconnects) so the streak is genuinely
+    /// per-peer. Reset on a successful ask or on eviction.
+    consecutive_ask_timeouts: AtomicU8,
 }
 
 impl PeerSession {
@@ -42,7 +46,19 @@ impl PeerSession {
             configured_addr: std::sync::RwLock::new(None),
             correlation: CorrelationTracker::new(),
             current_connection: ArcSwapOption::empty(),
+            consecutive_ask_timeouts: AtomicU8::new(0),
         }
+    }
+
+    fn reset_ask_timeout_streak(&self) {
+        self.consecutive_ask_timeouts.store(0, Ordering::Release);
+    }
+
+    /// Increment and return the new consecutive streak-timeout count.
+    fn record_ask_timeout(&self) -> u8 {
+        self.consecutive_ask_timeouts
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
     }
 
     fn configured_addr(&self) -> Option<SocketAddr> {

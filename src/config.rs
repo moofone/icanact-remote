@@ -33,7 +33,7 @@ pub const DEFAULT_TCP_KEEPALIVE_IDLE_SECS: u64 = 1;
 pub const DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS: u64 = 1;
 
 /// Default TCP keepalive probe retries
-pub const DEFAULT_TCP_KEEPALIVE_RETRIES: u32 = 1;
+pub const DEFAULT_TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 /// TCP keepalive configuration for fast disconnect detection during idle periods
 #[derive(Debug, Clone)]
@@ -59,6 +59,17 @@ pub struct ConnectionRecoveryPolicy {
     pub evict_peer_on_ask_cancel: bool,
     /// After evicting on timeout, reconnect and retry the actor ask once.
     pub retry_actor_ask_once_after_timeout: bool,
+    /// Number of *consecutive* ask outcomes a consumer classifies as
+    /// streak-timeouts (via the `note_peer_ask_*` mechanism) before the cached
+    /// transport session is evicted. `0` disables the streak mechanism.
+    ///
+    /// This is the single, generic eviction mechanism: the consumer supplies
+    /// the domain classification (which errors count, which RPCs participate)
+    /// and icanact-remote owns the per-peer counter, the threshold, the
+    /// reset-on-success, and the instance-guarded teardown. It lets
+    /// latency-sensitive consumers (e.g. raft) ride over transient transport
+    /// blips instead of evicting on the first timeout.
+    pub consecutive_timeout_threshold: u8,
 }
 
 impl ConnectionRecoveryPolicy {
@@ -67,6 +78,20 @@ impl ConnectionRecoveryPolicy {
             evict_peer_on_ask_timeout: true,
             evict_peer_on_ask_cancel: true,
             retry_actor_ask_once_after_timeout: true,
+            consecutive_timeout_threshold: 0,
+        }
+    }
+
+    /// Streak-based recovery: evict only after `threshold` consecutive
+    /// consumer-classified streak-timeouts (hard transport faults still evict
+    /// immediately). Rides over transient blips shorter than the streak. Used
+    /// by latency-sensitive consumers such as raft consensus.
+    pub const fn streak_ask_timeout_recovery(threshold: u8) -> Self {
+        Self {
+            evict_peer_on_ask_timeout: false,
+            evict_peer_on_ask_cancel: false,
+            retry_actor_ask_once_after_timeout: false,
+            consecutive_timeout_threshold: threshold,
         }
     }
 }
@@ -335,6 +360,10 @@ mod tests {
         assert_eq!(config.ask_window, DEFAULT_ASK_WINDOW);
         assert_eq!(config.dead_peer_timeout, Duration::from_secs(900));
         assert!(!config.nat_role_reconnect_enabled);
+        assert_eq!(
+            config.tcp_keepalive.as_ref().and_then(|ka| ka.retries),
+            Some(DEFAULT_TCP_KEEPALIVE_RETRIES)
+        );
         assert_eq!(
             config.connection_recovery,
             ConnectionRecoveryPolicy::default()
