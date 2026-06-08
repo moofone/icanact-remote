@@ -9,6 +9,13 @@ const SLOT_READY: u8 = 3;
 /// Pending response slot
 struct PendingResponseSlot {
     state: AtomicU8,
+    /// Full 16-bit correlation id of the request currently occupying this
+    /// slot (meaningful whenever `state != SLOT_EMPTY`). Because `id` and
+    /// `id + 8192*k` alias to the same slot index, the 13-bit slot index is
+    /// not by itself a sufficient match — `complete()` verifies this full id
+    /// so a stale/delayed response for a recycled id cannot complete a
+    /// *different* in-flight request occupying the same slot.
+    id: AtomicU16,
     response: UnsafeCell<MaybeUninit<crate::AlignedBytes>>,
     waker: AtomicWaker,
 }
@@ -58,6 +65,7 @@ impl CorrelationTracker {
         let mut pending = Vec::with_capacity(PENDING_RESPONSES_SIZE);
         pending.resize_with(PENDING_RESPONSES_SIZE, || PendingResponseSlot {
             state: AtomicU8::new(SLOT_EMPTY),
+            id: AtomicU16::new(0),
             response: UnsafeCell::new(MaybeUninit::uninit()),
             waker: AtomicWaker::new(),
         });
@@ -97,16 +105,23 @@ impl CorrelationTracker {
 
             let slot = Self::slot_index(id);
             let slot_ref = &self.pending[slot];
+            // Claim the slot through the transient WRITING state so we can
+            // publish this request's full id *before* the slot becomes
+            // observable as WAITING. A concurrent `complete()` acquires the
+            // WAITING state and is therefore guaranteed to see the id we store
+            // here, letting it reject a mismatched (aliased) response.
             if slot_ref
                 .state
                 .compare_exchange(
                     SLOT_EMPTY,
-                    SLOT_WAITING,
+                    SLOT_WRITING,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
                 .is_ok()
             {
+                slot_ref.id.store(id, Ordering::Relaxed);
+                slot_ref.state.store(SLOT_WAITING, Ordering::Release);
                 #[cfg(feature = "trace-correlation")]
                 trace!(
                     "CorrelationTracker: Allocated correlation_id {} in slot {}",
@@ -146,6 +161,17 @@ impl CorrelationTracker {
             )
             .is_err()
         {
+            return false;
+        }
+
+        // We now exclusively own the slot (WRITING). Reject a response whose
+        // full correlation id does not match the request currently occupying
+        // this slot: `id` and `id + 8192*k` share a slot index, so a stale or
+        // delayed response for a recycled id must not complete a *different*
+        // in-flight request. Restore the WAITING state so the genuine owner is
+        // still completed by its own response.
+        if slot_ref.id.load(Ordering::Relaxed) != correlation_id {
+            slot_ref.state.store(SLOT_WAITING, Ordering::Release);
             return false;
         }
 

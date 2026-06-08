@@ -26,23 +26,12 @@ impl<T> ConnectionPool<T> {
             "outbound_connect_start"
         );
 
-        // Make room if necessary - evict the least-recently-used connection.
+        // Make room if necessary - evict the least-recently-used connection
+        // that is safe to drop. Configured/required peers are never chosen, so
+        // a new (often transient/discovered) dial cannot disconnect a live
+        // cluster member to fit under the pool cap.
         if self.connections_by_addr.len() >= max_connections {
-            let mut oldest: Option<(SocketAddr, usize)> = None;
-            self.connections_by_addr.iter_sync(|addr, conn| {
-                let last_used = conn.last_used.load(Ordering::Acquire);
-                match oldest {
-                    None => oldest = Some((*addr, last_used)),
-                    Some((_, best_last_used)) => {
-                        if last_used < best_last_used {
-                            oldest = Some((*addr, last_used));
-                        }
-                    }
-                }
-                true
-            });
-
-            if let Some((oldest_addr, _)) = oldest {
+            if let Some(oldest_addr) = self.select_lru_eviction_victim() {
                 let _ = self.remove_connection(oldest_addr);
                 warn!(addr = %oldest_addr, "removed oldest connection to make room");
             }

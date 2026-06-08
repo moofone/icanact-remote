@@ -88,10 +88,17 @@ fn generate_self_signed_cert(secret_key: &SecretKey) -> Result<CertificateDer<'s
         0x30, 0x0F, 0x31, 0x0D, 0x30, 0x0B, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0C, 0x04, 0x6E, 0x6F,
         0x64, 0x65,
     ]);
-    tbs_cert.extend_from_slice(&[0x30, 0x1E, 0x17, 0x0D]);
-    tbs_cert.extend_from_slice(b"240101000000Z");
-    tbs_cert.extend_from_slice(&[0x17, 0x0D]);
-    tbs_cert.extend_from_slice(b"340101000000Z");
+    // Validity. Use GeneralizedTime (tag 0x18, 15 bytes "YYYYMMDDHHMMSSZ") so
+    // notAfter can be the RFC 5280 §4.1.2.5 "no well-defined expiration date"
+    // sentinel 99991231235959Z. UTCTime (the previous encoding) cannot
+    // represent years past 2049 and pinned a hard 2034-01-01 cluster-wide TLS
+    // time-bomb. Authenticity here comes from Ed25519 key possession, not a
+    // CA/expiry trust model, so these certs are intended never to expire.
+    // Validity SEQUENCE body = (2 + 15) + (2 + 15) = 34 = 0x22 bytes.
+    tbs_cert.extend_from_slice(&[0x30, 0x22, 0x18, 0x0F]);
+    tbs_cert.extend_from_slice(b"20240101000000Z");
+    tbs_cert.extend_from_slice(&[0x18, 0x0F]);
+    tbs_cert.extend_from_slice(b"99991231235959Z");
     tbs_cert.extend_from_slice(&[
         0x30, 0x0F, 0x31, 0x0D, 0x30, 0x0B, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0C, 0x04, 0x6E, 0x6F,
         0x64, 0x65,
@@ -119,4 +126,37 @@ fn generate_self_signed_cert(secret_key: &SecretKey) -> Result<CertificateDer<'s
     cert[3] = (total_len & 0xFF) as u8;
 
     Ok(CertificateDer::from(cert))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SecretKey;
+
+    fn der_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Audit finding A4: the self-signed certificate hardcoded a notAfter of
+    /// 2034-01-01 as a UTCTime, and both TLS verifiers ignore certificate
+    /// validity. On that date every cluster TLS handshake would begin failing.
+    /// These are pinned-key certs (authenticity = Ed25519 key possession, not a
+    /// CA/expiry model), so the cert must carry the RFC 5280 §4.1.2.5
+    /// "no well-defined expiration" sentinel (99991231235959Z) and never expire.
+    #[test]
+    fn self_signed_cert_has_no_near_term_expiry() {
+        let key = SecretKey::generate();
+        let cert = generate_self_signed_cert(&key).expect("cert generation should succeed");
+        let der = cert.as_ref();
+        assert!(
+            !der_contains(der, b"340101000000Z"),
+            "certificate must not embed the old 2034 UTCTime expiry time-bomb"
+        );
+        assert!(
+            der_contains(der, b"99991231235959Z"),
+            "certificate notAfter must be the far-future GeneralizedTime sentinel"
+        );
+    }
 }

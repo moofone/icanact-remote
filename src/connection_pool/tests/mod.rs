@@ -3183,3 +3183,311 @@ async fn delta_gossip_updates_last_response_received_ms() {
         stale_time,
     );
 }
+
+/// DRY consolidation: the per-peer consecutive-timeout streak eviction
+/// mechanism now lives in icanact-remote (the raft wrapper supplies only the
+/// classification). Evict only once the streak threshold is reached; a success
+/// resets it; a hard fault evicts immediately. (Ported from the shared-raft
+/// `RaftRpcDisconnectTracker` behaviour tests.)
+#[test]
+fn streak_timeout_evicts_only_at_threshold_and_resets_on_success() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer = crate::KeyPair::new_for_testing("streak_threshold").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7310".parse().unwrap();
+
+    let add = || {
+        let conn = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+        conn.set_state(ConnectionState::Connected);
+        assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
+    };
+    add();
+
+    // Threshold 3: first two streak-timeouts must NOT evict.
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
+    assert!(pool.get_lock_free_connection(addr).is_some());
+
+    // A success resets the streak, so the next two again don't evict.
+    pool.note_peer_ask_success(&peer);
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
+    assert!(pool.get_lock_free_connection(addr).is_some());
+
+    // Third consecutive timeout reaches the threshold and evicts.
+    assert!(pool.note_peer_ask_streak_timeout(&peer, 3, None));
+    assert!(pool.get_lock_free_connection(addr).is_none());
+}
+
+/// The per-peer streak is isolated: accruing timeouts for one peer never
+/// evicts another, and evicting one leaves the other untouched.
+#[test]
+fn streak_is_isolated_per_peer() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_a = crate::KeyPair::new_for_testing("streak_iso_a").peer_id();
+    let peer_b = crate::KeyPair::new_for_testing("streak_iso_b").peer_id();
+    let addr_a: SocketAddr = "127.0.0.1:7320".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:7321".parse().unwrap();
+    for (peer, addr) in [(&peer_a, addr_a), (&peer_b, addr_b)] {
+        let conn = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+        conn.set_state(ConnectionState::Connected);
+        assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
+    }
+
+    // Accrue peer_a to just below the threshold; peer_b once. Neither evicts.
+    assert!(!pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
+    assert!(!pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
+    assert!(!pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
+    assert!(!pool.note_peer_ask_streak_timeout(&peer_b, 4, None));
+    assert!(pool.get_lock_free_connection(addr_a).is_some());
+    assert!(pool.get_lock_free_connection(addr_b).is_some());
+
+    // peer_a's 4th consecutive timeout evicts ONLY peer_a.
+    assert!(pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
+    assert!(pool.get_lock_free_connection(addr_a).is_none());
+    assert!(pool.get_lock_free_connection(addr_b).is_some());
+}
+
+/// A hard fault evicts and clears the pending streak, so timeouts on the
+/// reconnected session restart from one rather than evicting immediately.
+#[test]
+fn hard_fault_clears_pending_streak() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer = crate::KeyPair::new_for_testing("hf_clears").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7322".parse().unwrap();
+    let add = || {
+        let conn = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+        conn.set_state(ConnectionState::Connected);
+        assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
+    };
+    add();
+
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // streak = 1
+    assert!(pool.note_peer_ask_hard_fault(&peer, None)); // evict + clear
+    assert!(pool.get_lock_free_connection(addr).is_none());
+
+    add(); // reconnect
+    // Must restart from 1, not carry the pre-fault count.
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None));
+    assert!(pool.get_lock_free_connection(addr).is_some());
+}
+
+/// Eviction requires `threshold` *consecutive* streak-timeouts: a success
+/// anywhere in the run resets the counter.
+#[test]
+fn streak_only_evicts_on_consecutive_timeouts() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer = crate::KeyPair::new_for_testing("consec").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7323".parse().unwrap();
+    let conn = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    conn.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
+
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // 1
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // 2
+    pool.note_peer_ask_success(&peer); // reset
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // 1
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // 2
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // 3
+    assert!(
+        pool.get_lock_free_connection(addr).is_some(),
+        "max consecutive run was 3 (< threshold 4): must not evict"
+    );
+    assert!(pool.note_peer_ask_streak_timeout(&peer, 4, None)); // 4 consecutive -> evict
+    assert!(pool.get_lock_free_connection(addr).is_none());
+}
+
+/// A hard transport fault evicts immediately, bypassing the streak threshold.
+#[test]
+fn hard_fault_evicts_immediately() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer = crate::KeyPair::new_for_testing("streak_hardfault").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7311".parse().unwrap();
+    let conn = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    conn.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
+
+    assert!(
+        pool.note_peer_ask_hard_fault(&peer, None),
+        "a hard fault must evict on the first occurrence"
+    );
+    assert!(pool.get_lock_free_connection(addr).is_none());
+}
+
+/// `threshold == 0` disables the streak mechanism entirely.
+#[test]
+fn streak_threshold_zero_never_evicts() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer = crate::KeyPair::new_for_testing("streak_zero").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7312".parse().unwrap();
+    let conn = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    conn.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
+
+    for _ in 0..10 {
+        assert!(!pool.note_peer_ask_streak_timeout(&peer, 0, None));
+    }
+    assert!(pool.get_lock_free_connection(addr).is_some());
+}
+
+/// C3 instance guard: a streak-timeout whose pinned instance no longer matches
+/// the live session (it was reconnected mid-ask) must NOT evict the fresh,
+/// healthy session.
+#[test]
+fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
+    run_multi_thread_test(async {
+        let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+        let peer = crate::KeyPair::new_for_testing("streak_instance_guard").peer_id();
+        let addr: SocketAddr = "127.0.0.1:7313".parse().unwrap();
+
+        // Associate the address with the peer so finalize publishes it under
+        // the peer id, giving us a real stream instance to pin.
+        pool.add_addr_to_peer_id(addr, peer.clone());
+        let (io, _keep) = tokio::io::duplex(1024);
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new())
+            .await
+            .expect("finalize outbound");
+
+        let live_instance = pool
+            .current_peer_connection_instance(&peer)
+            .expect("live session should have a stream instance");
+
+        // Threshold 1, but a STALE instance: the guard must block eviction.
+        let stale = live_instance.wrapping_add(1);
+        assert!(
+            !pool.note_peer_ask_streak_timeout(&peer, 1, Some(stale)),
+            "a streak-timeout pinned to a stale instance must not evict"
+        );
+        assert!(
+            pool.current_peer_connection_instance(&peer).is_some(),
+            "the live, reconnected session must survive a stale-instance timeout"
+        );
+
+        // The correct instance does evict.
+        assert!(
+            pool.note_peer_ask_streak_timeout(&peer, 1, Some(live_instance)),
+            "a streak-timeout pinned to the live instance must evict at threshold"
+        );
+        assert!(pool.current_peer_connection_instance(&peer).is_none());
+    });
+}
+
+/// Audit finding B2: the pool's LRU "make room" eviction picked the absolute
+/// least-recently-used connection with no regard for whether it was a
+/// configured/required cluster peer — so a new (often transient or discovered)
+/// dial could tear down a live cluster member to fit under the pool cap. The
+/// victim selector must skip configured peers.
+#[test]
+fn lru_eviction_spares_configured_peers() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // A configured (required) peer connection that is the LEAST recently used.
+    let cfg_peer = crate::KeyPair::new_for_testing("lru_cfg").peer_id();
+    let cfg_addr: SocketAddr = "127.0.0.1:7200".parse().unwrap();
+    pool.set_configured_peer_addr(&cfg_peer, cfg_addr);
+    let cfg_conn = Arc::new(LockFreeConnection::new(
+        cfg_addr,
+        ConnectionDirection::Inbound,
+    ));
+    cfg_conn.set_state(ConnectionState::Connected);
+    cfg_conn.last_used.store(1, Ordering::Relaxed);
+    assert!(pool.add_connection_by_peer_id(cfg_peer.clone(), cfg_addr, cfg_conn));
+
+    // An anonymous / discovered connection that is MORE recently used.
+    let other_addr: SocketAddr = "127.0.0.1:7201".parse().unwrap();
+    let other_conn = Arc::new(LockFreeConnection::new(
+        other_addr,
+        ConnectionDirection::Inbound,
+    ));
+    other_conn.set_state(ConnectionState::Connected);
+    other_conn.last_used.store(100, Ordering::Relaxed);
+    pool.index_connection_by_addr(other_addr, other_conn);
+
+    let victim = pool.select_lru_eviction_victim();
+    assert_eq!(
+        victim,
+        Some(other_addr),
+        "LRU must evict the anonymous connection, never the configured (required) peer"
+    );
+}
+
+/// Audit finding B1: the outbound finalize path inserts a connection into the
+/// pool but historically never incremented `connection_counter`, while every
+/// teardown path decremented it. Each outbound connect→disconnect therefore
+/// drove the counter toward underflow (wrapping to `usize::MAX`), which
+/// permanently breaks the inbound admission gate keyed on this counter.
+#[test]
+fn outbound_finalize_balances_connection_counter() {
+    run_multi_thread_test(async {
+        let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+        let addr: SocketAddr = "127.0.0.1:7100".parse().unwrap();
+        let (io, _peer) = tokio::io::duplex(1024);
+
+        let _handle = pool
+            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new())
+            .await
+            .expect("outbound finalize should succeed");
+
+        assert_eq!(
+            pool.connection_counter.load(Ordering::SeqCst),
+            1,
+            "a finalized outbound connection must be counted exactly once"
+        );
+
+        let removed = pool.remove_connection(addr);
+        assert!(
+            removed.is_some(),
+            "the finalized connection should be removable by address"
+        );
+
+        assert_eq!(
+            pool.connection_counter.load(Ordering::SeqCst),
+            0,
+            "removing the outbound connection must return the counter to zero, never underflow"
+        );
+    });
+}
+
+/// Audit finding D1: correlation slots are addressed by a 13-bit index, so
+/// `id` and `id + 8192*k` collide on the same slot. A stale/delayed response
+/// carrying a recycled, aliased id must NOT complete the slot currently owned
+/// by a *different* in-flight request — otherwise one RPC silently receives
+/// another RPC's response.
+#[test]
+fn complete_rejects_aliased_correlation_id() {
+    let tracker = CorrelationTracker::new();
+    let guard = tracker.allocate().expect("slot should be available");
+    let id = guard.id();
+    let aliased = id.wrapping_add(PENDING_RESPONSES_SIZE as u16);
+    assert_eq!(
+        CorrelationTracker::slot_index(id),
+        CorrelationTracker::slot_index(aliased),
+        "test precondition: the two ids must map to the same slot"
+    );
+    assert_ne!(id, aliased, "the two ids must be distinct");
+
+    let pool = Arc::new(crate::AlignedBytesPool::default());
+    let mut response = Some(crate::AlignedBytes::from_pooled_slice(
+        b"stale-response",
+        Arc::clone(&pool),
+    ));
+    assert!(
+        !tracker.complete(aliased, &mut response),
+        "an aliased correlation id must not complete a slot owned by a different id"
+    );
+    assert!(
+        response.is_some(),
+        "the response must be left intact when the full id does not match"
+    );
+
+    // The genuine owner still completes normally.
+    assert!(
+        tracker.complete(id, &mut response),
+        "the owning correlation id must complete its own slot"
+    );
+    assert!(
+        response.is_none(),
+        "the response is consumed when the full id matches"
+    );
+
+    drop(guard);
+}

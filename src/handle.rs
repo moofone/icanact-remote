@@ -65,6 +65,41 @@ fn is_registry_payload_aligned(payload: &[u8]) -> bool {
     ptr.is_multiple_of(REGISTRY_MESSAGE_ALIGNMENT)
 }
 
+fn resolve_inbound_peer_state_addr(
+    sender_bind_addr: Option<&str>,
+    peer_addr: SocketAddr,
+    configured_addr: Option<SocketAddr>,
+) -> SocketAddr {
+    let Some(sender_bind_addr) = sender_bind_addr else {
+        return configured_addr.unwrap_or(peer_addr);
+    };
+
+    let resolved_sender_addr = sender_bind_addr.parse::<SocketAddr>().ok().and_then(|_| {
+        crate::registry::resolve_peer_addr_checked(Some(sender_bind_addr), peer_addr)
+    });
+
+    if let Some(resolved_sender_addr) = resolved_sender_addr {
+        return resolved_sender_addr;
+    }
+
+    if let Some(configured_addr) = configured_addr {
+        warn!(
+            sender_bind_addr,
+            peer_addr = %peer_addr,
+            configured_addr = %configured_addr,
+            "ignoring non-dialable inbound advertised bind; using configured peer address"
+        );
+        return configured_addr;
+    }
+
+    warn!(
+        sender_bind_addr,
+        peer_addr = %peer_addr,
+        "ignoring non-dialable inbound advertised bind; using observed source address"
+    );
+    peer_addr
+}
+
 /// Main API for the gossip registry with vector clocks and separated locks
 pub struct GossipRegistryHandle<T = crate::BuilderTlsBootstrap> {
     pub registry: Arc<GossipRegistry>,
@@ -643,6 +678,54 @@ impl<T> GossipClient<T> {
             Arc::clone(&self.registry),
         ))
     }
+
+    /// Instance id of the peer's live transport session. Capture this *before*
+    /// an ask and pass it back to [`Self::note_peer_ask_streak_timeout`] /
+    /// [`Self::note_peer_ask_hard_fault`] so eviction is guarded against
+    /// tearing down a session reconnected while the ask was in flight.
+    pub fn current_peer_connection_instance(&self, peer_id: &crate::PeerId) -> Option<u64> {
+        self.registry
+            .connection_pool
+            .current_peer_connection_instance(peer_id)
+    }
+
+    /// Report a healthy ask outcome: resets the peer's consecutive-timeout streak.
+    ///
+    /// Consumer side of the single eviction mechanism: the consumer classifies
+    /// the outcome (domain-specific) and icanact-remote owns the streak
+    /// counter, threshold, and instance-guarded teardown.
+    pub fn note_peer_ask_success(&self, peer_id: &crate::PeerId) {
+        self.registry.connection_pool.note_peer_ask_success(peer_id);
+    }
+
+    /// Report a streak-timeout. Evicts (instance-guarded) once the configured
+    /// `consecutive_timeout_threshold` is reached. Returns whether evicted.
+    pub fn note_peer_ask_streak_timeout(
+        &self,
+        peer_id: &crate::PeerId,
+        expected_instance: Option<u64>,
+    ) -> bool {
+        let threshold = self
+            .registry
+            .config
+            .connection_recovery
+            .consecutive_timeout_threshold;
+        self.registry
+            .connection_pool
+            .note_peer_ask_streak_timeout(peer_id, threshold, expected_instance)
+    }
+
+    /// Report a hard transport fault: evicts immediately (instance-guarded),
+    /// bypassing the streak. Returns whether evicted.
+    pub fn note_peer_ask_hard_fault(
+        &self,
+        peer_id: &crate::PeerId,
+        expected_instance: Option<u64>,
+    ) -> bool {
+        self.registry
+            .connection_pool
+            .note_peer_ask_hard_fault(peer_id, expected_instance)
+    }
 }
 
 #[cfg(test)]
@@ -787,6 +870,46 @@ mod tests {
             ask_window: 1024,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn inbound_peer_state_addr_rejects_loopback_advertisement_from_remote_source() {
+        let peer_addr: SocketAddr = "10.10.0.8:49152".parse().unwrap();
+        let configured_addr: SocketAddr = "10.10.0.8:9301".parse().unwrap();
+
+        let resolved = resolve_inbound_peer_state_addr(
+            Some("127.0.0.1:9301"),
+            peer_addr,
+            Some(configured_addr),
+        );
+
+        assert_eq!(
+            resolved, configured_addr,
+            "non-dialable advertised loopback must not replace the stable configured address"
+        );
+    }
+
+    #[test]
+    fn inbound_peer_state_addr_rejects_zero_port_advertisement() {
+        let peer_addr: SocketAddr = "10.10.0.9:49153".parse().unwrap();
+        let configured_addr: SocketAddr = "10.10.0.9:9301".parse().unwrap();
+
+        let resolved =
+            resolve_inbound_peer_state_addr(Some("10.10.0.9:0"), peer_addr, Some(configured_addr));
+
+        assert_eq!(
+            resolved, configured_addr,
+            "advertised port zero must not replace the stable configured address"
+        );
+    }
+
+    #[test]
+    fn inbound_peer_state_addr_resolves_unspecified_bind_with_source_ip() {
+        let peer_addr: SocketAddr = "10.10.0.10:49154".parse().unwrap();
+
+        let resolved = resolve_inbound_peer_state_addr(Some("0.0.0.0:9301"), peer_addr, None);
+
+        assert_eq!(resolved, "10.10.0.10:9301".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
@@ -2199,20 +2322,18 @@ where
     }
     let node_id_opt = Some(sender_node_id_from_message);
 
-    // Prefer the sender's advertised bind address (validated) and fall back
-    // to any configured address, then the TCP source address.
+    // Prefer the sender's advertised bind address only after validation. If it
+    // is rejected, preserve any configured stable address instead of letting an
+    // ephemeral TCP source address replace the peer's dial target.
     let sender_bind_addr = sender_bind_addr_opt.as_deref();
-    let resolved_sender_addr =
-        sender_bind_addr.map(|addr| crate::registry::resolve_peer_addr(Some(addr), peer_addr));
     let configured_addr = {
         let pool = &registry.connection_pool;
         pool.peer_id_to_addr
             .read_sync(&peer_id, |_, v| *v)
             .filter(|addr| addr.port() != 0 && !addr.ip().is_unspecified())
     };
-    let peer_state_addr = resolved_sender_addr
-        .or_else(|| configured_addr)
-        .unwrap_or(peer_addr);
+    let peer_state_addr =
+        resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, configured_addr);
 
     if let Some(node_id) = node_id_opt {
         registry

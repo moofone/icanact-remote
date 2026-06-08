@@ -2497,8 +2497,13 @@ impl<T: 'static> GossipRegistry<T> {
                         .await
                 }
                 Ok(Err(e)) => {
-                    self.note_peer_liveness(&peer_id, addr, false, &format!("connect failed: {e:?}"))
-                        .await
+                    self.note_peer_liveness(
+                        &peer_id,
+                        addr,
+                        false,
+                        &format!("connect failed: {e:?}"),
+                    )
+                    .await
                 }
                 Err(_) => {
                     self.note_peer_liveness(&peer_id, addr, false, "connect timed out")
@@ -7156,9 +7161,12 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Full-sync actor locations are configured as direct routes rather than
         // gossip peers. Still derive the expected NodeId from that pinned PeerId
-        // so address-based TLS dials cannot fall back to placeholder SNI.
+        // so address-based TLS dials cannot fall back to placeholder SNI. Fall
+        // back to the configured peer map so even the *first* dial to a
+        // configured-but-not-yet-connected peer pins its NodeId.
         self.connection_pool
             .get_peer_id_by_addr(addr)
+            .or_else(|| self.connection_pool.configured_peer_id_for_addr(addr))
             .map(|peer_id| peer_id.to_node_id())
     }
 
@@ -7986,6 +7994,32 @@ mod tests {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         assert_eq!(registry.bind_addr, test_addr(8080));
         assert!(!registry.is_shutdown().await);
+    }
+
+    /// Audit finding A1: TLS server-cert NodeId pinning is only enforced when
+    /// the dial supplies a NodeId-encoded SNI. A configured cluster peer that
+    /// has not yet connected had no addr->NodeId mapping (it lived only in the
+    /// *configured* peer map), so `lookup_node_id` returned `None` and the
+    /// first dial fell back to an unauthenticated placeholder SNI. The expected
+    /// NodeId must be resolvable from the configured peer map alone.
+    #[tokio::test]
+    async fn lookup_node_id_resolves_configured_peer_before_first_connection() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let peer = test_peer_id("a1_configured_peer");
+        let peer_addr = test_addr(9301);
+
+        // Configure the peer's dial address without ever connecting to it.
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer, peer_addr);
+
+        let resolved = registry.lookup_node_id(&peer_addr).await;
+        assert_eq!(
+            resolved,
+            Some(peer.to_node_id()),
+            "a configured peer's NodeId must be resolvable by address so the \
+             dial pins it in the SNI instead of using a placeholder"
+        );
     }
 
     // #[tokio::test]
