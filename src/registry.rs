@@ -1662,9 +1662,13 @@ impl<T: 'static> GossipRegistry<T> {
                 "UDP transport keypair does not match registry peer id".to_string(),
             ));
         }
-        self.udp_mode = true;
-        self.tls_config = None;
-        Ok(())
+
+        // UDP transport is currently disabled until per-datagram peer authentication
+        // (signature/MAC + anti-replay) is implemented.
+        self.udp_mode = false;
+        Err(GossipError::InvalidConfig(
+            "UDP datagram transport is disabled: authenticated datagram peer identity is not implemented".to_string(),
+        ))
     }
 
     fn udp_now_ms(&self) -> u64 {
