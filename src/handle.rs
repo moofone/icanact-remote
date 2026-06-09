@@ -1367,42 +1367,6 @@ struct UdpPeerContext {
     authenticated_peer_id: crate::PeerId,
 }
 
-fn udp_gossip_sender_peer_id(datagram: &[u8], datagram_len: usize) -> Option<crate::PeerId> {
-    if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
-        return None;
-    }
-    let msg_len =
-        u32::from_be_bytes(datagram[..crate::framing::LENGTH_PREFIX_LEN].try_into().ok()?)
-            as usize;
-    let frame_len = crate::framing::LENGTH_PREFIX_LEN.checked_add(msg_len)?;
-    if frame_len > datagram_len || msg_len < crate::framing::GOSSIP_HEADER_LEN {
-        return None;
-    }
-    let msg_data = &datagram[crate::framing::LENGTH_PREFIX_LEN..frame_len];
-    if msg_data.first().copied() != Some(crate::MessageType::Gossip as u8) {
-        return None;
-    }
-    let payload_offset = crate::framing::GOSSIP_HEADER_LEN;
-    let payload = msg_data.get(payload_offset..)?;
-    let msg = decode_registry_message(payload).ok()?;
-    match msg {
-        crate::registry::RegistryMessage::DeltaGossip { delta, .. }
-        | crate::registry::RegistryMessage::DeltaGossipResponse { delta, .. } => {
-            Some(delta.sender_peer_id)
-        }
-        crate::registry::RegistryMessage::FullSyncRequest { sender_peer_id, .. }
-        | crate::registry::RegistryMessage::FullSync { sender_peer_id, .. }
-        | crate::registry::RegistryMessage::FullSyncResponse { sender_peer_id, .. } => {
-            Some(sender_peer_id)
-        }
-        crate::registry::RegistryMessage::PeerHealthReport { reporter, .. } => Some(reporter),
-        crate::registry::RegistryMessage::PeerHealthQuery { sender, .. } => Some(sender),
-        crate::registry::RegistryMessage::ImmediateAck { .. }
-        | crate::registry::RegistryMessage::ActorMessage { .. }
-        | crate::registry::RegistryMessage::PeerListGossip { .. } => None,
-    }
-}
-
 async fn process_udp_datagram_native(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
@@ -1420,17 +1384,6 @@ async fn process_udp_datagram_native(
         .map(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
         .unwrap_or(false);
     if !cached_peer_ready {
-        if registry
-            .connection_pool
-            .get_peer_id_by_addr(&peer_addr)
-            .is_none()
-            && let Some(peer_id) =
-                udp_gossip_sender_peer_id(datagram.as_ref(), datagram_len)
-        {
-            registry
-                .connection_pool
-                .add_addr_to_peer_id(peer_addr, peer_id);
-        }
         let mut response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
         if response_connection.is_none() {
             registry
