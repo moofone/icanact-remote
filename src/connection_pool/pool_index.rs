@@ -31,7 +31,8 @@ pub struct ConnectionPool<T = ()> {
 }
 
 struct PeerSession {
-    configured_addr: std::sync::RwLock<Option<SocketAddr>>,
+    route_addr: std::sync::RwLock<Option<SocketAddr>>,
+    required_addr: std::sync::RwLock<Option<SocketAddr>>,
     required_peer: AtomicBool,
     correlation: Arc<CorrelationTracker>,
     current_connection: ArcSwapOption<LockFreeConnection>,
@@ -44,7 +45,8 @@ struct PeerSession {
 impl PeerSession {
     fn new() -> Self {
         Self {
-            configured_addr: std::sync::RwLock::new(None),
+            route_addr: std::sync::RwLock::new(None),
+            required_addr: std::sync::RwLock::new(None),
             required_peer: AtomicBool::new(false),
             correlation: CorrelationTracker::new(),
             current_connection: ArcSwapOption::empty(),
@@ -64,17 +66,36 @@ impl PeerSession {
     }
 
     fn configured_addr(&self) -> Option<SocketAddr> {
-        *self
-            .configured_addr
-            .read()
-            .expect("peer session configured_addr poisoned")
+        self.route_addr()
+            .or_else(|| self.required_addr())
     }
 
     fn set_configured_addr(&self, addr: SocketAddr) {
         *self
-            .configured_addr
+            .route_addr
             .write()
-            .expect("peer session configured_addr poisoned") = Some(addr);
+            .expect("peer session route_addr poisoned") = Some(addr);
+    }
+
+    fn route_addr(&self) -> Option<SocketAddr> {
+        *self
+            .route_addr
+            .read()
+            .expect("peer session route_addr poisoned")
+    }
+
+    fn required_addr(&self) -> Option<SocketAddr> {
+        *self
+            .required_addr
+            .read()
+            .expect("peer session required_addr poisoned")
+    }
+
+    fn set_required_addr(&self, addr: SocketAddr) {
+        *self
+            .required_addr
+            .write()
+            .expect("peer session required_addr poisoned") = Some(addr);
     }
 
     fn mark_required_peer(&self) {

@@ -2897,8 +2897,10 @@ impl<T: 'static> GossipRegistry<T> {
     /// Connect to a configured peer by peer ID
     pub async fn connect_to_peer(&self, peer_id: &crate::PeerId) -> Result<()> {
         let pool = &self.connection_pool;
-        let configured_addr = pool.get_configured_peer_addr(peer_id);
-        match pool.get_connection_to_peer(peer_id).await {
+        let configured_addr = pool
+            .get_required_peer_addr(peer_id)
+            .or_else(|| pool.get_configured_peer_addr(peer_id));
+        match pool.get_connection_to_required_peer(peer_id).await {
             Ok(_) => {
                 if let Some(addr) = configured_addr {
                     let mut gossip_state = self.gossip_state.lock().await;
@@ -7584,6 +7586,53 @@ mod tests {
         assert!(
             reg.connection_pool.list_configured_peers().is_empty(),
             "full-sync actor locations are learned routes, not supervised required peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_learned_actor_route_does_not_replace_required_peer_dial_addr() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7402),
+            test_config_with_seed("full-sync-required-route-local"),
+        );
+        let remote_peer = KeyPair::new_for_testing("full-sync-required-route-remote").peer_id();
+        let required_addr = test_addr(8402);
+        let actor_addr = test_addr(9402);
+        let actor_name = "full-sync/required-route/service";
+
+        reg.configure_peer(remote_peer.clone(), required_addr).await;
+
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, remote_peer.clone()),
+        );
+
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            remote_peer.clone(),
+            required_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        assert!(
+            reg.lookup_actor(actor_name).await.is_some(),
+            "valid learned actor location should be retained"
+        );
+        assert_eq!(
+            reg.connection_pool.list_configured_peers(),
+            vec![(remote_peer.clone(), required_addr)],
+            "required-peer supervisor must keep the configured dial address"
+        );
+        assert_eq!(
+            reg.connection_pool
+                .peer_id_to_addr
+                .read_sync(&remote_peer, |_, addr| *addr),
+            Some(actor_addr),
+            "learned route remains available separately from required supervisor address"
         );
     }
 

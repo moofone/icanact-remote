@@ -1174,6 +1174,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_peer_connect_marks_peer_required_for_supervisor() -> crate::Result<()> {
+        let keypair = KeyPair::new_for_testing("manual-required-local");
+        let mut config = test_cfg();
+        config.key_pair = Some(keypair.clone());
+        config.connection_timeout = Duration::from_millis(10);
+
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            keypair.to_secret_key(),
+            Some(config),
+            TestTlsBootstrap,
+        )
+        .await?;
+
+        let peer_id = KeyPair::new_for_testing("manual-required-remote").peer_id();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let peer = handle.add_peer(&peer_id).await;
+        let _ = peer.connect(&addr).await;
+
+        assert_eq!(
+            handle.registry.connection_pool.list_configured_peers(),
+            vec![(peer_id, addr)],
+            "manual add_peer().connect() peers must be supervised as required peers"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_peer_connect_discovered_does_not_mark_peer_required() -> crate::Result<()> {
+        let keypair = KeyPair::new_for_testing("manual-discovered-local");
+        let mut config = test_cfg();
+        config.key_pair = Some(keypair.clone());
+        config.connection_timeout = Duration::from_millis(10);
+
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            keypair.to_secret_key(),
+            Some(config),
+            TestTlsBootstrap,
+        )
+        .await?;
+
+        let peer_id = KeyPair::new_for_testing("manual-discovered-remote").peer_id();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let peer = handle.add_peer(&peer_id).await;
+        let _ = peer.connect_discovered(&addr).await;
+
+        assert_eq!(
+            handle
+                .registry
+                .connection_pool
+                .get_configured_peer_addr(&peer_id),
+            Some(addr),
+            "discovered route should remain available for direct lookups"
+        );
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .list_configured_peers()
+                .is_empty(),
+            "discovered route must not be supervised as a required peer"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn udp_datagram_transport_is_disabled_until_datagrams_authenticate_peer_identity() {
         let keypair = KeyPair::new_for_testing("udp-enabled");
         let mut config = test_cfg();

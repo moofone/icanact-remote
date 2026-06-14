@@ -808,6 +808,16 @@ pub struct Peer<T = ()> {
 impl<T: 'static> Peer<T> {
     /// Connect to this peer at the specified address
     pub async fn connect(&self, addr: &SocketAddr) -> Result<()> {
+        self.connect_with_route_mode(addr, true).await
+    }
+
+    /// Connect to a learned actor/service route without making it a required
+    /// peer for the configured-peer supervisor.
+    pub async fn connect_discovered(&self, addr: &SocketAddr) -> Result<()> {
+        self.connect_with_route_mode(addr, false).await
+    }
+
+    async fn connect_with_route_mode(&self, addr: &SocketAddr, required_peer: bool) -> Result<()> {
         if self.peer_id == self.registry.peer_id {
             tracing::warn!(
                 peer_id = %self.peer_id,
@@ -837,7 +847,14 @@ impl<T: 'static> Peer<T> {
         // First configure the address for this peer
         {
             let pool = &self.registry.connection_pool;
-            pool.set_discovered_peer_addr(&self.peer_id, *addr);
+            if required_peer {
+                pool.set_configured_peer_addr(&self.peer_id, *addr);
+            } else {
+                pool.set_discovered_peer_addr(&self.peer_id, *addr);
+                let _ = pool
+                    .addr_to_peer_id
+                    .upsert_sync(*addr, self.peer_id.clone());
+            }
             pool.reindex_connection_addr(&self.peer_id, *addr);
         }
 
@@ -927,8 +944,13 @@ impl<T: 'static> Peer<T> {
             }
         }
 
-        // Then attempt to connect with enhanced error context
-        match self.registry.connect_to_peer(&self.peer_id).await {
+        // Then attempt to connect with enhanced error context.
+        let connect_result = if required_peer {
+            self.registry.connect_to_peer(&self.peer_id).await
+        } else {
+            self.registry.get_connection(*addr).await.map(|_| ())
+        };
+        match connect_result {
             Ok(()) => {
                 tracing::info!(
                     peer_id = %self.peer_id,
