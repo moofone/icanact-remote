@@ -400,6 +400,7 @@ impl ActorAskHandlerSync for DoubleHandler {
 }
 
 #[test]
+#[ignore = "UDP datagrams are disabled until per-datagram peer identity authentication is implemented"]
 fn udp_deferred_ask_reaches_handler_and_replies() {
     run_test("basic", || async {
         let node_a = create_udp_node(fast_cfg()).await;
@@ -456,6 +457,7 @@ impl ActorAskHandlerSync for TripleHandler {
 }
 
 #[test]
+#[ignore = "UDP datagrams are disabled until per-datagram peer identity authentication is implemented"]
 fn udp_ask_reply_has_correct_correlation_id() {
     run_test("concurrent", || async {
         let node_a = create_udp_node(fast_cfg()).await;
@@ -533,6 +535,7 @@ impl ActorAskHandlerSync for ForwarderHandler {
 }
 
 #[test]
+#[ignore = "UDP datagrams are disabled until per-datagram peer identity authentication is implemented"]
 fn udp_ask_forwarder_actor_roundtrip() {
     run_test("forwarder", || async {
         let node_a = create_udp_node(fast_cfg()).await;
@@ -579,6 +582,7 @@ fn udp_ask_forwarder_actor_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "UDP datagrams are disabled until per-datagram peer identity authentication is implemented"]
 fn udp_ask_timeout_when_handler_absent() {
     run_test("timeout", || async {
         let node_a = create_udp_node(fast_cfg()).await; // no handler installed
@@ -636,6 +640,7 @@ impl ActorAskHandlerSync for SlowHandler {
 }
 
 #[test]
+#[ignore = "UDP datagrams are disabled until per-datagram peer identity authentication is implemented"]
 fn udp_deferred_ask_does_not_block_receive_loop() {
     run_test("non-blocking", || async {
         let node_a = create_udp_node(fast_cfg()).await;
@@ -695,6 +700,7 @@ fn udp_deferred_ask_does_not_block_receive_loop() {
 
 /// Smoke: verify that UDP mode is actually enabled on nodes created with UdpBootstrap.
 #[test]
+#[ignore = "UDP datagrams are disabled until per-datagram peer identity authentication is implemented"]
 fn udp_nodes_have_udp_mode_enabled() {
     run_test("smoke", || async {
         let node = create_udp_node(fast_cfg()).await;

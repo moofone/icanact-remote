@@ -165,13 +165,33 @@ impl<T> ConnectionPool<T> {
             .or_else(|| self.peer_id_to_addr.read_sync(peer_id, |_, v| *v))
     }
 
-    fn set_session_configured_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+    pub(crate) fn get_required_peer_addr(&self, peer_id: &crate::PeerId) -> Option<SocketAddr> {
+        self.peer_sessions
+            .read_sync(peer_id, |_, session| session.required_addr())
+            .flatten()
+    }
+
+    fn set_session_route_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
         self.get_or_create_peer_session(peer_id).set_configured_addr(addr);
         let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
     }
 
     pub(crate) fn set_configured_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
-        self.set_session_configured_addr(peer_id, addr);
+        let session = self.get_or_create_peer_session(peer_id);
+        session.set_required_addr(addr);
+        session.set_configured_addr(addr);
+        session.mark_required_peer();
+        let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
+    }
+
+    pub(crate) fn set_discovered_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        self.set_session_route_addr(peer_id, addr);
+    }
+
+    pub(crate) fn is_required_peer(&self, peer_id: &crate::PeerId) -> bool {
+        self.peer_sessions
+            .read_sync(peer_id, |_, session| session.is_required_peer())
+            .unwrap_or(false)
     }
 
     /// Every peer that has a configured (desired) address — i.e. the "required
@@ -180,7 +200,9 @@ impl<T> ConnectionPool<T> {
     pub(crate) fn list_configured_peers(&self) -> Vec<(crate::PeerId, SocketAddr)> {
         let mut out = Vec::new();
         self.peer_sessions.iter_sync(|peer_id, session| {
-            if let Some(addr) = session.configured_addr() {
+            if session.is_required_peer()
+                && let Some(addr) = session.required_addr()
+            {
                 out.push((peer_id.clone(), addr));
             }
             true
@@ -549,7 +571,7 @@ impl<T> ConnectionPool<T> {
             .insert_sync(peer_id.clone(), addr)
             .is_ok()
         {
-            self.get_or_create_peer_session(peer_id).set_configured_addr(addr);
+            self.set_discovered_peer_addr(peer_id, addr);
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
         }
         debug!(
@@ -617,7 +639,7 @@ impl<T> ConnectionPool<T> {
             .upsert_sync(new_addr, connection.clone());
         let _ = self.addr_to_peer_id.upsert_sync(new_addr, peer_id.clone());
         // Also update peer_id_to_addr so disconnect uses the correct address
-        self.set_session_configured_addr(peer_id, new_addr);
+        self.set_discovered_peer_addr(peer_id, new_addr);
 
         // IMPORTANT: Keep the old (ephemeral) address entry as well!
         // Inbound messages still arrive with the TCP source address (old_addr),
@@ -735,8 +757,8 @@ impl<T> ConnectionPool<T> {
     /// rather than falling back to an unauthenticated placeholder.
     pub(crate) fn configured_peer_id_for_addr(&self, addr: &SocketAddr) -> Option<crate::PeerId> {
         let mut found = None;
-        self.peer_id_to_addr.iter_sync(|peer_id, peer_addr| {
-            if peer_addr == addr {
+        self.peer_sessions.iter_sync(|peer_id, session| {
+            if session.required_addr().as_ref() == Some(addr) {
                 found = Some(peer_id.clone());
                 return false;
             }
@@ -800,7 +822,7 @@ impl<T> ConnectionPool<T> {
         }
 
         // Update the address mappings
-        self.set_session_configured_addr(&peer_id, addr);
+        self.set_discovered_peer_addr(&peer_id, addr);
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
 
         debug!(
@@ -1304,6 +1326,11 @@ impl<T> ConnectionPool<T> {
             {
                 addrs_to_remove.push(configured_addr);
             }
+            if let Some(required_addr) = self.get_required_peer_addr(peer_id)
+                && !addrs_to_remove.contains(&required_addr)
+            {
+                addrs_to_remove.push(required_addr);
+            }
 
             for addr in &addrs_to_remove {
                 let _ = self.addr_to_peer_id.remove_sync(addr);
@@ -1335,7 +1362,7 @@ impl<T> ConnectionPool<T> {
         let mut oldest: Option<(SocketAddr, usize)> = None;
         self.connections_by_addr.iter_sync(|addr, conn| {
             if let Some(peer_id) = self.addr_to_peer_id.read_sync(addr, |_, pid| pid.clone())
-                && self.get_configured_peer_addr(&peer_id).is_some()
+                && self.is_required_peer(&peer_id)
             {
                 // Required cluster peer — not an eviction candidate.
                 return true;
@@ -1475,6 +1502,39 @@ impl<T> ConnectionPool<T> {
             peer_id
         );
 
+        let addr = self.get_configured_peer_addr(peer_id).ok_or_else(|| {
+            crate::GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No address configured for peer '{}'", peer_id),
+            ))
+        })?;
+
+        self.get_connection_to_peer_at(peer_id, addr).await
+    }
+
+    pub(crate) async fn get_connection_to_required_peer(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Result<ConnectionHandle<T>> {
+        let addr = self
+            .get_required_peer_addr(peer_id)
+            .or_else(|| self.get_configured_peer_addr(peer_id))
+            .ok_or_else(|| {
+                crate::GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("No required address configured for peer '{}'", peer_id),
+                ))
+            })?;
+
+        self.get_connection_to_peer_at(peer_id, addr).await
+    }
+
+    async fn get_connection_to_peer_at(
+        &self,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+    ) -> Result<ConnectionHandle<T>> {
+
         // First check if we already have any usable stream for this peer. This includes
         // inbound alias addresses, which are the preferred side for higher node IDs.
         if let Some(conn) = self.get_connection_by_peer_id(peer_id) {
@@ -1487,16 +1547,6 @@ impl<T> ConnectionPool<T> {
                 "Connection exists but has no usable writer handle",
             )));
         }
-
-        // Look up the address for this node
-        let addr = if let Some(addr) = self.get_configured_peer_addr(peer_id) {
-            addr
-        } else {
-            return Err(crate::GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("No address configured for peer '{}'", peer_id),
-            )));
-        };
 
         debug!(
             "CONNECTION POOL: Creating new connection to peer '{}' at {}",

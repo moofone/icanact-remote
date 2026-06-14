@@ -69,8 +69,16 @@ async fn supervisor_reports_unreachable_for_down_peer() -> Result<(), Box<dyn st
     registry.registry.supervise_configured_peers().await;
     {
         let ev = sink.events.lock().unwrap();
-        assert_eq!(ev.len(), 1, "expected exactly one liveness edge, got {ev:?}");
-        assert_eq!(ev[0], (peer_id.clone(), false), "expected unreachable=false");
+        assert_eq!(
+            ev.len(),
+            1,
+            "expected exactly one liveness edge, got {ev:?}"
+        );
+        assert_eq!(
+            ev[0],
+            (peer_id.clone(), false),
+            "expected unreachable=false"
+        );
     }
 
     // A second tick while still down must NOT re-fire the handler — it is
