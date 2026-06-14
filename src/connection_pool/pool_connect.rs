@@ -165,13 +165,26 @@ impl<T> ConnectionPool<T> {
             .or_else(|| self.peer_id_to_addr.read_sync(peer_id, |_, v| *v))
     }
 
-    fn set_session_configured_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+    fn set_session_route_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
         self.get_or_create_peer_session(peer_id).set_configured_addr(addr);
         let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
     }
 
     pub(crate) fn set_configured_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
-        self.set_session_configured_addr(peer_id, addr);
+        let session = self.get_or_create_peer_session(peer_id);
+        session.set_configured_addr(addr);
+        session.mark_required_peer();
+        let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
+    }
+
+    pub(crate) fn set_discovered_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        self.set_session_route_addr(peer_id, addr);
+    }
+
+    pub(crate) fn is_required_peer(&self, peer_id: &crate::PeerId) -> bool {
+        self.peer_sessions
+            .read_sync(peer_id, |_, session| session.is_required_peer())
+            .unwrap_or(false)
     }
 
     /// Every peer that has a configured (desired) address — i.e. the "required
@@ -180,7 +193,9 @@ impl<T> ConnectionPool<T> {
     pub(crate) fn list_configured_peers(&self) -> Vec<(crate::PeerId, SocketAddr)> {
         let mut out = Vec::new();
         self.peer_sessions.iter_sync(|peer_id, session| {
-            if let Some(addr) = session.configured_addr() {
+            if session.is_required_peer()
+                && let Some(addr) = session.configured_addr()
+            {
                 out.push((peer_id.clone(), addr));
             }
             true
@@ -549,7 +564,7 @@ impl<T> ConnectionPool<T> {
             .insert_sync(peer_id.clone(), addr)
             .is_ok()
         {
-            self.get_or_create_peer_session(peer_id).set_configured_addr(addr);
+            self.set_discovered_peer_addr(peer_id, addr);
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
         }
         debug!(
@@ -617,7 +632,7 @@ impl<T> ConnectionPool<T> {
             .upsert_sync(new_addr, connection.clone());
         let _ = self.addr_to_peer_id.upsert_sync(new_addr, peer_id.clone());
         // Also update peer_id_to_addr so disconnect uses the correct address
-        self.set_session_configured_addr(peer_id, new_addr);
+        self.set_discovered_peer_addr(peer_id, new_addr);
 
         // IMPORTANT: Keep the old (ephemeral) address entry as well!
         // Inbound messages still arrive with the TCP source address (old_addr),
@@ -800,7 +815,7 @@ impl<T> ConnectionPool<T> {
         }
 
         // Update the address mappings
-        self.set_session_configured_addr(&peer_id, addr);
+        self.set_discovered_peer_addr(&peer_id, addr);
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
 
         debug!(
@@ -1335,7 +1350,7 @@ impl<T> ConnectionPool<T> {
         let mut oldest: Option<(SocketAddr, usize)> = None;
         self.connections_by_addr.iter_sync(|addr, conn| {
             if let Some(peer_id) = self.addr_to_peer_id.read_sync(addr, |_, pid| pid.clone())
-                && self.get_configured_peer_addr(&peer_id).is_some()
+                && self.is_required_peer(&peer_id)
             {
                 // Required cluster peer — not an eviction candidate.
                 return true;

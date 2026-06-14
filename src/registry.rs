@@ -221,6 +221,42 @@ pub fn resolve_peer_addr(
     resolve_peer_addr_checked(sender_bind_addr, tcp_source_addr).unwrap_or(tcp_source_addr)
 }
 
+fn validate_remote_actor_addr(
+    actor_name: &str,
+    actor_addr: SocketAddr,
+    sender_addr: SocketAddr,
+) -> Option<SocketAddr> {
+    if actor_addr.port() == 0 {
+        warn!(
+            actor_name = %actor_name,
+            actor_addr = %actor_addr,
+            "dropping actor location with non-dialable port 0"
+        );
+        return None;
+    }
+
+    if actor_addr.ip().is_unspecified() {
+        warn!(
+            actor_name = %actor_name,
+            actor_addr = %actor_addr,
+            "dropping actor location with unspecified address"
+        );
+        return None;
+    }
+
+    if actor_addr.ip().is_loopback() && !sender_addr.ip().is_loopback() {
+        warn!(
+            actor_name = %actor_name,
+            actor_addr = %actor_addr,
+            sender_addr = %sender_addr,
+            "dropping actor location with remote loopback address"
+        );
+        return None;
+    }
+
+    Some(actor_addr)
+}
+
 /// Response payload for actor asks.
 pub enum ActorResponse {
     Bytes(bytes::Bytes),
@@ -2439,7 +2475,10 @@ impl<T: 'static> GossipRegistry<T> {
                     conn.abort_tasks();
                 }
 
-                self.configure_peer(peer_id, peer_addr).await;
+                let pool = &self.connection_pool;
+                pool.set_discovered_peer_addr(&peer_id, peer_addr);
+                let _ = pool.addr_to_peer_id.upsert_sync(peer_addr, peer_id.clone());
+                pool.reindex_connection_addr(&peer_id, peer_addr);
             }
         } else {
             info!(peer = %peer_addr, "not adding peer - same as self");
@@ -2779,8 +2818,9 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Get peer_id for this address
             if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-                // Update peer_id_to_addr mapping
-                pool.set_configured_peer_addr(&peer_id, new_addr);
+                // Update peer_id_to_addr mapping without making DNS-refreshed
+                // discovered routes required supervisor peers.
+                pool.set_discovered_peer_addr(&peer_id, new_addr);
                 // Add new address to addr_to_peer_id mapping
                 pool.add_addr_to_peer_id(new_addr, peer_id.clone());
 
@@ -4789,7 +4829,15 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
-            updates_to_apply.push((name, location));
+            let Some(addr) = location
+                .address
+                .parse::<SocketAddr>()
+                .ok()
+                .and_then(|addr| validate_remote_actor_addr(&name, addr, sender_addr))
+            else {
+                continue;
+            };
+            updates_to_apply.push((name, location, addr));
         }
 
         // Process remote known actors
@@ -4801,7 +4849,15 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
-            updates_to_apply.push((name, location));
+            let Some(addr) = location
+                .address
+                .parse::<SocketAddr>()
+                .ok()
+                .and_then(|addr| validate_remote_actor_addr(&name, addr, sender_addr))
+            else {
+                continue;
+            };
+            updates_to_apply.push((name, location, addr));
         }
 
         // STEP 2: Apply known_actors upserts, peer_to_actors update,
@@ -4815,7 +4871,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let mut gossip_state = self.gossip_state.lock().await;
 
-            for (name, location) in &updates_to_apply {
+            for (name, location, addr) in &updates_to_apply {
                 let Some((clear_tombstone, is_update)) =
                     self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id)
                 else {
@@ -4833,9 +4889,7 @@ impl<T: 'static> GossipRegistry<T> {
                 } else {
                     new_actors += 1;
                 }
-                if let Ok(addr) = location.address.parse::<SocketAddr>() {
-                    routes_to_configure.push((name.clone(), location.peer_id.clone(), addr));
-                }
+                routes_to_configure.push((name.clone(), location.peer_id.clone(), *addr));
             }
 
             let removed_now: Vec<String> = match gossip_state
@@ -4895,14 +4949,19 @@ impl<T: 'static> GossipRegistry<T> {
             let _ = gossip_state;
         }
 
-        // STEP 3: Configure direct routes outside the lock (these
+        // STEP 3: Record learned direct routes outside the lock (these
         // invoke user handlers and may not be held under gossip_state).
         for (name, peer_id, addr) in routes_to_configure {
-            self.configure_peer(peer_id, addr).await;
+            self.connection_pool
+                .set_discovered_peer_addr(&peer_id, addr);
+            let _ = self
+                .connection_pool
+                .addr_to_peer_id
+                .upsert_sync(addr, peer_id.clone());
             debug!(
                 actor = %name,
                 peer_addr = %addr,
-                "Configured direct route for actor's host"
+                "Recorded learned direct route for actor's host"
             );
         }
 
@@ -7445,15 +7504,19 @@ mod tests {
         RemoteActorLocation::new_with_peer(addr, test_peer_id("test_peer"))
     }
 
-    fn test_config() -> GossipConfig {
+    fn test_config_with_seed(seed: &str) -> GossipConfig {
         GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("registry_tests")),
+            key_pair: Some(KeyPair::new_for_testing(seed)),
             gossip_interval: Duration::from_millis(100),
             cleanup_interval: Duration::from_millis(200),
             peer_retry_interval: Duration::from_millis(50),
-            immediate_propagation_enabled: true, // Enable for testing
+            immediate_propagation_enabled: true,
             ..Default::default()
         }
+    }
+
+    fn test_config() -> GossipConfig {
+        test_config_with_seed("registry_tests")
     }
 
     fn clock_caps() -> crate::handshake::PeerCapabilities {
@@ -7480,6 +7543,90 @@ mod tests {
         assert_eq!(offset_ns, 1_500);
         assert_eq!(rtt_ns, 100);
         assert_eq!(error_bound_ns, 50);
+    }
+
+    #[tokio::test]
+    async fn full_sync_learned_actor_route_is_not_a_required_configured_peer() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7400),
+            test_config_with_seed("full-sync-learned-route-local"),
+        );
+        let remote_peer = KeyPair::new_for_testing("full-sync-learned-route-remote").peer_id();
+        let actor_addr = test_addr(9400);
+        let actor_name = "full-sync/learned-route/service";
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, remote_peer.clone()),
+        );
+
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            remote_peer.clone(),
+            test_addr(8400),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        assert!(
+            reg.lookup_actor(actor_name).await.is_some(),
+            "valid learned actor location should be retained"
+        );
+        assert_eq!(
+            reg.connection_pool
+                .peer_id_to_addr
+                .read_sync(&remote_peer, |_, addr| *addr),
+            Some(actor_addr),
+            "valid learned route should remain available for peer-id lookups"
+        );
+        assert!(
+            reg.connection_pool.list_configured_peers().is_empty(),
+            "full-sync actor locations are learned routes, not supervised required peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_rejects_unspecified_actor_route() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7401),
+            test_config_with_seed("full-sync-unspecified-route-local"),
+        );
+        let remote_peer = KeyPair::new_for_testing("full-sync-unspecified-route-remote").peer_id();
+        let actor_addr: SocketAddr = "0.0.0.0:9400".parse().unwrap();
+        let actor_name = "full-sync/unspecified-route/service";
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, remote_peer.clone()),
+        );
+
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            remote_peer.clone(),
+            "10.77.0.33:9400".parse().unwrap(),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        assert!(
+            reg.lookup_actor(actor_name).await.is_none(),
+            "non-dialable actor locations must not enter the directory"
+        );
+        assert!(
+            reg.connection_pool
+                .peer_id_to_addr
+                .read_sync(&remote_peer, |_, addr| *addr)
+                .is_none(),
+            "non-dialable actor locations must not install peer-id routes"
+        );
+        assert!(
+            reg.connection_pool.list_configured_peers().is_empty(),
+            "non-dialable actor locations must not be supervised"
+        );
     }
 
     #[test]
@@ -7642,18 +7789,22 @@ mod tests {
     }
 
     #[test]
-    fn enable_udp_sets_udp_mode_for_matching_keypair() {
+    fn enable_udp_rejects_matching_keypair_until_datagrams_authenticate_peer_identity() {
         let keypair = KeyPair::new_for_testing("udp-enabled-registry");
         let mut config = test_config();
         config.key_pair = Some(keypair.clone());
         let mut registry = GossipRegistry::<()>::new(test_addr(0), config);
 
-        registry
+        let err = registry
             .enable_udp(keypair.to_secret_key())
-            .expect("matching UDP keypair should enable datagram mode");
+            .expect_err("UDP datagrams must stay disabled until peer identity is authenticated");
 
-        assert!(registry.udp_mode);
-        assert!(registry.tls_config.is_none());
+        assert!(
+            err.to_string()
+                .contains("UDP datagram transport is disabled"),
+            "unexpected error: {err}"
+        );
+        assert!(!registry.udp_mode);
     }
 
     #[test]

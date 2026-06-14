@@ -32,6 +32,7 @@ pub struct ConnectionPool<T = ()> {
 
 struct PeerSession {
     configured_addr: std::sync::RwLock<Option<SocketAddr>>,
+    required_peer: AtomicBool,
     correlation: Arc<CorrelationTracker>,
     current_connection: ArcSwapOption<LockFreeConnection>,
     /// Consecutive consumer-classified streak-timeouts for this peer. Lives on
@@ -44,6 +45,7 @@ impl PeerSession {
     fn new() -> Self {
         Self {
             configured_addr: std::sync::RwLock::new(None),
+            required_peer: AtomicBool::new(false),
             correlation: CorrelationTracker::new(),
             current_connection: ArcSwapOption::empty(),
             consecutive_ask_timeouts: AtomicU8::new(0),
@@ -73,6 +75,14 @@ impl PeerSession {
             .configured_addr
             .write()
             .expect("peer session configured_addr poisoned") = Some(addr);
+    }
+
+    fn mark_required_peer(&self) {
+        self.required_peer.store(true, Ordering::Release);
+    }
+
+    fn is_required_peer(&self) -> bool {
+        self.required_peer.load(Ordering::Acquire)
     }
 
     fn current_connection(&self) -> Option<Arc<LockFreeConnection>> {

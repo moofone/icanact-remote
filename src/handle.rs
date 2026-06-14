@@ -389,13 +389,6 @@ impl<T> GossipRegistryHandle<T> {
             };
         }
 
-        // Pre-configure the peer as allowed (address will be set when connect() is called)
-        {
-            let pool = &self.registry.connection_pool;
-            // Use a placeholder address - will be updated when connect() is called.
-            pool.set_configured_peer_addr(peer_id, "0.0.0.0:0".parse().unwrap());
-        }
-
         crate::Peer {
             peer_id: peer_id.clone(),
             registry: self.registry.clone(),
@@ -710,9 +703,11 @@ impl<T> GossipClient<T> {
             .config
             .connection_recovery
             .consecutive_timeout_threshold;
-        self.registry
-            .connection_pool
-            .note_peer_ask_streak_timeout(peer_id, threshold, expected_instance)
+        self.registry.connection_pool.note_peer_ask_streak_timeout(
+            peer_id,
+            threshold,
+            expected_instance,
+        )
     }
 
     /// Report a hard transport fault: evicts immediately (instance-guarded),
@@ -1179,22 +1174,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_datagram_transport_starts_with_core_datagram_authentication() {
+    async fn udp_datagram_transport_is_disabled_until_datagrams_authenticate_peer_identity() {
         let keypair = KeyPair::new_for_testing("udp-enabled");
         let mut config = test_cfg();
         config.key_pair = Some(keypair.clone());
 
-        let handle = GossipRegistryHandle::new_with_transport_stack(
+        let result = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             keypair.to_secret_key(),
             Some(config),
             TestUdpBootstrap,
         )
-        .await
-        .expect("UDP datagram transport should start with matching keypair");
+        .await;
+        let err = match result {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await;
+                panic!(
+                    "UDP datagrams must stay disabled until per-datagram peer identity is authenticated"
+                );
+            }
+            Err(err) => err,
+        };
 
-        assert!(handle.registry.udp_mode);
-        handle.shutdown_and_wait().await;
+        assert!(
+            err.to_string()
+                .contains("UDP datagram transport is disabled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

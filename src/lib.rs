@@ -837,7 +837,7 @@ impl<T: 'static> Peer<T> {
         // First configure the address for this peer
         {
             let pool = &self.registry.connection_pool;
-            pool.set_configured_peer_addr(&self.peer_id, *addr);
+            pool.set_discovered_peer_addr(&self.peer_id, *addr);
             pool.reindex_connection_addr(&self.peer_id, *addr);
         }
 

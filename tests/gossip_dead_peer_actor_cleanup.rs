@@ -771,6 +771,10 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
             .registry
             .add_peer_with_node_id(sub_addr, Some(sub_peer_id.to_node_id()))
             .await;
+        publisher
+            .registry
+            .configure_peer(sub_peer_id.clone(), sub_addr)
+            .await;
         let pool = &publisher.registry.connection_pool;
         let connected_before = {
             let start = Instant::now();

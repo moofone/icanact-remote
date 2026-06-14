@@ -3410,6 +3410,42 @@ fn lru_eviction_spares_configured_peers() {
     );
 }
 
+/// Learned/discovered routes are useful for peer-id lookup and direct dials,
+/// but they are not operator-configured required peers. The supervisor must
+/// only monitor explicit `configure_peer` entries.
+#[test]
+fn learned_peer_route_is_not_a_required_configured_peer() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let learned_peer = crate::KeyPair::new_for_testing("learned_route").peer_id();
+    let learned_addr: SocketAddr = "127.0.0.1:7210".parse().unwrap();
+    let learned_conn = Arc::new(LockFreeConnection::new(
+        learned_addr,
+        ConnectionDirection::Inbound,
+    ));
+    learned_conn.set_state(ConnectionState::Connected);
+
+    assert!(pool.add_connection_by_peer_id(learned_peer.clone(), learned_addr, learned_conn));
+    assert_eq!(
+        pool.get_configured_peer_addr(&learned_peer),
+        Some(learned_addr),
+        "learned route must remain available for peer-id lookup"
+    );
+    assert!(
+        pool.list_configured_peers().is_empty(),
+        "learned routes must not enter the required-peer supervisor set"
+    );
+
+    let required_peer = crate::KeyPair::new_for_testing("required_route").peer_id();
+    let required_addr: SocketAddr = "127.0.0.1:7211".parse().unwrap();
+    pool.set_configured_peer_addr(&required_peer, required_addr);
+
+    assert_eq!(
+        pool.list_configured_peers(),
+        vec![(required_peer, required_addr)],
+        "only explicitly configured peers are supervised"
+    );
+}
+
 /// Audit finding B1: the outbound finalize path inserts a connection into the
 /// pool but historically never incremented `connection_counter`, while every
 /// teardown path decremented it. Each outbound connect→disconnect therefore
