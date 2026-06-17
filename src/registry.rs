@@ -1705,12 +1705,9 @@ impl<T: 'static> GossipRegistry<T> {
     ///
     /// Prefer [`Self::try_new`] in production startup paths so missing identity
     /// configuration is reported as a typed error. This compatibility
-    /// constructor preserves the old `Self` return type and fills a missing
-    /// keypair with a generated identity rather than panicking.
-    pub fn new(bind_addr: SocketAddr, mut config: GossipConfig) -> Self {
-        if config.key_pair.is_none() {
-            config.key_pair = Some(crate::KeyPair::generate());
-        }
+    /// constructor preserves the old fail-fast `Self` return type instead of
+    /// generating an identity that may not match later TLS configuration.
+    pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
         Self::try_new(bind_addr, config)
             .expect("GossipConfig.key_pair is required for TLS-only mode")
     }
@@ -7651,15 +7648,16 @@ mod tests {
     }
 
     #[test]
-    fn new_fills_missing_keypair_for_legacy_callers() {
+    fn new_panics_on_missing_keypair_for_legacy_callers() {
         let config = GossipConfig {
             key_pair: None,
             ..test_config()
         };
 
-        let registry = GossipRegistry::<()>::new(test_addr(7398), config);
+        let result =
+            std::panic::catch_unwind(|| GossipRegistry::<()>::new(test_addr(7398), config));
 
-        assert_eq!(registry.peer_id.to_bytes().len(), 32);
+        assert!(result.is_err());
     }
 
     #[tokio::test]
