@@ -42,6 +42,24 @@ struct PeerSession {
     consecutive_ask_timeouts: AtomicU8,
 }
 
+fn read_peer_session_addr(
+    lock: &std::sync::RwLock<Option<SocketAddr>>,
+) -> std::sync::RwLockReadGuard<'_, Option<SocketAddr>> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    }
+}
+
+fn write_peer_session_addr(
+    lock: &std::sync::RwLock<Option<SocketAddr>>,
+) -> std::sync::RwLockWriteGuard<'_, Option<SocketAddr>> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    }
+}
+
 impl PeerSession {
     fn new() -> Self {
         Self {
@@ -66,36 +84,23 @@ impl PeerSession {
     }
 
     fn configured_addr(&self) -> Option<SocketAddr> {
-        self.route_addr()
-            .or_else(|| self.required_addr())
+        self.route_addr().or_else(|| self.required_addr())
     }
 
     fn set_configured_addr(&self, addr: SocketAddr) {
-        *self
-            .route_addr
-            .write()
-            .expect("peer session route_addr poisoned") = Some(addr);
+        *write_peer_session_addr(&self.route_addr) = Some(addr);
     }
 
     fn route_addr(&self) -> Option<SocketAddr> {
-        *self
-            .route_addr
-            .read()
-            .expect("peer session route_addr poisoned")
+        *read_peer_session_addr(&self.route_addr)
     }
 
     fn required_addr(&self) -> Option<SocketAddr> {
-        *self
-            .required_addr
-            .read()
-            .expect("peer session required_addr poisoned")
+        *read_peer_session_addr(&self.required_addr)
     }
 
     fn set_required_addr(&self, addr: SocketAddr) {
-        *self
-            .required_addr
-            .write()
-            .expect("peer session required_addr poisoned") = Some(addr);
+        *write_peer_session_addr(&self.required_addr) = Some(addr);
     }
 
     fn mark_required_peer(&self) {
@@ -122,6 +127,30 @@ const OUTBOUND_DIAL_FAILED: u8 = 2;
 struct OutboundDialGate {
     state: AtomicU8,
     notify: Notify,
+}
+
+#[cfg(test)]
+#[test]
+fn peer_session_address_locks_recover_from_poison() {
+    let session = PeerSession::new();
+    let route_addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+    let required_addr: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = session.route_addr.write().expect("poison route_addr");
+        panic!("poison route_addr");
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = session.required_addr.write().expect("poison required_addr");
+        panic!("poison required_addr");
+    }));
+
+    session.set_configured_addr(route_addr);
+    session.set_required_addr(required_addr);
+
+    assert_eq!(session.route_addr(), Some(route_addr));
+    assert_eq!(session.required_addr(), Some(required_addr));
+    assert_eq!(session.configured_addr(), Some(route_addr));
 }
 
 impl OutboundDialGate {

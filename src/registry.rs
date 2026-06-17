@@ -1594,7 +1594,7 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Create a new gossip registry
-    pub fn new(bind_addr: SocketAddr, mut config: GossipConfig) -> Self {
+    pub fn try_new(bind_addr: SocketAddr, mut config: GossipConfig) -> Result<Self> {
         // R5: enforce runtime config invariants (e.g. liveness window >=
         // gossip interval * 2) at the point config enters the registry, clamping
         // unsafe consumer-supplied values with a warning. One-time at startup.
@@ -1604,7 +1604,7 @@ impl<T: 'static> GossipRegistry<T> {
         let peer_id = config
             .key_pair
             .as_ref()
-            .expect("GossipConfig.key_pair is required for TLS-only mode")
+            .ok_or_else(|| GossipError::InvalidKeyPair("missing key_pair".to_string()))?
             .peer_id();
 
         info!(
@@ -1622,7 +1622,7 @@ impl<T: 'static> GossipRegistry<T> {
         );
         let peer_capabilities = Arc::new(SccHashMap::default());
 
-        Self {
+        Ok(Self {
             bind_addr,
             peer_id,
             config: config.clone(),
@@ -1698,7 +1698,21 @@ impl<T: 'static> GossipRegistry<T> {
                 crate::TokioDnsResolver::default(),
             )
                 as Arc<dyn crate::dns::DnsResolver>)),
+        })
+    }
+
+    /// Create new gossip registry for legacy callers.
+    ///
+    /// Prefer [`Self::try_new`] in production startup paths so missing identity
+    /// configuration is reported as a typed error. This compatibility
+    /// constructor preserves the old `Self` return type and fills a missing
+    /// keypair with a generated identity rather than panicking.
+    pub fn new(bind_addr: SocketAddr, mut config: GossipConfig) -> Self {
+        if config.key_pair.is_none() {
+            config.key_pair = Some(crate::KeyPair::generate());
         }
+        Self::try_new(bind_addr, config)
+            .expect("GossipConfig.key_pair is required for TLS-only mode")
     }
 
     /// Override the DNS resolver used for peer refreshes (primarily for deterministic tests).
@@ -7619,6 +7633,33 @@ mod tests {
         assert_eq!(offset_ns, 1_500);
         assert_eq!(rtt_ns, 100);
         assert_eq!(error_bound_ns, 50);
+    }
+
+    #[test]
+    fn try_new_rejects_missing_keypair_without_panicking() {
+        let config = GossipConfig {
+            key_pair: None,
+            ..test_config()
+        };
+
+        let err = match GossipRegistry::<()>::try_new(test_addr(7399), config) {
+            Ok(_) => panic!("missing keypair must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, GossipError::InvalidKeyPair(_)));
+    }
+
+    #[test]
+    fn new_fills_missing_keypair_for_legacy_callers() {
+        let config = GossipConfig {
+            key_pair: None,
+            ..test_config()
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(7398), config);
+
+        assert_eq!(registry.peer_id.to_bytes().len(), 32);
     }
 
     #[tokio::test]

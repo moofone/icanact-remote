@@ -172,7 +172,7 @@ impl<T> GossipRegistryHandle<T> {
         };
 
         // Create registry and let the selected transport stack configure it.
-        let mut registry = GossipRegistry::<()>::new(actual_bind_addr, config.clone());
+        let mut registry = GossipRegistry::<()>::try_new(actual_bind_addr, config.clone())?;
         transport_stack.configure_registry(&mut registry, secret_key)?;
         let registry = Arc::new(registry);
 
