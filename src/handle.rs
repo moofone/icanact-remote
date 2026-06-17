@@ -1034,6 +1034,7 @@ mod tests {
             handle.registry.clone(),
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_keypair.peer_id().to_node_id()),
+            None,
         )
         .await;
 
@@ -1096,6 +1097,7 @@ mod tests {
             handle.registry.clone(),
             Some(Arc::downgrade(&handle.registry)),
             Some(imposter_keypair.peer_id().to_node_id()),
+            None,
         )
         .await;
 
@@ -1570,10 +1572,12 @@ async fn start_gossip_server_with_listener(
 
                 let registry_clone = registry.clone();
                 tokio::spawn(async move {
-                    // Permit is held for the duration of the handshake task and
-                    // released on completion (success or failure).
-                    let _permit = permit;
-                    handle_connection(stream, peer_addr, registry_clone).await;
+                    // The permit is released inside the connection handler once
+                    // the inbound peer is identified (after TLS accept, hello,
+                    // and the first frame) — see R6 below — so an established,
+                    // long-lived connection does not keep occupying a half-open
+                    // handshake slot. Failed handshakes drop it on early return.
+                    handle_connection(stream, peer_addr, registry_clone, permit).await;
                 });
             }
             Err(err) => {
@@ -1946,9 +1950,16 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     // blocks every other timer (periodic gossip, cleanup, supervisor, UDP
     // detector). Detach it into a spawned task so the select loop keeps
     // servicing other arms, and coalesce concurrent immediate rounds with a
-    // single in-flight gate so a flapping peer cannot pile up rounds. The trigger
-    // (`wait_immediate_peer_gossip`) is already edge-coalescing via a Notify.
+    // single in-flight gate so a flapping peer cannot pile up rounds.
+    //
+    // The `pending` flag preserves triggers that arrive while a round is
+    // already running: a peer-list change made after the running round took its
+    // snapshot would otherwise be dropped (the in-flight gate swallows the
+    // trigger) and wait for the periodic interval, defeating immediate
+    // propagation under churn. When the running round finishes it re-arms the
+    // immediate notifier if a trigger landed in the meantime.
     let immediate_gossip_in_flight = Arc::new(AtomicBool::new(false));
+    let immediate_gossip_pending = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -2066,19 +2077,40 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
             if registry.is_shutdown().await {
                 break;
             }
-            // Coalesce: only one immediate round runs at a time. If one is
-            // already in flight, skip — the Notify will re-fire if state is
-            // still pending. swap returns the previous value.
-            if !immediate_gossip_in_flight.swap(true, Ordering::AcqRel) {
+            // Record the trigger *before* contending for the gate so a worker
+            // that is about to finish cannot miss it (see the re-arm below).
+            immediate_gossip_pending.store(true, Ordering::SeqCst);
+            // Coalesce: only one immediate round runs at a time.
+            if !immediate_gossip_in_flight.swap(true, Ordering::SeqCst) {
                 let registry_for_round = registry.clone();
                 let in_flight = immediate_gossip_in_flight.clone();
+                let pending = immediate_gossip_pending.clone();
                 tokio::spawn(async move {
-                    // Don't start (or keep running) an immediate round during
-                    // shutdown.
-                    if !registry_for_round.is_shutdown().await {
-                        send_peer_list_gossip_round(registry_for_round, true).await;
+                    loop {
+                        // Claim the currently-pending work for this iteration.
+                        pending.store(false, Ordering::SeqCst);
+                        // Don't start (or keep running) an immediate round
+                        // during shutdown.
+                        if registry_for_round.is_shutdown().await {
+                            break;
+                        }
+                        send_peer_list_gossip_round(registry_for_round.clone(), true).await;
+                        // A trigger that arrived during the round re-set
+                        // `pending`; service the newer state in another
+                        // iteration before releasing the gate.
+                        if !pending.load(Ordering::SeqCst) {
+                            break;
+                        }
                     }
-                    in_flight.store(false, Ordering::Release);
+                    in_flight.store(false, Ordering::SeqCst);
+                    // A trigger that landed after the final claim but before the
+                    // gate was released set `pending` while the select arm saw
+                    // the gate still held (so it skipped). Re-arm the immediate
+                    // notifier so that change is not stranded until the periodic
+                    // interval.
+                    if pending.load(Ordering::SeqCst) {
+                        registry_for_round.trigger_immediate_peer_gossip();
+                    }
                 });
             }
         }
@@ -2104,11 +2136,15 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
 }
 
 /// Handle incoming TCP connections - immediately set up bidirectional communication
-#[instrument(skip(stream, registry), fields(peer = %peer_addr))]
+#[instrument(skip(stream, registry, handshake_permit), fields(peer = %peer_addr))]
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     registry: Arc<GossipRegistry>,
+    // Inbound-handshake admission permit (R6). Dropped on any early return
+    // here (TLS accept / hello failure) and handed to the TLS handler on
+    // success so it can be released the moment the peer is identified.
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let Some(tls_config) = registry.tls_config.clone() else {
         warn!(peer = %peer_addr, "stream connection received without TLS config");
@@ -2221,6 +2257,7 @@ async fn handle_connection(
                 registry,
                 Some(registry_weak),
                 peer_node_id,
+                Some(handshake_permit),
             )
             .await
             {
@@ -2256,6 +2293,11 @@ async fn handle_incoming_connection_tls<S>(
     registry: Arc<GossipRegistry>,
     _registry_weak: Option<std::sync::Weak<GossipRegistry>>,
     peer_node_id: Option<crate::NodeId>,
+    // Inbound-handshake admission permit (R6). Released once the peer is
+    // identified below so it bounds only the half-open handshake window, not
+    // the lifetime of the established connection. `None` for non-admission
+    // call paths (tests).
+    mut handshake_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> ConnectionCloseOutcome
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2435,6 +2477,15 @@ where
             .unwrap_or("none"),
         "inbound_identified"
     );
+
+    // R6: the inbound peer is now identified (TLS accept + hello happened in
+    // handle_connection; the first frame was just read above). Release the
+    // admission permit here so the established connection — which lives on
+    // until its IO task exits — no longer occupies a half-open-handshake slot.
+    // Without this, `max_inflight_inbound_handshakes` would cap the number of
+    // concurrent established inbound connections rather than just in-progress
+    // handshakes.
+    drop(handshake_permit.take());
 
     // Update the gossip state with the NodeId for this peer
     // This is critical for bidirectional TLS connections
@@ -3669,39 +3720,70 @@ mod framing_tests {
     /// This is the mechanism that prevents a flapping peer from head-of-line
     /// blocking (or flooding) the timer loop.
     #[tokio::test]
-    async fn immediate_gossip_coalesces_while_in_flight() {
+    async fn immediate_gossip_coalesces_and_preserves_triggers_while_in_flight() {
+        use std::sync::atomic::AtomicUsize;
         let in_flight = std::sync::Arc::new(AtomicBool::new(false));
-        let rounds_spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending = std::sync::Arc::new(AtomicBool::new(false));
+        let rounds_spawned = std::sync::Arc::new(AtomicUsize::new(0));
+        let rearms = std::sync::Arc::new(AtomicUsize::new(0));
 
-        // Mirror of the select-arm trigger handling.
-        let trigger =
-            |in_flight: std::sync::Arc<AtomicBool>,
-             rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>| {
-                if !in_flight.swap(true, Ordering::AcqRel) {
-                    rounds.fetch_add(1, Ordering::AcqRel);
-                    // Round "in flight"; gate stays closed until released.
-                }
-            };
+        // Mirror of the select-arm trigger handling (R7): record the trigger in
+        // `pending` before contending for the gate, then spawn a round only if
+        // the gate was free.
+        let trigger = |in_flight: std::sync::Arc<AtomicBool>,
+                       pending: std::sync::Arc<AtomicBool>,
+                       rounds: std::sync::Arc<AtomicUsize>| {
+            pending.store(true, Ordering::SeqCst);
+            if !in_flight.swap(true, Ordering::SeqCst) {
+                rounds.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        // Mirror of the worker exit: release the gate, then re-arm if a trigger
+        // landed while the gate was held.
+        let finish_round = |in_flight: std::sync::Arc<AtomicBool>,
+                            pending: std::sync::Arc<AtomicBool>,
+                            rearms: std::sync::Arc<AtomicUsize>| {
+            in_flight.store(false, Ordering::SeqCst);
+            if pending.load(Ordering::SeqCst) {
+                rearms.fetch_add(1, Ordering::SeqCst);
+            }
+        };
 
-        // Three rapid triggers while the first round is still in flight.
-        trigger(in_flight.clone(), rounds_spawned.clone());
-        trigger(in_flight.clone(), rounds_spawned.clone());
-        trigger(in_flight.clone(), rounds_spawned.clone());
+        // First trigger starts a round; the worker claims the pending work.
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        pending.store(false, Ordering::SeqCst); // worker claims current state
+        assert_eq!(rounds_spawned.load(Ordering::SeqCst), 1);
+
+        // Three rapid triggers while the round is still in flight: they coalesce
+        // (no new round spawned) but must NOT be lost.
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
         assert_eq!(
-            rounds_spawned.load(Ordering::Acquire),
+            rounds_spawned.load(Ordering::SeqCst),
             1,
             "concurrent immediate triggers must coalesce into a single round"
         );
+        assert!(
+            pending.load(Ordering::SeqCst),
+            "triggers arriving during the round must be preserved, not dropped"
+        );
 
-        // Round completes, gate reopens.
-        in_flight.store(false, Ordering::Release);
-
-        // A later trigger after completion spawns a fresh round.
-        trigger(in_flight.clone(), rounds_spawned.clone());
+        // Round completes: the preserved trigger must re-arm a follow-up.
+        finish_round(in_flight.clone(), pending.clone(), rearms.clone());
         assert_eq!(
-            rounds_spawned.load(Ordering::Acquire),
+            rearms.load(Ordering::SeqCst),
+            1,
+            "a trigger that arrived mid-round must re-arm a follow-up round"
+        );
+
+        // The re-arm fires a fresh trigger which spawns the follow-up round
+        // that propagates the newer peer-list state.
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        assert_eq!(
+            rounds_spawned.load(Ordering::SeqCst),
             2,
-            "a trigger after the previous round finished must spawn a new round"
+            "the re-armed follow-up round must run"
         );
     }
 
