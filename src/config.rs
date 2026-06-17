@@ -312,6 +312,35 @@ impl Default for GossipConfig {
     }
 }
 
+impl GossipConfig {
+    /// Enforce runtime invariants on a consumer-supplied config, clamping
+    /// unsafe values to safe ones with a warning rather than silently honoring
+    /// them. Called once when the config enters the registry; never on the hot
+    /// path.
+    ///
+    /// Invariant: `peer_liveness_window >= peer_gossip_interval * 2`. The
+    /// response-asymmetry detector compares elapsed time-since-last-response to
+    /// `peer_liveness_window`. If that window is shorter than two gossip
+    /// intervals, a single delayed inbound peer-gossip payload can false-fail an
+    /// otherwise healthy (non-required) peer. A consumer that sets a too-small
+    /// window would silently lose this protection; clamp it up instead.
+    pub fn validate_and_normalize(&mut self) {
+        if let Some(interval) = self.peer_gossip_interval {
+            let min_window = interval.saturating_mul(2);
+            if self.peer_liveness_window < min_window {
+                tracing::warn!(
+                    peer_liveness_window_ms = self.peer_liveness_window.as_millis(),
+                    peer_gossip_interval_ms = interval.as_millis(),
+                    clamped_to_ms = min_window.as_millis(),
+                    "peer_liveness_window < peer_gossip_interval*2; clamping up to avoid \
+false-failing healthy peers on a single delayed inbound peer-gossip payload"
+                );
+                self.peer_liveness_window = min_window;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +417,52 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
         assert_eq!(config.stale_ttl, Duration::from_secs(24 * 60 * 60));
         assert_eq!(config.known_peers_capacity, 10_000);
         assert_eq!(config.mesh_formation_target, 2);
+    }
+
+    #[test]
+    fn validate_and_normalize_clamps_too_small_liveness_window() {
+        let mut config = GossipConfig::default();
+        config.peer_gossip_interval = Some(Duration::from_secs(5));
+        // Violate the invariant: window < interval*2 (10s).
+        config.peer_liveness_window = Duration::from_secs(3);
+
+        config.validate_and_normalize();
+
+        assert_eq!(
+            config.peer_liveness_window,
+            Duration::from_secs(10),
+            "window must be clamped up to peer_gossip_interval*2"
+        );
+    }
+
+    #[test]
+    fn validate_and_normalize_leaves_conforming_config_unchanged() {
+        let mut config = GossipConfig::default();
+        config.peer_gossip_interval = Some(Duration::from_secs(5));
+        config.peer_liveness_window = Duration::from_secs(30); // >= 10s, conforming.
+
+        config.validate_and_normalize();
+
+        assert_eq!(
+            config.peer_liveness_window,
+            Duration::from_secs(30),
+            "conforming window must be left unchanged"
+        );
+    }
+
+    #[test]
+    fn validate_and_normalize_noop_when_gossip_interval_disabled() {
+        let mut config = GossipConfig::default();
+        config.peer_gossip_interval = None;
+        config.peer_liveness_window = Duration::from_secs(1);
+
+        config.validate_and_normalize();
+
+        assert_eq!(
+            config.peer_liveness_window,
+            Duration::from_secs(1),
+            "no interval means no invariant to enforce"
+        );
     }
 
     #[test]
