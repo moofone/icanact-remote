@@ -332,7 +332,15 @@ impl<T> ConnectionPool<T> {
 
                     let finalize_started = Instant::now();
                     let result = self
-                        .finalize_new_outbound_connection(addr, tls_stream, registry_weak.clone())
+                        .finalize_new_outbound_connection(
+                            addr,
+                            tls_stream,
+                            registry_weak.clone(),
+                            // R2: bind the connection identity to the NodeId we
+                            // extracted from the peer's verified TLS cert when no
+                            // NodeId was pinned (bootstrap/placeholder-SNI dials).
+                            discovered_node_id,
+                        )
                         .await;
                     match &result {
                         Ok(_) => info!(

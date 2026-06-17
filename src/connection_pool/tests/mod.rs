@@ -3343,7 +3343,7 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
         // the peer id, giving us a real stream instance to pin.
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new())
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
             .await
             .expect("finalize outbound");
 
@@ -3459,7 +3459,7 @@ fn outbound_finalize_balances_connection_counter() {
         let (io, _peer) = tokio::io::duplex(1024);
 
         let _handle = pool
-            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new())
+            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
             .await
             .expect("outbound finalize should succeed");
 
