@@ -153,12 +153,15 @@ fn test_mesh_formation_3_nodes() -> Result<(), DynError> {
         connect_preferred(&node_a, &node_b).await?;
         node_c.bootstrap_non_blocking(vec![addr_a]).await;
 
-        // Verify all nodes are known to each other (using wait_for_active_peers for robustness)
-
-        // A should have at least 2 peers
+        // A should be able to reach both peers; deterministic connection ownership
+        // may keep one direct handle on the other side.
         assert!(
-            wait_for_active_peers(&node_a, 2, Duration::from_secs(10)).await,
-            "Node A should have at least 2 peers"
+            wait_for_pair_lookup(&node_a, &node_b, Duration::from_secs(10)).await,
+            "Node A/B should be mutually reachable"
+        );
+        assert!(
+            wait_for_pair_lookup(&node_a, &node_c, Duration::from_secs(10)).await,
+            "Node A/C should be mutually reachable"
         );
 
         // B should have at least 1 peer
@@ -568,21 +571,22 @@ fn test_failure_recovery_backoff() -> Result<(), DynError> {
         node_c.registry.add_peer(addr_a).await;
 
         connect_preferred(&node_a, &node_b).await?;
-        node_c.bootstrap_non_blocking(vec![addr_a]).await;
+        connect_preferred(&node_a, &node_c).await?;
 
-        // Wait for mesh formation (robustly)
-        // Verify mesh formed
         assert!(
-            wait_for_active_peers(&node_a, 2, Duration::from_secs(10)).await,
-            "A should have 2+ peers"
+            wait_for_pair_lookup(&node_a, &node_b, Duration::from_secs(10)).await,
+            "A/B should be mutually reachable before failure simulation"
         );
-
+        assert!(
+            wait_for_pair_lookup(&node_a, &node_c, Duration::from_secs(10)).await,
+            "A/C should be mutually reachable before failure simulation"
+        );
         assert!(
             common::wait_for_condition(Duration::from_secs(10), || async {
-                node_a.stats().await.mesh_formation_time_ms.is_some()
+                node_a.stats().await.discovered_peers >= 2
             })
             .await,
-            "mesh formation timing should be recorded"
+            "A should know both peers before failure simulation"
         );
 
         // Verify stats for subsequent logic

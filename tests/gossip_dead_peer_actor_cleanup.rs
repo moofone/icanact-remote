@@ -412,6 +412,183 @@ fn subsecond_liveness_window_counts_no_response() -> Result<(), DynError> {
     })
 }
 
+async fn wait_for_lookup_peer(from: &GossipRegistryHandle, to: &PeerId, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if from.lookup_peer(to).await.is_ok() {
+            return true;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+#[test]
+fn required_peer_connects_within_one_second_without_waiting_for_discovery_gossip()
+-> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(3600),
+            peer_gossip_interval: Some(Duration::from_secs(3600)),
+            peer_supervisor_interval: Duration::from_millis(100),
+            peer_retry_interval: Duration::from_millis(100),
+            connection_timeout: Duration::from_millis(250),
+            response_timeout: Duration::from_millis(250),
+            ..Default::default()
+        };
+
+        let peer_a = create_node(config.clone()).await?;
+        let peer_b = create_node(config.clone()).await?;
+        let addr_a = peer_a.registry.bind_addr;
+        let addr_b = peer_b.registry.bind_addr;
+        let id_a = peer_a.registry.peer_id.clone();
+        let id_b = peer_b.registry.peer_id.clone();
+
+        peer_a
+            .registry
+            .add_peer_with_node_id(addr_b, Some(id_b.to_node_id()))
+            .await;
+        peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
+        peer_b
+            .registry
+            .add_peer_with_node_id(addr_a, Some(id_a.to_node_id()))
+            .await;
+        peer_b.registry.configure_peer(id_a.clone(), addr_a).await;
+
+        assert!(
+            wait_for_lookup_peer(&peer_a, &id_b, Duration::from_secs(1)).await,
+            "configured peer A->B must establish a direct lookup_peer route within 1s \
+             without waiting for periodic peer-discovery gossip"
+        );
+        assert!(
+            wait_for_lookup_peer(&peer_b, &id_a, Duration::from_secs(1)).await,
+            "configured peer B->A must establish a direct lookup_peer route within 1s \
+             without waiting for periodic peer-discovery gossip"
+        );
+
+        peer_a.shutdown().await;
+        peer_b.shutdown().await;
+        Ok(())
+    })
+}
+
+#[test]
+fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() -> Result<(), DynError>
+{
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(3600),
+            peer_gossip_interval: Some(Duration::from_millis(1500)),
+            peer_liveness_window: Duration::from_millis(500),
+            peer_supervisor_interval: Duration::from_secs(3600),
+            peer_retry_interval: Duration::from_secs(3600),
+            connection_timeout: Duration::from_millis(250),
+            response_timeout: Duration::from_millis(250),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let peer_a = create_node(config.clone()).await?;
+        let peer_b = create_node(config.clone()).await?;
+        let addr_b = peer_b.registry.bind_addr;
+        let id_b = peer_b.registry.peer_id.clone();
+
+        peer_a
+            .registry
+            .add_peer_with_node_id(addr_b, Some(id_b.to_node_id()))
+            .await;
+        peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
+        peer_a.registry.connect_to_peer(&id_b).await?;
+        assert!(
+            peer_a.lookup_peer(&id_b).await.is_ok(),
+            "test precondition: configured direct peer must be routable before silence simulation"
+        );
+
+        {
+            let mut state = peer_a.registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&addr_b)
+                .expect("configured peer must be present")
+                .last_response_received_ms =
+                icanact_remote::current_timestamp_millis().saturating_sub(600);
+        }
+
+        for sequence in 0..config.max_peer_failures {
+            peer_a
+                .registry
+                .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    peer_addr: addr_b,
+                    sent_sequence: sequence as u64,
+                    outcome: Ok(None),
+                }])
+                .await;
+        }
+
+        let failures = peer_failures(&peer_a, addr_b).await;
+        let lookup_result = peer_a.lookup_peer(&id_b).await;
+        let lookup_error = lookup_result.as_ref().err().map(ToString::to_string);
+        assert!(
+            failures == 0 && lookup_result.is_ok(),
+            "a configured peer with a live direct connection must not be failed solely \
+             because inbound peer-gossip silence exceeds peer_liveness_window while still \
+             below the peer_gossip_interval cadence; failures={failures}, \
+             lookup_peer_error={lookup_error:?}"
+        );
+        peer_a.shutdown().await;
+        peer_b.shutdown().await;
+        Ok(())
+    })
+}
+
+#[test]
+fn discovered_non_required_peer_still_uses_response_asymmetry_liveness() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_millis(100),
+            peer_gossip_interval: Some(Duration::from_millis(1500)),
+            peer_liveness_window: Duration::from_millis(500),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+
+        let publisher = create_node(config.clone()).await?;
+        let (peer_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
+
+        {
+            let mut state = publisher.registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&peer_addr)
+                .expect("discovered peer must be present")
+                .last_response_received_ms =
+                icanact_remote::current_timestamp_millis().saturating_sub(600);
+        }
+
+        for sequence in 0..config.max_peer_failures {
+            publisher
+                .registry
+                .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    peer_addr,
+                    sent_sequence: sequence as u64,
+                    outcome: Ok(None),
+                }])
+                .await;
+        }
+
+        assert_eq!(
+            peer_failures(&publisher, peer_addr).await,
+            config.max_peer_failures,
+            "non-required discovered peers should still use response-asymmetry liveness; \
+             the configured-peer exception must not disable discovery failure detection"
+        );
+
+        publisher.shutdown().await;
+        Ok(())
+    })
+}
+
 // =============================================================================
 // Direct exercise of the drop-side detection paths.
 //
@@ -749,6 +926,7 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
             // no-response simulation) or redial. The connection is established
             // by an explicit bootstrap dial below, independent of this.
             gossip_interval: Duration::from_secs(3600),
+            peer_gossip_interval: Some(Duration::from_millis(250)),
             peer_retry_interval: Duration::from_secs(3600),
             peer_liveness_window: Duration::from_millis(500),
             connection_timeout: Duration::from_millis(500),

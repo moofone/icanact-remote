@@ -5,7 +5,7 @@ pub const DEFAULT_PEER_RETRY_SECONDS: u64 = 5;
 pub const DEFAULT_PEER_SUPERVISOR_SECONDS: u64 = 1;
 
 /// Default maximum failed connection attempts before marking peer as failed
-pub const DEFAULT_MAX_PEER_FAILURES: usize = 3;
+pub const DEFAULT_MAX_PEER_FAILURES: usize = 2;
 
 /// Default gossip interval in seconds
 pub const DEFAULT_GOSSIP_INTERVAL_SECS: u64 = 5;
@@ -294,7 +294,7 @@ impl Default for GossipConfig {
             enable_peer_discovery: false, // Safe rollout: disabled by default
             max_peers: 100,
             max_peer_discovery_failures: 10,
-            peer_gossip_interval: Some(Duration::from_secs(30)),
+            peer_gossip_interval: Some(Duration::from_secs(5)),
             max_peer_gossip_targets: 3,
             allow_private_discovery: true,
             allow_loopback_discovery: false,
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
         assert_eq!(config.response_timeout, Duration::from_secs(5));
         assert_eq!(config.max_message_size, 10 * 1024 * 1024);
-        assert_eq!(config.max_peer_failures, 3);
+        assert_eq!(config.max_peer_failures, 2);
         assert_eq!(
             config.peer_retry_interval,
             Duration::from_secs(DEFAULT_PEER_RETRY_SECONDS)
@@ -373,11 +373,16 @@ mod tests {
         assert!(!config.enable_peer_discovery); // Disabled by default for safe rollout
         assert_eq!(config.max_peers, 100);
         assert_eq!(config.max_peer_discovery_failures, 10);
-        assert_eq!(config.peer_gossip_interval, Some(Duration::from_secs(30)));
+        assert_eq!(config.peer_gossip_interval, Some(Duration::from_secs(5)));
         assert_eq!(config.max_peer_gossip_targets, 3);
         assert!(config.allow_private_discovery);
         assert!(!config.allow_loopback_discovery);
         assert!(!config.allow_link_local_discovery);
+        assert!(
+            config.peer_liveness_window >= config.peer_gossip_interval.unwrap() * 2,
+            "peer_liveness_window must allow at least two peer-gossip intervals; \
+otherwise healthy peers can be false-failed by one delayed inbound peer-gossip payload"
+        );
         assert_eq!(config.fail_ttl, Duration::from_secs(6 * 60 * 60));
         assert_eq!(config.pending_ttl, Duration::from_secs(60 * 60));
         assert_eq!(config.stale_ttl, Duration::from_secs(24 * 60 * 60));

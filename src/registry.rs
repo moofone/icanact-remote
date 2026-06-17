@@ -15,7 +15,7 @@ use scc::HashMap as SccHashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use rand::seq::SliceRandom;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -1459,6 +1459,7 @@ pub struct GossipRegistry<T = ()> {
 
     /// Tracks the currently-running peer discovery dial task (H-004).
     pub discovery_task: Arc<DiscoveryTaskTracker>,
+    peer_gossip_notify: Arc<Notify>,
 
     /// Injectable DNS resolver used for deterministic tests and uniform reconnect behavior.
     pub dns_resolver: Arc<tokio::sync::RwLock<Arc<dyn crate::dns::DnsResolver>>>,
@@ -1542,6 +1543,35 @@ pub struct StreamAssemblyResult {
 }
 
 impl<T: 'static> GossipRegistry<T> {
+    fn duration_millis_u64(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn effective_peer_liveness_window_ms(&self, peer_addr: SocketAddr) -> u64 {
+        let configured = Self::duration_millis_u64(self.config.peer_liveness_window);
+        let peer_id = self
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&peer_addr, |_, peer_id| peer_id.clone());
+        let required_peer_floor = peer_id
+            .as_ref()
+            .filter(|peer_id| self.connection_pool.is_required_peer(peer_id))
+            .and_then(|_| self.config.peer_gossip_interval)
+            .map(|duration| Self::duration_millis_u64(duration).saturating_mul(2))
+            .unwrap_or(0);
+        configured.max(required_peer_floor)
+    }
+
+    pub(crate) fn trigger_immediate_peer_gossip(&self) {
+        if self.config.enable_peer_discovery {
+            self.peer_gossip_notify.notify_one();
+        }
+    }
+
+    pub(crate) async fn wait_immediate_peer_gossip(&self) {
+        self.peer_gossip_notify.notified().await;
+    }
+
     fn as_regular_gossip_change(change: &RegistryChange) -> RegistryChange {
         match change {
             RegistryChange::ActorAdded { name, location, .. } => RegistryChange::ActorAdded {
@@ -1658,6 +1688,7 @@ impl<T: 'static> GossipRegistry<T> {
             inflight_streams_per_peer: Arc::new(SccHashMap::default()),
             pending_acks: Arc::new(SccHashMap::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
+            peer_gossip_notify: Arc::new(Notify::new()),
             dns_resolver: Arc::new(tokio::sync::RwLock::new(Arc::new(
                 crate::TokioDnsResolver::default(),
             )
@@ -2904,12 +2935,26 @@ impl<T: 'static> GossipRegistry<T> {
             Ok(_) => {
                 if let Some(addr) = configured_addr {
                     let mut gossip_state = self.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
-                        peer_info.failures = 0;
-                        peer_info.outbound_dial_success = true;
-                        peer_info.last_success = current_timestamp();
-                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
-                        peer_info.last_failure_time = None;
+                    let node_id = peer_id.to_node_id();
+                    let now = current_timestamp();
+                    let now_ms = crate::current_timestamp_millis();
+                    for (peer_addr, peer_info) in gossip_state.peers.iter_mut() {
+                        if *peer_addr == addr || peer_info.node_id == Some(node_id) {
+                            peer_info.failures = 0;
+                            peer_info.outbound_dial_success = true;
+                            peer_info.last_success = now;
+                            peer_info.last_response_received_ms = now_ms;
+                            peer_info.last_failure_time = None;
+                        }
+                    }
+                    for (peer_addr, peer_info) in gossip_state.known_peers.iter_mut() {
+                        if *peer_addr == addr || peer_info.node_id == Some(node_id) {
+                            peer_info.failures = 0;
+                            peer_info.outbound_dial_success = true;
+                            peer_info.last_success = now;
+                            peer_info.last_response_received_ms = now_ms;
+                            peer_info.last_failure_time = None;
+                        }
                     }
                 }
                 info!(peer_id = %peer_id, "Connected to peer");
@@ -4439,7 +4484,6 @@ impl<T: 'static> GossipRegistry<T> {
     pub async fn apply_gossip_results(&self, results: Vec<GossipResult>) {
         let current_time = current_timestamp();
         let current_time_ms = crate::current_timestamp_millis();
-        let liveness_window_ms = self.config.peer_liveness_window.as_millis() as u64;
 
         // Collect peers that crossed the death threshold in this batch; we
         // fire `handle_peer_death` after dropping the `gossip_state` lock
@@ -4450,6 +4494,8 @@ impl<T: 'static> GossipRegistry<T> {
         for result in results {
             match result.outcome {
                 Ok(response_opt) => {
+                    let liveness_window_ms =
+                        self.effective_peer_liveness_window_ms(result.peer_addr);
                     let mut crossed_threshold = false;
                     {
                         let mut gossip_state = self.gossip_state.lock().await;
@@ -4471,8 +4517,12 @@ impl<T: 'static> GossipRegistry<T> {
                             //
                             // If we haven't received any inbound payload from
                             // this peer (delta response, full sync, etc.) for
-                            // `peer_liveness_window`, treat the next
-                            // no-response round as a soft failure. This catches
+                            // the effective liveness window, treat the next
+                            // no-response round as a soft failure. Configured
+                            // peers floor this window to two peer-gossip
+                            // intervals so one delayed inbound peer-gossip
+                            // payload cannot false-fail a required direct
+                            // route. This still catches
                             // "outbound writes succeed at the kernel level but
                             // the peer isn't reading anymore" — the scenario
                             // that kept `538a99…` alive on `stratum-devnet-a`
@@ -4492,8 +4542,9 @@ impl<T: 'static> GossipRegistry<T> {
                                 info!(
                                     peer = %result.peer_addr,
                                     silence_ms,
+                                    liveness_window_ms,
                                     new_failures = peer_info.failures,
-                                    "no response within peer_liveness_window; \
+                                    "no response within effective peer liveness window; \
                                      incrementing failures"
                                 );
                                 if peer_info.failures == self.config.max_peer_failures {
@@ -4620,6 +4671,7 @@ impl<T: 'static> GossipRegistry<T> {
                         "peer reached failure threshold; tore down stale connection \
                          (actors retained for reconnection)"
                     );
+                    self.trigger_immediate_peer_gossip();
                     continue;
                 }
             }
@@ -4637,6 +4689,7 @@ impl<T: 'static> GossipRegistry<T> {
                      (actors retained for reconnection)"
                 );
             }
+            self.trigger_immediate_peer_gossip();
         }
     }
 
@@ -4645,7 +4698,6 @@ impl<T: 'static> GossipRegistry<T> {
     /// `apply_gossip_results` knows the peer is alive at the application
     /// layer, not just the kernel-buffer-accepted layer.
     async fn mark_response_received(&self, peer_addr: SocketAddr, now: u64) {
-        let max_failures = self.config.max_peer_failures;
         let mut gossip_state = self.gossip_state.lock().await;
         if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
             // `now` is captured at the start of the gossip batch; a later
@@ -4654,11 +4706,10 @@ impl<T: 'static> GossipRegistry<T> {
             // backwards.
             peer_info.last_response_received_ms = peer_info.last_response_received_ms.max(now);
             peer_info.last_success = peer_info.last_success.max(current_timestamp());
-            // Keep the death verdict sticky: once a peer has crossed
-            // max_peer_failures, only a fresh handshake (via
-            // mark_peer_connected) should resurrect it. A late response
-            // from a dying peer is not sufficient evidence of liveness.
-            if peer_info.failures > 0 && peer_info.failures < max_failures {
+            // A valid application-level response is strong liveness evidence.
+            // Hard socket failures do not produce framed responses; if peer can
+            // answer, it must recover immediately.
+            if peer_info.failures > 0 {
                 peer_info.failures = 0;
                 peer_info.last_failure_time = None;
             }
@@ -5484,6 +5535,7 @@ impl<T: 'static> GossipRegistry<T> {
                 failed_peer = %failed_peer_addr,
                 "socket-close crossed failure threshold; retaining actors until consensus/timeout"
             );
+            self.trigger_immediate_peer_gossip();
         }
 
         // Now start consensus process for actor invalidation.
@@ -6870,6 +6922,15 @@ impl<T: 'static> GossipRegistry<T> {
     /// Periodic gossip of peer list to random subset of peers
     /// Returns gossip tasks for the caller to send.
     pub async fn gossip_peer_list(&self) -> Vec<GossipTask> {
+        self.gossip_peer_list_inner(false).await
+    }
+
+    /// Immediate peer-list gossip after direct peer availability changes.
+    pub async fn gossip_peer_list_immediate(&self) -> Vec<GossipTask> {
+        self.gossip_peer_list_inner(true).await
+    }
+
+    async fn gossip_peer_list_inner(&self, force: bool) -> Vec<GossipTask> {
         // Check if peer discovery is enabled
         if !self.config.enable_peer_discovery {
             return Vec::new();
@@ -6881,10 +6942,11 @@ impl<T: 'static> GossipRegistry<T> {
             let gossip_state = self.gossip_state.lock().await;
             if let Some(interval) = self.config.peer_gossip_interval {
                 let interval_secs = interval.as_secs();
-                if now
-                    < gossip_state
-                        .last_peer_gossip_time
-                        .saturating_add(interval_secs)
+                if !force
+                    && now
+                        < gossip_state
+                            .last_peer_gossip_time
+                            .saturating_add(interval_secs)
                 {
                     return Vec::new(); // Not time yet
                 }
@@ -7327,6 +7389,7 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         self.reset_udp_liveness_for_peer(addr).await;
+        self.trigger_immediate_peer_gossip();
     }
 
     /// Record that this peer was observed on an inbound connection accepted by this node.
@@ -7369,6 +7432,8 @@ impl<T: 'static> GossipRegistry<T> {
         peer.failures = 0;
         peer.last_failure_time = None;
         self.record_peer_discovery_connected(&mut gossip_state, peer_addr);
+        drop(gossip_state);
+        self.trigger_immediate_peer_gossip();
     }
 
     fn record_peer_discovery_connected(&self, gossip_state: &mut GossipState, addr: SocketAddr) {
