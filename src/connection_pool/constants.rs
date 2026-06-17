@@ -650,9 +650,23 @@ impl WriteQueue {
                 }
                 Err(cmd) => {
                     command = cmd;
-                    self.space_notify.notified().await;
-                    // Backpressure-branch-only check: if we were woken by teardown
-                    // (not a real `pop()`/`notify_space`), abandon the push.
+                    // Register on the space notifier *before* re-checking
+                    // `closed`. `mark_closed_and_wake` signals via
+                    // `notify_waiters()`, which stores no permit for an
+                    // unregistered waiter, so a teardown landing between the
+                    // failed push and the await would otherwise be lost and
+                    // park this sender forever. `enable()` arms the waiter so
+                    // any close after this point is delivered to the await
+                    // below, and the close-before-enable case is caught by the
+                    // load that follows. Backpressure-branch only; never on the
+                    // `try_push` fast path.
+                    let notified = self.space_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
+                    notified.await;
                     if self.closed.load(Ordering::Acquire) {
                         return Err(GossipError::ConnectionClosed(self.addr));
                     }
@@ -727,8 +741,16 @@ impl StreamingQueue {
                 }
                 Err(cmd) => {
                     command = cmd;
-                    self.space_notify.notified().await;
-                    // Backpressure-branch-only teardown check.
+                    // See WriteQueue::push: register before re-checking `closed`
+                    // so a teardown landing in the gap is not lost. Backpressure
+                    // branch only; never on the fast path.
+                    let notified = self.space_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
+                    notified.await;
                     if self.closed.load(Ordering::Acquire) {
                         return Err(GossipError::ConnectionClosed(self.addr));
                     }
