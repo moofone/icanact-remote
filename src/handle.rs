@@ -1835,6 +1835,35 @@ async fn start_gossip_server_with_udp_socket(
 
 /// Start the gossip timer with vector clock support
 #[instrument(skip(registry))]
+async fn send_peer_list_gossip_round(registry: Arc<GossipRegistry>, immediate: bool) {
+    if !registry.config.enable_peer_discovery {
+        return;
+    }
+    let tasks = if immediate {
+        registry.gossip_peer_list_immediate().await
+    } else {
+        registry.gossip_peer_list().await
+    };
+    if tasks.is_empty() {
+        return;
+    }
+    let mut futures = Vec::new();
+    for task in tasks {
+        let registry_clone = registry.clone();
+        let future = tokio::spawn(async move {
+            if let Err(err) = send_gossip_message_zero_copy(task, registry_clone).await {
+                warn!(error = %err, immediate, "peer list gossip send failed");
+            }
+        });
+        futures.push(future);
+    }
+    for future in futures {
+        if let Err(err) = future.await {
+            error!(error = %err, immediate, "peer list gossip task panicked");
+        }
+    }
+}
+
 async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     debug!("start_gossip_timer function called");
 
@@ -1992,37 +2021,18 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                     std::future::pending::<tokio::time::Instant>().await
                 }
             } => {
-                if registry.is_shutdown().await {
-                    break;
-                }
-                // Only gossip peer list if peer discovery is enabled
-                if registry.config.enable_peer_discovery {
-                    let tasks = registry.gossip_peer_list().await;
-                    if tasks.is_empty() {
-                        continue;
-                    }
-
-                    let mut futures = Vec::new();
-                    for task in tasks {
-                        let registry_clone = registry.clone();
-                        let future = tokio::spawn(async move {
-                            if let Err(err) =
-                                send_gossip_message_zero_copy(task, registry_clone).await
-                            {
-                                warn!(error = %err, "peer list gossip send failed");
-                            }
-                        });
-                        futures.push(future);
-                    }
-
-                    for future in futures {
-                        if let Err(err) = future.await {
-                            error!(error = %err, "peer list gossip task panicked");
-                        }
-                    }
-                }
+            if registry.is_shutdown().await {
+                break;
             }
-            // UDP detector timer - only active for udp experimental stack.
+            send_peer_list_gossip_round(registry.clone(), false).await;
+        }
+        _ = registry.wait_immediate_peer_gossip() => {
+            if registry.is_shutdown().await {
+                break;
+            }
+            send_peer_list_gossip_round(registry.clone(), true).await;
+        }
+        // UDP detector timer - only active for udp experimental stack.
             _ = async {
                 if let Some(ref mut timer) = udp_failure_timer {
                     timer.tick().await
