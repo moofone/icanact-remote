@@ -2932,29 +2932,33 @@ impl<T: 'static> GossipRegistry<T> {
             .get_required_peer_addr(peer_id)
             .or_else(|| pool.get_configured_peer_addr(peer_id));
         match pool.get_connection_to_required_peer(peer_id).await {
-            Ok(_) => {
-                if let Some(addr) = configured_addr {
-                    let mut gossip_state = self.gossip_state.lock().await;
-                    let node_id = peer_id.to_node_id();
-                    let now = current_timestamp();
-                    let now_ms = crate::current_timestamp_millis();
-                    for (peer_addr, peer_info) in gossip_state.peers.iter_mut() {
-                        if *peer_addr == addr || peer_info.node_id == Some(node_id) {
-                            peer_info.failures = 0;
-                            peer_info.outbound_dial_success = true;
-                            peer_info.last_success = now;
-                            peer_info.last_response_received_ms = now_ms;
-                            peer_info.last_failure_time = None;
-                        }
+            Ok(conn) => {
+                let mut recovered_addrs = Vec::with_capacity(2);
+                recovered_addrs.push(conn.addr);
+                if let Some(addr) = configured_addr
+                    && addr != conn.addr
+                {
+                    recovered_addrs.push(addr);
+                }
+                let mut gossip_state = self.gossip_state.lock().await;
+                let now = current_timestamp();
+                let now_ms = crate::current_timestamp_millis();
+                for (peer_addr, peer_info) in gossip_state.peers.iter_mut() {
+                    if recovered_addrs.contains(peer_addr) {
+                        peer_info.failures = 0;
+                        peer_info.outbound_dial_success = true;
+                        peer_info.last_success = now;
+                        peer_info.last_response_received_ms = now_ms;
+                        peer_info.last_failure_time = None;
                     }
-                    for (peer_addr, peer_info) in gossip_state.known_peers.iter_mut() {
-                        if *peer_addr == addr || peer_info.node_id == Some(node_id) {
-                            peer_info.failures = 0;
-                            peer_info.outbound_dial_success = true;
-                            peer_info.last_success = now;
-                            peer_info.last_response_received_ms = now_ms;
-                            peer_info.last_failure_time = None;
-                        }
+                }
+                for (peer_addr, peer_info) in gossip_state.known_peers.iter_mut() {
+                    if recovered_addrs.contains(peer_addr) {
+                        peer_info.failures = 0;
+                        peer_info.outbound_dial_success = true;
+                        peer_info.last_success = now;
+                        peer_info.last_response_received_ms = now_ms;
+                        peer_info.last_failure_time = None;
                     }
                 }
                 info!(peer_id = %peer_id, "Connected to peer");

@@ -471,6 +471,19 @@ async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconne
             .is_none(),
         "failed peer connection should be dropped from direct lookup cache"
     );
+    let stale_alias = "127.0.0.1:9".parse()?;
+    {
+        let mut state = node_a.registry.gossip_state.lock().await;
+        let mut alias = state
+            .peers
+            .get(&node_b.registry.bind_addr)
+            .expect("canonical peer must remain tracked")
+            .clone();
+        alias.address = stale_alias;
+        alias.failures = 2;
+        alias.last_failure_time = Some(icanact_remote::current_timestamp());
+        state.peers.insert(stale_alias, alias);
+    }
 
     node_a
         .registry
@@ -480,6 +493,11 @@ async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconne
         peer_failures(&node_a, node_b.registry.bind_addr).await,
         0,
         "successful reconnect must immediately clear liveness failures"
+    );
+    assert_eq!(
+        peer_failures(&node_a, stale_alias).await,
+        2,
+        "successful reconnect must not clear stale same-node-id aliases"
     );
     assert_eq!(
         ask_peer(&node_a, &node_b.registry.peer_id, b"after-reconnect").await?,
