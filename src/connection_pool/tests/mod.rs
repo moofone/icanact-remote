@@ -3343,7 +3343,7 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
         // the peer id, giving us a real stream instance to pin.
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new())
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
             .await
             .expect("finalize outbound");
 
@@ -3459,7 +3459,7 @@ fn outbound_finalize_balances_connection_counter() {
         let (io, _peer) = tokio::io::duplex(1024);
 
         let _handle = pool
-            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new())
+            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
             .await
             .expect("outbound finalize should succeed");
 
@@ -3526,4 +3526,100 @@ fn complete_rejects_aliased_correlation_id() {
     );
 
     drop(guard);
+}
+
+/// R1 regression: a `push()` parked on a full write queue must wake and return
+/// `ConnectionClosed` when the owning IO writer task tears down, instead of
+/// hanging forever (the space notifier is otherwise only fired by `pop()`,
+/// which has stopped). Before the fix this test times out.
+#[test]
+fn write_queue_push_unblocks_on_teardown() {
+    let rt = Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        // Smallest capacity (constructor clamps to 128).
+        let queue = WriteQueue::new(1, addr);
+
+        // Fill the queue to capacity so the next push must park.
+        let cap = 128usize;
+        for _ in 0..cap {
+            queue
+                .try_push(WriteCommand::Payload(WritePayload::Single(
+                    bytes::Bytes::new(),
+                )))
+                .expect("fill within capacity");
+        }
+        // Queue is full now.
+        assert!(
+            queue
+                .try_push(WriteCommand::Payload(WritePayload::Single(
+                    bytes::Bytes::new()
+                )))
+                .is_err(),
+            "queue should be full"
+        );
+
+        let queue_for_push = queue.clone();
+        let push_task = tokio::spawn(async move {
+            queue_for_push
+                .push(WriteCommand::Payload(WritePayload::Single(
+                    bytes::Bytes::new(),
+                )))
+                .await
+        });
+
+        // Let the push task park on the full queue.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Simulate ExitGuard::drop teardown.
+        queue.mark_closed_and_wake();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), push_task)
+            .await
+            .expect("push must not hang after teardown")
+            .expect("push task panicked");
+
+        match result {
+            Err(GossipError::ConnectionClosed(a)) => assert_eq!(a, addr),
+            other => panic!("expected ConnectionClosed, got {other:?}"),
+        }
+    });
+}
+
+/// R1 regression for the streaming queue (same teardown contract).
+#[test]
+fn streaming_queue_push_unblocks_on_teardown() {
+    let rt = Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let queue = StreamingQueue::new(1, addr);
+
+        let cap = 64usize;
+        for _ in 0..cap {
+            queue
+                .try_push(StreamingCommand::Flush)
+                .expect("fill within capacity");
+        }
+        assert!(
+            queue.try_push(StreamingCommand::Flush).is_err(),
+            "queue should be full"
+        );
+
+        let queue_for_push = queue.clone();
+        let push_task =
+            tokio::spawn(async move { queue_for_push.push(StreamingCommand::Flush).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        queue.mark_closed_and_wake();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), push_task)
+            .await
+            .expect("push must not hang after teardown")
+            .expect("push task panicked");
+
+        match result {
+            Err(GossipError::ConnectionClosed(a)) => assert_eq!(a, addr),
+            other => panic!("expected ConnectionClosed, got {other:?}"),
+        }
+    });
 }

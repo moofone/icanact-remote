@@ -1694,11 +1694,21 @@ impl<T> ConnectionPool<T> {
         addr: SocketAddr,
         stream: S,
         registry_weak: std::sync::Weak<GossipRegistry>,
+        tofu_node_id: Option<crate::NodeId>,
     ) -> Result<ConnectionHandle<T>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         // Determine peer ID (if known) before creating the stream handle.
+        //
+        // R2 (TLS identity binding): when no NodeId was pinned for this address,
+        // the caller passes the identity it extracted from the peer's
+        // signature-verified TLS certificate (`tofu_node_id`). We bind the
+        // connection's `embedded_peer_id` to that learned identity so every
+        // subsequent per-message gossip frame on this link IS cert-identity
+        // checked (the protocol guard requires `embedded_peer_id.is_some()`).
+        // Without this, bootstrap (placeholder-SNI) dials left `embedded_peer_id`
+        // as `None` and gossip on the link was never identity-checked.
         let peer_id_opt = self
             .addr_to_peer_id
             .read_sync(&addr, |_, v| v.clone())
@@ -1713,7 +1723,8 @@ impl<T> ConnectionPool<T> {
                     true
                 });
                 found
-            });
+            })
+            .or_else(|| tofu_node_id.as_ref().map(crate::PeerId::from_public_key));
 
         let correlation_tracker = peer_id_opt
             .as_ref()

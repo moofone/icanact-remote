@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::aligned::{AlignedBuffer, AlignedBytes};
 use bytes::Bytes;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream, UdpSocket},
@@ -1034,6 +1034,7 @@ mod tests {
             handle.registry.clone(),
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_keypair.peer_id().to_node_id()),
+            None,
         )
         .await;
 
@@ -1096,6 +1097,7 @@ mod tests {
             handle.registry.clone(),
             Some(Arc::downgrade(&handle.registry)),
             Some(imposter_keypair.peer_id().to_node_id()),
+            None,
         )
         .await;
 
@@ -1536,9 +1538,33 @@ async fn start_gossip_server_with_listener(
     let bind_addr = registry.bind_addr;
     info!(bind_addr = %bind_addr, "gossip server started");
 
+    // R6: bound the number of simultaneous in-flight (post-accept,
+    // pre-identified) inbound handshakes. A permit is acquired at accept and
+    // released when the handshake task finishes (via the owned permit moving
+    // into the task). This caps half-open inbound tasks under a connect flood
+    // without taxing the steady-state per-message read loop.
+    let inbound_handshake_limit = registry.config.max_inflight_inbound_handshakes.max(1);
+    let inbound_handshake_gate = Arc::new(tokio::sync::Semaphore::new(inbound_handshake_limit));
+
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                // Admission control: reject (drop) the connection when the
+                // half-open handshake budget is exhausted rather than spawning an
+                // unbounded number of handshake tasks.
+                let permit = match inbound_handshake_gate.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            peer_addr = %peer_addr,
+                            limit = inbound_handshake_limit,
+                            "inbound handshake admission limit reached - dropping connection"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                };
+
                 info!(peer_addr = %peer_addr, "📥 ACCEPTED incoming connection");
                 // Set TCP_NODELAY for low-latency communication
                 let _ = stream.set_nodelay(true);
@@ -1546,7 +1572,12 @@ async fn start_gossip_server_with_listener(
 
                 let registry_clone = registry.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, peer_addr, registry_clone).await;
+                    // The permit is released inside the connection handler once
+                    // the inbound peer is identified (after TLS accept, hello,
+                    // and the first frame) — see R6 below — so an established,
+                    // long-lived connection does not keep occupying a half-open
+                    // handshake slot. Failed handshakes drop it on early return.
+                    handle_connection(stream, peer_addr, registry_clone, permit).await;
                 });
             }
             Err(err) => {
@@ -1914,6 +1945,22 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         "gossip timer started with non-blocking I/O"
     );
 
+    // R7: the immediate (urgent) peer-gossip round may dial peers, bounded only
+    // by connection_timeout. Running it inline in the select arm head-of-line
+    // blocks every other timer (periodic gossip, cleanup, supervisor, UDP
+    // detector). Detach it into a spawned task so the select loop keeps
+    // servicing other arms, and coalesce concurrent immediate rounds with a
+    // single in-flight gate so a flapping peer cannot pile up rounds.
+    //
+    // The `pending` flag preserves triggers that arrive while a round is
+    // already running: a peer-list change made after the running round took its
+    // snapshot would otherwise be dropped (the in-flight gate swallows the
+    // trigger) and wait for the periodic interval, defeating immediate
+    // propagation under churn. When the running round finishes it re-arms the
+    // immediate notifier if a trigger landed in the meantime.
+    let immediate_gossip_in_flight = Arc::new(AtomicBool::new(false));
+    let immediate_gossip_pending = Arc::new(AtomicBool::new(false));
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(next_gossip_tick) => {
@@ -2030,7 +2077,42 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
             if registry.is_shutdown().await {
                 break;
             }
-            send_peer_list_gossip_round(registry.clone(), true).await;
+            // Record the trigger *before* contending for the gate so a worker
+            // that is about to finish cannot miss it (see the re-arm below).
+            immediate_gossip_pending.store(true, Ordering::SeqCst);
+            // Coalesce: only one immediate round runs at a time.
+            if !immediate_gossip_in_flight.swap(true, Ordering::SeqCst) {
+                let registry_for_round = registry.clone();
+                let in_flight = immediate_gossip_in_flight.clone();
+                let pending = immediate_gossip_pending.clone();
+                tokio::spawn(async move {
+                    loop {
+                        // Claim the currently-pending work for this iteration.
+                        pending.store(false, Ordering::SeqCst);
+                        // Don't start (or keep running) an immediate round
+                        // during shutdown.
+                        if registry_for_round.is_shutdown().await {
+                            break;
+                        }
+                        send_peer_list_gossip_round(registry_for_round.clone(), true).await;
+                        // A trigger that arrived during the round re-set
+                        // `pending`; service the newer state in another
+                        // iteration before releasing the gate.
+                        if !pending.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    in_flight.store(false, Ordering::SeqCst);
+                    // A trigger that landed after the final claim but before the
+                    // gate was released set `pending` while the select arm saw
+                    // the gate still held (so it skipped). Re-arm the immediate
+                    // notifier so that change is not stranded until the periodic
+                    // interval.
+                    if pending.load(Ordering::SeqCst) {
+                        registry_for_round.trigger_immediate_peer_gossip();
+                    }
+                });
+            }
         }
         // UDP detector timer - only active for udp experimental stack.
             _ = async {
@@ -2054,11 +2136,15 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
 }
 
 /// Handle incoming TCP connections - immediately set up bidirectional communication
-#[instrument(skip(stream, registry), fields(peer = %peer_addr))]
+#[instrument(skip(stream, registry, handshake_permit), fields(peer = %peer_addr))]
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     registry: Arc<GossipRegistry>,
+    // Inbound-handshake admission permit (R6). Dropped on any early return
+    // here (TLS accept / hello failure) and handed to the TLS handler on
+    // success so it can be released the moment the peer is identified.
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let Some(tls_config) = registry.tls_config.clone() else {
         warn!(peer = %peer_addr, "stream connection received without TLS config");
@@ -2171,6 +2257,7 @@ async fn handle_connection(
                 registry,
                 Some(registry_weak),
                 peer_node_id,
+                Some(handshake_permit),
             )
             .await
             {
@@ -2206,6 +2293,11 @@ async fn handle_incoming_connection_tls<S>(
     registry: Arc<GossipRegistry>,
     _registry_weak: Option<std::sync::Weak<GossipRegistry>>,
     peer_node_id: Option<crate::NodeId>,
+    // Inbound-handshake admission permit (R6). Released once the peer is
+    // identified below so it bounds only the half-open handshake window, not
+    // the lifetime of the established connection. `None` for non-admission
+    // call paths (tests).
+    mut handshake_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> ConnectionCloseOutcome
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2213,9 +2305,30 @@ where
     let max_message_size = registry.config.max_message_size;
     let aligned_pool = registry.connection_pool.aligned_bytes_pool();
 
-    // First, read the initial message to identify the sender
-    let msg_result =
-        read_message_from_tls_reader(&mut stream, max_message_size, Some(&aligned_pool)).await;
+    // First, read the initial message to identify the sender.
+    //
+    // R6: bound ONLY this initial read. A peer that completes the TLS handshake
+    // but never sends a first frame would otherwise hold the half-open
+    // connection (and its handshake task slot) open indefinitely. We do NOT add
+    // a timeout to the steady-state read loop below — that would tax the message
+    // hot path; this guard applies only to connection setup.
+    let connection_timeout = registry.config.connection_timeout;
+    let msg_result = match tokio::time::timeout(
+        connection_timeout,
+        read_message_from_tls_reader(&mut stream, max_message_size, Some(&aligned_pool)),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            warn!(
+                peer_addr = %peer_addr,
+                timeout_ms = connection_timeout.as_millis(),
+                "⚠️ Inbound first-read timed out before any frame arrived - dropping connection"
+            );
+            return ConnectionCloseOutcome::Normal { node_id: None };
+        }
+    };
     let known_node_id = match peer_node_id {
         Some(node_id) => Some(node_id),
         None => registry.lookup_node_id(&peer_addr).await,
@@ -2364,6 +2477,15 @@ where
             .unwrap_or("none"),
         "inbound_identified"
     );
+
+    // R6: the inbound peer is now identified (TLS accept + hello happened in
+    // handle_connection; the first frame was just read above). Release the
+    // admission permit here so the established connection — which lives on
+    // until its IO task exits — no longer occupies a half-open-handshake slot.
+    // Without this, `max_inflight_inbound_handshakes` would cap the number of
+    // concurrent established inbound connections rather than just in-progress
+    // handshakes.
+    drop(handshake_permit.take());
 
     // Update the gossip state with the NodeId for this peer
     // This is critical for bidirectional TLS connections
@@ -3554,6 +3676,7 @@ where
 mod framing_tests {
     use super::{MessageReadResult, read_message_from_tls_reader};
     use crate::{MessageType, framing, registry::RegistryMessage};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
 
     async fn read_frame(frame: Vec<u8>) -> MessageReadResult {
@@ -3564,6 +3687,127 @@ mod framing_tests {
         read_message_from_tls_reader(&mut reader, 1024 * 1024, None)
             .await
             .unwrap()
+    }
+
+    /// R6: the initial inbound read is wrapped in a connection-timeout. A peer
+    /// that completes the handshake but never sends a first frame must cause the
+    /// bounded read to elapse (so the handshake task can drop the connection)
+    /// rather than hang forever. This mirrors the timeout guard applied to the
+    /// first `read_message_from_tls_reader` call in handle_incoming_connection_tls.
+    #[tokio::test(start_paused = true)]
+    async fn first_read_times_out_when_peer_never_sends() {
+        // `_writer` is kept alive so the stream stays open but idle (no data,
+        // no EOF) — exactly the half-open case the timeout must defend against.
+        let (_writer, mut reader) = tokio::io::duplex(1024);
+
+        let timeout = std::time::Duration::from_secs(5);
+        let result = tokio::time::timeout(
+            timeout,
+            read_message_from_tls_reader(&mut reader, 1024 * 1024, None),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "first read on an idle stream must elapse, not hang"
+        );
+    }
+
+    /// R7: documents the immediate-gossip coalescing contract used in the
+    /// gossip select loop. A single in-flight gate ensures concurrent immediate
+    /// rounds do not pile up: repeated triggers while a round is in flight do not
+    /// spawn additional rounds, and once the round finishes the gate reopens.
+    /// This is the mechanism that prevents a flapping peer from head-of-line
+    /// blocking (or flooding) the timer loop.
+    #[tokio::test]
+    async fn immediate_gossip_coalesces_and_preserves_triggers_while_in_flight() {
+        use std::sync::atomic::AtomicUsize;
+        let in_flight = std::sync::Arc::new(AtomicBool::new(false));
+        let pending = std::sync::Arc::new(AtomicBool::new(false));
+        let rounds_spawned = std::sync::Arc::new(AtomicUsize::new(0));
+        let rearms = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // Mirror of the select-arm trigger handling (R7): record the trigger in
+        // `pending` before contending for the gate, then spawn a round only if
+        // the gate was free.
+        let trigger = |in_flight: std::sync::Arc<AtomicBool>,
+                       pending: std::sync::Arc<AtomicBool>,
+                       rounds: std::sync::Arc<AtomicUsize>| {
+            pending.store(true, Ordering::SeqCst);
+            if !in_flight.swap(true, Ordering::SeqCst) {
+                rounds.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        // Mirror of the worker exit: release the gate, then re-arm if a trigger
+        // landed while the gate was held.
+        let finish_round = |in_flight: std::sync::Arc<AtomicBool>,
+                            pending: std::sync::Arc<AtomicBool>,
+                            rearms: std::sync::Arc<AtomicUsize>| {
+            in_flight.store(false, Ordering::SeqCst);
+            if pending.load(Ordering::SeqCst) {
+                rearms.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        // First trigger starts a round; the worker claims the pending work.
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        pending.store(false, Ordering::SeqCst); // worker claims current state
+        assert_eq!(rounds_spawned.load(Ordering::SeqCst), 1);
+
+        // Three rapid triggers while the round is still in flight: they coalesce
+        // (no new round spawned) but must NOT be lost.
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        assert_eq!(
+            rounds_spawned.load(Ordering::SeqCst),
+            1,
+            "concurrent immediate triggers must coalesce into a single round"
+        );
+        assert!(
+            pending.load(Ordering::SeqCst),
+            "triggers arriving during the round must be preserved, not dropped"
+        );
+
+        // Round completes: the preserved trigger must re-arm a follow-up.
+        finish_round(in_flight.clone(), pending.clone(), rearms.clone());
+        assert_eq!(
+            rearms.load(Ordering::SeqCst),
+            1,
+            "a trigger that arrived mid-round must re-arm a follow-up round"
+        );
+
+        // The re-arm fires a fresh trigger which spawns the follow-up round
+        // that propagates the newer peer-list state.
+        trigger(in_flight.clone(), pending.clone(), rounds_spawned.clone());
+        assert_eq!(
+            rounds_spawned.load(Ordering::SeqCst),
+            2,
+            "the re-armed follow-up round must run"
+        );
+    }
+
+    /// R6: documents the inbound-handshake admission-gate contract used in the
+    /// accept loop — permits are bounded, exhaustion rejects (try_acquire fails),
+    /// and releasing a permit frees a slot for the next inbound handshake.
+    #[tokio::test]
+    async fn inbound_handshake_gate_caps_and_releases() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let p1 = gate.clone().try_acquire_owned().expect("slot 1");
+        let p2 = gate.clone().try_acquire_owned().expect("slot 2");
+        assert!(
+            gate.clone().try_acquire_owned().is_err(),
+            "third inbound handshake must be rejected when budget is exhausted"
+        );
+
+        // Releasing one permit (handshake finished) frees a slot.
+        drop(p1);
+        let _p3 = gate
+            .clone()
+            .try_acquire_owned()
+            .expect("slot freed after a handshake completes");
+        drop(p2);
     }
 
     #[tokio::test]

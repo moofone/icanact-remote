@@ -64,8 +64,8 @@ impl LockFreeStreamHandle {
         let bytes_written = Arc::new(AtomicUsize::new(0));
 
         // Create lock-free queue for payload writes and channel for streaming commands
-        let write_queue = WriteQueue::new(buffer_config.write_queue_capacity());
-        let streaming_queue = StreamingQueue::new(buffer_config.write_queue_capacity());
+        let write_queue = WriteQueue::new(buffer_config.write_queue_capacity(), addr);
+        let streaming_queue = StreamingQueue::new(buffer_config.write_queue_capacity(), addr);
 
         let max_message_size = read_context
             .as_ref()
@@ -296,6 +296,11 @@ impl LockFreeStreamHandle {
         struct ExitGuard {
             flag: Arc<AtomicBool>,
             notify: Arc<Notify>,
+            // Writer-owned queues. On teardown we must wake any sender parked in
+            // `push()` on a full queue, otherwise it hangs forever (the queue's
+            // space notifier is only fired by `pop()`, which has stopped).
+            write_queue: Arc<WriteQueue>,
+            streaming_queue: Arc<StreamingQueue>,
             response_correlation: Option<Arc<CorrelationTracker>>,
             registry_weak: Option<std::sync::Weak<GossipRegistry>>,
             peer_addr: Option<SocketAddr>,
@@ -307,6 +312,10 @@ impl LockFreeStreamHandle {
             fn drop(&mut self) {
                 self.flag.store(true, Ordering::Release);
                 self.notify.notify_waiters();
+                // Wake parked `push()` callers so they observe `closed` and
+                // return `ConnectionClosed` rather than hanging on a full queue.
+                self.write_queue.mark_closed_and_wake();
+                self.streaming_queue.mark_closed_and_wake();
                 let mut should_cancel_pending = true;
                 if let (Some(registry_weak), Some(peer_addr)) =
                     (self.registry_weak.as_ref(), self.peer_addr)
@@ -386,6 +395,8 @@ impl LockFreeStreamHandle {
         let _exit_guard = ExitGuard {
             flag: exit_flag,
             notify: exit_notify,
+            write_queue: write_queue.clone(),
+            streaming_queue: streaming_queue.clone(),
             response_correlation: read_context
                 .as_ref()
                 .and_then(|ctx| ctx.response_correlation.clone()),

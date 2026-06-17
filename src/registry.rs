@@ -1594,7 +1594,12 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Create a new gossip registry
-    pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
+    pub fn new(bind_addr: SocketAddr, mut config: GossipConfig) -> Self {
+        // R5: enforce runtime config invariants (e.g. liveness window >=
+        // gossip interval * 2) at the point config enters the registry, clamping
+        // unsafe consumer-supplied values with a warning. One-time at startup.
+        config.validate_and_normalize();
+
         // Use public key from config (required for TLS identity)
         let peer_id = config
             .key_pair

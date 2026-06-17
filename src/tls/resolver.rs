@@ -128,6 +128,13 @@ fn generate_self_signed_cert(secret_key: &SecretKey) -> Result<CertificateDer<'s
     Ok(CertificateDer::from(cert))
 }
 
+/// Test-only access to the self-signed certificate builder so sibling TLS
+/// modules can exercise the server-cert verifier against real certs.
+#[cfg(test)]
+pub(crate) fn test_self_signed_cert(secret_key: &SecretKey) -> Result<CertificateDer<'static>> {
+    generate_self_signed_cert(secret_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

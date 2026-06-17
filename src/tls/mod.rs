@@ -256,11 +256,96 @@ pub fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now() -> UnixTime {
+        UnixTime::since_unix_epoch(SystemTime::now().duration_since(UNIX_EPOCH).unwrap())
+    }
 
     #[test]
     fn client_cert_verifier_requires_authenticated_clients() {
         let verifier = NodeIdClientVerifier::new();
 
         assert!(verifier.client_auth_mandatory());
+    }
+
+    #[test]
+    fn server_verifier_accepts_matching_pinned_node_id() {
+        let key = SecretKey::generate();
+        let node_id = key.public();
+        let cert = resolver::test_self_signed_cert(&key).expect("cert");
+
+        let verifier = NodeIdServerVerifier::new();
+        let pinned = ServerName::try_from(name::encode(&node_id)).unwrap();
+        let res = verifier.verify_server_cert(&cert, &[], &pinned, &[], now());
+        assert!(
+            res.is_ok(),
+            "matching pinned NodeId must be accepted: {res:?}"
+        );
+    }
+
+    #[test]
+    fn server_verifier_rejects_mismatched_pinned_node_id() {
+        let key = SecretKey::generate();
+        let cert = resolver::test_self_signed_cert(&key).expect("cert");
+
+        // Pin a DIFFERENT node id than the cert actually carries.
+        let other_node_id = SecretKey::generate().public();
+        let verifier = NodeIdServerVerifier::new();
+        let pinned = ServerName::try_from(name::encode(&other_node_id)).unwrap();
+        let res = verifier.verify_server_cert(&cert, &[], &pinned, &[], now());
+        assert!(
+            res.is_err(),
+            "mismatched pinned NodeId must be rejected (identity binding)"
+        );
+    }
+
+    #[test]
+    fn server_verifier_placeholder_sni_is_tofu_learnable() {
+        // Bootstrap dials use a placeholder SNI that does not decode to a NodeId.
+        // The verifier accepts (key-possession is still proven via the TLS
+        // signature), and the TRUE identity is recoverable from the cert for
+        // TOFU-binding by the caller (R2). This proves the learned identity is
+        // the real cert NodeId, not None.
+        let key = SecretKey::generate();
+        let node_id = key.public();
+        let cert = resolver::test_self_signed_cert(&key).expect("cert");
+
+        let placeholder = "peer-4446.icanact.invalid";
+        assert!(
+            name::decode(placeholder).is_none(),
+            "placeholder SNI must NOT decode to a NodeId"
+        );
+        let sni = ServerName::try_from(placeholder).unwrap();
+
+        let verifier = NodeIdServerVerifier::new();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &sni, &[], now())
+                .is_ok(),
+            "placeholder-SNI bootstrap dial must still complete the handshake"
+        );
+
+        // The identity used for TOFU binding is the real cert NodeId.
+        let learned = extract_node_id_from_cert(&cert).expect("extract");
+        assert_eq!(
+            learned, node_id,
+            "TOFU-learned identity must equal the cert's true NodeId"
+        );
+    }
+
+    #[test]
+    fn tofu_node_id_maps_to_expected_peer_id() {
+        // The PeerId derived from the TOFU-learned NodeId must match the one a
+        // pinned NodeId would have produced, so subsequent per-message gossip
+        // guards (which compare embedded_peer_id) are consistent.
+        let key = SecretKey::generate();
+        let node_id = key.public();
+        let cert = resolver::test_self_signed_cert(&key).expect("cert");
+        let learned = extract_node_id_from_cert(&cert).expect("extract");
+        assert_eq!(
+            crate::PeerId::from_public_key(&learned),
+            crate::PeerId::from_public_key(&node_id),
+        );
     }
 }

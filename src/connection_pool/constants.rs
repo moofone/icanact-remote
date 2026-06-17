@@ -596,14 +596,23 @@ struct WriteQueue {
     queue: crossbeam_queue::ArrayQueue<WriteCommand>,
     data_notify: Notify,
     space_notify: Notify,
+    /// Set true when the owning IO writer task has exited (teardown). A blocked
+    /// `push()` observes this after being woken via the space notifier and
+    /// returns `ConnectionClosed` instead of re-parking forever. Hot path never
+    /// reads this flag.
+    closed: AtomicBool,
+    /// Peer address used to construct the `ConnectionClosed` error on teardown.
+    addr: SocketAddr,
 }
 
 impl WriteQueue {
-    fn new(capacity: usize) -> Arc<Self> {
+    fn new(capacity: usize, addr: SocketAddr) -> Arc<Self> {
         Arc::new(Self {
             queue: crossbeam_queue::ArrayQueue::new(capacity.max(128)),
             data_notify: Notify::new(),
             space_notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            addr,
         })
     }
 
@@ -620,7 +629,19 @@ impl WriteQueue {
         }
     }
 
+    /// Mark the queue closed and wake every task parked in `push()` so it can
+    /// observe the close and return an error instead of hanging forever.
+    /// Teardown-only; never called on the message fast path.
+    fn mark_closed_and_wake(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.space_notify.notify_waiters();
+    }
+
     async fn push(&self, mut command: WriteCommand) -> Result<()> {
+        // Fast reject if the writer already tore down before we attempt to park.
+        if self.closed.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
@@ -629,7 +650,26 @@ impl WriteQueue {
                 }
                 Err(cmd) => {
                     command = cmd;
-                    self.space_notify.notified().await;
+                    // Register on the space notifier *before* re-checking
+                    // `closed`. `mark_closed_and_wake` signals via
+                    // `notify_waiters()`, which stores no permit for an
+                    // unregistered waiter, so a teardown landing between the
+                    // failed push and the await would otherwise be lost and
+                    // park this sender forever. `enable()` arms the waiter so
+                    // any close after this point is delivered to the await
+                    // below, and the close-before-enable case is caught by the
+                    // load that follows. Backpressure-branch only; never on the
+                    // `try_push` fast path.
+                    let notified = self.space_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
+                    notified.await;
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                 }
             }
         }
@@ -648,14 +688,21 @@ struct StreamingQueue {
     queue: crossbeam_queue::ArrayQueue<StreamingCommand>,
     data_notify: Notify,
     space_notify: Notify,
+    /// Set true when the owning IO writer task has exited (teardown). See
+    /// `WriteQueue::closed`. Hot path never reads this flag.
+    closed: AtomicBool,
+    /// Peer address used to construct the `ConnectionClosed` error on teardown.
+    addr: SocketAddr,
 }
 
 impl StreamingQueue {
-    fn new(capacity: usize) -> Arc<Self> {
+    fn new(capacity: usize, addr: SocketAddr) -> Arc<Self> {
         Arc::new(Self {
             queue: crossbeam_queue::ArrayQueue::new(capacity.max(64)),
             data_notify: Notify::new(),
             space_notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            addr,
         })
     }
 
@@ -676,7 +723,16 @@ impl StreamingQueue {
         }
     }
 
+    /// Mark the queue closed and wake every task parked in `push()`. Teardown-only.
+    fn mark_closed_and_wake(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.space_notify.notify_waiters();
+    }
+
     async fn push(&self, mut command: StreamingCommand) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
@@ -685,7 +741,19 @@ impl StreamingQueue {
                 }
                 Err(cmd) => {
                     command = cmd;
-                    self.space_notify.notified().await;
+                    // See WriteQueue::push: register before re-checking `closed`
+                    // so a teardown landing in the gap is not lost. Backpressure
+                    // branch only; never on the fast path.
+                    let notified = self.space_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
+                    notified.await;
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                 }
             }
         }
