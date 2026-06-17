@@ -19,6 +19,10 @@ pub const DEFAULT_DEAD_PEER_TIMEOUT_SECS: u64 = 900;
 /// Default max concurrent ask inflight
 pub const DEFAULT_ASK_WINDOW: usize = 128;
 
+/// Default cap on simultaneous in-flight (post-accept, pre-identified) inbound
+/// handshakes. Bounds half-open inbound tasks.
+pub const DEFAULT_MAX_INFLIGHT_INBOUND_HANDSHAKES: usize = 256;
+
 /// Default small cluster threshold - clusters with this many nodes or fewer use full sync
 /// Set to 0 to always use delta sync when possible
 pub const DEFAULT_SMALL_CLUSTER_THRESHOLD: usize = 5;
@@ -225,6 +229,13 @@ pub struct GossipConfig {
     /// Default: 10 s. Set very small (e.g., 500 ms) in tests for
     /// determinism.
     pub peer_liveness_window: Duration,
+    /// Maximum number of inbound connections allowed to be in the
+    /// post-accept/pre-identified handshake stage simultaneously. Caps half-open
+    /// inbound tasks so a flood of TCP connects that complete the TLS handshake
+    /// but never send a first frame cannot spawn unbounded handshake tasks.
+    /// Acquired at accept, released when the handshake task finishes.
+    /// Default: 256.
+    pub max_inflight_inbound_handshakes: usize,
 }
 
 impl Default for GossipConfig {
@@ -308,6 +319,7 @@ impl Default for GossipConfig {
             // Example: ICANACT_ADVERTISE_DNS=data-feeder.default.svc.cluster.local:9400
             advertise_dns: std::env::var("ICANACT_ADVERTISE_DNS").ok(),
             peer_liveness_window: Duration::from_secs(10),
+            max_inflight_inbound_handshakes: DEFAULT_MAX_INFLIGHT_INBOUND_HANDSHAKES,
         }
     }
 }

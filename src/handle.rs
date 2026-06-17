@@ -1536,9 +1536,36 @@ async fn start_gossip_server_with_listener(
     let bind_addr = registry.bind_addr;
     info!(bind_addr = %bind_addr, "gossip server started");
 
+    // R6: bound the number of simultaneous in-flight (post-accept,
+    // pre-identified) inbound handshakes. A permit is acquired at accept and
+    // released when the handshake task finishes (via the owned permit moving
+    // into the task). This caps half-open inbound tasks under a connect flood
+    // without taxing the steady-state per-message read loop.
+    let inbound_handshake_limit = registry
+        .config
+        .max_inflight_inbound_handshakes
+        .max(1);
+    let inbound_handshake_gate = Arc::new(tokio::sync::Semaphore::new(inbound_handshake_limit));
+
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                // Admission control: reject (drop) the connection when the
+                // half-open handshake budget is exhausted rather than spawning an
+                // unbounded number of handshake tasks.
+                let permit = match inbound_handshake_gate.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            peer_addr = %peer_addr,
+                            limit = inbound_handshake_limit,
+                            "inbound handshake admission limit reached - dropping connection"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                };
+
                 info!(peer_addr = %peer_addr, "📥 ACCEPTED incoming connection");
                 // Set TCP_NODELAY for low-latency communication
                 let _ = stream.set_nodelay(true);
@@ -1546,6 +1573,9 @@ async fn start_gossip_server_with_listener(
 
                 let registry_clone = registry.clone();
                 tokio::spawn(async move {
+                    // Permit is held for the duration of the handshake task and
+                    // released on completion (success or failure).
+                    let _permit = permit;
                     handle_connection(stream, peer_addr, registry_clone).await;
                 });
             }
@@ -2213,9 +2243,30 @@ where
     let max_message_size = registry.config.max_message_size;
     let aligned_pool = registry.connection_pool.aligned_bytes_pool();
 
-    // First, read the initial message to identify the sender
-    let msg_result =
-        read_message_from_tls_reader(&mut stream, max_message_size, Some(&aligned_pool)).await;
+    // First, read the initial message to identify the sender.
+    //
+    // R6: bound ONLY this initial read. A peer that completes the TLS handshake
+    // but never sends a first frame would otherwise hold the half-open
+    // connection (and its handshake task slot) open indefinitely. We do NOT add
+    // a timeout to the steady-state read loop below — that would tax the message
+    // hot path; this guard applies only to connection setup.
+    let connection_timeout = registry.config.connection_timeout;
+    let msg_result = match tokio::time::timeout(
+        connection_timeout,
+        read_message_from_tls_reader(&mut stream, max_message_size, Some(&aligned_pool)),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            warn!(
+                peer_addr = %peer_addr,
+                timeout_ms = connection_timeout.as_millis(),
+                "⚠️ Inbound first-read timed out before any frame arrived - dropping connection"
+            );
+            return ConnectionCloseOutcome::Normal { node_id: None };
+        }
+    };
     let known_node_id = match peer_node_id {
         Some(node_id) => Some(node_id),
         None => registry.lookup_node_id(&peer_addr).await,
@@ -3564,6 +3615,53 @@ mod framing_tests {
         read_message_from_tls_reader(&mut reader, 1024 * 1024, None)
             .await
             .unwrap()
+    }
+
+    /// R6: the initial inbound read is wrapped in a connection-timeout. A peer
+    /// that completes the handshake but never sends a first frame must cause the
+    /// bounded read to elapse (so the handshake task can drop the connection)
+    /// rather than hang forever. This mirrors the timeout guard applied to the
+    /// first `read_message_from_tls_reader` call in handle_incoming_connection_tls.
+    #[tokio::test(start_paused = true)]
+    async fn first_read_times_out_when_peer_never_sends() {
+        // `_writer` is kept alive so the stream stays open but idle (no data,
+        // no EOF) — exactly the half-open case the timeout must defend against.
+        let (_writer, mut reader) = tokio::io::duplex(1024);
+
+        let timeout = std::time::Duration::from_secs(5);
+        let result = tokio::time::timeout(
+            timeout,
+            read_message_from_tls_reader(&mut reader, 1024 * 1024, None),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "first read on an idle stream must elapse, not hang"
+        );
+    }
+
+    /// R6: documents the inbound-handshake admission-gate contract used in the
+    /// accept loop — permits are bounded, exhaustion rejects (try_acquire fails),
+    /// and releasing a permit frees a slot for the next inbound handshake.
+    #[tokio::test]
+    async fn inbound_handshake_gate_caps_and_releases() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+
+        let p1 = gate.clone().try_acquire_owned().expect("slot 1");
+        let p2 = gate.clone().try_acquire_owned().expect("slot 2");
+        assert!(
+            gate.clone().try_acquire_owned().is_err(),
+            "third inbound handshake must be rejected when budget is exhausted"
+        );
+
+        // Releasing one permit (handshake finished) frees a slot.
+        drop(p1);
+        let _p3 = gate
+            .clone()
+            .try_acquire_owned()
+            .expect("slot freed after a handshake completes");
+        drop(p2);
     }
 
     #[tokio::test]
