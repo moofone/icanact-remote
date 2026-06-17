@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::aligned::{AlignedBuffer, AlignedBytes};
 use bytes::Bytes;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream, UdpSocket},
@@ -1541,10 +1541,7 @@ async fn start_gossip_server_with_listener(
     // released when the handshake task finishes (via the owned permit moving
     // into the task). This caps half-open inbound tasks under a connect flood
     // without taxing the steady-state per-message read loop.
-    let inbound_handshake_limit = registry
-        .config
-        .max_inflight_inbound_handshakes
-        .max(1);
+    let inbound_handshake_limit = registry.config.max_inflight_inbound_handshakes.max(1);
     let inbound_handshake_gate = Arc::new(tokio::sync::Semaphore::new(inbound_handshake_limit));
 
     loop {
@@ -1944,6 +1941,15 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         "gossip timer started with non-blocking I/O"
     );
 
+    // R7: the immediate (urgent) peer-gossip round may dial peers, bounded only
+    // by connection_timeout. Running it inline in the select arm head-of-line
+    // blocks every other timer (periodic gossip, cleanup, supervisor, UDP
+    // detector). Detach it into a spawned task so the select loop keeps
+    // servicing other arms, and coalesce concurrent immediate rounds with a
+    // single in-flight gate so a flapping peer cannot pile up rounds. The trigger
+    // (`wait_immediate_peer_gossip`) is already edge-coalescing via a Notify.
+    let immediate_gossip_in_flight = Arc::new(AtomicBool::new(false));
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(next_gossip_tick) => {
@@ -2060,7 +2066,21 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
             if registry.is_shutdown().await {
                 break;
             }
-            send_peer_list_gossip_round(registry.clone(), true).await;
+            // Coalesce: only one immediate round runs at a time. If one is
+            // already in flight, skip — the Notify will re-fire if state is
+            // still pending. swap returns the previous value.
+            if !immediate_gossip_in_flight.swap(true, Ordering::AcqRel) {
+                let registry_for_round = registry.clone();
+                let in_flight = immediate_gossip_in_flight.clone();
+                tokio::spawn(async move {
+                    // Don't start (or keep running) an immediate round during
+                    // shutdown.
+                    if !registry_for_round.is_shutdown().await {
+                        send_peer_list_gossip_round(registry_for_round, true).await;
+                    }
+                    in_flight.store(false, Ordering::Release);
+                });
+            }
         }
         // UDP detector timer - only active for udp experimental stack.
             _ = async {
@@ -3605,6 +3625,7 @@ where
 mod framing_tests {
     use super::{MessageReadResult, read_message_from_tls_reader};
     use crate::{MessageType, framing, registry::RegistryMessage};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
 
     async fn read_frame(frame: Vec<u8>) -> MessageReadResult {
@@ -3638,6 +3659,49 @@ mod framing_tests {
         assert!(
             result.is_err(),
             "first read on an idle stream must elapse, not hang"
+        );
+    }
+
+    /// R7: documents the immediate-gossip coalescing contract used in the
+    /// gossip select loop. A single in-flight gate ensures concurrent immediate
+    /// rounds do not pile up: repeated triggers while a round is in flight do not
+    /// spawn additional rounds, and once the round finishes the gate reopens.
+    /// This is the mechanism that prevents a flapping peer from head-of-line
+    /// blocking (or flooding) the timer loop.
+    #[tokio::test]
+    async fn immediate_gossip_coalesces_while_in_flight() {
+        let in_flight = std::sync::Arc::new(AtomicBool::new(false));
+        let rounds_spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Mirror of the select-arm trigger handling.
+        let trigger =
+            |in_flight: std::sync::Arc<AtomicBool>,
+             rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+                if !in_flight.swap(true, Ordering::AcqRel) {
+                    rounds.fetch_add(1, Ordering::AcqRel);
+                    // Round "in flight"; gate stays closed until released.
+                }
+            };
+
+        // Three rapid triggers while the first round is still in flight.
+        trigger(in_flight.clone(), rounds_spawned.clone());
+        trigger(in_flight.clone(), rounds_spawned.clone());
+        trigger(in_flight.clone(), rounds_spawned.clone());
+        assert_eq!(
+            rounds_spawned.load(Ordering::Acquire),
+            1,
+            "concurrent immediate triggers must coalesce into a single round"
+        );
+
+        // Round completes, gate reopens.
+        in_flight.store(false, Ordering::Release);
+
+        // A later trigger after completion spawns a fresh round.
+        trigger(in_flight.clone(), rounds_spawned.clone());
+        assert_eq!(
+            rounds_spawned.load(Ordering::Acquire),
+            2,
+            "a trigger after the previous round finished must spawn a new round"
         );
     }
 
