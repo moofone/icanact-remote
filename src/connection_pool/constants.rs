@@ -596,14 +596,23 @@ struct WriteQueue {
     queue: crossbeam_queue::ArrayQueue<WriteCommand>,
     data_notify: Notify,
     space_notify: Notify,
+    /// Set true when the owning IO writer task has exited (teardown). A blocked
+    /// `push()` observes this after being woken via the space notifier and
+    /// returns `ConnectionClosed` instead of re-parking forever. Hot path never
+    /// reads this flag.
+    closed: AtomicBool,
+    /// Peer address used to construct the `ConnectionClosed` error on teardown.
+    addr: SocketAddr,
 }
 
 impl WriteQueue {
-    fn new(capacity: usize) -> Arc<Self> {
+    fn new(capacity: usize, addr: SocketAddr) -> Arc<Self> {
         Arc::new(Self {
             queue: crossbeam_queue::ArrayQueue::new(capacity.max(128)),
             data_notify: Notify::new(),
             space_notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            addr,
         })
     }
 
@@ -620,7 +629,19 @@ impl WriteQueue {
         }
     }
 
+    /// Mark the queue closed and wake every task parked in `push()` so it can
+    /// observe the close and return an error instead of hanging forever.
+    /// Teardown-only; never called on the message fast path.
+    fn mark_closed_and_wake(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.space_notify.notify_waiters();
+    }
+
     async fn push(&self, mut command: WriteCommand) -> Result<()> {
+        // Fast reject if the writer already tore down before we attempt to park.
+        if self.closed.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
@@ -630,6 +651,11 @@ impl WriteQueue {
                 Err(cmd) => {
                     command = cmd;
                     self.space_notify.notified().await;
+                    // Backpressure-branch-only check: if we were woken by teardown
+                    // (not a real `pop()`/`notify_space`), abandon the push.
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                 }
             }
         }
@@ -648,14 +674,21 @@ struct StreamingQueue {
     queue: crossbeam_queue::ArrayQueue<StreamingCommand>,
     data_notify: Notify,
     space_notify: Notify,
+    /// Set true when the owning IO writer task has exited (teardown). See
+    /// `WriteQueue::closed`. Hot path never reads this flag.
+    closed: AtomicBool,
+    /// Peer address used to construct the `ConnectionClosed` error on teardown.
+    addr: SocketAddr,
 }
 
 impl StreamingQueue {
-    fn new(capacity: usize) -> Arc<Self> {
+    fn new(capacity: usize, addr: SocketAddr) -> Arc<Self> {
         Arc::new(Self {
             queue: crossbeam_queue::ArrayQueue::new(capacity.max(64)),
             data_notify: Notify::new(),
             space_notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            addr,
         })
     }
 
@@ -676,7 +709,16 @@ impl StreamingQueue {
         }
     }
 
+    /// Mark the queue closed and wake every task parked in `push()`. Teardown-only.
+    fn mark_closed_and_wake(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.space_notify.notify_waiters();
+    }
+
     async fn push(&self, mut command: StreamingCommand) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
@@ -686,6 +728,10 @@ impl StreamingQueue {
                 Err(cmd) => {
                     command = cmd;
                     self.space_notify.notified().await;
+                    // Backpressure-branch-only teardown check.
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                 }
             }
         }
