@@ -3120,7 +3120,7 @@ impl<T: 'static> GossipRegistry<T> {
             .known_actors
             .read_sync(name.as_str(), |_, location| location.clone())
         {
-            if loc.node_id == self_node_id {
+            if loc.node_id == self_node_id || loc.address == location.address {
                 let _ = self.actor_state.known_actors.remove_sync(name.as_str());
             }
         }
@@ -8501,6 +8501,47 @@ mod tests {
             .register_actor("test_actor".to_string(), location)
             .await;
         assert!(matches!(result, Err(GossipError::ActorAlreadyExists(_))));
+    }
+
+    #[tokio::test]
+    async fn register_actor_reclaims_stale_known_actor_at_same_address() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let actor_name = "test_actor_stale_same_addr";
+        let service_addr = test_addr(9001);
+        let stale_peer = test_peer_id("stale-known-owner");
+
+        registry.actor_state.known_actors.upsert_sync(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(service_addr, stale_peer),
+        );
+
+        let result = registry
+            .register_actor(actor_name.to_string(), test_location(service_addr))
+            .await;
+
+        assert!(result.is_ok());
+        assert!(registry.actor_state.local_actors.contains_sync(actor_name));
+        assert!(!registry.actor_state.known_actors.contains_sync(actor_name));
+    }
+
+    #[tokio::test]
+    async fn register_actor_rejects_known_actor_at_different_address() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let actor_name = "test_actor_known_elsewhere";
+        let stale_peer = test_peer_id("known-owner-elsewhere");
+
+        registry.actor_state.known_actors.upsert_sync(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(test_addr(9002), stale_peer),
+        );
+
+        let result = registry
+            .register_actor(actor_name.to_string(), test_location(test_addr(9001)))
+            .await;
+
+        assert!(matches!(result, Err(GossipError::ActorAlreadyExists(_))));
+        assert!(!registry.actor_state.local_actors.contains_sync(actor_name));
+        assert!(registry.actor_state.known_actors.contains_sync(actor_name));
     }
 
     #[tokio::test]
