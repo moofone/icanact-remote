@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
@@ -374,6 +374,7 @@ pub struct RoutedPubSub {
     seen_fingerprints: Box<[AtomicU64]>,
     counters: PubSubIngressCounters,
     next_sub_id: AtomicU64,
+    msg_id_epoch: u64,
     next_msg_id: AtomicU64,
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
 }
@@ -384,6 +385,7 @@ impl RoutedPubSub {
             FAST_FRAME_POOL_BUFFERS,
             FAST_FRAME_POOL_BUFFER_CAPACITY,
         );
+        let msg_id_epoch = new_msg_id_epoch(&registry.peer_id);
         let this = Arc::new(Self {
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
@@ -399,6 +401,7 @@ impl RoutedPubSub {
             seen_fingerprints: new_seen_fingerprints(),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
+            msg_id_epoch,
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
         });
@@ -411,6 +414,11 @@ impl RoutedPubSub {
 
     pub fn set_route_provider(&self, provider: Arc<dyn PubSubRouteProvider>) {
         self.route_provider.store(Arc::new(Some(provider)));
+    }
+
+    fn next_msg_id(&self) -> u128 {
+        let counter = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+        (u128::from(self.msg_id_epoch) << 64) | u128::from(counter)
     }
 
     pub fn stats(&self) -> PubSubIngressStats {
@@ -646,7 +654,7 @@ impl RoutedPubSub {
             return Ok(());
         }
 
-        let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed) as u128;
+        let msg_id = self.next_msg_id();
         match scope {
             PubSubScope::LocalOnly => Ok(()),
             PubSubScope::AutoExternal | PubSubScope::ClusterWide => {
@@ -904,11 +912,11 @@ impl RoutedPubSub {
                     self.hot_route_groups.store(None);
                     return;
                 };
-                    entries.push(HotRouteEntry {
-                        next_hop: next_hop.clone(),
-                        destinations: Arc::clone(destinations),
-                        conn: conn.clone(),
-                    });
+                entries.push(HotRouteEntry {
+                    next_hop: next_hop.clone(),
+                    destinations: Arc::clone(destinations),
+                    conn: conn.clone(),
+                });
             }
             self.hot_route_groups.store(Some(Arc::new(HotRouteGroups {
                 topic_key,
@@ -1554,6 +1562,25 @@ fn new_seen_fingerprints() -> Box<[AtomicU64]> {
         .into_boxed_slice()
 }
 
+fn new_msg_id_epoch(peer: &PeerId) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = fnv1a_hash_bytes_with_seed(peer.as_bytes(), now);
+    if mixed == 0 { 1 } else { mixed }
+}
+
+fn fnv1a_hash_bytes_with_seed(bytes: &[u8], seed: u64) -> u64 {
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = seed ^ 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn seen_fingerprint(origin: &PeerId, msg_id: u128) -> u64 {
     seen_fingerprint_bytes(origin.as_bytes(), msg_id)
 }
@@ -1717,6 +1744,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             config,
         ));
+        let msg_id_epoch = new_msg_id_epoch(&registry.peer_id);
         RoutedPubSub {
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
@@ -1732,6 +1760,7 @@ mod tests {
             seen_fingerprints: new_seen_fingerprints(),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
+            msg_id_epoch,
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
         }
@@ -1747,6 +1776,24 @@ mod tests {
             Arc::from(vec![SubscriberEntry::new(1, deliver)].into_boxed_slice()),
         );
         pubsub.subscribers.store(Arc::new(next));
+    }
+
+    #[test]
+    fn pubsub_msg_ids_do_not_reuse_after_same_peer_restarts() {
+        let first = test_pubsub("pubsub-restart-msg-id");
+        let second = test_pubsub("pubsub-restart-msg-id");
+
+        assert_eq!(first.local_peer_id, second.local_peer_id);
+
+        let first_msg_id = first.next_msg_id();
+        let second_msg_id = second.next_msg_id();
+
+        assert_ne!(
+            first_msg_id, second_msg_id,
+            "same peer restart must not reuse pubsub message ids while receivers still retain duplicate fingerprints"
+        );
+        assert_ne!(first_msg_id >> 64, 0);
+        assert_ne!(second_msg_id >> 64, 0);
     }
 
     #[test]
