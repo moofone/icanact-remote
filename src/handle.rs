@@ -256,6 +256,27 @@ impl<T> GossipRegistryHandle<T> {
         self.registry.register_actor(name, location).await
     }
 
+    /// Register local actor metadata after replacing a learned remote owner.
+    ///
+    /// Intended for configured singleton services during startup, where the
+    /// process already owns the advertised socket and stale gossip may still
+    /// contain the previous owner.
+    pub async fn register_with_metadata_replacing_known(
+        &self,
+        name: String,
+        address: SocketAddr,
+        metadata: Vec<u8>,
+    ) -> Result<()> {
+        let location = RemoteActorLocation::new_with_metadata(
+            address,
+            self.registry.peer_id.clone(),
+            metadata,
+        );
+        self.registry
+            .register_actor_replacing_known(name, location)
+            .await
+    }
+
     /// Register a local actor with high priority (faster propagation)
     pub async fn register_urgent(
         &self,
