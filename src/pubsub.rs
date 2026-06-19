@@ -19,6 +19,7 @@ const FAST_FRAME_HEADER_LEN: usize = 120;
 const FAST_FRAME_DEST_PEER_LEN: usize = 32;
 const FAST_FRAME_POOL_BUFFERS: usize = 4096;
 const FAST_FRAME_POOL_BUFFER_CAPACITY: usize = 4096;
+const UDP_MAX_DATAGRAM_SIZE: usize = 65_507;
 
 type TopicKey = u64;
 type TypeHash = u64;
@@ -772,7 +773,7 @@ impl RoutedPubSub {
         stats.remote_attempted = stats.remote_attempted.saturating_add(1);
 
         if supports_pooled_datagram {
-            let Some(datagram) = encode_fast_pubsub_datagram_pooled(
+            if let Some(datagram) = encode_fast_pubsub_datagram_pooled(
                 topic_key,
                 type_hash,
                 msg_id,
@@ -783,29 +784,25 @@ impl RoutedPubSub {
                 metadata,
                 destinations,
                 payload,
-            ) else {
-                stats.remote_full = stats.remote_full.saturating_add(1);
-                self.counters
-                    .queue_full_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            };
-            match conn.try_pooled_datagram(datagram) {
-                Ok(()) => {
-                    stats.remote_enqueued = stats.remote_enqueued.saturating_add(1);
-                    return;
-                }
-                Err(GossipError::WriteQueueFull) => {
-                    stats.remote_full = stats.remote_full.saturating_add(1);
-                    self.counters
-                        .queue_full_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Err(err) => {
-                    tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub UDP datagram send failed");
-                    stats.remote_transport_errors = stats.remote_transport_errors.saturating_add(1);
-                    return;
+            ) {
+                match conn.try_pooled_datagram(datagram) {
+                    Ok(()) => {
+                        stats.remote_enqueued = stats.remote_enqueued.saturating_add(1);
+                        return;
+                    }
+                    Err(GossipError::WriteQueueFull) => {
+                        stats.remote_full = stats.remote_full.saturating_add(1);
+                        self.counters
+                            .queue_full_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub UDP datagram send failed");
+                        stats.remote_transport_errors =
+                            stats.remote_transport_errors.saturating_add(1);
+                        return;
+                    }
                 }
             }
         }
@@ -1664,6 +1661,9 @@ fn encode_fast_pubsub_datagram_pooled(
     let payload_len = fast_frame_len(destination_peers, payload);
     let header = crate::framing::write_pubsub_frame_prefix(payload_len);
     let datagram_len = header.len().saturating_add(payload_len);
+    if datagram_len > UDP_MAX_DATAGRAM_SIZE {
+        return None;
+    }
     crate::typed::PooledPayload::try_from_pooled_bytes(datagram_len, |out| {
         out.extend_from_slice(&header);
         write_fast_frame(
@@ -1787,6 +1787,49 @@ mod tests {
             Arc::from(vec![SubscriberEntry::new(1, deliver)].into_boxed_slice()),
         );
         pubsub.subscribers.store(Arc::new(next));
+    }
+
+    #[test]
+    fn oversized_pubsub_payload_skips_datagram_but_encodes_stream_frame() {
+        let pubsub = test_pubsub("pubsub-oversize-stream-fallback");
+        let topic = topic_key("oversize-stream-fallback");
+        let type_hash = 77;
+        let payload = vec![0u8; UDP_MAX_DATAGRAM_SIZE];
+        let destination = crate::KeyPair::new_for_testing("pubsub-oversize-destination").peer_id();
+
+        assert!(
+            encode_fast_pubsub_datagram_pooled(
+                topic,
+                type_hash,
+                42,
+                &pubsub.local_peer_id,
+                &pubsub.local_peer_id,
+                2,
+                PubSubDeliveryMode::AtMostOnce,
+                PubSubFrameMetadata::default(),
+                std::slice::from_ref(&destination),
+                &payload,
+            )
+            .is_none()
+        );
+        let (frame, _prefix, payload_len) = encode_fast_frame_pooled(
+            topic,
+            type_hash,
+            42,
+            &pubsub.local_peer_id,
+            &pubsub.local_peer_id,
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
+            std::slice::from_ref(&destination),
+            &payload,
+        )
+        .expect("streamable pubsub frame");
+        assert_eq!(
+            payload_len,
+            fast_frame_len(std::slice::from_ref(&destination), &payload)
+        );
+        assert_eq!(frame.remaining(), payload_len);
     }
 
     #[test]

@@ -69,12 +69,17 @@ fn release_ctx(mut ctx: Box<SerializerCtx>) {
 }
 
 fn try_acquire_byte_buffer(min_capacity: usize) -> Option<Vec<u8>> {
-    let buffer = byte_payload_pool().pop()?;
-    if buffer.capacity() < min_capacity {
-        release_byte_buffer(buffer);
+    if min_capacity > MAX_POOLED_BYTE_CAPACITY {
         return None;
     }
-    Some(buffer)
+    match byte_payload_pool().pop() {
+        Some(buffer) if buffer.capacity() >= min_capacity => Some(buffer),
+        Some(buffer) => {
+            release_byte_buffer(buffer);
+            Some(Vec::with_capacity(min_capacity))
+        }
+        None => Some(Vec::with_capacity(min_capacity)),
+    }
 }
 
 fn release_byte_buffer(mut buffer: Vec<u8>) {
@@ -375,6 +380,19 @@ mod tests {
         };
         let big_payload = encode_typed_pooled(&big).unwrap();
         drop(big_payload);
+    }
+
+    #[test]
+    fn pooled_byte_payload_allocates_bounded_buffer_when_warm_pool_too_small() {
+        let payload = PooledPayload::try_from_pooled_bytes(65_507, |out| {
+            out.extend_from_slice(&vec![0u8; 65_507]);
+        })
+        .expect("bounded on-demand byte payload");
+        assert_eq!(payload.len(), 65_507);
+
+        assert!(
+            PooledPayload::try_from_pooled_bytes(MAX_POOLED_BYTE_CAPACITY + 1, |_| {}).is_none()
+        );
     }
 
     #[test]
