@@ -67,7 +67,6 @@ struct HotRouteEntry {
     next_hop: PeerId,
     destinations: Arc<[PeerId]>,
     conn: crate::RemoteConnection,
-    supports_pooled_datagram: bool,
 }
 
 impl SubscriberEntry {
@@ -659,7 +658,6 @@ impl RoutedPubSub {
                         self.publish_frame_to_conn(
                             &entry.next_hop,
                             &entry.conn,
-                            entry.supports_pooled_datagram,
                             entry.destinations.as_ref(),
                             topic_key,
                             type_hash,
@@ -744,7 +742,6 @@ impl RoutedPubSub {
         self.publish_frame_to_conn(
             next_hop,
             &conn,
-            conn.supports_pooled_datagram(),
             destinations,
             topic_key,
             type_hash,
@@ -760,7 +757,6 @@ impl RoutedPubSub {
         &self,
         next_hop: &PeerId,
         conn: &crate::RemoteConnection,
-        supports_pooled_datagram: bool,
         destinations: &[PeerId],
         topic_key: u64,
         type_hash: u64,
@@ -771,41 +767,6 @@ impl RoutedPubSub {
         stats: &mut PubSubPublishStats,
     ) {
         stats.remote_attempted = stats.remote_attempted.saturating_add(1);
-
-        if supports_pooled_datagram {
-            if let Some(datagram) = encode_fast_pubsub_datagram_pooled(
-                topic_key,
-                type_hash,
-                msg_id,
-                &self.local_peer_id,
-                &self.local_peer_id,
-                policy.hops_limit,
-                policy.mode,
-                metadata,
-                destinations,
-                payload,
-            ) {
-                match conn.try_pooled_datagram(datagram) {
-                    Ok(()) => {
-                        stats.remote_enqueued = stats.remote_enqueued.saturating_add(1);
-                        return;
-                    }
-                    Err(GossipError::WriteQueueFull) => {
-                        stats.remote_full = stats.remote_full.saturating_add(1);
-                        self.counters
-                            .queue_full_drops
-                            .fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Err(err) => {
-                        tracing::trace!(next_hop = %next_hop, error = %err, "routed pubsub UDP datagram send failed");
-                        stats.remote_transport_errors =
-                            stats.remote_transport_errors.saturating_add(1);
-                        return;
-                    }
-                }
-            }
-        }
 
         let Some((frame, prefix, payload_len)) = encode_fast_frame_pooled(
             topic_key,
@@ -943,12 +904,11 @@ impl RoutedPubSub {
                     self.hot_route_groups.store(None);
                     return;
                 };
-                entries.push(HotRouteEntry {
-                    next_hop: next_hop.clone(),
-                    destinations: Arc::clone(destinations),
-                    conn: conn.clone(),
-                    supports_pooled_datagram: conn.supports_pooled_datagram(),
-                });
+                    entries.push(HotRouteEntry {
+                        next_hop: next_hop.clone(),
+                        destinations: Arc::clone(destinations),
+                        conn: conn.clone(),
+                    });
             }
             self.hot_route_groups.store(Some(Arc::new(HotRouteGroups {
                 topic_key,
