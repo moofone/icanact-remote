@@ -2988,6 +2988,20 @@ impl<T: 'static> GossipRegistry<T> {
             .await
     }
 
+    /// Register a local actor after dropping any learned remote owner for the same name.
+    ///
+    /// This is for operator-configured services that are known to be singleton owners
+    /// after binding their advertised socket. It does not ignore local duplicates.
+    pub async fn register_actor_replacing_known(
+        &self,
+        name: String,
+        location: RemoteActorLocation,
+    ) -> Result<()> {
+        let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+        self.register_actor_with_priority(name, location, RegistrationPriority::Normal)
+            .await
+    }
+
     /// Register actor with confirmation from at least one peer
     /// Returns when first peer ACKs or timeout
     pub async fn register_actor_sync(
@@ -8542,6 +8556,43 @@ mod tests {
         assert!(matches!(result, Err(GossipError::ActorAlreadyExists(_))));
         assert!(!registry.actor_state.local_actors.contains_sync(actor_name));
         assert!(registry.actor_state.known_actors.contains_sync(actor_name));
+    }
+
+    #[tokio::test]
+    async fn register_actor_replacing_known_drops_learned_owner() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let actor_name = "test_actor_replace_known";
+        let remote_peer = test_peer_id("replace-known-owner");
+
+        registry.actor_state.known_actors.upsert_sync(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(test_addr(9002), remote_peer),
+        );
+
+        let result = registry
+            .register_actor_replacing_known(actor_name.to_string(), test_location(test_addr(9001)))
+            .await;
+
+        assert!(result.is_ok());
+        assert!(registry.actor_state.local_actors.contains_sync(actor_name));
+        assert!(!registry.actor_state.known_actors.contains_sync(actor_name));
+    }
+
+    #[tokio::test]
+    async fn register_actor_replacing_known_keeps_local_duplicate_rejection() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let actor_name = "test_actor_replace_known_local_duplicate";
+
+        registry
+            .register_actor(actor_name.to_string(), test_location(test_addr(9001)))
+            .await
+            .unwrap();
+
+        let result = registry
+            .register_actor_replacing_known(actor_name.to_string(), test_location(test_addr(9001)))
+            .await;
+
+        assert!(matches!(result, Err(GossipError::ActorAlreadyExists(_))));
     }
 
     #[tokio::test]
