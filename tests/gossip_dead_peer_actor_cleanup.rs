@@ -371,6 +371,7 @@ fn subsecond_liveness_window_counts_no_response() -> Result<(), DynError> {
     run_gossip_test(async {
         let config = GossipConfig {
             gossip_interval: Duration::from_millis(100),
+            peer_gossip_interval: None,
             peer_retry_interval: Duration::from_millis(200),
             peer_liveness_window: Duration::from_millis(500),
             max_peer_failures: 3,
@@ -546,7 +547,7 @@ fn discovered_non_required_peer_still_uses_response_asymmetry_liveness() -> Resu
     run_gossip_test(async {
         let config = GossipConfig {
             gossip_interval: Duration::from_millis(100),
-            peer_gossip_interval: Some(Duration::from_millis(1500)),
+            peer_gossip_interval: None,
             peer_liveness_window: Duration::from_millis(500),
             max_peer_failures: 3,
             ..Default::default()

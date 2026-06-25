@@ -19,6 +19,7 @@ const FAST_FRAME_HEADER_LEN: usize = 120;
 const FAST_FRAME_DEST_PEER_LEN: usize = 32;
 const FAST_FRAME_POOL_BUFFERS: usize = 4096;
 const FAST_FRAME_POOL_BUFFER_CAPACITY: usize = 4096;
+#[cfg(test)]
 const UDP_MAX_DATAGRAM_SIZE: usize = 65_507;
 
 type TopicKey = u64;
@@ -1633,6 +1634,7 @@ fn encode_fast_frame_pooled(
     Some((pooled, None, payload_len))
 }
 
+#[cfg(test)]
 fn encode_fast_pubsub_datagram_pooled(
     topic_key: u64,
     type_hash: u64,

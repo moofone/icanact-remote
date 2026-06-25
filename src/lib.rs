@@ -236,6 +236,8 @@ pub type NodeId = PublicKey;
 /// Secret key for node identity - Ed25519 signing key with secure cleanup
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SecretKey {
+    // `SigningKey` zeroizes itself on drop when ed25519-dalek's zeroize feature is enabled.
+    // The outer derive skips it so cleanup remains owned by the key type.
     #[zeroize(skip)]
     secret: SigningKey,
 }
