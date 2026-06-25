@@ -693,6 +693,29 @@ impl<T> GossipClient<T> {
         ))
     }
 
+    /// Lookup peer by address and return a RemoteActorRef.
+    ///
+    /// This mirrors `GossipRegistryHandle::lookup_address` but is available on
+    /// the cloneable client handle used by service tasks. Prefer
+    /// [`Self::lookup_peer`] when the peer id is already connected; use this
+    /// when a static peer address is the reconnect source of truth.
+    pub async fn lookup_address(&self, addr: SocketAddr) -> Result<crate::RemoteActorRef> {
+        let conn = self.registry.connection_pool.get_connection(addr).await?;
+        let peer_id = self
+            .registry
+            .connection_pool
+            .get_peer_id_by_addr(&addr)
+            .ok_or_else(|| {
+                crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
+            })?;
+        let location = crate::RemoteActorLocation::new_with_peer(addr, peer_id);
+        Ok(crate::RemoteActorRef::with_registry(
+            location,
+            Some(conn),
+            Arc::clone(&self.registry),
+        ))
+    }
+
     /// Instance id of the peer's live transport session. Capture this *before*
     /// an ask and pass it back to [`Self::note_peer_ask_streak_timeout`] /
     /// [`Self::note_peer_ask_hard_fault`] so eviction is guarded against

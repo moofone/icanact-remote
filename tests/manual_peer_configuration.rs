@@ -1,6 +1,41 @@
 use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey};
 
 #[tokio::test]
+async fn client_lookup_address_dials_live_peer() -> Result<(), Box<dyn std::error::Error>> {
+    let registry_a = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        SecretKey::generate(),
+        Some(GossipConfig::default()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
+    let registry_b = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse()?,
+        SecretKey::generate(),
+        Some(GossipConfig::default()),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await?;
+
+    let peer_ref = registry_a
+        .client()
+        .lookup_address(registry_b.registry.bind_addr)
+        .await?;
+
+    assert_eq!(
+        peer_ref.location.address,
+        registry_b.registry.bind_addr.to_string()
+    );
+    assert!(
+        registry_a
+            .client()
+            .lookup_connected_peer(&peer_ref.location.peer_id)
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_manual_peer_configuration_enables_lookup() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup a registry (client side)
     let secret = SecretKey::generate();
