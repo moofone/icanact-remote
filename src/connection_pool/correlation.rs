@@ -86,7 +86,7 @@ impl CorrelationTracker {
     /// Returns [`Err(NoFreeSlots)`](NoFreeSlots) when the entire ring is in
     /// a non-EMPTY state. Previously this method was an unbounded `loop {}`
     /// which monopolised single-threaded tokio runtimes when slots leaked
-    /// (production incident raft-1 2026-05-09).
+    /// (production incident 2026-05-09).
     ///
     /// The returned guard borrows from `self` rather than holding an Arc
     /// clone, so the success path adds zero atomic refcount traffic over

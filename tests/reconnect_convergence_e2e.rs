@@ -286,7 +286,7 @@ async fn isolated_static_peer_reconnect_converges_under_500ms() -> icanact_remot
     .await
     .expect("baseline C->A ask");
 
-    // Model the raft old-leader heal path: the isolated node's transport sessions to the
+    // Model an isolated-node heal path: the isolated node's transport sessions to the
     // healthy quorum are gone, but all three static peer addresses are still configured.
     node_a.disconnect_peer_connection(&node_b.registry.peer_id);
     node_a.disconnect_peer_connection(&node_c.registry.peer_id);

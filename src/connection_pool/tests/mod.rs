@@ -2718,7 +2718,7 @@ fn correlation_tracker_throughput_bench() {
 // ---------------------------------------------------------------------------
 // Bug-hunt regression guards: CorrelationTracker livelock + slot leak.
 //
-// Production incident 2026-05-09: raft-1 wedged at 100% CPU because the
+// Production incident 2026-05-09: a node wedged at 100% CPU because the
 // tokio current_thread runtime got monopolised by `CorrelationTracker::
 // allocate()` spinning in a `loop {}` after every slot landed in
 // SLOT_WAITING. Slots accumulated because in-flight `wait_for_response`
@@ -2763,7 +2763,7 @@ fn allocate_terminates_when_every_slot_is_already_waiting() {
              after the ring was exhausted. The producer spins in user space \
              with no yield point; on a tokio current_thread runtime this \
              monopolises the executor and stalls every other task — exactly \
-             the production wedge observed on raft-1 (2026-05-09 04:59:02Z)."
+             the production wedge observed 2026-05-09 04:59:02Z."
         );
     }
 }
@@ -3185,10 +3185,9 @@ async fn delta_gossip_updates_last_response_received_ms() {
 }
 
 /// DRY consolidation: the per-peer consecutive-timeout streak eviction
-/// mechanism now lives in icanact-remote (the raft wrapper supplies only the
+/// mechanism now lives in icanact-remote (the caller supplies only the
 /// classification). Evict only once the streak threshold is reached; a success
-/// resets it; a hard fault evicts immediately. (Ported from the shared-raft
-/// `RaftRpcDisconnectTracker` behaviour tests.)
+/// resets it; a hard fault evicts immediately.
 #[test]
 fn streak_timeout_evicts_only_at_threshold_and_resets_on_success() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));

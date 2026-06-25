@@ -71,8 +71,8 @@ pub struct ConnectionRecoveryPolicy {
     /// the domain classification (which errors count, which RPCs participate)
     /// and icanact-remote owns the per-peer counter, the threshold, the
     /// reset-on-success, and the instance-guarded teardown. It lets
-    /// latency-sensitive consumers (e.g. raft) ride over transient transport
-    /// blips instead of evicting on the first timeout.
+    /// latency-sensitive consumers ride over transient transport blips
+    /// instead of evicting on the first timeout.
     pub consecutive_timeout_threshold: u8,
 }
 
@@ -89,7 +89,7 @@ impl ConnectionRecoveryPolicy {
     /// Streak-based recovery: evict only after `threshold` consecutive
     /// consumer-classified streak-timeouts (hard transport faults still evict
     /// immediately). Rides over transient blips shorter than the streak. Used
-    /// by latency-sensitive consumers such as raft consensus.
+    /// by latency-sensitive consumers such as consensus layers.
     pub const fn streak_ask_timeout_recovery(threshold: u8) -> Self {
         Self {
             evict_peer_on_ask_timeout: false,

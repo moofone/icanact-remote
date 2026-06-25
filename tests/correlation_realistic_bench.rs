@@ -12,8 +12,8 @@
 //!     synthetic in-memory completion.
 //!
 //! Two scenarios are reported:
-//!   - `sequential` — exactly 1 ask in flight at any moment. Models a raft
-//!     leader's per-peer heartbeat path (one append_entries pending per
+//!   - `sequential` — exactly 1 ask in flight at any moment. Models a
+//!     leader's per-peer heartbeat path (one outbound ask pending per
 //!     follower at a time). Reports per-op latency and effective throughput.
 //!   - `concurrent` — `INFLIGHT` asks pipelined via `tokio::spawn`. Models
 //!     burst load. Reports max sustained throughput.
