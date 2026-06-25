@@ -12,6 +12,7 @@ use rustls::{
 };
 use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 pub const ALPN_ICANACT_V3: &[u8] = b"icanact-remote-v3";
 
@@ -210,45 +211,21 @@ impl ClientCertVerifier for NodeIdClientVerifier {
 }
 
 pub fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Result<NodeId, Error> {
-    let cert_bytes = cert.as_ref();
-    let ed25519_oid_pattern = &[0x06, 0x03, 0x2B, 0x65, 0x70];
-
-    let mut oid_positions = Vec::new();
-    for i in 0..cert_bytes.len().saturating_sub(ed25519_oid_pattern.len()) {
-        if &cert_bytes[i..i + ed25519_oid_pattern.len()] == ed25519_oid_pattern {
-            oid_positions.push(i);
-        }
-    }
-    if oid_positions.is_empty() {
+    let (_, parsed) = X509Certificate::from_der(cert.as_ref())
+        .map_err(|e| Error::General(format!("Invalid certificate DER: {e}")))?;
+    let public_key = parsed.public_key();
+    if public_key.algorithm.algorithm != x509_parser::oid_registry::OID_SIG_ED25519 {
         return Err(Error::General(
-            "Certificate does not contain Ed25519 OID".into(),
+            "Certificate does not contain Ed25519 public key".into(),
         ));
     }
-
-    let mut public_key_bytes = None;
-    for oid_index in oid_positions {
-        let search_start = oid_index + ed25519_oid_pattern.len();
-        for i in search_start..cert_bytes.len().saturating_sub(2).min(search_start + 10) {
-            if cert_bytes[i] == 0x03 {
-                let length = cert_bytes[i + 1] as usize;
-                if length == 33 {
-                    let key_start = i + 3;
-                    let key_end = key_start + 32;
-                    if key_end <= cert_bytes.len() {
-                        public_key_bytes = Some(&cert_bytes[key_start..key_end]);
-                        break;
-                    }
-                }
-            }
-        }
-        if public_key_bytes.is_some() {
-            break;
-        }
+    let key_bytes = public_key.subject_public_key.data.as_ref();
+    if key_bytes.len() != 32 {
+        return Err(Error::General(format!(
+            "Invalid Ed25519 public key length in certificate: expected 32, got {}",
+            key_bytes.len()
+        )));
     }
-
-    let key_bytes = public_key_bytes
-        .ok_or_else(|| Error::General("Could not find Ed25519 public key in certificate".into()))?;
-
     NodeId::from_bytes(key_bytes)
         .map_err(|e| Error::General(format!("Invalid public key in certificate: {}", e)))
 }

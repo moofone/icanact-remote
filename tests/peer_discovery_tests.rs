@@ -277,8 +277,10 @@ fn test_feature_flag_disabled_no_discovery() -> Result<(), DynError> {
         node_b.registry.add_peer(addr_a).await;
         connect_preferred(&node_a, &node_b).await?;
 
-        // Wait for gossip
-        sleep(Duration::from_secs(1)).await;
+        assert!(
+            wait_for_pair_lookup(&node_a, &node_b, Duration::from_secs(10)).await,
+            "A/B should connect before asserting discovery remains disabled"
+        );
 
         // discovered_peers should be 0 when peer discovery is disabled
         let stats_a = node_a.stats().await;
@@ -352,8 +354,14 @@ fn test_peer_list_ttl_cleanup() -> Result<(), DynError> {
             "stale peer should be tracked initially"
         );
 
-        sleep(Duration::from_secs(2)).await;
-        node.registry.prune_stale_peers().await;
+        assert!(
+            common::wait_for_condition(Duration::from_secs(5), || async {
+                node.registry.prune_stale_peers().await;
+                node.stats().await.discovered_peers == 0
+            })
+            .await,
+            "stale peer should be pruned after TTL"
+        );
         let stats_after = node.stats().await;
         assert_eq!(
             stats_after.discovered_peers, 0,
@@ -396,8 +404,13 @@ fn test_connect_on_demand_soft_cap() -> Result<(), DynError> {
             nodes.push(node);
         }
 
-        // Wait for connections
-        sleep(Duration::from_secs(2)).await;
+        assert!(
+            common::wait_for_condition(Duration::from_secs(10), || async {
+                node_a.stats().await.active_peers >= 2
+            })
+            .await,
+            "A should reach at least soft cap connections"
+        );
 
         // A should have at least 2 connections (soft cap), but may exceed
         let stats_a = node_a.stats().await;
@@ -437,8 +450,10 @@ fn test_known_peers_no_amnesia() -> Result<(), DynError> {
         node_b.registry.add_peer(addr_a).await;
         connect_preferred(&node_a, &node_b).await?;
 
-        // Wait for connection and discovery
-        sleep(Duration::from_secs(1)).await;
+        assert!(
+            wait_for_pair_lookup(&node_a, &node_b, Duration::from_secs(10)).await,
+            "A/B should be mutually reachable before disconnect"
+        );
 
         // B should have discovered A
         let stats_b_before = node_b.stats().await;
@@ -447,8 +462,14 @@ fn test_known_peers_no_amnesia() -> Result<(), DynError> {
         // Shutdown A (simulating disconnect)
         node_a.shutdown().await;
 
-        // Wait a bit
-        sleep(Duration::from_millis(500)).await;
+        assert!(
+            common::wait_for_condition(Duration::from_secs(5), || async {
+                node_b.lookup_peer(&node_a.registry.peer_id).await.is_ok()
+                    || node_b.stats().await.discovered_peers >= stats_b_before.discovered_peers
+            })
+            .await,
+            "B should retain knowledge of A after disconnect"
+        );
 
         // B should still remember A in known_peers (no amnesia)
         // The discovered_peers count may change due to cleanup,
@@ -521,8 +542,10 @@ fn test_peer_discovery_metrics() -> Result<(), DynError> {
         node_b.registry.add_peer(addr_a).await;
         connect_preferred(&node_a, &node_b).await?;
 
-        // Wait for gossip
-        sleep(Duration::from_secs(2)).await;
+        assert!(
+            wait_for_pair_lookup(&node_a, &node_b, Duration::from_secs(10)).await,
+            "A/B should connect before metrics assertion"
+        );
 
         // Check metrics are being tracked
         let stats = node_a.stats().await;
@@ -594,9 +617,6 @@ fn test_failure_recovery_backoff() -> Result<(), DynError> {
 
         // Kill node C (simulating failure)
         node_c.shutdown().await;
-
-        // Wait for failure detection
-        sleep(Duration::from_secs(1)).await;
 
         // A and B should still be connected; the deterministic connection owner
         // can be either side, so check pair lookup instead of A's local peer count.
@@ -812,8 +832,14 @@ fn test_partition_heal_behavior() -> Result<(), DynError> {
         connect_preferred(&node_a, &node_b).await?;
         connect_preferred(&node_c, &node_d).await?;
 
-        // Wait for partition formation
-        sleep(Duration::from_secs(1)).await;
+        assert!(
+            wait_for_pair_lookup(&node_a, &node_b, Duration::from_secs(10)).await,
+            "A/B partition edge should form before heal"
+        );
+        assert!(
+            wait_for_pair_lookup(&node_c, &node_d, Duration::from_secs(10)).await,
+            "C/D partition edge should form before heal"
+        );
 
         // Heal partition by connecting B to C
         node_b.registry.add_peer(addr_c).await;
@@ -901,8 +927,13 @@ fn test_known_peers_lru_capacity() -> Result<(), DynError> {
             node_a.registry.add_peer(fake_addr).await;
         }
 
-        // Wait for any processing
-        sleep(Duration::from_millis(200)).await;
+        assert!(
+            common::wait_for_condition(Duration::from_secs(5), || async {
+                node_a.stats().await.failed_peers >= 10
+            })
+            .await,
+            "manually added peers should be tracked"
+        );
 
         // The LRU cache should have evicted oldest entries
         // The active_peers count reflects the gossip_state.peers, not the LRU
