@@ -138,25 +138,25 @@ the asymmetric-seeding chaos drill (see below), the fix is accepted
 even if some lifecycle warn-logs remain — logs are diagnostic; job
 flow is the product.
 
-### Layer 3 — shared-raft/auth TLS identity acceptance
+### Layer 3 — shared-sync/auth TLS identity acceptance
 
 The same class of silent transport failure must be rejected on
-service-to-raft paths. A client-side generic timeout is not sufficient
-evidence when the raft side logs TLS accept failures.
+service-to-consensus paths. A client-side generic timeout is not sufficient
+evidence when the consensus side logs TLS accept failures.
 
 For any fix touching gossip, peer identity, TLS bootstrap, or service
 client routing, acceptance must include a two-sided correlation:
 
 1. Capture the service-client peer IDs, advertised bind addresses, and
    loaded peer/seed configuration from the auth binary at startup.
-2. Capture the raft-side accepted/rejected TLS peer evidence for the
+2. Capture the consensus-side accepted/rejected TLS peer evidence for the
    same client IP/time window.
-3. If raft logs `TLS accept failed` / `HandshakeFailure` while auth only
-   reports `cluster-api remote error: connection timeout`, the fix is
-   rejected until the mismatch is explained by exact peer ID, node ID,
-   certificate identity, or config state.
-4. After remediation, auth must complete lease RPCs against the raft
-   quorum without corresponding raft-side TLS `HandshakeFailure` logs
+3. If the consensus service logs `TLS accept failed` / `HandshakeFailure`
+   while auth only reports `cluster-api remote error: connection timeout`,
+   the fix is rejected until the mismatch is explained by exact peer ID,
+   node ID, certificate identity, or config state.
+4. After remediation, auth must complete lease RPCs against the consensus
+   quorum without corresponding consensus-side TLS `HandshakeFailure` logs
    from the service-client IPs.
 
 This prevents the transport from passing acceptance on a client-side
