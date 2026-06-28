@@ -649,7 +649,7 @@ pub struct UdpFailureDetectorConfig {
 impl Default for UdpFailureDetectorConfig {
     fn default() -> Self {
         Self {
-            health_probe_interval: Duration::from_millis(200),
+            health_probe_interval: Duration::from_millis(300),
             suspect_after_missed_probes: 2,
             terminate_after_missed_probes: 4,
             terminate_timeout: Duration::from_secs(3),
