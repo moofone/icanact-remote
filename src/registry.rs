@@ -22,7 +22,8 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    GossipConfig, GossipError, NodeId, PeerId, RegistrationPriority, RemoteActorLocation, Result,
+    GossipConfig, GossipError, NodeId, PeerHealthMode, PeerId, RegistrationPriority,
+    RemoteActorLocation, Result,
     connection_pool::ConnectionPool,
     current_timestamp,
     handshake::PeerCapabilities,
@@ -1377,9 +1378,9 @@ pub struct GossipState {
     pub shutdown: bool,
     /// Track which actors are connected from which peer address
     pub peer_to_actors: HashMap<SocketAddr, HashSet<String>>,
-    /// Track peer health reports from different observers
+    /// Legacy peer-health consensus reports from different observers.
     pub peer_health_reports: HashMap<SocketAddr, HashMap<SocketAddr, PeerHealthStatus>>,
-    /// Pending peer failures that need consensus
+    /// Legacy pending peer failures that need consensus.
     pub pending_peer_failures: HashMap<SocketAddr, PendingFailure>,
 
     // =================== Peer Discovery State ===================
@@ -1543,6 +1544,13 @@ pub struct StreamAssemblyResult {
 }
 
 impl<T: 'static> GossipRegistry<T> {
+    fn peer_health_consensus_enabled(&self) -> bool {
+        matches!(
+            self.config.peer_health_mode,
+            PeerHealthMode::LegacyConsensus
+        )
+    }
+
     fn duration_millis_u64(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
@@ -5561,6 +5569,14 @@ impl<T: 'static> GossipRegistry<T> {
             self.trigger_immediate_peer_gossip();
         }
 
+        if !self.peer_health_consensus_enabled() {
+            info!(
+                failed_peer = %failed_peer_addr,
+                "peer-health consensus disabled; retaining transport failure state for retry and TTL cleanup"
+            );
+            return Ok(());
+        }
+
         // Now start consensus process for actor invalidation.
         //
         // IMPORTANT: Do not spawn an untracked delayed task here. Under churn this can
@@ -5783,6 +5799,15 @@ impl<T: 'static> GossipRegistry<T> {
             );
         }
 
+        if !self.peer_health_consensus_enabled() {
+            info!(
+                failed_peer = %failed_peer_addr,
+                node_id = %failed_peer_id,
+                "peer-health consensus disabled; retaining transport failure state for retry and TTL cleanup"
+            );
+            return Ok(());
+        }
+
         // Now start consensus process for actor invalidation (same as address-based method).
         let should_send_query = {
             let mut gossip_state = self.gossip_state.lock().await;
@@ -5846,6 +5871,14 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Query other peers for their view of a potentially failed peer
     async fn query_peer_health_consensus(&self, target_peer: SocketAddr) -> Result<()> {
+        if !self.peer_health_consensus_enabled() {
+            debug!(
+                target_peer = %target_peer,
+                "peer-health consensus disabled; skipping peer-health query"
+            );
+            return Ok(());
+        }
+
         // Note: We may have a connection to this address but for a different peer (after reconnection)
         // This is OK - we query other peers to get consensus about the ORIGINAL peer
 
@@ -5908,6 +5941,10 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Check if we have consensus about any pending peer failures
     pub async fn check_peer_consensus(&self) {
+        if !self.peer_health_consensus_enabled() {
+            return;
+        }
+
         let current_time = current_timestamp();
 
         {
@@ -9086,6 +9123,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_only_peer_failure_does_not_start_health_consensus() {
+        let mut config = test_config();
+        config.peer_health_mode = PeerHealthMode::TransportOnly;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+
+        registry.add_peer(test_addr(8081)).await;
+
+        registry
+            .handle_peer_connection_failure(test_addr(8081))
+            .await
+            .unwrap();
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer = gossip_state.peers.get(&test_addr(8081)).unwrap();
+        assert_eq!(peer.failures, registry.config.max_peer_failures);
+        assert!(peer.last_failure_time.is_some());
+        assert!(gossip_state.pending_peer_failures.is_empty());
+        assert!(gossip_state.peer_health_reports.is_empty());
+    }
+
+    #[tokio::test]
     async fn peer_connection_failure_retains_remote_actors_for_reconnection() {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         let peer_addr = test_addr(8081);
@@ -10128,6 +10186,51 @@ mod tests {
         assert!(
             !gossip_state
                 .pending_peer_failures
+                .contains_key(&test_addr(8081))
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_only_check_peer_consensus_is_noop() {
+        let mut config = test_config();
+        config.peer_health_mode = PeerHealthMode::TransportOnly;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.pending_peer_failures.insert(
+                test_addr(8081),
+                PendingFailure {
+                    first_detected: current_timestamp() - 10,
+                    consensus_deadline: current_timestamp() - 5,
+                    query_sent: true,
+                },
+            );
+            let mut reports = HashMap::new();
+            reports.insert(
+                test_addr(8080),
+                PeerHealthStatus {
+                    is_alive: false,
+                    last_contact: current_timestamp(),
+                    failure_count: 1,
+                },
+            );
+            gossip_state
+                .peer_health_reports
+                .insert(test_addr(8081), reports);
+        }
+
+        registry.check_peer_consensus().await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state
+                .pending_peer_failures
+                .contains_key(&test_addr(8081))
+        );
+        assert!(
+            gossip_state
+                .peer_health_reports
                 .contains_key(&test_addr(8081))
         );
     }
