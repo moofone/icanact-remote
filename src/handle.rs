@@ -630,6 +630,11 @@ impl<T> GossipClient<T> {
         }
     }
 
+    /// Peer-health mode configured for this registry.
+    pub fn peer_health_mode(&self) -> crate::PeerHealthMode {
+        self.registry.config.peer_health_mode
+    }
+
     pub fn lookup_connected_connection(
         &self,
         peer_id: &crate::PeerId,
