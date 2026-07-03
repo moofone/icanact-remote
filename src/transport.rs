@@ -1,6 +1,11 @@
-use std::{fmt::Debug, io, net::SocketAddr, sync::Arc, sync::OnceLock};
+#[cfg(feature = "unstable-udp-transport")]
+use std::fmt::Debug;
+#[cfg(feature = "unstable-udp-transport")]
+use std::sync::OnceLock;
+use std::{io, net::SocketAddr, sync::Arc};
 
 use futures::future::BoxFuture;
+#[cfg(feature = "unstable-udp-transport")]
 use tokio::net as tokio_net;
 
 use crate::{
@@ -68,6 +73,7 @@ pub trait TransportStack {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportWireKind {
     TcpStream,
+    #[cfg(feature = "unstable-udp-transport")]
     UdpDatagram,
 }
 
@@ -76,6 +82,7 @@ pub struct TransportBootstrapArtifacts {
     pub wire_kind: TransportWireKind,
     pub bind_addr: SocketAddr,
     pub tcp_listener: Option<tokio::net::TcpListener>,
+    #[cfg(feature = "unstable-udp-transport")]
     pub udp_socket: Option<Arc<tokio_net::UdpSocket>>,
 }
 
@@ -113,6 +120,7 @@ pub trait TransportServer {
 }
 
 /// Writer contract for native datagram send paths.
+#[cfg(feature = "unstable-udp-transport")]
 pub trait TransportDatagramWriter {
     fn send_bytes(&self, datagram: bytes::Bytes) -> BoxFuture<'_, Result<()>>;
 
@@ -165,11 +173,14 @@ pub trait TransportDatagramWriter {
     fn try_send_chunks(&self, chunks: &[bytes::Bytes]) -> Result<()>;
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 pub trait TransportDatagramWriterDyn: TransportDatagramWriter + Debug + Send + Sync {}
 
+#[cfg(feature = "unstable-udp-transport")]
 impl<T> TransportDatagramWriterDyn for T where T: TransportDatagramWriter + Debug + Send + Sync {}
 
 /// Runtime contract for direct datagram send paths.
+#[cfg(feature = "unstable-udp-transport")]
 pub trait TransportDatagramRuntime {
     type Writer: TransportDatagramWriter + Clone + Debug + Send + Sync + 'static;
 
@@ -193,12 +204,16 @@ pub trait TransportDatagramRuntime {
     ) -> Result<()>;
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 type MakeWriterFn =
     fn(Arc<tokio_net::UdpSocket>, SocketAddr, usize) -> Arc<dyn TransportDatagramWriterDyn>;
+#[cfg(feature = "unstable-udp-transport")]
 type TrySendBytesToAddrFn = fn(&tokio_net::UdpSocket, SocketAddr, bytes::Bytes) -> Result<()>;
+#[cfg(feature = "unstable-udp-transport")]
 type TrySendPartsToAddrFn =
     fn(&tokio_net::UdpSocket, SocketAddr, bytes::Bytes, bytes::Bytes) -> Result<()>;
 
+#[cfg(feature = "unstable-udp-transport")]
 #[derive(Clone, Copy)]
 struct DatagramRuntimeHooks {
     make_writer: MakeWriterFn,
@@ -206,17 +221,21 @@ struct DatagramRuntimeHooks {
     try_send_parts_to_addr: TrySendPartsToAddrFn,
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 static DATAGRAM_RUNTIME_HOOKS: OnceLock<DatagramRuntimeHooks> = OnceLock::new();
 
+#[cfg(feature = "unstable-udp-transport")]
 fn datagram_runtime_not_installed_error() -> crate::GossipError {
     crate::GossipError::InvalidConfig(
         "UDP/datagram runtime hooks are not installed for this process".to_string(),
     )
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 #[derive(Debug, Clone, Copy, Default)]
 struct UnconfiguredDatagramWriter;
 
+#[cfg(feature = "unstable-udp-transport")]
 impl TransportDatagramWriter for UnconfiguredDatagramWriter {
     fn send_bytes(&self, _datagram: bytes::Bytes) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { Err(datagram_runtime_not_installed_error()) })
@@ -293,6 +312,7 @@ impl TransportDatagramWriter for UnconfiguredDatagramWriter {
     }
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 fn make_writer_for_runtime<R: TransportDatagramRuntime>(
     socket: Arc<tokio_net::UdpSocket>,
     peer_addr: SocketAddr,
@@ -301,6 +321,7 @@ fn make_writer_for_runtime<R: TransportDatagramRuntime>(
     Arc::new(R::make_writer(socket, peer_addr, queue_capacity))
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 fn try_send_bytes_to_addr_for_runtime<R: TransportDatagramRuntime>(
     socket: &tokio_net::UdpSocket,
     addr: SocketAddr,
@@ -309,6 +330,7 @@ fn try_send_bytes_to_addr_for_runtime<R: TransportDatagramRuntime>(
     R::try_send_bytes_to_addr(socket, addr, data)
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 fn try_send_parts_to_addr_for_runtime<R: TransportDatagramRuntime>(
     socket: &tokio_net::UdpSocket,
     addr: SocketAddr,
@@ -318,6 +340,7 @@ fn try_send_parts_to_addr_for_runtime<R: TransportDatagramRuntime>(
     R::try_send_parts_to_addr(socket, addr, header, payload)
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 pub fn install_datagram_runtime<R: TransportDatagramRuntime>() {
     let _ = DATAGRAM_RUNTIME_HOOKS.set(DatagramRuntimeHooks {
         make_writer: make_writer_for_runtime::<R>,
@@ -326,6 +349,7 @@ pub fn install_datagram_runtime<R: TransportDatagramRuntime>() {
     });
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 pub(crate) fn make_datagram_writer(
     socket: Arc<tokio_net::UdpSocket>,
     peer_addr: SocketAddr,
@@ -338,6 +362,7 @@ pub(crate) fn make_datagram_writer(
     }
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 pub(crate) fn try_send_bytes_to_addr(
     socket: &tokio_net::UdpSocket,
     addr: SocketAddr,
@@ -350,6 +375,7 @@ pub(crate) fn try_send_bytes_to_addr(
     }
 }
 
+#[cfg(feature = "unstable-udp-transport")]
 pub(crate) fn try_send_parts_to_addr(
     socket: &tokio_net::UdpSocket,
     addr: SocketAddr,

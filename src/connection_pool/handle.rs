@@ -19,7 +19,10 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
         f.debug_struct("ConnectionHandle")
             .field("addr", &self.addr)
             .field("stream_handle", &self.stream_handle)
-            .field("udp_socket", &self.udp_socket.as_ref().map(|_| "configured"))
+            .field(
+                "udp_socket",
+                &self.udp_socket.as_ref().map(|_| "configured"),
+            )
             .field("udp_writer", &self.udp_writer)
             .field("schema_hash", &self.schema_hash)
             .finish()
@@ -89,6 +92,7 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    #[cfg(feature = "unstable-udp-transport")]
     fn new_udp(
         addr: SocketAddr,
         udp_socket: Arc<UdpSocket>,
@@ -105,6 +109,34 @@ impl<T> ConnectionHandle<T> {
                 addr,
                 write_queue_capacity,
             )),
+            schema_hash,
+            correlation,
+            _marker: PhantomData,
+        }
+    }
+
+    // `unstable-udp-transport` off: this constructor is unreachable at runtime
+    // because `ConnectionPool::is_udp_transport_enabled()` is hard-wired to
+    // `false` in this build (see pool_connect.rs), matching `enable_udp()`'s
+    // permanent fail-closed behavior. It is kept, rather than also gating its
+    // (few) call sites, so the connection-pool wiring above it does not need
+    // to be duplicated per-feature; it must still type-check, so it fabricates
+    // a writer-less handle identical in shape to any other handle with no
+    // usable writer path (every write method already has a `NotConnected`
+    // fallback for that case).
+    #[cfg(not(feature = "unstable-udp-transport"))]
+    fn new_udp(
+        addr: SocketAddr,
+        _udp_socket: Arc<UdpSocket>,
+        _write_queue_capacity: usize,
+        schema_hash: Option<u64>,
+        correlation: Arc<CorrelationTracker>,
+    ) -> Self {
+        Self {
+            addr,
+            stream_handle: None,
+            udp_socket: None,
+            udp_writer: None,
             schema_hash,
             correlation,
             _marker: PhantomData,
