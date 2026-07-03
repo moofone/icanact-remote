@@ -16,7 +16,7 @@ use std::{
     collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc, time::Duration, time::Instant,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinHandle};
 #[cfg(feature = "trace-correlation")]
@@ -43,7 +43,6 @@ include!("handle.rs");
 include!("pool_connect.rs");
 
 pub(crate) mod transport_stream;
-pub(crate) mod transport_udp;
 
 #[cfg(test)]
 mod tests;

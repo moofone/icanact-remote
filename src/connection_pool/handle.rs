@@ -4,10 +4,6 @@ pub struct ConnectionHandle<T = ()> {
     pub addr: SocketAddr,
     // Stream-based writer path (TCP/TLS/Noise/QUIC stream transports).
     stream_handle: Option<Arc<LockFreeStreamHandle>>,
-    // Concrete UDP socket for direct non-queued datagram sends.
-    udp_socket: Option<Arc<UdpSocket>>,
-    // Native UDP datagram writer path.
-    udp_writer: Option<UdpTransportWriter>,
     schema_hash: Option<u64>,
     // Correlation tracker for ask/response
     correlation: Arc<CorrelationTracker>,
@@ -19,11 +15,6 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
         f.debug_struct("ConnectionHandle")
             .field("addr", &self.addr)
             .field("stream_handle", &self.stream_handle)
-            .field(
-                "udp_socket",
-                &self.udp_socket.as_ref().map(|_| "configured"),
-            )
-            .field("udp_writer", &self.udp_writer)
             .field("schema_hash", &self.schema_hash)
             .finish()
     }
@@ -84,59 +75,6 @@ impl<T> ConnectionHandle<T> {
         Self {
             addr,
             stream_handle: Some(stream_handle),
-            udp_socket: None,
-            udp_writer: None,
-            schema_hash,
-            correlation,
-            _marker: PhantomData,
-        }
-    }
-
-    #[cfg(feature = "unstable-udp-transport")]
-    fn new_udp(
-        addr: SocketAddr,
-        udp_socket: Arc<UdpSocket>,
-        write_queue_capacity: usize,
-        schema_hash: Option<u64>,
-        correlation: Arc<CorrelationTracker>,
-    ) -> Self {
-        Self {
-            addr,
-            stream_handle: None,
-            udp_socket: Some(Arc::clone(&udp_socket)),
-            udp_writer: Some(crate::transport::make_datagram_writer(
-                udp_socket,
-                addr,
-                write_queue_capacity,
-            )),
-            schema_hash,
-            correlation,
-            _marker: PhantomData,
-        }
-    }
-
-    // `unstable-udp-transport` off: this constructor is unreachable at runtime
-    // because `ConnectionPool::is_udp_transport_enabled()` is hard-wired to
-    // `false` in this build (see pool_connect.rs), matching `enable_udp()`'s
-    // permanent fail-closed behavior. It is kept, rather than also gating its
-    // (few) call sites, so the connection-pool wiring above it does not need
-    // to be duplicated per-feature; it must still type-check, so it fabricates
-    // a writer-less handle identical in shape to any other handle with no
-    // usable writer path (every write method already has a `NotConnected`
-    // fallback for that case).
-    #[cfg(not(feature = "unstable-udp-transport"))]
-    fn new_udp(
-        addr: SocketAddr,
-        _udp_socket: Arc<UdpSocket>,
-        _write_queue_capacity: usize,
-        schema_hash: Option<u64>,
-        correlation: Arc<CorrelationTracker>,
-    ) -> Self {
-        Self {
-            addr,
-            stream_handle: None,
-            udp_socket: None,
-            udp_writer: None,
             schema_hash,
             correlation,
             _marker: PhantomData,
@@ -153,16 +91,9 @@ impl<T> ConnectionHandle<T> {
         })
     }
 
-    #[inline]
-    fn udp_writer(&self) -> Option<&UdpTransportWriter> {
-        self.udp_writer.as_ref()
-    }
-
     async fn write_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_bytes_control(data).await
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.send_bytes(data).await
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -181,10 +112,6 @@ impl<T> ConnectionHandle<T> {
             stream_handle
                 .write_header_and_payload_control_inline(header, header_len, payload)
                 .await
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer
-                .send_header_and_payload16(header, header_len, payload)
-                .await
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -202,8 +129,6 @@ impl<T> ConnectionHandle<T> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle
                 .write_header_and_payload_control_inline_nonblocking(header, header_len, payload)
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.try_send_header_and_payload16(header, header_len, payload)
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -221,8 +146,6 @@ impl<T> ConnectionHandle<T> {
             stream_handle
                 .write_header_and_payload_control_inline32(header, payload)
                 .await
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.send_header_and_payload32(header, payload).await
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -238,8 +161,6 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_header_and_payload_control_inline32_nonblocking(header, payload)
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.try_send_header_and_payload32(header, payload)
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -258,10 +179,6 @@ impl<T> ConnectionHandle<T> {
             stream_handle
                 .write_header_and_payload_ask_inline(header, header_len, payload)
                 .await
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer
-                .send_header_and_payload16(header, header_len, payload)
-                .await
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -279,8 +196,6 @@ impl<T> ConnectionHandle<T> {
             stream_handle
                 .write_header_and_payload_ask_inline32(header, payload)
                 .await
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.send_header_and_payload32(header, payload).await
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -292,14 +207,6 @@ impl<T> ConnectionHandle<T> {
     async fn write_direct_ask_inline(&self, header: [u8; 16], payload: bytes::Bytes) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_direct_ask_inline(header, payload).await
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer
-                .send_header_and_payload16(
-                    header,
-                    crate::framing::DIRECT_ASK_FRAME_HEADER_LEN as u8,
-                    payload,
-                )
-                .await
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -405,12 +312,6 @@ impl<T> ConnectionHandle<T> {
                 crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
                 payload,
             )
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.try_send_header_and_payload16(
-                header,
-                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
-                payload,
-            )
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -436,41 +337,12 @@ impl<T> ConnectionHandle<T> {
                 prefix_len,
                 payload,
             )
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.try_send_header_prefix_pooled(
-                header,
-                crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
-                prefix,
-                payload,
-            )
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 format!("connection {} has no writer path", self.addr),
             )))
         }
-    }
-
-    /// Try to send a complete UDP datagram that already contains the outer frame header.
-    pub fn try_send_pooled_datagram(&self, payload: crate::typed::PooledPayload) -> Result<()> {
-        if let Some(socket) = self.udp_socket.as_ref() {
-            return socket
-                .try_send_to(payload.chunk(), self.addr)
-                .map(|_| ())
-                .map_err(GossipError::Network);
-        }
-        if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.try_send_pooled_datagram(payload)
-        } else {
-            Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("connection {} has no UDP writer path", self.addr),
-            )))
-        }
-    }
-
-    pub fn supports_pooled_datagram(&self) -> bool {
-        self.udp_socket.is_some() || self.udp_writer().is_some()
     }
 
     /// Send a response using the inline write queue (never streaming).
@@ -550,20 +422,10 @@ impl<T> ConnectionHandle<T> {
                 .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
                 .await
         } else {
-            let header = framing::write_ask_response_header(
-                crate::MessageType::Response,
-                correlation_id,
-                payload_len,
-            );
-            self.udp_writer()
-                .ok_or_else(|| {
-                    GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::NotConnected,
-                        format!("connection {} has no writer path", self.addr),
-                    ))
-                })?
-                .send_header_prefix_pooled(header, 16, prefix, payload)
-                .await
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no writer path", self.addr),
+            )))
         }
     }
 
@@ -586,7 +448,7 @@ impl<T> ConnectionHandle<T> {
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "stream_large_message is not supported on UDP datagram transport",
+                "stream_large_message requires a stream-based connection",
             )))
         }
     }
@@ -599,7 +461,7 @@ impl<T> ConnectionHandle<T> {
         self.stream_handle
             .as_ref()
             .map(|h| h.streaming_threshold())
-            .unwrap_or(UDP_MAX_DATAGRAM_SIZE.saturating_sub(crate::framing::LENGTH_PREFIX_LEN))
+            .unwrap_or(STREAMING_THRESHOLD)
     }
 
     /// Tell using owned bytes to avoid payload copies.
@@ -861,15 +723,10 @@ impl<T> ConnectionHandle<T> {
                 .write_pooled_control_inline(header, 4, prefix, prefix_len, payload)
                 .await
         } else {
-            self.udp_writer()
-                .ok_or_else(|| {
-                    GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::NotConnected,
-                        format!("connection {} has no writer path", self.addr),
-                    ))
-                })?
-                .send_header_prefix_pooled(header, 4, prefix, payload)
-                .await
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no writer path", self.addr),
+            )))
         }
     }
 
@@ -1182,7 +1039,7 @@ impl<T> ConnectionHandle<T> {
         let stream_handle = self.stream_handle().map_err(|_| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "ask_streaming_bytes is not supported on UDP datagram transport",
+                "ask_streaming_bytes requires a stream-based connection",
             ))
         })?;
         let chunk_size = stream_handle.max_stream_chunk_size()?;
@@ -1488,7 +1345,7 @@ impl<T> ConnectionHandle<T> {
         let stream_handle = self.stream_handle().map_err(|_| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "stream_send is not supported on UDP datagram transport",
+                "stream_send requires a stream-based connection",
             ))
         })?;
         // Serialize the data using rkyv for maximum performance
@@ -1533,7 +1390,7 @@ impl<T> ConnectionHandle<T> {
         let stream_handle = self.stream_handle().map_err(|_| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "stream_send_batch is not supported on UDP datagram transport",
+                "stream_send_batch requires a stream-based connection",
             ))
         })?;
         if batch.is_empty() {
@@ -1573,7 +1430,7 @@ impl<T> ConnectionHandle<T> {
     pub fn get_lock_free_stream(&self) -> &Arc<LockFreeStreamHandle> {
         self.stream_handle
             .as_ref()
-            .expect("lock-free stream handle is unavailable for UDP transport")
+            .expect("lock-free stream handle is unavailable for this connection")
     }
 
     /// Zero-copy vectored write for header + payload in single syscall
@@ -1585,8 +1442,6 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_bytes_vectored(header, payload).await
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.send_bytes_vectored(header, payload).await
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -1599,8 +1454,6 @@ impl<T> ConnectionHandle<T> {
     pub fn write_owned_chunks(&self, chunks: Vec<bytes::Bytes>) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_owned_chunks(chunks)
-        } else if let Some(udp_writer) = self.udp_writer() {
-            udp_writer.try_send_chunks(chunks.as_slice())
         } else {
             Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,

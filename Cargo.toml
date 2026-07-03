@@ -13,14 +13,6 @@ strict-zero-copy = []
 # feature lets production strip it entirely. Bonus optimisation discovered
 # during the slot-leak forensic investigation 2026-05-09.
 trace-correlation = []
-# UDP datagram transport machinery (GossipRegistry::enable_udp and its
-# supporting writer/runtime plumbing). Off by default: enable_udp() always
-# fail-closes because per-datagram peer authentication (signature/MAC +
-# anti-replay) is not implemented, so the entire code path is dead weight
-# for default consumers and previously exposed `udp_mode` as a `pub` field
-# that let external code bypass the fail-closed check. Gating it removes
-# that bypass and the unreachable surface from default builds.
-unstable-udp-transport = []
 
 [dependencies]
 crossbeam-queue = "0.3"
@@ -83,7 +75,3 @@ harness = false
 name = "pubsub_job_pattern"
 harness = false
 
-[[test]]
-name = "udp_ask_e2e"
-path = "tests/udp_ask_e2e.rs"
-required-features = ["unstable-udp-transport"]

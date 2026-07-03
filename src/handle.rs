@@ -1,12 +1,12 @@
 use std::marker::PhantomData;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::aligned::{AlignedBuffer, AlignedBytes};
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
     io::AsyncReadExt,
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream},
     time::{Instant, interval},
 };
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -154,7 +154,7 @@ impl<T> GossipRegistryHandle<T> {
         }
         transport_stack.prepare_config(&secret_key, &mut config)?;
 
-        let (listener, udp_socket, actual_bind_addr) = match transport_stack.wire_kind() {
+        let (listener, actual_bind_addr) = match transport_stack.wire_kind() {
             TransportWireKind::TcpStream => {
                 // Create the TCP listener first to get the actual bound address.
                 //
@@ -162,13 +162,7 @@ impl<T> GossipRegistryHandle<T> {
                 // port without spurious `AddrInUse` (common on macOS due to TIME_WAIT).
                 let listener = bind_with_reuseaddr(bind_addr)?;
                 let actual_bind_addr = listener.local_addr()?;
-                (Some(listener), None, actual_bind_addr)
-            }
-            #[cfg(feature = "unstable-udp-transport")]
-            TransportWireKind::UdpDatagram => {
-                let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
-                let actual_bind_addr = socket.local_addr()?;
-                (None, Some(socket), actual_bind_addr)
+                (listener, actual_bind_addr)
             }
         };
 
@@ -183,31 +177,13 @@ impl<T> GossipRegistryHandle<T> {
             pool.set_registry(registry.clone());
         }
 
-        if let Some(socket) = udp_socket.clone() {
-            registry.connection_pool.set_udp_socket(socket);
-        }
-
         // Start the server with the selected wire transport
         let server_registry = registry.clone();
-        let server_handle = match (listener, udp_socket) {
-            (Some(listener), None) => tokio::spawn(async move {
-                if let Err(err) = start_gossip_server_with_listener(server_registry, listener).await
-                {
-                    error!(error = %err, "server error");
-                }
-            }),
-            (None, Some(socket)) => tokio::spawn(async move {
-                if let Err(err) = start_gossip_server_with_udp_socket(server_registry, socket).await
-                {
-                    error!(error = %err, "udp server error");
-                }
-            }),
-            _ => {
-                return Err(GossipError::Network(std::io::Error::other(
-                    "invalid transport bootstrap wiring",
-                )));
+        let server_handle = tokio::spawn(async move {
+            if let Err(err) = start_gossip_server_with_listener(server_registry, listener).await {
+                error!(error = %err, "server error");
             }
-        };
+        });
 
         // Start the gossip timer
         let timer_registry = registry.clone();
@@ -784,8 +760,6 @@ mod tests {
     #[derive(Debug, Clone, Copy, Default)]
     struct TestTlsBootstrap;
     struct TestNoopBootstrap;
-    #[cfg(feature = "unstable-udp-transport")]
-    struct TestUdpBootstrap;
     struct TestRecoveringBootstrap;
 
     impl RegistryTransportBootstrap for TestTlsBootstrap {
@@ -855,33 +829,6 @@ mod tests {
             _secret_key: crate::SecretKey,
         ) -> Result<()> {
             Ok(())
-        }
-    }
-
-    #[cfg(feature = "unstable-udp-transport")]
-    impl RegistryTransportBootstrap for TestUdpBootstrap {
-        fn stack_name(&self) -> &'static str {
-            "test+udp"
-        }
-
-        fn wire_kind(&self) -> TransportWireKind {
-            TransportWireKind::UdpDatagram
-        }
-
-        fn prepare_config(
-            &self,
-            secret_key: &crate::SecretKey,
-            config: &mut GossipConfig,
-        ) -> Result<()> {
-            TestNoopBootstrap.prepare_config(secret_key, config)
-        }
-
-        fn configure_registry(
-            &self,
-            registry: &mut crate::registry::GossipRegistry,
-            secret_key: crate::SecretKey,
-        ) -> Result<()> {
-            registry.enable_udp(secret_key)
         }
     }
 
@@ -1298,66 +1245,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "unstable-udp-transport")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_datagram_transport_is_disabled_until_datagrams_authenticate_peer_identity() {
-        let keypair = KeyPair::new_for_testing("udp-enabled");
-        let mut config = test_cfg();
-        config.key_pair = Some(keypair.clone());
-
-        let result = GossipRegistryHandle::new_with_transport_stack(
-            "127.0.0.1:0".parse().unwrap(),
-            keypair.to_secret_key(),
-            Some(config),
-            TestUdpBootstrap,
-        )
-        .await;
-        let err = match result {
-            Ok(handle) => {
-                handle.shutdown_and_wait().await;
-                panic!(
-                    "UDP datagrams must stay disabled until per-datagram peer identity is authenticated"
-                );
-            }
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("UDP datagram transport is disabled"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[cfg(feature = "unstable-udp-transport")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_datagram_transport_rejects_mismatched_keypair() {
-        let keypair = KeyPair::new_for_testing("udp-mismatch-config");
-        let mut config = test_cfg();
-        config.key_pair = Some(keypair);
-        let secret_key = KeyPair::new_for_testing("udp-mismatch-secret").to_secret_key();
-
-        let err = GossipRegistryHandle::new_with_transport_stack(
-            "127.0.0.1:0".parse().unwrap(),
-            secret_key,
-            Some(config),
-            TestUdpBootstrap,
-        )
-        .await;
-        let err = match err {
-            Ok(handle) => {
-                handle.shutdown_and_wait().await;
-                panic!("UDP datagram transport must reject mismatched keypairs");
-            }
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string().contains("does not match"),
-            "unexpected error: {err}"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn new_with_transport_stack_applies_connection_recovery_policy() -> crate::Result<()> {
         let keypair = KeyPair::new_for_testing("stack-recovery");
@@ -1558,31 +1445,6 @@ pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> 
     TcpListener::from_std(std_listener).map_err(GossipError::Network)
 }
 
-#[allow(dead_code)]
-pub(crate) fn bind_udp_with_reuseaddr(bind_addr: SocketAddr) -> Result<UdpSocket> {
-    use socket2::{Domain, Socket, Type};
-
-    let domain = match bind_addr {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
-
-    let socket = Socket::new(domain, Type::DGRAM, None).map_err(GossipError::Network)?;
-    let _ = socket.set_reuse_address(true);
-    let udp_buf_size = std::env::var("ICANACT_UDP_SOCKET_BUFFER_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8 * 1024 * 1024);
-    let _ = socket.set_recv_buffer_size(udp_buf_size);
-    let _ = socket.set_send_buffer_size(udp_buf_size);
-    socket
-        .bind(&bind_addr.into())
-        .map_err(GossipError::Network)?;
-    socket.set_nonblocking(true).map_err(GossipError::Network)?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    UdpSocket::from_std(std_socket).map_err(GossipError::Network)
-}
-
 /// Start the gossip registry server with an existing listener
 #[instrument(skip(registry, listener))]
 async fn start_gossip_server_with_listener(
@@ -1641,283 +1503,6 @@ async fn start_gossip_server_with_listener(
     }
 }
 
-/// Parse and dispatch a UDP datagram using the shared message parser/protocol pipeline.
-///
-/// A single UDP datagram may contain one or more framed messages. This path keeps UDP receive
-/// native (no channel bridge) while reusing the same parser/dispatcher logic
-/// used by the other transport stacks.
-struct UdpPeerContext {
-    addr: SocketAddr,
-    connection: Arc<crate::connection_pool::LockFreeConnection>,
-    authenticated_peer_id: crate::PeerId,
-}
-
-fn udp_gossip_sender_peer_id(datagram: &[u8], datagram_len: usize) -> Option<crate::PeerId> {
-    if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
-        return None;
-    }
-    let msg_len = u32::from_be_bytes(
-        datagram[..crate::framing::LENGTH_PREFIX_LEN]
-            .try_into()
-            .ok()?,
-    ) as usize;
-    let frame_len = crate::framing::LENGTH_PREFIX_LEN.checked_add(msg_len)?;
-    if frame_len > datagram_len || msg_len < crate::framing::GOSSIP_HEADER_LEN {
-        return None;
-    }
-    let msg_data = &datagram[crate::framing::LENGTH_PREFIX_LEN..frame_len];
-    if msg_data.first().copied() != Some(crate::MessageType::Gossip as u8) {
-        return None;
-    }
-    let payload_offset = crate::framing::GOSSIP_HEADER_LEN;
-    let payload = msg_data.get(payload_offset..)?;
-    let msg = decode_registry_message(payload).ok()?;
-    match msg {
-        crate::registry::RegistryMessage::DeltaGossip { delta, .. }
-        | crate::registry::RegistryMessage::DeltaGossipResponse { delta, .. } => {
-            Some(delta.sender_peer_id)
-        }
-        crate::registry::RegistryMessage::FullSyncRequest { sender_peer_id, .. }
-        | crate::registry::RegistryMessage::FullSync { sender_peer_id, .. }
-        | crate::registry::RegistryMessage::FullSyncResponse { sender_peer_id, .. } => {
-            Some(sender_peer_id)
-        }
-        crate::registry::RegistryMessage::PeerHealthReport { reporter, .. } => Some(reporter),
-        crate::registry::RegistryMessage::PeerHealthQuery { sender, .. } => Some(sender),
-        crate::registry::RegistryMessage::ImmediateAck { .. }
-        | crate::registry::RegistryMessage::ActorMessage { .. }
-        | crate::registry::RegistryMessage::PeerListGossip { .. } => None,
-    }
-}
-
-async fn process_udp_datagram_native(
-    registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
-    mut datagram: crate::PooledAlignedBuffer,
-    datagram_len: usize,
-    streaming_states: &mut HashMap<SocketAddr, crate::protocol::StreamingState>,
-    peer_context: &mut Option<UdpPeerContext>,
-) -> Result<()> {
-    if datagram_len < crate::framing::LENGTH_PREFIX_LEN {
-        return Ok(());
-    }
-
-    let cached_peer_ready = peer_context
-        .as_ref()
-        .map(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
-        .unwrap_or(false);
-    if !cached_peer_ready {
-        if registry
-            .connection_pool
-            .get_peer_id_by_addr(&peer_addr)
-            .is_none()
-            && let Some(peer_id) = udp_gossip_sender_peer_id(datagram.as_ref(), datagram_len)
-        {
-            registry
-                .connection_pool
-                .add_addr_to_peer_id(peer_addr, peer_id);
-        }
-        let mut response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
-        if response_connection.is_none() {
-            registry
-                .connection_pool
-                .ensure_udp_peer_connection(peer_addr)
-                .await?;
-            response_connection = registry.connection_pool.get_connection_by_addr(&peer_addr);
-        }
-        let response_connection = response_connection.ok_or_else(|| {
-            GossipError::InvalidConfig(format!(
-                "UDP datagram from {peer_addr} has no established connection"
-            ))
-        })?;
-        let authenticated_peer_id = response_connection
-            .embedded_peer_id
-            .clone()
-            .or_else(|| registry.connection_pool.get_peer_id_by_addr(&peer_addr))
-            .ok_or_else(|| {
-                GossipError::InvalidConfig(format!(
-                    "UDP datagram from {peer_addr} has no established peer association"
-                ))
-            })?;
-        *peer_context = Some(UdpPeerContext {
-            addr: peer_addr,
-            connection: response_connection,
-            authenticated_peer_id,
-        });
-    }
-    let msg_len = u32::from_be_bytes(
-        datagram.as_ref()[..crate::framing::LENGTH_PREFIX_LEN]
-            .try_into()
-            .expect("slice length checked"),
-    ) as usize;
-    if msg_len > registry.config.max_message_size {
-        return Err(GossipError::MessageTooLarge {
-            size: msg_len,
-            max: registry.config.max_message_size,
-        });
-    }
-    let frame_len = crate::framing::LENGTH_PREFIX_LEN + msg_len;
-
-    // Common case: one framed message per datagram.
-    if frame_len == datagram_len {
-        if msg_len >= crate::framing::PUBSUB_HEADER_LEN {
-            let msg_data = &datagram.as_ref()
-                [crate::framing::LENGTH_PREFIX_LEN..crate::framing::LENGTH_PREFIX_LEN + msg_len];
-            if msg_data[0] == crate::MessageType::PubSub as u8 {
-                let payload_len = msg_len - crate::framing::PUBSUB_HEADER_LEN;
-                let payload_offset =
-                    crate::framing::LENGTH_PREFIX_LEN + crate::framing::PUBSUB_HEADER_LEN;
-                let payload = &datagram.as_ref()[payload_offset..payload_offset + payload_len];
-                let authenticated_peer_id = &peer_context
-                    .as_ref()
-                    .expect("UDP peer context is initialized before parsing datagram")
-                    .authenticated_peer_id;
-                if let Some(handler) = registry.pubsub_ingress_handler.load().as_ref() {
-                    if let Err(e) = handler.handle_borrowed(authenticated_peer_id, payload) {
-                        warn!(peer = %peer_addr, error = %e, "Failed to process UDP PubSub frame");
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        let peer_context = peer_context
-            .as_ref()
-            .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
-            .ok_or_else(|| {
-                GossipError::InvalidConfig(format!(
-                    "UDP datagram from {peer_addr} has no established peer context"
-                ))
-            })?;
-        let response_connection = Arc::clone(&peer_context.connection);
-        let authenticated_peer_id = peer_context.authenticated_peer_id.clone();
-        let response_correlation = response_connection.correlation.clone();
-        datagram.truncate(frame_len);
-        let parsed = parse_message_from_pooled_buffer(datagram, msg_len)?;
-        let streaming_state = streaming_states.entry(peer_addr).or_default();
-        crate::protocol::process_read_result(
-            parsed,
-            streaming_state,
-            registry,
-            peer_addr,
-            response_correlation.as_deref(),
-            Some(&response_connection),
-            Some(&authenticated_peer_id),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
-    let datagram_bytes = Bytes::from_owner(datagram);
-    let datagram_slice = &datagram_bytes.as_ref()[..datagram_len];
-    let mut offset = 0usize;
-    let peer_context = peer_context
-        .as_ref()
-        .filter(|ctx| ctx.addr == peer_addr && ctx.connection.is_connected())
-        .ok_or_else(|| {
-            GossipError::InvalidConfig(format!(
-                "UDP datagram from {peer_addr} has no established peer context"
-            ))
-        })?;
-    let response_connection = Arc::clone(&peer_context.connection);
-    let authenticated_peer_id = peer_context.authenticated_peer_id.clone();
-    while offset + crate::framing::LENGTH_PREFIX_LEN <= datagram_len {
-        let msg_len = u32::from_be_bytes(
-            datagram_slice[offset..offset + crate::framing::LENGTH_PREFIX_LEN]
-                .try_into()
-                .expect("slice length checked"),
-        ) as usize;
-
-        if msg_len > registry.config.max_message_size {
-            return Err(GossipError::MessageTooLarge {
-                size: msg_len,
-                max: registry.config.max_message_size,
-            });
-        }
-
-        let frame_len = crate::framing::LENGTH_PREFIX_LEN + msg_len;
-        if offset + frame_len > datagram_len {
-            // Truncated frame tail in one datagram: drop the remainder to preserve framing safety.
-            warn!(
-                peer = %peer_addr,
-                datagram_len = datagram_len,
-                frame_offset = offset,
-                frame_len = frame_len,
-                "dropping truncated udp frame batch tail"
-            );
-            break;
-        }
-
-        let response_correlation = response_connection.correlation.clone();
-        let mut frame =
-            unsafe { crate::PooledAlignedBuffer::with_len_uninit(frame_len, aligned_pool.clone()) };
-        frame
-            .as_mut_slice()
-            .copy_from_slice(&datagram_slice[offset..offset + frame_len]);
-        let parsed = parse_message_from_pooled_buffer(frame, msg_len)?;
-        let streaming_state = streaming_states.entry(peer_addr).or_default();
-        crate::protocol::process_read_result(
-            parsed,
-            streaming_state,
-            registry,
-            peer_addr,
-            response_correlation.as_deref(),
-            Some(&response_connection),
-            Some(&authenticated_peer_id),
-        )
-        .await?;
-
-        offset += frame_len;
-    }
-
-    Ok(())
-}
-
-/// Start the gossip registry server with a UDP socket.
-#[instrument(skip(registry, socket))]
-async fn start_gossip_server_with_udp_socket(
-    registry: Arc<GossipRegistry>,
-    socket: Arc<UdpSocket>,
-) -> Result<()> {
-    let bind_addr = registry.bind_addr;
-    info!(bind_addr = %bind_addr, "gossip udp server started");
-
-    let max_datagram_size =
-        (registry.config.max_message_size + crate::framing::LENGTH_PREFIX_LEN).min(65_507);
-    let datagram_capacity = max_datagram_size.max(2048);
-    let aligned_pool = registry.connection_pool.aligned_bytes_pool();
-    let mut streaming_states = HashMap::<SocketAddr, crate::protocol::StreamingState>::new();
-    let mut peer_context: Option<UdpPeerContext> = None;
-
-    loop {
-        let mut datagram = unsafe {
-            crate::PooledAlignedBuffer::with_len_uninit(datagram_capacity, aligned_pool.clone())
-        };
-        match socket.recv_from(datagram.as_mut_slice()).await {
-            Ok((len, peer_addr)) => {
-                if len >= crate::framing::LENGTH_PREFIX_LEN {
-                    if let Err(err) = process_udp_datagram_native(
-                        &registry,
-                        peer_addr,
-                        datagram,
-                        len,
-                        &mut streaming_states,
-                        &mut peer_context,
-                    )
-                    .await
-                    {
-                        warn!(peer = %peer_addr, error = %err, "failed to process udp datagram");
-                    }
-                }
-            }
-            Err(err) => {
-                error!(error = %err, "failed to receive udp datagram");
-            }
-        }
-    }
-}
-
 /// Start the gossip timer with vector clock support
 #[instrument(skip(registry))]
 async fn send_peer_list_gossip_round(registry: Arc<GossipRegistry>, immediate: bool) {
@@ -1949,28 +1534,6 @@ async fn send_peer_list_gossip_round(registry: Arc<GossipRegistry>, immediate: b
     }
 }
 
-/// Build the UDP liveness-detector probe timer, if UDP datagram transport is
-/// active. `unstable-udp-transport` off: `udp_mode` can never be `true` in
-/// this build (the only setter, `enable_udp()`, is itself gated out), so this
-/// always returns `None` — the timer is simply never created, matching
-/// today's fail-closed behavior without referencing the gated
-/// `udp_failure_detector_config` field.
-#[cfg(feature = "unstable-udp-transport")]
-fn build_udp_failure_timer(registry: &GossipRegistry) -> Option<tokio::time::Interval> {
-    if registry.udp_mode {
-        let mut t = interval(registry.udp_failure_detector_config.health_probe_interval);
-        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        Some(t)
-    } else {
-        None
-    }
-}
-
-#[cfg(not(feature = "unstable-udp-transport"))]
-fn build_udp_failure_timer(_registry: &GossipRegistry) -> Option<tokio::time::Interval> {
-    None
-}
-
 async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     debug!("start_gossip_timer function called");
 
@@ -1978,7 +1541,6 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     let cleanup_interval = registry.config.cleanup_interval;
     let vector_clock_gc_interval = registry.config.vector_clock_gc_frequency;
     let peer_gossip_interval = registry.config.peer_gossip_interval;
-    let mut udp_failure_timer = build_udp_failure_timer(&registry);
 
     let max_jitter = std::cmp::min(gossip_interval, Duration::from_millis(1000));
     let jitter_ms = if max_jitter.is_zero() {
@@ -2011,14 +1573,13 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         cleanup_interval_secs = cleanup_interval.as_secs(),
         vector_clock_gc_interval_secs = vector_clock_gc_interval.as_secs(),
         peer_gossip_interval_secs = peer_gossip_interval.map(|i| i.as_secs()),
-        udp_failure_detector = registry.udp_mode_enabled(),
         "gossip timer started with non-blocking I/O"
     );
 
     // R7: the immediate (urgent) peer-gossip round may dial peers, bounded only
     // by connection_timeout. Running it inline in the select arm head-of-line
-    // blocks every other timer (periodic gossip, cleanup, supervisor, UDP
-    // detector). Detach it into a spawned task so the select loop keeps
+    // blocks every other timer (periodic gossip, cleanup, supervisor).
+    // Detach it into a spawned task so the select loop keeps
     // servicing other arms, and coalesce concurrent immediate rounds with a
     // single in-flight gate so a flapping peer cannot pile up rounds.
     //
@@ -2184,21 +1745,6 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                 });
             }
         }
-        // UDP detector timer - only active for udp experimental stack.
-            _ = async {
-                if let Some(ref mut timer) = udp_failure_timer {
-                    timer.tick().await
-                } else {
-                    std::future::pending::<tokio::time::Instant>().await
-                }
-            } => {
-                if registry.is_shutdown().await {
-                    break;
-                }
-                if let Err(err) = registry.run_udp_failure_detector_once().await {
-                    warn!(error = %err, "udp failure detector tick failed");
-                }
-            }
         }
     }
 
@@ -3032,7 +2578,7 @@ pub(crate) async fn send_streaming_response(
                 // Intentionally quiet: this is the hot-path and can spam logs in benchmarks.
             }
         } else {
-            // UDP transport has no stream writer path; fall back to inline response.
+            // No stream writer available on this connection; fall back to inline response.
             send_inline_response(registry, peer_addr, correlation_id, response).await;
         }
     } else {

@@ -700,35 +700,6 @@ async fn handle_assembled_message(
                         }),
                         crate::registry::AskDisposition::Deferred => None,
                     })
-            } else if let Some(udp_socket) = registry.connection_pool.udp_socket_opt() {
-                // UDP deferred ask: peer_addr is the datagram source; socket is the shared
-                // registry UDP socket. No connection-pool lookup on the reply path.
-                let context = crate::AskContext::from_udp(
-                    corr_id,
-                    peer_addr,
-                    &udp_socket,
-                    authenticated_peer_id,
-                );
-                cell.handle(actor_id, type_hash, complete_data, context)
-                    .map(|disposition| match disposition {
-                        crate::registry::AskDisposition::Immediate(r) => Some(r),
-                        crate::registry::AskDisposition::ImmediateBytes(r) => {
-                            Some(ActorResponse::Bytes(r))
-                        }
-                        crate::registry::AskDisposition::ImmediateAligned(r) => {
-                            Some(ActorResponse::Aligned(r))
-                        }
-                        crate::registry::AskDisposition::ImmediatePooled {
-                            payload,
-                            prefix,
-                            payload_len,
-                        } => Some(ActorResponse::Pooled {
-                            payload,
-                            prefix,
-                            payload_len,
-                        }),
-                        crate::registry::AskDisposition::Deferred => None,
-                    })
             } else {
                 registry
                     .handle_actor_message(actor_id, type_hash, complete_data, correlation_opt)
@@ -756,31 +727,6 @@ async fn handle_assembled_message(
                     }
                     crate::registry::AskDisposition::ImmediateAligned(response) => {
                         Some(ActorResponse::Aligned(response))
-                    }
-                    crate::registry::AskDisposition::ImmediatePooled {
-                        payload,
-                        prefix,
-                        payload_len,
-                    } => Some(ActorResponse::Pooled {
-                        payload,
-                        prefix,
-                        payload_len,
-                    }),
-                    crate::registry::AskDisposition::Deferred => None,
-                })
-        } else if let Some(udp_socket) = registry.connection_pool.udp_socket_opt() {
-            // UDP deferred ask: peer_addr is the datagram source; socket is the shared
-            // registry UDP socket. No connection-pool lookup on the reply path.
-            let context =
-                crate::AskContext::from_udp(corr_id, peer_addr, &udp_socket, authenticated_peer_id);
-            cell.handle(actor_id, type_hash, complete_data, context)
-                .map(|disposition| match disposition {
-                    crate::registry::AskDisposition::Immediate(r) => Some(r),
-                    crate::registry::AskDisposition::ImmediateBytes(r) => {
-                        Some(ActorResponse::Bytes(r))
-                    }
-                    crate::registry::AskDisposition::ImmediateAligned(r) => {
-                        Some(ActorResponse::Aligned(r))
                     }
                     crate::registry::AskDisposition::ImmediatePooled {
                         payload,

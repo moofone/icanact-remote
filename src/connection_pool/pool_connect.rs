@@ -28,7 +28,6 @@ impl<T> ConnectionPool<T> {
             aligned_bytes_pool: Arc::new(crate::AlignedBytesPool::new(
                 aligned_pool_size.max(crate::aligned::DEFAULT_ALIGNED_POOL_SIZE),
             )),
-            udp_socket: ArcSwapOption::empty(),
             connection_counter: AtomicUsize::new(0),
             _marker: PhantomData,
         };
@@ -44,63 +43,6 @@ impl<T> ConnectionPool<T> {
     /// Set the registry reference for handling incoming messages
     pub fn set_registry(&self, registry: std::sync::Arc<GossipRegistry>) {
         self.registry.store(std::sync::Arc::downgrade(&registry));
-    }
-
-    /// Install the shared UDP socket used by datagram transport mode.
-    pub fn set_udp_socket(&self, socket: Arc<UdpSocket>) {
-        self.udp_socket.store(Some(socket));
-    }
-
-    fn udp_socket(&self) -> Result<Arc<UdpSocket>> {
-        self.udp_socket.load_full().ok_or_else(|| {
-            GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "udp socket is not initialized",
-            ))
-        })
-    }
-
-    /// Returns the shared UDP socket without error — `None` if UDP transport is not configured.
-    /// Used by the ask responder to reply to UDP asks without a connection-pool lookup.
-    pub(crate) fn udp_socket_opt(&self) -> Option<Arc<UdpSocket>> {
-        self.udp_socket.load_full()
-    }
-
-    // UDP datagram transport gate. `GossipRegistry::udp_mode` only exists
-    // under `unstable-udp-transport`; when the feature is off, UDP is
-    // unconditionally disabled (matching `enable_udp()`'s permanent
-    // fail-closed behavior in that build).
-    #[cfg(feature = "unstable-udp-transport")]
-    fn is_udp_transport_enabled(&self) -> bool {
-        self.registry
-            .load()
-            .upgrade()
-            .map(|registry| registry.udp_mode)
-            .unwrap_or(false)
-    }
-
-    #[cfg(not(feature = "unstable-udp-transport"))]
-    fn is_udp_transport_enabled(&self) -> bool {
-        false
-    }
-
-    fn current_schema_hash(&self) -> Option<u64> {
-        self.registry
-            .load()
-            .upgrade()
-            .and_then(|registry| registry.config.schema_hash)
-    }
-
-    fn udp_write_queue_capacity(&self) -> usize {
-        self.registry
-            .load()
-            .upgrade()
-            .map(|registry| {
-                BufferConfig::default()
-                    .with_ask_window(registry.config.ask_window)
-                    .write_queue_capacity()
-            })
-            .unwrap_or_else(|| BufferConfig::default().write_queue_capacity())
     }
 
     fn handle_correlation(
@@ -136,17 +78,6 @@ impl<T> ConnectionPool<T> {
             return Some(ConnectionHandle::new_stream(
                 addr,
                 stream_handle.clone(),
-                correlation,
-            ));
-        }
-
-        if self.is_udp_transport_enabled() {
-            let socket = self.udp_socket.load_full()?;
-            return Some(ConnectionHandle::new_udp(
-                addr,
-                socket,
-                self.udp_write_queue_capacity(),
-                self.current_schema_hash(),
                 correlation,
             ));
         }
@@ -314,11 +245,7 @@ impl<T> ConnectionPool<T> {
     }
 
     fn is_usable_connection(&self, conn: &LockFreeConnection) -> bool {
-        if self.is_udp_transport_enabled() {
-            conn.is_connected()
-        } else {
-            conn.has_live_stream()
-        }
+        conn.has_live_stream()
     }
 
     fn indexed_connection_by_peer_id(
@@ -439,115 +366,6 @@ impl<T> ConnectionPool<T> {
         if should_remove {
             let _ = self.outbound_dial_gates.remove_sync(&addr);
         }
-    }
-
-    async fn ensure_udp_connection(&self, addr: SocketAddr) -> Result<()> {
-        if let Some(existing) = self.get_lock_free_connection(addr) {
-            if existing.is_connected() {
-                return Ok(());
-            }
-            let _ = self.remove_connection(addr);
-        }
-
-        let udp_socket = self.udp_socket()?;
-        let registry_weak = self.registry.load_full();
-
-        // Mirror TCP path peer identity resolution so UDP shares the same correlation tracking.
-        let peer_id_opt = self
-            .addr_to_peer_id
-            .read_sync(&addr, |_, v| v.clone())
-            .or_else(|| {
-                let mut found: Option<crate::PeerId> = None;
-                self.peer_id_to_addr.iter_sync(|peer_id, peer_addr| {
-                    if peer_addr == &addr {
-                        found = Some(peer_id.clone());
-                        return false;
-                    }
-                    true
-                });
-                found
-            });
-
-        let correlation_tracker = peer_id_opt
-            .as_ref()
-            .map(|peer_id| self.get_or_create_correlation_tracker(peer_id))
-            .unwrap_or_else(CorrelationTracker::new);
-
-        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
-        conn.set_state(ConnectionState::Connected);
-        conn.update_last_used();
-        conn.correlation = Some(correlation_tracker.clone());
-        if let Some(peer_id) = peer_id_opt.clone() {
-            conn.embedded_peer_id = Some(peer_id.clone());
-        }
-
-        let connection_arc = Arc::new(conn);
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(addr, connection_arc.clone());
-
-        if let Some(peer_id) = peer_id_opt.clone() {
-            let _ = self
-                .connections_by_peer
-                .upsert_sync(peer_id.clone(), connection_arc.clone());
-            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
-            self.publish_current_peer_connection(&peer_id, connection_arc.clone());
-        }
-
-        // Keep startup identity exchange parity with stream transports.
-        if let Some(registry_arc) = registry_weak.upgrade() {
-            let initial_msg = {
-                let (local_actors, known_actors) = registry_arc.snapshot_actor_pairs();
-                let gossip_state = registry_arc.gossip_state.lock().await;
-
-                RegistryMessage::FullSync {
-                    local_actors,
-                    known_actors,
-                    sender_peer_id: registry_arc.peer_id.clone(),
-                    sender_bind_addr: Some(registry_arc.bind_addr.to_string()),
-                    sequence: gossip_state.gossip_sequence,
-                    wall_clock_time: crate::current_timestamp(),
-                    extensions: None,
-                }
-            };
-
-            match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
-                Ok(data) => {
-                    let header = framing::write_gossip_frame_prefix(data.len());
-                    let mut msg_buffer = Vec::with_capacity(header.len() + data.len());
-                    msg_buffer.extend_from_slice(&header); // ALLOW_COPY
-                    msg_buffer.extend_from_slice(&data); // ALLOW_COPY
-
-                    let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_udp(
-                        addr,
-                        udp_socket.clone(),
-                        self.udp_write_queue_capacity(),
-                        registry_arc.config.schema_hash,
-                        correlation_tracker.clone(),
-                    );
-                    if let Err(e) = conn_handle.send_data(msg_buffer).await {
-                        warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
-                    } else {
-                        info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
-                    }
-                }
-                Err(e) => {
-                    warn!(peer = %addr, error = %e, "Failed to serialize initial FullSync message");
-                }
-            }
-
-            let registry_clone_for_mark = registry_arc.clone();
-            tokio::spawn(async move {
-                registry_clone_for_mark.mark_peer_connected(addr).await;
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Ensure the per-peer UDP connection handle exists.
-    pub async fn ensure_udp_peer_connection(&self, addr: SocketAddr) -> Result<()> {
-        self.ensure_udp_connection(addr).await
     }
 
     /// Shared pool for aligned receive buffers.
@@ -868,47 +686,6 @@ impl<T> ConnectionPool<T> {
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
     }
 
-    // Both of these are unreachable at runtime when `unstable-udp-transport`
-    // is off: every call site below is guarded by `is_udp_transport_enabled()`,
-    // which is hard-wired to `false` in that build. They still need to
-    // type-check, so the off-feature variant fails closed instead of calling
-    // into the gated `crate::transport` datagram runtime.
-    #[cfg(feature = "unstable-udp-transport")]
-    fn try_send_udp_bytes_to_addr(&self, addr: SocketAddr, data: bytes::Bytes) -> Result<()> {
-        let socket = self.udp_socket()?;
-        crate::transport::try_send_bytes_to_addr(socket.as_ref(), addr, data)
-    }
-
-    #[cfg(not(feature = "unstable-udp-transport"))]
-    fn try_send_udp_bytes_to_addr(&self, _addr: SocketAddr, _data: bytes::Bytes) -> Result<()> {
-        Err(GossipError::InvalidConfig(
-            "UDP datagram transport is not enabled in this build".to_string(),
-        ))
-    }
-
-    #[cfg(feature = "unstable-udp-transport")]
-    fn try_send_udp_parts_to_addr(
-        &self,
-        addr: SocketAddr,
-        header: bytes::Bytes,
-        payload: bytes::Bytes,
-    ) -> Result<()> {
-        let socket = self.udp_socket()?;
-        crate::transport::try_send_parts_to_addr(socket.as_ref(), addr, header, payload)
-    }
-
-    #[cfg(not(feature = "unstable-udp-transport"))]
-    fn try_send_udp_parts_to_addr(
-        &self,
-        _addr: SocketAddr,
-        _header: bytes::Bytes,
-        _payload: bytes::Bytes,
-    ) -> Result<()> {
-        Err(GossipError::InvalidConfig(
-            "UDP datagram transport is not enabled in this build".to_string(),
-        ))
-    }
-
     /// Send data to a peer by ID.
     pub fn send_to_peer_id(&self, peer_id: &crate::PeerId, data: bytes::Bytes) -> Result<()> {
         debug!(
@@ -924,8 +701,6 @@ impl<T> ConnectionPool<T> {
                     peer_id
                 );
                 return stream_handle.write_bytes_nonblocking(data);
-            } else if self.is_udp_transport_enabled() {
-                return self.try_send_udp_bytes_to_addr(connection.addr, data);
             } else {
                 warn!(peer_id = %peer_id, "Connection found but no stream handle");
             }
@@ -956,8 +731,6 @@ impl<T> ConnectionPool<T> {
         if let Some(connection) = self.get_connection_by_peer_id(peer_id) {
             if let Some(ref stream_handle) = connection.stream_handle {
                 return stream_handle.write_header_and_payload_nonblocking_checked(header, payload);
-            } else if self.is_udp_transport_enabled() {
-                return self.try_send_udp_parts_to_addr(connection.addr, header, payload);
             } else {
                 warn!(peer_id = %peer_id, "Connection found but no stream handle");
             }
@@ -988,8 +761,6 @@ impl<T> ConnectionPool<T> {
                     peer_id
                 );
                 return stream_handle.write_bytes_nonblocking(data);
-            } else if self.is_udp_transport_enabled() {
-                return self.try_send_udp_bytes_to_addr(connection.addr, data);
             } else {
                 warn!(peer_id = %peer_id, "Connection found but no stream handle");
             }
@@ -1110,8 +881,6 @@ impl<T> ConnectionPool<T> {
         if let Some(connection) = self.get_lock_free_connection(addr) {
             if let Some(ref stream_handle) = connection.stream_handle {
                 return stream_handle.write_bytes_nonblocking(data);
-            } else if self.is_udp_transport_enabled() {
-                return self.try_send_udp_bytes_to_addr(connection.addr, data);
             } else {
                 warn!(addr = %addr, "Connection found but no stream handle");
             }
@@ -1141,8 +910,6 @@ impl<T> ConnectionPool<T> {
             if let Some(ref stream_handle) = connection.stream_handle {
                 stream_handle.write_header_and_payload_nonblocking_checked(header, payload)?;
                 return Ok(());
-            } else if self.is_udp_transport_enabled() {
-                return self.try_send_udp_parts_to_addr(connection.addr, header, payload);
             } else {
                 warn!(addr = %addr, "Connection found but no stream handle");
             }
@@ -1648,10 +1415,6 @@ impl<T> ConnectionPool<T> {
         let max_connections = self.max_connections;
         let connection_timeout = self.connection_timeout;
         let registry_weak = self.registry.load_full();
-
-        if self.is_udp_transport_enabled() {
-            return self.connect_via_udp(addr).await;
-        }
 
         let mut resolved_node_id = node_id;
         loop {
