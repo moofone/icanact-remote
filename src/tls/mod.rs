@@ -1,7 +1,7 @@
 pub mod name;
 pub mod resolver;
 
-use crate::{NodeId, Result, SecretKey};
+use crate::{GossipNodeId, Result, SecretKey};
 use rustls::client::Resumption;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -22,7 +22,7 @@ pub fn ensure_crypto_provider() {
 
 pub struct TlsConfig {
     pub secret_key: SecretKey,
-    pub node_id: NodeId,
+    pub node_id: GossipNodeId,
     pub client_config: Arc<ClientConfig>,
     pub server_config: Arc<ServerConfig>,
 }
@@ -114,7 +114,7 @@ impl ServerCertVerifier for NodeIdServerVerifier {
             if let Some(expected_node_id) = name::decode(dns_name.as_ref()) {
                 if actual_node_id != expected_node_id {
                     return Err(Error::General(format!(
-                        "NodeId mismatch: expected {}, got {}",
+                        "GossipNodeId mismatch: expected {}, got {}",
                         expected_node_id.fmt_short(),
                         actual_node_id.fmt_short()
                     )));
@@ -210,7 +210,9 @@ impl ClientCertVerifier for NodeIdClientVerifier {
     }
 }
 
-pub fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Result<NodeId, Error> {
+pub fn extract_node_id_from_cert(
+    cert: &CertificateDer<'_>,
+) -> std::result::Result<GossipNodeId, Error> {
     let (_, parsed) = X509Certificate::from_der(cert.as_ref())
         .map_err(|e| Error::General(format!("Invalid certificate DER: {e}")))?;
     let public_key = parsed.public_key();
@@ -226,7 +228,7 @@ pub fn extract_node_id_from_cert(cert: &CertificateDer<'_>) -> std::result::Resu
             key_bytes.len()
         )));
     }
-    NodeId::from_bytes(key_bytes)
+    GossipNodeId::from_bytes(key_bytes)
         .map_err(|e| Error::General(format!("Invalid public key in certificate: {}", e)))
 }
 
@@ -257,7 +259,7 @@ mod tests {
         let res = verifier.verify_server_cert(&cert, &[], &pinned, &[], now());
         assert!(
             res.is_ok(),
-            "matching pinned NodeId must be accepted: {res:?}"
+            "matching pinned GossipNodeId must be accepted: {res:?}"
         );
     }
 
@@ -273,17 +275,17 @@ mod tests {
         let res = verifier.verify_server_cert(&cert, &[], &pinned, &[], now());
         assert!(
             res.is_err(),
-            "mismatched pinned NodeId must be rejected (identity binding)"
+            "mismatched pinned GossipNodeId must be rejected (identity binding)"
         );
     }
 
     #[test]
     fn server_verifier_placeholder_sni_is_tofu_learnable() {
-        // Bootstrap dials use a placeholder SNI that does not decode to a NodeId.
+        // Bootstrap dials use a placeholder SNI that does not decode to a GossipNodeId.
         // The verifier accepts (key-possession is still proven via the TLS
         // signature), and the TRUE identity is recoverable from the cert for
         // TOFU-binding by the caller (R2). This proves the learned identity is
-        // the real cert NodeId, not None.
+        // the real cert GossipNodeId, not None.
         let key = SecretKey::generate();
         let node_id = key.public();
         let cert = resolver::test_self_signed_cert(&key).expect("cert");
@@ -291,7 +293,7 @@ mod tests {
         let placeholder = "peer-4446.icanact.invalid";
         assert!(
             name::decode(placeholder).is_none(),
-            "placeholder SNI must NOT decode to a NodeId"
+            "placeholder SNI must NOT decode to a GossipNodeId"
         );
         let sni = ServerName::try_from(placeholder).unwrap();
 
@@ -303,18 +305,18 @@ mod tests {
             "placeholder-SNI bootstrap dial must still complete the handshake"
         );
 
-        // The identity used for TOFU binding is the real cert NodeId.
+        // The identity used for TOFU binding is the real cert GossipNodeId.
         let learned = extract_node_id_from_cert(&cert).expect("extract");
         assert_eq!(
             learned, node_id,
-            "TOFU-learned identity must equal the cert's true NodeId"
+            "TOFU-learned identity must equal the cert's true GossipNodeId"
         );
     }
 
     #[test]
     fn tofu_node_id_maps_to_expected_peer_id() {
-        // The PeerId derived from the TOFU-learned NodeId must match the one a
-        // pinned NodeId would have produced, so subsequent per-message gossip
+        // The PeerId derived from the TOFU-learned GossipNodeId must match the one a
+        // pinned GossipNodeId would have produced, so subsequent per-message gossip
         // guards (which compare embedded_peer_id) are consistent.
         let key = SecretKey::generate();
         let node_id = key.public();

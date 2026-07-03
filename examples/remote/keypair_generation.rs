@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use icanact_remote::{SecretKey, NodeId};
+use icanact_remote::{GossipNodeId, SecretKey};
 
 /// Example showing how to generate and manage Ed25519 keypairs for TLS communication
 #[tokio::main]
@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
     let secret_key1 = SecretKey::generate();
     let node_id1 = secret_key1.public();
     
-    println!("   Public Key (NodeId): {}", node_id1.fmt_short());
+    println!("   Public Key (GossipNodeId): {}", node_id1.fmt_short());
     println!("   Public Key Hex: {}", hex::encode(node_id1.as_bytes()));
     println!("   Private Key: [HIDDEN - 32 bytes]\n");
     
@@ -48,9 +48,9 @@ async fn main() -> Result<()> {
     let tls_node1 = tls_key1.public();
     let tls_node2 = tls_key2.public();
     
-    println!("   TLS key 1 NodeId: {}", tls_node1.fmt_short());
-    println!("   TLS key 2 NodeId: {}", tls_node2.fmt_short());
-    println!("   NodeIds are unique: {}\n", tls_node1 != tls_node2);
+    println!("   TLS key 1 GossipNodeId: {}", tls_node1.fmt_short());
+    println!("   TLS key 2 GossipNodeId: {}", tls_node2.fmt_short());
+    println!("   GossipNodeIds are unique: {}\n", tls_node1 != tls_node2);
     
     // 4. Demonstrate TLS identity verification
     println!("4. Demonstrating TLS identity verification...");
@@ -61,19 +61,19 @@ async fn main() -> Result<()> {
     println!("   - Mutual TLS authentication (mTLS)");
     println!("   - Perfect forward secrecy with ephemeral keys");
     println!("   ");
-    println!("   Each NodeId represents a unique TLS certificate");
+    println!("   Each GossipNodeId represents a unique TLS certificate");
     println!("   Connections are verified automatically during TLS handshake\n");
     
-    // 5. Show NodeId conversions for TLS
-    println!("5. Demonstrating NodeId conversions for TLS...");
+    // 5. Show GossipNodeId conversions for TLS
+    println!("5. Demonstrating GossipNodeId conversions for TLS...");
     
-    // NodeId represents the public key of a TLS certificate
+    // GossipNodeId represents the public key of a TLS certificate
     let tls_node = secret_key1.public();
-    println!("   TLS NodeId: {}", tls_node.fmt_short());
+    println!("   TLS GossipNodeId: {}", tls_node.fmt_short());
     println!("   Full hex: {}", hex::encode(tls_node.as_bytes()));
     
     // Convert between formats
-    let node_from_bytes = NodeId::from_bytes(&tls_node.as_bytes())?;
+    let node_from_bytes = GossipNodeId::from_bytes(&tls_node.as_bytes())?;
     println!("   Roundtrip conversion successful: {}\n", tls_node == node_from_bytes);
     
     // 6. Generate multiple TLS keypairs for a distributed setup
@@ -82,9 +82,9 @@ async fn main() -> Result<()> {
     let client1_key = SecretKey::generate();
     let client2_key = SecretKey::generate();
     
-    println!("   Server NodeId:  {}", server_key.public().fmt_short());
-    println!("   Client1 NodeId: {}", client1_key.public().fmt_short());
-    println!("   Client2 NodeId: {}\n", client2_key.public().fmt_short());
+    println!("   Server GossipNodeId:  {}", server_key.public().fmt_short());
+    println!("   Client1 GossipNodeId: {}", client1_key.public().fmt_short());
+    println!("   Client2 GossipNodeId: {}\n", client2_key.public().fmt_short());
     
     // Save all keypairs
     let keys_dir = "/tmp/icanact_tls_keys";

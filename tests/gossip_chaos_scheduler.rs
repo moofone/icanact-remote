@@ -1,5 +1,7 @@
 use icanact_remote::registry::{GossipRegistry, RegistryChange, RegistryDelta, RegistryMessage};
-use icanact_remote::{GossipConfig, KeyPair, NodeId, RegistrationPriority, RemoteActorLocation};
+use icanact_remote::{
+    GossipConfig, GossipNodeId, KeyPair, RegistrationPriority, RemoteActorLocation,
+};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng as _, SeedableRng as _};
@@ -23,7 +25,7 @@ fn snapshot_known(reg: &GossipRegistry) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     reg.actor_state.known_actors.iter_sync(|k, loc| {
         // Avoid relying on private VectorClock helpers; use the public node set + get().
-        let mut nodes: Vec<NodeId> = loc.vector_clock.get_nodes().into_iter().collect();
+        let mut nodes: Vec<GossipNodeId> = loc.vector_clock.get_nodes().into_iter().collect();
         nodes.sort();
         let clock = nodes
             .into_iter()

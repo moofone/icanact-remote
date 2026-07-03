@@ -3,7 +3,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
-use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey, NodeId};
+use icanact_remote::{GossipConfig, GossipNodeId, GossipRegistryHandle, SecretKey};
 use tracing::{info, warn, error};
 
 /// TLS-enabled secure client with Ed25519 certificate authentication
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     println!("1. Loading server TLS identity...");
     let server_node_id = match load_node_id(&server_pub_path) {
         Ok(id) => {
-            println!("   ✅ Server NodeId: {}", id.fmt_short());
+            println!("   ✅ Server GossipNodeId: {}", id.fmt_short());
             println!("   ✅ Loaded from: {}\n", server_pub_path);
             id
         },
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     let client_secret = load_or_generate_tls_key(client_key_path).await?;
     let client_node_id = client_secret.public();
     
-    println!("   ✅ Client NodeId: {}", client_node_id.fmt_short());
+    println!("   ✅ Client GossipNodeId: {}", client_node_id.fmt_short());
     println!("   ✅ TLS key loaded from: {}\n", client_key_path);
     
     // 3. Create TLS-enabled client registry
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     
     let actual_addr = registry.registry.bind_addr;
     println!("   ✅ Client listening on: {}", actual_addr);
-    println!("   ✅ Client NodeId: {}", client_node_id.fmt_short());
+    println!("   ✅ Client GossipNodeId: {}", client_node_id.fmt_short());
     println!("   ✅ TLS 1.3 encryption: ENABLED\n");
     
     // 4. Connect to TLS server with certificate verification
@@ -80,8 +80,8 @@ async fn main() -> Result<()> {
     registry.registry.add_peer_with_node_id(server_addr, Some(server_node_id.clone())).await;
     
     println!("   🔗 Connecting to {} with TLS", server_addr);
-    println!("   🔑 Client NodeId: {}", client_node_id.fmt_short());
-    println!("   🎯 Server NodeId: {}", server_node_id.fmt_short());
+    println!("   🔑 Client GossipNodeId: {}", client_node_id.fmt_short());
+    println!("   🎯 Server GossipNodeId: {}", server_node_id.fmt_short());
     println!("   ✅ TLS handshake in progress...\n");
     
     // Wait for connection and gossip
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
         if status_count % 3 == 0 { // Every 30 seconds
             let stats = registry.registry.get_stats().await;
             println!("   📊 TLS Client Status:");
-            println!("      - Client NodeId: {}", client_node_id.fmt_short());
+            println!("      - Client GossipNodeId: {}", client_node_id.fmt_short());
             println!("      - TLS peers: {}", stats.active_peers);
             println!("      - Connected to: {}", server_addr);
             println!("      - Service available: secure_chat_service");
@@ -160,8 +160,8 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Load NodeId from public key file
-fn load_node_id(path: &str) -> Result<NodeId> {
+/// Load GossipNodeId from public key file
+fn load_node_id(path: &str) -> Result<GossipNodeId> {
     let pub_key_hex = fs::read_to_string(path)?;
     let pub_key_bytes = hex::decode(pub_key_hex.trim())?;
     
@@ -169,8 +169,8 @@ fn load_node_id(path: &str) -> Result<NodeId> {
         return Err(anyhow::anyhow!("Invalid public key length: expected 32, got {}", pub_key_bytes.len()));
     }
     
-    NodeId::from_bytes(&pub_key_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid NodeId: {}", e))
+    GossipNodeId::from_bytes(&pub_key_bytes)
+        .map_err(|e| anyhow::anyhow!("Invalid GossipNodeId: {}", e))
 }
 
 /// Load or generate TLS keypair

@@ -30,7 +30,7 @@
 //!
 //! ## What this test pins down
 //!
-//! Two registries A and B. A's NodeId > B's NodeId. Only A is seeded with B's
+//! Two registries A and B. A's GossipNodeId > B's GossipNodeId. Only A is seeded with B's
 //! address. We `connect_to_peer` from A and assert the dial succeeds within
 //! a small timeout. **Today this test fails** with the exact production error,
 //! reproducing the stall.

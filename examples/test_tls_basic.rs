@@ -19,11 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Generate keys for both nodes
     let server_key = SecretKey::generate();
     let server_node_id = server_key.public();
-    println!("Server NodeId: {}", server_node_id.fmt_short());
+    println!("Server GossipNodeId: {}", server_node_id.fmt_short());
 
     let client_key = SecretKey::generate();
     let client_node_id = client_key.public();
-    println!("Client NodeId: {}", client_node_id.fmt_short());
+    println!("Client GossipNodeId: {}", client_node_id.fmt_short());
 
     // Create TLS configurations
     let server_tls = TlsConfig::new(server_key)?;

@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let pub_path = key_path.replace(".key", ".pub");
     fs::write(&pub_path, hex::encode(node_id.as_bytes()))?;
 
-    println!("Server NodeId: {}", node_id.fmt_short());
+    println!("Server GossipNodeId: {}", node_id.fmt_short());
     println!("Public key: {}\n", pub_path);
 
     let server_addr = "127.0.0.1:29200".parse()?;

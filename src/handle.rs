@@ -401,7 +401,7 @@ impl<T> GossipRegistryHandle<T> {
         self.registry.get_connection(addr).await
     }
 
-    /// Get a connection handle by peer ID (ensures TLS NodeId is known)
+    /// Get a connection handle by peer ID (ensures TLS GossipNodeId is known)
     pub(crate) async fn get_connection_to_peer(
         &self,
         peer_id: &crate::PeerId,
@@ -990,7 +990,8 @@ mod tests {
             !handle
                 .registry
                 .should_keep_connection(&remote_peer_id, false),
-            "the lower local NodeId must not prefer inbound connections from the higher remote NodeId"
+            "the lower local GossipNodeId must not prefer inbound connections from the \
+             higher remote GossipNodeId"
         );
 
         let existing_addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
@@ -1919,8 +1920,8 @@ enum ConnectionCloseOutcome {
 }
 
 fn inbound_tls_sender_is_authenticated(
-    peer_node_id: Option<crate::NodeId>,
-    claimed_node_id: crate::NodeId,
+    peer_node_id: Option<crate::GossipNodeId>,
+    claimed_node_id: crate::GossipNodeId,
 ) -> bool {
     peer_node_id.is_some_and(|authenticated_node_id| authenticated_node_id == claimed_node_id)
 }
@@ -1932,7 +1933,7 @@ async fn handle_incoming_connection_tls<S>(
     peer_addr: SocketAddr,
     registry: Arc<GossipRegistry>,
     _registry_weak: Option<std::sync::Weak<GossipRegistry>>,
-    peer_node_id: Option<crate::NodeId>,
+    peer_node_id: Option<crate::GossipNodeId>,
     // Inbound-handshake admission permit (R6). Released once the peer is
     // identified below so it bounds only the half-open handshake window, not
     // the lifetime of the established connection. `None` for non-admission
@@ -2019,7 +2020,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "Ask request arrived before peer NodeId is known"
+                    "Ask request arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2030,7 +2031,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "Response arrived before peer NodeId is known"
+                    "Response arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2041,7 +2042,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "DirectAsk arrived before peer NodeId is known"
+                    "DirectAsk arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2052,7 +2053,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "Response arrived before peer NodeId is known"
+                    "Response arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2063,7 +2064,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "PubSub frame arrived before peer NodeId is known"
+                    "PubSub frame arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2074,7 +2075,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "Actor frame arrived before peer NodeId is known"
+                    "Actor frame arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2085,7 +2086,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "Streaming frame arrived before peer NodeId is known"
+                    "Streaming frame arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2096,7 +2097,7 @@ where
             } else {
                 warn!(
                     peer_addr = %peer_addr,
-                    "Raw message arrived before peer NodeId is known"
+                    "Raw message arrived before peer GossipNodeId is known"
                 );
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
@@ -2127,7 +2128,7 @@ where
     // handshakes.
     drop(handshake_permit.take());
 
-    // Update the gossip state with the NodeId for this peer
+    // Update the gossip state with the GossipNodeId for this peer
     // This is critical for bidirectional TLS connections
     let peer_id = match crate::PeerId::from_hex(&sender_node_id) {
         Ok(peer_id) => peer_id,
@@ -2156,14 +2157,16 @@ where
                     peer_addr = %peer_addr,
                     authenticated_node_id = %authenticated_node_id.fmt_short(),
                     claimed_node_id = %sender_node_id_from_message.fmt_short(),
-                    "TLS client certificate NodeId does not match first message sender; dropping connection"
+                    "TLS client certificate GossipNodeId does not match first message sender; \
+                     dropping connection"
                 );
             }
             None => {
                 warn!(
                     peer_addr = %peer_addr,
                     claimed_node_id = %sender_node_id_from_message.fmt_short(),
-                    "TLS client certificate NodeId missing for inbound connection; dropping connection"
+                    "TLS client certificate GossipNodeId missing for inbound connection; \
+                     dropping connection"
                 );
             }
         }
@@ -2213,7 +2216,7 @@ where
         debug!(
             peer_addr = %peer_addr,
             peer_state_addr = %peer_state_addr,
-            "Updated gossip state with NodeId for incoming TLS connection"
+            "Updated gossip state with GossipNodeId for incoming TLS connection"
         );
     }
 

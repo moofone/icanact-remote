@@ -1,5 +1,5 @@
 use anyhow::Result;
-use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey, NodeId};
+use icanact_remote::{GossipConfig, GossipNodeId, GossipRegistryHandle, SecretKey};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     // 1. Load server's public key for TLS verification
     println!("1. Loading server identity...");
     let server_node_id = load_node_id(&server_pub_path)?;
-    println!("   Server NodeId: {}", server_node_id.fmt_short());
+    println!("   Server GossipNodeId: {}", server_node_id.fmt_short());
     println!("   Loaded from: {}\n", server_pub_path);
     
     // 2. Load or generate client keypair
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     let client_secret = load_or_generate_key(client_key_path).await?;
     let client_node_id = client_secret.public();
     
-    println!("   Client NodeId: {}", client_node_id.fmt_short());
+    println!("   Client GossipNodeId: {}", client_node_id.fmt_short());
     println!("   Key file: {}\n", client_key_path);
     
     // 3. Create TLS-enabled gossip registry
@@ -68,8 +68,8 @@ async fn main() -> Result<()> {
     
     registry.registry.add_peer_with_node_id(server_addr, Some(server_node_id.clone())).await;
     
-    println!("   🔗 Connecting to {} with NodeId verification", server_addr);
-    println!("   ✅ Server NodeId: {}", server_node_id.fmt_short());
+    println!("   🔗 Connecting to {} with GossipNodeId verification", server_addr);
+    println!("   ✅ Server GossipNodeId: {}", server_node_id.fmt_short());
     
     // Wait for connection and gossip
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         if status_count % 3 == 0 { // Every 30 seconds
             let stats = registry.registry.get_stats().await;
             println!("📊 Client Status:");
-            println!("   - NodeId: {}", client_node_id.fmt_short());
+            println!("   - GossipNodeId: {}", client_node_id.fmt_short());
             println!("   - TLS peers: {}", stats.active_peers);
             println!("   - Service available: echo_service at {}", service_location.address);
             println!();
@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn load_node_id(path: &str) -> Result<NodeId> {
+fn load_node_id(path: &str) -> Result<GossipNodeId> {
     let pub_key_hex = fs::read_to_string(path)?;
     let pub_key_bytes = hex::decode(pub_key_hex.trim())?;
     
@@ -138,8 +138,8 @@ fn load_node_id(path: &str) -> Result<NodeId> {
         return Err(anyhow::anyhow!("Invalid public key length: expected 32, got {}", pub_key_bytes.len()));
     }
     
-    NodeId::from_bytes(&pub_key_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid NodeId: {}", e))
+    GossipNodeId::from_bytes(&pub_key_bytes)
+        .map_err(|e| anyhow::anyhow!("Invalid GossipNodeId: {}", e))
 }
 
 async fn load_or_generate_key(path: &str) -> Result<SecretKey> {
