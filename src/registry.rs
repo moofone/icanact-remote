@@ -291,7 +291,6 @@ pub struct PubSubIngressHandlerCell {
     owner: Arc<dyn crate::pubsub::PubSubIngressHandler>,
     ptr: usize,
     call: unsafe fn(usize, &crate::PeerId, crate::AlignedBytes) -> Result<()>,
-    call_borrowed: unsafe fn(usize, &crate::PeerId, &[u8]) -> Result<()>,
 }
 
 #[derive(Clone)]
@@ -581,25 +580,12 @@ impl PubSubIngressHandlerCell {
             handler.handle_pubsub_frame(authenticated_source_peer_id, payload)
         }
 
-        unsafe fn call_borrowed_impl<H>(
-            ptr: usize,
-            authenticated_source_peer_id: &crate::PeerId,
-            payload: &[u8],
-        ) -> Result<()>
-        where
-            H: crate::pubsub::PubSubIngressHandler + 'static,
-        {
-            let handler = unsafe { &*(ptr as *const H) };
-            handler.handle_pubsub_frame_borrowed(authenticated_source_peer_id, payload)
-        }
-
         let ptr = Arc::as_ptr(&handler) as usize;
         let owner: Arc<dyn crate::pubsub::PubSubIngressHandler> = handler;
         Self {
             owner,
             ptr,
             call: call_impl::<H>,
-            call_borrowed: call_borrowed_impl::<H>,
         }
     }
 
@@ -611,16 +597,6 @@ impl PubSubIngressHandlerCell {
     ) -> Result<()> {
         let _keepalive = &self.owner;
         unsafe { (self.call)(self.ptr, authenticated_source_peer_id, payload) }
-    }
-
-    #[inline]
-    pub(crate) fn handle_borrowed(
-        &self,
-        authenticated_source_peer_id: &crate::PeerId,
-        payload: &[u8],
-    ) -> Result<()> {
-        let _keepalive = &self.owner;
-        unsafe { (self.call_borrowed)(self.ptr, authenticated_source_peer_id, payload) }
     }
 }
 
@@ -637,56 +613,6 @@ pub struct PeerConnectHandlerCell {
 #[derive(Clone)]
 pub struct PeerLivenessHandlerCell {
     handler: Arc<dyn PeerLivenessHandler>,
-}
-
-#[cfg(feature = "unstable-udp-transport")]
-#[derive(Debug, Clone)]
-pub struct UdpFailureDetectorConfig {
-    pub health_probe_interval: Duration,
-    pub suspect_after_missed_probes: u32,
-    pub terminate_after_missed_probes: u32,
-    pub terminate_timeout: Duration,
-}
-
-#[cfg(feature = "unstable-udp-transport")]
-impl Default for UdpFailureDetectorConfig {
-    fn default() -> Self {
-        Self {
-            health_probe_interval: Duration::from_millis(300),
-            suspect_after_missed_probes: 2,
-            terminate_after_missed_probes: 4,
-            terminate_timeout: Duration::from_secs(3),
-        }
-    }
-}
-
-#[cfg(feature = "unstable-udp-transport")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UdpLivenessState {
-    Alive,
-    Suspect,
-    Terminated,
-}
-
-#[cfg(feature = "unstable-udp-transport")]
-#[derive(Debug, Clone)]
-struct UdpPeerLiveness {
-    state: UdpLivenessState,
-    missed_probes: u32,
-    last_probe_at_ms: u64,
-    suspect_since_ms: Option<u64>,
-}
-
-#[cfg(feature = "unstable-udp-transport")]
-impl UdpPeerLiveness {
-    fn alive(now_ms: u64) -> Self {
-        Self {
-            state: UdpLivenessState::Alive,
-            missed_probes: 0,
-            last_probe_at_ms: now_ms,
-            suspect_since_ms: None,
-        }
-    }
 }
 
 impl ActorResponse {
@@ -1409,18 +1335,6 @@ pub struct GossipRegistry<T = ()> {
     pub start_time: u64,
     pub start_instant: Instant,
 
-    // UDP datagram transport mode flag and liveness detector controls.
-    // Gated behind `unstable-udp-transport` (off by default): `udp_mode` was
-    // previously a `pub` field, letting external code holding `&mut
-    // GossipRegistry` bypass the fail-closed `enable_udp()` check entirely.
-    // Removing it from default builds closes that bypass outright.
-    #[cfg(feature = "unstable-udp-transport")]
-    pub udp_mode: bool,
-    #[cfg(feature = "unstable-udp-transport")]
-    pub udp_failure_detector_config: UdpFailureDetectorConfig,
-    #[cfg(feature = "unstable-udp-transport")]
-    udp_liveness: Arc<Mutex<HashMap<SocketAddr, UdpPeerLiveness>>>,
-
     /// Atomic shutdown flag for lock-free checking in hot paths
     pub shutdown: Arc<AtomicBool>,
 
@@ -1648,12 +1562,6 @@ impl<T: 'static> GossipRegistry<T> {
             config: config.clone(),
             start_time: current_timestamp(),
             start_instant: crate::current_instant(),
-            #[cfg(feature = "unstable-udp-transport")]
-            udp_mode: false,
-            #[cfg(feature = "unstable-udp-transport")]
-            udp_failure_detector_config: UdpFailureDetectorConfig::default(),
-            #[cfg(feature = "unstable-udp-transport")]
-            udp_liveness: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             actor_state: Arc::new(ActorState::default()),
             gossip_state: Arc::new(Mutex::new(GossipState {
@@ -1732,10 +1640,6 @@ impl<T: 'static> GossipRegistry<T> {
     /// Enable TLS for secure connections
     /// This must be called before starting the registry to enable TLS
     pub fn enable_tls(&mut self, secret_key: crate::SecretKey) -> Result<()> {
-        #[cfg(feature = "unstable-udp-transport")]
-        {
-            self.udp_mode = false;
-        }
         self.tls_config = Some(Arc::new(crate::tls::TlsConfig::with_peer_discovery(
             secret_key,
             self.config.enable_peer_discovery,
@@ -1753,169 +1657,6 @@ impl<T: 'static> GossipRegistry<T> {
         Err(GossipError::InvalidConfig(
             "Noise transport auth is not implemented in this build: refusing to fall back to unauthenticated plain stream transport".to_string(),
         ))
-    }
-
-    /// Enable UDP datagram transport mode.
-    ///
-    /// UDP transport is currently disabled until per-datagram peer
-    /// authentication (signature/MAC + anti-replay) is implemented, so this
-    /// unconditionally fails closed. Gated behind `unstable-udp-transport`
-    /// (off by default): the entire datagram transport code path is
-    /// otherwise dead weight in default builds.
-    #[cfg(feature = "unstable-udp-transport")]
-    pub fn enable_udp(&mut self, secret_key: crate::SecretKey) -> Result<()> {
-        let keypair = secret_key.to_keypair();
-        if keypair.peer_id() != self.peer_id {
-            return Err(GossipError::InvalidKeyPair(
-                "UDP transport keypair does not match registry peer id".to_string(),
-            ));
-        }
-
-        // UDP transport is currently disabled until per-datagram peer authentication
-        // (signature/MAC + anti-replay) is implemented.
-        self.udp_mode = false;
-        Err(GossipError::InvalidConfig(
-            "UDP datagram transport is disabled: authenticated datagram peer identity is not implemented".to_string(),
-        ))
-    }
-
-    #[cfg(feature = "unstable-udp-transport")]
-    fn udp_now_ms(&self) -> u64 {
-        self.start_instant.elapsed().as_millis() as u64
-    }
-
-    // Stubbed (rather than gating call sites) when the feature is off: every
-    // call site below is unconditional today because the fail-closed guard
-    // lives inside this function (`if !self.udp_mode { return; }`), and
-    // `udp_mode` can never be `true` in this build (the only setter,
-    // `enable_udp()`, is itself gated out). Keeping a no-op stub avoids
-    // duplicating those call sites per-feature.
-    #[cfg(feature = "unstable-udp-transport")]
-    async fn reset_udp_liveness_for_peer(&self, peer_addr: SocketAddr) {
-        if !self.udp_mode {
-            return;
-        }
-        let mut liveness = self.udp_liveness.lock().await;
-        liveness.insert(peer_addr, UdpPeerLiveness::alive(self.udp_now_ms()));
-    }
-
-    #[cfg(not(feature = "unstable-udp-transport"))]
-    async fn reset_udp_liveness_for_peer(&self, _peer_addr: SocketAddr) {}
-
-    /// Whether UDP datagram transport mode is active on this registry.
-    /// Always `false` when `unstable-udp-transport` is off: the `udp_mode`
-    /// field does not exist in that build.
-    #[cfg(feature = "unstable-udp-transport")]
-    pub(crate) fn udp_mode_enabled(&self) -> bool {
-        self.udp_mode
-    }
-
-    #[cfg(not(feature = "unstable-udp-transport"))]
-    pub(crate) fn udp_mode_enabled(&self) -> bool {
-        false
-    }
-
-    /// Run one UDP liveness detector cycle.
-    /// Any transition to `Terminated` emits the same disconnect path as stream transports.
-    #[cfg(feature = "unstable-udp-transport")]
-    pub async fn run_udp_failure_detector_once(&self) -> Result<usize> {
-        if !self.udp_mode {
-            return Ok(0);
-        }
-
-        let tracked_peers: Vec<SocketAddr> = {
-            let gossip_state = self.gossip_state.lock().await;
-            gossip_state.peers.keys().copied().collect()
-        };
-        if tracked_peers.is_empty() {
-            return Ok(0);
-        }
-
-        let now_ms = self.udp_now_ms();
-        let mut should_terminate = Vec::new();
-        {
-            let mut liveness = self.udp_liveness.lock().await;
-            for peer_addr in tracked_peers {
-                if self.connection_pool.has_connection(&peer_addr) {
-                    liveness.insert(peer_addr, UdpPeerLiveness::alive(now_ms));
-                    continue;
-                }
-
-                let peer_state = liveness
-                    .entry(peer_addr)
-                    .or_insert_with(|| UdpPeerLiveness::alive(now_ms));
-
-                if now_ms.saturating_sub(peer_state.last_probe_at_ms)
-                    < self
-                        .udp_failure_detector_config
-                        .health_probe_interval
-                        .as_millis() as u64
-                {
-                    continue;
-                }
-
-                peer_state.last_probe_at_ms = now_ms;
-                peer_state.missed_probes = peer_state.missed_probes.saturating_add(1);
-
-                if peer_state.state == UdpLivenessState::Alive
-                    && peer_state.missed_probes
-                        >= self.udp_failure_detector_config.suspect_after_missed_probes
-                {
-                    peer_state.state = UdpLivenessState::Suspect;
-                    peer_state.suspect_since_ms = Some(now_ms);
-                }
-
-                let suspect_timed_out = peer_state.suspect_since_ms.is_some_and(|since| {
-                    now_ms.saturating_sub(since)
-                        >= self
-                            .udp_failure_detector_config
-                            .terminate_timeout
-                            .as_millis() as u64
-                });
-
-                let should_term = peer_state.missed_probes
-                    >= self
-                        .udp_failure_detector_config
-                        .terminate_after_missed_probes
-                    || suspect_timed_out;
-                if peer_state.state != UdpLivenessState::Terminated && should_term {
-                    peer_state.state = UdpLivenessState::Terminated;
-                    should_terminate.push(peer_addr);
-                }
-            }
-        }
-
-        let mut terminated = 0usize;
-        for peer_addr in should_terminate.iter().copied() {
-            // Re-check connection state right before declaring the peer
-            // dead. Between the udp_liveness probe loop above and this
-            // point, a fresh connection (TCP fallback, reconnect
-            // attempt, inbound from peer) may have been established —
-            // if so we must not rip it down based on a stale liveness
-            // verdict.
-            if self.connection_pool.has_connection(&peer_addr) {
-                // Reset liveness so the next probe doesn't immediately
-                // re-fire on the same stale state.
-                let mut liveness = self.udp_liveness.lock().await;
-                liveness.insert(peer_addr, UdpPeerLiveness::alive(self.udp_now_ms()));
-                continue;
-            }
-            if let Err(err) = self.handle_peer_connection_failure(peer_addr).await {
-                warn!(
-                    peer = %peer_addr,
-                    error = %err,
-                    "udp detector failed to propagate terminated peer"
-                );
-            }
-            terminated += 1;
-        }
-
-        Ok(terminated)
-    }
-
-    #[cfg(not(feature = "unstable-udp-transport"))]
-    pub async fn run_udp_failure_detector_once(&self) -> Result<usize> {
-        Ok(0)
     }
 
     /// Track negotiated peer capabilities for a peer connection
@@ -2616,7 +2357,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Already connected -> reachable. Leave the connection alone: do not
             // re-dial (no storm) and do not reset liveness state (so gossip's own
             // dead-peer detection still fires). Data flows over this connection
-            // (UDP) at full speed.
+            // at full speed.
             if self
                 .connection_pool
                 .get_connected_connection_to_peer(&peer_id)
@@ -2629,7 +2370,7 @@ impl<T: 'static> GossipRegistry<T> {
             // No connection -> actively *establish* one now. This is what makes a
             // freshly-started peer connect immediately (rather than waiting for a
             // lazy gossip round) and what reconnects after a connection is lost.
-            // `connect_to_peer` establishes over UDP or TCP, reuses a healthy
+            // `connect_to_peer` establishes a TCP connection, reuses a healthy
             // pooled connection, and refreshes the gossip liveness state from the
             // result. Bounded so the 1Hz cadence holds even when a peer is down.
             let budget = self
@@ -4668,12 +4409,6 @@ impl<T: 'static> GossipRegistry<T> {
                         {
                             warn!(peer = %result.peer_addr, error = %err, "failed to handle gossip response");
                         }
-                    } else if self.udp_mode_enabled() {
-                        // UDP datagrams don't carry an explicit response
-                        // in this path; the UDP failure detector handles
-                        // liveness separately, so still refresh its
-                        // tracker.
-                        self.reset_udp_liveness_for_peer(result.peer_addr).await;
                     }
                 }
                 Err(err) => {
@@ -4745,7 +4480,7 @@ impl<T: 'static> GossipRegistry<T> {
             // kept sending but received nothing back for `peer_liveness_window`.
             // Tear down the now-stale connection so the very next send/connect
             // re-establishes a fresh one (self-correcting), and so
-            // `get_connected_connection_to_peer` stops reporting a dead UDP peer as
+            // `get_connected_connection_to_peer` stops reporting a dead peer as
             // connected. Only the transport connection is removed — actor state is
             // RETAINED so a reconnecting peer keeps its actors (a returning peer's
             // re-negotiation handshake replaces the entry even sooner via
@@ -5320,13 +5055,6 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
-            #[cfg(feature = "unstable-udp-transport")]
-            if self.udp_mode {
-                let mut liveness = self.udp_liveness.lock().await;
-                for peer_addr in &peers_to_cleanup {
-                    liveness.remove(peer_addr);
-                }
-            }
             for peer_addr in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
             }
@@ -5528,7 +5256,6 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             }
         }
-        self.reset_udp_liveness_for_peer(peer_addr).await;
     }
 
     /// Handle peer connection failure - start consensus process
@@ -6332,13 +6059,6 @@ impl<T: 'static> GossipRegistry<T> {
         // self-contained instead of relying on the deferred
         // `cleanup_dead_peers` pass.
         if !evicted_addrs.is_empty() {
-            #[cfg(feature = "unstable-udp-transport")]
-            if self.udp_mode {
-                let mut liveness = self.udp_liveness.lock().await;
-                for addr in &evicted_addrs {
-                    liveness.remove(addr);
-                }
-            }
             for addr in &evicted_addrs {
                 self.clear_peer_capabilities(addr);
             }
@@ -7508,7 +7228,6 @@ impl<T: 'static> GossipRegistry<T> {
             cell.handler.handle_peer_connect(addr, peer_id).await;
         }
 
-        self.reset_udp_liveness_for_peer(addr).await;
         self.trigger_immediate_peer_gossip();
     }
 
@@ -8040,26 +7759,6 @@ mod tests {
                 .contains("Noise transport auth is not implemented"),
             "unexpected error: {err}"
         );
-    }
-
-    #[cfg(feature = "unstable-udp-transport")]
-    #[test]
-    fn enable_udp_rejects_matching_keypair_until_datagrams_authenticate_peer_identity() {
-        let keypair = KeyPair::new_for_testing("udp-enabled-registry");
-        let mut config = test_config();
-        config.key_pair = Some(keypair.clone());
-        let mut registry = GossipRegistry::<()>::new(test_addr(0), config);
-
-        let err = registry
-            .enable_udp(keypair.to_secret_key())
-            .expect_err("UDP datagrams must stay disabled until peer identity is authenticated");
-
-        assert!(
-            err.to_string()
-                .contains("UDP datagram transport is disabled"),
-            "unexpected error: {err}"
-        );
-        assert!(!registry.udp_mode);
     }
 
     #[test]

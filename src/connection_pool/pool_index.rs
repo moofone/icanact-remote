@@ -23,8 +23,6 @@ pub struct ConnectionPool<T = ()> {
     message_buffer_pool: Arc<MessageBufferPool>,
     /// Shared aligned bytes pool for zero-copy receive buffers
     aligned_bytes_pool: Arc<crate::AlignedBytesPool>,
-    /// Shared UDP socket for datagram transport mode
-    udp_socket: ArcSwapOption<UdpSocket>,
     /// Connection counter for load balancing
     connection_counter: AtomicUsize,
     _marker: PhantomData<fn() -> T>,
@@ -66,8 +64,7 @@ impl PeerSession {
     }
 
     fn configured_addr(&self) -> Option<SocketAddr> {
-        self.route_addr()
-            .or_else(|| self.required_addr())
+        self.route_addr().or_else(|| self.required_addr())
     }
 
     fn set_configured_addr(&self, addr: SocketAddr) {
