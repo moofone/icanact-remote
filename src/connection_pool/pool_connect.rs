@@ -66,12 +66,22 @@ impl<T> ConnectionPool<T> {
         self.udp_socket.load_full()
     }
 
+    // UDP datagram transport gate. `GossipRegistry::udp_mode` only exists
+    // under `unstable-udp-transport`; when the feature is off, UDP is
+    // unconditionally disabled (matching `enable_udp()`'s permanent
+    // fail-closed behavior in that build).
+    #[cfg(feature = "unstable-udp-transport")]
     fn is_udp_transport_enabled(&self) -> bool {
         self.registry
             .load()
             .upgrade()
             .map(|registry| registry.udp_mode)
             .unwrap_or(false)
+    }
+
+    #[cfg(not(feature = "unstable-udp-transport"))]
+    fn is_udp_transport_enabled(&self) -> bool {
+        false
     }
 
     fn current_schema_hash(&self) -> Option<u64> {
@@ -172,7 +182,8 @@ impl<T> ConnectionPool<T> {
     }
 
     fn set_session_route_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
-        self.get_or_create_peer_session(peer_id).set_configured_addr(addr);
+        self.get_or_create_peer_session(peer_id)
+            .set_configured_addr(addr);
         let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
     }
 
@@ -288,7 +299,9 @@ impl<T> ConnectionPool<T> {
                     peer: peer_id.clone(),
                     addr: candidate.addr,
                     direction: match candidate.direction {
-                        ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
+                        ConnectionDirection::Inbound => {
+                            crate::lifecycle::TransportDirection::Inbound
+                        }
                         ConnectionDirection::Outbound => {
                             crate::lifecycle::TransportDirection::Outbound
                         }
@@ -792,7 +805,10 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
     ) -> Arc<CorrelationTracker> {
         let tracker = self.get_or_create_peer_session(peer_id).correlation.clone();
-        debug!("CONNECTION POOL: Got correlation tracker for peer {}", peer_id);
+        debug!(
+            "CONNECTION POOL: Got correlation tracker for peer {}",
+            peer_id
+        );
         tracker
     }
 
@@ -852,11 +868,25 @@ impl<T> ConnectionPool<T> {
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
     }
 
+    // Both of these are unreachable at runtime when `unstable-udp-transport`
+    // is off: every call site below is guarded by `is_udp_transport_enabled()`,
+    // which is hard-wired to `false` in that build. They still need to
+    // type-check, so the off-feature variant fails closed instead of calling
+    // into the gated `crate::transport` datagram runtime.
+    #[cfg(feature = "unstable-udp-transport")]
     fn try_send_udp_bytes_to_addr(&self, addr: SocketAddr, data: bytes::Bytes) -> Result<()> {
         let socket = self.udp_socket()?;
         crate::transport::try_send_bytes_to_addr(socket.as_ref(), addr, data)
     }
 
+    #[cfg(not(feature = "unstable-udp-transport"))]
+    fn try_send_udp_bytes_to_addr(&self, _addr: SocketAddr, _data: bytes::Bytes) -> Result<()> {
+        Err(GossipError::InvalidConfig(
+            "UDP datagram transport is not enabled in this build".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "unstable-udp-transport")]
     fn try_send_udp_parts_to_addr(
         &self,
         addr: SocketAddr,
@@ -865,6 +895,18 @@ impl<T> ConnectionPool<T> {
     ) -> Result<()> {
         let socket = self.udp_socket()?;
         crate::transport::try_send_parts_to_addr(socket.as_ref(), addr, header, payload)
+    }
+
+    #[cfg(not(feature = "unstable-udp-transport"))]
+    fn try_send_udp_parts_to_addr(
+        &self,
+        _addr: SocketAddr,
+        _header: bytes::Bytes,
+        _payload: bytes::Bytes,
+    ) -> Result<()> {
+        Err(GossipError::InvalidConfig(
+            "UDP datagram transport is not enabled in this build".to_string(),
+        ))
     }
 
     /// Send data to a peer by ID.
@@ -1148,12 +1190,13 @@ impl<T> ConnectionPool<T> {
             );
 
             let mut alias_addrs = Vec::new();
-            self.connections_by_addr.iter_sync(|alias_addr, alias_conn| {
-                if Arc::ptr_eq(alias_conn, &connection) {
-                    alias_addrs.push(*alias_addr);
-                }
-                true
-            });
+            self.connections_by_addr
+                .iter_sync(|alias_addr, alias_conn| {
+                    if Arc::ptr_eq(alias_conn, &connection) {
+                        alias_addrs.push(*alias_addr);
+                    }
+                    true
+                });
 
             let mut peer_ids = Vec::new();
             if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&addr) {
@@ -1195,8 +1238,11 @@ impl<T> ConnectionPool<T> {
     /// instance-guarded eviction — see [`Self::note_peer_ask_streak_timeout`]
     /// and [`Self::note_peer_ask_hard_fault`].
     pub(crate) fn current_peer_connection_instance(&self, peer_id: &crate::PeerId) -> Option<u64> {
-        self.get_connection_by_peer_id(peer_id)
-            .and_then(|conn| conn.stream_handle.as_ref().map(|handle| handle.instance_id()))
+        self.get_connection_by_peer_id(peer_id).and_then(|conn| {
+            conn.stream_handle
+                .as_ref()
+                .map(|handle| handle.instance_id())
+        })
     }
 
     /// Evict the peer's cached session, but only if the session currently
@@ -1388,11 +1434,11 @@ impl<T> ConnectionPool<T> {
     /// admission gate (`add_lock_free_connection`) sane even under accounting
     /// skew.
     fn decrement_connection_counter(&self) {
-        let _ = self.connection_counter.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |count| Some(count.saturating_sub(1)),
-        );
+        let _ =
+            self.connection_counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    Some(count.saturating_sub(1))
+                });
     }
 
     /// Get connection count - lock-free operation
@@ -1534,7 +1580,6 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         addr: SocketAddr,
     ) -> Result<ConnectionHandle<T>> {
-
         // First check if we already have any usable stream for this peer. This includes
         // inbound alias addresses, which are the preferred side for higher node IDs.
         if let Some(conn) = self.get_connection_by_peer_id(peer_id) {

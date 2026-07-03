@@ -164,6 +164,7 @@ impl<T> GossipRegistryHandle<T> {
                 let actual_bind_addr = listener.local_addr()?;
                 (Some(listener), None, actual_bind_addr)
             }
+            #[cfg(feature = "unstable-udp-transport")]
             TransportWireKind::UdpDatagram => {
                 let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
                 let actual_bind_addr = socket.local_addr()?;
@@ -783,6 +784,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, Default)]
     struct TestTlsBootstrap;
     struct TestNoopBootstrap;
+    #[cfg(feature = "unstable-udp-transport")]
     struct TestUdpBootstrap;
     struct TestRecoveringBootstrap;
 
@@ -856,6 +858,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "unstable-udp-transport")]
     impl RegistryTransportBootstrap for TestUdpBootstrap {
         fn stack_name(&self) -> &'static str {
             "test+udp"
@@ -1295,6 +1298,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "unstable-udp-transport")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn udp_datagram_transport_is_disabled_until_datagrams_authenticate_peer_identity() {
         let keypair = KeyPair::new_for_testing("udp-enabled");
@@ -1325,6 +1329,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unstable-udp-transport")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn udp_datagram_transport_rejects_mismatched_keypair() {
         let keypair = KeyPair::new_for_testing("udp-mismatch-config");
@@ -1944,6 +1949,28 @@ async fn send_peer_list_gossip_round(registry: Arc<GossipRegistry>, immediate: b
     }
 }
 
+/// Build the UDP liveness-detector probe timer, if UDP datagram transport is
+/// active. `unstable-udp-transport` off: `udp_mode` can never be `true` in
+/// this build (the only setter, `enable_udp()`, is itself gated out), so this
+/// always returns `None` — the timer is simply never created, matching
+/// today's fail-closed behavior without referencing the gated
+/// `udp_failure_detector_config` field.
+#[cfg(feature = "unstable-udp-transport")]
+fn build_udp_failure_timer(registry: &GossipRegistry) -> Option<tokio::time::Interval> {
+    if registry.udp_mode {
+        let mut t = interval(registry.udp_failure_detector_config.health_probe_interval);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(t)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "unstable-udp-transport"))]
+fn build_udp_failure_timer(_registry: &GossipRegistry) -> Option<tokio::time::Interval> {
+    None
+}
+
 async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     debug!("start_gossip_timer function called");
 
@@ -1951,13 +1978,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
     let cleanup_interval = registry.config.cleanup_interval;
     let vector_clock_gc_interval = registry.config.vector_clock_gc_frequency;
     let peer_gossip_interval = registry.config.peer_gossip_interval;
-    let mut udp_failure_timer = if registry.udp_mode {
-        let mut t = interval(registry.udp_failure_detector_config.health_probe_interval);
-        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        Some(t)
-    } else {
-        None
-    };
+    let mut udp_failure_timer = build_udp_failure_timer(&registry);
 
     let max_jitter = std::cmp::min(gossip_interval, Duration::from_millis(1000));
     let jitter_ms = if max_jitter.is_zero() {
@@ -1990,7 +2011,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
         cleanup_interval_secs = cleanup_interval.as_secs(),
         vector_clock_gc_interval_secs = vector_clock_gc_interval.as_secs(),
         peer_gossip_interval_secs = peer_gossip_interval.map(|i| i.as_secs()),
-        udp_failure_detector = registry.udp_mode,
+        udp_failure_detector = registry.udp_mode_enabled(),
         "gossip timer started with non-blocking I/O"
     );
 

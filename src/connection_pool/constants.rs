@@ -1,6 +1,102 @@
 const UDP_MAX_DATAGRAM_SIZE: usize = 65_507;
 
+// When `unstable-udp-transport` is disabled (the default), no value of this
+// type can ever be constructed (the only producer, `ConnectionHandle::new_udp`,
+// is itself feature-gated), so it is aliased to a locally-defined uninhabited
+// type carrying inherent stub methods matching `TransportDatagramWriter`'s
+// shape. This lets `ConnectionHandle`'s `udp_writer: Option<UdpTransportWriter>`
+// field and its handful of `if let Some(udp_writer) = ...` fallback branches
+// keep compiling unchanged (always observing `None` at runtime, exactly
+// matching today's fail-closed behavior) without pulling the gated
+// `TransportDatagramWriterDyn` trait facade into default builds. The method
+// bodies are unreachable (`match *self {}` on a zero-variant enum), never
+// executed.
+#[cfg(feature = "unstable-udp-transport")]
 type UdpTransportWriter = Arc<dyn crate::transport::TransportDatagramWriterDyn>;
+
+#[cfg(not(feature = "unstable-udp-transport"))]
+#[derive(Debug, Clone)]
+enum NeverUdpWriter {}
+
+#[cfg(not(feature = "unstable-udp-transport"))]
+impl NeverUdpWriter {
+    async fn send_bytes(&self, _datagram: bytes::Bytes) -> Result<()> {
+        match *self {}
+    }
+
+    async fn send_header_and_payload16(
+        &self,
+        _header: [u8; 16],
+        _header_len: u8,
+        _payload: bytes::Bytes,
+    ) -> Result<()> {
+        match *self {}
+    }
+
+    async fn send_header_and_payload32(
+        &self,
+        _header: [u8; 32],
+        _payload: bytes::Bytes,
+    ) -> Result<()> {
+        match *self {}
+    }
+
+    fn try_send_header_and_payload16(
+        &self,
+        _header: [u8; 16],
+        _header_len: u8,
+        _payload: bytes::Bytes,
+    ) -> Result<()> {
+        match *self {}
+    }
+
+    fn try_send_header_and_payload32(
+        &self,
+        _header: [u8; 32],
+        _payload: bytes::Bytes,
+    ) -> Result<()> {
+        match *self {}
+    }
+
+    async fn send_header_prefix_pooled(
+        &self,
+        _header: [u8; 16],
+        _header_len: u8,
+        _prefix: Option<[u8; 16]>,
+        _payload: crate::typed::PooledPayload,
+    ) -> Result<()> {
+        match *self {}
+    }
+
+    fn try_send_header_prefix_pooled(
+        &self,
+        _header: [u8; 16],
+        _header_len: u8,
+        _prefix: Option<[u8; 16]>,
+        _payload: crate::typed::PooledPayload,
+    ) -> Result<()> {
+        match *self {}
+    }
+
+    fn try_send_pooled_datagram(&self, _datagram: crate::typed::PooledPayload) -> Result<()> {
+        match *self {}
+    }
+
+    async fn send_bytes_vectored(
+        &self,
+        _header: bytes::Bytes,
+        _payload: bytes::Bytes,
+    ) -> Result<()> {
+        match *self {}
+    }
+
+    fn try_send_chunks(&self, _chunks: &[bytes::Bytes]) -> Result<()> {
+        match *self {}
+    }
+}
+
+#[cfg(not(feature = "unstable-udp-transport"))]
+type UdpTransportWriter = NeverUdpWriter;
 
 // ==== SINGLE SOURCE OF TRUTH FOR ALL BUFFER SIZES ====
 // THIS is the ONLY place we define the master buffer size!
