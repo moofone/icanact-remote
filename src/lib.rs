@@ -174,7 +174,8 @@ impl PublicKey {
 
     /// Convert to PeerId
     pub fn to_peer_id(&self) -> PeerId {
-        PeerId::from_bytes(self.as_bytes()).expect("NodeId should always convert to valid PeerId")
+        PeerId::from_bytes(self.as_bytes())
+            .expect("GossipNodeId should always convert to valid PeerId")
     }
 }
 
@@ -230,8 +231,15 @@ impl<'de> Deserialize<'de> for PublicKey {
     }
 }
 
-/// Node identifier - alias for PublicKey (like Iroh)
-pub type NodeId = PublicKey;
+/// Gossip-registry / vector-clock identity - alias for PublicKey (like Iroh).
+///
+/// This is the key used in [`VectorClock`] and [`RemoteActorLocation`] to
+/// track per-node causal history in the actor-location gossip registry. It is
+/// intentionally NOT named `NodeId` (its pre-rename name): membership's stable
+/// `NodeId` (actor-framework-core's SWIM membership module) is a distinct,
+/// unrelated identity space -- a cluster-membership identity, not a
+/// vector-clock/gossip key. Do not conflate the two.
+pub type GossipNodeId = PublicKey;
 
 /// Secret key for node identity - Ed25519 signing key with secure cleanup
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -310,7 +318,7 @@ pub struct VectorClock {
     // `ArcSwap` gives us lock-free reads with copy-on-write updates. This keeps
     // VectorClock mutation APIs (`&self`) usable throughout the codebase while
     // avoiding lock-based maps.
-    clocks: ArcSwap<BTreeMap<NodeId, u64>>,
+    clocks: ArcSwap<BTreeMap<GossipNodeId, u64>>,
 }
 
 impl Clone for VectorClock {
@@ -331,7 +339,7 @@ impl VectorClock {
         }
     }
 
-    pub fn with_node(node_id: NodeId) -> Self {
+    pub fn with_node(node_id: GossipNodeId) -> Self {
         let mut map = BTreeMap::new();
         map.insert(node_id, 0);
         Self {
@@ -340,7 +348,7 @@ impl VectorClock {
     }
 
     /// Increment the clock for a specific node.
-    pub fn increment(&self, node_id: NodeId) {
+    pub fn increment(&self, node_id: GossipNodeId) {
         // Copy-on-write update: clone the small map and CAS it in.
         loop {
             let current = self.clocks.load();
@@ -407,7 +415,7 @@ impl VectorClock {
     }
 
     /// Garbage collect entries for nodes not seen recently (thread-safe)
-    pub fn gc_old_nodes(&self, active_nodes: &std::collections::HashSet<NodeId>) {
+    pub fn gc_old_nodes(&self, active_nodes: &std::collections::HashSet<GossipNodeId>) {
         loop {
             let current = self.clocks.load();
             if current.is_empty() {
@@ -443,7 +451,8 @@ impl VectorClock {
             }
 
             // Collect all entries and sort by clock value desc (drop small entries first).
-            let mut entries: Vec<(NodeId, u64)> = current.iter().map(|(k, v)| (*k, *v)).collect();
+            let mut entries: Vec<(GossipNodeId, u64)> =
+                current.iter().map(|(k, v)| (*k, *v)).collect();
             entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             entries.truncate(max_size);
 
@@ -460,7 +469,7 @@ impl VectorClock {
     }
 
     /// Convert to a sorted Vec for serialization
-    fn to_vec(&self) -> Vec<(NodeId, u64)> {
+    fn to_vec(&self) -> Vec<(GossipNodeId, u64)> {
         self.clocks
             .load()
             .iter()
@@ -469,7 +478,7 @@ impl VectorClock {
     }
 
     /// Create from a Vec (used in deserialization)
-    fn from_vec(vec: Vec<(NodeId, u64)>) -> Self {
+    fn from_vec(vec: Vec<(GossipNodeId, u64)>) -> Self {
         let mut clocks = BTreeMap::new();
         for (node_id, clock) in vec {
             clocks.insert(node_id, clock);
@@ -480,7 +489,7 @@ impl VectorClock {
     }
 
     /// Get the clock value for a specific node
-    pub fn get(&self, node_id: &NodeId) -> u64 {
+    pub fn get(&self, node_id: &GossipNodeId) -> u64 {
         self.clocks.load().get(node_id).copied().unwrap_or(0)
     }
 
@@ -500,7 +509,7 @@ impl VectorClock {
     }
 
     /// Get all nodes referenced in this vector clock
-    pub fn get_nodes(&self) -> std::collections::HashSet<NodeId> {
+    pub fn get_nodes(&self) -> std::collections::HashSet<GossipNodeId> {
         self.clocks.load().keys().copied().collect()
     }
 
@@ -545,7 +554,7 @@ impl std::hash::Hash for VectorClock {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
 #[rkyv(derive(Debug))]
 pub struct VectorClockData {
-    pub clocks: Vec<(NodeId, u64)>,
+    pub clocks: Vec<(GossipNodeId, u64)>,
 }
 
 impl From<&VectorClock> for VectorClockData {
@@ -770,9 +779,9 @@ impl PeerId {
         })
     }
 
-    /// Convert to NodeId (which is just an alias for PublicKey)
-    pub fn to_node_id(&self) -> NodeId {
-        NodeId::from_bytes(&self.0).expect("PeerId should always be a valid NodeId")
+    /// Convert to GossipNodeId (which is just an alias for PublicKey)
+    pub fn to_node_id(&self) -> GossipNodeId {
+        GossipNodeId::from_bytes(&self.0).expect("PeerId should always be a valid GossipNodeId")
     }
 }
 
@@ -871,10 +880,10 @@ impl<T: 'static> Peer<T> {
             let current_time_ms = crate::current_timestamp_millis();
             let peers_before = gossip_state.peers.len();
 
-            // Convert PeerId to NodeId for TLS
+            // Convert PeerId to GossipNodeId for TLS
             let node_id = Some(self.peer_id.to_node_id());
             if node_id.is_some() {
-                tracing::debug!("🔐 Converted PeerId {} to NodeId for TLS", self.peer_id);
+                tracing::debug!("🔐 Converted PeerId {} to GossipNodeId for TLS", self.peer_id);
             }
 
             gossip_state.peers.insert(
@@ -884,7 +893,7 @@ impl<T: 'static> Peer<T> {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
-                    node_id,                    // Set the NodeId for TLS verification
+                    node_id,                    // Set the GossipNodeId for TLS verification
                     dns_name: None,             // Will be set via set_dns_name() if needed
                     failures: 0,                // Start with 0 failures
                     last_attempt: current_time, // Set last_attempt to now

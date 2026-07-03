@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("icanact_remote=debug,test_tls_with_node_id=info")
         .init();
 
-    info!("Starting TLS test with NodeId mapping for outgoing connections");
+    info!("Starting TLS test with GossipNodeId mapping for outgoing connections");
 
     // Create two nodes with their own secret keys
     let secret_key_a = SecretKey::generate();
@@ -62,20 +62,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     info!("Registered test_actor on Node A at {}", actor_addr);
 
-    // Add peers WITH NodeId for proper TLS verification
+    // Add peers WITH GossipNodeId for proper TLS verification
     // Node A knows about Node B
     registry_a
         .registry
         .add_peer_with_node_id(addr_b, Some(node_id_b))
         .await;
-    info!("Node A added Node B as peer with NodeId");
+    info!("Node A added Node B as peer with GossipNodeId");
 
     // Node B knows about Node A
     registry_b
         .registry
         .add_peer_with_node_id(addr_a, Some(node_id_a))
         .await;
-    info!("Node B added Node A as peer with NodeId");
+    info!("Node B added Node A as peer with GossipNodeId");
 
     // Wait for gossip to propagate
     info!("Waiting for TLS-encrypted gossip to propagate...");
@@ -119,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Local actors: {}", stats_b.local_actors);
     info!("  Known actors: {}", stats_b.known_actors);
 
-    // Test outgoing connection with wrong NodeId (should fail)
-    info!("\n--- Testing TLS verification with wrong NodeId ---");
+    // Test outgoing connection with wrong GossipNodeId (should fail)
+    info!("\n--- Testing TLS verification with wrong GossipNodeId ---");
 
     // Create a third node
     let secret_key_c = SecretKey::generate();
@@ -135,29 +135,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     info!("Node C started with ID: {}", node_id_c.fmt_short());
 
-    // Node A tries to connect to Node C but with wrong NodeId (Node B's ID)
+    // Node A tries to connect to Node C but with wrong GossipNodeId (Node B's ID)
     registry_a
         .registry
         .add_peer_with_node_id(addr_c, Some(node_id_b))
         .await;
-    info!("Node A added Node C with WRONG NodeId (using Node B's ID)");
+    info!("Node A added Node C with WRONG GossipNodeId (using Node B's ID)");
 
     // Wait a bit for connection attempt
     sleep(Duration::from_secs(3)).await;
 
-    // Check stats - Node C should not be connected due to NodeId mismatch
+    // Check stats - Node C should not be connected due to GossipNodeId mismatch
     let stats_a_after = registry_a.stats().await;
     if stats_a_after.failed_peers > stats_a.failed_peers {
-        info!("✅ TLS verification working: Connection to Node C failed due to NodeId mismatch");
+        info!(
+            "✅ TLS verification working: Connection to Node C failed due to GossipNodeId mismatch"
+        );
     } else {
         info!("⚠️  Connection status unclear - may need more time for verification");
     }
 
-    info!("\n✅ TLS with NodeId mapping test complete!");
+    info!("\n✅ TLS with GossipNodeId mapping test complete!");
     info!("Summary:");
-    info!("- Nodes can connect with TLS when NodeId is provided and correct");
+    info!("- Nodes can connect with TLS when GossipNodeId is provided and correct");
     info!("- Gossip propagates over TLS-encrypted connections");
-    info!("- Wrong NodeId prevents TLS handshake (security feature working)");
+    info!("- Wrong GossipNodeId prevents TLS handshake (security feature working)");
 
     Ok(())
 }

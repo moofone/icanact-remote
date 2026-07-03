@@ -21,7 +21,7 @@ static BAD_CLIENT_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 async fn connect_tls(
     server_addr: SocketAddr,
-    server_node_id: icanact_remote::NodeId,
+    server_node_id: icanact_remote::GossipNodeId,
 ) -> (
     tokio_rustls::client::TlsStream<TcpStream>,
     icanact_remote::PeerId,

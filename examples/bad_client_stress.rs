@@ -187,7 +187,7 @@ fn build_actor_ask_frame(
 
 async fn connect_tls(
     server_addr: SocketAddr,
-    server_node_id: icanact_remote::NodeId,
+    server_node_id: icanact_remote::GossipNodeId,
 ) -> tokio_rustls::client::TlsStream<TcpStream> {
     let client_secret = SecretKey::generate();
     let tls = tls::TlsConfig::new(client_secret).expect("tls config");

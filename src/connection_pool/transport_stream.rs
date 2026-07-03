@@ -6,7 +6,7 @@ impl<T> ConnectionPool<T> {
     pub(super) async fn connect_via_stream(
         &self,
         mut addr: SocketAddr,
-        resolved_node_id: Option<crate::NodeId>,
+        resolved_node_id: Option<crate::GossipNodeId>,
         max_connections: usize,
         connection_timeout: Duration,
         registry_weak: std::sync::Weak<GossipRegistry>,
@@ -224,7 +224,7 @@ impl<T> ConnectionPool<T> {
                         let dns_name = crate::tls::name::encode(&node_id);
                         let server_name = rustls::pki_types::ServerName::try_from(dns_name)
                             .map_err(|e| GossipError::TlsError(format!("Invalid DNS name: {}", e)))?;
-                        (server_name, format!("NodeId {}", node_id.fmt_short()))
+                        (server_name, format!("GossipNodeId {}", node_id.fmt_short()))
                     } else {
                         let placeholder = format!("peer-{}.icanact.invalid", addr.port());
                         let server_name = rustls::pki_types::ServerName::try_from(placeholder.clone())
@@ -233,7 +233,7 @@ impl<T> ConnectionPool<T> {
                             })?;
                         (
                             server_name,
-                            format!("placeholder SNI {} (NodeId unknown)", placeholder),
+                            format!("placeholder SNI {} (GossipNodeId unknown)", placeholder),
                         )
                     };
 
@@ -336,9 +336,9 @@ impl<T> ConnectionPool<T> {
                             addr,
                             tls_stream,
                             registry_weak.clone(),
-                            // R2: bind the connection identity to the NodeId we
+                            // R2: bind the connection identity to the GossipNodeId we
                             // extracted from the peer's verified TLS cert when no
-                            // NodeId was pinned (bootstrap/placeholder-SNI dials).
+                            // GossipNodeId was pinned (bootstrap/placeholder-SNI dials).
                             discovered_node_id,
                         )
                         .await;

@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use tokio::net as tokio_net;
 
 use crate::{
-    GossipConfig, NodeId, PeerId, Result, SecretKey, config::ConnectionRecoveryPolicy,
+    GossipConfig, GossipNodeId, PeerId, Result, SecretKey, config::ConnectionRecoveryPolicy,
     handshake::PeerCapabilities, registry::GossipRegistry,
 };
 
@@ -21,7 +21,7 @@ pub struct TargetAddr {
 #[derive(Debug, Clone, Default)]
 pub struct AuthContext {
     pub peer_id: Option<PeerId>,
-    pub node_id: Option<NodeId>,
+    pub node_id: Option<GossipNodeId>,
     pub session_binding: Option<[u8; 32]>,
     pub capabilities: Option<PeerCapabilities>,
 }

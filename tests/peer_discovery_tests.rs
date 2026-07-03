@@ -877,7 +877,7 @@ fn test_partition_heal_behavior() -> Result<(), DynError> {
 }
 
 /// Scenario 16: Identity verification via TLS
-/// Verify that NodeId is determined by TLS handshake, not gossip
+/// Verify that GossipNodeId is determined by TLS handshake, not gossip
 #[test]
 fn test_identity_tls_verification() -> Result<(), DynError> {
     run_peer_discovery_test(async {

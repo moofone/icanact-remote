@@ -4,7 +4,9 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
-use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey, NodeId, RegistrationPriority};
+use icanact_remote::{
+    GossipConfig, GossipNodeId, GossipRegistryHandle, RegistrationPriority, SecretKey,
+};
 use tracing::{info, warn, error};
 
 /// TLS-enabled secure server with Ed25519 certificate verification
@@ -34,7 +36,7 @@ async fn main() -> Result<()> {
     let server_secret = load_or_generate_tls_key(server_key_path).await?;
     let server_node_id = server_secret.public();
     
-    println!("   Server NodeId: {}", server_node_id.fmt_short());
+    println!("   Server GossipNodeId: {}", server_node_id.fmt_short());
     println!("   Server TLS key loaded from: {}\n", server_key_path);
     
     // 2. Save server public key for clients
@@ -54,7 +56,7 @@ async fn main() -> Result<()> {
     icanact_remote::BuilderTlsBootstrap).await?;
     
     println!("   ✅ Server listening on: {}", server_addr);
-    println!("   ✅ Server NodeId: {}", server_node_id.fmt_short());
+    println!("   ✅ Server GossipNodeId: {}", server_node_id.fmt_short());
     println!("   ✅ TLS 1.3 encryption: ENABLED");
     println!("   ✅ Ed25519 certificates: ACTIVE\n");
     
@@ -96,7 +98,7 @@ async fn main() -> Result<()> {
             let stats = registry.registry.get_stats().await;
             println!("   📊 TLS Server Status:");
             println!("      - Listening on: {}", server_addr);
-            println!("      - Server NodeId: {}", server_node_id.fmt_short());
+            println!("      - Server GossipNodeId: {}", server_node_id.fmt_short());
             println!("      - TLS peers: {}", stats.active_peers);
             println!("      - TLS 1.3: ENABLED");
             println!("      - Services: secure_chat_service");

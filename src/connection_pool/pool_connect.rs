@@ -753,7 +753,7 @@ impl<T> ConnectionPool<T> {
     /// Unlike [`get_peer_id_by_addr`](Self::get_peer_id_by_addr) — which only
     /// sees addresses we have already connected to (`addr_to_peer_id`) — this
     /// consults the *configured* peer map (`peer_id_to_addr`). It lets the very
-    /// first TLS dial to a configured peer pin the expected NodeId in its SNI
+    /// first TLS dial to a configured peer pin the expected GossipNodeId in its SNI
     /// rather than falling back to an unauthenticated placeholder.
     pub(crate) fn configured_peer_id_for_addr(&self, addr: &SocketAddr) -> Option<crate::PeerId> {
         let mut found = None;
@@ -1553,11 +1553,11 @@ impl<T> ConnectionPool<T> {
             peer_id, addr
         );
 
-        // Convert PeerId to NodeId for TLS
+        // Convert PeerId to GossipNodeId for TLS
         let node_id_for_tls = Some(peer_id.to_node_id());
 
         // Create the connection and store it by node ID
-        // Pass the NodeId so TLS can work even if gossip state doesn't have it yet
+        // Pass the GossipNodeId so TLS can work even if gossip state doesn't have it yet
         let handle = self
             .get_connection_with_node_id(addr, node_id_for_tls)
             .await?;
@@ -1592,7 +1592,7 @@ impl<T> ConnectionPool<T> {
     pub(crate) async fn get_connection_with_node_id(
         &self,
         addr: SocketAddr,
-        node_id: Option<crate::NodeId>,
+        node_id: Option<crate::GossipNodeId>,
     ) -> Result<ConnectionHandle<T>> {
         let _current_time = current_timestamp();
         // Debug logging removed for performance - these logs were too verbose
@@ -1694,14 +1694,14 @@ impl<T> ConnectionPool<T> {
         addr: SocketAddr,
         stream: S,
         registry_weak: std::sync::Weak<GossipRegistry>,
-        tofu_node_id: Option<crate::NodeId>,
+        tofu_node_id: Option<crate::GossipNodeId>,
     ) -> Result<ConnectionHandle<T>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         // Determine peer ID (if known) before creating the stream handle.
         //
-        // R2 (TLS identity binding): when no NodeId was pinned for this address,
+        // R2 (TLS identity binding): when no GossipNodeId was pinned for this address,
         // the caller passes the identity it extracted from the peer's
         // signature-verified TLS certificate (`tofu_node_id`). We bind the
         // connection's `embedded_peer_id` to that learned identity so every

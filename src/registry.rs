@@ -22,7 +22,7 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    GossipConfig, GossipError, NodeId, PeerHealthMode, PeerId, RegistrationPriority,
+    GossipConfig, GossipError, GossipNodeId, PeerHealthMode, PeerId, RegistrationPriority,
     RemoteActorLocation, Result,
     connection_pool::ConnectionPool,
     current_timestamp,
@@ -101,7 +101,7 @@ fn stable_concurrent_location_wins(
 
 #[inline]
 fn stable_concurrent_removal_wins(
-    removing_node_id: &crate::NodeId,
+    removing_node_id: &crate::GossipNodeId,
     removal_clock: &crate::VectorClock,
     existing: &RemoteActorLocation,
 ) -> bool {
@@ -109,7 +109,7 @@ fn stable_concurrent_removal_wins(
 
     // Stable total order for concurrent removal vs existing state.
     // Compare vector-clocks by their sorted representation first, then node IDs.
-    // (VectorClock::to_vec is stable-sorted by NodeId.)
+    // (VectorClock::to_vec is stable-sorted by GossipNodeId.)
     match removal_clock.to_vec().cmp(&existing.vector_clock.to_vec()) {
         Ordering::Greater => true,
         Ordering::Less => false,
@@ -833,7 +833,7 @@ pub enum RegistryChange {
     ActorRemoved {
         name: String,
         vector_clock: crate::VectorClock,
-        removing_node_id: crate::NodeId, // Node that performed the removal
+        removing_node_id: crate::GossipNodeId, // Node that performed the removal
         priority: RegistrationPriority,
     },
 }
@@ -1161,7 +1161,8 @@ pub struct PeerInfo {
     pub inbound_observed: bool,
     /// Whether this node has ever established an outbound dial to this peer.
     pub outbound_dial_success: bool,
-    pub node_id: Option<crate::NodeId>, // NodeId for TLS verification (may be learned on connect)
+    // GossipNodeId for TLS verification (may be learned on connect).
+    pub node_id: Option<crate::GossipNodeId>,
     /// DNS name for this peer (e.g., "data-feeder-icanact:9400").
     /// When set, the address will be re-resolved via DNS on reconnection attempts.
     /// This handles Kubernetes pod restarts where the IP changes but DNS stays the same.
@@ -1305,8 +1306,8 @@ pub struct PeerInfoGossip {
     pub address: String,
     /// Actual connection address if different (NAT)
     pub peer_address: Option<String>,
-    /// NodeId for TLS verification
-    pub node_id: Option<crate::NodeId>,
+    /// GossipNodeId for TLS verification
+    pub node_id: Option<crate::GossipNodeId>,
     /// Number of consecutive failures
     pub failures: usize,
     /// Last connection attempt timestamp
@@ -1420,8 +1421,8 @@ pub struct GossipRegistry<T = ()> {
     pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
-        Arc<SccHashMap<crate::NodeId, crate::handshake::PeerCapabilities>>,
-    pub peer_capability_addr_to_node: Arc<SccHashMap<SocketAddr, crate::NodeId>>,
+        Arc<SccHashMap<crate::GossipNodeId, crate::handshake::PeerCapabilities>>,
+    pub peer_capability_addr_to_node: Arc<SccHashMap<SocketAddr, crate::GossipNodeId>>,
     clock_probe_state: Arc<SccHashMap<SocketAddr, PeerClockProbeState>>,
     pending_clock_probes: Arc<SccHashMap<u64, PendingClockProbe>>,
     pending_clock_echoes: Arc<SccHashMap<SocketAddr, PendingClockEcho>>,
@@ -1865,8 +1866,12 @@ impl<T: 'static> GossipRegistry<T> {
         let _ = self.peer_capabilities.upsert_sync(addr, caps);
     }
 
-    /// Attach capabilities recorded for an address to a specific NodeId (once known)
-    pub async fn associate_peer_capabilities_with_node(&self, addr: SocketAddr, node_id: NodeId) {
+    /// Attach capabilities recorded for an address to a specific GossipNodeId (once known)
+    pub async fn associate_peer_capabilities_with_node(
+        &self,
+        addr: SocketAddr,
+        node_id: GossipNodeId,
+    ) {
         let caps = self.peer_capabilities.read_sync(&addr, |_, v| *v);
         if let Some(caps) = caps {
             let _ = self.peer_capabilities_by_node.upsert_sync(node_id, caps);
@@ -2131,7 +2136,7 @@ impl<T: 'static> GossipRegistry<T> {
         );
     }
 
-    async fn propagate_node_id_to_known_addresses(&self, addr: SocketAddr, node_id: NodeId) {
+    async fn propagate_node_id_to_known_addresses(&self, addr: SocketAddr, node_id: GossipNodeId) {
         // Only track in known_peers if peer discovery is enabled
         if !self.config.enable_peer_discovery {
             return;
@@ -2413,11 +2418,11 @@ impl<T: 'static> GossipRegistry<T> {
         self.add_peer_with_node_id(peer_addr, None).await;
     }
 
-    /// Add a new peer with NodeId for TLS verification
+    /// Add a new peer with GossipNodeId for TLS verification
     pub async fn add_peer_with_node_id(
         &self,
         peer_addr: SocketAddr,
-        node_id: Option<crate::NodeId>,
+        node_id: Option<crate::GossipNodeId>,
     ) {
         debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
         if peer_addr.ip().is_unspecified() || peer_addr.port() == 0 {
@@ -2433,10 +2438,10 @@ impl<T: 'static> GossipRegistry<T> {
 
                 // Check if we already have this peer
                 if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
-                    // Update NodeId if provided and not already set
+                    // Update GossipNodeId if provided and not already set
                     if node_id.is_some() && existing_peer.node_id.is_none() {
                         existing_peer.node_id = node_id;
-                        debug!(peer = %peer_addr, "updated existing peer with NodeId");
+                        debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
                     } else {
                         debug!(peer = %peer_addr, "peer already tracked");
                     }
@@ -2490,7 +2495,7 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             } // Lock dropped
 
-            // Safely update connection pool if we have a NodeId
+            // Safely update connection pool if we have a GossipNodeId
             // This is critical for TLS connections to work (get_connection_to_peer needs this mapping)
             if let Some(id) = node_id {
                 let peer_id = id.to_peer_id();
@@ -3987,7 +3992,7 @@ impl<T: 'static> GossipRegistry<T> {
         &self,
         name: &str,
         vector_clock: &crate::VectorClock,
-        removing_node_id: &crate::NodeId,
+        removing_node_id: &crate::GossipNodeId,
     ) -> Option<(crate::VectorClock, bool)> {
         if self.actor_state.local_actors.contains_sync(name) {
             debug!(
@@ -4288,15 +4293,15 @@ impl<T: 'static> GossipRegistry<T> {
             }
 
             // Filter to retry-eligible, non-suppressed peers and deduplicate
-            // by stable identity (NodeId) so a physical peer that is tracked
+            // by stable identity (GossipNodeId) so a physical peer that is tracked
             // under multiple SocketAddr keys — ephemeral TCP-source still
             // present alongside its migrated bind address, dual-stack
             // IPv4/IPv6 aliases, DNS-resolved hostnames — receives one
-            // delivery per round. Peers whose NodeId is not yet known
+            // delivery per round. Peers whose GossipNodeId is not yet known
             // continue to be keyed by SocketAddr.
             #[derive(Hash, Eq, PartialEq)]
             enum DispatchKey {
-                Node(crate::NodeId),
+                Node(crate::GossipNodeId),
                 Addr(SocketAddr),
             }
             let mut seen: std::collections::HashSet<DispatchKey> = std::collections::HashSet::new();
@@ -6301,7 +6306,7 @@ impl<T: 'static> GossipRegistry<T> {
     ) -> Vec<SocketAddr> {
         #[derive(Hash, Eq, PartialEq)]
         enum DispatchKey {
-            Node(crate::NodeId),
+            Node(crate::GossipNodeId),
             Addr(SocketAddr),
         }
 
@@ -7305,9 +7310,12 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// Lookup advertised address for a NodeId
+    /// Lookup advertised address for a GossipNodeId
     /// First checks active peers, then falls back to known_peers
-    pub async fn lookup_advertised_addr(&self, node_id: &crate::NodeId) -> Option<SocketAddr> {
+    pub async fn lookup_advertised_addr(
+        &self,
+        node_id: &crate::GossipNodeId,
+    ) -> Option<SocketAddr> {
         let gossip_state = self.gossip_state.lock().await;
 
         // First check active peers
@@ -7327,9 +7335,9 @@ impl<T: 'static> GossipRegistry<T> {
         None
     }
 
-    /// Lookup NodeId for a given address (active peers first, then known_peers, then
+    /// Lookup GossipNodeId for a given address (active peers first, then known_peers, then
     /// direct routing configuration).
-    pub async fn lookup_node_id(&self, addr: &SocketAddr) -> Option<crate::NodeId> {
+    pub async fn lookup_node_id(&self, addr: &SocketAddr) -> Option<crate::GossipNodeId> {
         let mut gossip_state = self.gossip_state.lock().await;
 
         if let Some(peer_info) = gossip_state.peers.get(addr)
@@ -7347,10 +7355,10 @@ impl<T: 'static> GossipRegistry<T> {
         drop(gossip_state);
 
         // Full-sync actor locations are configured as direct routes rather than
-        // gossip peers. Still derive the expected NodeId from that pinned PeerId
+        // gossip peers. Still derive the expected GossipNodeId from that pinned PeerId
         // so address-based TLS dials cannot fall back to placeholder SNI. Fall
         // back to the configured peer map so even the *first* dial to a
-        // configured-but-not-yet-connected peer pins its NodeId.
+        // configured-but-not-yet-connected peer pins its GossipNodeId.
         self.connection_pool
             .get_peer_id_by_addr(addr)
             .or_else(|| self.connection_pool.configured_peer_id_for_addr(addr))
@@ -7366,7 +7374,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// First checks active connections, then uses known_peers to look up the address.
     pub async fn ensure_connection_for_actor(
         &self,
-        node_id: &crate::NodeId,
+        node_id: &crate::GossipNodeId,
     ) -> Result<crate::connection_pool::ConnectionHandle<T>> {
         // Check if we have an active connection to the node already
         if let Some(addr) = self.lookup_advertised_addr(node_id).await {
@@ -7570,9 +7578,9 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Duplicate connection tie-breaker
-    /// When both nodes try to connect simultaneously, use NodeId comparison:
-    /// - Lower NodeId keeps outbound connection
-    /// - Higher NodeId keeps inbound connection
+    /// When both nodes try to connect simultaneously, use GossipNodeId comparison:
+    /// - Lower GossipNodeId keeps outbound connection
+    /// - Higher GossipNodeId keeps inbound connection
     ///
     /// Returns true if this connection should be kept.
     pub fn should_keep_connection(
@@ -7596,7 +7604,11 @@ impl<T: 'static> GossipRegistry<T> {
             std::cmp::Ordering::Greater => !is_outbound,
             std::cmp::Ordering::Equal => {
                 // Same node ID shouldn't happen in practice
-                warn!(local = %local_id, remote = %remote_id, "duplicate connection from same NodeId");
+                warn!(
+                    local = %local_id,
+                    remote = %remote_id,
+                    "duplicate connection from same GossipNodeId"
+                );
                 false
             }
         }
@@ -8325,12 +8337,12 @@ mod tests {
         assert!(!registry.is_shutdown().await);
     }
 
-    /// Audit finding A1: TLS server-cert NodeId pinning is only enforced when
-    /// the dial supplies a NodeId-encoded SNI. A configured cluster peer that
-    /// has not yet connected had no addr->NodeId mapping (it lived only in the
+    /// Audit finding A1: TLS server-cert GossipNodeId pinning is only enforced when
+    /// the dial supplies a GossipNodeId-encoded SNI. A configured cluster peer that
+    /// has not yet connected had no addr->GossipNodeId mapping (it lived only in the
     /// *configured* peer map), so `lookup_node_id` returned `None` and the
     /// first dial fell back to an unauthenticated placeholder SNI. The expected
-    /// NodeId must be resolvable from the configured peer map alone.
+    /// GossipNodeId must be resolvable from the configured peer map alone.
     #[tokio::test]
     async fn lookup_node_id_resolves_configured_peer_before_first_connection() {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
@@ -8346,7 +8358,7 @@ mod tests {
         assert_eq!(
             resolved,
             Some(peer.to_node_id()),
-            "a configured peer's NodeId must be resolvable by address so the \
+            "a configured peer's GossipNodeId must be resolvable by address so the \
              dial pins it in the SNI instead of using a placeholder"
         );
     }
@@ -8382,7 +8394,7 @@ mod tests {
     /// Used by the duplicate-broadcast regression tests to manufacture the
     /// "two SocketAddr aliases for the same physical peer" state that the
     /// devnet stratum trace surfaced for sender `f4061522…`.
-    fn peer_info_with_node_id(addr: SocketAddr, node_id: crate::NodeId) -> PeerInfo {
+    fn peer_info_with_node_id(addr: SocketAddr, node_id: crate::GossipNodeId) -> PeerInfo {
         let now = crate::current_timestamp();
         let now_ms = crate::current_timestamp_millis();
         PeerInfo {
@@ -8451,7 +8463,7 @@ mod tests {
         assert_eq!(
             aliases_targeted,
             1,
-            "expected exactly one gossip task for the shared NodeId across \
+            "expected exactly one gossip task for the shared GossipNodeId across \
              aliases {alias_a} and {alias_b}, got {aliases_targeted} (tasks: {:?})",
             tasks.iter().map(|t| t.peer_addr).collect::<Vec<_>>()
         );
@@ -8460,7 +8472,7 @@ mod tests {
     /// Mirror of the above for the urgent fan-out path
     /// (`trigger_immediate_gossip`): a single immediate-priority registration
     /// must produce at most one DeltaGossip per physical peer, regardless of
-    /// how many SocketAddr aliases share its NodeId.
+    /// how many SocketAddr aliases share its GossipNodeId.
     #[tokio::test]
     async fn trigger_immediate_gossip_deduplicates_peer_aliases_by_node_id() {
         let mut config = test_config();
@@ -8508,7 +8520,7 @@ mod tests {
             .count();
         assert_eq!(
             aliases_selected, 1,
-            "expected exactly one immediate-gossip target for shared NodeId across \
+            "expected exactly one immediate-gossip target for shared GossipNodeId across \
              aliases {alias_a},{alias_b},{alias_c}, got {aliases_selected} (selected: {:?})",
             selected
         );
@@ -9981,7 +9993,7 @@ mod tests {
         assert!(!gossip_state.peers.contains_key(&test_addr(9003)));
         drop(gossip_state);
 
-        // Direct routes still pin the expected NodeId for TLS verification.
+        // Direct routes still pin the expected GossipNodeId for TLS verification.
         // This prevents address-based actor lookups from using placeholder SNI
         // when a full-sync actor location claims a specific PeerId.
         assert_eq!(

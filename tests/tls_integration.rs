@@ -127,7 +127,7 @@ fn test_mutual_authentication() {
         let addr_a = registry_a.registry.bind_addr;
         let addr_b = registry_b.registry.bind_addr;
 
-        // Add peers with NodeIds for TLS
+        // Add peers with GossipNodeIds for TLS
         registry_a
             .registry
             .add_peer_with_node_id(addr_b, Some(node_id_b))
@@ -137,7 +137,8 @@ fn test_mutual_authentication() {
             .add_peer_with_node_id(addr_a, Some(node_id_a))
             .await;
 
-        // Manually trigger connection from the lexicographically smaller NodeId to avoid duplicate TLS dials.
+        // Manually trigger connection from the lexicographically smaller GossipNodeId to
+        // avoid duplicate TLS dials.
         let (dialer, target_peer_id, other_registry) =
             if node_id_a.as_bytes() <= node_id_b.as_bytes() {
                 (&registry_a, node_id_b.to_peer_id(), &registry_b)
@@ -181,7 +182,7 @@ fn test_mutual_authentication() {
     });
 }
 
-/// Test that impersonation is prevented - wrong NodeId rejects connection
+/// Test that impersonation is prevented - wrong GossipNodeId rejects connection
 #[test]
 fn test_impersonation_prevention() {
     run_tls_test("impersonation-prevention", || async {
@@ -236,7 +237,7 @@ fn test_impersonation_prevention() {
         registry_a
             .registry
             .add_peer_with_node_id(addr_imposter, Some(node_id_a))
-            .await; // Wrong NodeId!
+            .await; // Wrong GossipNodeId!
         registry_imposter
             .registry
             .add_peer_with_node_id(addr_a, Some(node_id_imposter))
@@ -263,7 +264,7 @@ fn test_impersonation_prevention() {
         let stats_a = registry_a.registry.get_stats().await;
         assert_eq!(
             stats_a.active_peers, 0,
-            "Should have no connected peers due to NodeId mismatch"
+            "Should have no connected peers due to GossipNodeId mismatch"
         );
     });
 }
@@ -594,13 +595,13 @@ fn test_tls_reconnection() {
     });
 }
 
-/// Test DNS name encoding and decoding for NodeIds
+/// Test DNS name encoding and decoding for GossipNodeIds
 #[test]
 fn test_node_id_dns_encoding() {
     run_tls_test("node-id-dns-encoding", || async {
         use icanact_remote::tls::name;
 
-        // Test with various NodeIds
+        // Test with various GossipNodeIds
         for _ in 0..10 {
             let secret_key = SecretKey::generate();
             let node_id = secret_key.public();
@@ -618,7 +619,7 @@ fn test_node_id_dns_encoding() {
             assert_eq!(
                 decoded.unwrap(),
                 node_id,
-                "Round-trip should preserve NodeId"
+                "Round-trip should preserve GossipNodeId"
             );
         }
 
@@ -761,7 +762,7 @@ fn test_certificate_generation() {
             // Verify the node_id matches
             assert_eq!(
                 tls_config.node_id, node_id,
-                "TLS config should have correct NodeId"
+                "TLS config should have correct GossipNodeId"
             );
 
             // Verify we can create connector and acceptor
