@@ -659,10 +659,21 @@ async fn indirect_peer_is_rediscovered_immediately_when_seen_by_direct_neighbor(
         .await?,
         b"c:indirect"
     );
-    assert_eq!(
-        asks_c.load(Ordering::Acquire),
-        1,
-        "C actor should receive ask through A's rediscovered direct route"
+    // `ask_peer_until_success` retries at the RPC layer on any local error
+    // (including a client-side `ASK_TIMEOUT` when the fresh connection to a
+    // just-discovered peer is still finalizing) — it is an at-least-once
+    // helper, not exactly-once. A retried attempt can genuinely deliver to
+    // C's handler even though the *prior* attempt's reply raced its own
+    // timeout locally on A, so C legitimately observes more than one ask in
+    // that case. This assertion existed as `== 1` and was flaky under load
+    // (observed both with and without unrelated connection-pool changes)
+    // for exactly this reason — it was asserting a stronger guarantee than
+    // the helper actually provides. The correctness property under test is
+    // "the ask reaches C at all through the rediscovered route", i.e.
+    // at-least-once, so assert that instead of an exact count.
+    assert!(
+        asks_c.load(Ordering::Acquire) >= 1,
+        "C actor should receive at least one ask through A's rediscovered direct route"
     );
 
     node_a.shutdown().await;

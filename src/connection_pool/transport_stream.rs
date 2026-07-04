@@ -107,6 +107,12 @@ impl<T> ConnectionPool<T> {
                         },
                     );
                     let _ = self.disconnect_connection_by_peer_id(&remote_peer_id);
+                    // Arm the storm-prevention cooldown: this is a direct,
+                    // local observation of a duplicate-connection conflict
+                    // (not a generic socket failure), so it is safe and
+                    // narrow to gate this peer's *next* reconnect attempt on
+                    // it — see `GossipRegistry::note_tie_break_eviction`.
+                    registry_arc.note_tie_break_eviction(&remote_peer_id);
                 }
             }
 
@@ -149,6 +155,29 @@ impl<T> ConnectionPool<T> {
                         },
                     );
                     return Ok(handle);
+                }
+                // Storm guard: the preferred-inbound wait just timed out,
+                // which is expected during normal asymmetric bootstrap but is
+                // also exactly what happens on every tick of a tie-break
+                // oscillation (dial, get evicted/rejected almost instantly,
+                // wait, time out, dial again — see
+                // `GossipRegistry::note_tie_break_eviction`). If a
+                // connection to this peer died very recently, do not fall
+                // back to a fresh dial this call; let the caller's own retry
+                // cadence (bounded by `tie_break_reconnect_cooldown`) try
+                // again shortly instead of hammering TCP/TLS on every call.
+                if registry_arc.tie_break_cooldown_active(&remote_peer_id) {
+                    info!(
+                        target: "icanact_remote_lifecycle",
+                        attempt_id,
+                        remote = %remote_peer_id,
+                        addr = %addr,
+                        "outbound_connect_preferred_inbound_timeout_cooldown_active_skip_dial"
+                    );
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "tie-break reconnect cooldown active; skipping fallback dial",
+                    )));
                 }
                 info!(
                     target: "icanact_remote_lifecycle",
