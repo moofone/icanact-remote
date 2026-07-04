@@ -1349,6 +1349,12 @@ pub struct GossipRegistry<T = ()> {
         Arc<SccHashMap<crate::NodeId, crate::handshake::PeerCapabilities>>,
     pub peer_capability_addr_to_node: Arc<SccHashMap<SocketAddr, crate::NodeId>>,
     clock_probe_state: Arc<SccHashMap<SocketAddr, PeerClockProbeState>>,
+    /// Per-peer deadline (monotonic `Instant`) before which a fresh outbound
+    /// TCP/TLS dial to that peer is suppressed, set whenever the
+    /// duplicate-connection tie-break evicts a connection for that peer id.
+    /// See `GossipConfig::tie_break_reconnect_cooldown` and
+    /// `tie_break_cooldown_remaining`/`note_tie_break_eviction`.
+    tie_break_cooldown_until: Arc<SccHashMap<crate::PeerId, Instant>>,
     pending_clock_probes: Arc<SccHashMap<u64, PendingClockProbe>>,
     pending_clock_echoes: Arc<SccHashMap<SocketAddr, PendingClockEcho>>,
     peer_clock_snapshots: Arc<SccHashMap<SocketAddr, PeerClockSnapshot>>,
@@ -1605,6 +1611,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
             peer_capability_addr_to_node: Arc::new(SccHashMap::default()),
             clock_probe_state: Arc::new(SccHashMap::default()),
+            tie_break_cooldown_until: Arc::new(SccHashMap::default()),
             pending_clock_probes: Arc::new(SccHashMap::default()),
             pending_clock_echoes: Arc::new(SccHashMap::default()),
             peer_clock_snapshots: Arc::new(SccHashMap::default()),
@@ -2365,6 +2372,26 @@ impl<T: 'static> GossipRegistry<T> {
             {
                 self.note_peer_liveness(&peer_id, addr, true, "connected")
                     .await;
+                continue;
+            }
+            // A connection to this peer died within the last
+            // `tie_break_reconnect_cooldown` window (tie-break eviction or
+            // any other observed socket failure — see
+            // `note_tie_break_eviction`). This supervisor loop deliberately
+            // bypasses `peer_retry_interval` so a genuinely-down required
+            // peer reconnects promptly; without this check that same
+            // unthrottled cadence turns a tie-break-induced flap (dial,
+            // evicted almost instantly, dial again) into a sustained
+            // TCP-connect + TLS-accept storm at the supervisor's tick rate.
+            // Skip this tick only; the next tick retries once the cooldown
+            // expires, so a real reconnect is delayed by at most one
+            // cooldown window, never dropped.
+            if self.tie_break_cooldown_active(&peer_id) {
+                debug!(
+                    peer_id = %peer_id,
+                    addr = %addr,
+                    "supervisor: reconnect cooldown active, skipping this tick"
+                );
                 continue;
             }
             // No connection -> actively *establish* one now. This is what makes a
@@ -5347,6 +5374,19 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
+        // Arm the short reconnect cooldown regardless of `peer_retry_interval`.
+        // `peer_retry_interval` only gates the opportunistic gossip-round peer
+        // selection; the required/configured-peer supervisor
+        // (`supervise_configured_peers`) intentionally bypasses that slower
+        // backoff so a genuinely-down cluster member reconnects promptly. A
+        // connection that dies within milliseconds of being established
+        // (the tie-break-eviction storm signature) would otherwise be
+        // redialed by the supervisor at its full unthrottled cadence
+        // forever. See `note_tie_break_eviction` / `tie_break_cooldown_active`.
+        if let Some(pid) = peer_id.as_ref() {
+            self.note_tie_break_eviction(pid);
+        }
+
         if crossed_threshold {
             info!(
                 failed_peer = %failed_peer_addr,
@@ -5576,6 +5616,12 @@ impl<T: 'static> GossipRegistry<T> {
                 );
             }
         }
+
+        // See the matching comment in `handle_peer_connection_failure`: arm
+        // the short reconnect cooldown independently of `peer_retry_interval`
+        // so the required-peer supervisor's unthrottled per-tick redial does
+        // not immediately re-dial a peer whose connection just died.
+        self.note_tie_break_eviction(failed_peer_id);
 
         if crossed_threshold {
             info!(
@@ -7379,6 +7425,37 @@ impl<T: 'static> GossipRegistry<T> {
                 false
             }
         }
+    }
+
+    /// Record that a duplicate-connection tie-break just evicted (or
+    /// rejected) a connection for `remote_peer_id`, arming a short cooldown
+    /// before the next real TCP dial to that peer is allowed.
+    ///
+    /// `should_keep_connection` is a pure, stateless function of NodeId
+    /// ordering — it has no memory of the eviction it just caused. Without
+    /// this cooldown, the losing side of a tie-break (and the higher-ID
+    /// side's preferred-inbound fallback dialer, once its wait times out)
+    /// re-litigates the same decision on the very next gossip tick, with no
+    /// backoff, because eviction is a protocol decision rather than an
+    /// observed socket failure (`handle_peer_connection_failure[_by_peer_id]`
+    /// is what feeds `peer_retry_interval`, and tie-break eviction never
+    /// goes through that path). Under restart/reconnect churn this produces
+    /// a self-sustaining TCP-connect + TLS-accept storm at the gossip-tick
+    /// cadence. This cooldown bounds that redial rate without touching which
+    /// side wins.
+    pub(crate) fn note_tie_break_eviction(&self, remote_peer_id: &crate::PeerId) {
+        let deadline = Instant::now() + self.config.tie_break_reconnect_cooldown;
+        let _ = self
+            .tie_break_cooldown_until
+            .upsert_sync(remote_peer_id.clone(), deadline);
+    }
+
+    /// Returns `true` while a tie-break-triggered reconnect cooldown is
+    /// still active for `remote_peer_id` (see `note_tie_break_eviction`).
+    pub(crate) fn tie_break_cooldown_active(&self, remote_peer_id: &crate::PeerId) -> bool {
+        self.tie_break_cooldown_until
+            .read_sync(remote_peer_id, |_, deadline| Instant::now() < *deadline)
+            .unwrap_or(false)
     }
 
     /// Check if we already have a connection to a peer by peer ID

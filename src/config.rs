@@ -23,6 +23,11 @@ pub const DEFAULT_ASK_WINDOW: usize = 128;
 /// handshakes. Bounds half-open inbound tasks.
 pub const DEFAULT_MAX_INFLIGHT_INBOUND_HANDSHAKES: usize = 256;
 
+/// Default cooldown after a duplicate-connection tie-break eviction before
+/// the losing side (or a timed-out preferred-inbound fallback dialer) may
+/// redial the same peer. See `GossipConfig::tie_break_reconnect_cooldown`.
+pub const DEFAULT_TIE_BREAK_RECONNECT_COOLDOWN_MS: u64 = 250;
+
 /// Default small cluster threshold - clusters with this many nodes or fewer use full sync
 /// Set to 0 to always use delta sync when possible
 pub const DEFAULT_SMALL_CLUSTER_THRESHOLD: usize = 5;
@@ -258,6 +263,33 @@ pub struct GossipConfig {
     /// Acquired at accept, released when the handshake task finishes.
     /// Default: 256.
     pub max_inflight_inbound_handshakes: usize,
+    /// Minimum time a peer pair must wait before re-attempting an outbound
+    /// dial (including the preferred-inbound fallback dial) after either
+    /// side's duplicate-connection tie-break evicted a connection for that
+    /// peer.
+    ///
+    /// The tie-break (`should_keep_connection`) is stateless by design: it
+    /// re-decides the preferred direction from scratch on every call. Under
+    /// restart/reconnect churn this gets re-litigated on every gossip tick
+    /// with no memory of the immediately-preceding eviction, so the losing
+    /// side (and the preferred-inbound fallback dialer, once its wait times
+    /// out) can redial at the tick cadence indefinitely — a self-sustaining
+    /// TCP/TLS churn storm with no backoff, distinct from (and not covered
+    /// by) `peer_retry_interval`, which only gates redial after an observed
+    /// hard socket failure.
+    ///
+    /// This cooldown is recorded at the moment of every tie-break eviction
+    /// (`outbound_tiebreak_evict_wrong_direction`,
+    /// `inbound_tiebreak_replace_wrong_direction`,
+    /// `inbound_tiebreak_reject_live_duplicate`,
+    /// `inbound_tiebreak_reject_non_preferred_inbound`) and gates the next
+    /// real TCP dial to that peer, bounding the storm's attempt rate without
+    /// changing which side ultimately wins (`should_keep_connection`'s
+    /// NodeId ordering is unchanged).
+    ///
+    /// Default: 250 ms. Set very small (e.g., 20 ms) in tests for
+    /// determinism.
+    pub tie_break_reconnect_cooldown: Duration,
 }
 
 impl Default for GossipConfig {
@@ -343,6 +375,9 @@ impl Default for GossipConfig {
             advertise_dns: std::env::var("ICANACT_ADVERTISE_DNS").ok(),
             peer_liveness_window: Duration::from_secs(10),
             max_inflight_inbound_handshakes: DEFAULT_MAX_INFLIGHT_INBOUND_HANDSHAKES,
+            tie_break_reconnect_cooldown: Duration::from_millis(
+                DEFAULT_TIE_BREAK_RECONNECT_COOLDOWN_MS,
+            ),
         }
     }
 }

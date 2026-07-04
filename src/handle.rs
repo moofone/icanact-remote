@@ -1786,13 +1786,37 @@ async fn handle_connection(
             );
         }
         Ok(Err(err)) => {
-            warn!(
-                target: "icanact_remote_lifecycle",
-                peer = %peer_addr,
-                elapsed_ms = tls_accept_started.elapsed().as_millis(),
-                error = %err,
-                "TLS accept failed"
-            );
+            // `UnexpectedEof` here means the peer closed the raw TCP socket
+            // before completing (often before *starting*) the TLS record
+            // exchange — rustls surfaces this as "tls handshake eof" even
+            // though no TLS negotiation (cert, cipher, protocol version) was
+            // ever attempted. Logging this under the same "TLS accept
+            // failed" label as a genuine cert/crypto rejection sends
+            // diagnosis toward the wrong layer (misdiagnosed as a TLS/cert
+            // problem during the 2026-06 devnet incident, when the actual
+            // cause was connection-lifecycle churn: the dialer's own
+            // duplicate-connection tie-break or supervisor retry closing the
+            // TCP connection pre-ClientHello). Label it distinctly so a
+            // sustained burst of these points at reconnect/tie-break churn,
+            // not at TLS configuration.
+            let is_pre_handshake_eof = err.kind() == std::io::ErrorKind::UnexpectedEof;
+            if is_pre_handshake_eof {
+                warn!(
+                    target: "icanact_remote_lifecycle",
+                    peer = %peer_addr,
+                    elapsed_ms = tls_accept_started.elapsed().as_millis(),
+                    error = %err,
+                    "inbound_pre_handshake_eof (peer closed TCP before/without sending TLS handshake bytes - likely reconnect/tie-break churn on the dialer, not a TLS/cert failure)"
+                );
+            } else {
+                warn!(
+                    target: "icanact_remote_lifecycle",
+                    peer = %peer_addr,
+                    elapsed_ms = tls_accept_started.elapsed().as_millis(),
+                    error = %err,
+                    "TLS accept failed"
+                );
+            }
         }
         Ok(Ok(mut tls_stream)) => {
             info!(
