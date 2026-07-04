@@ -95,8 +95,12 @@ async fn wait_for_pair_connection(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undialable_actor_address_still_delivers_by_identity() -> icanact_remote::Result<()> {
     let (key_a, key_b) = keys_ordered_dialer_first("identity-garbage-a", "identity-garbage-b");
-    let addr_a: SocketAddr = format!("127.0.0.1:{}", reserve_free_port()).parse().unwrap();
-    let addr_b: SocketAddr = format!("127.0.0.1:{}", reserve_free_port()).parse().unwrap();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
 
     let node_a = start_node(addr_a, &key_a, test_config()).await?;
     let node_b = start_node(addr_b, &key_b, test_config()).await?;
@@ -164,8 +168,14 @@ async fn undialable_actor_address_still_delivers_by_identity() -> icanact_remote
 
     // The verified connection survives: no address-triggered eviction.
     assert!(
-        node_a.registry.has_connection_to_peer(&node_b.registry.peer_id).await
-            || node_b.registry.has_connection_to_peer(&node_a.registry.peer_id).await,
+        node_a
+            .registry
+            .has_connection_to_peer(&node_b.registry.peer_id)
+            .await
+            || node_b
+                .registry
+                .has_connection_to_peer(&node_a.registry.peer_id)
+                .await,
         "the verified connection must never be dropped over an address"
     );
 
@@ -186,15 +196,21 @@ async fn inbound_from_unknown_source_accepted_by_key_despite_wrong_configured_ad
     // The node with the CORRECT config is the preferred dialer so the
     // wrong-configured side's dialer never has to succeed.
     let (key_a, key_b) = keys_ordered_dialer_first("identity-inbound-a", "identity-inbound-b");
-    let addr_a: SocketAddr = format!("127.0.0.1:{}", reserve_free_port()).parse().unwrap();
-    let addr_b: SocketAddr = format!("127.0.0.1:{}", reserve_free_port()).parse().unwrap();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
 
     let node_a = start_node(addr_a, &key_a, test_config()).await?;
     let node_b = start_node(addr_b, &key_b, test_config()).await?;
 
     // B is configured with A's key at a dead address: connection refused,
     // forever. (Reserved-then-released port on localhost.)
-    let wrong_addr: SocketAddr = format!("127.0.0.1:{}", reserve_free_port()).parse().unwrap();
+    let wrong_addr: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
     let peer_a_from_b = node_b.add_peer(&node_a.registry.peer_id).await;
     let _ = peer_a_from_b.connect(&wrong_addr).await; // expected to fail
 

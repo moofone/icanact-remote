@@ -205,8 +205,17 @@ pub struct GossipConfig {
     pub peer_health_mode: PeerHealthMode,
 
     // =================== Peer Discovery Configuration ===================
-    /// Advertised address for peer discovery (what we tell others to connect to)
-    /// If None, uses the listening address
+    /// NAT-only escape hatch: the address told to peers that cannot reach
+    /// this node at its bind address (spec/PEER_ID_REFACTOR.md §1.8).
+    ///
+    /// Leave `None` for directly routable deployments — the configured mesh
+    /// is fully functional without it: peers dial the operator-configured
+    /// address, connections are accepted and deduplicated by cryptographic
+    /// identity, actors route by owning `peer_id` over those connections,
+    /// and receivers repair an owner-sent unusable advertised IP from the
+    /// verified source IP (`resolve_remote_actor_addr`). Setting this to
+    /// work around address problems on a routable network masks the real
+    /// misconfiguration. If None, uses the listening address.
     pub advertise_address: Option<std::net::SocketAddr>,
     /// Enable automatic peer discovery via gossip (default: false for safe rollout)
     pub enable_peer_discovery: bool,

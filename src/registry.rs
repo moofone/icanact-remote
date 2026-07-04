@@ -1112,6 +1112,13 @@ pub struct RegistryStats {
     pub avg_mesh_connectivity: f64,
     /// Time taken to form initial mesh (first N peers connected), in milliseconds
     pub mesh_formation_time_ms: Option<u64>,
+    // PEER_ID_REFACTOR observability (§5): storm-signature counters.
+    /// Owner-sent unusable advertised IPs repaired from the verified source IP.
+    pub addr_substitutions: u64,
+    /// Relayed locations whose unusable advertised address was kept verbatim.
+    pub relayed_addr_kept: u64,
+    /// Duplicate-connection tie-break evictions/rejections observed.
+    pub tie_break_evictions: u64,
 }
 
 /// Peer information with failure tracking and delta state
@@ -1395,6 +1402,16 @@ pub struct GossipRegistry<T = ()> {
     pending_clock_echoes: Arc<SccHashMap<SocketAddr, PendingClockEcho>>,
     peer_clock_snapshots: Arc<SccHashMap<SocketAddr, PeerClockSnapshot>>,
     next_clock_sample_id: Arc<AtomicU64>,
+    /// PEER_ID_REFACTOR runtime observability: owner-sent unusable
+    /// advertised IPs repaired from the verified source IP
+    /// (`resolve_remote_actor_addr`).
+    pub(crate) addr_substitutions: Arc<AtomicU64>,
+    /// Relayed (sender != owner) locations whose unusable advertised
+    /// address was kept verbatim rather than falsified (§1.6).
+    pub(crate) relayed_unusable_addr_kept: Arc<AtomicU64>,
+    /// Duplicate-connection tie-break evictions/rejections observed
+    /// (`note_tie_break_eviction`) — the storm signature counter.
+    pub(crate) tie_break_evictions: Arc<AtomicU64>,
 
     // Actor message handler callback
     pub actor_message_handler: Arc<ArcSwapOption<ActorMessageHandlerCell>>,
@@ -1667,6 +1684,9 @@ impl<T: 'static> GossipRegistry<T> {
             pending_clock_echoes: Arc::new(SccHashMap::default()),
             peer_clock_snapshots: Arc::new(SccHashMap::default()),
             next_clock_sample_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            addr_substitutions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            relayed_unusable_addr_kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tie_break_evictions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             actor_message_handler: Arc::new(ArcSwapOption::empty()),
             actor_tell_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_tell_handler_sync_context: Arc::new(ArcSwapOption::empty()),
@@ -3325,6 +3345,9 @@ impl<T: 'static> GossipRegistry<T> {
             failed_discovery_attempts,
             avg_mesh_connectivity,
             mesh_formation_time_ms,
+            addr_substitutions: self.addr_substitutions.load(Ordering::Relaxed),
+            relayed_addr_kept: self.relayed_unusable_addr_kept.load(Ordering::Relaxed),
+            tie_break_evictions: self.tie_break_evictions.load(Ordering::Relaxed),
         }
     }
 
@@ -3409,11 +3432,18 @@ impl<T: 'static> GossipRegistry<T> {
                         if let Some((addr, sender_addr)) =
                             location.address.parse::<SocketAddr>().ok().zip(sender_addr)
                         {
+                            let owner_is_sender = location.peer_id == sender_peer_id;
                             let resolved = resolve_remote_actor_addr(
                                 name.as_str(),
                                 addr,
                                 sender_addr,
-                                location.peer_id == sender_peer_id,
+                                owner_is_sender,
+                            );
+                            self.note_actor_addr_resolution(
+                                addr,
+                                resolved,
+                                sender_addr,
+                                owner_is_sender,
                             );
                             location.address = resolved.to_string();
                         }
@@ -4808,12 +4838,10 @@ impl<T: 'static> GossipRegistry<T> {
             // wire value, so this node's own future full-sync fan-out
             // re-advertises the repaired route instead of the unusable one.
             let resolved = location.address.parse::<SocketAddr>().ok().map(|addr| {
-                resolve_remote_actor_addr(
-                    &name,
-                    addr,
-                    sender_addr,
-                    location.peer_id == sender_peer_id,
-                )
+                let owner_is_sender = location.peer_id == sender_peer_id;
+                let resolved = resolve_remote_actor_addr(&name, addr, sender_addr, owner_is_sender);
+                self.note_actor_addr_resolution(addr, resolved, sender_addr, owner_is_sender);
+                resolved
             });
             let mut location = location;
             if let Some(addr) = resolved {
@@ -4832,12 +4860,10 @@ impl<T: 'static> GossipRegistry<T> {
                 continue;
             }
             let resolved = location.address.parse::<SocketAddr>().ok().map(|addr| {
-                resolve_remote_actor_addr(
-                    &name,
-                    addr,
-                    sender_addr,
-                    location.peer_id == sender_peer_id,
-                )
+                let owner_is_sender = location.peer_id == sender_peer_id;
+                let resolved = resolve_remote_actor_addr(&name, addr, sender_addr, owner_is_sender);
+                self.note_actor_addr_resolution(addr, resolved, sender_addr, owner_is_sender);
+                resolved
             });
             let mut location = location;
             if let Some(addr) = resolved {
@@ -7542,7 +7568,27 @@ impl<T: 'static> GossipRegistry<T> {
     /// never on an isolated first eviction. This bounds the storm's redial
     /// rate without touching which side wins and without taxing ordinary
     /// one-off tie-break convergence.
+    /// Record a `resolve_remote_actor_addr` outcome for runtime
+    /// observability (PEER_ID_REFACTOR §5): substitutions and
+    /// relayed-kept-verbatim events make the storm signature visible in
+    /// production telemetry, not only in tests.
+    pub(crate) fn note_actor_addr_resolution(
+        &self,
+        original: SocketAddr,
+        resolved: SocketAddr,
+        sender_addr: SocketAddr,
+        owner_is_sender: bool,
+    ) {
+        if resolved != original {
+            self.addr_substitutions.fetch_add(1, Ordering::Relaxed);
+        } else if !owner_is_sender && advertised_ip_unusable(original.ip(), sender_addr.ip()) {
+            self.relayed_unusable_addr_kept
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn note_tie_break_eviction(&self, remote_peer_id: &crate::PeerId) {
+        self.tie_break_evictions.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let is_rapid_repeat = self
             .tie_break_last_eviction_at
@@ -7972,10 +8018,8 @@ mod tests {
     /// address is resolved from its TLS-verified source IP — never dropped.
     #[tokio::test]
     async fn wp1_full_sync_resolves_owner_remote_loopback_route_using_sender_ip() {
-        let reg = GossipRegistry::<()>::new(
-            test_addr(7412),
-            test_config_with_seed("wp1-loopback-local"),
-        );
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7412), test_config_with_seed("wp1-loopback-local"));
         let owner = KeyPair::new_for_testing("wp1-loopback-owner").peer_id();
         let actor_addr: SocketAddr = "127.0.0.1:9400".parse().unwrap();
         let sender_addr: SocketAddr = "10.77.0.33:9400".parse().unwrap();
@@ -8092,10 +8136,8 @@ mod tests {
     /// unrouted decoration, while identity routing still works.
     #[tokio::test]
     async fn wp1_full_sync_keeps_relayed_wildcard_route_unfalsified() {
-        let reg = GossipRegistry::<()>::new(
-            test_addr(7415),
-            test_config_with_seed("wp1-relay-local"),
-        );
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7415), test_config_with_seed("wp1-relay-local"));
         let owner = KeyPair::new_for_testing("wp1-relay-owner").peer_id();
         let relay = KeyPair::new_for_testing("wp1-relay-sender").peer_id();
         let actor_addr: SocketAddr = "0.0.0.0:9400".parse().unwrap();
@@ -8167,6 +8209,57 @@ mod tests {
             .expect("immediate-delta port-0 location must be stored, never dropped");
         assert_eq!(stored.peer_id, sender);
         assert_eq!(stored.address, actor_addr.to_string());
+    }
+
+    /// PEER_ID_REFACTOR §5 runtime observability: substitutions,
+    /// relayed-kept events, and tie-break evictions are counted and exposed
+    /// via `get_stats` so the storm signature is visible in prod telemetry.
+    #[tokio::test]
+    async fn wp4_storm_signature_counters_are_exposed_in_stats() {
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7417), test_config_with_seed("wp4-counters-local"));
+        let owner = KeyPair::new_for_testing("wp4-counters-owner").peer_id();
+        let relay = KeyPair::new_for_testing("wp4-counters-relay").peer_id();
+        let sender_addr: SocketAddr = "10.77.0.33:9400".parse().unwrap();
+
+        // Owner-sent wildcard → substitution counted.
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            "wp4/owner-wildcard/service".to_string(),
+            RemoteActorLocation::new_with_peer("0.0.0.0:9400".parse().unwrap(), owner.clone()),
+        );
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            sender_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        // Relayed wildcard → kept verbatim, counted separately.
+        let mut known_actors = HashMap::new();
+        known_actors.insert(
+            "wp4/relayed-wildcard/service".to_string(),
+            RemoteActorLocation::new_with_peer("0.0.0.0:9401".parse().unwrap(), owner.clone()),
+        );
+        reg.merge_full_sync(
+            HashMap::new(),
+            known_actors,
+            relay.clone(),
+            "10.77.0.44:9400".parse().unwrap(),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        reg.note_tie_break_eviction(&owner);
+
+        let stats = reg.get_stats().await;
+        assert_eq!(stats.addr_substitutions, 1, "owner-sent wildcard repaired");
+        assert_eq!(stats.relayed_addr_kept, 1, "relayed wildcard kept verbatim");
+        assert_eq!(stats.tie_break_evictions, 1, "tie-break eviction counted");
     }
 
     #[test]
@@ -8497,6 +8590,9 @@ mod tests {
             failed_discovery_attempts: 2,
             avg_mesh_connectivity: 0.2,
             mesh_formation_time_ms: Some(500),
+            addr_substitutions: 0,
+            relayed_addr_kept: 0,
+            tie_break_evictions: 0,
         };
 
         assert_eq!(stats.local_actors, 5);
