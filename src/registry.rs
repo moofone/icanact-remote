@@ -222,60 +222,71 @@ pub fn resolve_peer_addr(
     resolve_peer_addr_checked(sender_bind_addr, tcp_source_addr).unwrap_or(tcp_source_addr)
 }
 
-/// Validate (and, for the unspecified case, repair) an advertised remote
-/// actor location address before it is allowed into `known_actors`.
+/// True when `advertised_ip` cannot be a dial target for THIS node given the
+/// verified `sender_ip` it was learned over: unspecified and multicast IPs
+/// are never unicast dial targets; loopback and link-local are only
+/// meaningful when the sender itself is on that same scope.
+fn advertised_ip_unusable(advertised_ip: std::net::IpAddr, sender_ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    if advertised_ip.is_unspecified() || advertised_ip.is_multicast() {
+        return true;
+    }
+    if advertised_ip.is_loopback() && !sender_ip.is_loopback() {
+        return true;
+    }
+    let link_local = |ip: IpAddr| match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    };
+    link_local(advertised_ip) && !link_local(sender_ip)
+}
+
+/// Resolve a gossiped remote actor location address before it is stored in
+/// `known_actors`.
 ///
-/// `sender_addr` is the TCP-verified source address of the peer that
-/// gossiped this location, exactly the same trust anchor
-/// `resolve_peer_addr_checked` (above) already uses to repair peer
-/// bind-address advertisements. An unspecified advertised IP
-/// (`0.0.0.0`/`::`) is not a malformed value to reject — it is what a
-/// legitimately wildcard-bound host necessarily advertises whenever it (or
-/// one of its actors, e.g. a routed-pubsub interest actor — see
-/// `pubsub.rs::note_interest`) fails to resolve through
-/// `GossipRegistry::advertised_addr`. Dropping it outright starves the
-/// receiver of any route at all and, per the tie-break reconnect
-/// mechanics, feeds a reconnect/re-gossip churn loop instead of a
-/// converged, quiet steady state. Rewriting it with the verified TCP
-/// source IP (keeping the advertised port) restores a route using
-/// information this function already trusts, with no new trust extended.
-fn validate_remote_actor_addr(
+/// PEER_ID_REFACTOR §1.5: this NEVER drops — the non-`Option` return type
+/// encodes the invariant. Remote actors are routed by `location.peer_id`
+/// over the identity-keyed connection pool (`GossipRegistryHandle::lookup`
+/// → `get_connection_to_peer`), never by this address; discarding an
+/// identity-routable actor over an unusable advertised address is what
+/// starved receivers of routed-pubsub interest actors and fed the
+/// reconnect/re-gossip churn loop. The resolved value is a best-effort dial
+/// hint and re-gossip hygiene only.
+///
+/// PEER_ID_REFACTOR §1.6: the advertised IP is substituted with the
+/// sender's verified source IP only when the sender IS the actor's owner
+/// (`owner_is_sender`) — authenticated endpoint learning from the peer
+/// itself. Gossip is transitive: a relay's source IP says nothing about the
+/// owner's reachability, so relayed locations are stored verbatim rather
+/// than falsified. The advertised port is always preserved, including 0:
+/// the sender's source port is an ephemeral connect port, not its listen
+/// port, so there is nothing valid to substitute.
+fn resolve_remote_actor_addr(
     actor_name: &str,
     actor_addr: SocketAddr,
     sender_addr: SocketAddr,
-) -> Option<SocketAddr> {
-    if actor_addr.port() == 0 {
-        warn!(
-            actor_name = %actor_name,
-            actor_addr = %actor_addr,
-            "dropping actor location with non-dialable port 0"
-        );
-        return None;
+    owner_is_sender: bool,
+) -> SocketAddr {
+    if !owner_is_sender || !advertised_ip_unusable(actor_addr.ip(), sender_addr.ip()) {
+        return actor_addr;
     }
+    let resolved = SocketAddr::new(sender_addr.ip(), actor_addr.port());
+    debug!(
+        actor_name = %actor_name,
+        actor_addr = %actor_addr,
+        sender_addr = %sender_addr,
+        resolved = %resolved,
+        "owner-advertised address is unusable from this node; substituting the verified source IP"
+    );
+    resolved
+}
 
-    if actor_addr.ip().is_unspecified() {
-        let resolved = SocketAddr::new(sender_addr.ip(), actor_addr.port());
-        debug!(
-            actor_name = %actor_name,
-            actor_addr = %actor_addr,
-            sender_addr = %sender_addr,
-            resolved = %resolved,
-            "actor location advertised an unspecified address; rewriting using the TCP source IP"
-        );
-        return Some(resolved);
-    }
-
-    if actor_addr.ip().is_loopback() && !sender_addr.ip().is_loopback() {
-        warn!(
-            actor_name = %actor_name,
-            actor_addr = %actor_addr,
-            sender_addr = %sender_addr,
-            "dropping actor location with remote loopback address"
-        );
-        return None;
-    }
-
-    Some(actor_addr)
+/// True when `addr` may be recorded as a learned dial route
+/// (`set_discovered_peer_addr` / `addr_to_peer_id`). Storage in
+/// `known_actors` is unconditional (§1.5); dial-hint learning is not —
+/// port 0 and IPs unusable from this node must not poison the dial tables.
+fn learnable_dial_route(addr: SocketAddr, sender_addr: SocketAddr) -> bool {
+    addr.port() != 0 && !advertised_ip_unusable(addr.ip(), sender_addr.ip())
 }
 
 /// Response payload for actor asks.
@@ -3388,25 +3399,22 @@ impl<T: 'static> GossipRegistry<T> {
                         };
                         // This is the wire path used by
                         // `RegistrationPriority::Immediate` (e.g. routed-pubsub
-                        // interest registration, `pubsub.rs::note_interest`) —
-                        // unlike `merge_full_sync`, immediate deltas were never
-                        // address-validated at all, so an unresolved wildcard
-                        // advertised address (`0.0.0.0:<port>`) would be stored
-                        // and gossiped verbatim. Apply the same
-                        // validate-or-rewrite-using-the-known-peer-address
-                        // policy as `merge_full_sync` when we have a trusted
-                        // address to rewrite from; if we don't (peer never
-                        // configured/discovered), fall back to accepting the
-                        // wire value as before rather than dropping actors we
-                        // have no way to validate.
+                        // interest registration, `pubsub.rs::note_interest`).
+                        // Same never-drop contract as `merge_full_sync`
+                        // (PEER_ID_REFACTOR §1.5): the actor is stored and
+                        // identity-routable regardless of its advertised
+                        // address; when we have a trusted sender address the
+                        // owner's unusable advertised IP is resolved from it,
+                        // otherwise the wire value is kept verbatim.
                         if let Some((addr, sender_addr)) =
                             location.address.parse::<SocketAddr>().ok().zip(sender_addr)
                         {
-                            let Some(resolved) =
-                                validate_remote_actor_addr(name.as_str(), addr, sender_addr)
-                            else {
-                                continue;
-                            };
+                            let resolved = resolve_remote_actor_addr(
+                                name.as_str(),
+                                addr,
+                                sender_addr,
+                                location.peer_id == sender_peer_id,
+                            );
                             location.address = resolved.to_string();
                         }
                         if clear_tombstone {
@@ -4795,23 +4803,23 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
-            let Some(addr) = location
-                .address
-                .parse::<SocketAddr>()
-                .ok()
-                .and_then(|addr| validate_remote_actor_addr(&name, addr, sender_addr))
-            else {
-                continue;
-            };
+            // PEER_ID_REFACTOR §1.5: never dropped over the address. The
+            // stored location carries the resolved address, not the raw
+            // wire value, so this node's own future full-sync fan-out
+            // re-advertises the repaired route instead of the unusable one.
+            let resolved = location.address.parse::<SocketAddr>().ok().map(|addr| {
+                resolve_remote_actor_addr(
+                    &name,
+                    addr,
+                    sender_addr,
+                    location.peer_id == sender_peer_id,
+                )
+            });
             let mut location = location;
-            // `validate_remote_actor_addr` may have rewritten an
-            // unspecified advertised address using the TCP source IP; the
-            // stored location must carry the resolved address, not the
-            // raw wire value, or every downstream reader (including this
-            // same node's own future full-sync fan-out) would re-advertise
-            // the undialable address right back out.
-            location.address = addr.to_string();
-            updates_to_apply.push((name, location, addr));
+            if let Some(addr) = resolved {
+                location.address = addr.to_string();
+            }
+            updates_to_apply.push((name, location, resolved));
         }
 
         // Process remote known actors
@@ -4823,17 +4831,19 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
-            let Some(addr) = location
-                .address
-                .parse::<SocketAddr>()
-                .ok()
-                .and_then(|addr| validate_remote_actor_addr(&name, addr, sender_addr))
-            else {
-                continue;
-            };
+            let resolved = location.address.parse::<SocketAddr>().ok().map(|addr| {
+                resolve_remote_actor_addr(
+                    &name,
+                    addr,
+                    sender_addr,
+                    location.peer_id == sender_peer_id,
+                )
+            });
             let mut location = location;
-            location.address = addr.to_string();
-            updates_to_apply.push((name, location, addr));
+            if let Some(addr) = resolved {
+                location.address = addr.to_string();
+            }
+            updates_to_apply.push((name, location, resolved));
         }
 
         // STEP 2: Apply known_actors upserts, peer_to_actors update,
@@ -4865,7 +4875,14 @@ impl<T: 'static> GossipRegistry<T> {
                 } else {
                     new_actors += 1;
                 }
-                routes_to_configure.push((name.clone(), location.peer_id.clone(), *addr));
+                // Storage above is unconditional (§1.5); dial-hint learning
+                // is gated so port-0/unusable addresses (e.g. a relayed
+                // wildcard kept verbatim) never poison the dial tables.
+                if let Some(addr) = addr
+                    && learnable_dial_route(*addr, sender_addr)
+                {
+                    routes_to_configure.push((name.clone(), location.peer_id.clone(), *addr));
+                }
             }
 
             let removed_now: Vec<String> = match gossip_state
@@ -7800,38 +7817,356 @@ mod tests {
         );
     }
 
-    /// Port `0` is never dialable regardless of IP, and unlike an
-    /// unspecified IP there is no sender-derived value to repair it with,
-    /// so it must still be dropped outright.
+    /// PEER_ID_REFACTOR T1: exhaustive address-class matrix for
+    /// `resolve_remote_actor_addr` — every `advertised-class × source-class ×
+    /// port × ownership` cell asserted individually. The truth table below is
+    /// the human-written contract per advertised value; the sweep applies the
+    /// two universal invariants on top: relays never substitute (§1.6) and
+    /// the advertised port is always preserved.
+    #[test]
+    fn wp1_resolve_remote_actor_addr_exhaustive_matrix() {
+        use std::net::IpAddr;
+
+        /// When (and only when) the OWNER sent the location, is the
+        /// advertised IP kept or substituted with the source IP?
+        #[derive(Clone, Copy, Debug)]
+        enum OwnerExpectation {
+            AlwaysKeep,
+            AlwaysSubstitute,
+            KeepIfSourceLoopback,
+            KeepIfSourceLinkLocal,
+        }
+        use OwnerExpectation::*;
+
+        let advertised: &[(&str, OwnerExpectation)] = &[
+            // unspecified: never a unicast dial target
+            ("0.0.0.0", AlwaysSubstitute),
+            ("::", AlwaysSubstitute),
+            // multicast: never a unicast dial target
+            ("224.0.0.1", AlwaysSubstitute),
+            ("ff02::1", AlwaysSubstitute),
+            // loopback: only meaningful when the sender is loopback too
+            ("127.0.0.1", KeepIfSourceLoopback),
+            ("::1", KeepIfSourceLoopback),
+            // link-local: only meaningful from the same link
+            ("169.254.1.1", KeepIfSourceLinkLocal),
+            ("fe80::1", KeepIfSourceLinkLocal),
+            // private / unique-local / global unicast: always usable as-is
+            ("10.1.2.3", AlwaysKeep),
+            ("192.168.1.5", AlwaysKeep),
+            ("172.16.9.9", AlwaysKeep),
+            ("fd00::1", AlwaysKeep),
+            ("1.2.3.4", AlwaysKeep),
+            ("2606:4700::1", AlwaysKeep),
+        ];
+        let sources: &[&str] = &[
+            "127.0.0.1",    // loopback v4
+            "::1",          // loopback v6
+            "169.254.9.9",  // link-local v4
+            "fe80::9",      // link-local v6
+            "10.77.0.33",   // private v4
+            "fd00::99",     // unique-local v6
+            "1.1.1.1",      // global v4
+            "2606:4700::2", // global v6
+        ];
+        let is_loopback = |ip: IpAddr| ip.is_loopback();
+        let is_link_local = |ip: IpAddr| match ip {
+            IpAddr::V4(v4) => v4.is_link_local(),
+            IpAddr::V6(v6) => v6.is_unicast_link_local(),
+        };
+
+        let mut cells = 0usize;
+        for (adv_ip_str, expectation) in advertised {
+            for src_ip_str in sources {
+                for port in [9400u16, 0] {
+                    for owner_is_sender in [true, false] {
+                        let adv_ip: IpAddr = adv_ip_str.parse().unwrap();
+                        let src_ip: IpAddr = src_ip_str.parse().unwrap();
+                        let actor_addr = SocketAddr::new(adv_ip, port);
+                        let sender_addr = SocketAddr::new(src_ip, 55555);
+
+                        let keep = if !owner_is_sender {
+                            // §1.6: a relay's source IP says nothing about
+                            // the owner — never substituted, no exceptions.
+                            true
+                        } else {
+                            match expectation {
+                                AlwaysKeep => true,
+                                AlwaysSubstitute => false,
+                                KeepIfSourceLoopback => is_loopback(src_ip),
+                                KeepIfSourceLinkLocal => is_link_local(src_ip),
+                            }
+                        };
+                        let expected = if keep {
+                            actor_addr
+                        } else {
+                            // Port always preserved: the sender's source
+                            // port is ephemeral, never its listen port.
+                            SocketAddr::new(src_ip, port)
+                        };
+
+                        let resolved = resolve_remote_actor_addr(
+                            "wp1/matrix/service",
+                            actor_addr,
+                            sender_addr,
+                            owner_is_sender,
+                        );
+                        assert_eq!(
+                            resolved, expected,
+                            "cell advertised={adv_ip_str} source={src_ip_str} \
+                             port={port} owner_is_sender={owner_is_sender}"
+                        );
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 14 * 8 * 2 * 2, "matrix must cover every cell");
+    }
+
+    /// PEER_ID_REFACTOR WP1 (§1.5): an actor location is NEVER dropped over
+    /// its address. Port 0 is undialable, but the actor is still routable via
+    /// its owning peer's connection (`lookup()` routes remote actors by
+    /// `peer_id`, not `.address`), so it must be stored. The port is
+    /// preserved: the sender's source port is an ephemeral connect port, not
+    /// its listen port, so there is nothing valid to substitute.
     #[tokio::test]
-    async fn full_sync_rejects_actor_route_with_port_zero() {
+    async fn wp1_full_sync_stores_port_zero_actor_route_keyed_by_identity() {
         let reg = GossipRegistry::<()>::new(
-            test_addr(7402),
-            test_config_with_seed("full-sync-port-zero-route-local"),
+            test_addr(7411),
+            test_config_with_seed("wp1-port-zero-local"),
         );
-        let remote_peer = KeyPair::new_for_testing("full-sync-port-zero-route-remote").peer_id();
+        let owner = KeyPair::new_for_testing("wp1-port-zero-owner").peer_id();
         let actor_addr: SocketAddr = "10.77.0.40:0".parse().unwrap();
-        let actor_name = "full-sync/port-zero-route/service";
+        let actor_name = "wp1/port-zero/service";
         let mut local_actors = HashMap::new();
         local_actors.insert(
             actor_name.to_string(),
-            RemoteActorLocation::new_with_peer(actor_addr, remote_peer.clone()),
+            RemoteActorLocation::new_with_peer(actor_addr, owner.clone()),
         );
 
         reg.merge_full_sync(
             local_actors,
             HashMap::new(),
-            remote_peer.clone(),
+            owner.clone(),
             "10.77.0.33:9400".parse().unwrap(),
             1,
             current_timestamp(),
         )
         .await;
 
-        assert!(
-            reg.lookup_actor(actor_name).await.is_none(),
-            "port-0 actor locations must not enter the directory"
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("port-0 actor location must be stored (identity-routable), never dropped");
+        assert_eq!(stored.peer_id, owner);
+        assert_eq!(
+            stored.address,
+            actor_addr.to_string(),
+            "advertised port must be preserved; source port is ephemeral and never substituted"
         );
+    }
+
+    /// PEER_ID_REFACTOR WP1: an owner-sent remote-loopback address is
+    /// unusable from this node, but the owner is the verified sender, so the
+    /// address is resolved from its TLS-verified source IP — never dropped.
+    #[tokio::test]
+    async fn wp1_full_sync_resolves_owner_remote_loopback_route_using_sender_ip() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7412),
+            test_config_with_seed("wp1-loopback-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-loopback-owner").peer_id();
+        let actor_addr: SocketAddr = "127.0.0.1:9400".parse().unwrap();
+        let sender_addr: SocketAddr = "10.77.0.33:9400".parse().unwrap();
+        let actor_name = "wp1/loopback/service";
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, owner.clone()),
+        );
+
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            sender_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("owner-sent loopback route must be resolved and stored, never dropped");
+        assert_eq!(
+            stored.address,
+            SocketAddr::new(sender_addr.ip(), actor_addr.port()).to_string(),
+            "unusable owner-sent IP must be substituted with the verified source IP"
+        );
+    }
+
+    /// PEER_ID_REFACTOR WP1: link-local advertised by the owner from a
+    /// non-link-local source is unusable here and must be resolved from the
+    /// verified source IP (today it is accepted verbatim — a latent bug).
+    #[tokio::test]
+    async fn wp1_full_sync_resolves_owner_link_local_route_using_sender_ip() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7413),
+            test_config_with_seed("wp1-link-local-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-link-local-owner").peer_id();
+        let actor_addr: SocketAddr = "169.254.1.1:9400".parse().unwrap();
+        let sender_addr: SocketAddr = "10.77.0.33:9400".parse().unwrap();
+        let actor_name = "wp1/link-local/service";
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, owner.clone()),
+        );
+
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            sender_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("owner-sent link-local route must be resolved and stored");
+        assert_eq!(
+            stored.address,
+            SocketAddr::new(sender_addr.ip(), actor_addr.port()).to_string(),
+            "link-local advertised from a non-link-local source must be substituted"
+        );
+    }
+
+    /// PEER_ID_REFACTOR WP1: a multicast advertised IP can never be a unicast
+    /// dial target; owner-sent, it resolves from the verified source IP.
+    #[tokio::test]
+    async fn wp1_full_sync_resolves_owner_multicast_route_using_sender_ip() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7414),
+            test_config_with_seed("wp1-multicast-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-multicast-owner").peer_id();
+        let actor_addr: SocketAddr = "224.0.0.1:9400".parse().unwrap();
+        let sender_addr: SocketAddr = "10.77.0.33:9400".parse().unwrap();
+        let actor_name = "wp1/multicast/service";
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, owner.clone()),
+        );
+
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            sender_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("owner-sent multicast route must be resolved and stored");
+        assert_eq!(
+            stored.address,
+            SocketAddr::new(sender_addr.ip(), actor_addr.port()).to_string(),
+        );
+    }
+
+    /// PEER_ID_REFACTOR WP1 (§1.6): gossip is transitive — when a RELAY
+    /// (sender != owner) forwards a location with an unusable address, the
+    /// relay's source IP says nothing about the OWNER's reachability.
+    /// Substituting it would falsify the address. It must be stored as-is:
+    /// unrouted decoration, while identity routing still works.
+    #[tokio::test]
+    async fn wp1_full_sync_keeps_relayed_wildcard_route_unfalsified() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7415),
+            test_config_with_seed("wp1-relay-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-relay-owner").peer_id();
+        let relay = KeyPair::new_for_testing("wp1-relay-sender").peer_id();
+        let actor_addr: SocketAddr = "0.0.0.0:9400".parse().unwrap();
+        let relay_addr: SocketAddr = "10.77.0.44:9400".parse().unwrap();
+        let actor_name = "wp1/relayed-wildcard/service";
+        let mut known_actors = HashMap::new();
+        known_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, owner.clone()),
+        );
+
+        reg.merge_full_sync(
+            HashMap::new(),
+            known_actors,
+            relay.clone(),
+            relay_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("relayed location must be stored (identity-routable), never dropped");
+        assert_eq!(stored.peer_id, owner);
+        assert_eq!(
+            stored.address,
+            actor_addr.to_string(),
+            "a relay's source IP must never be substituted for a third party's address"
+        );
+    }
+
+    /// PEER_ID_REFACTOR WP1: the immediate-delta wire path
+    /// (`RegistrationPriority::Immediate`, routed-pubsub interest) obeys the
+    /// same never-drop contract as full sync — port 0 stays stored and
+    /// identity-routable even when the sender has a configured address to
+    /// validate against.
+    #[tokio::test]
+    async fn wp1_delta_stores_port_zero_actor_route_keyed_by_identity() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(7416),
+            test_config_with_seed("wp1-delta-port-zero-local"),
+        );
+        let sender = test_peer_id("wp1-delta-port-zero-sender");
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&sender, "10.77.0.55:9500".parse().unwrap());
+
+        let actor_addr: SocketAddr = "10.77.0.60:0".parse().unwrap();
+        let delta = RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: "wp1/delta-port-zero/service".to_string(),
+                location: RemoteActorLocation::new_with_peer(actor_addr, sender.clone()),
+                priority: RegistrationPriority::Immediate,
+            }],
+            sender_peer_id: sender.clone(),
+            wall_clock_time: current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        };
+
+        registry.apply_delta(delta).await.unwrap();
+
+        let stored = registry
+            .lookup_actor("wp1/delta-port-zero/service")
+            .await
+            .expect("immediate-delta port-0 location must be stored, never dropped");
+        assert_eq!(stored.peer_id, sender);
+        assert_eq!(stored.address, actor_addr.to_string());
     }
 
     #[test]
