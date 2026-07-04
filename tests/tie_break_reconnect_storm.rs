@@ -84,9 +84,12 @@ use icanact_remote::{
     set_transport_lifecycle_recorder,
 };
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
@@ -102,6 +105,7 @@ const RESTART_UP_MS: &[u64] = &[
     15, 120, 10, 180, 15, 20, 150, 10, 25, 15, 180, 20, 10, 150, 15,
 ];
 const RESTART_DOWN_MS: &[u64] = &[10, 15, 10, 20, 10, 10, 15, 10, 20, 10, 15, 10, 10, 20, 10];
+static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn reserve_free_addr() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -179,8 +183,39 @@ async fn start_node(
     .await
 }
 
+async fn configure_required_peer(
+    node: &GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>,
+    peer_id: &icanact_remote::PeerId,
+    addr: SocketAddr,
+) {
+    let peer = node.add_peer(peer_id).await;
+    let _ = peer.connect(&addr).await;
+}
+
+async fn pre_handshake_eof_listener() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind pre-handshake EOF listener");
+    let addr = listener.local_addr().expect("pre-handshake local addr");
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (addr, task)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_churn_does_not_produce_unbounded_reconnect_storm() -> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let pre_handshake_eofs = init_storm_layer();
     let counters = Arc::new(StormCounters::default());
 
@@ -395,6 +430,231 @@ async fn restart_churn_does_not_produce_unbounded_reconnect_storm() -> icanact_r
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_handshake_eof_churn_does_not_arm_tie_break_cooldown() -> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let counters = Arc::new(StormCounters::default());
+    let counters_for_recorder = counters.clone();
+    set_transport_lifecycle_recorder(Some(Arc::new(move |event| match event {
+        TransportLifecycleEvent::OutboundStart { .. } => {
+            counters_for_recorder
+                .outbound_starts
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        TransportLifecycleEvent::WrongDirectionEvicted { .. } => {
+            counters_for_recorder
+                .wrong_direction_evictions
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    })));
+
+    let (bad_addr, bad_listener) = pre_handshake_eof_listener().await;
+    let mut config = churn_config();
+    config.connection_timeout = Duration::from_millis(80);
+    config.tie_break_reconnect_cooldown = Duration::from_millis(500);
+    let node = start_node(
+        "127.0.0.1:0".parse().unwrap(),
+        KeyPair::new_for_testing("half-open-eof-supervisor"),
+        config,
+    )
+    .await?;
+    let bad_peer = KeyPair::new_for_testing("half-open-eof-peer").peer_id();
+
+    configure_required_peer(&node, &bad_peer, bad_addr).await;
+    let after_first = counters.outbound_starts.load(Ordering::SeqCst);
+    assert!(
+        after_first >= 1,
+        "setup should have attempted at least one outbound dial to the half-open peer"
+    );
+    assert_eq!(
+        counters.wrong_direction_evictions.load(Ordering::SeqCst),
+        0,
+        "pre-handshake EOF churn is not a duplicate-connection tie-break"
+    );
+
+    // This call is deliberately inside tie_break_reconnect_cooldown. If
+    // generic socket/TLS EOF failures accidentally arm the tie-break storm
+    // guard, the supervisor will skip this tick and the outbound count will
+    // not increase. The desired contract is narrower: only repeated
+    // duplicate-connection tie-break evictions can gate reconnect.
+    node.registry.supervise_configured_peers().await;
+    let after_second = counters.outbound_starts.load(Ordering::SeqCst);
+    assert!(
+        after_second > after_first,
+        "ordinary half-open/pre-handshake EOF failure must not be throttled by tie-break cooldown"
+    );
+
+    set_transport_lifecycle_recorder(None);
+    bad_listener.abort();
+    node.shutdown_and_wait().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn witness_mesh_restart_and_simultaneous_open_matrix_converges_quietly()
+-> icanact_remote::Result<()> {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let pre_handshake_eofs = init_storm_layer();
+    let counters = Arc::new(StormCounters::default());
+    let counters_for_recorder = counters.clone();
+    set_transport_lifecycle_recorder(Some(Arc::new(move |event| match event {
+        TransportLifecycleEvent::OutboundStart { .. } => {
+            counters_for_recorder
+                .outbound_starts
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        TransportLifecycleEvent::WrongDirectionEvicted { .. } => {
+            counters_for_recorder
+                .wrong_direction_evictions
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    })));
+
+    let churn_addr = reserve_free_addr();
+    let churn_key = KeyPair::new_for_testing("witness-mesh-churn-node");
+    let stable_a = start_node(
+        "127.0.0.1:0".parse().unwrap(),
+        KeyPair::new_for_testing("witness-mesh-stable-a"),
+        churn_config(),
+    )
+    .await?;
+    let stable_b = start_node(
+        "127.0.0.1:0".parse().unwrap(),
+        KeyPair::new_for_testing("witness-mesh-stable-b"),
+        churn_config(),
+    )
+    .await?;
+
+    configure_required_peer(
+        &stable_a,
+        &stable_b.registry.peer_id,
+        stable_b.registry.bind_addr,
+    )
+    .await;
+    configure_required_peer(
+        &stable_b,
+        &stable_a.registry.peer_id,
+        stable_a.registry.bind_addr,
+    )
+    .await;
+    configure_required_peer(&stable_a, &churn_key.peer_id(), churn_addr).await;
+    configure_required_peer(&stable_b, &churn_key.peer_id(), churn_addr).await;
+
+    for cycle in 0..10 {
+        let churn = start_node(churn_addr, churn_key.clone(), churn_config()).await?;
+        configure_required_peer(
+            &churn,
+            &stable_a.registry.peer_id,
+            stable_a.registry.bind_addr,
+        )
+        .await;
+        configure_required_peer(
+            &churn,
+            &stable_b.registry.peer_id,
+            stable_b.registry.bind_addr,
+        )
+        .await;
+        let _ = tokio::join!(
+            stable_a.registry.connect_to_peer(&churn.registry.peer_id),
+            stable_b.registry.connect_to_peer(&churn.registry.peer_id),
+            churn.registry.connect_to_peer(&stable_a.registry.peer_id),
+            churn.registry.connect_to_peer(&stable_b.registry.peer_id),
+        );
+        sleep(Duration::from_millis(if cycle % 3 == 0 { 140 } else { 20 })).await;
+        churn.shutdown_and_wait().await;
+        sleep(Duration::from_millis(15)).await;
+    }
+
+    let churn = start_node(churn_addr, churn_key.clone(), churn_config()).await?;
+    configure_required_peer(
+        &churn,
+        &stable_a.registry.peer_id,
+        stable_a.registry.bind_addr,
+    )
+    .await;
+    configure_required_peer(
+        &churn,
+        &stable_b.registry.peer_id,
+        stable_b.registry.bind_addr,
+    )
+    .await;
+
+    for _ in 0..25 {
+        let _ = tokio::join!(
+            stable_a
+                .registry
+                .connect_to_peer(&stable_b.registry.peer_id),
+            stable_b
+                .registry
+                .connect_to_peer(&stable_a.registry.peer_id),
+            stable_a.registry.connect_to_peer(&churn.registry.peer_id),
+            stable_b.registry.connect_to_peer(&churn.registry.peer_id),
+            churn.registry.connect_to_peer(&stable_a.registry.peer_id),
+            churn.registry.connect_to_peer(&stable_b.registry.peer_id),
+        );
+        sleep(Duration::from_millis(5)).await;
+    }
+
+    counters.outbound_starts.store(0, Ordering::SeqCst);
+    counters
+        .wrong_direction_evictions
+        .store(0, Ordering::SeqCst);
+    pre_handshake_eofs.store(0, Ordering::SeqCst);
+
+    assert!(
+        common_wait_for_mesh_connections(&[&stable_a, &stable_b, &churn], Duration::from_secs(8))
+            .await,
+        "three-node witness mesh failed to converge after restart + simultaneous-open matrix"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+    let settled_outbound = counters.outbound_starts.load(Ordering::SeqCst);
+    let settled_evictions = counters.wrong_direction_evictions.load(Ordering::SeqCst);
+    let settled_eofs = pre_handshake_eofs.load(Ordering::SeqCst);
+    sleep(Duration::from_millis(1500)).await;
+
+    let quiet_outbound = counters.outbound_starts.load(Ordering::SeqCst) - settled_outbound;
+    let quiet_evictions =
+        counters.wrong_direction_evictions.load(Ordering::SeqCst) - settled_evictions;
+    let quiet_eofs = pre_handshake_eofs.load(Ordering::SeqCst) - settled_eofs;
+    assert!(
+        quiet_outbound <= 6,
+        "witness mesh kept dialing after convergence: outbound_starts={quiet_outbound}, evictions={quiet_evictions}"
+    );
+    assert!(
+        quiet_evictions <= 2,
+        "witness mesh kept re-litigating duplicate tie-breaks after convergence: {quiet_evictions}"
+    );
+    assert_eq!(
+        quiet_eofs, 0,
+        "witness mesh logged pre-handshake EOFs after convergence: {quiet_eofs}"
+    );
+
+    churn
+        .register("witness_mesh_probe".to_string(), churn.registry.bind_addr)
+        .await
+        .expect("witness mesh probe registration");
+    assert!(
+        common_wait_for_actor(&stable_a, "witness_mesh_probe", Duration::from_secs(5)).await
+            && common_wait_for_actor(&stable_b, "witness_mesh_probe", Duration::from_secs(5)).await,
+        "registry traffic did not flow through the converged witness mesh"
+    );
+
+    set_transport_lifecycle_recorder(None);
+    churn.shutdown_and_wait().await;
+    stable_a.shutdown_and_wait().await;
+    stable_b.shutdown_and_wait().await;
+    Ok(())
+}
+
 async fn common_wait_for_pair_connection(
     a: &GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>,
     b: &GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>,
@@ -409,6 +669,42 @@ async fn common_wait_for_pair_connection(
         let up = a.registry.has_connection_to_peer(&b.registry.peer_id).await
             || b.registry.has_connection_to_peer(&a.registry.peer_id).await;
         if up {
+            consecutive += 1;
+            if consecutive >= 3 {
+                return true;
+            }
+        } else {
+            consecutive = 0;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn common_wait_for_mesh_connections(
+    nodes: &[&GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut consecutive = 0;
+    while Instant::now() < deadline {
+        let mut all_connected = true;
+        for left in 0..nodes.len() {
+            for right in (left + 1)..nodes.len() {
+                let a = nodes[left];
+                let b = nodes[right];
+                let connected = a.registry.has_connection_to_peer(&b.registry.peer_id).await
+                    || b.registry.has_connection_to_peer(&a.registry.peer_id).await;
+                if !connected {
+                    all_connected = false;
+                    break;
+                }
+            }
+            if !all_connected {
+                break;
+            }
+        }
+        if all_connected {
             consecutive += 1;
             if consecutive >= 3 {
                 return true;

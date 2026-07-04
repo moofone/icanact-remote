@@ -2380,10 +2380,9 @@ impl<T: 'static> GossipRegistry<T> {
                     .await;
                 continue;
             }
-            // A connection to this peer died within the last
-            // `tie_break_reconnect_cooldown` window (tie-break eviction or
-            // any other observed socket failure — see
-            // `note_tie_break_eviction`). This supervisor loop deliberately
+            // A repeated duplicate-connection tie-break eviction for this
+            // peer happened within the last `tie_break_reconnect_cooldown`
+            // window (see `note_tie_break_eviction`). This supervisor loop deliberately
             // bypasses `peer_retry_interval` so a genuinely-down required
             // peer reconnects promptly; without this check that same
             // unthrottled cadence turns a tie-break-induced flap (dial,
@@ -7539,6 +7538,50 @@ mod tests {
                 crate::handshake::Feature::ClockCalibration,
             ]),
         )
+    }
+
+    #[test]
+    fn tie_break_cooldown_arms_only_after_rapid_repeat_eviction() {
+        let mut config = test_config_with_seed("tie-break-cooldown-repeat");
+        config.tie_break_reconnect_cooldown = Duration::from_millis(250);
+        let registry = GossipRegistry::<()>::new(test_addr(10_100), config);
+        let peer_id = test_peer_id("tie-break-cooldown-peer");
+
+        registry.note_tie_break_eviction(&peer_id);
+        assert!(
+            !registry.tie_break_cooldown_active(&peer_id),
+            "a single ordinary simultaneous-open tie-break must not gate reconnect"
+        );
+
+        registry.note_tie_break_eviction(&peer_id);
+        assert!(
+            registry.tie_break_cooldown_active(&peer_id),
+            "a rapid repeated tie-break eviction must arm the reconnect storm guard"
+        );
+    }
+
+    #[test]
+    fn tie_break_cooldown_expires_and_requires_another_rapid_pair() {
+        let mut config = test_config_with_seed("tie-break-cooldown-expiry");
+        config.tie_break_reconnect_cooldown = Duration::from_millis(30);
+        let registry = GossipRegistry::<()>::new(test_addr(10_101), config);
+        let peer_id = test_peer_id("tie-break-cooldown-expiry-peer");
+
+        registry.note_tie_break_eviction(&peer_id);
+        registry.note_tie_break_eviction(&peer_id);
+        assert!(registry.tie_break_cooldown_active(&peer_id));
+
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(
+            !registry.tie_break_cooldown_active(&peer_id),
+            "cooldown must be a bounded delay, not a sticky liveness state"
+        );
+
+        registry.note_tie_break_eviction(&peer_id);
+        assert!(
+            !registry.tie_break_cooldown_active(&peer_id),
+            "after expiry, one later eviction is again treated as ordinary bootstrap churn"
+        );
     }
 
     #[test]
