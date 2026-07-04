@@ -2321,6 +2321,10 @@ where
                             "inbound_tiebreak_reject_non_preferred_inbound"
                         );
                         registry.clear_peer_capabilities(&peer_addr);
+                        // Direct, local evidence of a duplicate-connection
+                        // conflict for this peer — arm the storm-prevention
+                        // cooldown (narrow: not on generic socket failures).
+                        registry.note_tie_break_eviction(&peer_id);
                         false
                     }
                 } else if !keep_existing && keep_new_inbound {
@@ -2352,6 +2356,10 @@ where
                         peer_state_addr,
                         connection_arc.clone(),
                     );
+                    // Direct, local evidence of a duplicate-connection
+                    // conflict for this peer — arm the storm-prevention
+                    // cooldown (narrow: not on generic socket failures).
+                    registry.note_tie_break_eviction(&peer_id);
                     true
                 } else {
                     info!(
@@ -2363,6 +2371,7 @@ where
                         "inbound_tiebreak_reject_live_duplicate"
                     );
                     registry.clear_peer_capabilities(&peer_addr);
+                    registry.note_tie_break_eviction(&peer_id);
                     false
                 }
             } else {

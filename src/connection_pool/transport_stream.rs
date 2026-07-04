@@ -107,6 +107,12 @@ impl<T> ConnectionPool<T> {
                         },
                     );
                     let _ = self.disconnect_connection_by_peer_id(&remote_peer_id);
+                    // Arm the storm-prevention cooldown: this is a direct,
+                    // local observation of a duplicate-connection conflict
+                    // (not a generic socket failure), so it is safe and
+                    // narrow to gate this peer's *next* reconnect attempt on
+                    // it — see `GossipRegistry::note_tie_break_eviction`.
+                    registry_arc.note_tie_break_eviction(&remote_peer_id);
                 }
             }
 
