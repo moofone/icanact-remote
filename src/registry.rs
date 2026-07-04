@@ -222,6 +222,23 @@ pub fn resolve_peer_addr(
     resolve_peer_addr_checked(sender_bind_addr, tcp_source_addr).unwrap_or(tcp_source_addr)
 }
 
+/// Validate (and, for the unspecified case, repair) an advertised remote
+/// actor location address before it is allowed into `known_actors`.
+///
+/// `sender_addr` is the TCP-verified source address of the peer that
+/// gossiped this location, exactly the same trust anchor
+/// `resolve_peer_addr_checked` (above) already uses to repair peer
+/// bind-address advertisements. An unspecified advertised IP
+/// (`0.0.0.0`/`::`) is not a malformed value to reject — it is what a
+/// legitimately wildcard-bound host necessarily advertises whenever it (or
+/// one of its actors, e.g. a routed-pubsub interest actor — see
+/// `pubsub.rs::note_interest`) fails to resolve through
+/// `GossipRegistry::advertised_addr`. Dropping it outright starves the
+/// receiver of any route at all and, per the tie-break reconnect
+/// mechanics, feeds a reconnect/re-gossip churn loop instead of a
+/// converged, quiet steady state. Rewriting it with the verified TCP
+/// source IP (keeping the advertised port) restores a route using
+/// information this function already trusts, with no new trust extended.
 fn validate_remote_actor_addr(
     actor_name: &str,
     actor_addr: SocketAddr,
@@ -237,12 +254,15 @@ fn validate_remote_actor_addr(
     }
 
     if actor_addr.ip().is_unspecified() {
-        warn!(
+        let resolved = SocketAddr::new(sender_addr.ip(), actor_addr.port());
+        debug!(
             actor_name = %actor_name,
             actor_addr = %actor_addr,
-            "dropping actor location with unspecified address"
+            sender_addr = %sender_addr,
+            resolved = %resolved,
+            "actor location advertised an unspecified address; rewriting using the TCP source IP"
         );
-        return None;
+        return Some(resolved);
     }
 
     if actor_addr.ip().is_loopback() && !sender_addr.ip().is_loopback() {
@@ -1481,6 +1501,20 @@ pub struct StreamAssemblyResult {
 }
 
 impl<T: 'static> GossipRegistry<T> {
+    /// The address this node should advertise to peers for anything it
+    /// hosts (gossip `sender_addr`, peer-list snapshots, routed-pubsub
+    /// interest actors, ...): `GossipConfig::advertise_address` when set,
+    /// falling back to `bind_addr`.
+    ///
+    /// A node bound to a wildcard address (`0.0.0.0:<port>`) MUST NOT
+    /// advertise that raw bind address to peers — it is not dialable. Any
+    /// site in this crate that gossips "here is where to reach an actor/
+    /// peer hosted by me" must resolve through this helper rather than
+    /// reading `self.bind_addr` directly.
+    pub(crate) fn advertised_addr(&self) -> SocketAddr {
+        self.config.advertise_address.unwrap_or(self.bind_addr)
+    }
+
     fn peer_health_consensus_enabled(&self) -> bool {
         matches!(
             self.config.peer_health_mode,
@@ -3342,7 +3376,7 @@ impl<T: 'static> GossipRegistry<T> {
                 match change {
                     RegistryChange::ActorAdded {
                         name,
-                        location,
+                        mut location,
                         priority,
                     } => {
                         let Some((clear_tombstone, _is_update)) = self.current_actor_upsert_plan(
@@ -3352,6 +3386,29 @@ impl<T: 'static> GossipRegistry<T> {
                         ) else {
                             continue;
                         };
+                        // This is the wire path used by
+                        // `RegistrationPriority::Immediate` (e.g. routed-pubsub
+                        // interest registration, `pubsub.rs::note_interest`) —
+                        // unlike `merge_full_sync`, immediate deltas were never
+                        // address-validated at all, so an unresolved wildcard
+                        // advertised address (`0.0.0.0:<port>`) would be stored
+                        // and gossiped verbatim. Apply the same
+                        // validate-or-rewrite-using-the-known-peer-address
+                        // policy as `merge_full_sync` when we have a trusted
+                        // address to rewrite from; if we don't (peer never
+                        // configured/discovered), fall back to accepting the
+                        // wire value as before rather than dropping actors we
+                        // have no way to validate.
+                        if let Some((addr, sender_addr)) =
+                            location.address.parse::<SocketAddr>().ok().zip(sender_addr)
+                        {
+                            let Some(resolved) =
+                                validate_remote_actor_addr(name.as_str(), addr, sender_addr)
+                            else {
+                                continue;
+                            };
+                            location.address = resolved.to_string();
+                        }
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                         }
@@ -4746,6 +4803,14 @@ impl<T: 'static> GossipRegistry<T> {
             else {
                 continue;
             };
+            let mut location = location;
+            // `validate_remote_actor_addr` may have rewritten an
+            // unspecified advertised address using the TCP source IP; the
+            // stored location must carry the resolved address, not the
+            // raw wire value, or every downstream reader (including this
+            // same node's own future full-sync fan-out) would re-advertise
+            // the undialable address right back out.
+            location.address = addr.to_string();
             updates_to_apply.push((name, location, addr));
         }
 
@@ -4766,6 +4831,8 @@ impl<T: 'static> GossipRegistry<T> {
             else {
                 continue;
             };
+            let mut location = location;
+            location.address = addr.to_string();
             updates_to_apply.push((name, location, addr));
         }
 
@@ -6760,7 +6827,7 @@ impl<T: 'static> GossipRegistry<T> {
         let mut peers: Vec<PeerInfoGossip> = Vec::new();
 
         // Include self (using advertised address or bind address)
-        let self_addr = self.config.advertise_address.unwrap_or(self.bind_addr);
+        let self_addr = self.advertised_addr();
         let mut self_info = PeerInfo::local(self_addr);
         // Include our DNS name in gossip so peers can re-resolve us on reconnect
         self_info.dns_name = self.config.advertise_dns.clone();
@@ -6881,7 +6948,7 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // Create message
-        let self_addr = self.config.advertise_address.unwrap_or(self.bind_addr);
+        let self_addr = self.advertised_addr();
         let msg = RegistryMessage::PeerListGossip {
             peers,
             timestamp: now,
@@ -7688,8 +7755,16 @@ mod tests {
         );
     }
 
+    /// An unspecified advertised actor address (`0.0.0.0:<port>`) is the
+    /// legitimate wire shape a wildcard-bound peer produces — see
+    /// `pubsub.rs::note_interest` and `tests/wildcard_advertise_interest_storm.rs`
+    /// — so `merge_full_sync` must repair it using the verified sender
+    /// address rather than discard the route entirely (which starves the
+    /// receiver of any path to that actor and feeds a reconnect/re-gossip
+    /// churn loop). This mirrors `resolve_peer_addr_checked`'s existing
+    /// unspecified-bind repair for peer addresses.
     #[tokio::test]
-    async fn full_sync_rejects_unspecified_actor_route() {
+    async fn full_sync_rewrites_unspecified_actor_route_using_sender_addr() {
         let reg = GossipRegistry::<()>::new(
             test_addr(7401),
             test_config_with_seed("full-sync-unspecified-route-local"),
@@ -7697,6 +7772,46 @@ mod tests {
         let remote_peer = KeyPair::new_for_testing("full-sync-unspecified-route-remote").peer_id();
         let actor_addr: SocketAddr = "0.0.0.0:9400".parse().unwrap();
         let actor_name = "full-sync/unspecified-route/service";
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, remote_peer.clone()),
+        );
+
+        let sender_addr: SocketAddr = "10.77.0.33:9400".parse().unwrap();
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            remote_peer.clone(),
+            sender_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("unspecified actor route must be rewritten and stored, not dropped");
+        assert_eq!(
+            stored.address,
+            SocketAddr::new(sender_addr.ip(), actor_addr.port()).to_string(),
+            "rewritten actor location must use the sender's verified IP with the advertised port"
+        );
+    }
+
+    /// Port `0` is never dialable regardless of IP, and unlike an
+    /// unspecified IP there is no sender-derived value to repair it with,
+    /// so it must still be dropped outright.
+    #[tokio::test]
+    async fn full_sync_rejects_actor_route_with_port_zero() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7402),
+            test_config_with_seed("full-sync-port-zero-route-local"),
+        );
+        let remote_peer = KeyPair::new_for_testing("full-sync-port-zero-route-remote").peer_id();
+        let actor_addr: SocketAddr = "10.77.0.40:0".parse().unwrap();
+        let actor_name = "full-sync/port-zero-route/service";
         let mut local_actors = HashMap::new();
         local_actors.insert(
             actor_name.to_string(),
@@ -7715,18 +7830,7 @@ mod tests {
 
         assert!(
             reg.lookup_actor(actor_name).await.is_none(),
-            "non-dialable actor locations must not enter the directory"
-        );
-        assert!(
-            reg.connection_pool
-                .peer_id_to_addr
-                .read_sync(&remote_peer, |_, addr| *addr)
-                .is_none(),
-            "non-dialable actor locations must not install peer-id routes"
-        );
-        assert!(
-            reg.connection_pool.list_configured_peers().is_empty(),
-            "non-dialable actor locations must not be supervised"
+            "port-0 actor locations must not enter the directory"
         );
     }
 
