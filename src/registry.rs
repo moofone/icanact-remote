@@ -10251,6 +10251,133 @@ mod tests {
         );
     }
 
+    /// RED (P1 primary finding): a socket failure whose `failed_instance_id`
+    /// matches the CURRENT session's own instance id must retire that
+    /// instance by CAS'd identity (`disconnect_connection_instance`), never
+    /// fall through to the peer-wide `disconnect_connection_by_peer_id`. A
+    /// fresh session for the same peer published in the gap between the
+    /// instance-id match and a peer-wide teardown must survive — only the
+    /// failed instance may be retired.
+    ///
+    /// Pinned deterministically via `set_transport_lifecycle_recorder`:
+    /// both `disconnect_connection_by_peer_id` (buggy, peer-wide) and
+    /// `disconnect_connection_instance` (fixed, CAS-scoped) fire a
+    /// `SessionRemoved { reason: DisconnectByPeerId }` event for this peer.
+    /// The peer-wide path fires it BEFORE its unconditional
+    /// `clear_current_peer_connection` store and peer-id-keyed address-alias
+    /// sweep — publishing a fresh session from inside this hook lands
+    /// exactly in that check-then-act gap and gets clobbered. The CAS path
+    /// fires the same event only AFTER its atomic compare-and-clear has
+    /// already completed, so the identical publish lands safely afterward.
+    #[tokio::test]
+    async fn socket_failure_matched_instance_teardown_is_instance_scoped_not_peer_wide() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        struct RecorderGuard;
+        impl Drop for RecorderGuard {
+            fn drop(&mut self) {
+                crate::set_transport_lifecycle_recorder(None);
+            }
+        }
+
+        let registry = GossipRegistry::<()>::new(test_addr(9400), test_config());
+        let peer_id = test_peer_id("matched_instance_peer");
+        let old_addr = test_addr(9401);
+        let fresh_addr = test_addr(9402);
+        let pool = registry.connection_pool.clone();
+        pool.set_configured_peer_addr(&peer_id, old_addr);
+
+        // Current, live session whose IO task is about to fail.
+        let (io_old, _p_old) = tokio::io::duplex(1024);
+        let (sh_old, _w_old, _r_old) = LockFreeStreamHandle::new(
+            io_old,
+            old_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn_old = LockFreeConnection::new(old_addr, ConnectionDirection::Outbound);
+        conn_old.stream_handle = Some(Arc::new(sh_old));
+        conn_old.embedded_peer_id = Some(peer_id.clone());
+        conn_old.set_state(ConnectionState::Connected);
+        let conn_old = Arc::new(conn_old);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn_old.clone()));
+
+        let old_instance_id = conn_old
+            .stream_handle
+            .as_ref()
+            .map(|h| h.instance_id())
+            .expect("conn_old must have a stream handle");
+
+        // The FRESH replacement session a concurrent inbound publishes for
+        // the same peer identity while `conn_old`'s teardown is in flight —
+        // models the publish landing in the match-then-disconnect gap.
+        let (io_fresh, _p_fresh) = tokio::io::duplex(1024);
+        let (sh_fresh, _w_fresh, _r_fresh) = LockFreeStreamHandle::new(
+            io_fresh,
+            fresh_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn_fresh = LockFreeConnection::new(fresh_addr, ConnectionDirection::Inbound);
+        conn_fresh.stream_handle = Some(Arc::new(sh_fresh));
+        conn_fresh.embedded_peer_id = Some(peer_id.clone());
+        conn_fresh.set_state(ConnectionState::Connected);
+        let conn_fresh = Arc::new(conn_fresh);
+
+        let _guard = RecorderGuard;
+        {
+            let pool = pool.clone();
+            let peer_id = peer_id.clone();
+            let conn_fresh = conn_fresh.clone();
+            crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::SessionRemoved {
+                    peer,
+                    reason: crate::SessionRemovalReason::DisconnectByPeerId,
+                    ..
+                } = &event
+                    && *peer == peer_id
+                {
+                    // Deregister first: the nested `publish_current_peer_connection`
+                    // call below fires its own (non-matching) `SessionPublished`
+                    // event through this same global hook, and this avoids any
+                    // reentrant/recursive invocation of this closure.
+                    crate::set_transport_lifecycle_recorder(None);
+                    pool.publish_current_peer_connection(&peer_id, conn_fresh.clone());
+                }
+            })));
+        }
+
+        // conn_old's IO task exits and reports failure, identifying itself
+        // by its OWN captured instance id — which matches the current
+        // session at the moment the handler makes its decision.
+        registry
+            .handle_peer_connection_failure(old_addr, Some(old_instance_id))
+            .await
+            .unwrap();
+
+        let after = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            after.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn_fresh)),
+            "a fresh session published from inside the matched-instance teardown's \
+             check-then-act gap must survive — retiring the failed instance must never \
+             fall through to a peer-wide disconnect that clobbers it (got {after:?})"
+        );
+        assert!(
+            pool.connections_by_peer
+                .read_sync(&peer_id, |_, v| Arc::ptr_eq(v, &conn_fresh))
+                .unwrap_or(false),
+            "`connections_by_peer` must still point at the fresh instance after the matched \
+             failed instance is retired"
+        );
+    }
+
     /// RED (absence-of-alias misread as superseded): a socket failure for an
     /// INBOUND current session's *ephemeral* peer address — which was never
     /// (or is no longer) indexed in `connections_by_addr` — must NOT be
