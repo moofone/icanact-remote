@@ -31,3 +31,4 @@ benchmarks/**/logs/
 test_output*.log
 test_output*.txt
 validation_output*.log
+!spec/PEER_ID_REFACTOR.md

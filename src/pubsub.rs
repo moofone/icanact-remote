@@ -1123,7 +1123,26 @@ impl RoutedPubSub {
 
                 let name = interest_name(topic_key, &peer);
                 let result = if present {
-                    let mut location = RemoteActorLocation::new_with_peer(registry.bind_addr, peer);
+                    // Advertise through `advertised_addr()`, never the raw
+                    // `bind_addr` — a node bound to a wildcard address
+                    // (`0.0.0.0:<port>`, a normal deployment pattern) would
+                    // otherwise gossip an undialable interest-actor
+                    // location, starving peers of a route to it (the
+                    // wildcard-advertise reconnect-storm class of bug; see
+                    // `tests/wildcard_advertise_interest_storm.rs`). When
+                    // no `GossipConfig::advertise_address` override is
+                    // configured this can still resolve to an unspecified
+                    // IP; that is deliberately not rejected here.
+                    // Registration proceeds and the receiving side's
+                    // `validate_remote_actor_addr` (`registry.rs`) rewrites
+                    // an unspecified advertised IP using the gossiping
+                    // peer's own verified address — the same trust anchor
+                    // `resolve_peer_addr_checked` already uses for peer
+                    // bind-address resolution — so wildcard-bound nodes
+                    // work correctly with zero required configuration,
+                    // exactly like peer addresses already do.
+                    let advertised = registry.advertised_addr();
+                    let mut location = RemoteActorLocation::new_with_peer(advertised, peer);
                     location.priority = RegistrationPriority::Immediate;
                     registry
                         .register_actor_with_priority(
@@ -1132,7 +1151,6 @@ impl RoutedPubSub {
                             RegistrationPriority::Immediate,
                         )
                         .await
-                        .map(|_| ())
                 } else {
                     registry.unregister_actor(&name).await.map(|_| ())
                 };

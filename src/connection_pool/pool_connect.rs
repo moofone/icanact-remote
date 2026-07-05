@@ -127,6 +127,17 @@ impl<T> ConnectionPool<T> {
     }
 
     pub(crate) fn set_discovered_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        // PEER_ID_REFACTOR §1.7 dial precedence: configured → learned →
+        // advertised. A REQUIRED peer's operator-configured session route
+        // must never be displaced by a learned hint (the hint may be stale
+        // or NAT-only while the configured address is the routable target).
+        // The hint is still recorded in the fallback index, which
+        // `get_configured_peer_addr` only consults when no session route
+        // is configured.
+        if self.is_required_peer(peer_id) {
+            let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
+            return;
+        }
         self.set_session_route_addr(peer_id, addr);
     }
 
@@ -1647,7 +1658,7 @@ impl<T> ConnectionPool<T> {
                     local_actors,
                     known_actors,
                     sender_peer_id: registry_arc.peer_id.clone(),
-                    sender_bind_addr: Some(registry_arc.bind_addr.to_string()), // Use our listening address, not ephemeral port
+                    sender_bind_addr: Some(registry_arc.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
                     sequence: gossip_state.gossip_sequence,
                     wall_clock_time: crate::current_timestamp(),
                     extensions: None,
@@ -2067,7 +2078,12 @@ pub(crate) fn handle_incoming_message(
                 // already-tombstoned) return an empty list, so we don't emit
                 // redundant `ImmediateAck` frames for senders that broadcast
                 // the same change more than once.
-                let immediate_actors = registry.apply_delta(delta).await?;
+                //
+                // `_peer_addr` is the verified socket address of the
+                // connection this delta arrived on — the §1.6 trust anchor
+                // for advertised-address repair (outranks configured/
+                // discovered route state, which may be stale).
+                let immediate_actors = registry.apply_delta_from(delta, Some(_peer_addr)).await?;
 
                 // NEW: Send ACK back for immediate registrations
                 if !immediate_actors.is_empty() {
@@ -2267,13 +2283,16 @@ pub(crate) fn handle_incoming_message(
                     );
                 }
 
-                // Only remaining async operation
+                // Only remaining async operation. Peer bookkeeping keys on
+                // the bind-derived address; address REPAIR anchors on the
+                // verified TCP source (§1.6).
                 registry
-                    .merge_full_sync(
+                    .merge_full_sync_from(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
                         sender_socket_addr,
+                        Some(_peer_addr),
                         sequence,
                         wall_clock_time,
                     )
@@ -2298,7 +2317,7 @@ pub(crate) fn handle_incoming_message(
                         local_actors: our_local_actors,
                         known_actors: our_known_actors,
                         sender_peer_id: registry.peer_id.clone(), // Use peer ID
-                        sender_bind_addr: Some(registry.bind_addr.to_string()), // Our listening address
+                        sender_bind_addr: Some(registry.advertised_addr().to_string()), // reachable advertised address (NAT-aware)
                         sequence: our_sequence,
                         wall_clock_time: crate::current_timestamp(),
                         extensions: registry
@@ -2474,7 +2493,10 @@ pub(crate) fn handle_incoming_message(
                     crate::current_timestamp_nanos(),
                 );
 
-                if let Err(err) = registry.apply_delta(delta).await {
+                // Same §1.6 trust anchor as the DeltaGossip branch above:
+                // responses also carry actor additions, and repair must use
+                // the verified socket address of this connection.
+                if let Err(err) = registry.apply_delta_from(delta, Some(_peer_addr)).await {
                     warn!(error = %err, "failed to apply delta from response");
                 } else {
                     let mut gossip_state = registry.gossip_state.lock().await;
@@ -2518,11 +2540,12 @@ pub(crate) fn handle_incoming_message(
                 );
 
                 registry
-                    .merge_full_sync(
+                    .merge_full_sync_from(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
                         sender_socket_addr,
+                        Some(_peer_addr),
                         sequence,
                         wall_clock_time,
                     )
