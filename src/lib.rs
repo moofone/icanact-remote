@@ -19,7 +19,6 @@
     clippy::redundant_pattern_matching,
     clippy::too_many_arguments,
     clippy::type_complexity,
-    clippy::unnecessary_lazy_evaluations,
     clippy::vec_box,
     reason = "legacy lint debt outside the focused gossip QA fix"
 )]
