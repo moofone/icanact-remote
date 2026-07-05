@@ -2287,110 +2287,137 @@ where
 
         let connection_arc = Arc::new(connection);
 
+        // Routed through the shared identity-only chokepoint
+        // (`resolve_connection_conflict`, `connection_pool/pool_connect.rs`)
+        // for every case where a concrete existing connection is present. The
+        // "no existing connection at all" fast path below is intentionally
+        // NOT routed: it always accepts unconditionally (matching
+        // `finalize_new_outbound_connection`'s own `None => AcceptIncoming`
+        // precedent) rather than tie-break-checking a peer's very first
+        // connection, which would reject legitimate first contact whenever
+        // this side happens to be the lower-NodeId side.
         let keep_connection = {
             let pool = &registry.connection_pool;
 
-            if let Some(existing_conn) = pool.get_connection_by_peer_id(&peer_id) {
-                let existing_usable = existing_conn.has_live_stream();
-                let keep_existing = existing_usable
-                    && registry.should_keep_connection(
-                        &peer_id,
-                        existing_conn.direction
-                            == crate::connection_pool::ConnectionDirection::Outbound,
-                    );
-                let keep_new_inbound = registry.should_keep_connection(&peer_id, false);
-
-                if !existing_usable {
-                    info!(
-                        target: "icanact_remote_lifecycle",
-                        peer_id = %peer_id,
-                        addr = %existing_conn.addr,
-                        peer_state_addr = %peer_state_addr,
-                        "inbound_tiebreak_evict_stale"
-                    );
-                    let _ = pool.disconnect_connection_by_peer_id(&peer_id);
-                    if keep_new_inbound {
-                        pool.add_connection_by_peer_id(
-                            peer_id.clone(),
-                            peer_state_addr,
-                            connection_arc.clone(),
-                        );
-                        true
-                    } else {
-                        info!(
-                            target: "icanact_remote_lifecycle",
-                            peer_id = %peer_id,
-                            peer_state_addr = %peer_state_addr,
-                            "inbound_tiebreak_reject_non_preferred_inbound"
-                        );
-                        registry.clear_peer_capabilities(&peer_addr);
-                        // Direct, local evidence of a duplicate-connection
-                        // conflict for this peer — arm the storm-prevention
-                        // cooldown (narrow: not on generic socket failures).
-                        registry.note_tie_break_eviction(&peer_id);
-                        false
-                    }
-                } else if !keep_existing && keep_new_inbound {
-                    info!(
-                        target: "icanact_remote_lifecycle",
-                        peer_id = %peer_id,
-                        addr = %existing_conn.addr,
-                        peer_state_addr = %peer_state_addr,
-                        existing_direction = ?existing_conn.direction,
-                        "inbound_tiebreak_replace_wrong_direction"
-                    );
-                    crate::lifecycle::record_transport_event(
-                        crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
-                            peer: peer_id.clone(),
-                            addr: existing_conn.addr,
-                            direction: match existing_conn.direction {
-                                crate::connection_pool::ConnectionDirection::Inbound => {
-                                    crate::lifecycle::TransportDirection::Inbound
-                                }
-                                crate::connection_pool::ConnectionDirection::Outbound => {
-                                    crate::lifecycle::TransportDirection::Outbound
-                                }
-                            },
-                        },
-                    );
-                    let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+            match pool.get_connection_by_peer_id(&peer_id) {
+                None => {
                     pool.add_connection_by_peer_id(
                         peer_id.clone(),
                         peer_state_addr,
                         connection_arc.clone(),
                     );
-                    // Direct, local evidence of a duplicate-connection
-                    // conflict for this peer — arm the storm-prevention
-                    // cooldown (narrow: not on generic socket failures).
-                    registry.note_tie_break_eviction(&peer_id);
-                    true
-                } else {
                     info!(
                         target: "icanact_remote_lifecycle",
                         peer_id = %peer_id,
-                        addr = %existing_conn.addr,
+                        peer_addr = %peer_addr,
                         peer_state_addr = %peer_state_addr,
-                        existing_direction = ?existing_conn.direction,
-                        "inbound_tiebreak_reject_live_duplicate"
+                        "inbound_connection_accepted"
                     );
-                    registry.clear_peer_capabilities(&peer_addr);
-                    registry.note_tie_break_eviction(&peer_id);
-                    false
+                    true
                 }
-            } else {
-                pool.add_connection_by_peer_id(
-                    peer_id.clone(),
-                    peer_state_addr,
-                    connection_arc.clone(),
-                );
-                info!(
-                    target: "icanact_remote_lifecycle",
-                    peer_id = %peer_id,
-                    peer_addr = %peer_addr,
-                    peer_state_addr = %peer_state_addr,
-                    "inbound_connection_accepted"
-                );
-                true
+                Some(existing_conn) => {
+                    let existing_usable = existing_conn.has_live_stream();
+                    let keep_existing = existing_usable
+                        && registry.should_keep_connection(
+                            &peer_id,
+                            existing_conn.direction
+                                == crate::connection_pool::ConnectionDirection::Outbound,
+                        );
+                    let keep_new_inbound = registry.should_keep_connection(&peer_id, false);
+
+                    match crate::connection_pool::resolve_connection_conflict(
+                        existing_usable,
+                        keep_existing,
+                        keep_new_inbound,
+                    ) {
+                        crate::connection_pool::ConnectionConflictDecision::AcceptIncoming => {
+                            info!(
+                                target: "icanact_remote_lifecycle",
+                                peer_id = %peer_id,
+                                addr = %existing_conn.addr,
+                                peer_state_addr = %peer_state_addr,
+                                "inbound_tiebreak_evict_stale"
+                            );
+                            let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                            pool.add_connection_by_peer_id(
+                                peer_id.clone(),
+                                peer_state_addr,
+                                connection_arc.clone(),
+                            );
+                            true
+                        }
+                        crate::connection_pool::ConnectionConflictDecision::EvictStaleRejectIncoming => {
+                            info!(
+                                target: "icanact_remote_lifecycle",
+                                peer_id = %peer_id,
+                                addr = %existing_conn.addr,
+                                peer_state_addr = %peer_state_addr,
+                                "inbound_tiebreak_evict_stale"
+                            );
+                            let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                            info!(
+                                target: "icanact_remote_lifecycle",
+                                peer_id = %peer_id,
+                                peer_state_addr = %peer_state_addr,
+                                "inbound_tiebreak_reject_non_preferred_inbound"
+                            );
+                            registry.clear_peer_capabilities(&peer_addr);
+                            // Direct, local evidence of a duplicate-connection
+                            // conflict for this peer — arm the storm-prevention
+                            // cooldown (narrow: not on generic socket failures).
+                            registry.note_tie_break_eviction(&peer_id);
+                            false
+                        }
+                        crate::connection_pool::ConnectionConflictDecision::ReplaceExisting => {
+                            info!(
+                                target: "icanact_remote_lifecycle",
+                                peer_id = %peer_id,
+                                addr = %existing_conn.addr,
+                                peer_state_addr = %peer_state_addr,
+                                existing_direction = ?existing_conn.direction,
+                                "inbound_tiebreak_replace_wrong_direction"
+                            );
+                            crate::lifecycle::record_transport_event(
+                                crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
+                                    peer: peer_id.clone(),
+                                    addr: existing_conn.addr,
+                                    direction: match existing_conn.direction {
+                                        crate::connection_pool::ConnectionDirection::Inbound => {
+                                            crate::lifecycle::TransportDirection::Inbound
+                                        }
+                                        crate::connection_pool::ConnectionDirection::Outbound => {
+                                            crate::lifecycle::TransportDirection::Outbound
+                                        }
+                                    },
+                                },
+                            );
+                            let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                            pool.add_connection_by_peer_id(
+                                peer_id.clone(),
+                                peer_state_addr,
+                                connection_arc.clone(),
+                            );
+                            // Direct, local evidence of a duplicate-connection
+                            // conflict for this peer — arm the storm-prevention
+                            // cooldown (narrow: not on generic socket failures).
+                            registry.note_tie_break_eviction(&peer_id);
+                            true
+                        }
+                        crate::connection_pool::ConnectionConflictDecision::RejectIncoming => {
+                            info!(
+                                target: "icanact_remote_lifecycle",
+                                peer_id = %peer_id,
+                                addr = %existing_conn.addr,
+                                peer_state_addr = %peer_state_addr,
+                                existing_direction = ?existing_conn.direction,
+                                "inbound_tiebreak_reject_live_duplicate"
+                            );
+                            registry.clear_peer_capabilities(&peer_addr);
+                            registry.note_tie_break_eviction(&peer_id);
+                            false
+                        }
+                    }
+                }
             }
         };
         if keep_connection {

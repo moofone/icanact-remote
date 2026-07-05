@@ -1,46 +1,114 @@
 /// Outcome of a connection keep/drop/dedup conflict for a single peer identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a connection conflict decision must be acted on explicitly by the \
+              caller (accept/replace/reject/evict) — silently discarding it and \
+              falling back to ad hoc (often address-keyed) logic is exactly the \
+              regression this chokepoint exists to prevent"]
 pub(crate) enum ConnectionConflictDecision {
-    /// No live rival session — take the incoming connection as the session.
+    /// No live rival (none exists, or the existing entry is stale/dead) and the
+    /// incoming candidate is identity-preferred — take incoming as the session.
     AcceptIncoming,
-    /// The incoming is the preferred direction — replace the existing session.
+    /// A live rival exists but the tie-break prefers the incoming candidate —
+    /// evict the rival, take incoming as the session.
     ReplaceExisting,
-    /// Keep the existing session — the incoming loses the tie-break.
+    /// A live rival exists and the tie-break does not strictly prefer the
+    /// incoming candidate over it — keep the rival, reject incoming.
     RejectIncoming,
+    /// The existing entry is stale/dead *and* the incoming candidate is not
+    /// identity-preferred either — evict the stale entry, but do not accept
+    /// incoming as the session either (neither survives as "the" session).
+    EvictStaleRejectIncoming,
 }
 
-/// THE single decision point for connection keep/drop/dedup outcomes.
+/// THE single decision authority for connection keep/drop/dedup/replace
+/// outcomes for a verified peer identity.
 ///
 /// Its inputs are *purely* identity-derived: `keep_existing` / `keep_incoming`
 /// are the results of [`GossipRegistry::should_keep_connection`], a pure
 /// function of verified peer NodeId ordering plus connection direction, and
 /// `existing_usable` is the rival's liveness. There is deliberately **no
-/// `SocketAddr` parameter**: a keep/drop/dedup outcome can never be a function
-/// of where a peer happens to be dialing from, only of its cryptographic
-/// identity. A changed socket address is handled as reindex-only metadata (see
-/// [`ConnectionPool::reindex_connection_addr`]) and never reaches this
-/// function. This structural absence is the invariant that prevents the
-/// address-keyed teardown that caused the single-node-restart reconnect thrash.
+/// `SocketAddr` parameter** — this is enforced structurally (at the type/
+/// signature level, not by a runtime check): a keep/drop/dedup outcome can
+/// never be a function of where a peer happens to be dialing from, only of
+/// its cryptographic identity. A changed socket address is handled as
+/// reindex-only metadata (see [`ConnectionPool::reindex_connection_addr`]) and
+/// never reaches this function. This structural absence — no caller can even
+/// attempt to pass an address in — is the invariant that prevents the
+/// address-keyed teardown that caused the single-node-restart reconnect
+/// thrash. The `#[must_use]` on [`ConnectionConflictDecision`] is a second,
+/// compiler-enforced guard: a call site cannot silently ignore the decision
+/// and fall back to inline address-conditioned logic.
 ///
-/// The inbound-accept tie-break (`handle.rs`) and the outbound top-of-dial
-/// tie-break (`transport_stream.rs`) make the identical identity-keyed decision
-/// inline today; consolidating them onto this function is a follow-up. They are
-/// already address-free (they consult only `should_keep_connection`), so they
-/// are not a source of the address-keyed defect this function guards against.
+/// `resolve_connection_conflict_matches_all_routed_call_sites`
+/// (`src/connection_pool/tests/mod.rs`) pins the exact (existing_usable,
+/// keep_existing, keep_incoming) → decision contract each routed call site
+/// below relies on, so a future change to this function's logic that breaks
+/// any one site's assumption fails loudly there, not silently at runtime.
+///
+/// ## Routed call sites
+///
+/// - **Outbound finalize** (`ConnectionPool::finalize_new_outbound_connection`,
+///   `pool_connect.rs` — the publish-gate call, see `resolve_connection_conflict(...)`
+///   a few hundred lines below): a freshly-dialed outbound socket already
+///   exists; `keep_incoming = should_keep_connection(peer, true)`.
+/// - **Inbound accept** (`handle_incoming_connection_tls`, `src/handle.rs`,
+///   the `keep_connection` block once `pool.get_connection_by_peer_id` returns
+///   `Some`): a freshly-accepted inbound socket already exists;
+///   `keep_incoming = should_keep_connection(peer, false)`. The "no existing
+///   connection at all" fast path is intentionally **not** routed through
+///   this function (see exception below).
+/// - **Outbound top-of-dial, stale-rival branch** (`ConnectionPool::connect_via_stream`,
+///   `src/connection_pool/transport_stream.rs`, the `!alive` arm): the
+///   existing entry is dead; `keep_incoming = should_keep_connection(peer, true)`
+///   (the same value the caller reuses immediately afterward for its
+///   preferred-inbound-wait decision).
+///
+/// ## Explicitly-justified exceptions (not routed)
+///
+/// - **Outbound top-of-dial, alive-rival branch** (same function, the `alive`
+///   arm): this decides "is the connection I already hold still the
+///   tie-break-correct one to keep" — a genuinely **one-input** question
+///   (`keep_existing` alone), asked *before* any concrete incoming candidate
+///   exists (the actual TCP/TLS dial for a replacement has not even started
+///   yet at this point in the code; whether to dial at all, or instead wait
+///   for a preferred inbound, is a *separate* decision made further down via
+///   `keep_outbound_dial`). Feeding that same `keep_outbound_dial` value into
+///   this function as a synthetic `keep_incoming` would be dishonest: it can
+///   legitimately be `false` (this side is the higher-NodeId side, which
+///   never wants to keep an outbound) while the live existing outbound must
+///   *still* be evicted as wrong-direction regardless of that fact — this
+///   function's `!existing_usable`-adjacent formula (`!keep_existing &&
+///   keep_incoming ⇒ Replace`) would then wrongly return `RejectIncoming`
+///   (reuse) instead of `ReplaceExisting` (evict). Synthesizing a `true` to
+///   force the correct branch would misrepresent `should_keep_connection`'s
+///   real output at that call site, defeating the "purely identity-derived
+///   inputs" contract this function exists to guarantee. The correct rule
+///   there really is the strict one-input reduction `if keep_existing { keep
+///   } else { evict }`, which this function cannot express without either a
+///   third parameter carrying the existing connection's own direction
+///   (over-generalizing a chokepoint whose entire value is a small, auditable
+///   surface) or a dishonest second input. It remains a direct
+///   `should_keep_connection` call, cross-referenced in a code comment at the
+///   call site back to this doc section.
 pub(crate) fn resolve_connection_conflict(
     existing_usable: bool,
     keep_existing: bool,
     keep_incoming: bool,
 ) -> ConnectionConflictDecision {
-    if existing_usable && keep_existing && !keep_incoming {
-        return ConnectionConflictDecision::RejectIncoming;
+    if !existing_usable {
+        return if keep_incoming {
+            ConnectionConflictDecision::AcceptIncoming
+        } else {
+            ConnectionConflictDecision::EvictStaleRejectIncoming
+        };
     }
-    if existing_usable && !keep_incoming {
-        // Rival is live but the tie-break does not prefer either strictly in
-        // the incoming's favour (e.g. equal/degenerate) — keep the live rival.
-        return ConnectionConflictDecision::RejectIncoming;
+    if !keep_existing && keep_incoming {
+        return ConnectionConflictDecision::ReplaceExisting;
     }
-    ConnectionConflictDecision::ReplaceExisting
+    // Covers both "the rival is kept" and "neither side is strictly
+    // preferred" (equal/degenerate) — in both cases the live rival survives
+    // rather than being displaced by an equally-unpreferred incoming.
+    ConnectionConflictDecision::RejectIncoming
 }
 
 impl<T> ConnectionPool<T> {
@@ -1719,6 +1787,22 @@ impl<T> ConnectionPool<T> {
                         peer = %addr,
                         peer_id = %peer_id,
                         "outbound finalize kept existing preferred session; not displacing it"
+                    );
+                }
+                ConnectionConflictDecision::EvictStaleRejectIncoming => {
+                    // The rival was dead, but this freshly-dialed outbound is
+                    // *also* not the tie-break-preferred direction (e.g. the
+                    // higher-NodeId side's fallback dial after a
+                    // preferred-inbound-wait timeout). Clean up the stale
+                    // entry so it does not linger, but do not publish this
+                    // outbound as the session either — a preferred inbound
+                    // may still arrive and must not be pre-empted.
+                    let _ = self.disconnect_connection_by_peer_id(peer_id);
+                    debug!(
+                        peer = %addr,
+                        peer_id = %peer_id,
+                        "outbound finalize evicted a stale rival but declined to publish a \
+                         non-preferred outbound as the session"
                     );
                 }
             }
