@@ -3378,6 +3378,20 @@ impl<T: 'static> GossipRegistry<T> {
     /// duplicate delta whose contents were all suppressed must not generate
     /// fresh acks.
     pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<Vec<String>> {
+        self.apply_delta_from(delta, None).await
+    }
+
+    /// Apply a delta, resolving advertised addresses against the
+    /// AUTHENTICATED socket address of the connection that delivered it
+    /// (PEER_ID_REFACTOR §1.6): the verified source of THIS message
+    /// outranks any locally derived route (configured/discovered), which
+    /// may be stale. Wire receive paths must pass `verified_sender_addr`;
+    /// `None` (local/test callers) falls back to the connection-pool route.
+    pub async fn apply_delta_from(
+        &self,
+        delta: RegistryDelta,
+        verified_sender_addr: Option<SocketAddr>,
+    ) -> Result<Vec<String>> {
         let total_changes = delta.changes.len();
         let sender_peer_id = delta.sender_peer_id.clone();
 
@@ -3405,11 +3419,12 @@ impl<T: 'static> GossipRegistry<T> {
             .as_nanos();
 
         // Resolve the sender's address before taking the lock so the
-        // lock section is short.
-        let sender_addr = {
+        // lock section is short. The verified source of this very message
+        // wins over locally derived route state (§1.6).
+        let sender_addr = verified_sender_addr.or_else(|| {
             let pool = &self.connection_pool;
             pool.get_configured_peer_addr(&sender_peer_id)
-        };
+        });
 
         // Critical section: apply all known_actors / removed_actors
         // mutations AND the peer_to_actors update under a single
@@ -4711,7 +4726,9 @@ impl<T: 'static> GossipRegistry<T> {
 
                 let delta_sequence = delta.current_sequence;
 
-                self.apply_delta(delta).await?;
+                // `addr` is the verified socket address this response
+                // arrived from — the §1.6 trust anchor for address repair.
+                self.apply_delta_from(delta, Some(addr)).await?;
                 // Don't add peer here - peers are managed through handle_connection
 
                 let now = crate::current_timestamp_millis();

@@ -2067,7 +2067,12 @@ pub(crate) fn handle_incoming_message(
                 // already-tombstoned) return an empty list, so we don't emit
                 // redundant `ImmediateAck` frames for senders that broadcast
                 // the same change more than once.
-                let immediate_actors = registry.apply_delta(delta).await?;
+                //
+                // `_peer_addr` is the verified socket address of the
+                // connection this delta arrived on — the §1.6 trust anchor
+                // for advertised-address repair (outranks configured/
+                // discovered route state, which may be stale).
+                let immediate_actors = registry.apply_delta_from(delta, Some(_peer_addr)).await?;
 
                 // NEW: Send ACK back for immediate registrations
                 if !immediate_actors.is_empty() {

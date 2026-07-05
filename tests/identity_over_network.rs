@@ -261,3 +261,140 @@ async fn inbound_from_unknown_source_accepted_by_key_despite_wrong_configured_ad
     node_b.shutdown().await;
     Ok(())
 }
+
+async fn wait_for_stored_location(
+    node: &GossipRegistryHandle<BuilderTlsBootstrap>,
+    actor_name: &str,
+    timeout: Duration,
+) -> icanact_remote::RemoteActorLocation {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(location) = node.registry.lookup_actor(actor_name).await {
+            return location;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actor location must be stored (identity-routable), not dropped"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Codex P1 (round 2) / §1.6: the immediate-delta path must repair an
+/// owner-sent wildcard from the AUTHENTICATED source address of the
+/// connection that delivered the delta — not from the receiver's configured
+/// route for the sender. Topology: the receiver never configured the
+/// dialer at all (inbound-only, accept-by-key), so a config-derived lookup
+/// has nothing trustworthy to offer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wildcard_interest_from_unconfigured_inbound_peer_resolves_to_source_ip()
+-> icanact_remote::Result<()> {
+    // Dialer = tie-break-preferred side; the listener has ZERO config for it.
+    let (key_dialer, key_listener) =
+        keys_ordered_dialer_first("identity-unconfig-a", "identity-unconfig-b");
+    let addr_dialer: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+    let addr_listener: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+
+    let dialer = start_node(addr_dialer, &key_dialer, test_config()).await?;
+    let listener = start_node(addr_listener, &key_listener, test_config()).await?;
+
+    dialer
+        .add_peer(&listener.registry.peer_id)
+        .await
+        .connect(&addr_listener)
+        .await?;
+    assert!(
+        wait_for_pair_connection(&dialer, &listener, Duration::from_secs(10)).await,
+        "listener must accept the inbound by key"
+    );
+
+    // The dialer advertises a wildcard-bound actor over the immediate path.
+    let actor_name = "identity/unconfigured-source/echo";
+    dialer
+        .register_urgent(
+            actor_name.to_string(),
+            "0.0.0.0:9400".parse().unwrap(),
+            RegistrationPriority::Immediate,
+        )
+        .await?;
+
+    let stored = wait_for_stored_location(&listener, actor_name, Duration::from_secs(10)).await;
+    let stored_addr: SocketAddr = stored.address.parse().expect("stored address parses");
+    assert!(
+        !stored_addr.ip().is_unspecified(),
+        "owner-sent wildcard must be repaired from the verified connection source, \
+         even when the receiver has no configured route for the sender (got {})",
+        stored.address
+    );
+    assert_eq!(stored_addr.port(), 9400, "advertised port preserved");
+
+    dialer.shutdown().await;
+    listener.shutdown().await;
+    Ok(())
+}
+
+/// Codex P1 (round 2), stale-config flavor: when the receiver's configured
+/// address for a peer is stale/dead but the peer is LIVE on a verified
+/// connection, wildcard repair must use the live connection's source IP —
+/// never the stale configured IP (that would re-advertise a dead route).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wildcard_interest_repair_prefers_live_source_over_stale_config()
+-> icanact_remote::Result<()> {
+    let (key_dialer, key_listener) =
+        keys_ordered_dialer_first("identity-staleconf-a", "identity-staleconf-b");
+    let addr_dialer: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+    let addr_listener: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+
+    let dialer = start_node(addr_dialer, &key_dialer, test_config()).await?;
+    let listener = start_node(addr_listener, &key_listener, test_config()).await?;
+
+    // Listener is configured with the dialer's key at a STALE, unreachable
+    // address whose IP differs from the dialer's real source IP.
+    let stale_addr: SocketAddr = "10.255.255.1:9".parse().unwrap();
+    let peer_from_listener = listener.add_peer(&dialer.registry.peer_id).await;
+    let _ = peer_from_listener.connect(&stale_addr).await; // dead, expected to fail
+
+    dialer
+        .add_peer(&listener.registry.peer_id)
+        .await
+        .connect(&addr_listener)
+        .await?;
+    assert!(
+        wait_for_pair_connection(&dialer, &listener, Duration::from_secs(10)).await,
+        "pair must connect via the dialer's outbound"
+    );
+
+    let actor_name = "identity/stale-config-source/echo";
+    dialer
+        .register_urgent(
+            actor_name.to_string(),
+            "0.0.0.0:9400".parse().unwrap(),
+            RegistrationPriority::Immediate,
+        )
+        .await?;
+
+    let stored = wait_for_stored_location(&listener, actor_name, Duration::from_secs(10)).await;
+    let stored_addr: SocketAddr = stored.address.parse().expect("stored address parses");
+    assert_ne!(
+        stored_addr.ip(),
+        stale_addr.ip(),
+        "repair must never use the stale configured IP over the live verified source"
+    );
+    assert!(
+        !stored_addr.ip().is_unspecified(),
+        "owner-sent wildcard must be repaired (got {})",
+        stored.address
+    );
+
+    dialer.shutdown().await;
+    listener.shutdown().await;
+    Ok(())
+}
