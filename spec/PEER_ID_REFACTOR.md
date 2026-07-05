@@ -108,6 +108,20 @@ Residual address coupling (the refactor targets):
   ~4802/4830) to pass the ownership flag and drop the `else { continue }`. The
   actor is always stored, always `peer_id`-routable.
 
+  Two hard sub-rules (from review):
+  - **Malformed wire addresses are bounded, never stored raw.** A
+    `location.address` that does not parse as a socket address is hostile
+    wire data; it canonicalizes to the unspecified placeholder (`0.0.0.0:0`)
+    and then resolves like any other unusable address. The stored/re-gossiped
+    field is always a typed `SocketAddr`, never attacker-chosen bytes — §1.5
+    (never drop) and input-bounding are BOTH honored.
+  - **Dial-hint learning is owner-gated, not just usability-gated.**
+    `set_discovered_peer_addr` / `addr_to_peer_id` / addr→NodeId pinning
+    only ever run for locations the SENDER OWNS (§1.6). A relay's claim
+    about a third party's reachability — however syntactically usable —
+    must never plant or overwrite that peer's dial route (dial-route
+    poisoning). Relayed locations are stored for identity routing only.
+
 - **WP2 — interest is identity, not address (fixes C2/C3).** `note_interest`
   publishes a location whose routing key is `peer_id`; the address is best-effort
   (resolved, never a gate). Never publish a bare `0.0.0.0`. No dependence on

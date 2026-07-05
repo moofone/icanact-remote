@@ -285,8 +285,27 @@ fn resolve_remote_actor_addr(
 /// (`set_discovered_peer_addr` / `addr_to_peer_id`). Storage in
 /// `known_actors` is unconditional (§1.5); dial-hint learning is not —
 /// port 0 and IPs unusable from this node must not poison the dial tables.
+/// (Ownership is enforced at the call sites: dial hints are only learned
+/// from the OWNER's own gossip, §1.6 — a relay's claim about a third
+/// party's reachability is unauthenticated.)
 fn learnable_dial_route(addr: SocketAddr, sender_addr: SocketAddr) -> bool {
     addr.port() != 0 && !advertised_ip_unusable(addr.ip(), sender_addr.ip())
+}
+
+/// Parse a gossiped `location.address` wire string, bounding hostile input:
+/// anything that is not a socket address canonicalizes to the unspecified
+/// placeholder (`0.0.0.0:0`), which then flows through
+/// `resolve_remote_actor_addr` like any other unusable advertised address.
+/// The actor stays identity-routable (§1.5) while the stored/re-gossiped
+/// field is always a typed `SocketAddr`, never attacker-chosen bytes.
+fn canonical_wire_addr(actor_name: &str, address: &str) -> SocketAddr {
+    address.parse().unwrap_or_else(|_| {
+        warn!(
+            actor_name = %actor_name,
+            "actor location address does not parse; canonicalizing to the unspecified placeholder"
+        );
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+    })
 }
 
 /// Response payload for actor asks.
@@ -3424,29 +3443,32 @@ impl<T: 'static> GossipRegistry<T> {
                         // `RegistrationPriority::Immediate` (e.g. routed-pubsub
                         // interest registration, `pubsub.rs::note_interest`).
                         // Same never-drop contract as `merge_full_sync`
-                        // (PEER_ID_REFACTOR §1.5): the actor is stored and
-                        // identity-routable regardless of its advertised
-                        // address; when we have a trusted sender address the
-                        // owner's unusable advertised IP is resolved from it,
-                        // otherwise the wire value is kept verbatim.
-                        if let Some((addr, sender_addr)) =
-                            location.address.parse::<SocketAddr>().ok().zip(sender_addr)
-                        {
-                            let owner_is_sender = location.peer_id == sender_peer_id;
-                            let resolved = resolve_remote_actor_addr(
-                                name.as_str(),
-                                addr,
-                                sender_addr,
-                                owner_is_sender,
-                            );
-                            self.note_actor_addr_resolution(
-                                addr,
-                                resolved,
-                                sender_addr,
-                                owner_is_sender,
-                            );
-                            location.address = resolved.to_string();
-                        }
+                        // (PEER_ID_REFACTOR §1.5): the wire address is
+                        // canonicalized (malformed input is bounded, never
+                        // persisted verbatim), then — when we have a trusted
+                        // sender address — the owner's unusable advertised IP
+                        // is resolved from it.
+                        let owner_is_sender = location.peer_id == sender_peer_id;
+                        let wire_addr = canonical_wire_addr(name.as_str(), &location.address);
+                        let resolved = match sender_addr {
+                            Some(sender_addr) => {
+                                let resolved = resolve_remote_actor_addr(
+                                    name.as_str(),
+                                    wire_addr,
+                                    sender_addr,
+                                    owner_is_sender,
+                                );
+                                self.note_actor_addr_resolution(
+                                    wire_addr,
+                                    resolved,
+                                    sender_addr,
+                                    owner_is_sender,
+                                );
+                                resolved
+                            }
+                            None => wire_addr,
+                        };
+                        location.address = resolved.to_string();
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                         }
@@ -4837,17 +4859,17 @@ impl<T: 'static> GossipRegistry<T> {
             // stored location carries the resolved address, not the raw
             // wire value, so this node's own future full-sync fan-out
             // re-advertises the repaired route instead of the unusable one.
-            let resolved = location.address.parse::<SocketAddr>().ok().map(|addr| {
-                let owner_is_sender = location.peer_id == sender_peer_id;
-                let resolved = resolve_remote_actor_addr(&name, addr, sender_addr, owner_is_sender);
-                self.note_actor_addr_resolution(addr, resolved, sender_addr, owner_is_sender);
-                resolved
-            });
+            let owner_is_sender = location.peer_id == sender_peer_id;
+            let wire_addr = canonical_wire_addr(&name, &location.address);
+            let resolved =
+                resolve_remote_actor_addr(&name, wire_addr, sender_addr, owner_is_sender);
+            self.note_actor_addr_resolution(wire_addr, resolved, sender_addr, owner_is_sender);
             let mut location = location;
-            if let Some(addr) = resolved {
-                location.address = addr.to_string();
-            }
-            updates_to_apply.push((name, location, resolved));
+            location.address = resolved.to_string();
+            // Dial hints may only be learned from the OWNER's own gossip
+            // (§1.6): a relay's claim about a third party's reachability is
+            // unauthenticated and must never (over)write that peer's route.
+            updates_to_apply.push((name, location, owner_is_sender.then_some(resolved)));
         }
 
         // Process remote known actors
@@ -4859,17 +4881,17 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
-            let resolved = location.address.parse::<SocketAddr>().ok().map(|addr| {
-                let owner_is_sender = location.peer_id == sender_peer_id;
-                let resolved = resolve_remote_actor_addr(&name, addr, sender_addr, owner_is_sender);
-                self.note_actor_addr_resolution(addr, resolved, sender_addr, owner_is_sender);
-                resolved
-            });
+            let owner_is_sender = location.peer_id == sender_peer_id;
+            let wire_addr = canonical_wire_addr(&name, &location.address);
+            let resolved =
+                resolve_remote_actor_addr(&name, wire_addr, sender_addr, owner_is_sender);
+            self.note_actor_addr_resolution(wire_addr, resolved, sender_addr, owner_is_sender);
             let mut location = location;
-            if let Some(addr) = resolved {
-                location.address = addr.to_string();
-            }
-            updates_to_apply.push((name, location, resolved));
+            location.address = resolved.to_string();
+            // Dial hints may only be learned from the OWNER's own gossip
+            // (§1.6): a relay's claim about a third party's reachability is
+            // unauthenticated and must never (over)write that peer's route.
+            updates_to_apply.push((name, location, owner_is_sender.then_some(resolved)));
         }
 
         // STEP 2: Apply known_actors upserts, peer_to_actors update,
@@ -8211,6 +8233,178 @@ mod tests {
         assert_eq!(stored.address, actor_addr.to_string());
     }
 
+    /// PEER_ID_REFACTOR §1.6 (codex P1): dial-hint learning is
+    /// authenticated-source ONLY. A relay forwarding a third party's
+    /// location — even with a perfectly usable address — must not be able
+    /// to (over)write that peer's dial route: its claim about someone
+    /// else's reachability is unauthenticated. The location itself is
+    /// still stored (§1.5 never-drop, identity-routable).
+    #[tokio::test]
+    async fn wp1_full_sync_relay_does_not_learn_dial_route_for_third_party() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7418),
+            test_config_with_seed("wp1-relay-route-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-relay-route-owner").peer_id();
+        let relay = KeyPair::new_for_testing("wp1-relay-route-sender").peer_id();
+        let actor_addr: SocketAddr = "203.0.113.7:9400".parse().unwrap();
+        let actor_name = "wp1/relay-route-poison/service";
+        let mut known_actors = HashMap::new();
+        known_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(actor_addr, owner.clone()),
+        );
+
+        reg.merge_full_sync(
+            HashMap::new(),
+            known_actors,
+            relay.clone(),
+            "10.77.0.44:9400".parse().unwrap(),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("relayed location must still be stored (identity-routable)");
+        assert_eq!(stored.address, actor_addr.to_string());
+        assert_eq!(
+            reg.connection_pool.get_configured_peer_addr(&owner),
+            None,
+            "a relay must never plant or overwrite a third party's dial route (§1.6)"
+        );
+    }
+
+    /// PEER_ID_REFACTOR (codex P2): a `location.address` that does not
+    /// parse as a socket address is hostile/garbage wire data. It must not
+    /// be persisted or re-gossiped verbatim — it is canonicalized to the
+    /// unspecified address (port 0) and then resolved like any other
+    /// unusable advertised address, keeping the actor identity-routable
+    /// while bounding the stored field to a typed `SocketAddr`.
+    #[tokio::test]
+    async fn wp1_full_sync_canonicalizes_malformed_owner_address() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7419),
+            test_config_with_seed("wp1-malformed-owner-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-malformed-owner").peer_id();
+        let sender_addr: SocketAddr = "10.77.0.33:9400".parse().unwrap();
+        let actor_name = "wp1/malformed-owner/service";
+        let mut location =
+            RemoteActorLocation::new_with_peer("10.0.0.1:9400".parse().unwrap(), owner.clone());
+        location.address = "definitely !! not an address \u{1F480}".to_string();
+        let mut local_actors = HashMap::new();
+        local_actors.insert(actor_name.to_string(), location);
+
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            sender_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("malformed-address location must still be stored (identity-routable)");
+        assert_eq!(
+            stored.address,
+            SocketAddr::new(sender_addr.ip(), 0).to_string(),
+            "malformed owner-sent address canonicalizes to unspecified:0, then resolves \
+             from the verified source IP — never persisted verbatim"
+        );
+    }
+
+    /// Codex P2, relay flavor: malformed relayed addresses canonicalize to
+    /// the unspecified placeholder and stay there (a relay's source IP is
+    /// never substituted for a third party, §1.6).
+    #[tokio::test]
+    async fn wp1_full_sync_canonicalizes_malformed_relayed_address() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7420),
+            test_config_with_seed("wp1-malformed-relay-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-malformed-relay-owner").peer_id();
+        let relay = KeyPair::new_for_testing("wp1-malformed-relay-sender").peer_id();
+        let actor_name = "wp1/malformed-relay/service";
+        let mut location =
+            RemoteActorLocation::new_with_peer("10.0.0.1:9400".parse().unwrap(), owner.clone());
+        location.address = "<script>alert(1)</script>".to_string();
+        let mut known_actors = HashMap::new();
+        known_actors.insert(actor_name.to_string(), location);
+
+        reg.merge_full_sync(
+            HashMap::new(),
+            known_actors,
+            relay.clone(),
+            "10.77.0.44:9400".parse().unwrap(),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("malformed relayed location must still be stored (identity-routable)");
+        assert_eq!(
+            stored.address, "0.0.0.0:0",
+            "malformed relayed address is bounded to the canonical placeholder, never stored raw"
+        );
+        assert_eq!(
+            reg.connection_pool.get_configured_peer_addr(&owner),
+            None,
+            "and it must never configure a dial route"
+        );
+    }
+
+    /// Codex P2, immediate-delta flavor: the wire path used by routed-pubsub
+    /// interest obeys the same canonicalization — malformed addresses are
+    /// never persisted verbatim, with or without a configured sender.
+    #[tokio::test]
+    async fn wp1_delta_canonicalizes_malformed_address() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(7421),
+            test_config_with_seed("wp1-delta-malformed-local"),
+        );
+        let sender = test_peer_id("wp1-delta-malformed-sender");
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&sender, "10.77.0.55:9500".parse().unwrap());
+
+        let mut location =
+            RemoteActorLocation::new_with_peer("10.0.0.1:9400".parse().unwrap(), sender.clone());
+        location.address = "junk:not:a:socket".to_string();
+        let delta = RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: "wp1/delta-malformed/service".to_string(),
+                location,
+                priority: RegistrationPriority::Immediate,
+            }],
+            sender_peer_id: sender.clone(),
+            wall_clock_time: current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        };
+
+        registry.apply_delta(delta).await.unwrap();
+
+        let stored = registry
+            .lookup_actor("wp1/delta-malformed/service")
+            .await
+            .expect("malformed-address delta location must still be stored");
+        assert_eq!(
+            stored.address, "10.77.0.55:0",
+            "canonicalized to unspecified:0 then resolved from the configured sender address"
+        );
+    }
+
     /// PEER_ID_REFACTOR §5 runtime observability: substitutions,
     /// relayed-kept events, and tie-break evictions are counted and exposed
     /// via `get_stats` so the storm signature is visible in prod telemetry.
@@ -10444,17 +10638,13 @@ mod tests {
         assert!(!gossip_state.peers.contains_key(&test_addr(9003)));
         drop(gossip_state);
 
-        // Direct routes still pin the expected NodeId for TLS verification.
-        // This prevents address-based actor lookups from using placeholder SNI
-        // when a full-sync actor location claims a specific PeerId.
-        assert_eq!(
-            registry.lookup_node_id(&test_addr(9001)).await,
-            Some(test_peer_id("remote_actor1").to_node_id())
-        );
-        assert_eq!(
-            registry.lookup_node_id(&test_addr(9002)).await,
-            Some(test_peer_id("remote_actor2").to_node_id())
-        );
+        // PEER_ID_REFACTOR §1.6: every location in this payload is owned by
+        // a peer OTHER than the sender, so it is a relayed, unauthenticated
+        // claim about a third party's reachability. Relayed locations are
+        // stored (asserted above, §1.5) but must never pin an addr→NodeId
+        // route or a dial hint — that is the dial-route poisoning vector.
+        assert_eq!(registry.lookup_node_id(&test_addr(9001)).await, None);
+        assert_eq!(registry.lookup_node_id(&test_addr(9002)).await, None);
         assert_eq!(registry.lookup_node_id(&test_addr(9003)).await, None);
 
         let remote_actor1 = registry
@@ -10466,7 +10656,34 @@ mod tests {
             .connection_pool
             .peer_id_to_addr
             .read_sync(&remote_actor1.peer_id, |_, v| *v);
-        assert_eq!(actor1_addr, Some(test_addr(9001)));
+        assert_eq!(
+            actor1_addr, None,
+            "relayed third-party locations must not plant dial routes (§1.6)"
+        );
+
+        // Owner-sent locations DO pin the route: the sender advertising its
+        // own actor is the authenticated source for its own reachability.
+        let owner = test_peer_id("merge_full_sync_owner");
+        let mut own_local = HashMap::new();
+        own_local.insert(
+            "owner_actor".to_string(),
+            RemoteActorLocation::new_with_peer(test_addr(9004), owner.clone()),
+        );
+        registry
+            .merge_full_sync(
+                own_local,
+                HashMap::new(),
+                owner.clone(),
+                test_addr(8082),
+                1,
+                current_timestamp(),
+            )
+            .await;
+        assert_eq!(
+            registry.lookup_node_id(&test_addr(9004)).await,
+            Some(owner.to_node_id()),
+            "owner-sent locations pin the expected NodeId for TLS verification"
+        );
     }
 
     #[tokio::test]
