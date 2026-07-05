@@ -3732,6 +3732,115 @@ async fn outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter() 
     );
 }
 
+/// RED (review finding P2, outbound-finalize reject leaves the live
+/// session's address index erased): the freshly-dialed outbound candidate is
+/// provisionally `connections_by_addr.upsert(addr, candidate)`-ed BEFORE the
+/// tie-break decision is known. When the candidate dials the SAME address a
+/// live, tie-break-preferred INBOUND session already owns (rather than a
+/// different address, as in
+/// `outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter`),
+/// that provisional upsert overwrites the live inbound's own
+/// `connections_by_addr` / `addr_to_peer_id` entry at that address. The old
+/// `unpublish_rejected_outbound_candidate` only removed the candidate's
+/// entry on reject — it never restored what the provisional upsert had
+/// displaced — so after the reject, `connections_by_addr[addr]` /
+/// `addr_to_peer_id[addr]` were left EMPTY even though the peer session
+/// still points at the live inbound. Address-keyed lookups and
+/// failure-canonicalization would then miss the live session entirely and
+/// could redial a duplicate connection to a peer already fully connected.
+#[tokio::test]
+async fn outbound_finalize_reject_restores_displaced_live_session_address_index() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    // Local is the HIGHER NodeId, so the existing INBOUND session for this
+    // peer IS tie-break preferred, while a fresh OUTBOUND dial is NOT — the
+    // textbook `RejectIncoming` case, same as
+    // `outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter`,
+    // except the candidate here dials the EXACT SAME address the live
+    // inbound already owns.
+    let (hi_kp, lo_kp) = hi_lo_keypairs("finalize-reject-restore-hi", "finalize-reject-restore-lo");
+    let remote_peer_id = lo_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // The existing, live, preferred INBOUND session, published as this
+    // peer's CURRENT connection AND indexed by address at `shared_addr`.
+    let shared_addr: SocketAddr = "127.0.0.1:7460".parse().unwrap();
+    let (existing_io, _existing_keep) = tokio::io::duplex(1024);
+    let (existing_sh, _existing_w, _existing_r) = LockFreeStreamHandle::new(
+        existing_io,
+        shared_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut existing_conn = LockFreeConnection::new(shared_addr, ConnectionDirection::Inbound);
+    existing_conn.stream_handle = Some(Arc::new(existing_sh));
+    existing_conn.set_state(ConnectionState::Connected);
+    let existing = Arc::new(existing_conn);
+    assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), shared_addr, existing.clone()));
+
+    let counter_before = pool.connection_counter.load(Ordering::SeqCst);
+
+    // A fresh, non-preferred OUTBOUND dial finalizes at the EXACT SAME
+    // address the live inbound already owns.
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(shared_addr, io, registry_weak, None)
+        .await;
+
+    assert!(
+        matches!(result, Err(crate::GossipError::ConnectionExists)),
+        "a rejected outbound candidate must be surfaced as an error: got {result:?}"
+    );
+
+    // The live inbound's address index must survive the reject: it was
+    // displaced by the candidate's provisional upsert, and must be restored,
+    // never left empty.
+    let indexed_at_addr = pool.get_lock_free_connection(shared_addr);
+    assert!(
+        indexed_at_addr
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &existing)),
+        "connections_by_addr at the shared address must resolve to the LIVE inbound \
+         session after the reject, not be empty and not the rejected candidate \
+         (got: {indexed_at_addr:?})"
+    );
+    assert_eq!(
+        pool.addr_to_peer_id
+            .read_sync(&shared_addr, |_, v| v.clone()),
+        Some(remote_peer_id.clone()),
+        "addr_to_peer_id at the shared address must still map to the live inbound's \
+         peer id after the reject, never left empty"
+    );
+
+    let current = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &existing)),
+        "the preferred existing inbound session must remain the peer's current connection"
+    );
+    assert!(
+        existing.has_live_stream(),
+        "the live inbound's background tasks must not be touched by the reject"
+    );
+
+    assert_eq!(
+        pool.connection_counter.load(Ordering::SeqCst),
+        counter_before,
+        "a rejected outbound candidate must never bump the live connection counter"
+    );
+}
+
 /// Deterministic ordering helper mirroring `tiebreak_reconnect_thrash.rs`'s
 /// `ordered()`: returns `(higher_node_id_keypair, lower_node_id_keypair)`
 /// regardless of which seed happens to hash higher, so tests do not depend on
@@ -3849,6 +3958,135 @@ async fn outbound_finalize_stale_rival_lookup_is_pure_and_excludes_the_new_candi
         "the real wrong-direction rival must be properly evicted (tasks aborted), \
          not silently overwritten/leaked when the new candidate is indexed at its \
          same address"
+    );
+}
+
+/// RED (review finding P1, `transport_stream.rs` stale-rival branch): the
+/// `!alive` branch used to retire `existing_conn` by ADDRESS
+/// (`remove_connection(existing_conn.addr)`), never by `Arc` instance
+/// identity — even though the branch is explicitly routed through
+/// `resolve_connection_conflict` (an identity-only chokepoint) for its
+/// decision. If `existing_conn` dies and a fresh, preferred connection gets
+/// reindexed at the exact same bind address before that removal actually
+/// runs, the address-keyed removal deletes whatever is CURRENTLY at that
+/// address — the fresh session — not the stale instance the eviction was
+/// actually about. This is the identical address-vs-identity defect this
+/// entire branch/PR exists to eliminate, just at the top-of-dial call site
+/// (`ConnectionPool::connect_via_stream`) instead of the outbound-finalize
+/// one.
+///
+/// This drives `existing_conn`'s eviction call using the EXACT arguments
+/// `connect_via_stream`'s `!alive` branch computes (`existing_conn` snapshot
+/// taken while it was still the peer's live connection, then the connection
+/// dies, then a fresh preferred connection is reindexed at the identical
+/// bind address before the eviction runs — precisely the sequence the
+/// finding and this branch's own comment describe), and asserts on the
+/// production primitive that call site actually invokes today. A "contrast"
+/// section below then demonstrates, on the SAME race-arranged state, that
+/// the address-keyed alternative this branch used to call
+/// (`remove_connection(existing_conn.addr)`) would destroy the fresh
+/// connection instead — the exact defect this fix eliminates.
+#[tokio::test]
+async fn stale_rival_eviction_at_reindexed_address_is_instance_scoped_not_address_keyed() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("stale-rival-reindex-peer").peer_id();
+
+    // `existing_conn`: alive and published as the peer's current connection
+    // at bind address B — exactly the snapshot `connect_via_stream` takes
+    // via `get_connection_by_peer_id` before its own separate liveness
+    // re-check.
+    let bind_addr: SocketAddr = "127.0.0.1:7450".parse().unwrap();
+    let (stale_io, _stale_peer_io) = tokio::io::duplex(1024);
+    let (stale_sh, _stale_w, _stale_r) = LockFreeStreamHandle::new(
+        stale_io,
+        bind_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut stale_conn = LockFreeConnection::new(bind_addr, ConnectionDirection::Outbound);
+    stale_conn.stream_handle = Some(Arc::new(stale_sh));
+    stale_conn.set_state(ConnectionState::Connected);
+    let existing_conn = Arc::new(stale_conn);
+    assert!(existing_conn.has_live_stream(), "test precondition");
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), bind_addr, existing_conn.clone()));
+
+    // `existing_conn` dies ...
+    if let Some(sh) = existing_conn.stream_handle.as_ref() {
+        sh.exit_flag.store(true, Ordering::Release);
+    }
+    assert!(
+        !existing_conn.has_live_stream(),
+        "test precondition: existing_conn must now be dead, matching the branch's \
+         `!alive` condition"
+    );
+
+    // ... and a fresh, preferred connection is reindexed/published at the
+    // EXACT SAME bind address, before the eviction call runs — modelling a
+    // concurrent inbound accept landing in that window.
+    let (fresh_io, _fresh_peer_io) = tokio::io::duplex(1024);
+    let (fresh_sh, _fresh_w, _fresh_r) = LockFreeStreamHandle::new(
+        fresh_io,
+        bind_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut fresh_conn = LockFreeConnection::new(bind_addr, ConnectionDirection::Inbound);
+    fresh_conn.stream_handle = Some(Arc::new(fresh_sh));
+    fresh_conn.set_state(ConnectionState::Connected);
+    let fresh_conn = Arc::new(fresh_conn);
+    pool.index_connection_by_addr(bind_addr, fresh_conn.clone());
+    pool.add_addr_to_peer_id(bind_addr, peer_id.clone());
+    pool.publish_current_peer_connection(&peer_id, fresh_conn.clone());
+
+    // The eviction call `connect_via_stream`'s `!alive` branch actually
+    // makes today: instance-scoped, re-validating by `Arc` identity
+    // immediately before acting.
+    let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
+
+    let indexed_at_addr = pool.get_lock_free_connection(bind_addr);
+    assert!(
+        indexed_at_addr
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &fresh_conn)),
+        "the fresh connection reindexed at the stale rival's bind address must survive \
+         the stale-rival eviction unchanged (got: {indexed_at_addr:?})"
+    );
+    assert!(
+        fresh_conn.has_live_stream(),
+        "the fresh connection's background tasks must not be touched by the stale \
+         rival's eviction"
+    );
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &fresh_conn)),
+        "the fresh connection must remain the peer's current session"
+    );
+
+    // Contrast: the address-keyed primitive this branch used to call
+    // (`remove_connection(existing_conn.addr)`) on this EXACT same
+    // race-arranged state would instead destroy the fresh connection —
+    // demonstrating the danger the instance-scoped call above eliminates.
+    // Re-arrange fresh back into place first (the assertions above already
+    // proved it survived the real fix).
+    assert!(
+        pool.get_lock_free_connection(bind_addr).is_some(),
+        "sanity: fresh connection still indexed before the contrast"
+    );
+    let removed_by_address = pool.remove_connection(existing_conn.addr);
+    assert!(
+        removed_by_address
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &fresh_conn)),
+        "contrast/danger check: an address-keyed removal at the stale rival's address \
+         deletes whatever is CURRENTLY indexed there — the fresh connection, not the \
+         stale instance — which is exactly the bug this fix eliminates (got: \
+         {removed_by_address:?})"
     );
 }
 
