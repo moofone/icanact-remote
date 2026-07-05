@@ -3519,6 +3519,77 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
     });
 }
 
+/// Sweep finding: `evict_peer_session_if_instance` (backing
+/// `note_peer_ask_hard_fault`/`note_peer_ask_streak_timeout`, both reachable
+/// public API on `GossipRegistryHandle` for application-classified ask
+/// outcomes) matched `expected_instance` against the current session's
+/// instance id, then acted via the PEER-WIDE `disconnect_connection_by_peer_id`
+/// — the same match-then-peer-wide-disconnect gap as the primary
+/// `handle_peer_connection_failure` finding. A fresh session published for
+/// the same peer between the instance-id match and the peer-wide teardown
+/// must survive; only the matched (now-retired) instance may be torn down.
+///
+/// Pinned deterministically via the same `set_transport_lifecycle_recorder`
+/// technique as `stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_session`:
+/// the buggy peer-wide path fires `SessionRemoved { reason: DisconnectByPeerId }`
+/// BEFORE its unconditional `clear_current_peer_connection` store; a fixed,
+/// CAS-scoped path fires the same event only AFTER the atomic clear already
+/// succeeded, so an identical publish lands safely.
+#[test]
+fn hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide() {
+    run_multi_thread_test(async {
+        let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+        let peer = crate::KeyPair::new_for_testing("hard_fault_instance_scoped").peer_id();
+        let addr: SocketAddr = "127.0.0.1:7314".parse().unwrap();
+
+        pool.add_addr_to_peer_id(addr, peer.clone());
+        let (io, _keep) = tokio::io::duplex(1024);
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
+            .await
+            .expect("finalize outbound");
+
+        let live_instance = pool
+            .current_peer_connection_instance(&peer)
+            .expect("live session should have a stream instance");
+
+        let fresh_addr: SocketAddr = "127.0.0.1:7315".parse().unwrap();
+        let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+
+        let _guard = RecorderGuard;
+        {
+            let pool = pool.clone();
+            let peer = peer.clone();
+            let fresh = fresh.clone();
+            crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::SessionRemoved {
+                    peer: event_peer,
+                    reason: crate::SessionRemovalReason::DisconnectByPeerId,
+                    ..
+                } = &event
+                    && *event_peer == peer
+                {
+                    crate::set_transport_lifecycle_recorder(None);
+                    pool.publish_current_peer_connection(&peer, fresh.clone());
+                }
+            })));
+        }
+
+        // A hard transport fault pinned to the (currently live) instance —
+        // models the caller's ask having actually failed on `live_instance`.
+        // Per the hook installed above, a FRESH session for the same peer is
+        // published from inside the match-then-disconnect gap.
+        pool.note_peer_ask_hard_fault(&peer, Some(live_instance));
+
+        let current = pool.get_connection_by_peer_id(&peer);
+        assert!(
+            current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+            "a fresh session published from inside the matched-instance hard-fault \
+             eviction's check-then-act gap must survive — matching an instance must never \
+             fall through to a peer-wide disconnect that clobbers it (got {current:?})"
+        );
+    });
+}
+
 /// Audit finding B2: the pool's LRU "make room" eviction picked the absolute
 /// least-recently-used connection with no regard for whether it was a
 /// configured/required cluster peer — so a new (often transient or discovered)
