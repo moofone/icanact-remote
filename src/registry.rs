@@ -3418,13 +3418,20 @@ impl<T: 'static> GossipRegistry<T> {
             .unwrap()
             .as_nanos();
 
-        // Resolve the sender's address before taking the lock so the
-        // lock section is short. The verified source of this very message
-        // wins over locally derived route state (§1.6).
-        let sender_addr = verified_sender_addr.or_else(|| {
+        // Resolve the sender's addresses before taking the lock so the
+        // lock section is short. TWO distinct roles (never conflate them):
+        // - `repair_addr` (§1.6 trust anchor): the verified socket source
+        //   of THIS message when the wire path supplied it, else the
+        //   configured route. Used ONLY for advertised-address repair.
+        // - `bookkeeping_addr`: the peer-state key (configured/discovered
+        //   route). `peer_to_actors` must key on it — an ephemeral inbound
+        //   TCP source is not in `gossip_state.peers`, and actors filed
+        //   under it would be invisible to cleanup_dead_peers/pruning.
+        let bookkeeping_addr = {
             let pool = &self.connection_pool;
             pool.get_configured_peer_addr(&sender_peer_id)
-        });
+        };
+        let repair_addr = verified_sender_addr.or(bookkeeping_addr);
 
         // Critical section: apply all known_actors / removed_actors
         // mutations AND the peer_to_actors update under a single
@@ -3462,18 +3469,18 @@ impl<T: 'static> GossipRegistry<T> {
                         // attacker-chosen bytes.
                         let owner_is_sender = location.peer_id == sender_peer_id;
                         let wire_addr = canonical_wire_addr(name.as_str(), &location.address);
-                        let resolved = match sender_addr {
-                            Some(sender_addr) => {
+                        let resolved = match repair_addr {
+                            Some(repair_addr) => {
                                 let resolved = resolve_remote_actor_addr(
                                     name.as_str(),
                                     wire_addr,
-                                    sender_addr,
+                                    repair_addr,
                                     owner_is_sender,
                                 );
                                 self.note_actor_addr_resolution(
                                     wire_addr,
                                     resolved,
-                                    sender_addr,
+                                    repair_addr,
                                     owner_is_sender,
                                 );
                                 resolved
@@ -3556,10 +3563,10 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             }
 
-            if let Some(sender_addr) = sender_addr {
+            if let Some(bookkeeping_addr) = bookkeeping_addr {
                 let entry = gossip_state
                     .peer_to_actors
-                    .entry(sender_addr)
+                    .entry(bookkeeping_addr)
                     .or_insert_with(std::collections::HashSet::new);
                 for name in &peer_actors_removed {
                     entry.remove(name);
