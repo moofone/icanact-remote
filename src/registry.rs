@@ -1579,11 +1579,19 @@ impl<T: 'static> GossipRegistry<T> {
             .connection_pool
             .addr_to_peer_id
             .read_sync(&peer_addr, |_, peer_id| peer_id.clone());
+        // Required (configured) peers are floored against the cadence that
+        // actually refreshes `last_response_received_ms` — the regular
+        // gossip round (`gossip_interval`), not peer-list discovery gossip
+        // (`peer_gossip_interval`). See `crate::config::required_peer_liveness_floor_ms`.
         let required_peer_floor = peer_id
             .as_ref()
             .filter(|peer_id| self.connection_pool.is_required_peer(peer_id))
-            .and_then(|_| self.config.peer_gossip_interval)
-            .map(|duration| Self::duration_millis_u64(duration).saturating_mul(2))
+            .map(|_| {
+                crate::config::required_peer_liveness_floor_ms(
+                    self.config.gossip_interval,
+                    self.config.peer_gossip_interval,
+                )
+            })
             .unwrap_or(0);
         configured.max(required_peer_floor)
     }
@@ -4524,10 +4532,12 @@ impl<T: 'static> GossipRegistry<T> {
                             // this peer (delta response, full sync, etc.) for
                             // the effective liveness window, treat the next
                             // no-response round as a soft failure. Configured
-                            // peers floor this window to two peer-gossip
-                            // intervals so one delayed inbound peer-gossip
-                            // payload cannot false-fail a required direct
-                            // route. This still catches
+                            // peers floor this window to two regular-gossip
+                            // (`gossip_interval`) intervals — the cadence
+                            // that actually refreshes
+                            // `last_response_received_ms` — so one delayed
+                            // inbound gossip response cannot false-fail a
+                            // required direct route. This still catches
                             // "outbound writes succeed at the kernel level but
                             // the peer isn't reading anymore" — the scenario
                             // that kept `538a99…` alive on `stratum-devnet-a`
@@ -9158,6 +9168,41 @@ mod tests {
             Some(peer.to_node_id()),
             "a configured peer's NodeId must be resolvable by address so the \
              dial pins it in the SNI instead of using a placeholder"
+        );
+    }
+
+    /// Liveness-window clamp bug: raising `gossip_interval` (the cadence that
+    /// actually refreshes `last_response_received_ms` via delta/full-sync
+    /// responses) far above `peer_gossip_interval` must still raise the
+    /// required-peer floor. Before the fix, the floor was computed from
+    /// `peer_gossip_interval*2` only, so a required peer with a slow
+    /// `gossip_interval` would be false-failed by the response-asymmetry
+    /// detector well before any inbound payload was actually overdue.
+    #[tokio::test]
+    async fn effective_liveness_window_floors_required_peer_to_gossip_interval_not_peer_gossip_interval()
+     {
+        let mut config = test_config_with_seed("effective-liveness-window-required-peer");
+        config.gossip_interval = Duration::from_secs(30);
+        config.peer_gossip_interval = Some(Duration::from_secs(5));
+        config.peer_liveness_window = Duration::from_secs(10);
+        let registry = GossipRegistry::<()>::new(test_addr(9500), config);
+        let peer = test_peer_id("effective-liveness-window-required-peer-remote");
+        let peer_addr = test_addr(9501);
+
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer, peer_addr);
+        registry
+            .connection_pool
+            .add_addr_to_peer_id(peer_addr, peer.clone());
+
+        let effective = registry.effective_peer_liveness_window_ms(peer_addr);
+
+        assert!(
+            effective >= 60_000,
+            "required-peer floor must reflect the gossip_interval (30s) cadence that \
+             actually refreshes last_response_received_ms, not peer_gossip_interval (5s); \
+             got {effective}ms"
         );
     }
 
