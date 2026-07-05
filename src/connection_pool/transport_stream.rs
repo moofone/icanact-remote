@@ -88,7 +88,18 @@ impl<T> ConnectionPool<T> {
                         addr = %existing_conn.addr,
                         "outbound_tiebreak_evict_stale"
                     );
-                    let _ = self.remove_connection(existing_conn.addr);
+                    // Instance-scoped, never address-keyed: `existing_conn` was
+                    // observed dead/stale above, but a fresh preferred
+                    // connection can be reindexed at the exact same bind
+                    // address between that aliveness check and this eviction
+                    // (e.g. a concurrent inbound accept). A plain
+                    // `remove_connection(existing_conn.addr)` would delete
+                    // whatever is *currently* at that address — the fresh
+                    // session, not the stale instance actually being retired.
+                    // `disconnect_connection_instance` re-validates by `Arc`
+                    // identity immediately before acting and is a no-op if
+                    // `existing_conn` has already been superseded.
+                    let _ = self.disconnect_connection_instance(&remote_peer_id, &existing_conn);
                 } else {
                     // NOT routed through `resolve_connection_conflict` — see
                     // that function's doc comment ("Explicitly-justified

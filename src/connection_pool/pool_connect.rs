@@ -1318,18 +1318,51 @@ impl<T> ConnectionPool<T> {
     /// `connection_counter`: the counter increment for a finalized outbound
     /// happens later, only on the non-reject paths, so a rejected candidate
     /// has nothing to decrement.
+    ///
+    /// `existing_before` is the rival this candidate's caller snapshotted
+    /// *before* the provisional upsert — i.e. whatever was legitimately
+    /// indexed at `addr` immediately prior to that upsert, PROVIDED
+    /// `existing_before` was actually indexed at THIS `addr` itself
+    /// (`existing_before.addr == addr`). That last condition matters: the
+    /// far more common reject shape is a rival that lives at some OTHER
+    /// address entirely (this candidate dialed a different address than the
+    /// rival's own), in which case the provisional upsert never displaced
+    /// anything at `addr` and restoring `existing_before` here would
+    /// incorrectly plant it at an address it was never indexed under. Only
+    /// when the candidate's dial address is the exact SAME address the rival
+    /// already owns (a concurrent preferred inbound at that address) did the
+    /// provisional upsert genuinely displace it — and only then would
+    /// clearing the slot on reject leave `connections_by_addr[addr]` /
+    /// `addr_to_peer_id[addr]` empty even though the peer session still
+    /// points at the live `existing_before`, letting address lookups and
+    /// failure-canonicalization miss it and redial a duplicate. So when the
+    /// slot still holds the candidate AND the rival was genuinely displaced
+    /// from this exact address, restore its mapping instead of erasing it.
+    /// Only ever restores a still-live rival: a dead/aborted
+    /// `existing_before`, or one that never actually lived at `addr`, is
+    /// discarded exactly as before (empty slot), never resurrected.
     fn unpublish_rejected_outbound_candidate(
         &self,
         addr: SocketAddr,
         candidate: &Arc<LockFreeConnection>,
+        peer_id: &crate::PeerId,
+        existing_before: Option<&Arc<LockFreeConnection>>,
     ) {
         let removed = self
             .connections_by_addr
             .remove_if_sync(&addr, |v| Arc::ptr_eq(v, candidate))
             .is_some();
         if removed {
-            let _ = self.addr_to_peer_id.remove_sync(&addr);
-            self.clear_capabilities_for_addr(&addr);
+            match existing_before {
+                Some(existing) if existing.addr == addr && existing.has_live_stream() => {
+                    let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
+                    let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+                }
+                _ => {
+                    let _ = self.addr_to_peer_id.remove_sync(&addr);
+                    self.clear_capabilities_for_addr(&addr);
+                }
+            }
         }
         // Abort the writer/reader tasks regardless of whether the address
         // removal above found this exact instance still indexed — the
@@ -2066,7 +2099,12 @@ impl<T> ConnectionPool<T> {
                     // rejected candidate. Do not bump `connection_counter`,
                     // do not send FullSync, and do not hand this candidate
                     // back to the caller as a live handle.
-                    self.unpublish_rejected_outbound_candidate(addr, &connection_arc);
+                    self.unpublish_rejected_outbound_candidate(
+                        addr,
+                        &connection_arc,
+                        peer_id,
+                        existing_before.as_ref(),
+                    );
                     return Err(crate::GossipError::ConnectionExists);
                 }
                 ConnectionConflictDecision::EvictStaleRejectIncoming => {
@@ -2100,7 +2138,22 @@ impl<T> ConnectionPool<T> {
                     // tie-break and must not be left indexed or served —
                     // only the stale RIVAL was evicted above; the candidate
                     // itself still needs its own provisional indexing undone.
-                    self.unpublish_rejected_outbound_candidate(addr, &connection_arc);
+                    // `existing_before` here is the stale rival itself (dead
+                    // by construction of this decision arm), so
+                    // `unpublish_rejected_outbound_candidate`'s liveness check
+                    // declines to "restore" it and simply clears the slot —
+                    // but a fresh preferred inbound published concurrently at
+                    // this exact address, between the `existing_before`
+                    // snapshot and this candidate's provisional upsert, is a
+                    // distinct (live) connection this call cannot see; that
+                    // narrower race is out of scope here and shares the
+                    // pre-existing address-reindex repair path.
+                    self.unpublish_rejected_outbound_candidate(
+                        addr,
+                        &connection_arc,
+                        peer_id,
+                        existing_before.as_ref(),
+                    );
                     return Err(crate::GossipError::ConnectionExists);
                 }
             }
