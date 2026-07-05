@@ -155,7 +155,19 @@ impl<T> ConnectionPool<T> {
                             },
                         },
                     );
-                    let _ = self.disconnect_connection_by_peer_id(&remote_peer_id);
+                    // Instance-scoped, never peer-wide: `keep_existing` was
+                    // computed against this specific `existing_conn`, but a
+                    // fresh preferred inbound can be published/reindexed for
+                    // this peer between that decision and this eviction
+                    // (e.g. a concurrent inbound accept winning the tie-break
+                    // first). A plain `disconnect_connection_by_peer_id`
+                    // tears down "whatever is currently indexed" for the
+                    // peer — which would be that fresh session, not the
+                    // wrong-direction instance actually being retired here.
+                    // `disconnect_connection_instance` re-validates by `Arc`
+                    // identity immediately before acting and is a no-op if
+                    // `existing_conn` has already been superseded.
+                    let _ = self.disconnect_connection_instance(&remote_peer_id, &existing_conn);
                     // Arm the storm-prevention cooldown: this is a direct,
                     // local observation of a duplicate-connection conflict
                     // (not a generic socket failure), so it is safe and
