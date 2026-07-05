@@ -1286,6 +1286,102 @@ impl<T> ConnectionPool<T> {
         }
     }
 
+    /// Disconnect a specific connection instance for `peer_id`, but only if
+    /// it is still the instance actually indexed for that peer — matched by
+    /// `Arc` identity, never merely by `peer_id`. A concurrent publish that
+    /// has replaced the indexed connection since the caller captured
+    /// `target` (e.g. `handle_incoming_connection_tls` publishing a fresh
+    /// preferred inbound between an outbound-finalize tie-break decision and
+    /// this call) is left untouched.
+    ///
+    /// This is the instance-scoped counterpart to
+    /// [`Self::disconnect_connection_by_peer_id`], which tears down
+    /// "whatever is currently indexed" for the peer and must never be called
+    /// from a decision computed earlier without re-validating the target —
+    /// see the outbound-finalize `EvictStaleRejectIncoming`/`ReplaceExisting`
+    /// call sites, which is exactly the gap that reproduced the tie-break
+    /// reconnect thrash from the outbound side.
+    pub(crate) fn disconnect_connection_instance(
+        &self,
+        peer_id: &crate::PeerId,
+        target: &Arc<LockFreeConnection>,
+    ) -> bool {
+        // Re-validate against the peer's PRIMARY current-connection slot by
+        // `Arc` identity — the same check-then-act idiom as
+        // `clear_current_peer_connection_if_matches`. `get_connection_by_peer_id`
+        // (which every caller of this function uses to capture `target`)
+        // always self-heals PRIMARY to the resolved connection before
+        // returning it, so PRIMARY reflects `target` here unless a
+        // concurrent publish has genuinely replaced it — exactly the race
+        // this function exists to detect and decline.
+        let still_current = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| {
+                session
+                    .current_connection()
+                    .map(|current| Arc::ptr_eq(&current, target))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !still_current {
+            debug!(
+                peer_id = %peer_id,
+                "declined instance-scoped disconnect: the connection currently indexed for \
+                 this peer is no longer the expected instance (superseded by a concurrent \
+                 publish)"
+            );
+            return false;
+        }
+
+        let stream_instance_id = target
+            .stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id());
+        info!(
+            peer_id = %peer_id,
+            addr = %target.addr,
+            direction = ?target.direction,
+            stream_instance_id = ?stream_instance_id,
+            reason = "disconnect_by_peer_id",
+            "transport_session_removed"
+        );
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
+                peer: peer_id.clone(),
+                addr: target.addr,
+                direction: match target.direction {
+                    ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
+                    ConnectionDirection::Outbound => crate::lifecycle::TransportDirection::Outbound,
+                },
+                reason: crate::lifecycle::SessionRemovalReason::DisconnectByPeerId,
+            },
+        );
+        self.clear_current_peer_connection(peer_id);
+
+        // Only remove `target`'s own address entry, and only if it still
+        // points at `target` specifically. A blanket peer-id-keyed address
+        // sweep (as `disconnect_connection_by_peer_id` does) is exactly
+        // wrong here: `target` and a brand-new candidate that has already
+        // superseded it often share the same configured/dial address, and a
+        // sweep keyed on peer identity would collaterally delete the NEW
+        // connection's own, already-correct address entry.
+        let still_indexed_at_addr = self
+            .connections_by_addr
+            .read_sync(&target.addr, |_, v| Arc::ptr_eq(v, target))
+            .unwrap_or(false);
+        if still_indexed_at_addr {
+            let _ = self.connections_by_addr.remove_sync(&target.addr);
+            let _ = self.addr_to_peer_id.remove_sync(&target.addr);
+            self.clear_capabilities_for_addr(&target.addr);
+        }
+
+        self.decrement_connection_counter();
+
+        // H-004: Abort background tasks (writer, reader) to prevent resource leaks.
+        target.abort_tasks();
+        true
+    }
+
     /// Choose the least-recently-used connection eligible for eviction when
     /// the pool is at capacity.
     ///
@@ -1740,6 +1836,24 @@ impl<T> ConnectionPool<T> {
 
         let connection_arc = Arc::new(conn);
 
+        // Snapshot any pre-existing rival for this peer BEFORE this candidate
+        // is indexed by address/peer_id below. `get_connection_by_peer_id` is
+        // not a pure lookup: its configured-address and alias fallbacks read
+        // straight out of `connections_by_addr` / `addr_to_peer_id`. Calling
+        // it *after* indexing this candidate risks it returning the brand
+        // new connection as its own "existing rival" (the fallback matches
+        // the configured address, which is exactly the address we just
+        // dialed and already inserted) — that silently bypasses the
+        // `existing_usable == false` / `EvictStaleRejectIncoming` path and
+        // can let a non-preferred outbound become the current session, and
+        // makes `ReplaceExisting` "evict" nothing at all. Capturing the
+        // rival here, while the candidate is still unindexed, guarantees the
+        // decision and any eviction below can only ever target the real
+        // prior connection instance, never this new one.
+        let existing_before = peer_id_opt
+            .as_ref()
+            .and_then(|peer_id| self.get_connection_by_peer_id(peer_id));
+
         // Insert into lock-free map before spawning.
         let _ = self
             .connections_by_addr
@@ -1759,7 +1873,7 @@ impl<T> ConnectionPool<T> {
             // without making it the session; it is retired by its own IO
             // lifecycle, and the next outbound tie-break tick reuses the
             // preferred session.
-            let decision = match self.get_connection_by_peer_id(peer_id) {
+            let decision = match existing_before.as_ref() {
                 None => ConnectionConflictDecision::AcceptIncoming,
                 Some(existing) => registry_weak
                     .upgrade()
@@ -1778,8 +1892,20 @@ impl<T> ConnectionPool<T> {
                     .unwrap_or(ConnectionConflictDecision::AcceptIncoming),
             };
             match decision {
-                ConnectionConflictDecision::AcceptIncoming
-                | ConnectionConflictDecision::ReplaceExisting => {
+                ConnectionConflictDecision::AcceptIncoming => {
+                    self.publish_current_peer_connection(peer_id, connection_arc.clone());
+                }
+                ConnectionConflictDecision::ReplaceExisting => {
+                    // Evict the *specific* rival the decision above was
+                    // computed about — instance-scoped, so a rival already
+                    // superseded by a concurrent publish (e.g. a fresh
+                    // preferred inbound) is left alone. We still publish our
+                    // outbound afterward: the tie-break already decided we
+                    // win regardless of exactly what is indexed at this
+                    // instant.
+                    if let Some(existing) = existing_before.as_ref() {
+                        let _ = self.disconnect_connection_instance(peer_id, existing);
+                    }
                     self.publish_current_peer_connection(peer_id, connection_arc.clone());
                 }
                 ConnectionConflictDecision::RejectIncoming => {
@@ -1797,7 +1923,19 @@ impl<T> ConnectionPool<T> {
                     // entry so it does not linger, but do not publish this
                     // outbound as the session either — a preferred inbound
                     // may still arrive and must not be pre-empted.
-                    let _ = self.disconnect_connection_by_peer_id(peer_id);
+                    //
+                    // Instance-scoped: only ever tears down the exact rival
+                    // instance `existing_before` captured above. If a
+                    // concurrent inbound accept has already published a
+                    // fresh preferred inbound for this peer between that
+                    // capture and this call, `disconnect_connection_instance`
+                    // is a no-op — a peer-wide
+                    // `disconnect_connection_by_peer_id` here would have torn
+                    // that fresh inbound down instead, reproducing the
+                    // reconnect thrash from the outbound-finalize side.
+                    if let Some(existing) = existing_before.as_ref() {
+                        let _ = self.disconnect_connection_instance(peer_id, existing);
+                    }
                     debug!(
                         peer = %addr,
                         peer_id = %peer_id,
