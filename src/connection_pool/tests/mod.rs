@@ -3838,6 +3838,269 @@ async fn disconnect_connection_instance_never_removes_a_concurrently_published_r
     assert!(pool.current_peer_connection_instance(&peer_id).is_none());
 }
 
+/// Reviewer finding (P2, `disconnect_connection_instance`): extends
+/// `disconnect_connection_instance_never_removes_a_concurrently_published_replacement`,
+/// which only modelled the replacement being published *before* the
+/// instance-scoped teardown call — a pure sequential ordering that the
+/// existing `Arc`-identity check-then-return already handled correctly. The
+/// actual defect was a SECOND check-then-act pair *inside*
+/// `disconnect_connection_instance` itself: after confirming `target` was
+/// still current, it called the unconditional `clear_current_peer_connection`,
+/// which has a real gap (logging + lifecycle-event construction) before it
+/// stores `None`. A concurrent `publish_current_peer_connection` landing in
+/// that specific gap — *during* teardown, not before it — got clobbered by
+/// the unconditional clear.
+///
+/// This drives the two operations with genuine OS-thread concurrency
+/// (raw `std::thread::spawn` + a `std::sync::Barrier`, so both threads are
+/// released at the same instant and can run truly in parallel on separate
+/// cores — a cooperative-scheduling `tokio::spawn` race was not tight
+/// enough to reliably land in the gap) across many iterations so the
+/// scheduler actually explores it. With the
+/// checked-then-unconditional-clear idiom, `current == None` was reachable
+/// (the fresh publish landed in the gap and was then clobbered); with the
+/// atomic `compare_and_clear_current_connection` CAS fix, exactly `fresh`
+/// must survive on every single iteration, deterministically — the CAS
+/// either observes `target` and clears it before `fresh` is installed (and
+/// `fresh`'s later, unconditional publish then wins regardless), or it
+/// observes `fresh` already installed and declines outright. Either way
+/// `None` is never a reachable outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnect_connection_instance_atomic_clear_survives_concurrent_publish_mid_teardown() {
+    for i in 0u16..300 {
+        let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+        let peer_id = crate::KeyPair::new_for_testing(format!("race-mid-teardown-{i}")).peer_id();
+
+        let stale_addr: SocketAddr = format!("127.0.0.1:{}", 21000 + i).parse().unwrap();
+        let (stale_io, _stale_peer_io) = tokio::io::duplex(1024);
+        let (stale_sh, _stale_w, _stale_r) = LockFreeStreamHandle::new(
+            stale_io,
+            stale_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut stale_conn = LockFreeConnection::new(stale_addr, ConnectionDirection::Outbound);
+        stale_conn.stream_handle = Some(Arc::new(stale_sh));
+        stale_conn.set_state(ConnectionState::Connected);
+        let stale = Arc::new(stale_conn);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
+
+        let fresh_addr: SocketAddr = format!("127.0.0.1:{}", 31000 + i).parse().unwrap();
+        let (fresh_io, _fresh_peer_io) = tokio::io::duplex(1024);
+        let (fresh_sh, _fresh_w, _fresh_r) = LockFreeStreamHandle::new(
+            fresh_io,
+            fresh_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut fresh_conn = LockFreeConnection::new(fresh_addr, ConnectionDirection::Inbound);
+        fresh_conn.stream_handle = Some(Arc::new(fresh_sh));
+        fresh_conn.set_state(ConnectionState::Connected);
+        let fresh = Arc::new(fresh_conn);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let evict_task = {
+            let pool = pool.clone();
+            let peer_id = peer_id.clone();
+            let target = stale.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                pool.disconnect_connection_instance(&peer_id, &target)
+            })
+        };
+        let publish_task = {
+            let pool = pool.clone();
+            let peer_id = peer_id.clone();
+            let fresh = fresh.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                pool.publish_current_peer_connection(&peer_id, fresh);
+            })
+        };
+
+        evict_task.join().expect("evict task must not panic");
+        publish_task.join().expect("publish task must not panic");
+
+        let current = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+            "iteration {i}: a concurrently published replacement must survive a \
+             same-instant instance-scoped teardown of a DIFFERENT instance — atomic \
+             compare-and-clear must never clobber a publish landing mid-teardown \
+             (got {current:?})"
+        );
+    }
+}
+
+/// Reviewer finding (P2, `disconnect_connection_instance`): before the fix
+/// this only removed `target.addr` from `connections_by_addr`, but an
+/// accepted inbound is commonly indexed under BOTH the
+/// advertised/configured bind address AND the ephemeral socket address
+/// (see the "Also indexed incoming connection by ephemeral address" block in
+/// `handle_incoming_connection_tls`). Leaving the second alias behind is a
+/// zombie: a later socket-failure cleanup keyed on that alias
+/// double-decrements accounting, and direct address lookups through it
+/// observe a dead connection. The fix scans `connections_by_addr` for every
+/// entry whose value is `Arc::ptr_eq` to the torn-down instance and removes
+/// all of them (plus their `addr_to_peer_id` rows) — still instance-scoped,
+/// never a peer-id sweep.
+#[test]
+fn disconnect_connection_instance_removes_all_address_aliases() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("alias-removal-peer").peer_id();
+
+    let bind_addr: SocketAddr = "127.0.0.1:7440".parse().unwrap();
+    let ephemeral_addr: SocketAddr = "127.0.0.1:54440".parse().unwrap();
+
+    let conn = LockFreeConnection::new(bind_addr, ConnectionDirection::Inbound);
+    conn.set_state(ConnectionState::Connected);
+    let target = Arc::new(conn);
+
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), bind_addr, target.clone()));
+    // Mirrors the ephemeral-address indexing `handle_incoming_connection_tls`
+    // performs after acceptance for an accepted inbound: both the bind addr
+    // and the ephemeral socket addr point at the same instance.
+    pool.index_connection_by_addr(ephemeral_addr, target.clone());
+    pool.add_addr_to_peer_id(ephemeral_addr, peer_id.clone());
+
+    assert!(pool.disconnect_connection_instance(&peer_id, &target));
+
+    assert!(
+        pool.connections_by_addr
+            .read_sync(&bind_addr, |_, _| ())
+            .is_none(),
+        "bind-address alias must be removed"
+    );
+    assert!(
+        pool.connections_by_addr
+            .read_sync(&ephemeral_addr, |_, _| ())
+            .is_none(),
+        "ephemeral-address alias must be removed — a lingering entry is exactly the \
+         zombie that double-decrements accounting on a later socket-failure cleanup \
+         keyed on this alias"
+    );
+    assert!(
+        pool.addr_to_peer_id
+            .read_sync(&bind_addr, |_, _| ())
+            .is_none(),
+        "bind-address addr_to_peer_id row must be removed"
+    );
+    assert!(
+        pool.addr_to_peer_id
+            .read_sync(&ephemeral_addr, |_, _| ())
+            .is_none(),
+        "ephemeral-address addr_to_peer_id row must be removed — no zombie row left \
+         pointing at a torn-down instance"
+    );
+}
+
+/// Test helper: a `LockFreeConnection` with a real, live stream handle (so
+/// `has_live_stream()`/`get_connection_by_peer_id`'s usability filter treats
+/// it as usable), backed by an in-memory `tokio::io::duplex` pair.
+async fn make_live_connection(
+    addr: SocketAddr,
+    direction: ConnectionDirection,
+) -> Arc<LockFreeConnection> {
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (sh, _w, _r) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut conn = LockFreeConnection::new(addr, direction);
+    conn.stream_handle = Some(Arc::new(sh));
+    conn.set_state(ConnectionState::Connected);
+    Arc::new(conn)
+}
+
+/// Reviewer finding 1 (P1, `handle.rs` inbound-accept tie-break): the
+/// inbound-accept evict/replace arms compute their decision against
+/// `existing_conn` but, before the fix, called the PEER-WIDE
+/// `disconnect_connection_by_peer_id(peer_id)` to act on it. Between the
+/// decision and that call, a concurrent accept/finalize can publish a fresh
+/// connection for the same peer, and the peer-wide disconnect tears down
+/// THAT replacement instead of the stale rival the decision was actually
+/// about.
+///
+/// HONESTY NOTE: this pins the exact contrast at the primitive level (the
+/// call shape `handle.rs`'s arms use), the same established pattern as
+/// `disconnect_connection_instance_never_removes_a_concurrently_published_replacement`
+/// for the outbound-finalize side. It does not drive the real async
+/// `handle_incoming_connection_tls` accept path with genuine concurrency —
+/// an attempt to do so found that racing a publish against that call can
+/// itself change which decision branch is taken (the race can land before
+/// the internal snapshot too, altering `existing_usable`), so it cannot
+/// isolate this specific bug reliably and was intentionally not kept. The
+/// routing fix in `handle.rs` (swapping `disconnect_connection_by_peer_id`
+/// for `disconnect_connection_instance` in the three evict/replace arms) is
+/// verified by direct code inspection plus the full end-to-end regression
+/// suite (`tiebreak_reconnect_thrash`, `tie_break_reconnect_storm`,
+/// `witness_mesh_restart_and_simultaneous_open_matrix_converges_quietly`)
+/// remaining green, which exercises this exact inbound-accept-vs-concurrent
+/// -finalize thrash scenario end-to-end.
+#[tokio::test]
+async fn inbound_accept_evict_arm_must_use_instance_scoped_disconnect_not_peer_wide() {
+    let peer_id = crate::KeyPair::new_for_testing("inbound-accept-race-peer").peer_id();
+    let stale_addr: SocketAddr = "127.0.0.1:7450".parse().unwrap();
+    let fresh_addr: SocketAddr = "127.0.0.1:7451".parse().unwrap();
+
+    // First pool: documents the WRONG (pre-fix) call shape used by the
+    // inbound-accept arms — peer-wide disconnect keyed only on `peer_id`,
+    // ignoring the specific `existing_conn` a tie-break decision was
+    // actually about. Between the decision and the eviction call, a
+    // concurrent accept/finalize publishes a fresh replacement for the SAME
+    // peer.
+    {
+        let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+        let existing_conn = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, existing_conn.clone()));
+        let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+        pool.publish_current_peer_connection(&peer_id, fresh.clone());
+
+        let wrongly_evicted = pool.disconnect_connection_by_peer_id(&peer_id);
+        assert!(
+            wrongly_evicted.is_some_and(|c| Arc::ptr_eq(&c, &fresh)),
+            "documents the bug this finding fixes: the peer-wide primitive tears down \
+             whatever is current for the peer — including a concurrently published \
+             replacement the decision was never about"
+        );
+    }
+
+    // Second pool, same shape: exercises the FIXED call shape, routed
+    // through the instance-scoped primitive with the exact `existing_conn`
+    // snapshot, exactly as the fixed `handle.rs` inbound-accept arms now do.
+    {
+        let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+        let existing_conn = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, existing_conn.clone()));
+        let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+        pool.publish_current_peer_connection(&peer_id, fresh.clone());
+
+        let correctly_declined = pool.disconnect_connection_instance(&peer_id, &existing_conn);
+        assert!(
+            !correctly_declined,
+            "instance-scoped disconnect must decline: `existing_conn` is no longer the \
+             peer's indexed connection"
+        );
+        let current = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+            "the concurrently published replacement must survive the inbound-accept \
+             arm's instance-scoped eviction of the stale snapshot"
+        );
+    }
+}
+
 /// Audit finding D1: correlation slots are addressed by a 13-bit index, so
 /// `id` and `id + 8192*k` collide on the same slot. A stale/delayed response
 /// carrying a recycled, aliased id must NOT complete the slot currently owned

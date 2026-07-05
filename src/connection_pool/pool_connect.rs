@@ -1306,24 +1306,23 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         target: &Arc<LockFreeConnection>,
     ) -> bool {
-        // Re-validate against the peer's PRIMARY current-connection slot by
-        // `Arc` identity — the same check-then-act idiom as
-        // `clear_current_peer_connection_if_matches`. `get_connection_by_peer_id`
-        // (which every caller of this function uses to capture `target`)
-        // always self-heals PRIMARY to the resolved connection before
-        // returning it, so PRIMARY reflects `target` here unless a
-        // concurrent publish has genuinely replaced it — exactly the race
-        // this function exists to detect and decline.
-        let still_current = self
+        // Atomic compare-and-clear on the peer's PRIMARY current-connection
+        // slot, by `Arc` identity, via `PeerSession::compare_and_clear_current_connection`
+        // (a single lock-free CAS on the underlying `ArcSwapOption`). This
+        // IS the entire re-validation: it either finds `target` still
+        // installed and clears it right here, atomically, or it finds
+        // something else — a concurrent publish (e.g. a fresh preferred
+        // inbound) has already superseded `target` — and declines. There is
+        // deliberately no separate check-then-act pair here: a read
+        // followed by an unconditional clear has a gap in which exactly
+        // that concurrent publish can land and be clobbered.
+        let cleared = self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
-                session
-                    .current_connection()
-                    .map(|current| Arc::ptr_eq(&current, target))
-                    .unwrap_or(false)
+                session.compare_and_clear_current_connection(target)
             })
             .unwrap_or(false);
-        if !still_current {
+        if !cleared {
             debug!(
                 peer_id = %peer_id,
                 "declined instance-scoped disconnect: the connection currently indexed for \
@@ -1356,23 +1355,47 @@ impl<T> ConnectionPool<T> {
                 reason: crate::lifecycle::SessionRemovalReason::DisconnectByPeerId,
             },
         );
-        self.clear_current_peer_connection(peer_id);
 
-        // Only remove `target`'s own address entry, and only if it still
-        // points at `target` specifically. A blanket peer-id-keyed address
+        // Mirror the clear onto the secondary `connections_by_peer` index —
+        // again instance-scoped: only the entry that still points at
+        // `target` is removed, via `remove_if_sync`'s single-bucket-lock
+        // compare-and-remove, never a blanket peer-id-keyed removal that
+        // could delete a newer instance already reinserted under the same
+        // `peer_id`.
+        let _ = self
+            .connections_by_peer
+            .remove_if_sync(peer_id, |v| Arc::ptr_eq(v, target));
+
+        // Remove EVERY `connections_by_addr` alias of THIS instance. An
+        // accepted inbound is commonly indexed under both its
+        // advertised/bind address and its ephemeral socket address, and
+        // both must go — leaving one behind is a zombie alias: a later
+        // socket-failure cleanup that lands on it double-decrements
+        // accounting, and direct lookups by that address observe a dead
+        // connection. Each removal is its own atomic, per-key
+        // compare-and-remove (`remove_if_sync` holds one bucket lock across
+        // the identity check and the removal); a blanket peer-id-keyed
         // sweep (as `disconnect_connection_by_peer_id` does) is exactly
-        // wrong here: `target` and a brand-new candidate that has already
-        // superseded it often share the same configured/dial address, and a
-        // sweep keyed on peer identity would collaterally delete the NEW
-        // connection's own, already-correct address entry.
-        let still_indexed_at_addr = self
-            .connections_by_addr
-            .read_sync(&target.addr, |_, v| Arc::ptr_eq(v, target))
-            .unwrap_or(false);
-        if still_indexed_at_addr {
-            let _ = self.connections_by_addr.remove_sync(&target.addr);
-            let _ = self.addr_to_peer_id.remove_sync(&target.addr);
-            self.clear_capabilities_for_addr(&target.addr);
+        // wrong here, since `target` and a brand-new candidate that has
+        // already superseded it often share the same configured/dial
+        // address, and a sweep keyed on peer identity would collaterally
+        // delete the NEW connection's own, already-correct address entry.
+        let mut candidate_addrs: Vec<SocketAddr> = Vec::new();
+        self.connections_by_addr.iter_sync(|addr, v| {
+            if Arc::ptr_eq(v, target) {
+                candidate_addrs.push(*addr);
+            }
+            true
+        });
+        for addr in candidate_addrs {
+            let removed = self
+                .connections_by_addr
+                .remove_if_sync(&addr, |v| Arc::ptr_eq(v, target))
+                .is_some();
+            if removed {
+                let _ = self.addr_to_peer_id.remove_sync(&addr);
+                self.clear_capabilities_for_addr(&addr);
+            }
         }
 
         self.decrement_connection_counter();

@@ -110,6 +110,24 @@ impl PeerSession {
     fn set_current_connection(&self, connection: Option<Arc<LockFreeConnection>>) {
         self.current_connection.store(connection);
     }
+
+    /// Atomically clear the current connection iff it is still exactly
+    /// `expected` (`Arc::ptr_eq`) — a single lock-free CAS on the slot
+    /// itself via `ArcSwapOption::compare_and_swap`.
+    ///
+    /// This is deliberately NOT `read (ptr_eq check) -> store(None)` as two
+    /// separate steps: that idiom has a genuine gap between the check and
+    /// the store in which a concurrent `publish_current_peer_connection`
+    /// (e.g. a fresh preferred inbound landing mid-teardown) can install a
+    /// new `Arc`, which the second, unconditional step would then clobber.
+    /// A single CAS closes that gap completely: it either finds `expected`
+    /// still installed and atomically swaps it for `None`, or it finds
+    /// something else and leaves the slot untouched — there is no
+    /// observable state in between.
+    fn compare_and_clear_current_connection(&self, expected: &Arc<LockFreeConnection>) -> bool {
+        let previous = self.current_connection.compare_and_swap(expected, None);
+        matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected))
+    }
 }
 
 const OUTBOUND_DIAL_PENDING: u8 = 0;

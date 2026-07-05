@@ -2338,7 +2338,16 @@ where
                                 peer_state_addr = %peer_state_addr,
                                 "inbound_tiebreak_evict_stale"
                             );
-                            let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                            // Instance-scoped: only ever tears down the exact
+                            // `existing_conn` this decision was computed
+                            // about. A peer-wide `disconnect_connection_by_peer_id`
+                            // here would tear down whatever is currently
+                            // indexed for the peer — including a fresh
+                            // replacement a concurrent accept/finalize
+                            // published between the decision above and this
+                            // call — reproducing the tie-break reconnect
+                            // thrash from the inbound-accept side.
+                            let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
                             pool.add_connection_by_peer_id(
                                 peer_id.clone(),
                                 peer_state_addr,
@@ -2354,7 +2363,9 @@ where
                                 peer_state_addr = %peer_state_addr,
                                 "inbound_tiebreak_evict_stale"
                             );
-                            let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                            // Instance-scoped for the same reason as the
+                            // `AcceptIncoming` arm above.
+                            let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
                             info!(
                                 target: "icanact_remote_lifecycle",
                                 peer_id = %peer_id,
@@ -2391,7 +2402,9 @@ where
                                     },
                                 },
                             );
-                            let _ = pool.disconnect_connection_by_peer_id(&peer_id);
+                            // Instance-scoped for the same reason as the
+                            // `AcceptIncoming` arm above.
+                            let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
                             pool.add_connection_by_peer_id(
                                 peer_id.clone(),
                                 peer_state_addr,
