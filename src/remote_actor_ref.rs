@@ -25,6 +25,13 @@ impl RemoteConnection {
         self.inner.bytes_written()
     }
 
+    /// Instance id of the specific connection this handle was cached from —
+    /// used to retire exactly this instance (never "whatever is currently
+    /// indexed for the peer") when an ask on it fails or is cancelled.
+    pub(crate) fn instance_id(&self) -> Option<u64> {
+        self.inner.instance_id()
+    }
+
     pub fn is_streaming_active(&self) -> bool {
         self.inner.is_streaming_active()
     }
@@ -333,6 +340,8 @@ pub struct RemoteActorRef<T = ()> {
 struct ActorAskCancellationGuard {
     registry: Arc<crate::registry::GossipRegistry>,
     peer_id: crate::PeerId,
+    addr: SocketAddr,
+    instance_id: Option<u64>,
     armed: bool,
 }
 
@@ -347,15 +356,27 @@ impl Drop for ActorAskCancellationGuard {
         if !self.armed {
             return;
         }
-        let evicted = self
-            .registry
-            .connection_pool
-            .disconnect_connection_by_peer_id(&self.peer_id)
-            .is_some();
+        // Instance-scoped, not peer-wide: this guard was armed for the
+        // SPECIFIC connection instance the cancelled ask was made on
+        // (`addr`/`instance_id` captured from that connection at guard
+        // creation). A peer-wide `disconnect_connection_by_peer_id` here
+        // would tear down whatever is *currently* indexed for the peer,
+        // which may already be a fresh, healthy reconnection established
+        // after this ask was sent — collateral teardown of a session this
+        // cancellation has nothing to do with. `instance_id == None` means
+        // the connection this ask ran on had no live stream handle to begin
+        // with, so there is nothing identifiable to retire.
+        let evicted = self.instance_id.is_some_and(|instance_id| {
+            self.registry
+                .connection_pool
+                .remove_connection_instance_by_id(self.addr, instance_id)
+                .is_some()
+        });
         tracing::warn!(
             peer_id = %self.peer_id,
+            addr = %self.addr,
             evicted,
-            "actor ask cancelled; evicted peer transport session"
+            "actor ask cancelled; evicted the specific peer transport session instance it ran on"
         );
     }
 }
@@ -443,7 +464,10 @@ impl<T> RemoteActorRef<T> {
         self.connection.clone()
     }
 
-    fn actor_ask_cancellation_guard(&self) -> Option<ActorAskCancellationGuard> {
+    fn actor_ask_cancellation_guard(
+        &self,
+        conn: &RemoteConnection,
+    ) -> Option<ActorAskCancellationGuard> {
         let registry = self.registry.upgrade()?;
         if !registry.config.connection_recovery.evict_peer_on_ask_cancel {
             return None;
@@ -451,6 +475,8 @@ impl<T> RemoteActorRef<T> {
         Some(ActorAskCancellationGuard {
             registry,
             peer_id: self.location.peer_id.clone(),
+            addr: conn.addr,
+            instance_id: conn.instance_id(),
             armed: true,
         })
     }
@@ -458,6 +484,7 @@ impl<T> RemoteActorRef<T> {
     async fn recover_connection_after_actor_ask_timeout(
         &self,
         deadline: tokio::time::Instant,
+        failed_conn: &RemoteConnection,
     ) -> crate::Result<Option<RemoteConnection>> {
         let Some(registry) = self.registry.upgrade() else {
             return Err(crate::GossipError::Shutdown);
@@ -468,15 +495,24 @@ impl<T> RemoteActorRef<T> {
         }
 
         let peer_id = &self.location.peer_id;
-        let evicted = registry
-            .connection_pool
-            .disconnect_connection_by_peer_id(peer_id)
-            .is_some();
+        // Instance-scoped, not peer-wide: retire exactly the connection
+        // instance the timed-out ask actually ran on
+        // (`failed_conn`'s own addr/instance id), never whatever happens to
+        // be indexed for the peer at this moment — a concurrent reconnect
+        // landing here must not be collaterally destroyed by a timeout on a
+        // now-superseded instance.
+        let evicted = failed_conn.instance_id().is_some_and(|instance_id| {
+            registry
+                .connection_pool
+                .remove_connection_instance_by_id(failed_conn.addr, instance_id)
+                .is_some()
+        });
         tracing::warn!(
             peer_id = %peer_id,
+            addr = %failed_conn.addr,
             evicted,
             retry = policy.retry_actor_ask_once_after_timeout,
-            "actor ask timed out; evicted peer transport session"
+            "actor ask timed out; evicted the specific peer transport session instance it ran on"
         );
 
         if !policy.retry_actor_ask_once_after_timeout {
@@ -552,7 +588,7 @@ impl<T> RemoteActorRef<T> {
     ) -> crate::Result<bytes::Bytes> {
         let conn = self.connection_or_not_listening()?;
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut guard = self.actor_ask_cancellation_guard();
+        let mut guard = self.actor_ask_cancellation_guard(conn);
         let remaining = Self::remaining_until(deadline)?;
         let result = Self::ask_actor_frame_with_deadline(
             conn,
@@ -568,10 +604,10 @@ impl<T> RemoteActorRef<T> {
         match result {
             Err(crate::GossipError::Timeout) => {
                 if let Some(reconnected) = self
-                    .recover_connection_after_actor_ask_timeout(deadline)
+                    .recover_connection_after_actor_ask_timeout(deadline, conn)
                     .await?
                 {
-                    let mut retry_guard = self.actor_ask_cancellation_guard();
+                    let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
                     let remaining = Self::remaining_until(deadline)?;
                     let retry_result = Self::ask_actor_frame_with_deadline(
                         &reconnected,

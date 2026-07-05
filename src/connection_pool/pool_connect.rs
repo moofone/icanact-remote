@@ -1155,17 +1155,36 @@ impl<T> ConnectionPool<T> {
     /// expectation evicts unconditionally (caller had no instance to pin).
     /// This is the instance guard that stops a timeout on an already-replaced
     /// session from tearing down the freshly reconnected, healthy session.
+    ///
+    /// The eviction itself is instance-scoped (`disconnect_connection_instance`),
+    /// never `disconnect_connection_by_peer_id`: fetching the current
+    /// connection to compare its instance id, then separately calling a
+    /// peer-wide disconnect, would reopen exactly the check/act gap this
+    /// guard exists to close — a fresh publish landing between the match and
+    /// the peer-wide sweep would be collaterally destroyed. Re-validating by
+    /// `Arc` identity via a single atomic compare-and-clear is the only way
+    /// to make the guard itself race-free.
     fn evict_peer_session_if_instance(
         &self,
         peer_id: &crate::PeerId,
         expected_instance: Option<u64>,
     ) -> bool {
-        if let Some(expected) = expected_instance
-            && self.current_peer_connection_instance(peer_id) != Some(expected)
-        {
-            return false;
+        match expected_instance {
+            Some(expected) => {
+                let Some(current) = self.get_connection_by_peer_id(peer_id) else {
+                    return false;
+                };
+                let current_instance = current
+                    .stream_handle
+                    .as_ref()
+                    .map(|handle| handle.instance_id());
+                if current_instance != Some(expected) {
+                    return false;
+                }
+                self.disconnect_connection_instance(peer_id, &current)
+            }
+            None => self.disconnect_connection_by_peer_id(peer_id).is_some(),
         }
-        self.disconnect_connection_by_peer_id(peer_id).is_some()
     }
 
     /// Consumer-classified healthy ask outcome: reset the peer's streak.

@@ -882,7 +882,10 @@ impl<T: 'static> Peer<T> {
             // Convert PeerId to GossipNodeId for TLS
             let node_id = Some(self.peer_id.to_node_id());
             if node_id.is_some() {
-                tracing::debug!("🔐 Converted PeerId {} to GossipNodeId for TLS", self.peer_id);
+                tracing::debug!(
+                    "🔐 Converted PeerId {} to GossipNodeId for TLS",
+                    self.peer_id
+                );
             }
 
             gossip_state.peers.insert(
@@ -947,10 +950,21 @@ impl<T: 'static> Peer<T> {
                         },
                     },
                 );
+                // Instance-scoped, not peer-wide: `should_keep_connection`
+                // was evaluated against this specific `existing_conn`. A
+                // peer-wide `disconnect_connection_by_peer_id` here would
+                // tear down whatever is *currently* indexed for the peer,
+                // which could be a fresh connection published between the
+                // decision above and this call — exactly the collateral
+                // teardown / reconnect-thrash race this crate's
+                // instance-scoped teardown discipline exists to close.
+                // `disconnect_connection_instance` CAS's against
+                // `existing_conn` by `Arc` identity and is a safe no-op if a
+                // concurrent publish has already superseded it.
                 let _ = self
                     .registry
                     .connection_pool
-                    .disconnect_connection_by_peer_id(&self.peer_id);
+                    .disconnect_connection_instance(&self.peer_id, &existing_conn);
             }
         }
 

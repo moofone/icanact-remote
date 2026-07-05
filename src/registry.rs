@@ -5538,6 +5538,16 @@ impl<T: 'static> GossipRegistry<T> {
         // freshly-accepted preferred inbound `disconnect_by_peer_id`'d moments
         // after acceptance. Retire only the stale link and leave the live
         // session — identified purely by connection-instance identity — intact.
+        // Whether the block below already retired the specific failed
+        // instance by CAS'd identity (`disconnect_connection_instance`). When
+        // true, the peer-wide cleanup block further down must NOT also run
+        // `disconnect_connection_by_peer_id` for this peer: that would
+        // re-open the exact check/act gap this handler exists to close — a
+        // fresh session published for the same peer between the instance-id
+        // match above and a peer-wide sweep would be collaterally destroyed
+        // instead of only the failed instance.
+        let mut instance_teardown_done = false;
+
         if let Some(peer_id) = peer_id.as_ref() {
             let pool = &self.connection_pool;
             if let Some(current) = pool.get_connection_by_peer_id(peer_id) {
@@ -5557,32 +5567,76 @@ impl<T: 'static> GossipRegistry<T> {
                 // failure path, which is always safe for the failing
                 // session itself.
                 let current_instance_id = current.stream_handle.as_ref().map(|h| h.instance_id());
-                let failed_is_current = match failed_instance_id {
-                    Some(failed_id) => Some(failed_id) == current_instance_id,
-                    None => true,
-                };
-                if !failed_is_current {
-                    let retired = failed_instance_id.and_then(|failed_id| {
-                        pool.remove_connection_instance_by_id(observed_peer_addr, failed_id)
-                    });
-                    info!(
-                        peer_id = %peer_id,
-                        observed_peer = %observed_peer_addr,
-                        current_addr = %current.addr,
-                        retired_instance = retired.is_some(),
-                        "socket failure for a superseded connection; retiring only the stale \
-                         link and preserving the live identity-verified session"
-                    );
-                    return Ok(());
+                match failed_instance_id {
+                    Some(failed_id) if Some(failed_id) != current_instance_id => {
+                        let retired =
+                            pool.remove_connection_instance_by_id(observed_peer_addr, failed_id);
+                        info!(
+                            peer_id = %peer_id,
+                            observed_peer = %observed_peer_addr,
+                            current_addr = %current.addr,
+                            retired_instance = retired.is_some(),
+                            "socket failure for a superseded connection; retiring only the stale \
+                             link and preserving the live identity-verified session"
+                        );
+                        return Ok(());
+                    }
+                    Some(_) => {
+                        // The failed instance IS the current session. Retire
+                        // it here by CAS'd instance identity
+                        // (`disconnect_connection_instance`) rather than
+                        // falling through to the peer-wide
+                        // `disconnect_connection_by_peer_id` below: that call
+                        // clears the peer's current-connection slot and
+                        // sweeps every address alias mapped to `peer_id`
+                        // unconditionally, so a fresh session published for
+                        // this peer between this comparison and that sweep
+                        // would be torn down along with the failed instance
+                        // instead of surviving it. `disconnect_connection_instance`
+                        // performs a single atomic compare-and-clear against
+                        // `current` and declines (a safe no-op) if a
+                        // concurrent publish has already superseded it —
+                        // that "already superseded" outcome is handled
+                        // identically to a successful retirement here: either
+                        // way, this instance must never be retired again via
+                        // the peer-wide path below.
+                        let retired = pool.disconnect_connection_instance(peer_id, &current);
+                        info!(
+                            peer_id = %peer_id,
+                            observed_peer = %observed_peer_addr,
+                            current_addr = %current.addr,
+                            retired,
+                            "socket failure matched the current session's connection instance; \
+                             retiring by CAS'd instance identity, not peer-wide, so a \
+                             concurrently published fresh session survives"
+                        );
+                        instance_teardown_done = true;
+                    }
+                    None => {
+                        // Caller cannot identify the failed instance at all;
+                        // fall through to the legacy peer-wide path below,
+                        // unchanged.
+                    }
                 }
             }
         }
 
         let current_time = current_timestamp();
 
-        // IMMEDIATELY mark the connection as failed and remove from pool
-        // Use disconnect_connection_by_peer_id when possible to clean up ALL address aliases
-        {
+        // IMMEDIATELY mark the connection as failed and remove from pool.
+        // Use disconnect_connection_by_peer_id when possible to clean up ALL
+        // address aliases — UNLESS the block above already retired the
+        // specific failed instance by CAS'd identity, in which case running
+        // this peer-wide sweep too would reopen the exact collateral-teardown
+        // gap that instance-scoped retirement exists to close.
+        if instance_teardown_done {
+            info!(
+                addr = %failed_peer_addr,
+                peer_id = ?peer_id,
+                "failed connection instance already retired by CAS'd identity; skipping the \
+                 peer-wide pool sweep"
+            );
+        } else {
             let pool = &self.connection_pool;
             // Try to find peer_id for proper cleanup of all aliases
             if let Some(peer_id) = peer_id.clone() {
