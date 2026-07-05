@@ -4784,12 +4784,15 @@ impl<T: 'static> GossipRegistry<T> {
                     "📥 GOSSIP: Received full sync response (using bind_addr, not TCP source)"
                 );
 
-                // Use the peer's BIND address (not ephemeral TCP source port)
-                self.merge_full_sync(
+                // Peer bookkeeping keys on the peer's BIND address; address
+                // REPAIR anchors on the verified TCP source (§1.6) — the
+                // peer-controlled sender_bind_addr is never a trust anchor.
+                self.merge_full_sync_from(
                     local_actors.into_iter().collect(),
                     known_actors.into_iter().collect(),
                     sender_peer_id,
                     sender_socket_addr,
+                    Some(addr),
                     sequence,
                     wall_clock_time,
                 )
@@ -4822,8 +4825,41 @@ impl<T: 'static> GossipRegistry<T> {
         sender_peer_id: crate::PeerId,
         sender_addr: SocketAddr,
         sequence: u64,
+        wall_clock_time: u64,
+    ) {
+        self.merge_full_sync_from(
+            remote_local,
+            remote_known,
+            sender_peer_id,
+            sender_addr,
+            None,
+            sequence,
+            wall_clock_time,
+        )
+        .await
+    }
+
+    /// Merge a full sync, resolving advertised actor addresses against the
+    /// AUTHENTICATED socket address of the connection that delivered it
+    /// (PEER_ID_REFACTOR §1.6). `sender_addr` is the bind-derived peer
+    /// bookkeeping key (may come from the peer-controlled
+    /// `sender_bind_addr` wire field); `verified_sender_addr` is the
+    /// actual TCP source and, when present, is the ONLY trust anchor used
+    /// for address repair — a peer's self-declared bind must never be
+    /// what we repair other addresses from. Wire receive paths must pass
+    /// it; `None` (local/test callers) falls back to `sender_addr`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_full_sync_from(
+        &self,
+        remote_local: HashMap<String, RemoteActorLocation>,
+        remote_known: HashMap<String, RemoteActorLocation>,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        verified_sender_addr: Option<SocketAddr>,
+        sequence: u64,
         _wall_clock_time: u64,
     ) {
+        let repair_addr = verified_sender_addr.unwrap_or(sender_addr);
         // Don't add peer here - peers are managed through handle_connection
 
         // Record comprehensive node activity
@@ -4879,8 +4915,8 @@ impl<T: 'static> GossipRegistry<T> {
             let owner_is_sender = location.peer_id == sender_peer_id;
             let wire_addr = canonical_wire_addr(&name, &location.address);
             let resolved =
-                resolve_remote_actor_addr(&name, wire_addr, sender_addr, owner_is_sender);
-            self.note_actor_addr_resolution(wire_addr, resolved, sender_addr, owner_is_sender);
+                resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender);
+            self.note_actor_addr_resolution(wire_addr, resolved, repair_addr, owner_is_sender);
             let mut location = location;
             location.address = resolved.to_string();
             // Dial hints may only be learned from the OWNER's own gossip
@@ -4901,8 +4937,8 @@ impl<T: 'static> GossipRegistry<T> {
             let owner_is_sender = location.peer_id == sender_peer_id;
             let wire_addr = canonical_wire_addr(&name, &location.address);
             let resolved =
-                resolve_remote_actor_addr(&name, wire_addr, sender_addr, owner_is_sender);
-            self.note_actor_addr_resolution(wire_addr, resolved, sender_addr, owner_is_sender);
+                resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender);
+            self.note_actor_addr_resolution(wire_addr, resolved, repair_addr, owner_is_sender);
             let mut location = location;
             location.address = resolved.to_string();
             // Dial hints may only be learned from the OWNER's own gossip
@@ -4944,7 +4980,7 @@ impl<T: 'static> GossipRegistry<T> {
                 // is gated so port-0/unusable addresses (e.g. a relayed
                 // wildcard kept verbatim) never poison the dial tables.
                 if let Some(addr) = addr
-                    && learnable_dial_route(*addr, sender_addr)
+                    && learnable_dial_route(*addr, repair_addr)
                 {
                     routes_to_configure.push((name.clone(), location.peer_id.clone(), *addr));
                 }
@@ -8419,6 +8455,49 @@ mod tests {
         assert_eq!(
             stored.address, "10.77.0.55:0",
             "canonicalized to unspecified:0 then resolved from the configured sender address"
+        );
+    }
+
+    /// PEER_ID_REFACTOR §1.6 (codex round-3 P1): full-sync address repair
+    /// anchors on the VERIFIED TCP source, never on the bind-derived
+    /// `sender_addr` bookkeeping key (which may come from the
+    /// peer-controlled `sender_bind_addr` wire field). When both are
+    /// supplied, the verified address wins for repair.
+    #[tokio::test]
+    async fn wp1_full_sync_repair_prefers_verified_source_over_bind_addr() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7422),
+            test_config_with_seed("wp1-verified-vs-bind-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-verified-vs-bind-owner").peer_id();
+        let bind_addr: SocketAddr = "10.255.255.1:9400".parse().unwrap(); // peer-declared
+        let verified_addr: SocketAddr = "10.77.0.33:52511".parse().unwrap(); // TCP source
+        let actor_name = "wp1/verified-vs-bind/service";
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer("0.0.0.0:9400".parse().unwrap(), owner.clone()),
+        );
+
+        reg.merge_full_sync_from(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            bind_addr,
+            Some(verified_addr),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored = reg
+            .lookup_actor(actor_name)
+            .await
+            .expect("wildcard location must be stored and repaired");
+        assert_eq!(
+            stored.address,
+            SocketAddr::new(verified_addr.ip(), 9400).to_string(),
+            "repair must use the verified TCP source IP, not the self-declared bind"
         );
     }
 

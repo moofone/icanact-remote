@@ -2272,13 +2272,16 @@ pub(crate) fn handle_incoming_message(
                     );
                 }
 
-                // Only remaining async operation
+                // Only remaining async operation. Peer bookkeeping keys on
+                // the bind-derived address; address REPAIR anchors on the
+                // verified TCP source (§1.6).
                 registry
-                    .merge_full_sync(
+                    .merge_full_sync_from(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
                         sender_socket_addr,
+                        Some(_peer_addr),
                         sequence,
                         wall_clock_time,
                     )
@@ -2523,11 +2526,12 @@ pub(crate) fn handle_incoming_message(
                 );
 
                 registry
-                    .merge_full_sync(
+                    .merge_full_sync_from(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
                         sender_socket_addr,
+                        Some(_peer_addr),
                         sequence,
                         wall_clock_time,
                     )

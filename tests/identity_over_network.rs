@@ -337,6 +337,75 @@ async fn wildcard_interest_from_unconfigured_inbound_peer_resolves_to_source_ip(
     Ok(())
 }
 
+/// Codex P1 (round 3) / §1.6: FULL-SYNC address repair must anchor on the
+/// verified TCP source of the connection, not the peer-controlled
+/// `sender_bind_addr` wire field. A peer advertising a bogus/stale bind
+/// address (NAT misconfig, advertise_address typo) with a live verified
+/// connection must have its wildcard actors repaired to the address we
+/// actually observe it at — never to its self-declared bind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_sync_wildcard_repair_uses_verified_source_not_advertised_bind()
+-> icanact_remote::Result<()> {
+    let (key_dialer, key_listener) =
+        keys_ordered_dialer_first("identity-bindlie-a", "identity-bindlie-b");
+    let addr_dialer: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+    let addr_listener: SocketAddr = format!("127.0.0.1:{}", reserve_free_port())
+        .parse()
+        .unwrap();
+
+    // Dialer advertises a bogus bind address and never sends delta rounds
+    // (huge gossip interval), so the actor can only propagate through the
+    // initial full-sync exchange — the path under test.
+    let bogus_bind: SocketAddr = "10.255.255.1:9400".parse().unwrap();
+    let mut dialer_config = test_config();
+    dialer_config.advertise_address = Some(bogus_bind);
+    dialer_config.gossip_interval = Duration::from_secs(3600);
+
+    let dialer = start_node(addr_dialer, &key_dialer, dialer_config).await?;
+    let listener = start_node(addr_listener, &key_listener, test_config()).await?;
+
+    // Register BEFORE connecting: no immediate delta can carry it (no
+    // connected peers yet); only the full sync on connection setup will.
+    let actor_name = "identity/bind-lie/echo";
+    dialer
+        .register_urgent(
+            actor_name.to_string(),
+            "0.0.0.0:7777".parse().unwrap(),
+            RegistrationPriority::Immediate,
+        )
+        .await?;
+
+    dialer
+        .add_peer(&listener.registry.peer_id)
+        .await
+        .connect(&addr_listener)
+        .await?;
+    assert!(
+        wait_for_pair_connection(&dialer, &listener, Duration::from_secs(10)).await,
+        "pair must connect"
+    );
+
+    let stored = wait_for_stored_location(&listener, actor_name, Duration::from_secs(15)).await;
+    let stored_addr: SocketAddr = stored.address.parse().expect("stored address parses");
+    assert_ne!(
+        stored_addr.ip(),
+        bogus_bind.ip(),
+        "full-sync repair must never trust the peer-controlled sender_bind_addr"
+    );
+    assert!(
+        !stored_addr.ip().is_unspecified(),
+        "owner-sent wildcard must be repaired from the verified TCP source (got {})",
+        stored.address
+    );
+    assert_eq!(stored_addr.port(), 7777, "advertised port preserved");
+
+    dialer.shutdown().await;
+    listener.shutdown().await;
+    Ok(())
+}
+
 /// Codex P1 (round 2), stale-config flavor: when the receiver's configured
 /// address for a peer is stale/dead but the peer is LIVE on a verified
 /// connection, wildcard repair must use the live connection's source IP —
