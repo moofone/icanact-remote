@@ -8469,6 +8469,52 @@ mod tests {
         );
     }
 
+    /// PEER_ID_REFACTOR §1.7 (codex round-7 P2): dial precedence is
+    /// configured → learned → advertised. A REQUIRED peer's
+    /// operator-configured dial address must never be displaced by a
+    /// learned actor-address hint — the hint may be stale or NAT-only
+    /// while the configured address is the routable target. The hint is
+    /// still recorded in the fallback index for non-configured lookups.
+    #[tokio::test]
+    async fn wp1_learned_hint_never_overrides_required_peer_dial_addr() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7423),
+            test_config_with_seed("wp1-required-precedence-local"),
+        );
+        let owner = KeyPair::new_for_testing("wp1-required-precedence-owner").peer_id();
+        let required_addr: SocketAddr = "10.77.0.50:9400".parse().unwrap();
+        reg.configure_peer(owner.clone(), required_addr).await;
+
+        let learned_addr: SocketAddr = "10.77.0.60:9500".parse().unwrap();
+        let mut local_actors = HashMap::new();
+        local_actors.insert(
+            "wp1/required-precedence/service".to_string(),
+            RemoteActorLocation::new_with_peer(learned_addr, owner.clone()),
+        );
+        reg.merge_full_sync(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            required_addr,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        assert_eq!(
+            reg.connection_pool.get_configured_peer_addr(&owner),
+            Some(required_addr),
+            "operator-configured dial address outranks learned hints for required peers (§1.7)"
+        );
+        assert_eq!(
+            reg.connection_pool
+                .peer_id_to_addr
+                .read_sync(&owner, |_, addr| *addr),
+            Some(learned_addr),
+            "the learned hint is still recorded in the fallback index"
+        );
+    }
+
     /// PEER_ID_REFACTOR §1.6 (codex round-3 P1): full-sync address repair
     /// anchors on the VERIFIED TCP source, never on the bind-derived
     /// `sender_addr` bookkeeping key (which may come from the

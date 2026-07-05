@@ -127,6 +127,17 @@ impl<T> ConnectionPool<T> {
     }
 
     pub(crate) fn set_discovered_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        // PEER_ID_REFACTOR §1.7 dial precedence: configured → learned →
+        // advertised. A REQUIRED peer's operator-configured session route
+        // must never be displaced by a learned hint (the hint may be stale
+        // or NAT-only while the configured address is the routable target).
+        // The hint is still recorded in the fallback index, which
+        // `get_configured_peer_addr` only consults when no session route
+        // is configured.
+        if self.is_required_peer(peer_id) {
+            let _ = self.peer_id_to_addr.upsert_sync(peer_id.clone(), addr);
+            return;
+        }
         self.set_session_route_addr(peer_id, addr);
     }
 
