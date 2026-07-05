@@ -1300,6 +1300,44 @@ impl<T> ConnectionPool<T> {
         }
     }
 
+    /// Fully un-publish and tear down an outbound candidate that
+    /// `resolve_connection_conflict` rejected in `finalize_new_outbound_connection`
+    /// (`RejectIncoming` / `EvictStaleRejectIncoming`).
+    ///
+    /// The candidate is provisionally inserted into `connections_by_addr` /
+    /// `addr_to_peer_id` *before* the tie-break decision is known (so
+    /// `existing_before` can be snapshotted without racing the insert). When
+    /// the decision comes back "reject", that provisional indexing must be
+    /// fully undone by the exact `Arc` identity of the rejected candidate —
+    /// never by a plain address removal, which could delete a different,
+    /// legitimate connection a concurrent operation has since published at
+    /// the same address. The rejected candidate was never published as
+    /// anyone's current session (`publish_current_peer_connection` only runs
+    /// on `AcceptIncoming`/`ReplaceExisting`), so there is no `peer_sessions`
+    /// entry to clear here. This also deliberately never touches
+    /// `connection_counter`: the counter increment for a finalized outbound
+    /// happens later, only on the non-reject paths, so a rejected candidate
+    /// has nothing to decrement.
+    fn unpublish_rejected_outbound_candidate(
+        &self,
+        addr: SocketAddr,
+        candidate: &Arc<LockFreeConnection>,
+    ) {
+        let removed = self
+            .connections_by_addr
+            .remove_if_sync(&addr, |v| Arc::ptr_eq(v, candidate))
+            .is_some();
+        if removed {
+            let _ = self.addr_to_peer_id.remove_sync(&addr);
+            self.clear_capabilities_for_addr(&addr);
+        }
+        // Abort the writer/reader tasks regardless of whether the address
+        // removal above found this exact instance still indexed — the
+        // candidate is being discarded either way and its tasks must not be
+        // left running unaccounted for.
+        candidate.abort_tasks();
+    }
+
     /// Disconnect a specific connection instance for `peer_id`, but only if
     /// it is still the instance actually indexed for that peer — matched by
     /// `Arc` identity, never merely by `peer_id`. A concurrent publish that
@@ -2020,6 +2058,16 @@ impl<T> ConnectionPool<T> {
                         peer_id = %peer_id,
                         "outbound finalize kept existing preferred session; not displacing it"
                     );
+                    // The candidate was provisionally indexed by address
+                    // above, before this decision was known. It lost the
+                    // tie-break: fully un-publish it so `connections_by_addr`
+                    // / `addr_to_peer_id` keep pointing at the preferred
+                    // existing session, never silently overwritten by the
+                    // rejected candidate. Do not bump `connection_counter`,
+                    // do not send FullSync, and do not hand this candidate
+                    // back to the caller as a live handle.
+                    self.unpublish_rejected_outbound_candidate(addr, &connection_arc);
+                    return Err(crate::GossipError::ConnectionExists);
                 }
                 ConnectionConflictDecision::EvictStaleRejectIncoming => {
                     // The rival was dead, but this freshly-dialed outbound is
@@ -2048,6 +2096,12 @@ impl<T> ConnectionPool<T> {
                         "outbound finalize evicted a stale rival but declined to publish a \
                          non-preferred outbound as the session"
                     );
+                    // As with `RejectIncoming`, this candidate lost the
+                    // tie-break and must not be left indexed or served —
+                    // only the stale RIVAL was evicted above; the candidate
+                    // itself still needs its own provisional indexing undone.
+                    self.unpublish_rejected_outbound_candidate(addr, &connection_arc);
+                    return Err(crate::GossipError::ConnectionExists);
                 }
             }
         }

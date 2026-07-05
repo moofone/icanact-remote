@@ -5556,19 +5556,23 @@ impl<T: 'static> GossipRegistry<T> {
                 // evidence of supersession — fall through to the normal
                 // failure path, which is always safe for the failing
                 // session itself.
-                let failed_is_current = pool
-                    .get_lock_free_connection(observed_peer_addr)
-                    .map(|failed| Arc::ptr_eq(&failed, &current))
-                    .unwrap_or(true);
+                let current_instance_id = current.stream_handle.as_ref().map(|h| h.instance_id());
+                let failed_is_current = match failed_instance_id {
+                    Some(failed_id) => Some(failed_id) == current_instance_id,
+                    None => true,
+                };
                 if !failed_is_current {
+                    let retired = failed_instance_id.and_then(|failed_id| {
+                        pool.remove_connection_instance_by_id(observed_peer_addr, failed_id)
+                    });
                     info!(
                         peer_id = %peer_id,
                         observed_peer = %observed_peer_addr,
                         current_addr = %current.addr,
+                        retired_instance = retired.is_some(),
                         "socket failure for a superseded connection; retiring only the stale \
                          link and preserving the live identity-verified session"
                     );
-                    pool.remove_connection(observed_peer_addr);
                     return Ok(());
                 }
             }
