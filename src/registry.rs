@@ -2404,28 +2404,26 @@ impl<T: 'static> GossipRegistry<T> {
             if let Some(id) = node_id {
                 let peer_id = id.to_peer_id();
 
-                let mut conn_to_abort = None;
-
-                // Check if we need to close an existing connection to a different address
+                // A peer re-announced at a new address (e.g. a restart on a
+                // fresh ephemeral port) keeps the SAME verified identity, so its
+                // live session must not be torn down: identity, not socket
+                // address, owns the connection (PEER_ID_REFACTOR §1). Tearing
+                // the session down here on `old_addr != new_addr` was the
+                // address-keyed leak behind the single-node-restart reconnect
+                // thrash — a freshly-accepted preferred inbound got
+                // `disconnect_by_peer_id`'d the moment the peer's advertised
+                // address changed. We only reindex the address mapping; the old
+                // connection, if any, is retired by its own IO lifecycle when it
+                // actually dies, never by an address change alone.
+                if let Some(old_addr) = self.connection_pool.get_configured_peer_addr(&peer_id)
+                    && old_addr != peer_addr
                 {
-                    let pool = &self.connection_pool;
-                    if let Some(old_addr) = pool.get_configured_peer_addr(&peer_id) {
-                        if old_addr != peer_addr {
-                            info!(
-                                peer_id = %peer_id,
-                                old_addr = %old_addr,
-                                new_addr = %peer_addr,
-                                "Closing old connection for peer due to address change"
-                            );
-
-                            conn_to_abort = pool.disconnect_connection_by_peer_id(&peer_id);
-                        }
-                    }
-                }
-
-                // Abort tasks outside the lock to avoid potential deadlocks
-                if let Some(conn) = conn_to_abort {
-                    conn.abort_tasks();
+                    debug!(
+                        peer_id = %peer_id,
+                        old_addr = %old_addr,
+                        new_addr = %peer_addr,
+                        "peer advertised a new address; reindexing without disconnecting the live session"
+                    );
                 }
 
                 let pool = &self.connection_pool;
@@ -5515,6 +5513,38 @@ impl<T: 'static> GossipRegistry<T> {
             observed_peer = %observed_peer_addr,
             "socket disconnection detected, marking connection as failed (actors remain available)"
         );
+
+        // Address-vs-identity guard. The failure is reported for one specific
+        // socket (`observed_peer_addr`). If the peer's current published session
+        // is a DIFFERENT connection instance than the one that failed, the
+        // failed connection is superseded — e.g. an old link dying shortly
+        // after the peer already reconnected from a new address. Tearing down
+        // the whole peer session here (`disconnect_connection_by_peer_id` is
+        // peer-wide) would collaterally drop the healthy current connection,
+        // which is exactly the single-node-restart reconnect thrash: a
+        // freshly-accepted preferred inbound `disconnect_by_peer_id`'d moments
+        // after acceptance. Retire only the stale link and leave the live
+        // session — identified purely by peer identity — intact.
+        if let Some(peer_id) = peer_id.as_ref() {
+            let pool = &self.connection_pool;
+            if let Some(current) = pool.get_connection_by_peer_id(peer_id) {
+                let failed_is_current = pool
+                    .get_lock_free_connection(observed_peer_addr)
+                    .map(|failed| Arc::ptr_eq(&failed, &current))
+                    .unwrap_or(current.addr == observed_peer_addr);
+                if !failed_is_current {
+                    info!(
+                        peer_id = %peer_id,
+                        observed_peer = %observed_peer_addr,
+                        current_addr = %current.addr,
+                        "socket failure for a superseded connection; retiring only the stale \
+                         link and preserving the live identity-verified session"
+                    );
+                    pool.remove_connection(observed_peer_addr);
+                    return Ok(());
+                }
+            }
+        }
 
         let current_time = current_timestamp();
 
@@ -10104,7 +10134,9 @@ mod tests {
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn.clone()));
 
         // Peer re-announced at a new address with the same identity.
-        registry.add_peer_with_node_id(new_addr, Some(node_id)).await;
+        registry
+            .add_peer_with_node_id(new_addr, Some(node_id))
+            .await;
 
         let after = pool.get_connection_by_peer_id(&peer_id);
         assert!(

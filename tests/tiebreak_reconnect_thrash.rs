@@ -39,7 +39,7 @@ static CRYPTO_INIT: Once = Once::new();
 static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn init_crypto() {
-    CRYPTO_INIT.call_once(|| tls::ensure_crypto_provider());
+    CRYPTO_INIT.call_once(tls::ensure_crypto_provider);
 }
 
 fn churn_cfg() -> GossipConfig {
@@ -65,9 +65,14 @@ async fn start(addr: SocketAddr, kp: KeyPair) -> GossipRegistryHandle<BuilderTls
     init_crypto();
     let mut c = churn_cfg();
     c.key_pair = Some(kp.clone());
-    GossipRegistryHandle::new_with_transport_stack(addr, kp.to_secret_key(), Some(c), BuilderTlsBootstrap)
-        .await
-        .expect("start node")
+    GossipRegistryHandle::new_with_transport_stack(
+        addr,
+        kp.to_secret_key(),
+        Some(c),
+        BuilderTlsBootstrap,
+    )
+    .await
+    .expect("start node")
 }
 
 fn ordered(a: &str, b: &str) -> (KeyPair, KeyPair) {

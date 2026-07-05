@@ -146,6 +146,39 @@ fn print_io_perf(label: &str) {
 }
 
 #[test]
+fn resolve_connection_conflict_is_identity_only() {
+    use super::ConnectionConflictDecision::*;
+    // No live rival -> always take the incoming, regardless of verdicts.
+    assert_eq!(
+        resolve_connection_conflict(false, true, false),
+        ReplaceExisting
+    );
+    assert_eq!(
+        resolve_connection_conflict(false, false, false),
+        ReplaceExisting
+    );
+    // Live rival the tie-break prefers, incoming not preferred -> keep rival.
+    assert_eq!(
+        resolve_connection_conflict(true, true, false),
+        RejectIncoming
+    );
+    // Live rival, incoming preferred -> replace rival.
+    assert_eq!(
+        resolve_connection_conflict(true, false, true),
+        ReplaceExisting
+    );
+    // Live rival, incoming preferred even if rival nominally kept -> incoming
+    // (preferred direction) wins.
+    assert_eq!(
+        resolve_connection_conflict(true, true, true),
+        ReplaceExisting
+    );
+    // The decision signature carries no SocketAddr: the structural invariant
+    // that a keep/drop outcome can never depend on a peer's address, only on
+    // its verified identity. (Compile-time: the calls above pass only bools.)
+}
+
+#[test]
 fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer_id = crate::KeyPair::new_for_testing("session_correlation").peer_id();

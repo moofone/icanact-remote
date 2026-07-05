@@ -1,3 +1,48 @@
+/// Outcome of a connection keep/drop/dedup conflict for a single peer identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionConflictDecision {
+    /// No live rival session — take the incoming connection as the session.
+    AcceptIncoming,
+    /// The incoming is the preferred direction — replace the existing session.
+    ReplaceExisting,
+    /// Keep the existing session — the incoming loses the tie-break.
+    RejectIncoming,
+}
+
+/// THE single decision point for connection keep/drop/dedup outcomes.
+///
+/// Its inputs are *purely* identity-derived: `keep_existing` / `keep_incoming`
+/// are the results of [`GossipRegistry::should_keep_connection`], a pure
+/// function of verified peer NodeId ordering plus connection direction, and
+/// `existing_usable` is the rival's liveness. There is deliberately **no
+/// `SocketAddr` parameter**: a keep/drop/dedup outcome can never be a function
+/// of where a peer happens to be dialing from, only of its cryptographic
+/// identity. A changed socket address is handled as reindex-only metadata (see
+/// [`ConnectionPool::reindex_connection_addr`]) and never reaches this
+/// function. This structural absence is the invariant that prevents the
+/// address-keyed teardown that caused the single-node-restart reconnect thrash.
+///
+/// The inbound-accept tie-break (`handle.rs`) and the outbound top-of-dial
+/// tie-break (`transport_stream.rs`) make the identical identity-keyed decision
+/// inline today; consolidating them onto this function is a follow-up. They are
+/// already address-free (they consult only `should_keep_connection`), so they
+/// are not a source of the address-keyed defect this function guards against.
+pub(crate) fn resolve_connection_conflict(
+    existing_usable: bool,
+    keep_existing: bool,
+    keep_incoming: bool,
+) -> ConnectionConflictDecision {
+    if existing_usable && keep_existing && !keep_incoming {
+        return ConnectionConflictDecision::RejectIncoming;
+    }
+    if existing_usable && !keep_incoming {
+        // Rival is live but the tie-break does not prefer either strictly in
+        // the incoming's favour (e.g. equal/degenerate) — keep the live rival.
+        return ConnectionConflictDecision::RejectIncoming;
+    }
+    ConnectionConflictDecision::ReplaceExisting
+}
+
 impl<T> ConnectionPool<T> {
     pub fn new(max_connections: usize, connection_timeout: Duration) -> Self {
         Self::new_with_aligned_pool_size(
@@ -1633,7 +1678,50 @@ impl<T> ConnectionPool<T> {
             .upsert_sync(addr, connection_arc.clone());
         if let Some(peer_id) = peer_id_opt.as_ref() {
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
-            self.publish_current_peer_connection(peer_id, connection_arc.clone());
+            // Identity-keyed publish gate. This freshly-dialed OUTBOUND must not
+            // displace an existing live session the tie-break says to keep. A
+            // higher-NodeId node that fell back to dialing (its preferred-inbound
+            // wait timed out) must not overwrite a preferred inbound that arrived
+            // concurrently: publishing the outbound here, then evicting it as the
+            // wrong direction on the next tick, collaterally tore down the good
+            // inbound — the single-node-restart reconnect thrash. The decision is
+            // purely identity-derived (`should_keep_connection`), never keyed on
+            // `addr`. If the existing preferred session wins, we leave the
+            // outbound indexed by address only (its FullSync/handle still work)
+            // without making it the session; it is retired by its own IO
+            // lifecycle, and the next outbound tie-break tick reuses the
+            // preferred session.
+            let decision = match self.get_connection_by_peer_id(peer_id) {
+                None => ConnectionConflictDecision::AcceptIncoming,
+                Some(existing) => registry_weak
+                    .upgrade()
+                    .map(|registry| {
+                        let keep_existing = registry.should_keep_connection(
+                            peer_id,
+                            existing.direction == ConnectionDirection::Outbound,
+                        );
+                        let keep_incoming = registry.should_keep_connection(peer_id, true);
+                        resolve_connection_conflict(
+                            existing.has_live_stream(),
+                            keep_existing,
+                            keep_incoming,
+                        )
+                    })
+                    .unwrap_or(ConnectionConflictDecision::AcceptIncoming),
+            };
+            match decision {
+                ConnectionConflictDecision::AcceptIncoming
+                | ConnectionConflictDecision::ReplaceExisting => {
+                    self.publish_current_peer_connection(peer_id, connection_arc.clone());
+                }
+                ConnectionConflictDecision::RejectIncoming => {
+                    debug!(
+                        peer = %addr,
+                        peer_id = %peer_id,
+                        "outbound finalize kept existing preferred session; not displacing it"
+                    );
+                }
+            }
         }
         // Count this connection exactly once, mirroring `add_connection_by_peer_id`.
         // Without this the outbound path published a live connection that the
