@@ -2482,7 +2482,10 @@ pub(crate) fn handle_incoming_message(
                     crate::current_timestamp_nanos(),
                 );
 
-                if let Err(err) = registry.apply_delta(delta).await {
+                // Same §1.6 trust anchor as the DeltaGossip branch above:
+                // responses also carry actor additions, and repair must use
+                // the verified socket address of this connection.
+                if let Err(err) = registry.apply_delta_from(delta, Some(_peer_addr)).await {
                     warn!(error = %err, "failed to apply delta from response");
                 } else {
                     let mut gossip_state = registry.gossip_state.lock().await;

@@ -3447,13 +3447,6 @@ impl<T: 'static> GossipRegistry<T> {
                         mut location,
                         priority,
                     } => {
-                        let Some((clear_tombstone, _is_update)) = self.current_actor_upsert_plan(
-                            name.as_str(),
-                            &location,
-                            &sender_peer_id,
-                        ) else {
-                            continue;
-                        };
                         // This is the wire path used by
                         // `RegistrationPriority::Immediate` (e.g. routed-pubsub
                         // interest registration, `pubsub.rs::note_interest`).
@@ -3462,7 +3455,11 @@ impl<T: 'static> GossipRegistry<T> {
                         // canonicalized (malformed input is bounded, never
                         // persisted verbatim), then — when we have a trusted
                         // sender address — the owner's unusable advertised IP
-                        // is resolved from it.
+                        // is resolved from it. Sanitization happens BEFORE
+                        // `current_actor_upsert_plan` so conflict resolution
+                        // (`stable_concurrent_location_wins` compares
+                        // `location.address`) never operates on
+                        // attacker-chosen bytes.
                         let owner_is_sender = location.peer_id == sender_peer_id;
                         let wire_addr = canonical_wire_addr(name.as_str(), &location.address);
                         let resolved = match sender_addr {
@@ -3484,6 +3481,13 @@ impl<T: 'static> GossipRegistry<T> {
                             None => wire_addr,
                         };
                         location.address = resolved.to_string();
+                        let Some((clear_tombstone, _is_update)) = self.current_actor_upsert_plan(
+                            name.as_str(),
+                            &location,
+                            &sender_peer_id,
+                        ) else {
+                            continue;
+                        };
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                         }
