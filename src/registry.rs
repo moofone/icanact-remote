@@ -5528,10 +5528,22 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(peer_id) = peer_id.as_ref() {
             let pool = &self.connection_pool;
             if let Some(current) = pool.get_connection_by_peer_id(peer_id) {
+                // Only a *positive* resolution to a different, live connection
+                // instance proves the failure belongs to a superseded link.
+                // `get_lock_free_connection` returning `None` means the
+                // observed address has no alias in `connections_by_addr` at
+                // all — e.g. the ephemeral peer address for an inbound
+                // session whose post-accept alias insertion hasn't happened
+                // yet (or was already cleaned up), which is exactly the case
+                // for the CURRENT session's own socket. Treat "cannot
+                // resolve" as "this may be the current session failing" and
+                // fall through to the normal failure path, never as proof of
+                // supersession — absence of an alias must never be read as
+                // evidence of a different, superseded connection.
                 let failed_is_current = pool
                     .get_lock_free_connection(observed_peer_addr)
                     .map(|failed| Arc::ptr_eq(&failed, &current))
-                    .unwrap_or(current.addr == observed_peer_addr);
+                    .unwrap_or(true);
                 if !failed_is_current {
                     info!(
                         peer_id = %peer_id,
