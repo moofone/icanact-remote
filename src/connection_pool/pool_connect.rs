@@ -1647,7 +1647,7 @@ impl<T> ConnectionPool<T> {
                     local_actors,
                     known_actors,
                     sender_peer_id: registry_arc.peer_id.clone(),
-                    sender_bind_addr: Some(registry_arc.bind_addr.to_string()), // Use our listening address, not ephemeral port
+                    sender_bind_addr: Some(registry_arc.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
                     sequence: gossip_state.gossip_sequence,
                     wall_clock_time: crate::current_timestamp(),
                     extensions: None,
@@ -2306,7 +2306,7 @@ pub(crate) fn handle_incoming_message(
                         local_actors: our_local_actors,
                         known_actors: our_known_actors,
                         sender_peer_id: registry.peer_id.clone(), // Use peer ID
-                        sender_bind_addr: Some(registry.bind_addr.to_string()), // Our listening address
+                        sender_bind_addr: Some(registry.advertised_addr().to_string()), // reachable advertised address (NAT-aware)
                         sequence: our_sequence,
                         wall_clock_time: crate::current_timestamp(),
                         extensions: registry

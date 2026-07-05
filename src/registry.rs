@@ -3806,7 +3806,7 @@ impl<T: 'static> GossipRegistry<T> {
             local_actors: local_pairs,
             known_actors: known_pairs,
             sender_peer_id: self.peer_id.clone(), // Use peer ID
-            sender_bind_addr: Some(self.bind_addr.to_string()), // Use our listening address, not ephemeral port
+            sender_bind_addr: Some(self.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
             sequence,
             wall_clock_time: current_timestamp(),
             extensions: None,
@@ -3837,7 +3837,7 @@ impl<T: 'static> GossipRegistry<T> {
             local_actors: local_pairs,
             known_actors: known_pairs,
             sender_peer_id: self.peer_id.clone(), // Use peer ID
-            sender_bind_addr: Some(self.bind_addr.to_string()), // Use our listening address, not ephemeral port
+            sender_bind_addr: Some(self.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
             sequence,
             wall_clock_time: current_timestamp(),
             extensions: None,
