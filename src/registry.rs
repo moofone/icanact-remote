@@ -10095,6 +10095,75 @@ mod tests {
         );
     }
 
+    /// RED (absence-of-alias misread as superseded): a socket failure for an
+    /// INBOUND current session's *ephemeral* peer address — which was never
+    /// (or is no longer) indexed in `connections_by_addr` — must NOT be
+    /// misclassified as "superseded, ignore". The current session's `addr`
+    /// is the advertised/bind address, not the ephemeral socket address the
+    /// IO-failure callback reports, so `get_lock_free_connection` legitimately
+    /// returns `None` for the observed address on a genuinely dead current
+    /// session. Absence of an alias must fall through to the normal
+    /// current-connection failure path (disconnect + failure accounting),
+    /// never be read as proof of a different, superseded instance.
+    #[tokio::test]
+    async fn socket_failure_of_unaliased_ephemeral_addr_fails_current_session() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9200), test_config());
+        let peer_id = test_peer_id("ephemeral_absent_peer");
+        let bind_addr = test_addr(9201);
+        let ephemeral_addr = test_addr(9202);
+        let pool = &registry.connection_pool;
+        pool.set_configured_peer_addr(&peer_id, bind_addr);
+
+        // Current, live, INBOUND session published under its bind address.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer, _reader) = LockFreeStreamHandle::new(
+            io,
+            bind_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(bind_addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), bind_addr, conn.clone()));
+
+        // The peer is reachable by identity via `ephemeral_addr` (the socket
+        // the IO task actually failed on), but the ephemeral alias was never
+        // inserted into `connections_by_addr` — e.g. the IO task exited
+        // before the post-accept alias insertion, or it was already cleaned
+        // up. `get_lock_free_connection(ephemeral_addr)` must return `None`.
+        pool.add_addr_to_peer_id(ephemeral_addr, peer_id.clone());
+        assert!(pool.get_lock_free_connection(ephemeral_addr).is_none());
+
+        let before = pool
+            .get_connection_by_peer_id(&peer_id)
+            .expect("current session must resolve to conn");
+        assert!(Arc::ptr_eq(&before, &conn));
+
+        // The current session's own (ephemeral) socket fails.
+        registry
+            .handle_peer_connection_failure(ephemeral_addr)
+            .await
+            .unwrap();
+
+        let after = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            after.is_none(),
+            "socket failure for the current session's unaliased ephemeral address was \
+             misclassified as a superseded connection and silently ignored — the dead \
+             current session stayed published"
+        );
+    }
+
     /// RED (address-vs-identity): a peer re-announced at a NEW address (same
     /// verified identity — e.g. a restart on a fresh ephemeral port) must
     /// reindex the address mapping WITHOUT tearing down the live
