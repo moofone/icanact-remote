@@ -10227,6 +10227,65 @@ mod tests {
         );
     }
 
+    /// RED (address-vs-identity, lookup-by-new-address): the same-identity
+    /// address-change path in `add_peer_with_node_id` upserts
+    /// `addr_to_peer_id[new_addr]` BEFORE calling `reindex_connection_addr`.
+    /// `reindex_connection_addr`'s "already indexed under this peer" branch
+    /// used to trust that alias and return without ever writing
+    /// `connections_by_addr[new_addr]`. Result: `addr_to_peer_id` says the new
+    /// address belongs to this peer, but a direct lookup/dial by that address
+    /// finds no connection at all and would spin up a duplicate instead of
+    /// reusing the live, identity-verified session.
+    #[tokio::test]
+    async fn address_change_reindex_makes_new_address_resolve_to_live_connection() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9120), test_config());
+        let node_id = test_peer_id("addr_change_lookup_peer").to_node_id();
+        let peer_id = node_id.to_peer_id();
+        let old_addr = test_addr(9121);
+        let new_addr = test_addr(9122);
+        let pool = &registry.connection_pool;
+        pool.set_configured_peer_addr(&peer_id, old_addr);
+
+        let (io, _p) = tokio::io::duplex(1024);
+        let (sh, _w, _r) = LockFreeStreamHandle::new(
+            io,
+            old_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(old_addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(sh));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn.clone()));
+
+        // Peer re-announced at a new address with the same identity.
+        registry
+            .add_peer_with_node_id(new_addr, Some(node_id))
+            .await;
+
+        assert_eq!(
+            pool.addr_to_peer_id.read_sync(&new_addr, |_, v| v.clone()),
+            Some(peer_id.clone()),
+            "addr_to_peer_id must map the reannounced address to the same identity"
+        );
+        let by_addr = pool.get_lock_free_connection(new_addr);
+        assert!(
+            by_addr.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)),
+            "connections_by_addr[new_addr] was missing after the same-identity address \
+             change; a lookup/dial by the reannounced address misses the live session and \
+             would create a duplicate connection instead of reusing it"
+        );
+    }
+
     #[tokio::test]
     async fn transport_only_peer_failure_does_not_start_health_consensus() {
         let mut config = test_config();

@@ -553,7 +553,21 @@ impl<T> ConnectionPool<T> {
         {
             if existing_peer_id == *peer_id {
                 // Already indexed under the advertised address for this peer.
-                // But we still need to ensure the OLD (ephemeral) address is indexed too!
+                // Callers commonly upsert `addr_to_peer_id[new_addr]` themselves
+                // BEFORE calling this function (e.g. registry.rs's same-identity
+                // address-change path), so this branch fires on essentially
+                // every reindex. If we trusted the alias alone and returned, we
+                // could leave `connections_by_addr[new_addr]` missing or
+                // pointed at a stale/dead connection while
+                // `addr_to_peer_id[new_addr]` looks correct — a lookup/dial by
+                // the new address would then miss the live session and spin up
+                // a duplicate connection instead of reusing it. Always repair
+                // `connections_by_addr[new_addr]` to the current live
+                // connection so both maps stay consistent.
+                let _ = self
+                    .connections_by_addr
+                    .upsert_sync(new_addr, connection.clone());
+                // We still need to ensure the OLD (ephemeral) address is indexed too!
                 // Without this, lookups by ephemeral address fail after gossip rounds.
                 let old_addr = connection.addr;
                 if old_addr != new_addr && !self.connections_by_addr.contains_sync(&old_addr) {
