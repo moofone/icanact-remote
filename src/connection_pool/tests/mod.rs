@@ -4479,6 +4479,113 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
     );
 }
 
+/// Reviewer finding (P2, `remove_connection_instance_by_id`'s defensive
+/// current-session clear): the stale-instance cleanup path called
+/// `clear_current_peer_connection_if_matches`, which is a genuine
+/// check-then-act pair — it reads the peer session's current connection,
+/// `Arc::ptr_eq`-compares it against the retiring instance, and only THEN
+/// (after constructing a log line and a lifecycle event — real work, a real
+/// gap) calls the unconditional `clear_current_peer_connection`, which stores
+/// `None` and removes the `connections_by_peer` row regardless of what is
+/// installed by that point. A concurrent `publish_current_peer_connection`
+/// for a fresh instance landing in that gap — after the read observed the
+/// stale instance still current, but before the unconditional store — is
+/// clobbered: the fresh session is erased and its `connections_by_peer` entry
+/// removed, even though the cleanup was only ever supposed to retire the
+/// stale, already-superseded instance. This is exactly the
+/// collateral-teardown/reconnect-thrash race this PR closes, reopened through
+/// this one remaining check-then-clear call site.
+///
+/// Rather than chase the check-then-clear gap with a wall-clock OS-thread
+/// race (unreliable here: `remove_connection_instance_by_id` does real
+/// address-index bookkeeping — the `connections_by_addr`/`addr_to_peer_id`
+/// removal and alias sweep — *before* it ever reaches the current-session
+/// clear, which in practice lets a naive concurrent publish finish well
+/// before the check runs, masking the bug under ordinary scheduling), this
+/// pins the race deterministically using the crate's own
+/// `set_transport_lifecycle_recorder` hook. `clear_current_peer_connection_if_matches`
+/// unconditionally fires a `SessionRemoved { reason: CurrentConnectionCleared }`
+/// lifecycle event *before* calling the unconditional
+/// `clear_current_peer_connection` store — i.e. exactly inside the
+/// check-then-act gap. Installing a recorder that publishes the FRESH
+/// connection synchronously from within that event callback lands the
+/// concurrent publish in that exact window on every run, with no scheduling
+/// luck required.
+struct RecorderGuard;
+impl Drop for RecorderGuard {
+    fn drop(&mut self) {
+        crate::set_transport_lifecycle_recorder(None);
+    }
+}
+
+#[tokio::test]
+async fn stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_session() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("stale-cleanup-cas-peer").peer_id();
+
+    let stale_addr: SocketAddr = "127.0.0.1:42000".parse().unwrap();
+    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    let stale_instance_id = stale
+        .stream_handle
+        .as_ref()
+        .map(|handle| handle.instance_id())
+        .expect("stale connection must have a live stream handle");
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
+
+    let fresh_addr: SocketAddr = "127.0.0.1:52000".parse().unwrap();
+    let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+
+    // Install the injection hook, guarded so it is always uninstalled again
+    // (including on panic/assertion failure) — this is process-global state
+    // shared with every other test in the binary.
+    let _guard = RecorderGuard;
+    {
+        let pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let fresh = fresh.clone();
+        crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+            if let crate::TransportLifecycleEvent::SessionRemoved {
+                peer,
+                reason: crate::SessionRemovalReason::CurrentConnectionCleared,
+                ..
+            } = &event
+                && *peer == peer_id
+            {
+                // Deregister first: the nested `publish_current_peer_connection`
+                // call below fires its own (non-matching) `SessionPublished`
+                // lifecycle event through this same global hook, and this
+                // avoids any reentrant/recursive invocation of this closure.
+                crate::set_transport_lifecycle_recorder(None);
+                pool.publish_current_peer_connection(&peer_id, fresh.clone());
+            }
+        })));
+    }
+
+    // The defensive stale-instance cleanup path
+    // (`remove_connection_instance_by_id`) retiring the OLD `stale`
+    // instance — models a failed/superseded connection finally being torn
+    // down. Per the hook installed above, the FRESH connection is published
+    // as the peer's current session synchronously from inside the
+    // check-then-act gap of the stale-instance clear.
+    pool.remove_connection_instance_by_id(stale_addr, stale_instance_id);
+
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+        "a fresh session published from inside the stale-instance clear's check-then-act \
+         gap must survive — atomic compare-and-clear must never clobber a publish landing \
+         mid-cleanup (got {current:?})"
+    );
+    assert!(
+        pool.connections_by_peer
+            .read_sync(&peer_id, |_, v| Arc::ptr_eq(v, &fresh))
+            .unwrap_or(false),
+        "`connections_by_peer` must still point at the fresh instance — its removal must be \
+         conditional on the CAS actually having cleared the stale instance, never \
+         unconditional"
+    );
+}
+
 /// Test helper: a `LockFreeConnection` with a real, live stream handle (so
 /// `has_live_stream()`/`get_connection_by_peer_id`'s usability filter treats
 /// it as usable), backed by an in-memory `tokio::io::duplex` pair.
