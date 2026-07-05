@@ -4090,6 +4090,145 @@ async fn stale_rival_eviction_at_reindexed_address_is_instance_scoped_not_addres
     );
 }
 
+/// RED (review finding, `transport_stream.rs` LIVE wrong-direction rival
+/// branch, distinct from the `!alive` stale-rival branch above): after
+/// `keep_existing = registry_arc.should_keep_connection(&remote_peer_id,
+/// existing_conn.direction == Outbound)` decides `existing_conn` (a live,
+/// wrong-direction outbound) must be evicted, the branch used to retire it
+/// with the PEER-WIDE `disconnect_connection_by_peer_id(&remote_peer_id)` —
+/// "whatever is currently indexed for this peer", not the specific
+/// `existing_conn` instance the decision was actually computed about. If a
+/// fresh, tie-break-preferred INBOUND connection is published for the same
+/// peer between that decision and the eviction call (e.g. a concurrent
+/// inbound accept winning the tie-break first), the peer-wide disconnect
+/// collaterally tears down that brand-new current session instead of the
+/// stale `existing_conn` it evaluated — the identical collateral-teardown
+/// thrash this whole branch/PR exists to eliminate, just for the live-rival
+/// arm instead of the already-fixed `!alive` one.
+///
+/// Same race-arranged-state technique as
+/// `stale_rival_eviction_at_reindexed_address_is_instance_scoped_not_address_keyed`:
+/// `existing_conn` is published as the peer's current session while alive,
+/// then a fresh preferred connection is published in its place (modelling the
+/// concurrent inbound accept), then the eviction is driven with the exact
+/// production primitive this branch calls today
+/// (`disconnect_connection_instance`, scoped to `existing_conn`'s own `Arc`
+/// identity) and asserted to leave the fresh session untouched. The
+/// "contrast" section then demonstrates, on the identical race-arranged
+/// state, that the PEER-WIDE alternative this branch used to call
+/// (`disconnect_connection_by_peer_id`) would instead destroy the fresh
+/// session — the exact defect this fix eliminates.
+#[tokio::test]
+async fn live_wrong_direction_rival_eviction_is_instance_scoped_not_peer_wide() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("live-wrong-direction-rival-peer").peer_id();
+
+    // `existing_conn`: a LIVE, wrong-direction (Outbound) connection,
+    // published as the peer's current session — exactly the snapshot
+    // `connect_via_stream`'s live-rival branch evaluates `keep_existing`
+    // against before deciding to evict it.
+    let bind_addr: SocketAddr = "127.0.0.1:7451".parse().unwrap();
+    let (existing_io, _existing_peer_io) = tokio::io::duplex(1024);
+    let (existing_sh, _existing_w, _existing_r) = LockFreeStreamHandle::new(
+        existing_io,
+        bind_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut existing_conn = LockFreeConnection::new(bind_addr, ConnectionDirection::Outbound);
+    existing_conn.stream_handle = Some(Arc::new(existing_sh));
+    existing_conn.set_state(ConnectionState::Connected);
+    let existing_conn = Arc::new(existing_conn);
+    assert!(
+        existing_conn.has_live_stream(),
+        "test precondition: existing_conn must be LIVE, matching this branch's \
+         (not the `!alive` branch's) condition"
+    );
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), bind_addr, existing_conn.clone()));
+
+    // ... and, before the eviction call runs, a FRESH preferred INBOUND
+    // connection is published as the peer's current session at its own
+    // address — modelling a concurrent inbound accept winning the tie-break
+    // for this peer in the window between `keep_existing`'s decision and the
+    // eviction call.
+    let fresh_addr: SocketAddr = "127.0.0.1:7452".parse().unwrap();
+    let (fresh_io, _fresh_peer_io) = tokio::io::duplex(1024);
+    let (fresh_sh, _fresh_w, _fresh_r) = LockFreeStreamHandle::new(
+        fresh_io,
+        fresh_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut fresh_conn = LockFreeConnection::new(fresh_addr, ConnectionDirection::Inbound);
+    fresh_conn.stream_handle = Some(Arc::new(fresh_sh));
+    fresh_conn.set_state(ConnectionState::Connected);
+    let fresh_conn = Arc::new(fresh_conn);
+    pool.index_connection_by_addr(fresh_addr, fresh_conn.clone());
+    pool.add_addr_to_peer_id(fresh_addr, peer_id.clone());
+    pool.publish_current_peer_connection(&peer_id, fresh_conn.clone());
+
+    // The eviction call `connect_via_stream`'s live wrong-direction-rival
+    // branch actually makes today: instance-scoped, re-validating by `Arc`
+    // identity immediately before acting.
+    let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
+
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &fresh_conn)),
+        "the fresh preferred inbound published for this peer must remain the peer's \
+         current session, unaffected by the wrong-direction rival's eviction (got: \
+         {current:?})"
+    );
+    assert!(
+        fresh_conn.has_live_stream(),
+        "the fresh connection's background tasks must not be touched by the live \
+         wrong-direction rival's eviction"
+    );
+    // `existing_conn` was already superseded (no longer the peer's current
+    // session) by the time the eviction call runs — the exact race outcome
+    // this test models. `disconnect_connection_instance` correctly declines
+    // to touch it in that case (see its own doc comment: "a safe no-op if a
+    // fresh preferred connection was already published/reindexed for that
+    // peer"); its own retirement is the concurrently-winning accept path's
+    // responsibility, not this call's. Asserting it stays untouched here
+    // pins that documented no-op contract rather than fabricating a
+    // touched/aborted expectation this call was never meant to satisfy.
+    assert!(
+        existing_conn.has_live_stream(),
+        "disconnect_connection_instance must be a no-op on an already-superseded \
+         target, never reaching in to abort a connection it declined to clear"
+    );
+
+    // Contrast: the peer-wide primitive this branch used to call
+    // (`disconnect_connection_by_peer_id`) on this EXACT same race-arranged
+    // state would instead destroy the fresh session — demonstrating the
+    // danger the instance-scoped call above eliminates. Re-arrange fresh
+    // back into place first (the assertions above already proved it survived
+    // the real fix).
+    assert!(
+        pool.get_connection_by_peer_id(&peer_id)
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &fresh_conn)),
+        "sanity: fresh connection still the peer's current session before the contrast"
+    );
+    let removed_peer_wide = pool.disconnect_connection_by_peer_id(&peer_id);
+    assert!(
+        removed_peer_wide
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &fresh_conn)),
+        "contrast/danger check: a peer-wide disconnect at the wrong-direction rival's \
+         eviction site tears down whatever is CURRENTLY indexed for the peer — the \
+         fresh session, not the stale instance — which is exactly the bug this fix \
+         eliminates (got: {removed_peer_wide:?})"
+    );
+}
+
 /// RED (review finding P2, outbound-finalize peer-wide eviction race):
 /// `disconnect_connection_by_peer_id` is peer-wide — it tears down
 /// "whatever is currently indexed" for a peer, not a specific connection
