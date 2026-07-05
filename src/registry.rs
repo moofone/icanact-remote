@@ -9989,6 +9989,131 @@ mod tests {
         assert!(peer.last_failure_time.is_some());
     }
 
+    /// RED (thrash repro, collateral teardown): a socket failure reported for
+    /// a *superseded* connection instance must never tear down the peer's
+    /// current live session. This is the address-vs-identity defect: the
+    /// failure handler resolved identity then blanket-`disconnect_connection_by_peer_id`'d,
+    /// removing whatever was current — which, after a restart-into-live-peer,
+    /// is the freshly-accepted preferred inbound, not the connection that died.
+    #[tokio::test]
+    async fn socket_failure_of_superseded_connection_preserves_current_session() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9100), test_config());
+        let peer_id = test_peer_id("collateral_peer");
+        let cur_addr = test_addr(9101);
+        let stale_addr = test_addr(9102);
+        let pool = &registry.connection_pool;
+        pool.set_configured_peer_addr(&peer_id, cur_addr);
+
+        // Current, preferred, live session.
+        let (io2, _p2) = tokio::io::duplex(1024);
+        let (sh2, _w2, _r2) = LockFreeStreamHandle::new(
+            io2,
+            cur_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn2 = LockFreeConnection::new(cur_addr, ConnectionDirection::Inbound);
+        conn2.stream_handle = Some(Arc::new(sh2));
+        conn2.embedded_peer_id = Some(peer_id.clone());
+        conn2.set_state(ConnectionState::Connected);
+        let conn2 = Arc::new(conn2);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), cur_addr, conn2.clone()));
+
+        // A superseded connection instance for the SAME identity at a different
+        // address, still aliased in the addr indices (as after a reconnect).
+        let (io1, _p1) = tokio::io::duplex(1024);
+        let (sh1, _w1, _r1) = LockFreeStreamHandle::new(
+            io1,
+            stale_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn1 = LockFreeConnection::new(stale_addr, ConnectionDirection::Outbound);
+        conn1.stream_handle = Some(Arc::new(sh1));
+        conn1.embedded_peer_id = Some(peer_id.clone());
+        conn1.set_state(ConnectionState::Connected);
+        let conn1 = Arc::new(conn1);
+        pool.index_connection_by_addr(stale_addr, conn1.clone());
+        pool.add_addr_to_peer_id(stale_addr, peer_id.clone());
+
+        let before = pool
+            .get_connection_by_peer_id(&peer_id)
+            .expect("current session must resolve to conn2");
+        assert!(Arc::ptr_eq(&before, &conn2));
+
+        // The superseded connection's socket fails.
+        registry
+            .handle_peer_connection_failure(stale_addr)
+            .await
+            .unwrap();
+
+        let after = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            after.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn2)),
+            "socket failure of a superseded connection collaterally tore down the live \
+             current session (thrash: disconnect_connection_by_peer_id is peer-wide, not \
+             instance-scoped)"
+        );
+    }
+
+    /// RED (address-vs-identity): a peer re-announced at a NEW address (same
+    /// verified identity — e.g. a restart on a fresh ephemeral port) must
+    /// reindex the address mapping WITHOUT tearing down the live
+    /// identity-verified session. `add_peer_with_node_id`'s "Closing old
+    /// connection for peer due to address change" path
+    /// (registry.rs `disconnect_connection_by_peer_id` on `old_addr != new_addr`)
+    /// is address-keyed and drops the good session.
+    #[tokio::test]
+    async fn address_change_reindexes_without_tearing_down_live_session() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9110), test_config());
+        let node_id = test_peer_id("addr_change_peer").to_node_id();
+        let peer_id = node_id.to_peer_id();
+        let old_addr = test_addr(9111);
+        let new_addr = test_addr(9112);
+        let pool = &registry.connection_pool;
+        pool.set_configured_peer_addr(&peer_id, old_addr);
+
+        let (io, _p) = tokio::io::duplex(1024);
+        let (sh, _w, _r) = LockFreeStreamHandle::new(
+            io,
+            old_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(old_addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(sh));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn.clone()));
+
+        // Peer re-announced at a new address with the same identity.
+        registry.add_peer_with_node_id(new_addr, Some(node_id)).await;
+
+        let after = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            after.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)),
+            "address change tore down the live identity-verified session; identity is \
+             unchanged so the address must only be reindexed, never disconnected"
+        );
+    }
+
     #[tokio::test]
     async fn transport_only_peer_failure_does_not_start_health_consensus() {
         let mut config = test_config();

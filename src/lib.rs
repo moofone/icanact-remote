@@ -74,7 +74,7 @@ pub const MAX_STREAM_SIZE: usize = 64 * 1024 * 1024; // 64MB
 pub use handle::{GossipClient, GossipRegistryHandle};
 pub use handle_builder::{BuilderTlsBootstrap, GossipRegistryBuilder};
 pub use lifecycle::{
-    TransportDirection, TransportLifecycleEvent, TransportLifecycleRecorder,
+    SessionRemovalReason, TransportDirection, TransportLifecycleEvent, TransportLifecycleRecorder,
     set_transport_lifecycle_recorder,
 };
 pub use priority::{ConsistencyLevel, RegistrationPriority};
