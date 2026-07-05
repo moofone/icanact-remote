@@ -3631,6 +3631,213 @@ fn outbound_finalize_balances_connection_counter() {
     });
 }
 
+/// Deterministic ordering helper mirroring `tiebreak_reconnect_thrash.rs`'s
+/// `ordered()`: returns `(higher_node_id_keypair, lower_node_id_keypair)`
+/// regardless of which seed happens to hash higher, so tests do not depend on
+/// which literal seed string wins the NodeId comparison.
+fn hi_lo_keypairs(a: &str, b: &str) -> (crate::KeyPair, crate::KeyPair) {
+    let x = crate::KeyPair::new_for_testing(a);
+    let y = crate::KeyPair::new_for_testing(b);
+    if x.peer_id().to_node_id().as_bytes() > y.peer_id().to_node_id().as_bytes() {
+        (x, y)
+    } else {
+        (y, x)
+    }
+}
+
+/// RED (review finding P1, outbound-finalize impure rival lookup):
+/// `finalize_new_outbound_connection` used to call
+/// `get_connection_by_peer_id` for its tie-break rival lookup *after* the
+/// freshly-dialed candidate was already indexed into `connections_by_addr`
+/// under the peer's configured dial address. That lookup is not a pure
+/// function — its configured-address fallback reads straight out of that
+/// map — so when a real, live, tie-break-losable rival (wrong direction, not
+/// yet promoted to "current") sits at exactly that same address (the
+/// documented "left indexed by address only, not published as the session"
+/// state this very file's `RejectIncoming`/`EvictStaleRejectIncoming` arms
+/// intentionally leave behind), overwriting that address entry with the new
+/// candidate *before* looking permanently loses the real rival — it is
+/// simply clobbered, never disconnected/evicted — and the lookup instead
+/// resolves "the existing rival" as the brand-new candidate itself. Because
+/// both are then compared under the identical `is_outbound = true`
+/// direction, `keep_existing == keep_incoming` always, which can never
+/// satisfy `ReplaceExisting`'s `!keep_existing && keep_incoming` — so a
+/// rival that is genuinely wrong-direction and should be replaced instead
+/// falls through to `RejectIncoming`, and NEITHER connection ends up as the
+/// peer's session: the real rival is silently lost (never evicted, its
+/// background tasks never aborted) and the new, tie-break-correct outbound
+/// is declined.
+#[tokio::test]
+async fn outbound_finalize_stale_rival_lookup_is_pure_and_excludes_the_new_candidate() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    // Local registry identity is the LOWER NodeId, so a fresh OUTBOUND dial
+    // to `remote_peer_id` IS tie-break preferred
+    // (`should_keep_connection(remote, is_outbound=true) == true`), while an
+    // INBOUND rival for the same peer is NOT
+    // (`should_keep_connection(remote, is_outbound=false) == false`) — the
+    // textbook "wrong-direction rival must be replaced" case.
+    let (hi_kp, lo_kp) = hi_lo_keypairs("finalize-purity-hi", "finalize-purity-lo");
+    let remote_peer_id = hi_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(lo_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // A real, LIVE, wrong-direction (Inbound) rival for this peer, indexed
+    // ONLY by address (not promoted to "current") — exactly the state this
+    // file's own `RejectIncoming`/`EvictStaleRejectIncoming` arms document
+    // leaving behind ("we leave the outbound indexed by address only ...
+    // without making it the session"). Crucially, it sits at the SAME
+    // address the fresh outbound below dials.
+    let dial_addr: SocketAddr = "127.0.0.1:7422".parse().unwrap();
+    let (rival_io, _rival_keep) = tokio::io::duplex(1024);
+    let (rival_sh, _rival_w, _rival_r) = LockFreeStreamHandle::new(
+        rival_io,
+        dial_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut rival_conn = LockFreeConnection::new(dial_addr, ConnectionDirection::Inbound);
+    rival_conn.stream_handle = Some(Arc::new(rival_sh));
+    rival_conn.set_state(ConnectionState::Connected);
+    let rival = Arc::new(rival_conn);
+    assert!(
+        rival.has_live_stream(),
+        "test precondition: rival must be live"
+    );
+    pool.index_connection_by_addr(dial_addr, rival.clone());
+    pool.add_addr_to_peer_id(dial_addr, remote_peer_id.clone());
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    pool.finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .await
+        .expect("outbound finalize should succeed");
+
+    // The tie-break-correct outbound must become the peer's current
+    // session — never silently declined because the impure lookup mistook
+    // itself for its own rival.
+    let current = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        current.as_ref().is_some_and(
+            |c| c.direction == ConnectionDirection::Outbound && !Arc::ptr_eq(c, &rival)
+        ),
+        "the tie-break-preferred outbound must become the peer's current session, \
+         not be declined because a pure-lookup bug mistook the new candidate for \
+         its own rival"
+    );
+
+    // The real wrong-direction rival must have actually been evicted
+    // (background tasks aborted), never silently clobbered/leaked by being
+    // overwritten in `connections_by_addr` without ever being disconnected.
+    assert!(
+        rival
+            .stream_handle
+            .as_ref()
+            .is_some_and(|h| h.exit_flag.load(Ordering::Acquire)),
+        "the real wrong-direction rival must be properly evicted (tasks aborted), \
+         not silently overwritten/leaked when the new candidate is indexed at its \
+         same address"
+    );
+}
+
+/// RED (review finding P2, outbound-finalize peer-wide eviction race):
+/// `disconnect_connection_by_peer_id` is peer-wide — it tears down
+/// "whatever is currently indexed" for a peer, not a specific connection
+/// instance. The outbound-finalize `EvictStaleRejectIncoming` (and
+/// `ReplaceExisting`) arms compute their eviction target from a rival
+/// snapshot taken *before* the candidate is indexed; if a concurrent inbound
+/// accept (`handle_incoming_connection_tls`) publishes a fresh preferred
+/// inbound for the same peer identity between that snapshot and the
+/// eviction call, a peer-wide disconnect at eviction time collaterally tears
+/// down the fresh inbound instead of the stale rival the decision was
+/// actually about — the exact reconnect thrash from the outbound side.
+/// `disconnect_connection_instance` is the fix: it must re-validate that its
+/// target is still the connection actually indexed for the peer (by `Arc`
+/// identity) immediately before acting, and must be a no-op — never touching
+/// a different, concurrently-published connection — when it is not.
+#[tokio::test]
+async fn disconnect_connection_instance_never_removes_a_concurrently_published_replacement() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("finalize-instance-scope-peer").peer_id();
+
+    // T1: the stale rival an outbound-finalize tie-break decision was
+    // computed about (`existing_before` in `finalize_new_outbound_connection`).
+    let stale_addr: SocketAddr = "127.0.0.1:7430".parse().unwrap();
+    let (stale_io, _stale_peer_io) = tokio::io::duplex(1024);
+    let (stale_sh, _stale_w, _stale_r) = LockFreeStreamHandle::new(
+        stale_io,
+        stale_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut stale_conn = LockFreeConnection::new(stale_addr, ConnectionDirection::Outbound);
+    stale_conn.stream_handle = Some(Arc::new(stale_sh));
+    stale_conn.set_state(ConnectionState::Connected);
+    let stale_rival = Arc::new(stale_conn);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale_rival.clone()));
+
+    // Between the decision and the eviction call, a concurrent inbound
+    // accept publishes a fresh, live, preferred inbound for the SAME peer
+    // identity — modelling `handle_incoming_connection_tls` racing the
+    // outbound-finalize path.
+    let fresh_addr: SocketAddr = "127.0.0.1:7431".parse().unwrap();
+    let (fresh_io, _fresh_peer_io) = tokio::io::duplex(1024);
+    let (fresh_sh, _fresh_w, _fresh_r) = LockFreeStreamHandle::new(
+        fresh_io,
+        fresh_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut fresh_conn = LockFreeConnection::new(fresh_addr, ConnectionDirection::Inbound);
+    fresh_conn.stream_handle = Some(Arc::new(fresh_sh));
+    fresh_conn.set_state(ConnectionState::Connected);
+    let fresh_inbound = Arc::new(fresh_conn);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), fresh_addr, fresh_inbound.clone()));
+
+    // T2: eviction targeting the ORIGINAL stale rival instance captured at
+    // T1 — must be a no-op now that the peer's indexed connection has moved
+    // on to `fresh_inbound`.
+    let evicted = pool.disconnect_connection_instance(&peer_id, &stale_rival);
+    assert!(
+        !evicted,
+        "must decline to evict once the target is no longer the peer's indexed connection"
+    );
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &fresh_inbound)),
+        "the concurrently published fresh inbound must survive the stale rival's \
+         instance-scoped eviction unchanged"
+    );
+
+    // Contrast: the peer-wide primitive this instance-scoped one exists to
+    // guard against removes "whatever is current" without re-validating —
+    // exactly the bug. Demonstrating it here (on the now-current fresh
+    // inbound) makes the danger, and the fix's necessity, explicit.
+    let removed = pool.disconnect_connection_by_peer_id(&peer_id);
+    assert!(
+        removed.is_some(),
+        "peer-wide disconnect removes whatever is current"
+    );
+    assert!(pool.current_peer_connection_instance(&peer_id).is_none());
+}
+
 /// Audit finding D1: correlation slots are addressed by a 13-bit index, so
 /// `id` and `id + 8192*k` collide on the same slot. A stale/delayed response
 /// carrying a recycled, aliased id must NOT complete the slot currently owned
