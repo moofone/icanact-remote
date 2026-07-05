@@ -126,10 +126,10 @@ async fn configured_peer_id_mismatch_is_reported_as_tls_identity_failure() {
         .await
         .connect(&server.registry.bind_addr)
         .await
-        .expect_err("server certificate NodeId must match the configured peer id");
+        .expect_err("server certificate GossipNodeId must match the configured peer id");
     let err_text = err.to_string();
     assert!(
-        err_text.contains("TLS handshake failed") && err_text.contains("NodeId mismatch"),
+        err_text.contains("TLS handshake failed") && err_text.contains("GossipNodeId mismatch"),
         "identity mismatch must be visible as TLS identity failure, got: {err_text}"
     );
     assert!(

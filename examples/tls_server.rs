@@ -50,8 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secret_key = load_or_generate_key(key_path).await?;
     let node_id = secret_key.public();
 
-    println!("   NodeId: {}", node_id.fmt_short());
-    println!("   Full NodeId: {:?}", hex::encode(node_id.as_bytes()));
+    println!("   GossipNodeId: {}", node_id.fmt_short());
+    println!("   Full GossipNodeId: {:?}", hex::encode(node_id.as_bytes()));
     println!("   Key file: {}", key_path);
     println!("   Port: {}", port);
     println!();
@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if stats.active_peers > 0 {
             println!();
             println!("✅ Connected peers:");
-            // In real implementation, we'd list the actual peer NodeIds
+            // In real implementation, we'd list the actual peer GossipNodeIds
             println!("   {} peer(s) connected via TLS", stats.active_peers);
         }
 

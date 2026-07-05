@@ -1,4 +1,4 @@
-use crate::{NodeId, RegistrationPriority, VectorClock, current_timestamp};
+use crate::{GossipNodeId, RegistrationPriority, VectorClock, current_timestamp};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::net::SocketAddr;
 
@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 pub struct RemoteActorLocation {
     pub address: String,                // Use String for rkyv serialization
     pub peer_id: crate::PeerId,         // Which peer is hosting this actor
-    pub node_id: NodeId,                // Node ID for vector clock operations
+    pub node_id: GossipNodeId,                // Node ID for vector clock operations
     pub vector_clock: VectorClock,      // Vector clock for causal ordering
     pub wall_clock_time: u64,           // Still needed for TTL calculations
     pub priority: RegistrationPriority, // Registration priority for propagation
@@ -17,8 +17,8 @@ pub struct RemoteActorLocation {
 }
 
 impl RemoteActorLocation {
-    /// Generate a deterministic fallback NodeId from PeerId using SHA-256
-    fn generate_fallback_node_id(peer_id: &crate::PeerId) -> NodeId {
+    /// Generate a deterministic fallback GossipNodeId from PeerId using SHA-256
+    fn generate_fallback_node_id(peer_id: &crate::PeerId) -> GossipNodeId {
         use sha2::{Digest, Sha256};
 
         // Create a deterministic hash from the peer_id string representation
@@ -26,24 +26,24 @@ impl RemoteActorLocation {
         hasher.update(format!("fallback_node_id:{}", peer_id));
         let hash_result = hasher.finalize();
 
-        // Convert the hash to a 32-byte array for NodeId
+        // Convert the hash to a 32-byte array for GossipNodeId
         let mut node_id_bytes = [0u8; 32];
         node_id_bytes.copy_from_slice(&hash_result[..32]);
 
-        NodeId::from_bytes(&node_id_bytes)
-            .expect("SHA-256 output should always be valid NodeId bytes")
+        GossipNodeId::from_bytes(&node_id_bytes)
+            .expect("SHA-256 output should always be valid GossipNodeId bytes")
     }
 
     /// Create a new RemoteActorLocation with peer_id
     pub fn new_with_peer(address: SocketAddr, peer_id: crate::PeerId) -> Self {
-        // Convert PeerId to NodeId for vector clock operations
+        // Convert PeerId to GossipNodeId for vector clock operations
         let node_id = peer_id
             .to_verifying_key()
             .ok()
-            .and_then(|key| NodeId::from_bytes(key.as_bytes()).ok())
+            .and_then(|key| GossipNodeId::from_bytes(key.as_bytes()).ok())
             .unwrap_or_else(|| {
                 tracing::warn!(
-                    "Failed to convert PeerId to NodeId for {}, using deterministic fallback",
+                    "Failed to convert PeerId to GossipNodeId for {}, using deterministic fallback",
                     peer_id
                 );
                 Self::generate_fallback_node_id(&peer_id)
@@ -70,14 +70,14 @@ impl RemoteActorLocation {
         peer_id: crate::PeerId,
         metadata: Vec<u8>,
     ) -> Self {
-        // Convert PeerId to NodeId for vector clock operations
+        // Convert PeerId to GossipNodeId for vector clock operations
         let node_id = peer_id
             .to_verifying_key()
             .ok()
-            .and_then(|key| NodeId::from_bytes(key.as_bytes()).ok())
+            .and_then(|key| GossipNodeId::from_bytes(key.as_bytes()).ok())
             .unwrap_or_else(|| {
                 tracing::warn!(
-                    "Failed to convert PeerId to NodeId for {}, using deterministic fallback",
+                    "Failed to convert PeerId to GossipNodeId for {}, using deterministic fallback",
                     peer_id
                 );
                 Self::generate_fallback_node_id(&peer_id)
@@ -107,10 +107,10 @@ impl RemoteActorLocation {
         let node_id = peer_id
             .to_verifying_key()
             .ok()
-            .and_then(|key| NodeId::from_bytes(key.as_bytes()).ok())
+            .and_then(|key| GossipNodeId::from_bytes(key.as_bytes()).ok())
             .unwrap_or_else(|| {
                 tracing::warn!(
-                    "Failed to convert PeerId to NodeId for {}, using deterministic fallback",
+                    "Failed to convert PeerId to GossipNodeId for {}, using deterministic fallback",
                     peer_id
                 );
                 Self::generate_fallback_node_id(&peer_id)
@@ -136,10 +136,10 @@ impl RemoteActorLocation {
         let node_id = peer_id
             .to_verifying_key()
             .ok()
-            .and_then(|key| NodeId::from_bytes(key.as_bytes()).ok())
+            .and_then(|key| GossipNodeId::from_bytes(key.as_bytes()).ok())
             .unwrap_or_else(|| {
                 tracing::warn!(
-                    "Failed to convert PeerId to NodeId for {}, using deterministic fallback",
+                    "Failed to convert PeerId to GossipNodeId for {}, using deterministic fallback",
                     peer_id
                 );
                 Self::generate_fallback_node_id(&peer_id)
@@ -170,8 +170,8 @@ impl RemoteActorLocation {
         let node_id = peer_id
             .to_verifying_key()
             .ok()
-            .and_then(|key| NodeId::from_bytes(key.as_bytes()).ok())
-            .unwrap_or_else(|| NodeId::from_bytes(&[0u8; 32]).unwrap());
+            .and_then(|key| GossipNodeId::from_bytes(key.as_bytes()).ok())
+            .unwrap_or_else(|| GossipNodeId::from_bytes(&[0u8; 32]).unwrap());
 
         Self {
             address: address.to_string(),
@@ -280,8 +280,8 @@ mod tests {
         let node_id = peer_id
             .to_verifying_key()
             .ok()
-            .and_then(|key| NodeId::from_bytes(key.as_bytes()).ok())
-            .unwrap_or_else(|| NodeId::from_bytes(&[0u8; 32]).unwrap());
+            .and_then(|key| GossipNodeId::from_bytes(key.as_bytes()).ok())
+            .unwrap_or_else(|| GossipNodeId::from_bytes(&[0u8; 32]).unwrap());
         let location1 = RemoteActorLocation {
             address: addr.to_string(),
             peer_id: peer_id.clone(),

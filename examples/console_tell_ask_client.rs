@@ -2,7 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use icanact_remote::registry::PeerDisconnectHandler;
-use icanact_remote::{GossipConfig, GossipRegistryHandle, NodeId, SecretKey, wire_type};
+use icanact_remote::{GossipConfig, GossipNodeId, GossipRegistryHandle, SecretKey, wire_type};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::fs;
@@ -98,14 +98,14 @@ async fn main() -> Result<()> {
     println!("================================\n");
 
     let server_node_id = load_node_id(&server_pub_path)?;
-    println!("Server NodeId: {}", server_node_id.fmt_short());
+    println!("Server GossipNodeId: {}", server_node_id.fmt_short());
     println!("Server key: {}\n", server_pub_path);
 
     let client_key_path = "/tmp/icanact_tls/console_tell_ask_client.key";
     let client_secret = load_or_generate_key(client_key_path)?;
     let client_node_id = client_secret.public();
 
-    println!("Client NodeId: {}", client_node_id.fmt_short());
+    println!("Client GossipNodeId: {}", client_node_id.fmt_short());
     println!("Client key: {}\n", client_key_path);
     println!("Actor Id: 0x{:016x}\n", ACTOR_ID);
 
@@ -645,7 +645,7 @@ fn parse_human_count(raw: &str) -> Option<usize> {
     Some(value as usize)
 }
 
-fn load_node_id(path: &str) -> Result<NodeId> {
+fn load_node_id(path: &str) -> Result<GossipNodeId> {
     let pub_key_hex = fs::read_to_string(path)?;
     let pub_key_bytes = hex::decode(pub_key_hex.trim())?;
 
@@ -656,7 +656,8 @@ fn load_node_id(path: &str) -> Result<NodeId> {
         ));
     }
 
-    NodeId::from_bytes(&pub_key_bytes).map_err(|e| anyhow::anyhow!("Invalid NodeId: {}", e))
+    GossipNodeId::from_bytes(&pub_key_bytes)
+        .map_err(|e| anyhow::anyhow!("Invalid GossipNodeId: {}", e))
 }
 
 fn load_or_generate_key(path: &str) -> Result<SecretKey> {

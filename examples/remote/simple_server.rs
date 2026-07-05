@@ -1,5 +1,7 @@
 use anyhow::Result;
-use icanact_remote::{GossipConfig, GossipRegistryHandle, SecretKey, NodeId, RegistrationPriority};
+use icanact_remote::{
+    GossipConfig, GossipNodeId, GossipRegistryHandle, RegistrationPriority, SecretKey,
+};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -31,7 +33,7 @@ async fn main() -> Result<()> {
     let secret_key = load_or_generate_key(key_path).await?;
     let node_id = secret_key.public();
     
-    println!("   Server NodeId: {}", node_id.fmt_short());
+    println!("   Server GossipNodeId: {}", node_id.fmt_short());
     println!("   Key file: {}", key_path);
     
     // Save public key for clients
@@ -50,7 +52,7 @@ async fn main() -> Result<()> {
     println!("Server Status:");
     println!("  ✅ Listening on: {}", server_addr);
     println!("  🔐 TLS encryption: ENABLED");
-    println!("  🎯 Server NodeId: {}\n", node_id.fmt_short());
+    println!("  🎯 Server GossipNodeId: {}\n", node_id.fmt_short());
     
     // Register an echo service
     let echo_service_addr = "127.0.0.1:39100".parse()?;
@@ -78,7 +80,7 @@ async fn main() -> Result<()> {
         if counter % 6 == 0 { // Every minute
             let stats = registry.registry.get_stats().await;
             println!("📊 Server Status ({}m running):", counter / 6);
-            println!("   - NodeId: {}", node_id.fmt_short());
+            println!("   - GossipNodeId: {}", node_id.fmt_short());
             println!("   - TLS peers: {}", stats.active_peers);
             println!("   - Service: echo_service");
             println!("   - Waiting for TLS clients...\n");

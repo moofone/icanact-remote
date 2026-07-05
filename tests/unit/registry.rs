@@ -340,7 +340,7 @@ async fn test_cleanup_stale_actors() {
 }
 
 // Tests removed: test_record_node_activity, test_record_vector_clock_activity, test_vector_clock_gc
-// These tests are no longer relevant after removing NodeId and VectorClock
+// These tests are no longer relevant after removing GossipNodeId and VectorClock
 
 #[tokio::test]
 async fn test_prepare_gossip_round_no_peers() {

@@ -1,4 +1,4 @@
-use icanact_remote::{GossipConfig, GossipRegistryHandle, NodeId, SecretKey};
+use icanact_remote::{GossipConfig, GossipNodeId, GossipRegistryHandle, SecretKey};
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -18,12 +18,12 @@ use tracing::debug;
 ///   # Connect with specific client key
 ///   cargo run --example tls_client 9001 /tmp/icanact_tls_server.pub /tmp/client1.key
 ///   
-///   # Test authentication failure with wrong NodeId
+///   # Test authentication failure with wrong GossipNodeId
 ///   cargo run --example tls_client 9001 /tmp/icanact_tls_server.pub --wrong-key
 ///
 /// This client:
 /// 1. Loads or generates its own Ed25519 keypair
-/// 2. Loads the server's public key (NodeId)
+/// 2. Loads the server's public key (GossipNodeId)
 /// 3. Connects to the server using TLS with mutual authentication
 /// 4. Registers some client actors
 /// 5. Discovers server actors through gossip
@@ -82,11 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.as_str())
     };
 
-    // Load server's public key (NodeId)
+    // Load server's public key (GossipNodeId)
     println!("📋 Loading server information:");
     let server_node_id = match load_server_node_id(server_pub_path) {
         Ok(node_id) => {
-            println!("   Server NodeId: {}", node_id.fmt_short());
+            println!("   Server GossipNodeId: {}", node_id.fmt_short());
             println!("   Server public key from: {}", server_pub_path);
             node_id
         }
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load or generate client keypair
     println!("📋 Client Configuration:");
     let (client_secret_key, client_key_source) = if use_wrong_key {
-        println!("   ⚠️  TESTING MODE: Using wrong NodeId for authentication failure test");
+        println!("   ⚠️  TESTING MODE: Using wrong GossipNodeId for authentication failure test");
         let wrong_key = SecretKey::generate();
         (wrong_key, "generated for testing".to_string())
     } else {
@@ -123,17 +123,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client_node_id = client_secret_key.public();
-    println!("   Client NodeId: {}", client_node_id.fmt_short());
+    println!("   Client GossipNodeId: {}", client_node_id.fmt_short());
     println!("   Client key: {}", client_key_source);
     println!();
 
-    // What NodeId to tell the server we are (for testing wrong key scenario)
+    // What GossipNodeId to tell the server we are (for testing wrong key scenario)
     let claimed_server_node_id = if use_wrong_key {
         // Claim we're someone else to test authentication failure
-        println!("   ❌ Will claim wrong server NodeId to test authentication failure");
-        println!("   Expected NodeId: {}", server_node_id.fmt_short());
+        println!("   ❌ Will claim wrong server GossipNodeId to test authentication failure");
+        println!("   Expected GossipNodeId: {}", server_node_id.fmt_short());
         let wrong_node_id = SecretKey::generate().public();
-        println!("   Claiming NodeId: {}", wrong_node_id.fmt_short());
+        println!("   Claiming GossipNodeId: {}", wrong_node_id.fmt_short());
         wrong_node_id
     } else {
         server_node_id
@@ -173,9 +173,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   - client.data -> 127.0.0.1:11002");
     println!();
 
-    // Add server as peer with its NodeId for TLS verification
+    // Add server as peer with its GossipNodeId for TLS verification
     println!(
-        "🔗 Adding server as peer at {} with NodeId {}",
+        "🔗 Adding server as peer at {} with GossipNodeId {}",
         server_addr,
         claimed_server_node_id.fmt_short()
     );
@@ -188,11 +188,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
         println!("⏳ Attempting to connect to server (should fail due to public key mismatch)...");
         println!(
-            "   We claim the server has NodeId: {}",
+            "   We claim the server has GossipNodeId: {}",
             claimed_server_node_id.fmt_short()
         );
         println!(
-            "   But server actually has NodeId: {}",
+            "   But server actually has GossipNodeId: {}",
             server_node_id.fmt_short()
         );
 
@@ -210,12 +210,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 println!("✅ Connection correctly rejected: {}", e);
 
-                // Verify the error is about NodeId/PublicKey mismatch
-                if e.to_string().contains("NodeId mismatch") {
+                // Verify the error is about GossipNodeId/PublicKey mismatch
+                if e.to_string().contains("GossipNodeId mismatch") {
                     println!("✅ TEST PASSED: Public key verification working correctly!");
                     println!();
                     println!("Explanation:");
-                    println!("- NodeId IS the Ed25519 public key (they're the same thing)");
+                    println!("- GossipNodeId IS the Ed25519 public key (they're the same thing)");
                     println!(
                         "- Server's certificate contains its public key: {}",
                         server_node_id.fmt_short()
@@ -232,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("tries to impersonate the server with their own key.");
                 } else {
                     println!("⚠️  Connection failed but not for the expected reason");
-                    println!("   Expected: NodeId/PublicKey mismatch error");
+                    println!("   Expected: GossipNodeId/PublicKey mismatch error");
                     println!("   Got: {}", e);
                 }
             }
@@ -305,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn load_server_node_id(path: &str) -> Result<NodeId, Box<dyn std::error::Error>> {
+fn load_server_node_id(path: &str) -> Result<GossipNodeId, Box<dyn std::error::Error>> {
     let pub_key_hex = fs::read_to_string(path)?;
     let pub_key_bytes = hex::decode(pub_key_hex.trim())?;
 
@@ -317,7 +317,8 @@ fn load_server_node_id(path: &str) -> Result<NodeId, Box<dyn std::error::Error>>
         .into());
     }
 
-    NodeId::from_bytes(&pub_key_bytes).map_err(|e| format!("Invalid NodeId: {}", e).into())
+    GossipNodeId::from_bytes(&pub_key_bytes)
+        .map_err(|e| format!("Invalid GossipNodeId: {}", e).into())
 }
 
 async fn load_or_generate_key(path: &str) -> Result<SecretKey, Box<dyn std::error::Error>> {
