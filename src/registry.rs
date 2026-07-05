@@ -5501,9 +5501,22 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Handle peer connection failure - start consensus process
     /// This is called for socket disconnections (not timeouts)
+    ///
+    /// `failed_instance_id` is the `LockFreeStreamHandle::instance_id()` of
+    /// the SPECIFIC connection instance whose IO task exited, when the
+    /// caller can supply it (the persistent-connection writer's exit guard
+    /// always can — it holds the instance id of the handle it was created
+    /// for). It must never be re-derived by re-resolving `observed_peer_addr`
+    /// through the address index: once a fresh connection has been reindexed
+    /// under the same bind address as an older, now-superseded link, that
+    /// relookup silently returns the NEW instance rather than the one that
+    /// actually failed. `None` means the caller cannot identify the specific
+    /// failed instance and this falls back to the conservative "may be the
+    /// current session" path.
     pub async fn handle_peer_connection_failure(
         &self,
         observed_peer_addr: SocketAddr,
+        failed_instance_id: Option<u64>,
     ) -> Result<()> {
         let (failed_peer_addr, peer_id) = self
             .resolve_failed_peer_state_addr(observed_peer_addr)
@@ -5524,22 +5537,25 @@ impl<T: 'static> GossipRegistry<T> {
         // which is exactly the single-node-restart reconnect thrash: a
         // freshly-accepted preferred inbound `disconnect_by_peer_id`'d moments
         // after acceptance. Retire only the stale link and leave the live
-        // session — identified purely by peer identity — intact.
+        // session — identified purely by connection-instance identity — intact.
         if let Some(peer_id) = peer_id.as_ref() {
             let pool = &self.connection_pool;
             if let Some(current) = pool.get_connection_by_peer_id(peer_id) {
-                // Only a *positive* resolution to a different, live connection
-                // instance proves the failure belongs to a superseded link.
-                // `get_lock_free_connection` returning `None` means the
-                // observed address has no alias in `connections_by_addr` at
-                // all — e.g. the ephemeral peer address for an inbound
-                // session whose post-accept alias insertion hasn't happened
-                // yet (or was already cleaned up), which is exactly the case
-                // for the CURRENT session's own socket. Treat "cannot
-                // resolve" as "this may be the current session failing" and
-                // fall through to the normal failure path, never as proof of
-                // supersession — absence of an alias must never be read as
-                // evidence of a different, superseded connection.
+                // Compare INSTANCE IDENTITY directly against the current
+                // session's own stream handle. This deliberately does not
+                // re-resolve `observed_peer_addr` through
+                // `get_lock_free_connection`: once a fresh connection has
+                // been reindexed under the same bind address the failed
+                // link used, that address now resolves to the NEW instance,
+                // and comparing it to `current` (also the new instance)
+                // would trivially and incorrectly conclude "the current
+                // session is failing". Only a caller-supplied instance id
+                // that provably differs from the current session's own
+                // proves supersession; when the caller cannot identify the
+                // failed instance at all, never treat that absence as
+                // evidence of supersession — fall through to the normal
+                // failure path, which is always safe for the failing
+                // session itself.
                 let failed_is_current = pool
                     .get_lock_free_connection(observed_peer_addr)
                     .map(|failed| Arc::ptr_eq(&failed, &current))
@@ -10020,7 +10036,7 @@ mod tests {
 
         // Simulate failure
         registry
-            .handle_peer_connection_failure(test_addr(8081))
+            .handle_peer_connection_failure(test_addr(8081), None)
             .await
             .unwrap();
 
@@ -10092,9 +10108,17 @@ mod tests {
             .expect("current session must resolve to conn2");
         assert!(Arc::ptr_eq(&before, &conn2));
 
-        // The superseded connection's socket fails.
+        let conn1_instance_id = conn1
+            .stream_handle
+            .as_ref()
+            .map(|h| h.instance_id())
+            .expect("conn1 must have a stream handle");
+
+        // The superseded connection's socket fails; the caller (the exit
+        // guard) identifies it by its OWN instance id, never by re-resolving
+        // `stale_addr`.
         registry
-            .handle_peer_connection_failure(stale_addr)
+            .handle_peer_connection_failure(stale_addr, Some(conn1_instance_id))
             .await
             .unwrap();
 
@@ -10104,6 +10128,122 @@ mod tests {
             "socket failure of a superseded connection collaterally tore down the live \
              current session (thrash: disconnect_connection_by_peer_id is peer-wide, not \
              instance-scoped)"
+        );
+        assert!(
+            pool.get_lock_free_connection(stale_addr).is_none(),
+            "the superseded instance itself must still be retired from connections_by_addr"
+        );
+    }
+
+    /// RED (thrash repro, SAME-bind-address collision): the precise defect
+    /// underlying `socket_failure_of_superseded_connection_preserves_current_session`
+    /// is not merely "different addresses" but a fresh connection reindexed
+    /// under the EXACT SAME bind address an older, now-superseded link used.
+    /// An old OUTBOUND connection to a peer's bind address `B` fails AFTER a
+    /// fresh INBOUND for the same identity has already been reindexed under
+    /// that same `B`. Resolving the failed socket "by address" — looking `B`
+    /// up in `connections_by_addr` — returns the NEW current connection, not
+    /// the one whose IO task actually exited, so an address-only check
+    /// concludes `failed_is_current == true` and tears down the healthy
+    /// replacement. Only comparing the failure callback's own captured
+    /// instance identity against the current session's instance identity
+    /// tells the two apart.
+    #[tokio::test]
+    async fn socket_failure_of_old_outbound_at_reused_bind_addr_preserves_fresh_inbound() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9300), test_config());
+        let peer_id = test_peer_id("reused_bind_addr_peer");
+        let bind_addr = test_addr(9301);
+        let pool = &registry.connection_pool;
+        pool.set_configured_peer_addr(&peer_id, bind_addr);
+
+        // Old, now-superseded OUTBOUND connection instance, originally
+        // indexed at the peer's bind address `bind_addr`.
+        let (io1, _p1) = tokio::io::duplex(1024);
+        let (sh1, _w1, _r1) = LockFreeStreamHandle::new(
+            io1,
+            bind_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn1 = LockFreeConnection::new(bind_addr, ConnectionDirection::Outbound);
+        conn1.stream_handle = Some(Arc::new(sh1));
+        conn1.embedded_peer_id = Some(peer_id.clone());
+        conn1.set_state(ConnectionState::Connected);
+        let conn1 = Arc::new(conn1);
+        let conn1_instance_id = conn1
+            .stream_handle
+            .as_ref()
+            .map(|h| h.instance_id())
+            .expect("conn1 must have a stream handle");
+        pool.index_connection_by_addr(bind_addr, conn1.clone());
+        pool.add_addr_to_peer_id(bind_addr, peer_id.clone());
+
+        // A fresh INBOUND session for the SAME identity arrives and is
+        // reindexed under the SAME `bind_addr`, becoming the peer's current
+        // connection — `connections_by_addr[bind_addr]` now points at conn2,
+        // not conn1, even though conn1's IO task is still what is about to
+        // fail.
+        let (io2, _p2) = tokio::io::duplex(1024);
+        let (sh2, _w2, _r2) = LockFreeStreamHandle::new(
+            io2,
+            bind_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn2 = LockFreeConnection::new(bind_addr, ConnectionDirection::Inbound);
+        conn2.stream_handle = Some(Arc::new(sh2));
+        conn2.embedded_peer_id = Some(peer_id.clone());
+        conn2.set_state(ConnectionState::Connected);
+        let conn2 = Arc::new(conn2);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), bind_addr, conn2.clone()));
+
+        let before = pool
+            .get_connection_by_peer_id(&peer_id)
+            .expect("current session must resolve to conn2");
+        assert!(Arc::ptr_eq(&before, &conn2));
+        assert!(
+            Arc::ptr_eq(
+                &pool
+                    .get_lock_free_connection(bind_addr)
+                    .expect("bind_addr must resolve to the reindexed connection"),
+                &conn2
+            ),
+            "test precondition: bind_addr must now resolve to the fresh inbound, not conn1"
+        );
+
+        // conn1's IO task exits and reports failure for `bind_addr` — the
+        // address it was originally dialed to — identifying itself by its
+        // OWN captured instance id, never by re-resolving `bind_addr`.
+        registry
+            .handle_peer_connection_failure(bind_addr, Some(conn1_instance_id))
+            .await
+            .unwrap();
+
+        let after = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            after.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn2)),
+            "a stale outbound's socket failure at a bind address since reused by a fresh \
+             inbound must never tear down the healthy current session (address-only \
+             resolution collateral teardown)"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &pool
+                    .get_lock_free_connection(bind_addr)
+                    .expect("bind_addr must still resolve to conn2 after the stale failure"),
+                &conn2
+            ),
+            "connections_by_addr[bind_addr] must still point at the fresh inbound, never \
+             be clobbered or removed by the stale outbound's failure handling"
         );
     }
 
@@ -10163,7 +10303,7 @@ mod tests {
 
         // The current session's own (ephemeral) socket fails.
         registry
-            .handle_peer_connection_failure(ephemeral_addr)
+            .handle_peer_connection_failure(ephemeral_addr, None)
             .await
             .unwrap();
 
@@ -10295,7 +10435,7 @@ mod tests {
         registry.add_peer(test_addr(8081)).await;
 
         registry
-            .handle_peer_connection_failure(test_addr(8081))
+            .handle_peer_connection_failure(test_addr(8081), None)
             .await
             .unwrap();
 
@@ -10331,7 +10471,7 @@ mod tests {
         );
 
         registry
-            .handle_peer_connection_failure(peer_addr)
+            .handle_peer_connection_failure(peer_addr, None)
             .await
             .unwrap();
 
@@ -10414,7 +10554,7 @@ mod tests {
             .await;
 
         registry
-            .handle_peer_connection_failure(peer_addr)
+            .handle_peer_connection_failure(peer_addr, None)
             .await
             .unwrap();
 
@@ -10464,7 +10604,7 @@ mod tests {
             .await;
 
         registry
-            .handle_peer_connection_failure(peer_addr)
+            .handle_peer_connection_failure(peer_addr, None)
             .await
             .unwrap();
 
@@ -10522,7 +10662,7 @@ mod tests {
         // Pre-shutdown sanity check: the handler fires normally so the
         // assertion below is testing the gate, not handler wiring.
         registry
-            .handle_peer_connection_failure(peer_addr)
+            .handle_peer_connection_failure(peer_addr, None)
             .await
             .unwrap();
         for _ in 0..10 {
@@ -10539,7 +10679,7 @@ mod tests {
         // would keep running and bump the counter to 2.
         registry.shutdown().await;
         registry
-            .handle_peer_connection_failure(peer_addr)
+            .handle_peer_connection_failure(peer_addr, None)
             .await
             .unwrap();
         for _ in 0..20 {

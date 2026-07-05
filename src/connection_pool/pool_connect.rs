@@ -1419,6 +1419,75 @@ impl<T> ConnectionPool<T> {
         true
     }
 
+    /// Retire a specific, address-indexed connection INSTANCE identified by
+    /// its stream-handle `instance_id`, without touching whatever is
+    /// currently indexed for the peer.
+    ///
+    /// This exists for the socket-failure path
+    /// (`GossipRegistry::handle_peer_connection_failure`): once a fresh
+    /// connection has been reindexed under the same bind address as an older,
+    /// now-superseded link, the caller cannot safely name the failed
+    /// connection by address alone — a plain address relookup would return
+    /// the NEW instance, not the one whose IO task actually exited. The
+    /// caller instead threads through the `instance_id` captured directly
+    /// from the failing stream handle, and this does a single atomic
+    /// compare-and-remove keyed on that id: `connections_by_addr` is only
+    /// cleared at `addr` if the entry found there is *still* the failed
+    /// instance. If a newer connection has already taken that slot, the
+    /// removal is declined and the newer connection is left completely
+    /// untouched.
+    pub(crate) fn remove_connection_instance_by_id(
+        &self,
+        addr: SocketAddr,
+        instance_id: u64,
+    ) -> Option<Arc<LockFreeConnection>> {
+        let peer_id_at_addr = self.addr_to_peer_id.read_sync(&addr, |_, v| v.clone());
+
+        let removed = self.connections_by_addr.remove_if_sync(&addr, |v| {
+            v.stream_handle.as_ref().map(|handle| handle.instance_id()) == Some(instance_id)
+        });
+        let (_, connection) = removed?;
+
+        let _ = self.addr_to_peer_id.remove_sync(&addr);
+        self.clear_capabilities_for_addr(&addr);
+
+        // The same instance may also be indexed under other aliases (e.g. an
+        // inbound's ephemeral socket address alongside its bind address).
+        // Sweep and remove every alias that still points at THIS Arc.
+        let mut alias_addrs: Vec<SocketAddr> = Vec::new();
+        self.connections_by_addr.iter_sync(|alias_addr, v| {
+            if Arc::ptr_eq(v, &connection) {
+                alias_addrs.push(*alias_addr);
+            }
+            true
+        });
+        for alias_addr in alias_addrs {
+            let removed_alias = self
+                .connections_by_addr
+                .remove_if_sync(&alias_addr, |v| Arc::ptr_eq(v, &connection))
+                .is_some();
+            if removed_alias {
+                let _ = self.addr_to_peer_id.remove_sync(&alias_addr);
+                self.clear_capabilities_for_addr(&alias_addr);
+            }
+        }
+
+        // This instance is, by the caller's contract, already known to be
+        // superseded — never the peer session's current connection. Clear
+        // the session's current-connection slot ONLY in the defensive case
+        // where it still literally points at this exact Arc (it should not,
+        // by construction, but `clear_current_peer_connection_if_matches` is
+        // itself identity-gated and a no-op otherwise, so this can never
+        // clobber a newer, already-installed connection).
+        if let Some(peer_id) = peer_id_at_addr {
+            self.clear_current_peer_connection_if_matches(&peer_id, &connection);
+        }
+
+        self.decrement_connection_counter();
+        connection.abort_tasks();
+        Some(connection)
+    }
+
     /// Choose the least-recently-used connection eligible for eviction when
     /// the pool is at capacity.
     ///
@@ -2258,7 +2327,14 @@ impl<T> ConnectionPool<T> {
         info!(peer = %peer_addr, "CONNECTION_POOL: Triggering peer failure handling");
         if let Some(ref registry_weak) = registry_weak {
             if let Some(registry) = registry_weak.upgrade() {
-                if let Err(e) = registry.handle_peer_connection_failure(peer_addr).await {
+                // Dead-code path (`#[allow(dead_code)]`, no call sites): no
+                // stream-handle instance id is available here, so this
+                // conservatively falls back to the "may be the current
+                // session" path, same as before this parameter existed.
+                if let Err(e) = registry
+                    .handle_peer_connection_failure(peer_addr, None)
+                    .await
+                {
                     warn!(error = %e, peer = %peer_addr, "CONNECTION_POOL: Failed to handle peer connection failure");
                 }
             }

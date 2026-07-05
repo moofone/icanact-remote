@@ -327,8 +327,14 @@ pub async fn force_disconnect(a: &TlsHandle, b: &TlsHandle) {
     let addr_a = a.registry.bind_addr;
     let addr_b = b.registry.bind_addr;
 
-    let _ = a.registry.handle_peer_connection_failure(addr_b).await;
-    let _ = b.registry.handle_peer_connection_failure(addr_a).await;
+    let _ = a
+        .registry
+        .handle_peer_connection_failure(addr_b, None)
+        .await;
+    let _ = b
+        .registry
+        .handle_peer_connection_failure(addr_a, None)
+        .await;
 }
 
 #[allow(dead_code)]

@@ -3631,6 +3631,107 @@ fn outbound_finalize_balances_connection_counter() {
     });
 }
 
+/// RED (review finding P2, outbound-finalize reject leaves the rejected
+/// candidate indexed and served): the freshly-dialed outbound candidate is
+/// inserted into `connections_by_addr` / `addr_to_peer_id` BEFORE the
+/// tie-break decision is known (so `existing_before` can be snapshotted
+/// without racing the insert). When `resolve_connection_conflict` returns
+/// `RejectIncoming` — the existing session is live and tie-break-preferred,
+/// the new outbound is not — the old code only logged and fell through:
+/// `connection_counter` was still bumped, an initial FullSync was still sent
+/// on the rejected candidate's stream, and `Ok(ConnectionHandle)` for the
+/// REJECTED candidate was still returned to the caller, while the candidate
+/// remained the live entry in `connections_by_addr` at its dial address —
+/// silently overwriting address-based lookups for the preferred session with
+/// a connection that was never installed as anyone's current session and
+/// whose background tasks the caller has no way to ever tear down.
+#[tokio::test]
+async fn outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    // Local is the HIGHER NodeId, so the existing INBOUND session for this
+    // peer IS tie-break preferred (`should_keep_connection(remote, is_outbound=false) == true`),
+    // while a fresh OUTBOUND dial to the same peer is NOT
+    // (`should_keep_connection(remote, is_outbound=true) == false`) — the
+    // textbook `RejectIncoming` case (`resolve_connection_conflict(true, true, false)`).
+    let (hi_kp, lo_kp) = hi_lo_keypairs("finalize-reject-hi", "finalize-reject-lo");
+    let remote_peer_id = lo_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // The existing, live, preferred INBOUND session, published as this
+    // peer's CURRENT connection.
+    let existing_addr: SocketAddr = "127.0.0.1:7440".parse().unwrap();
+    let (existing_io, _existing_keep) = tokio::io::duplex(1024);
+    let (existing_sh, _existing_w, _existing_r) = LockFreeStreamHandle::new(
+        existing_io,
+        existing_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut existing_conn = LockFreeConnection::new(existing_addr, ConnectionDirection::Inbound);
+    existing_conn.stream_handle = Some(Arc::new(existing_sh));
+    existing_conn.set_state(ConnectionState::Connected);
+    let existing = Arc::new(existing_conn);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        existing_addr,
+        existing.clone()
+    ));
+
+    let counter_before = pool.connection_counter.load(Ordering::SeqCst);
+
+    // A fresh, non-preferred OUTBOUND dial to a DIFFERENT address for the
+    // same peer identity (resolved via the configured-address fallback).
+    let dial_addr: SocketAddr = "127.0.0.1:7441".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .await;
+
+    assert!(
+        matches!(result, Err(crate::GossipError::ConnectionExists)),
+        "a rejected outbound candidate must be surfaced as an error, never handed back \
+         to the caller as a live handle: got {result:?}"
+    );
+
+    assert!(
+        pool.get_lock_free_connection(dial_addr).is_none(),
+        "the rejected candidate must not remain indexed in connections_by_addr"
+    );
+    assert!(
+        pool.addr_to_peer_id
+            .read_sync(&dial_addr, |_, v| v.clone())
+            .is_none(),
+        "the rejected candidate's dial address must not remain mapped to the peer id"
+    );
+
+    let current = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &existing)),
+        "the preferred existing inbound session must remain the peer's current connection"
+    );
+
+    assert_eq!(
+        pool.connection_counter.load(Ordering::SeqCst),
+        counter_before,
+        "a rejected outbound candidate must never bump the live connection counter"
+    );
+}
+
 /// Deterministic ordering helper mirroring `tiebreak_reconnect_thrash.rs`'s
 /// `ordered()`: returns `(higher_node_id_keypair, lower_node_id_keypair)`
 /// regardless of which seed happens to hash higher, so tests do not depend on

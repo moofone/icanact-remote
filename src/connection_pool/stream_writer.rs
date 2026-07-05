@@ -367,7 +367,9 @@ impl LockFreeStreamHandle {
                             correlation.cancel_all();
                         }
                         tokio::spawn(async move {
-                            if let Err(e) = registry.handle_peer_connection_failure(peer_addr).await
+                            if let Err(e) = registry
+                                .handle_peer_connection_failure(peer_addr, Some(expected_instance))
+                                .await
                             {
                                 warn!(
                                     peer = %peer_addr,
