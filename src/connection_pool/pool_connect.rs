@@ -1546,12 +1546,65 @@ impl<T> ConnectionPool<T> {
         // This instance is, by the caller's contract, already known to be
         // superseded — never the peer session's current connection. Clear
         // the session's current-connection slot ONLY in the defensive case
-        // where it still literally points at this exact Arc (it should not,
-        // by construction, but `clear_current_peer_connection_if_matches` is
-        // itself identity-gated and a no-op otherwise, so this can never
-        // clobber a newer, already-installed connection).
+        // where it still literally points at this exact Arc. This MUST be a
+        // single atomic compare-and-clear (the same
+        // `PeerSession::compare_and_clear_current_connection` primitive
+        // `disconnect_connection_instance` uses), never the
+        // check-then-unconditional-clear idiom `clear_current_peer_connection_if_matches`
+        // used to perform here: that idiom reads current, ptr_eq-compares it
+        // to `connection`, and only afterward (past a log line and a
+        // lifecycle-event construction — a real gap) stores `None`
+        // unconditionally. A fresh publish for this peer landing in that gap
+        // was clobbered — the exact collateral-teardown/reconnect-thrash race
+        // this PR closes, reopened through this one call site. The CAS
+        // closes the gap completely: it either finds `connection` still
+        // installed and atomically clears it, or finds something else — a
+        // concurrent publish already superseded it — and leaves the slot
+        // untouched. The `connections_by_peer` removal is likewise mirrored
+        // from `disconnect_connection_instance`: a conditional,
+        // identity-scoped `remove_if_sync`, performed ONLY when the CAS
+        // actually cleared the slot, never an unconditional
+        // peer-id-keyed removal that could delete a newer instance already
+        // reinserted under the same `peer_id`.
         if let Some(peer_id) = peer_id_at_addr {
-            self.clear_current_peer_connection_if_matches(&peer_id, &connection);
+            let cleared = self
+                .peer_sessions
+                .read_sync(&peer_id, |_, session| {
+                    session.compare_and_clear_current_connection(&connection)
+                })
+                .unwrap_or(false);
+            if cleared {
+                let stream_instance_id = connection
+                    .stream_handle
+                    .as_ref()
+                    .map(|handle| handle.instance_id());
+                info!(
+                    peer_id = %peer_id,
+                    addr = %connection.addr,
+                    direction = ?connection.direction,
+                    stream_instance_id = ?stream_instance_id,
+                    reason = "current_connection_cleared",
+                    "transport_session_removed"
+                );
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
+                        peer: peer_id.clone(),
+                        addr: connection.addr,
+                        direction: match connection.direction {
+                            ConnectionDirection::Inbound => {
+                                crate::lifecycle::TransportDirection::Inbound
+                            }
+                            ConnectionDirection::Outbound => {
+                                crate::lifecycle::TransportDirection::Outbound
+                            }
+                        },
+                        reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
+                    },
+                );
+                let _ = self
+                    .connections_by_peer
+                    .remove_if_sync(&peer_id, |v| Arc::ptr_eq(v, &connection));
+            }
         }
 
         self.decrement_connection_counter();
