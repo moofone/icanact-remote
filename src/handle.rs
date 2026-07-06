@@ -1065,6 +1065,223 @@ mod tests {
         Ok(())
     }
 
+    /// RED (review finding B, P1, `handle_incoming_connection_tls`'s
+    /// `ReplaceExisting` inbound-accept arm): the arm computes its decision
+    /// against a snapshotted `existing_conn`, evicts it via the
+    /// instance-scoped `disconnect_connection_instance` (which declines
+    /// harmlessly if `existing_conn` was already superseded by a concurrent
+    /// publish), and — before this fix — then called `add_connection_by_peer_id`
+    /// UNCONDITIONALLY, clobbering whatever a concurrent accept/finalize had
+    /// already installed in that gap. This drives the REAL
+    /// `handle_incoming_connection_tls` accept path (not a primitive-level
+    /// stand-in): local uses the HIGHER GossipNodeId for this remote, so
+    /// `should_keep_connection(remote, is_outbound=true) == false` and
+    /// `should_keep_connection(remote, is_outbound=false) == true` — an
+    /// existing live OUTBOUND connection is the wrong direction and this
+    /// freshly-accepted INBOUND candidate is preferred, so the decision is
+    /// `ReplaceExisting`.
+    ///
+    /// Pinned deterministically via `TransportLifecycleRecorderGuard` on the
+    /// new `InboundAcceptPublishAttempt` instrumentation event (fires
+    /// unconditionally immediately before the inbound candidate's own
+    /// compare-and-publish attempt, mirroring `OutboundFinalizePublishAttempt`
+    /// on the outbound side): when it fires, a FRESH, genuinely live, tie-break
+    /// PREFERRED inbound connection is published for real (counted) into the
+    /// peer's session slot — modelling a concurrent accept/finalize landing in
+    /// the gap between this candidate's own eviction of the stale outbound and
+    /// its publish attempt. The re-resolved, address-blind tie-break against
+    /// that fresh inbound comes back `RejectIncoming` (a live, already-preferred
+    /// rival is kept over an equally-preferred but not-yet-installed duplicate).
+    ///
+    /// RED at HEAD (before this fix): the stale incoming candidate's
+    /// unconditional `add_connection_by_peer_id` clobbers the fresh session —
+    /// `get_connection_by_peer_id` returns the STALE candidate, not `fresh`,
+    /// and `connection_counter` is bumped twice (once for `fresh`, once for
+    /// the clobbering candidate) even though only one connection should ever
+    /// be counted as current. GREEN after the fix: `fresh` remains the peer's
+    /// current session, the stale candidate is dropped
+    /// (`ConnectionCloseOutcome::DroppedByTieBreaker`) and never counted, and
+    /// `connection_counter` reflects only `existing_conn` (evicted, so no
+    /// longer counted — see the counted_instances ownership table) plus
+    /// `fresh`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_accept_replace_existing_compare_and_publishes_against_snapshot()
+    -> crate::Result<()> {
+        // `ordered_keypairs` returns `(lower, higher)` regardless of
+        // argument order, so bind `local_keypair` to the HIGHER NodeId
+        // (preferring inbound for this remote) by taking the pair reversed.
+        let (remote_keypair, local_keypair) = ordered_keypairs(
+            "inbound-replace-cas-gap-remote-lower",
+            "inbound-replace-cas-gap-local-higher",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            !handle
+                .registry
+                .should_keep_connection(&remote_peer_id, true),
+            "test precondition: local's higher GossipNodeId must not prefer outbound for this \
+             remote"
+        );
+        assert!(
+            handle
+                .registry
+                .should_keep_connection(&remote_peer_id, false),
+            "test precondition: local's higher GossipNodeId must prefer inbound for this remote"
+        );
+
+        // The existing, live, WRONG-DIRECTION outbound connection the
+        // decision below is computed about.
+        let existing_addr: SocketAddr = "127.0.0.1:41101".parse().unwrap();
+        let (existing_io, _existing_peer) = tokio::io::duplex(1024);
+        let (existing_stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                existing_io,
+                existing_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut existing = crate::connection_pool::LockFreeConnection::new(
+            existing_addr,
+            crate::connection_pool::ConnectionDirection::Outbound,
+        );
+        existing.stream_handle = Some(Arc::new(existing_stream_handle));
+        existing.set_state(crate::connection_pool::ConnectionState::Connected);
+        let existing = Arc::new(existing);
+        assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            existing_addr,
+            existing.clone(),
+        ));
+
+        // The FRESH, genuinely live, tie-break-PREFERRED inbound connection
+        // published concurrently, into the exact gap between this
+        // candidate's eviction of `existing` and its own publish attempt.
+        let fresh_addr: SocketAddr = "127.0.0.1:41102".parse().unwrap();
+        let (fresh_io, _fresh_peer) = tokio::io::duplex(1024);
+        let (fresh_stream_handle, _fresh_writer_task, _fresh_reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                fresh_io,
+                fresh_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut fresh = crate::connection_pool::LockFreeConnection::new(
+            fresh_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        fresh.stream_handle = Some(Arc::new(fresh_stream_handle));
+        fresh.set_state(crate::connection_pool::ConnectionState::Connected);
+        let fresh = Arc::new(fresh);
+
+        let baseline = handle.registry.connection_pool.raw_connection_counter();
+        assert_eq!(
+            baseline, 1,
+            "test precondition: exactly one counted session"
+        );
+
+        let _guard = {
+            let pool = handle.registry.connection_pool.clone();
+            let peer_id = remote_peer_id.clone();
+            let fresh = fresh.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::InboundAcceptPublishAttempt {
+                    peer: event_peer,
+                    ..
+                } = &event
+                    && *event_peer == peer_id
+                {
+                    // Deregister first: `add_connection_by_peer_id` below
+                    // fires its own (non-matching) `SessionPublished` event
+                    // through this same global hook, avoiding reentrant
+                    // invocation.
+                    crate::set_transport_lifecycle_recorder(None);
+                    assert!(pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        fresh_addr,
+                        fresh.clone()
+                    ));
+                }
+            }))
+        };
+
+        // The stale, freshly-accepted inbound candidate: dials in from a
+        // third address, computed against the now-superseded `existing`
+        // snapshot.
+        let attacker_addr: SocketAddr = "127.0.0.1:41103".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: remote_peer_id.clone(),
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            attacker_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_keypair.peer_id().to_node_id()),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ConnectionCloseOutcome::DroppedByTieBreaker),
+            "a stale inbound candidate whose compare-and-publish re-resolution loses to a \
+             concurrently published, tie-break-preferred rival must be dropped, never accepted"
+        );
+
+        let current = handle
+            .registry
+            .connection_pool
+            .get_connection_by_peer_id(&remote_peer_id);
+        assert!(
+            current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+            "the FRESH inbound published concurrently in the compare-and-publish gap must \
+             remain the peer's current session — the stale candidate's own publish, computed \
+             from a superseded `existing_conn` snapshot, must never overwrite it (got {current:?})"
+        );
+        assert!(
+            fresh.has_live_stream(),
+            "the fresh inbound's background tasks must survive untouched"
+        );
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_existing_connection(attacker_addr)
+                .is_none(),
+            "the stale candidate must not remain indexed by its own ephemeral address"
+        );
+
+        assert_eq!(
+            handle.registry.connection_pool.raw_connection_counter(),
+            baseline,
+            "connection_counter must reflect only `fresh` — `existing` was evicted (its own \
+             count released) and the stale candidate that lost its compare-and-publish \
+             re-resolution must never be counted, so the total stays exactly where it started"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inbound_gossip_rejects_sender_not_bound_to_tls_certificate() -> crate::Result<()> {
         let (local_keypair, claimed_keypair) =

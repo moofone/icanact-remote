@@ -92,6 +92,18 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired immediately before `resolve_and_act_on_outbound_rival`'s
+    /// `ReplaceExisting` arm retries its compare-and-publish after evicting
+    /// the rival it just re-resolved as live-but-non-preferred. Purely
+    /// instrumentation, the `ReplaceExisting` counterpart of
+    /// `OutboundFinalizeAcceptIncomingRetryAttempt`: lets tests
+    /// deterministically pin a further concurrent publish into the exact gap
+    /// between that eviction and this retry, so the retry itself observably
+    /// loses (`Err(Some(new_rival))` / `Err(None)`).
+    OutboundFinalizeReplaceExistingRetryAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
     /// Fired immediately after `finalize_new_outbound_connection` snapshots
     /// `existing_before` (the pre-existing rival, if any, for this peer) and
     /// before the tie-break decision is computed from it a few lines below.
@@ -121,6 +133,32 @@ pub enum TransportLifecycleEvent {
         addr: SocketAddr,
         direction: TransportDirection,
         reason: SessionRemovalReason,
+    },
+    /// Inbound-accept counterpart of `OutboundFinalizePublishAttempt`: fired
+    /// immediately before `publish_inbound_or_reresolve`'s first
+    /// compare-and-publish attempt for a freshly-accepted inbound
+    /// connection, unconditionally regardless of whether that attempt
+    /// succeeds or loses a re-resolution.
+    InboundAcceptPublishAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
+    /// Inbound-accept counterpart of `OutboundFinalizeClearRaceRetry`.
+    InboundAcceptClearRaceRetry {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
+    /// Inbound-accept counterpart of
+    /// `OutboundFinalizeAcceptIncomingRetryAttempt`.
+    InboundAcceptAcceptIncomingRetryAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
+    /// Inbound-accept counterpart of
+    /// `OutboundFinalizeReplaceExistingRetryAttempt`.
+    InboundAcceptReplaceExistingRetryAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
     },
 }
 

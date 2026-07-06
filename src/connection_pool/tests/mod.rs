@@ -4597,6 +4597,335 @@ async fn outbound_finalize_evict_replace_retry_loss_to_new_rival_fully_unpublish
     );
 }
 
+/// RED (audit finding, same class as review finding A, one level deeper:
+/// `resolve_and_act_on_outbound_rival_bounded`'s OWN nested `ReplaceExisting`
+/// arm): once the first compare-and-publish loses to an actually-installed,
+/// LIVE, wrong-direction rival (`Err(Some(rival))`, not a clear), the
+/// re-resolved decision against that rival can itself be `ReplaceExisting`
+/// (the rival is live but not tie-break-preferred, and this candidate still
+/// is). That arm evicts the rival and retries its own compare-and-publish —
+/// which is the exact same "evict, then publish" shape as review finding A,
+/// just reached through the re-resolve path instead of the eager decision.
+/// This exercises that identical fix one level deeper: if a THIRD,
+/// genuinely live, tie-break-preferred session publishes into the gap
+/// between that second eviction and its own retry, the retry must lose and
+/// bound its own nested re-resolve (consuming the one-retry budget) rather
+/// than reporting success for a candidate that was never installed.
+///
+/// Local uses the LOWER NodeId, so `should_keep_connection(remote,
+/// is_outbound) == is_outbound`. `existing_before` is snapshotted LIVE then
+/// flipped dead via `OutboundFinalizeExistingSnapshotTaken`, making the
+/// eager decision `AcceptIncoming`. The rival published into the FIRST CAS's
+/// window is a LIVE, wrong-direction (inbound) connection — not stale — so
+/// the re-resolved decision against it is `ReplaceExisting`, not
+/// `AcceptIncoming`. A further, genuinely live, PREFERRED (outbound) rival
+/// then publishes into THAT arm's own eviction-to-retry gap, forcing its
+/// retry to lose too; re-resolving once more against that final preferred
+/// rival comes back `RejectIncoming` (a live, already-preferred rival is
+/// kept over a not-yet-installed duplicate), consuming the bounded nested
+/// retry budget exactly once.
+///
+/// RED at HEAD (before this fix, i.e. before the nested `ReplaceExisting`
+/// arm routed through compare-and-publish): `result.is_ok()`, the loser
+/// stays indexed/counted, and `connection_counter` is bumped for a
+/// connection that was never installed as the session. GREEN after the fix:
+/// `result == Err(GossipError::ConnectionExists)`, the loser is fully
+/// unpublished, and the final preferred rival remains current.
+#[tokio::test]
+async fn outbound_finalize_nested_replace_existing_retry_loss_to_new_rival_fully_unpublishes() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs(
+        "nested-replace-existing-retry-hi",
+        "nested-replace-existing-retry-lo",
+    );
+    let remote_peer_id = hi_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(lo_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+
+    let dial_addr: SocketAddr = "127.0.0.1:7498".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+
+    // Snapshotted LIVE (so `expected = Some(existing_before)` threads into
+    // the first compare-and-publish), flipped dead immediately afterward so
+    // the eager decision computed from it is `AcceptIncoming`.
+    let existing_before = make_live_connection(dial_addr, ConnectionDirection::Outbound).await;
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        dial_addr,
+        existing_before.clone()
+    ));
+
+    let baseline = pool.connection_counter.load(Ordering::SeqCst);
+    assert_eq!(
+        baseline, 1,
+        "test precondition: exactly one counted session"
+    );
+
+    // Genuinely LIVE, wrong-direction (inbound) rival published into the
+    // FIRST compare-and-publish's window — not stale, so the re-resolved
+    // decision against it is `ReplaceExisting`, exercising the nested arm.
+    let wrong_direction_addr: SocketAddr = "127.0.0.1:7499".parse().unwrap();
+    let wrong_direction_rival =
+        make_live_connection(wrong_direction_addr, ConnectionDirection::Inbound).await;
+
+    // The final, genuinely live, PREFERRED (outbound) rival published into
+    // the nested `ReplaceExisting` arm's own eviction-to-retry gap.
+    let preferred_addr: SocketAddr = "127.0.0.1:7500".parse().unwrap();
+    let preferred_rival = make_live_connection(preferred_addr, ConnectionDirection::Outbound).await;
+
+    let _guard = {
+        let pool = pool.clone();
+        let peer_id = remote_peer_id.clone();
+        let existing_before = existing_before.clone();
+        let wrong_direction_rival = wrong_direction_rival.clone();
+        let preferred_rival = preferred_rival.clone();
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            match &event {
+                crate::TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    if let Some(sh) = existing_before.stream_handle.as_ref() {
+                        sh.exit_flag.store(true, Ordering::Release);
+                    }
+                }
+                crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    pool.publish_current_peer_connection(&peer_id, wrong_direction_rival.clone());
+                }
+                crate::TransportLifecycleEvent::OutboundFinalizeReplaceExistingRetryAttempt {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    // Deregister first: `add_connection_by_peer_id` below
+                    // fires its own (non-matching) `SessionPublished` event
+                    // through this same global hook, avoiding reentrant
+                    // invocation.
+                    crate::set_transport_lifecycle_recorder(None);
+                    assert!(pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        preferred_addr,
+                        preferred_rival.clone()
+                    ));
+                }
+                _ => {}
+            }
+        }))
+    };
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .await;
+
+    assert!(
+        matches!(result, Err(crate::GossipError::ConnectionExists)),
+        "a candidate whose nested ReplaceExisting retry also loses to a preferred rival must be \
+         surfaced as an error, never handed back to the caller as a live handle: got {result:?}"
+    );
+
+    let current = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        current
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &preferred_rival)),
+        "the preferred rival published into the nested ReplaceExisting retry window must remain \
+         the peer's current session (got {current:?})"
+    );
+    assert!(
+        preferred_rival.has_live_stream(),
+        "the preferred rival's background tasks must survive untouched"
+    );
+    assert!(
+        !wrong_direction_rival.has_live_stream(),
+        "the evicted wrong-direction rival must actually have been torn down"
+    );
+
+    assert!(
+        pool.get_lock_free_connection(dial_addr).is_none(),
+        "the rejected candidate must not remain indexed in connections_by_addr at its own \
+         dial address"
+    );
+    assert!(
+        pool.addr_to_peer_id
+            .read_sync(&dial_addr, |_, v| v.clone())
+            .is_none(),
+        "the rejected candidate's dial address must not remain mapped to the peer id"
+    );
+
+    assert_eq!(
+        pool.connection_counter.load(Ordering::SeqCst),
+        baseline + 1,
+        "connection_counter must reflect only the legitimately published `existing_before` and \
+         `preferred_rival` sessions (`wrong_direction_rival` was published test-internally via \
+         `publish_current_peer_connection`, never counted, mirroring the sibling \
+         `outbound_finalize_evict_replace_retry_loss_to_new_rival_fully_unpublishes` test) — the \
+         candidate that lost its nested re-resolution must never be counted"
+    );
+}
+
+/// RED (review finding A, P1, outbound-finalize `ReplaceExisting` eager
+/// decision arm): the decision above is computed against `existing_before` —
+/// a live, wrong-direction rival — and evicts it via the instance-scoped
+/// `disconnect_connection_instance` (a self-validating CAS that declines
+/// harmlessly if `existing_before` was already superseded). Before this fix,
+/// the arm then called `publish_current_peer_connection` UNCONDITIONALLY
+/// afterward, on the theory that "the tie-break already decided we win
+/// regardless of what is indexed at this instant" — which is exactly wrong
+/// when a FRESH, tie-break-preferred session is published for the same peer
+/// in the gap between the eviction attempt and that publish: the eviction
+/// correctly leaves the fresh session alone (it is no longer `existing_before`),
+/// but the old unconditional publish still clobbered it, orphaning the fresh
+/// session and reporting the stale, now-invalid outbound as current.
+///
+/// Local uses the LOWER NodeId, so `should_keep_connection(remote,
+/// is_outbound=true) == true` — a fresh OUTBOUND dial is tie-break preferred
+/// — and `existing_before` is a live INBOUND rival (`keep_existing == false`),
+/// so the eager decision is `ReplaceExisting`.
+///
+/// Pinned deterministically via `TransportLifecycleRecorderGuard` on
+/// `OutboundFinalizePublishAttempt` (fires unconditionally immediately before
+/// the outbound's own compare-and-publish attempt, AFTER the eviction of
+/// `existing_before` has already run): when it fires, a FRESH, genuinely
+/// live, tie-break-preferred OUTBOUND connection is published for real
+/// (counted) into the peer's session slot — modelling a concurrent
+/// accept/finalize landing in the gap between this candidate's eviction of
+/// `existing_before` and its own publish. The re-resolved, address-blind
+/// tie-break against that fresh outbound comes back `RejectIncoming` (an
+/// equally-preferred, already-live rival is kept over a not-yet-installed
+/// duplicate) — the "avoid duplicate/flapping outbound dials" case.
+///
+/// RED at HEAD (before this fix): `result.is_ok()` (the stale candidate is
+/// handed back as a live handle, clobbering `fresh`). GREEN after the fix:
+/// `result == Err(GossipError::ConnectionExists)`, `fresh` remains current,
+/// and `connection_counter` reflects only `fresh` (`existing_before` was
+/// evicted and its own count released).
+#[tokio::test]
+async fn outbound_finalize_replace_existing_compare_and_publishes_against_snapshot() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) =
+        hi_lo_keypairs("replace-existing-cas-gap-hi", "replace-existing-cas-gap-lo");
+    let remote_peer_id = hi_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(lo_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+
+    // The pre-existing, live, WRONG-DIRECTION (inbound) rival the decision
+    // is computed about, at its own address — distinct from the fresh
+    // outbound's own dial address below.
+    let existing_addr: SocketAddr = "127.0.0.1:7495".parse().unwrap();
+    let existing_before = make_live_connection(existing_addr, ConnectionDirection::Inbound).await;
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        existing_addr,
+        existing_before.clone()
+    ));
+
+    let baseline = pool.connection_counter.load(Ordering::SeqCst);
+    assert_eq!(
+        baseline, 1,
+        "test precondition: exactly one counted session"
+    );
+
+    let dial_addr: SocketAddr = "127.0.0.1:7496".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+
+    // The FRESH, genuinely live, tie-break-preferred (outbound) rival
+    // published concurrently, into the exact gap between this candidate's
+    // eviction of `existing_before` and its own publish attempt.
+    let fresh_addr: SocketAddr = "127.0.0.1:7497".parse().unwrap();
+    let fresh = make_live_connection(fresh_addr, ConnectionDirection::Outbound).await;
+
+    let _guard = {
+        let pool = pool.clone();
+        let peer_id = remote_peer_id.clone();
+        let fresh = fresh.clone();
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            if let crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                peer: event_peer,
+                ..
+            } = &event
+                && *event_peer == peer_id
+            {
+                // Deregister first: `add_connection_by_peer_id` below fires
+                // its own (non-matching) `SessionPublished` event through
+                // this same global hook, avoiding reentrant invocation.
+                crate::set_transport_lifecycle_recorder(None);
+                assert!(pool.add_connection_by_peer_id(peer_id.clone(), fresh_addr, fresh.clone()));
+            }
+        }))
+    };
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .await;
+
+    assert!(
+        matches!(result, Err(crate::GossipError::ConnectionExists)),
+        "a stale outbound candidate whose compare-and-publish re-resolution loses to a \
+         concurrently published, tie-break-preferred rival must be surfaced as an error, never \
+         handed back to the caller as a live handle: got {result:?}"
+    );
+
+    let current = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+        "the FRESH outbound published concurrently in the compare-and-publish gap must remain \
+         the peer's current session — the stale candidate's own publish, computed from a \
+         superseded `existing_before` snapshot, must never overwrite it (got {current:?})"
+    );
+    assert!(
+        fresh.has_live_stream(),
+        "the fresh outbound's background tasks must survive untouched"
+    );
+    assert!(
+        !existing_before.has_live_stream(),
+        "the evicted wrong-direction rival must actually have been torn down"
+    );
+
+    assert!(
+        pool.get_lock_free_connection(dial_addr).is_none(),
+        "the rejected candidate must not remain indexed in connections_by_addr at its own \
+         dial address"
+    );
+    assert!(
+        pool.addr_to_peer_id
+            .read_sync(&dial_addr, |_, v| v.clone())
+            .is_none(),
+        "the rejected candidate's dial address must not remain mapped to the peer id"
+    );
+
+    assert_eq!(
+        pool.connection_counter.load(Ordering::SeqCst),
+        baseline,
+        "connection_counter must reflect only `fresh` — `existing_before` was evicted (its own \
+         count released) and the stale candidate that lost its compare-and-publish \
+         re-resolution must never be counted, so the total stays exactly where it started"
+    );
+}
+
 /// RED (review finding P1, outbound-finalize impure rival lookup):
 /// `finalize_new_outbound_connection` used to call
 /// `get_connection_by_peer_id` for its tie-break rival lookup *after* the
