@@ -413,6 +413,41 @@ impl<T> ConnectionPool<T> {
                         }
                     }
 
+                    // Guard 2b (post-cert self-dial short-circuit, address-only
+                    // path): Guard 2 above only fires when `resolved_node_id`
+                    // is already populated *before* dialing. For an
+                    // address-only outbound (bootstrap/configured-seed
+                    // mistake, a DNS refresh that lands on a self address, or
+                    // a stale connections_by_addr/discovery entry with no
+                    // node_id attached), `resolved_node_id` is `None` on
+                    // entry and Guard 2 is skipped entirely — the dial
+                    // proceeds through TCP/TLS and `discovered_node_id` is
+                    // only known now, from the peer's cert-verified identity
+                    // above. Re-check identity here, immediately after the
+                    // cert-derived identity becomes available and strictly
+                    // before the hello handshake / `finalize_new_outbound_connection`,
+                    // so a self-dial can never be indexed, published, or
+                    // counted under this registry's own PeerId. Terminal
+                    // error — this returns directly out of the connect
+                    // future, so no wait-for-preferred-inbound / fallback /
+                    // retry machinery is armed for it.
+                    if let Some(node_id_value) = discovered_node_id.as_ref() {
+                        let discovered_peer_id = crate::PeerId::from(node_id_value);
+                        if discovered_peer_id == registry_arc.peer_id {
+                            warn!(
+                                target: "icanact_remote_lifecycle",
+                                attempt_id,
+                                addr = %addr,
+                                peer_id = %discovered_peer_id,
+                                "outbound_connect_refused_self_dial_post_cert"
+                            );
+                            return Err(GossipError::Network(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "refusing to dial self peer_id",
+                            )));
+                        }
+                    }
+
                     let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(|proto| proto.to_vec());
                     let hello_started = Instant::now();
                     let peer_caps = match crate::handshake::perform_hello_handshake(
