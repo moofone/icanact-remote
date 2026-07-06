@@ -3067,6 +3067,11 @@ impl<T> ConnectionPool<T> {
             crate::lifecycle::TransportLifecycleEvent::ConnectionCountMarkerAttempt { instance_id },
         );
         if self.mark_instance_counted(instance_id) {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::ConnectionCountIncrementAttempt {
+                    instance_id,
+                },
+            );
             self.connection_counter.fetch_add(1, Ordering::AcqRel);
         }
     }

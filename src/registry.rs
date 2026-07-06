@@ -11394,6 +11394,101 @@ mod tests {
         );
     }
 
+    /// RED (re-review residual of the #86 fix above): `count_in_new_instance`
+    /// fires `ConnectionCountMarkerAttempt` and inserts the `counted_instances`
+    /// marker BEFORE it bumps `connection_counter` — so a concurrent teardown
+    /// of the SAME instance can land strictly *after* the insert but *before*
+    /// the increment: `remove_sync` finds the marker (present), decrements,
+    /// and only THEN does the original caller's `fetch_add` run. At a
+    /// baseline of 0 this used to leak permanently: the decrement used a
+    /// `saturating_sub`, which clamps the transient `0 -> -1` down to `0`
+    /// instead of letting it go net-negative, so the following `+1` landed on
+    /// `0` and produced `1` — with the marker already gone, nothing can ever
+    /// release that phantom unit again. Reconnect/failover churn compounds
+    /// this until the admission gate (`add_lock_free_connection`'s
+    /// `connection_count >= max_connections` check) falsely trips with no
+    /// real growth in live connections.
+    ///
+    /// Pinned deterministically via
+    /// `TransportLifecycleEvent::ConnectionCountIncrementAttempt`, fired
+    /// immediately after the marker insert succeeds and immediately before
+    /// the paired `fetch_add` — the exact insert-then-teardown-then-increment
+    /// window this finding depends on, distinct from
+    /// `ConnectionCountMarkerAttempt` (fired before the insert, and already
+    /// covered by `count_marker_teardown_race_does_not_leak_connection_counter`
+    /// above).
+    #[tokio::test]
+    async fn count_marker_teardown_between_insert_and_increment_does_not_leak() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9760), test_config());
+        let peer_id = test_peer_id("count_marker_insert_increment_race_peer");
+        let addr = test_addr(9761);
+        let pool = registry.connection_pool.clone();
+
+        let baseline = pool.raw_connection_counter();
+        assert_eq!(
+            baseline, 0,
+            "test precondition: a fresh pool has no live sessions"
+        );
+
+        let (io, _keep) = tokio::io::duplex(1024);
+        let (sh, _w, _r) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(sh));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        let instance_id = conn
+            .stream_handle
+            .as_ref()
+            .expect("stream handle set above")
+            .instance_id();
+
+        // The mid-window teardown: fires exactly between the
+        // `counted_instances` marker insert and the `connection_counter`
+        // increment (inside `count_in_new_instance`, reached here via
+        // `add_connection_by_peer_id`), mirroring a concurrent
+        // `release_counted_instance` racing this exact instance in that gap.
+        let _guard = {
+            let pool = pool.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::ConnectionCountIncrementAttempt {
+                    instance_id: fired_id,
+                } = &event
+                    && *fired_id == instance_id
+                {
+                    // Deregister first: this closure must fire exactly once
+                    // for this exact instance.
+                    crate::set_transport_lifecycle_recorder(None);
+                    pool.release_counted_instance(instance_id);
+                }
+            }))
+        };
+
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, conn.clone()));
+
+        let final_count = pool.raw_connection_counter();
+        assert_eq!(
+            final_count,
+            baseline,
+            "connection_counter must return to baseline ({baseline}) after a mid-window \
+             teardown raced the marker-insert/counter-increment pairing — got {final_count} \
+             (permanently leaked {} if unfixed by a saturating clamp)",
+            final_count.saturating_sub(baseline)
+        );
+    }
+
     /// RED (absence-of-alias misread as superseded): a socket failure for an
     /// INBOUND current session's *ephemeral* peer address — which was never
     /// (or is no longer) indexed in `connections_by_addr` — must NOT be
