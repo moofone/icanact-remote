@@ -12984,6 +12984,77 @@ mod tests {
         );
     }
 
+    // RED (investigate-self-connect-loop): relayed peer-list gossip that
+    // describes THIS node's own advertised address (as another peer would
+    // see and re-gossip it) is neither filtered by
+    // `PeerDiscovery::on_peer_list_gossip` (which self-filters against
+    // `local_addr`, constructed from `bind_addr` at registry construction —
+    // see `GossipRegistry::new`, `PeerDiscovery::new(bind_addr, ..)`) nor by
+    // `on_peer_list_gossip` itself, when `advertise_address` differs from
+    // `bind_addr` (the common NAT/K8s/devnet-mesh case). The gossiped entry
+    // even carries this node's own `GossipNodeId` and is still not
+    // recognized as self. The candidate address is handed back to the
+    // caller (`connection_pool/pool_connect.rs` `PeerListGossip` handler),
+    // which dials it — driving `ConnectionPool::connect_via_stream` into a
+    // self-dial: `should_keep_connection` (registry.rs) is hard-coded
+    // `false` for `remote_peer_id == self.peer_id` regardless of direction,
+    // so `wait_for_preferred_connection` (transport_stream.rs) can never
+    // converge and the outbound path free-runs
+    // `outbound_connect_wait_preferred_inbound` ->
+    // `outbound_connect_preferred_inbound_timeout_fallback_dial` forever.
+    // This test proves the gap at the discovery/self-filter boundary, one
+    // level before the connection-pool livelock.
+    #[tokio::test]
+    async fn on_peer_list_gossip_does_not_filter_self_when_advertise_address_differs_from_bind_addr()
+     {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            advertise_address: Some(test_addr(19_100)),
+            ..test_config_with_seed("self-connect-loop")
+        };
+
+        // bind_addr (19_099) != advertise_address (19_100): the same
+        // bind-vs-advertise split that occurs in production whenever a node
+        // binds to one address/port and advertises a different externally
+        // reachable one (NAT, container port mapping, mesh overlay IP).
+        let registry = GossipRegistry::<()>::new(test_addr(19_099), config);
+        let self_advertised_addr = registry.advertised_addr();
+        assert_ne!(
+            self_advertised_addr,
+            test_addr(19_099),
+            "test setup requires advertise_address to differ from bind_addr"
+        );
+
+        let self_node_id = registry.peer_id.to_node_id();
+        let peers = vec![PeerInfoGossip {
+            address: self_advertised_addr.to_string(),
+            peer_address: None,
+            node_id: Some(self_node_id),
+            failures: 0,
+            last_attempt: 1,
+            last_success: 1,
+            dns_name: None,
+        }];
+
+        let candidates = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9999", 1)
+            .await;
+
+        assert!(
+            !candidates.contains(&self_advertised_addr),
+            "self-connect guard gap: relayed gossip describing this node's own \
+             advertised address (node_id == self.peer_id) was returned as a \
+             dial candidate instead of being filtered as self. This is what \
+             feeds ConnectionPool::get_connection / connect_via_stream a \
+             self-dial, which then free-runs \
+             outbound_connect_wait_preferred_inbound -> \
+             outbound_connect_preferred_inbound_timeout_fallback_dial forever \
+             because should_keep_connection(self, _) is unconditionally false \
+             so wait_for_preferred_connection can never converge."
+        );
+    }
+
     #[tokio::test]
     async fn test_refresh_peer_dns_rejects_unsafe_resolution_results() {
         // Use a non-loopback current address so it won't match localhost results.
