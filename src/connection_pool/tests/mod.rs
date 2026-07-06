@@ -451,6 +451,39 @@ async fn get_connection_by_peer_id_rejects_alias_identity_mismatch() {
 }
 
 #[tokio::test]
+async fn finalize_binds_cert_identity_over_stale_addr_map_on_rekey() {
+    // Rekey/restart: a peer B was previously at `addr`, so the addr->peer map
+    // still points at B. The peer that ACTUALLY answers now is A (new identity
+    // at the same address), proven by A's TLS certificate (`tofu_node_id`). The
+    // finalized connection must bind A — the cert-verified identity — not the
+    // stale cached B, otherwise the per-message identity guard black-holes every
+    // frame A sends.
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let addr: SocketAddr = "127.0.0.1:40611".parse().unwrap();
+
+    let stale_b = crate::KeyPair::new_for_testing("rekey_stale_peer_b").peer_id();
+    pool.add_addr_to_peer_id(addr, stale_b.clone());
+
+    let new_a = crate::KeyPair::new_for_testing("rekey_new_peer_a").peer_id();
+    let new_a_node_id = new_a.to_node_id();
+
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let _handle = pool
+        .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), Some(new_a_node_id))
+        .await
+        .expect("finalize outbound connection");
+
+    let conn = pool
+        .get_connection_by_addr(&addr)
+        .expect("finalized connection is indexed by addr");
+    assert_eq!(
+        conn.embedded_peer_id.as_ref(),
+        Some(&new_a),
+        "cert-verified TOFU identity must take precedence over the stale addr->peer map"
+    );
+}
+
+#[tokio::test]
 async fn remove_connection_cleans_all_address_aliases_for_same_stream() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer_id = crate::KeyPair::new_for_testing("remove_alias_connection").peer_id();
