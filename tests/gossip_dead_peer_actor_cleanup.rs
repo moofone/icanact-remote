@@ -645,7 +645,7 @@ fn disconnect_handler_retains_actors_after_transport_failure() -> Result<(), Dyn
         // observes a socket close.
         publisher
             .registry
-            .handle_peer_connection_failure(sub_addr)
+            .handle_peer_connection_failure(sub_addr, None)
             .await?;
 
         // Failures should be jammed to `max_peer_failures`, but actor
@@ -694,7 +694,7 @@ fn disconnect_handler_canonicalizes_ephemeral_source_addr_before_cleanup() -> Re
 
         publisher
             .registry
-            .handle_peer_connection_failure(ephemeral_source_addr)
+            .handle_peer_connection_failure(ephemeral_source_addr, None)
             .await?;
 
         assert_eq!(
@@ -854,7 +854,7 @@ fn socket_close_does_not_trigger_actor_removed_broadcast() -> Result<(), DynErro
 
         publisher
             .registry
-            .handle_peer_connection_failure(sub_addr)
+            .handle_peer_connection_failure(sub_addr, None)
             .await?;
 
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;

@@ -329,12 +329,13 @@ impl LockFreeStreamHandle {
                     let pool = &registry.connection_pool;
                     let peer_id = peer_id_hint.or_else(|| pool.get_peer_id_by_addr(&peer_addr));
 
+                    let mut superseded = false;
                     if let Some(peer_id) = peer_id.as_ref()
                         && let Some(current) = pool.get_connection_by_peer_id(peer_id)
                         && let Some(handle) = current.stream_handle.as_ref()
                         && handle.instance_id() != expected_instance
                     {
-                        should_cancel_pending = false;
+                        superseded = true;
                         debug!(
                             peer = %peer_addr,
                             peer_id = %peer_id,
@@ -347,13 +348,67 @@ impl LockFreeStreamHandle {
                         && let Some(handle) = current.stream_handle.as_ref()
                         && handle.instance_id() != expected_instance
                     {
-                        should_cancel_pending = false;
+                        superseded = true;
                         debug!(
                             peer = %peer_addr,
                             exiting_instance = expected_instance,
                             current_instance = handle.instance_id(),
                             "IO task exited for stale addr-mapped connection; skipping pending cancel/failure handling"
                         );
+                    }
+
+                    if superseded {
+                        should_cancel_pending = false;
+                        // The exiting IO task's OWN instance is superseded —
+                        // the peer's current session (or, address-only, the
+                        // addr-indexed session) is a DIFFERENT stream
+                        // instance. `should_cancel_pending = false` above
+                        // suppresses pending-request cancellation and
+                        // peer-wide failure accounting/consensus/gossip
+                        // signalling, which must never fire for a superseded
+                        // exit. It must NOT, however, suppress retiring the
+                        // exiting instance's own bookkeeping: this call is
+                        // the sole production caller that can retire it, and
+                        // skipping it here leaves a zombie
+                        // `connections_by_addr` alias plus a leaked
+                        // `connection_counter` contribution forever (nothing
+                        // else will ever find this instance again once it is
+                        // no longer indexed by address). This goes straight
+                        // to the pool's instance-scoped cleanup rather than
+                        // through `GossipRegistry::handle_peer_connection_failure`:
+                        // that function's own superseded-instance branch is
+                        // reached only when `peer_id` is resolvable; for the
+                        // address-only branch above (`peer_id` unknown) it
+                        // instead falls through to its unconditional
+                        // peer-wide tail (marks the peer failed, may trigger
+                        // consensus) — exactly the accounting this path must
+                        // never fire. Calling the pool method directly is
+                        // correct and synchronous for both branches, and
+                        // never touches the current (winning) session: the
+                        // compare-and-remove inside is keyed on
+                        // `expected_instance`'s own identity.
+                        let retired =
+                            pool.remove_connection_instance_by_id(peer_addr, expected_instance);
+                        if retired.is_none() {
+                            // Not found at `peer_addr` — either a fresh
+                            // reconnect already reindexed that address, or a
+                            // different teardown path (e.g. a concurrent
+                            // `ReplaceExisting` tie-break's
+                            // `disconnect_connection_instance`) already
+                            // retired this exact instance. Route through the
+                            // shared ownership table rather than
+                            // decrementing unconditionally: it releases the
+                            // compensating count exactly once if it is still
+                            // outstanding, and is a safe no-op both when
+                            // another path already released it and when this
+                            // instance (a rejected outbound candidate that
+                            // `unpublish_rejected_outbound_candidate` aborted
+                            // without ever counting it) was never counted at
+                            // all — which is exactly what prevents this
+                            // fallback from underflowing `connection_counter`
+                            // for a candidate that never bumped it.
+                            pool.release_displaced_connection_count(expected_instance);
+                        }
                     }
 
                     if should_cancel_pending {
@@ -367,7 +422,9 @@ impl LockFreeStreamHandle {
                             correlation.cancel_all();
                         }
                         tokio::spawn(async move {
-                            if let Err(e) = registry.handle_peer_connection_failure(peer_addr).await
+                            if let Err(e) = registry
+                                .handle_peer_connection_failure(peer_addr, Some(expected_instance))
+                                .await
                             {
                                 warn!(
                                     peer = %peer_addr,
@@ -616,7 +673,8 @@ impl LockFreeStreamHandle {
                         let is_immediate_payload =
                             matches!(&command, WriteCommand::ImmediatePayload(_));
                         let payload = match command {
-                            WriteCommand::Payload(payload) | WriteCommand::ImmediatePayload(payload) => payload,
+                            WriteCommand::Payload(payload)
+                            | WriteCommand::ImmediatePayload(payload) => payload,
                             WriteCommand::AskPayload(payload) => {
                                 wrote_ask_payload = true;
                                 payload

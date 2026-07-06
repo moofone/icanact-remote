@@ -49,6 +49,13 @@ impl<T> ConnectionPool<T> {
                     attempt_id,
                 },
             );
+            // Computed once and reused both for the existing-connection
+            // tie-break immediately below and the preferred-inbound
+            // suppression check further down (`should_keep_connection(peer,
+            // true)` is a pure function of identity, so both call sites
+            // asking the identical question must see the identical answer —
+            // and this avoids a redundant call).
+            let keep_outbound_dial = registry_arc.should_keep_connection(&remote_peer_id, true);
             if let Some(existing_conn) = self.get_connection_by_peer_id(&remote_peer_id) {
                 let alive = if let Some(stream_handle) = existing_conn.stream_handle.as_ref() {
                     existing_conn.is_connected() && !stream_handle.exit_flag.load(Ordering::Acquire)
@@ -56,6 +63,24 @@ impl<T> ConnectionPool<T> {
                     false
                 };
                 if !alive {
+                    // Routed through the shared identity-only chokepoint
+                    // (`resolve_connection_conflict`). Both outcomes it can
+                    // produce for a stale/dead rival (`AcceptIncoming` /
+                    // `EvictStaleRejectIncoming`) lead to the identical action
+                    // here — evict — because this call site defers the actual
+                    // dial-vs-wait-for-preferred-inbound decision to the
+                    // `keep_outbound_dial` check below, regardless of which of
+                    // the two decisions comes back.
+                    let decision = resolve_connection_conflict(false, false, keep_outbound_dial);
+                    debug_assert!(
+                        matches!(
+                            decision,
+                            ConnectionConflictDecision::AcceptIncoming
+                                | ConnectionConflictDecision::EvictStaleRejectIncoming
+                        ),
+                        "resolve_connection_conflict must never return a live-rival decision \
+                         when existing_usable=false, got {decision:?}"
+                    );
                     info!(
                         target: "icanact_remote_lifecycle",
                         attempt_id,
@@ -63,27 +88,51 @@ impl<T> ConnectionPool<T> {
                         addr = %existing_conn.addr,
                         "outbound_tiebreak_evict_stale"
                     );
-                    let _ = self.remove_connection(existing_conn.addr);
-                } else if registry_arc.should_keep_connection(
-                    &remote_peer_id,
-                    existing_conn.direction == ConnectionDirection::Outbound,
-                ) {
-                    info!(
-                        target: "icanact_remote_lifecycle",
-                        attempt_id,
-                        remote = %remote_peer_id,
-                        addr = %existing_conn.addr,
-                        "outbound_tiebreak_reuse_existing"
-                    );
-                    if let Some(handle) =
-                        self.make_connection_handle(existing_conn.addr, &existing_conn)
-                    {
-                        return Ok(handle);
-                    }
-                    return Err(GossipError::Network(std::io::Error::other(
-                        "Existing connection missing writer handle",
-                    )));
+                    // Instance-scoped, never address-keyed: `existing_conn` was
+                    // observed dead/stale above, but a fresh preferred
+                    // connection can be reindexed at the exact same bind
+                    // address between that aliveness check and this eviction
+                    // (e.g. a concurrent inbound accept). A plain
+                    // `remove_connection(existing_conn.addr)` would delete
+                    // whatever is *currently* at that address — the fresh
+                    // session, not the stale instance actually being retired.
+                    // `disconnect_connection_instance` re-validates by `Arc`
+                    // identity immediately before acting and is a no-op if
+                    // `existing_conn` has already been superseded.
+                    let _ = self.disconnect_connection_instance(&remote_peer_id, &existing_conn);
                 } else {
+                    // NOT routed through `resolve_connection_conflict` — see
+                    // that function's doc comment ("Explicitly-justified
+                    // exceptions") for the precise reason: this is a
+                    // one-input question ("is the connection I already hold
+                    // still the tie-break-correct one to keep"), asked before
+                    // any concrete incoming candidate exists. Synthesizing
+                    // `keep_outbound_dial` as a second input here would be
+                    // dishonest — it can be `false` (this side is the
+                    // higher-NodeId side) while the live existing outbound
+                    // must still be evicted as wrong-direction regardless, and
+                    // the chokepoint's formula would then wrongly reuse it.
+                    let keep_existing = registry_arc.should_keep_connection(
+                        &remote_peer_id,
+                        existing_conn.direction == ConnectionDirection::Outbound,
+                    );
+                    if keep_existing {
+                        info!(
+                            target: "icanact_remote_lifecycle",
+                            attempt_id,
+                            remote = %remote_peer_id,
+                            addr = %existing_conn.addr,
+                            "outbound_tiebreak_reuse_existing"
+                        );
+                        if let Some(handle) =
+                            self.make_connection_handle(existing_conn.addr, &existing_conn)
+                        {
+                            return Ok(handle);
+                        }
+                        return Err(GossipError::Network(std::io::Error::other(
+                            "Existing connection missing writer handle",
+                        )));
+                    }
                     info!(
                         target: "icanact_remote_lifecycle",
                         attempt_id,
@@ -106,7 +155,19 @@ impl<T> ConnectionPool<T> {
                             },
                         },
                     );
-                    let _ = self.disconnect_connection_by_peer_id(&remote_peer_id);
+                    // Instance-scoped, never peer-wide: `keep_existing` was
+                    // computed against this specific `existing_conn`, but a
+                    // fresh preferred inbound can be published/reindexed for
+                    // this peer between that decision and this eviction
+                    // (e.g. a concurrent inbound accept winning the tie-break
+                    // first). A plain `disconnect_connection_by_peer_id`
+                    // tears down "whatever is currently indexed" for the
+                    // peer — which would be that fresh session, not the
+                    // wrong-direction instance actually being retired here.
+                    // `disconnect_connection_instance` re-validates by `Arc`
+                    // identity immediately before acting and is a no-op if
+                    // `existing_conn` has already been superseded.
+                    let _ = self.disconnect_connection_instance(&remote_peer_id, &existing_conn);
                     // Arm the storm-prevention cooldown: this is a direct,
                     // local observation of a duplicate-connection conflict
                     // (not a generic socket failure), so it is safe and
@@ -116,7 +177,7 @@ impl<T> ConnectionPool<T> {
                 }
             }
 
-            if !registry_arc.should_keep_connection(&remote_peer_id, true) {
+            if !keep_outbound_dial {
                 info!(
                     target: "icanact_remote_lifecycle",
                     attempt_id,

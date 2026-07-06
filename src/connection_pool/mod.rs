@@ -45,4 +45,4 @@ include!("pool_connect.rs");
 pub(crate) mod transport_stream;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

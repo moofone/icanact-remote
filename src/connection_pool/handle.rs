@@ -81,6 +81,18 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    /// Instance id of the specific stream-handle backing this connection
+    /// handle, if any. Callers that need to retire *this exact* connection
+    /// instance (rather than "whatever is currently indexed for the peer")
+    /// use this together with `addr` and
+    /// `ConnectionPool::remove_connection_instance_by_id`.
+    #[inline]
+    pub(crate) fn instance_id(&self) -> Option<u64> {
+        self.stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id())
+    }
+
     #[inline]
     fn stream_handle(&self) -> Result<&Arc<LockFreeStreamHandle>> {
         self.stream_handle.as_ref().ok_or_else(|| {

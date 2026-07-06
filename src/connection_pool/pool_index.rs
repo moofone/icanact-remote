@@ -13,6 +13,20 @@ pub struct ConnectionPool<T = ()> {
     pub connections_by_addr: SccHashMap<SocketAddr, Arc<LockFreeConnection>>,
     /// Stable per-peer session state that survives reconnects.
     peer_sessions: SccHashMap<crate::PeerId, Arc<PeerSession>>,
+    /// Ownership table for outstanding `connection_counter` contributions,
+    /// keyed by stream-handle `instance_id`. Presence of a key IS the fact
+    /// "this instance's count is still outstanding and un-released" — set by
+    /// `mark_instance_counted` at the exact moment (and only at the moment)
+    /// an instance's count is actually added, consumed by
+    /// `release_counted_instance`'s single atomic `remove_sync`. This lets
+    /// any caller who only has an `instance_id` (a socket-failure handler, an
+    /// aborted IO task's exit guard) determine and consume ownership
+    /// correctly without ever needing to resolve the instance through an
+    /// index that may already have discarded it — and makes releases
+    /// exactly-once regardless of which teardown path notices a given
+    /// instance first, closing both the double-decrement (underflow) and
+    /// leaked-count classes structurally rather than by convention.
+    counted_instances: SccHashMap<u64, ()>,
     /// Cold-path dial ownership gate keyed by address so concurrent callers share one outbound dial.
     outbound_dial_gates: SccHashMap<SocketAddr, Arc<OutboundDialGate>>,
     max_connections: usize,
@@ -109,6 +123,88 @@ impl PeerSession {
 
     fn set_current_connection(&self, connection: Option<Arc<LockFreeConnection>>) {
         self.current_connection.store(connection);
+    }
+
+    /// Atomically clear the current connection iff it is still exactly
+    /// `expected` (`Arc::ptr_eq`) — a single lock-free CAS on the slot
+    /// itself via `ArcSwapOption::compare_and_swap`.
+    ///
+    /// This is deliberately NOT `read (ptr_eq check) -> store(None)` as two
+    /// separate steps: that idiom has a genuine gap between the check and
+    /// the store in which a concurrent `publish_current_peer_connection`
+    /// (e.g. a fresh preferred inbound landing mid-teardown) can install a
+    /// new `Arc`, which the second, unconditional step would then clobber.
+    /// A single CAS closes that gap completely: it either finds `expected`
+    /// still installed and atomically swaps it for `None`, or it finds
+    /// something else and leaves the slot untouched — there is no
+    /// observable state in between.
+    fn compare_and_clear_current_connection(&self, expected: &Arc<LockFreeConnection>) -> bool {
+        let previous = self.current_connection.compare_and_swap(expected, None);
+        matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected))
+    }
+
+    /// Like [`Self::compare_and_clear_current_connection`], but exposes what
+    /// was actually found in the slot when the CAS declines, via the same
+    /// single atomic CAS (no separate read).
+    ///
+    /// `Err(Some(other))` means a DIFFERENT connection is genuinely
+    /// installed as current — a real concurrent supersession the caller must
+    /// not touch. `Err(None)` means the slot was already empty: `expected`
+    /// was never the peer's "current" session at all — e.g. a decision
+    /// snapshot found it only via an address/alias fallback
+    /// (`ConnectionPool::peer_current_connection_snapshot`) without ever
+    /// promoting it there. That is NOT a concurrent supersession — nothing
+    /// is being protected by declining — so a caller evicting `expected` by
+    /// its own instance identity may safely proceed with that eviction
+    /// either way.
+    fn compare_and_take_current_connection(
+        &self,
+        expected: &Arc<LockFreeConnection>,
+    ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let previous = self.current_connection.compare_and_swap(expected, None);
+        if matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected)) {
+            Ok(())
+        } else {
+            Err((*previous).clone())
+        }
+    }
+
+    /// Publish-side counterpart to `compare_and_clear_current_connection`:
+    /// atomically install `new` as the current connection iff the slot is
+    /// still exactly `expected` — `None` meaning "still empty", `Some(arc)`
+    /// meaning "still holding that exact `Arc`" — via a single lock-free CAS
+    /// on the underlying `ArcSwapOption`.
+    ///
+    /// This closes the outbound-finalize publish gap: a decision computed
+    /// against a snapshot (`expected`) taken before this candidate was
+    /// indexed must never be enacted by blindly overwriting whatever is
+    /// installed *now*. A concurrent `publish_current_peer_connection` (a
+    /// fresh preferred inbound landing in the gap between that snapshot and
+    /// this call) leaves a different `Arc` in the slot; the CAS then finds a
+    /// mismatch and declines, returning the connection actually installed so
+    /// the caller can re-resolve the tie-break against reality instead of
+    /// clobbering it. There is no observable check-then-act gap: either the
+    /// slot still holds `expected` and is atomically swapped for `new`, or
+    /// it holds something else and is left completely untouched.
+    fn compare_and_set_current_connection(
+        &self,
+        expected: Option<&Arc<LockFreeConnection>>,
+        new: Arc<LockFreeConnection>,
+    ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let expected_owned: Option<Arc<LockFreeConnection>> = expected.cloned();
+        let previous = self
+            .current_connection
+            .compare_and_swap(&expected_owned, Some(new));
+        let matched = match (&expected_owned, &*previous) {
+            (None, None) => true,
+            (Some(exp), Some(prev)) => Arc::ptr_eq(exp, prev),
+            _ => false,
+        };
+        if matched {
+            Ok(())
+        } else {
+            Err((*previous).clone())
+        }
     }
 }
 
