@@ -2981,6 +2981,26 @@ where
                         peer_state_addr,
                         connection_arc.clone(),
                     );
+                    // No existing connection for this peer at all — nothing
+                    // to tie-break/re-resolve against, so this fast path is
+                    // intentionally not routed through the guarded
+                    // compare-and-publish + `finish_indexing_accepted_connection`
+                    // chokepoint (see the comment on `keep_connection` above).
+                    // Still index the separate ephemeral TCP source address
+                    // alias directly here, matching the ephemeral-aliasing
+                    // `finish_indexing_accepted_connection` performs for the
+                    // guarded arms below.
+                    if peer_addr != peer_state_addr {
+                        pool.index_connection_by_addr(peer_addr, connection_arc.clone());
+                        pool.add_addr_to_peer_id(peer_addr, peer_id.clone());
+                        debug!(
+                            node_id = %sender_node_id,
+                            peer_addr = %peer_addr,
+                            peer_state_addr = %peer_state_addr,
+                            "Also indexed incoming connection by ephemeral address for response \
+                             delivery"
+                        );
+                    }
                     info!(
                         target: "icanact_remote_lifecycle",
                         peer_id = %peer_id,
@@ -3058,9 +3078,12 @@ where
                                 // has already undone its own writes, so this
                                 // gets the IDENTICAL treatment as the
                                 // re-resolved tie-break reject arms below.
+                                let ephemeral_addr =
+                                    (peer_addr != peer_state_addr).then_some(peer_addr);
                                 if pool.finish_indexing_accepted_connection(
                                     &peer_id,
                                     peer_state_addr,
+                                    ephemeral_addr,
                                     &connection_arc,
                                 ) {
                                     true
@@ -3147,9 +3170,12 @@ where
                                 // of the peer session in the window before it
                                 // was durably indexed — treat it exactly like
                                 // the re-resolved tie-break reject case below.
+                                let ephemeral_addr =
+                                    (peer_addr != peer_state_addr).then_some(peer_addr);
                                 accepted = pool.finish_indexing_accepted_connection(
                                     &peer_id,
                                     peer_state_addr,
+                                    ephemeral_addr,
                                     &connection_arc,
                                 );
                                 if !accepted {
@@ -3201,30 +3227,19 @@ where
             return ConnectionCloseOutcome::DroppedByTieBreaker;
         }
 
-        // CRITICAL FIX: Also index by ephemeral peer_addr if it differs from peer_state_addr.
-        // This ensures that handle_response_message (which looks up by peer_addr) can find
-        // the connection AND the correlation tracker. Without this, responses fail to be
-        // delivered because they are looked up by the ephemeral address but only indexed
-        // by the configured bind address.
-        if peer_addr != peer_state_addr {
-            let pool = &registry.connection_pool;
-            crate::lifecycle::record_transport_event(
-                crate::lifecycle::TransportLifecycleEvent::InboundAcceptEphemeralAliasAttempt {
-                    peer: peer_id.clone(),
-                    addr: peer_addr,
-                },
-            );
-            pool.index_connection_by_addr(peer_addr, connection_arc.clone());
-            // Also add the addr_to_peer_id mapping so handle_response_message can look up
-            // the shared correlation tracker via peer_id
-            pool.add_addr_to_peer_id(peer_addr, peer_id.clone());
-            debug!(
-                node_id = %sender_node_id,
-                peer_addr = %peer_addr,
-                peer_state_addr = %peer_state_addr,
-                "Also indexed incoming connection by ephemeral address for response delivery"
-            );
-        }
+        // The ephemeral TCP source address alias (when it differs from
+        // `peer_state_addr`) is written as part of the SAME guarded,
+        // revalidated operation as the `peer_state_addr` alias itself —
+        // either inside `finish_indexing_accepted_connection` (the
+        // `AcceptIncoming`/`ReplaceExisting` arms above) or, for the
+        // no-existing-connection fast path, immediately alongside
+        // `add_connection_by_peer_id` in the `None` arm above. There must be
+        // no unconditional alias write here, outside those guarded bodies:
+        // a concurrent evict/supersede of `connection_arc` landing after
+        // `keep_connection` was decided but before an unconditional write
+        // here would resurrect a stale ephemeral alias for an
+        // already-evicted, already-aborted connection — the review finding
+        // this closes.
 
         debug!(
             node_id = %sender_node_id,
