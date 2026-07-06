@@ -420,22 +420,39 @@ impl<T> ConnectionPool<T> {
             Some(rival) => rival,
             None => {
                 // The CAS failed but the slot is empty now too: a concurrent
-                // CLEAR (not a publish) raced us. Safe to retry once against
-                // the now-empty slot; further nested races are out of scope,
-                // matching the tolerance the `EvictStaleRejectIncoming` arm
-                // above already documents for narrower races.
+                // CLEAR (not a publish) raced us. Retry once against the
+                // now-empty slot — instrumented so a test can deterministically
+                // pin a further concurrent publish into this exact retry gap.
                 crate::lifecycle::record_transport_event(
                     crate::lifecycle::TransportLifecycleEvent::OutboundFinalizeClearRaceRetry {
                         peer: peer_id.clone(),
                         addr: connection_arc.addr,
                     },
                 );
-                let _ = self.compare_and_publish_peer_connection(
+                match self.compare_and_publish_peer_connection(
                     peer_id,
                     None,
                     connection_arc.clone(),
-                );
-                return true;
+                ) {
+                    Ok(()) => return true,
+                    Err(Some(retry_rival)) => retry_rival,
+                    Err(None) => {
+                        // A second concurrent CLEAR raced the retry itself.
+                        // Nested races beyond this single bounded retry are
+                        // out of scope, matching the tolerance already
+                        // documented elsewhere in this function — reject
+                        // rather than loop indefinitely. The candidate was
+                        // never actually installed as the session, so it
+                        // must never be finalized as one.
+                        debug!(
+                            peer_id = %peer_id,
+                            "outbound finalize compare-and-publish retry also lost to a second \
+                             concurrent clear; rejecting our own candidate rather than retrying \
+                             indefinitely"
+                        );
+                        return false;
+                    }
+                }
             }
         };
         // A rival is actually installed now (e.g. a fresh preferred inbound

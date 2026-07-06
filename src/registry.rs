@@ -5620,7 +5620,20 @@ impl<T: 'static> GossipRegistry<T> {
                             },
                         );
                         let retired = pool.disconnect_connection_instance(peer_id, &current);
-                        let _ = failed_id;
+                        if !retired {
+                            // The CAS lost: a FRESH session was published for
+                            // this peer before it ran, so `current` (the
+                            // FAILED instance) was NOT removed from
+                            // `peer_sessions`/`connections_by_peer` — nor
+                            // should it be, those now correctly point at the
+                            // fresh winner. But `current` itself is still
+                            // outstanding: its address aliases and
+                            // `connection_counter` contribution must still
+                            // be released, by its own identity, without
+                            // touching the fresh winner. See
+                            // `retire_lost_cas_matched_instance`.
+                            pool.retire_lost_cas_matched_instance(&current, failed_id);
+                        }
                         info!(
                             peer_id = %peer_id,
                             observed_peer = %observed_peer_addr,
