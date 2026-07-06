@@ -1200,6 +1200,23 @@ impl<T> ConnectionPool<T> {
         let _ = self.connections_by_peer.remove_sync(peer_id);
     }
 
+    /// Check-then-unconditional-clear: reads `current_connection`,
+    /// `ptr_eq`-compares it to `candidate`, and — ONLY afterward, past a log
+    /// line and a lifecycle-event construction, a real gap — unconditionally
+    /// clears the slot. A concurrent `publish_current_peer_connection`
+    /// landing in that gap (e.g. a fresh preferred inbound for this exact
+    /// peer) is silently clobbered.
+    ///
+    /// `get_connection_by_peer_id`'s own internal self-heal no longer uses
+    /// this (see [`Self::compare_and_clear_current_peer_connection`]) —
+    /// this remains in use only by callers that are themselves already
+    /// acting on a connection they just pulled out of an index as part of
+    /// tearing it down (`remove_connection`'s per-alias peer cleanup,
+    /// `GossipRegistry`'s DNS-refresh dead-connection cleanup), where the
+    /// `candidate` was obtained from the SAME removal/observation this call
+    /// is reacting to rather than from an earlier decision snapshot. Prefer
+    /// [`Self::compare_and_clear_current_peer_connection`] for any new
+    /// caller.
     pub(crate) fn clear_current_peer_connection_if_matches(
         &self,
         peer_id: &crate::PeerId,
@@ -1246,11 +1263,94 @@ impl<T> ConnectionPool<T> {
         }
     }
 
+    /// Atomic counterpart to [`Self::clear_current_peer_connection_if_matches`]:
+    /// clears the peer's current-connection slot iff it still holds exactly
+    /// `candidate` (`Arc::ptr_eq`), via a single CAS
+    /// (`PeerSession::compare_and_clear_current_connection`) with no
+    /// observable check-then-act gap. Used by `get_connection_by_peer_id`'s
+    /// internal self-heal so a concurrent publish landing between "this
+    /// session looks stale" and "clear it" can never be clobbered — it
+    /// either finds `candidate` still installed and clears it, or finds the
+    /// concurrent publish already there and declines, untouched.
+    ///
+    /// Mirrors `clear_current_peer_connection_if_matches`'s scope exactly:
+    /// only the primary session slot and its `connections_by_peer` mirror
+    /// are touched — no `connections_by_addr`/`addr_to_peer_id` cleanup, no
+    /// counter release, no task abort. Callers that need full teardown of a
+    /// specific instance want `disconnect_connection_instance` instead.
+    fn compare_and_clear_current_peer_connection(
+        &self,
+        peer_id: &crate::PeerId,
+        candidate: &Arc<LockFreeConnection>,
+    ) -> bool {
+        let cleared = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| {
+                session.compare_and_clear_current_connection(candidate)
+            })
+            .unwrap_or(false);
+        if cleared {
+            let stream_instance_id = candidate
+                .stream_handle
+                .as_ref()
+                .map(|handle| handle.instance_id());
+            info!(
+                peer_id = %peer_id,
+                addr = %candidate.addr,
+                direction = ?candidate.direction,
+                stream_instance_id = ?stream_instance_id,
+                reason = "current_connection_cleared",
+                "transport_session_removed"
+            );
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
+                    peer: peer_id.clone(),
+                    addr: candidate.addr,
+                    direction: match candidate.direction {
+                        ConnectionDirection::Inbound => {
+                            crate::lifecycle::TransportDirection::Inbound
+                        }
+                        ConnectionDirection::Outbound => {
+                            crate::lifecycle::TransportDirection::Outbound
+                        }
+                    },
+                    reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
+                },
+            );
+            let _ = self
+                .connections_by_peer
+                .remove_if_sync(peer_id, |v| Arc::ptr_eq(v, candidate));
+        }
+        cleared
+    }
+
     fn is_usable_connection(&self, conn: &LockFreeConnection) -> bool {
         conn.has_live_stream()
     }
 
-    fn indexed_connection_by_peer_id(
+    /// PURE, non-mutating read of "what connection does this peer currently
+    /// have" — the primary session slot, then (as fallbacks, purely as
+    /// reads) the secondary `connections_by_peer` mirror, the
+    /// configured-address index, and the ephemeral-address alias index.
+    ///
+    /// This performs NO self-heal clear of a stale/unusable session and NO
+    /// publish of a fallback match into the peer session slot — unlike
+    /// `get_connection_by_peer_id`, which does both as side effects of a
+    /// primary-slot miss/staleness. That distinction is load-bearing for any
+    /// caller using the result ONLY to compute a tie-break/keep-drop
+    /// DECISION: taking this snapshot can never itself mutate pool state, so
+    /// a fresh, concurrently-published preferred session can never be
+    /// erased merely because something asked "what do you have for this
+    /// peer right now?" (reviewer finding P1, the outbound-finalize
+    /// `existing_before` snapshot calling the self-healing
+    /// `get_connection_by_peer_id` instead of a pure lookup).
+    ///
+    /// Callers that need the self-healing "give me the usable current
+    /// connection, repairing the index if needed" behavior for actual
+    /// message routing/dialing must keep using `get_connection_by_peer_id`
+    /// — that behavior is intentional there and is now itself race-free via
+    /// a CAS-based self-heal (see its own doc).
+    pub(crate) fn peer_current_connection_snapshot(
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
@@ -1508,6 +1608,23 @@ impl<T> ConnectionPool<T> {
     }
 
     /// Get a connection by peer ID
+    ///
+    /// This is a SELF-HEALING lookup, not a pure one: when the primary
+    /// session slot holds a connection that is no longer usable, it clears
+    /// that slot, and when a fallback (address/alias) lookup finds a live
+    /// match, it publishes that match back into the primary slot. Both are
+    /// intentional for callers that want "the live connection to route a
+    /// message through / dial against, repairing the index along the way" —
+    /// see `send_to_peer_id*`, `get_connection_to_peer`, and the various
+    /// consumers listed at the bottom of this function.
+    ///
+    /// It must never be used to decide a tie-break/keep-drop conflict: the
+    /// self-heal clear below is a real mutation, and callers that used it
+    /// only to compute a decision (e.g. `finalize_new_outbound_connection`'s
+    /// `existing_before`) could have that mutation race a concurrent publish
+    /// and erase a fresh session before the decision even ran. Use the pure
+    /// [`Self::peer_current_connection_snapshot`] for decision snapshots
+    /// instead.
     pub(crate) fn get_connection_by_peer_id(
         &self,
         peer_id: &crate::PeerId,
@@ -1526,7 +1643,28 @@ impl<T> ConnectionPool<T> {
                 "CONNECTION POOL: Connection for peer '{}' is not usable",
                 peer_id
             );
-            self.clear_current_peer_connection_if_matches(peer_id, &conn);
+            // Self-heal the stale slot, but atomically at the source: a
+            // check-then-unconditional-clear (the old
+            // `clear_current_peer_connection_if_matches` shape) has a real
+            // gap between the ptr_eq check above and the clear below, in
+            // which a concurrent `publish_current_peer_connection` (e.g. a
+            // fresh preferred inbound landing for this exact peer) can
+            // install a new session that the unconditional clear would then
+            // silently erase — this primitive being called from a
+            // decision-only context is precisely how that reproduced the
+            // tie-break reconnect thrash (reviewer finding P1). The
+            // instrumentation event below fires unconditionally,
+            // immediately before the attempt, so tests can pin a concurrent
+            // publish into this exact gap; the CAS then either finds `conn`
+            // still installed and clears it, or finds something else — the
+            // concurrent publish — and declines untouched.
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::GetConnectionSelfHealClearAttempt {
+                    peer: peer_id.clone(),
+                    addr: conn.addr,
+                },
+            );
+            let _ = self.compare_and_clear_current_peer_connection(peer_id, &conn);
         }
 
         // FALLBACK: Outbound connections may only be indexed by address.
@@ -2156,7 +2294,7 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
-        if let Some(connection) = self.indexed_connection_by_peer_id(peer_id) {
+        if let Some(connection) = self.peer_current_connection_snapshot(peer_id) {
             let stream_instance_id = connection
                 .stream_handle
                 .as_ref()
@@ -2315,13 +2453,29 @@ impl<T> ConnectionPool<T> {
     /// see the outbound-finalize `EvictStaleRejectIncoming`/`ReplaceExisting`
     /// call sites, which is exactly the gap that reproduced the tie-break
     /// reconnect thrash from the outbound side.
+    ///
+    /// `target` need not have ever been the peer's "current" session:
+    /// `peer_current_connection_snapshot` (the pure decision-snapshot
+    /// lookup `finalize_new_outbound_connection`'s `existing_before` and
+    /// `handle_incoming_connection_tls`'s inbound-accept decision use) can
+    /// find a rival purely via the configured-address or ephemeral-alias
+    /// fallback without ever promoting it to "current" — unlike the old
+    /// self-healing `get_connection_by_peer_id`, which used to publish such
+    /// a fallback match as a side effect of being read. So this
+    /// distinguishes two DIFFERENT reasons the primary-slot CAS can decline:
+    /// a genuinely different connection installed there (a real concurrent
+    /// supersession — must decline, untouched) versus the slot being
+    /// already empty (`target` simply was never promoted to "current" in
+    /// the first place — nothing is being protected by declining, so the
+    /// instance-scoped teardown below may still safely proceed by `target`'s
+    /// own identity).
     pub(crate) fn disconnect_connection_instance(
         &self,
         peer_id: &crate::PeerId,
         target: &Arc<LockFreeConnection>,
     ) -> bool {
-        // Atomic compare-and-clear on the peer's PRIMARY current-connection
-        // slot, by `Arc` identity, via `PeerSession::compare_and_clear_current_connection`
+        // Atomic compare-and-take on the peer's PRIMARY current-connection
+        // slot, by `Arc` identity, via `PeerSession::compare_and_take_current_connection`
         // (a single lock-free CAS on the underlying `ArcSwapOption`). This
         // IS the entire re-validation: it either finds `target` still
         // installed and clears it right here, atomically, or it finds
@@ -2330,20 +2484,39 @@ impl<T> ConnectionPool<T> {
         // deliberately no separate check-then-act pair here: a read
         // followed by an unconditional clear has a gap in which exactly
         // that concurrent publish can land and be clobbered.
-        let cleared = self
+        match self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
-                session.compare_and_clear_current_connection(target)
+                session.compare_and_take_current_connection(target)
             })
-            .unwrap_or(false);
-        if !cleared {
-            debug!(
-                peer_id = %peer_id,
-                "declined instance-scoped disconnect: the connection currently indexed for \
-                 this peer is no longer the expected instance (superseded by a concurrent \
-                 publish)"
-            );
-            return false;
+            .unwrap_or(Err(None))
+        {
+            Ok(()) => {}
+            Err(Some(_other)) => {
+                debug!(
+                    peer_id = %peer_id,
+                    "declined instance-scoped disconnect: the connection currently indexed for \
+                     this peer is no longer the expected instance (superseded by a concurrent \
+                     publish)"
+                );
+                return false;
+            }
+            Err(None) => {
+                // The primary slot is genuinely empty — `target` was never
+                // promoted to "current" (e.g. found only via
+                // `peer_current_connection_snapshot`'s address/alias
+                // fallback). No concurrent publish superseded it (that would
+                // show up as `Some(other)` above), so there is nothing to
+                // protect by declining: proceed with `target`'s own
+                // instance-scoped teardown below.
+                debug!(
+                    peer_id = %peer_id,
+                    addr = %target.addr,
+                    "instance-scoped disconnect target was never the peer's \"current\" \
+                     session (found only via an address/alias fallback); proceeding with its \
+                     own instance-scoped teardown"
+                );
+            }
         }
 
         let stream_instance_id = target
@@ -3258,22 +3431,37 @@ impl<T> ConnectionPool<T> {
         let connection_arc = Arc::new(conn);
 
         // Snapshot any pre-existing rival for this peer BEFORE this candidate
-        // is indexed by address/peer_id below. `get_connection_by_peer_id` is
-        // not a pure lookup: its configured-address and alias fallbacks read
-        // straight out of `connections_by_addr` / `addr_to_peer_id`. Calling
-        // it *after* indexing this candidate risks it returning the brand
-        // new connection as its own "existing rival" (the fallback matches
-        // the configured address, which is exactly the address we just
-        // dialed and already inserted) — that silently bypasses the
-        // `existing_usable == false` / `EvictStaleRejectIncoming` path and
-        // can let a non-preferred outbound become the current session, and
-        // makes `ReplaceExisting` "evict" nothing at all. Capturing the
-        // rival here, while the candidate is still unindexed, guarantees the
-        // decision and any eviction below can only ever target the real
-        // prior connection instance, never this new one.
+        // is indexed by address/peer_id below, via the PURE
+        // `peer_current_connection_snapshot` — never `get_connection_by_peer_id`.
+        // Two independent reasons this must be a pure read:
+        //
+        // 1. (fixed earlier) `get_connection_by_peer_id`'s configured-address
+        //    and alias fallbacks read straight out of `connections_by_addr` /
+        //    `addr_to_peer_id`. Calling it *after* indexing this candidate
+        //    risks it returning the brand new connection as its own
+        //    "existing rival" — capturing the snapshot before the candidate
+        //    is indexed closes that.
+        // 2. (reviewer finding P1, this fix) `get_connection_by_peer_id` is
+        //    ALSO not pure with respect to the candidate's own peer session:
+        //    when the primary slot holds an unusable connection it
+        //    self-heal-clears it as a side effect of being READ. A decision
+        //    snapshot must never mutate — if a PREFERRED inbound is
+        //    published for this peer in the internal check-then-clear gap of
+        //    that self-heal, the unconditional clear erases the fresh
+        //    session, `existing_before` comes back `None`, and the decision
+        //    below proceeds as if there were no rival at all, recreating the
+        //    exact collateral teardown this PR removes. A pure snapshot can
+        //    never trigger that clear in the first place, mutation or not.
+        //
+        // Capturing the rival here, while the candidate is still unindexed
+        // and via a snapshot that cannot itself mutate anything, guarantees
+        // the decision and any eviction below can only ever target the real
+        // prior connection instance, never this new one and never a
+        // concurrently published replacement destroyed by the snapshot
+        // itself.
         let existing_before = peer_id_opt
             .as_ref()
-            .and_then(|peer_id| self.get_connection_by_peer_id(peer_id));
+            .and_then(|peer_id| self.peer_current_connection_snapshot(peer_id));
 
         if let Some(peer_id) = peer_id_opt.as_ref() {
             crate::lifecycle::record_transport_event(

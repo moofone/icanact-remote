@@ -3150,27 +3150,36 @@ where
         // first contact is never rejected merely because this side happens
         // to be the lower-NodeId side.
         //
-        // What it must NOT do is treat the `None` snapshot from
-        // `get_connection_by_peer_id` as stable and unconditionally publish
-        // over it: two concurrent first inbound accepts for the SAME peer
-        // can both observe `None` here, and an unconditional
-        // `add_connection_by_peer_id` would let the later one silently
-        // overwrite the earlier one's already-published session while both
-        // sides' indexing/counting proceed independently — a duplicate
-        // counted/indexed zombie, the same snapshot-to-publish race the
-        // existing-connection arms below close via compare-and-publish. So
-        // this arm is routed through the identical
-        // `publish_inbound_or_reresolve` + `finish_indexing_accepted_connection`
+        // What it must NOT do is treat the `None` snapshot from this
+        // decision read as stable and unconditionally publish over it: two
+        // concurrent first inbound accepts for the SAME peer can both
+        // observe `None` here, and an unconditional `add_connection_by_peer_id`
+        // would let the later one silently overwrite the earlier one's
+        // already-published session while both sides' indexing/counting
+        // proceed independently — a duplicate counted/indexed zombie, the
+        // same snapshot-to-publish race the existing-connection arms below
+        // close via compare-and-publish. So this arm is routed through the
+        // identical `publish_inbound_or_reresolve` + `finish_indexing_accepted_connection`
         // chokepoint with `expected = None`: it installs this candidate only
         // if the peer session slot is still genuinely empty; on CAS-loss
         // (another first-accept won the race) it re-resolves the
         // address-blind tie-break against whichever connection actually won,
         // exactly like the existing-connection arms.
+        //
+        // This decision snapshot is deliberately taken via the PURE
+        // `peer_current_connection_snapshot`, never the self-healing
+        // `get_connection_by_peer_id` (reviewer finding P1): the latter
+        // clears an observed-unusable current session as a side effect of
+        // being read, so a preferred session published for this peer
+        // concurrently, in that self-heal's internal check-then-clear gap,
+        // could be silently erased before this decision even runs — the
+        // exact same defect the outbound-finalize `existing_before` snapshot
+        // had. A pure read can never trigger that clear.
         let keep_connection = {
             let pool = &registry.connection_pool;
             let registry_weak = Arc::downgrade(&registry);
 
-            match pool.get_connection_by_peer_id(&peer_id) {
+            match pool.peer_current_connection_snapshot(&peer_id) {
                 None => {
                     let accepted = if pool.publish_inbound_or_reresolve(
                         &peer_id,

@@ -143,6 +143,32 @@ impl PeerSession {
         matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected))
     }
 
+    /// Like [`Self::compare_and_clear_current_connection`], but exposes what
+    /// was actually found in the slot when the CAS declines, via the same
+    /// single atomic CAS (no separate read).
+    ///
+    /// `Err(Some(other))` means a DIFFERENT connection is genuinely
+    /// installed as current — a real concurrent supersession the caller must
+    /// not touch. `Err(None)` means the slot was already empty: `expected`
+    /// was never the peer's "current" session at all — e.g. a decision
+    /// snapshot found it only via an address/alias fallback
+    /// (`ConnectionPool::peer_current_connection_snapshot`) without ever
+    /// promoting it there. That is NOT a concurrent supersession — nothing
+    /// is being protected by declining — so a caller evicting `expected` by
+    /// its own instance identity may safely proceed with that eviction
+    /// either way.
+    fn compare_and_take_current_connection(
+        &self,
+        expected: &Arc<LockFreeConnection>,
+    ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let previous = self.current_connection.compare_and_swap(expected, None);
+        if matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected)) {
+            Ok(())
+        } else {
+            Err((*previous).clone())
+        }
+    }
+
     /// Publish-side counterpart to `compare_and_clear_current_connection`:
     /// atomically install `new` as the current connection iff the slot is
     /// still exactly `expected` — `None` meaning "still empty", `Some(arc)`
