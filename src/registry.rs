@@ -1680,17 +1680,33 @@ impl<T: 'static> GossipRegistry<T> {
                 // Peer discovery state
                 last_peer_gossip_time: 0,
                 peer_discovery: if config.enable_peer_discovery {
-                    Some(PeerDiscovery::new(
-                        bind_addr,
-                        PeerDiscoveryConfig {
-                            max_peers: config.max_peers,
-                            allow_private_discovery: config.allow_private_discovery,
-                            allow_loopback_discovery: config.allow_loopback_discovery,
-                            allow_link_local_discovery: config.allow_link_local_discovery,
-                            fail_ttl: config.fail_ttl,
-                            pending_ttl: config.pending_ttl,
-                        },
-                    ))
+                    Some(
+                        PeerDiscovery::new(
+                            // `local_addr` stays `bind_addr`: relayed/stale
+                            // gossip can describe this node by its raw
+                            // bind address with no `node_id` attached (see
+                            // `PeerInfo::local`), so `bind_addr` must always
+                            // be filtered here regardless of whether
+                            // `advertise_address` is configured.
+                            bind_addr,
+                            PeerDiscoveryConfig {
+                                max_peers: config.max_peers,
+                                allow_private_discovery: config.allow_private_discovery,
+                                allow_loopback_discovery: config.allow_loopback_discovery,
+                                allow_link_local_discovery: config.allow_link_local_discovery,
+                                fail_ttl: config.fail_ttl,
+                                pending_ttl: config.pending_ttl,
+                            },
+                        )
+                        // A peer relaying gossip about this node may
+                        // instead describe it by its *advertised* address,
+                        // which can differ from `bind_addr` under
+                        // NAT/K8s/mesh overlays. Filtering both — bind_addr
+                        // via `local_addr` above and the advertised address
+                        // here — closes that gap without ever filtering a
+                        // distinct real peer.
+                        .with_additional_self_addr(config.advertise_address),
+                    )
                 } else {
                     None
                 },
@@ -2333,6 +2349,16 @@ impl<T: 'static> GossipRegistry<T> {
             debug!(
                 peer = %peer_addr,
                 "refusing to add peer with unspecified address or zero port"
+            );
+            return;
+        }
+        // Identity self-filter (authoritative — address alone is not
+        // sufficient when advertise_address != bind_addr; see
+        // `on_peer_list_gossip`'s matching filter for the full rationale).
+        if node_id == Some(self.peer_id.to_node_id()) {
+            debug!(
+                peer = %peer_addr,
+                "refusing to add self as peer (node_id identifies this node)"
             );
             return;
         }
@@ -7349,6 +7375,32 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         let _now = current_timestamp();
+
+        // Identity self-filter: a peer may relay gossip describing THIS
+        // node under its *advertised* address (which can differ from
+        // `bind_addr` under NAT/K8s/mesh — see `advertised_addr()`). The
+        // address-keyed self-filter in `PeerDiscovery` only ever knew about
+        // `bind_addr`, so a relayed entry naming our own advertised address
+        // slipped through as a dial candidate and fed a self-dial livelock
+        // (`should_keep_connection` is unconditionally `false` for self in
+        // both directions, so `wait_for_preferred_connection` never
+        // converges). Identity is the authoritative signal here — filter by
+        // `node_id` first, independent of whatever address is attached.
+        let self_node_id = self.peer_id.to_node_id();
+        let peers: Vec<PeerInfoGossip> = peers
+            .into_iter()
+            .filter(|peer_gossip| {
+                if peer_gossip.node_id == Some(self_node_id) {
+                    debug!(
+                        addr = %peer_gossip.address,
+                        sender = %sender_addr,
+                        "dropping relayed gossip describing this node's own identity (self node_id)"
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect();
 
         // DON'T PENALIZE THE MESSENGER:
         // Count bogon IPs to detect if sender is sending suspicious data
@@ -12981,6 +13033,137 @@ mod tests {
         assert!(
             gossip_state.known_peers.get(&private_addr).is_none(),
             "private address should not be ingested into known_peers when allow_private_discovery=false"
+        );
+    }
+
+    // RED (investigate-self-connect-loop): relayed peer-list gossip that
+    // describes THIS node's own advertised address (as another peer would
+    // see and re-gossip it) is neither filtered by
+    // `PeerDiscovery::on_peer_list_gossip` (which self-filters against
+    // `local_addr`, constructed from `bind_addr` at registry construction —
+    // see `GossipRegistry::new`, `PeerDiscovery::new(bind_addr, ..)`) nor by
+    // `on_peer_list_gossip` itself, when `advertise_address` differs from
+    // `bind_addr` (the common NAT/K8s/devnet-mesh case). The gossiped entry
+    // even carries this node's own `GossipNodeId` and is still not
+    // recognized as self. The candidate address is handed back to the
+    // caller (`connection_pool/pool_connect.rs` `PeerListGossip` handler),
+    // which dials it — driving `ConnectionPool::connect_via_stream` into a
+    // self-dial: `should_keep_connection` (registry.rs) is hard-coded
+    // `false` for `remote_peer_id == self.peer_id` regardless of direction,
+    // so `wait_for_preferred_connection` (transport_stream.rs) can never
+    // converge and the outbound path free-runs
+    // `outbound_connect_wait_preferred_inbound` ->
+    // `outbound_connect_preferred_inbound_timeout_fallback_dial` forever.
+    // This test proves the gap at the discovery/self-filter boundary, one
+    // level before the connection-pool livelock.
+    #[tokio::test]
+    async fn on_peer_list_gossip_does_not_filter_self_when_advertise_address_differs_from_bind_addr()
+     {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            advertise_address: Some(test_addr(19_100)),
+            ..test_config_with_seed("self-connect-loop")
+        };
+
+        // bind_addr (19_099) != advertise_address (19_100): the same
+        // bind-vs-advertise split that occurs in production whenever a node
+        // binds to one address/port and advertises a different externally
+        // reachable one (NAT, container port mapping, mesh overlay IP).
+        let registry = GossipRegistry::<()>::new(test_addr(19_099), config);
+        let self_advertised_addr = registry.advertised_addr();
+        assert_ne!(
+            self_advertised_addr,
+            test_addr(19_099),
+            "test setup requires advertise_address to differ from bind_addr"
+        );
+
+        let self_node_id = registry.peer_id.to_node_id();
+        let peers = vec![PeerInfoGossip {
+            address: self_advertised_addr.to_string(),
+            peer_address: None,
+            node_id: Some(self_node_id),
+            failures: 0,
+            last_attempt: 1,
+            last_success: 1,
+            dns_name: None,
+        }];
+
+        let candidates = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9999", 1)
+            .await;
+
+        assert!(
+            !candidates.contains(&self_advertised_addr),
+            "self-connect guard gap: relayed gossip describing this node's own \
+             advertised address (node_id == self.peer_id) was returned as a \
+             dial candidate instead of being filtered as self. This is what \
+             feeds ConnectionPool::get_connection / connect_via_stream a \
+             self-dial, which then free-runs \
+             outbound_connect_wait_preferred_inbound -> \
+             outbound_connect_preferred_inbound_timeout_fallback_dial forever \
+             because should_keep_connection(self, _) is unconditionally false \
+             so wait_for_preferred_connection can never converge."
+        );
+    }
+
+    // RED (self-connect regression, Guard 1 follow-up): the fix above (using
+    // `advertise_address` as `PeerDiscovery`'s `local_addr`) closed the gap
+    // for a relayed self-entry that carries this node's `node_id`, but it
+    // reopened the ORIGINAL gap for a relayed self-entry that describes this
+    // node's `bind_addr` and carries NO `node_id` at all. This is exactly
+    // the shape of `PeerInfo::local`'s own self-entry (see `PeerInfo::local`,
+    // which always sets `node_id: None`) once it has been relayed/gossiped
+    // by another node and echoed back. Such an entry:
+    //   - passes the identity self-filter in `on_peer_list_gossip`
+    //     (line ~7385) because `peer_gossip.node_id != Some(self_node_id)`
+    //     (it's `None`);
+    //   - must therefore be caught by `PeerDiscovery`'s address-keyed
+    //     self-filter instead, which has to know about BOTH `bind_addr` and
+    //     `advertise_address`, not just whichever one `local_addr` happens
+    //     to hold.
+    // This proves `bind_addr` is filtered even when `advertise_address` is
+    // configured and differs from it.
+    #[tokio::test]
+    async fn on_peer_list_gossip_filters_own_bind_addr_even_when_advertise_address_configured() {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            advertise_address: Some(test_addr(19_102)),
+            ..test_config_with_seed("self-connect-loop-bind-addr")
+        };
+
+        let bind_addr = test_addr(19_101);
+        let registry = GossipRegistry::<()>::new(bind_addr, config);
+        let self_advertised_addr = registry.advertised_addr();
+        assert_ne!(
+            self_advertised_addr, bind_addr,
+            "test setup requires advertise_address to differ from bind_addr"
+        );
+
+        // No node_id attached — matches `PeerInfo::local`'s own self-entry
+        // shape once relayed by another node.
+        let peers = vec![PeerInfoGossip {
+            address: bind_addr.to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 1,
+            last_success: 1,
+            dns_name: None,
+        }];
+
+        let candidates = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9998", 1)
+            .await;
+
+        assert!(
+            !candidates.contains(&bind_addr),
+            "self-connect guard regression: relayed gossip describing this \
+             node's own bind_addr with no node_id attached was returned as a \
+             dial candidate instead of being filtered as self, even though \
+             advertise_address is configured. PeerDiscovery's address-keyed \
+             self-filter must reject both bind_addr and advertise_address."
         );
     }
 
