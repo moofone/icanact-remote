@@ -263,7 +263,10 @@ fn try_handle_read_fast_from_pooled(
             payload,
         }));
     }
-    if ctx.tell_handler_sync.is_none() && ctx.sync_actor_handler.is_none() {
+    if ctx.tell_handler_sync.is_none()
+        && ctx.tell_handler_sync_context.is_none()
+        && ctx.sync_actor_handler.is_none()
+    {
         return Ok(FastReadOutcome::Unhandled(buffer));
     }
     if msg_data[1] != 0 || msg_data[2] != 0 {
@@ -289,6 +292,20 @@ fn try_handle_read_fast_from_pooled(
     let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::ACTOR_HEADER_LEN;
     let payload =
         crate::AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
+    // Prefer the context-aware tell handler so the TLS-authenticated sender
+    // identity (`ctx.peer_id`) reaches routes registered via
+    // `register_tell_route_with_context` (membership/pubsub/broadcast). Without
+    // this, the inline fast path fell straight to the no-context handler and the
+    // authenticated peer was dropped. Mirrors `handle_fast_actor_sync_io`.
+    if let Some(cell) = ctx.tell_handler_sync_context.as_ref() {
+        let _ = cell.handle(
+            actor_id,
+            type_hash,
+            payload,
+            crate::TellContext::new(ctx.peer_id.as_ref()),
+        );
+        return Ok(FastReadOutcome::Handled);
+    }
     if let Some(cell) = ctx.tell_handler_sync.as_ref() {
         let _ = cell.handle(actor_id, type_hash, payload);
         return Ok(FastReadOutcome::Handled);
