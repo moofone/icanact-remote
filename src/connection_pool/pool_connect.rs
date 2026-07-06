@@ -741,12 +741,46 @@ impl<T> ConnectionPool<T> {
     /// compare-and-publish actually succeeded — never for a candidate that
     /// lost its tie-break re-resolution, mirroring
     /// `finalize_new_outbound_connection`'s own non-reject-path counting.
+    ///
+    /// The compare-and-publish this follows only proves `connection` won the
+    /// peer-session slot AT THAT INSTANT; a concurrent evict/supersede of
+    /// this exact instance (e.g. another accept/finalize's
+    /// `disconnect_connection_instance` or a further compare-and-publish)
+    /// can land in the window between that CAS win and this call. Any such
+    /// eviction's own `connections_by_addr` alias-sweep runs before this
+    /// function has written `connection`'s alias at `addr` at all, so it
+    /// cannot find or clean it up — without a recheck here, the writes below
+    /// would durably index and count an already-evicted, already-aborted
+    /// connection (a stale address alias plus a zombie `connection_counter`
+    /// contribution).
+    ///
+    /// After performing the writes, this therefore RE-VALIDATES that the
+    /// peer session slot still holds exactly `connection` (`Arc::ptr_eq`).
+    /// If it no longer does — evicted or superseded by something else in the
+    /// window above — every write just performed is undone: the
+    /// `connections_by_addr`/`addr_to_peer_id` alias at `addr` is removed
+    /// (only if it is still `connection`'s own alias, via
+    /// `remove_connection_instance_by_id`'s identity-scoped compare-and-remove,
+    /// so a different, already-current instance's alias is never touched),
+    /// the `connection_counter` contribution just marked above is released
+    /// exactly once through the same `counted_instances` ownership table
+    /// every other teardown path uses, and `connection`'s tasks are aborted.
+    /// Returns `false` in that case so the caller treats this exactly like a
+    /// re-resolved tie-break rejection: never indexed, counted, or reported
+    /// as the accepted session. Returns `true` when `connection` is still
+    /// genuinely the peer's current session after the writes, in which case
+    /// they are durable.
+    #[must_use = "a `false` return means a concurrent evict raced this connection out of the \
+                  peer session in the window before it was durably indexed, and this function \
+                  has already undone its own writes — the caller MUST treat the candidate as \
+                  rejected exactly like a re-resolved tie-break loss, never report it as the \
+                  accepted session"]
     pub(crate) fn finish_indexing_accepted_connection(
         &self,
         peer_id: &crate::PeerId,
         addr: SocketAddr,
         connection: &Arc<LockFreeConnection>,
-    ) {
+    ) -> bool {
         crate::lifecycle::record_transport_event(
             crate::lifecycle::TransportLifecycleEvent::InboundAcceptIndexAttempt {
                 peer: peer_id.clone(),
@@ -759,9 +793,51 @@ impl<T> ConnectionPool<T> {
             .connections_by_addr
             .upsert_sync(addr, connection.clone());
         self.connection_counter.fetch_add(1, Ordering::AcqRel);
-        if let Some(instance_id) = connection.stream_handle.as_ref().map(|h| h.instance_id()) {
+        let instance_id = connection.stream_handle.as_ref().map(|h| h.instance_id());
+        if let Some(instance_id) = instance_id {
             self.mark_instance_counted(instance_id);
         }
+
+        let still_current = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| {
+                session
+                    .current_connection()
+                    .is_some_and(|current| Arc::ptr_eq(&current, connection))
+            })
+            .unwrap_or(false);
+        if still_current {
+            return true;
+        }
+
+        debug!(
+            peer_id = %peer_id,
+            addr = %addr,
+            "finish_indexing_accepted_connection: a concurrent evict/supersede raced this \
+             connection out of the peer session before it was durably indexed; undoing the \
+             address index and counter contribution just written and rejecting the candidate"
+        );
+        match instance_id {
+            Some(instance_id) => {
+                let _ = self.remove_connection_instance_by_id(addr, instance_id);
+            }
+            None => {
+                // No stream handle to identify an instance by — fall back to
+                // a direct identity-scoped removal at `addr`. Never counted
+                // above either (no `instance_id` to mark), so there is
+                // nothing to release.
+                let removed = self
+                    .connections_by_addr
+                    .remove_if_sync(&addr, |v| Arc::ptr_eq(v, connection))
+                    .is_some();
+                if removed {
+                    let _ = self.addr_to_peer_id.remove_sync(&addr);
+                    self.clear_capabilities_for_addr(&addr);
+                }
+                connection.abort_tasks();
+            }
+        }
+        false
     }
 
     /// Inbound-accept counterpart of `publish_outbound_or_reresolve`: enact

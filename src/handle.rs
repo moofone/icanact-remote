@@ -2813,12 +2813,24 @@ where
                                 expected.as_ref(),
                                 &registry_weak,
                             ) {
-                                pool.finish_indexing_accepted_connection(
+                                // A `false` return here means a concurrent
+                                // evict/supersede raced this connection out
+                                // of the peer session in the window before it
+                                // was durably indexed — `finish_indexing_accepted_connection`
+                                // has already undone its own writes, so this
+                                // gets the IDENTICAL treatment as the
+                                // re-resolved tie-break reject arms below.
+                                if pool.finish_indexing_accepted_connection(
                                     &peer_id,
                                     peer_state_addr,
                                     &connection_arc,
-                                );
-                                true
+                                ) {
+                                    true
+                                } else {
+                                    registry.clear_peer_capabilities(&peer_addr);
+                                    registry.note_tie_break_eviction(&peer_id);
+                                    false
+                                }
                             } else {
                                 registry.clear_peer_capabilities(&peer_addr);
                                 registry.note_tie_break_eviction(&peer_id);
@@ -2885,18 +2897,26 @@ where
                             } else {
                                 Some(existing_conn.clone())
                             };
-                            let accepted = pool.publish_inbound_or_reresolve(
+                            let mut accepted = pool.publish_inbound_or_reresolve(
                                 &peer_id,
                                 &connection_arc,
                                 expected.as_ref(),
                                 &registry_weak,
                             );
                             if accepted {
-                                pool.finish_indexing_accepted_connection(
+                                // A `false` return here means a concurrent
+                                // evict/supersede raced this connection out
+                                // of the peer session in the window before it
+                                // was durably indexed — treat it exactly like
+                                // the re-resolved tie-break reject case below.
+                                accepted = pool.finish_indexing_accepted_connection(
                                     &peer_id,
                                     peer_state_addr,
                                     &connection_arc,
                                 );
+                                if !accepted {
+                                    registry.clear_peer_capabilities(&peer_addr);
+                                }
                             } else {
                                 registry.clear_peer_capabilities(&peer_addr);
                             }
