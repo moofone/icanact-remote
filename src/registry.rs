@@ -1680,25 +1680,33 @@ impl<T: 'static> GossipRegistry<T> {
                 // Peer discovery state
                 last_peer_gossip_time: 0,
                 peer_discovery: if config.enable_peer_discovery {
-                    Some(PeerDiscovery::new(
-                        // Self-filtering in `PeerDiscovery::on_peer_list_gossip`
-                        // compares gossiped addresses against `local_addr`. A
-                        // peer relaying gossip about this node describes it by
-                        // its *advertised* address, which can differ from
-                        // `bind_addr` under NAT/K8s/mesh overlays. Using the
-                        // advertised address here (falling back to bind_addr
-                        // when unset) closes that gap; it only ever filters
-                        // this node's own address, never a distinct real peer.
-                        config.advertise_address.unwrap_or(bind_addr),
-                        PeerDiscoveryConfig {
-                            max_peers: config.max_peers,
-                            allow_private_discovery: config.allow_private_discovery,
-                            allow_loopback_discovery: config.allow_loopback_discovery,
-                            allow_link_local_discovery: config.allow_link_local_discovery,
-                            fail_ttl: config.fail_ttl,
-                            pending_ttl: config.pending_ttl,
-                        },
-                    ))
+                    Some(
+                        PeerDiscovery::new(
+                            // `local_addr` stays `bind_addr`: relayed/stale
+                            // gossip can describe this node by its raw
+                            // bind address with no `node_id` attached (see
+                            // `PeerInfo::local`), so `bind_addr` must always
+                            // be filtered here regardless of whether
+                            // `advertise_address` is configured.
+                            bind_addr,
+                            PeerDiscoveryConfig {
+                                max_peers: config.max_peers,
+                                allow_private_discovery: config.allow_private_discovery,
+                                allow_loopback_discovery: config.allow_loopback_discovery,
+                                allow_link_local_discovery: config.allow_link_local_discovery,
+                                fail_ttl: config.fail_ttl,
+                                pending_ttl: config.pending_ttl,
+                            },
+                        )
+                        // A peer relaying gossip about this node may
+                        // instead describe it by its *advertised* address,
+                        // which can differ from `bind_addr` under
+                        // NAT/K8s/mesh overlays. Filtering both — bind_addr
+                        // via `local_addr` above and the advertised address
+                        // here — closes that gap without ever filtering a
+                        // distinct real peer.
+                        .with_additional_self_addr(config.advertise_address),
+                    )
                 } else {
                     None
                 },

@@ -194,6 +194,18 @@ pub struct PeerDiscovery {
     config: PeerDiscoveryConfig,
     /// Local address (for self-filtering)
     local_addr: SocketAddr,
+    /// A second self-address to filter, in addition to `local_addr`.
+    ///
+    /// A node can be reachable/described under two distinct addresses at
+    /// once: its raw `bind_addr` and its advertised address (when
+    /// `GossipConfig::advertise_address` is set and differs from
+    /// `bind_addr`). Relayed or stale gossip can describe this node by
+    /// EITHER address, and — because such relayed self-entries are built
+    /// without a `node_id` (see `PeerInfo::local`) — the identity-based
+    /// self-filter in `GossipRegistry::on_peer_list_gossip` cannot catch
+    /// them. Both addresses must therefore be filtered here so neither one
+    /// can become a dial candidate that reintroduces a self-connect loop.
+    additional_self_addr: Option<SocketAddr>,
     /// Unified peer state map (atomic state transitions)
     peer_states: HashMap<SocketAddr, PeerState>,
     /// Currently connected peers (legacy, kept for backward compatibility)
@@ -210,6 +222,7 @@ impl PeerDiscovery {
         Self {
             config,
             local_addr,
+            additional_self_addr: None,
             peer_states: HashMap::new(),
             connected_peers: HashSet::new(),
             pending_peers: HashMap::new(),
@@ -220,6 +233,17 @@ impl PeerDiscovery {
     /// Create with default configuration
     pub fn with_defaults(local_addr: SocketAddr) -> Self {
         Self::new(local_addr, PeerDiscoveryConfig::default())
+    }
+
+    /// Register a second self-address to filter alongside `local_addr`.
+    ///
+    /// No-op when `addr` is `None` or equal to `local_addr` (nothing extra
+    /// to filter). See the `additional_self_addr` field doc for why both
+    /// `bind_addr` and the advertised address must be filtered.
+    #[must_use]
+    pub fn with_additional_self_addr(mut self, addr: Option<SocketAddr>) -> Self {
+        self.additional_self_addr = addr.filter(|addr| *addr != self.local_addr);
+        self
     }
 
     /// Process incoming peer list gossip and return candidates to connect to
@@ -265,8 +289,10 @@ impl PeerDiscovery {
                 }
             };
 
-            // Filter self
-            if addr == self.local_addr {
+            // Filter self: both `local_addr` (bind_addr) and, when
+            // configured and distinct, the advertised address (see
+            // `additional_self_addr` doc).
+            if addr == self.local_addr || Some(addr) == self.additional_self_addr {
                 continue;
             }
 
