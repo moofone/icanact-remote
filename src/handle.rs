@@ -3172,29 +3172,21 @@ where
 
             match pool.get_connection_by_peer_id(&peer_id) {
                 None => {
-                    // KNOWN BUG under test below (reviewer finding, closed in
-                    // the immediately following commit): this snapshot is
-                    // treated as stable and the accepted candidate is
-                    // published/indexed/counted unconditionally, so two
-                    // concurrent first inbound accepts for the same peer can
-                    // both observe `None` here and clobber each other.
-                    let accepted = {
-                        crate::lifecycle::record_transport_event(
-                            crate::lifecycle::TransportLifecycleEvent::InboundAcceptPublishAttempt {
-                                peer: peer_id.clone(),
-                                addr: connection_arc.addr,
-                            },
-                        );
-                        pool.add_connection_by_peer_id(
-                            peer_id.clone(),
+                    let accepted = if pool.publish_inbound_or_reresolve(
+                        &peer_id,
+                        &connection_arc,
+                        None,
+                        &registry_weak,
+                    ) {
+                        let ephemeral_addr = (peer_addr != peer_state_addr).then_some(peer_addr);
+                        pool.finish_indexing_accepted_connection(
+                            &peer_id,
                             peer_state_addr,
-                            connection_arc.clone(),
-                        );
-                        if peer_addr != peer_state_addr {
-                            pool.index_connection_by_addr(peer_addr, connection_arc.clone());
-                            pool.add_addr_to_peer_id(peer_addr, peer_id.clone());
-                        }
-                        true
+                            ephemeral_addr,
+                            &connection_arc,
+                        )
+                    } else {
+                        false
                     };
                     if accepted {
                         info!(
