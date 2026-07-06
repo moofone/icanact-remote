@@ -6049,7 +6049,7 @@ async fn ask_eviction_already_displaced_instance_releases_counter_marker() {
         .expect("stale connection must have a stream instance");
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, stale.clone()));
     assert_eq!(
-        pool.raw_connection_counter(),
+        pool.raw_connection_counter_signed(),
         1,
         "test precondition: exactly one counted session (the stale one)"
     );
@@ -6065,7 +6065,7 @@ async fn ask_eviction_already_displaced_instance_releases_counter_marker() {
     let fresh = make_live_connection(addr, ConnectionDirection::Inbound).await;
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, fresh.clone()));
     assert_eq!(
-        pool.raw_connection_counter(),
+        pool.raw_connection_counter_signed(),
         2,
         "test precondition: both the stale and fresh instances are counted"
     );
@@ -6084,7 +6084,7 @@ async fn ask_eviction_already_displaced_instance_releases_counter_marker() {
         "test precondition: the peer's current slot must already point at the fresh instance"
     );
 
-    let before = pool.raw_connection_counter();
+    let before = pool.raw_connection_counter_signed();
 
     // The failed ask's own recovery path now runs, naming the OLD instance
     // it actually observed — which is unreachable by `Arc` through either
@@ -6096,7 +6096,7 @@ async fn ask_eviction_already_displaced_instance_releases_counter_marker() {
          must not be reported as evicted (nothing matching it remains indexed anywhere)"
     );
 
-    let after = pool.raw_connection_counter();
+    let after = pool.raw_connection_counter_signed();
     assert_eq!(
         after,
         1,
@@ -6205,7 +6205,7 @@ async fn accept_incoming_preferred_over_stale_expected_retires_displaced_instanc
     // caller separately indexes/counts an accepted/finalized connection.
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), other_addr, incoming.clone()));
 
-    let counter = pool.raw_connection_counter();
+    let counter = pool.raw_connection_counter_signed();
     assert_eq!(
         counter,
         1,

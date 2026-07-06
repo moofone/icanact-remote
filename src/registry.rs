@@ -10440,7 +10440,7 @@ mod tests {
             spawn_live_connection(addr, ConnectionDirection::Outbound, &peer_id).await;
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, initial.clone()));
 
-        let baseline = pool.raw_connection_counter();
+        let baseline = pool.raw_connection_counter_signed();
         assert_eq!(
             baseline, 1,
             "test precondition: exactly one counted, live session"
@@ -10489,7 +10489,7 @@ mod tests {
             old_instance_id = fresh_instance_id;
         }
 
-        let final_count = pool.raw_connection_counter();
+        let final_count = pool.raw_connection_counter_signed();
         assert_eq!(
             final_count,
             baseline,
@@ -11214,7 +11214,7 @@ mod tests {
         let conn_old = Arc::new(conn_old);
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn_old.clone()));
 
-        let baseline = pool.raw_connection_counter();
+        let baseline = pool.raw_connection_counter_signed();
         assert_eq!(
             baseline, 1,
             "test precondition: exactly one counted, live session before the tie-break"
@@ -11227,8 +11227,12 @@ mod tests {
             pool.disconnect_connection_instance(&peer_id, &conn_old),
             "test precondition: `old` must still be current at the moment of eviction"
         );
+        // Asserted via the signed accessor: this precondition's expected
+        // value is exactly 0, the one steady-state count the clamped
+        // `raw_connection_counter()` view cannot distinguish from an
+        // unfixed underflow.
         assert_eq!(
-            pool.raw_connection_counter(),
+            pool.raw_connection_counter_signed(),
             0,
             "test precondition: evicting `old` must release its counted contribution \
              immediately"
@@ -11252,7 +11256,7 @@ mod tests {
         let conn_fresh = Arc::new(conn_fresh);
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), fresh_addr, conn_fresh.clone()));
 
-        let before_exit = pool.raw_connection_counter();
+        let before_exit = pool.raw_connection_counter_signed();
         assert_eq!(
             before_exit, 1,
             "test precondition: exactly one counted, live session (`fresh`) after the \
@@ -11270,7 +11274,7 @@ mod tests {
             .await
             .expect("old instance's IO task must not panic");
 
-        let final_count = pool.raw_connection_counter();
+        let final_count = pool.raw_connection_counter_signed();
         assert_eq!(
             final_count,
             before_exit,
@@ -11324,7 +11328,12 @@ mod tests {
         let addr = test_addr(9751);
         let pool = registry.connection_pool.clone();
 
-        let baseline = pool.raw_connection_counter();
+        // Asserted via the signed accessor: a baseline of exactly 0 is the
+        // one steady-state value the clamped `raw_connection_counter()` view
+        // cannot distinguish from an unfixed underflow (both read as 0), so
+        // this precondition — and the final comparison below — must pin the
+        // signed value, not the clamped one.
+        let baseline = pool.raw_connection_counter_signed();
         assert_eq!(
             baseline, 0,
             "test precondition: a fresh pool has no live sessions"
@@ -11383,13 +11392,14 @@ mod tests {
              candidate treated as rejected, exactly like a re-resolved tie-break loss"
         );
 
-        let final_count = pool.raw_connection_counter();
+        let final_count = pool.raw_connection_counter_signed();
         assert_eq!(
             final_count,
             baseline,
             "connection_counter must return to baseline ({baseline}) after a mid-window \
              teardown raced the counter/marker pairing — got {final_count} (leaked {} if \
-             unfixed)",
+             unfixed; a negative steady-state value would otherwise clamp to 0 and hide the \
+             regression)",
             final_count.saturating_sub(baseline)
         );
     }
@@ -11429,7 +11439,12 @@ mod tests {
         let addr = test_addr(9761);
         let pool = registry.connection_pool.clone();
 
-        let baseline = pool.raw_connection_counter();
+        // Asserted via the signed accessor: a baseline of exactly 0 is the
+        // one steady-state value the clamped `raw_connection_counter()` view
+        // cannot distinguish from an unfixed underflow (both read as 0), so
+        // this precondition — and the final comparison below — must pin the
+        // signed value, not the clamped one.
+        let baseline = pool.raw_connection_counter_signed();
         assert_eq!(
             baseline, 0,
             "test precondition: a fresh pool has no live sessions"
@@ -11478,13 +11493,14 @@ mod tests {
 
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, conn.clone()));
 
-        let final_count = pool.raw_connection_counter();
+        let final_count = pool.raw_connection_counter_signed();
         assert_eq!(
             final_count,
             baseline,
             "connection_counter must return to baseline ({baseline}) after a mid-window \
              teardown raced the marker-insert/counter-increment pairing — got {final_count} \
-             (permanently leaked {} if unfixed by a saturating clamp)",
+             (permanently leaked {} if unfixed by a saturating clamp; a negative steady-state \
+             value would otherwise clamp to 0 and hide the regression)",
             final_count.saturating_sub(baseline)
         );
     }

@@ -3142,6 +3142,22 @@ impl<T> ConnectionPool<T> {
         self.connection_counter.load(Ordering::Acquire).max(0) as usize
     }
 
+    /// Unclamped, signed view of the same counter as
+    /// [`Self::raw_connection_counter`], for tests whose steady-state
+    /// baseline is itself zero (or otherwise cannot be distinguished from an
+    /// unfixed underflow by the clamped `usize` view above): a genuine
+    /// double-decrement/undercount regression leaves the counter at a
+    /// negative steady-state value, which `raw_connection_counter`'s
+    /// `.max(0)` clamp would silently present as an indistinguishable `0`.
+    /// Tests asserting an exact steady-state count — especially a baseline
+    /// of `0` — must assert against this signed value instead, so that a
+    /// negative regression fails loudly rather than reading as a correct
+    /// zero balance.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn raw_connection_counter_signed(&self) -> isize {
+        self.connection_counter.load(Ordering::Acquire)
+    }
+
     /// Get connection count - lock-free operation
     pub fn connection_count(&self) -> usize {
         let mut count = 0usize;
