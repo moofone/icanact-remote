@@ -493,6 +493,12 @@ impl<T> ConnectionPool<T> {
                 // outbound is still preferred — one bounded retry against
                 // it. A further nested race here is out of scope, same as
                 // elsewhere in this function.
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt {
+                        peer: peer_id.clone(),
+                        addr: connection_arc.addr,
+                    },
+                );
                 let _ = self.compare_and_publish_peer_connection(
                     peer_id,
                     Some(rival),

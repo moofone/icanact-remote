@@ -79,6 +79,19 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired immediately before `resolve_and_act_on_outbound_rival`'s
+    /// `AcceptIncoming` arm retries its compare-and-publish against a rival
+    /// it just re-resolved as stale/non-preferred. Purely instrumentation:
+    /// lets tests deterministically pin a further concurrent publish — e.g.
+    /// a fresh preferred session landing in the exact gap between that
+    /// re-resolved decision and this retry — so the retry itself observably
+    /// loses (`Err(Some(new_rival))` / `Err(None)`), the same technique
+    /// `OutboundFinalizeClearRaceRetry` uses for the outer publish's own
+    /// bounded retry.
+    OutboundFinalizeAcceptIncomingRetryAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
     /// Fired immediately after `finalize_new_outbound_connection` snapshots
     /// `existing_before` (the pre-existing rival, if any, for this peer) and
     /// before the tie-break decision is computed from it a few lines below.
