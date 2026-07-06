@@ -469,12 +469,47 @@ impl<T> ConnectionPool<T> {
     /// by both `publish_outbound_or_reresolve` CAS-loss shapes: a rival
     /// observed directly by the primary compare-and-publish, and a rival
     /// observed only after its bounded clear-race retry.
+    ///
+    /// Entry point for a bounded total of ONE nested re-resolve beyond this
+    /// call's own `AcceptIncoming` retry (see
+    /// `resolve_and_act_on_outbound_rival_bounded`) — nested races beyond
+    /// that are rejected rather than chased indefinitely.
     fn resolve_and_act_on_outbound_rival(
         &self,
         peer_id: &crate::PeerId,
         connection_arc: &Arc<LockFreeConnection>,
         rival: &Arc<LockFreeConnection>,
         registry_weak: &std::sync::Weak<GossipRegistry>,
+    ) -> bool {
+        self.resolve_and_act_on_outbound_rival_bounded(
+            peer_id,
+            connection_arc,
+            rival,
+            registry_weak,
+            1,
+        )
+    }
+
+    /// Implementation of `resolve_and_act_on_outbound_rival` with an explicit
+    /// `nested_retries_remaining` budget. The `AcceptIncoming` arm's own
+    /// retry against `rival` can itself lose to a THIRD session — another
+    /// publish landing in the window between this re-resolved decision and
+    /// the retry's compare-and-publish. That loss must never be silently
+    /// treated as success (the reviewer finding this closes): on
+    /// `Err(Some(new_rival))` this re-resolves once more against the new
+    /// rival (consuming the budget), and on exhaustion — or on `Err(None)`'s
+    /// own single empty-slot retry also failing — rejects the candidate
+    /// (`false`) instead of looping. The bool contract from
+    /// `resolve_and_act_on_outbound_rival` holds on every path: `true` only
+    /// when `connection_arc` is actually installed as the peer's current
+    /// session.
+    fn resolve_and_act_on_outbound_rival_bounded(
+        &self,
+        peer_id: &crate::PeerId,
+        connection_arc: &Arc<LockFreeConnection>,
+        rival: &Arc<LockFreeConnection>,
+        registry_weak: &std::sync::Weak<GossipRegistry>,
+        nested_retries_remaining: u8,
     ) -> bool {
         let decision = registry_weak
             .upgrade()
@@ -490,21 +525,79 @@ impl<T> ConnectionPool<T> {
         match decision {
             ConnectionConflictDecision::AcceptIncoming => {
                 // The rival is stale/dead by the time we re-resolved and our
-                // outbound is still preferred — one bounded retry against
-                // it. A further nested race here is out of scope, same as
-                // elsewhere in this function.
+                // outbound is still preferred — retry the compare-and-publish
+                // against it. This retry's own result MUST be checked: a
+                // further concurrent publish can land in this exact window
+                // and make the retry itself lose, in which case our
+                // candidate was never installed and must not be reported as
+                // if it were.
                 crate::lifecycle::record_transport_event(
                     crate::lifecycle::TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt {
                         peer: peer_id.clone(),
                         addr: connection_arc.addr,
                     },
                 );
-                let _ = self.compare_and_publish_peer_connection(
+                match self.compare_and_publish_peer_connection(
                     peer_id,
                     Some(rival),
                     connection_arc.clone(),
-                );
-                true
+                ) {
+                    Ok(()) => true,
+                    Err(Some(new_rival)) => {
+                        // A THIRD session was published into the retry's own
+                        // window. Re-resolve once more against reality
+                        // (bounded by `nested_retries_remaining`) rather than
+                        // reporting the stale-rival retry as a success it
+                        // never was.
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "outbound finalize AcceptIncoming retry lost to yet another \
+                                 concurrently published rival and the bounded nested-re-resolve \
+                                 budget is exhausted; rejecting our own candidate rather than \
+                                 retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        self.resolve_and_act_on_outbound_rival_bounded(
+                            peer_id,
+                            connection_arc,
+                            &new_rival,
+                            registry_weak,
+                            nested_retries_remaining - 1,
+                        )
+                    }
+                    Err(None) => {
+                        // A concurrent CLEAR raced this retry. One bounded
+                        // retry against the now-empty slot; if that also
+                        // fails, reject rather than loop.
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "outbound finalize AcceptIncoming retry lost to a concurrent \
+                                 clear and the bounded nested-re-resolve budget is exhausted; \
+                                 rejecting our own candidate rather than retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        match self.compare_and_publish_peer_connection(
+                            peer_id,
+                            None,
+                            connection_arc.clone(),
+                        ) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                debug!(
+                                    peer_id = %peer_id,
+                                    "outbound finalize AcceptIncoming retry's own empty-slot \
+                                     retry also lost; rejecting our own candidate rather than \
+                                     retrying indefinitely"
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
             }
             ConnectionConflictDecision::ReplaceExisting => {
                 let _ = self.disconnect_connection_instance(peer_id, rival);
