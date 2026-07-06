@@ -128,6 +128,44 @@ impl PeerSession {
         let previous = self.current_connection.compare_and_swap(expected, None);
         matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected))
     }
+
+    /// Publish-side counterpart to `compare_and_clear_current_connection`:
+    /// atomically install `new` as the current connection iff the slot is
+    /// still exactly `expected` — `None` meaning "still empty", `Some(arc)`
+    /// meaning "still holding that exact `Arc`" — via a single lock-free CAS
+    /// on the underlying `ArcSwapOption`.
+    ///
+    /// This closes the outbound-finalize publish gap: a decision computed
+    /// against a snapshot (`expected`) taken before this candidate was
+    /// indexed must never be enacted by blindly overwriting whatever is
+    /// installed *now*. A concurrent `publish_current_peer_connection` (a
+    /// fresh preferred inbound landing in the gap between that snapshot and
+    /// this call) leaves a different `Arc` in the slot; the CAS then finds a
+    /// mismatch and declines, returning the connection actually installed so
+    /// the caller can re-resolve the tie-break against reality instead of
+    /// clobbering it. There is no observable check-then-act gap: either the
+    /// slot still holds `expected` and is atomically swapped for `new`, or
+    /// it holds something else and is left completely untouched.
+    fn compare_and_set_current_connection(
+        &self,
+        expected: Option<&Arc<LockFreeConnection>>,
+        new: Arc<LockFreeConnection>,
+    ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let expected_owned: Option<Arc<LockFreeConnection>> = expected.cloned();
+        let previous = self
+            .current_connection
+            .compare_and_swap(&expected_owned, Some(new));
+        let matched = match (&expected_owned, &*previous) {
+            (None, None) => true,
+            (Some(exp), Some(prev)) => Arc::ptr_eq(exp, prev),
+            _ => false,
+        };
+        if matched {
+            Ok(())
+        } else {
+            Err((*previous).clone())
+        }
+    }
 }
 
 const OUTBOUND_DIAL_PENDING: u8 = 0;

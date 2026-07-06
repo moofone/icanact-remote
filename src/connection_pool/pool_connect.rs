@@ -317,6 +317,144 @@ impl<T> ConnectionPool<T> {
             .upsert_sync(peer_id.clone(), connection);
     }
 
+    /// Compare-and-publish counterpart to `publish_current_peer_connection`:
+    /// install `connection` as the peer's current session iff the session
+    /// slot still holds exactly `expected` — the snapshot a caller's
+    /// tie-break decision was computed against — via
+    /// `PeerSession::compare_and_set_current_connection`.
+    ///
+    /// On success this performs the identical side effects as
+    /// `publish_current_peer_connection` (lifecycle event + logging +
+    /// `connections_by_peer` mirror). On failure it performs NONE of them
+    /// and returns whatever is actually installed now, so the caller can
+    /// re-resolve its conflict decision against reality instead of
+    /// clobbering a concurrently published rival (e.g. a preferred inbound
+    /// that landed between the caller's snapshot and this call).
+    pub(crate) fn compare_and_publish_peer_connection(
+        &self,
+        peer_id: &crate::PeerId,
+        expected: Option<&Arc<LockFreeConnection>>,
+        connection: Arc<LockFreeConnection>,
+    ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let session = self.get_or_create_peer_session(peer_id);
+        session.compare_and_set_current_connection(expected, connection.clone())?;
+
+        let stream_instance_id = connection
+            .stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id());
+        info!(
+            peer_id = %peer_id,
+            addr = %connection.addr,
+            direction = ?connection.direction,
+            stream_instance_id = ?stream_instance_id,
+            "transport_session_published"
+        );
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SessionPublished {
+                peer: peer_id.clone(),
+                addr: connection.addr,
+                direction: match connection.direction {
+                    ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
+                    ConnectionDirection::Outbound => crate::lifecycle::TransportDirection::Outbound,
+                },
+            },
+        );
+        let _ = self
+            .connections_by_peer
+            .upsert_sync(peer_id.clone(), connection);
+        Ok(())
+    }
+
+    /// Enact an `AcceptIncoming` outbound-finalize decision via
+    /// compare-and-publish against the exact snapshot (`expected`) the
+    /// decision was computed from, re-resolving against reality if a
+    /// concurrent publish beat this call to the peer session slot.
+    ///
+    /// See the module-level `finalize_new_outbound_connection` commentary
+    /// on the `existing_before` snapshot for why the decision and the
+    /// publish that enacts it can never be a single non-atomic step: a
+    /// PREFERRED inbound can be published for this peer in the gap between
+    /// that snapshot and this call, and this is the fallback outbound's own
+    /// publish attempt — it must never unconditionally overwrite whatever a
+    /// concurrent publish already installed.
+    fn publish_outbound_or_reresolve(
+        &self,
+        peer_id: &crate::PeerId,
+        connection_arc: &Arc<LockFreeConnection>,
+        expected: Option<&Arc<LockFreeConnection>>,
+        registry_weak: &std::sync::Weak<GossipRegistry>,
+    ) {
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                peer: peer_id.clone(),
+                addr: connection_arc.addr,
+            },
+        );
+        let Err(rival) =
+            self.compare_and_publish_peer_connection(peer_id, expected, connection_arc.clone())
+        else {
+            return;
+        };
+        let Some(rival) = rival else {
+            // The CAS failed but the slot is empty now too: a concurrent
+            // CLEAR (not a publish) raced us. Safe to retry once against
+            // the now-empty slot; further nested races are out of scope,
+            // matching the tolerance the `EvictStaleRejectIncoming` arm
+            // above already documents for narrower races.
+            let _ = self.compare_and_publish_peer_connection(peer_id, None, connection_arc.clone());
+            return;
+        };
+        // A rival is actually installed now (e.g. a fresh preferred inbound
+        // published concurrently). Re-resolve the identical, address-blind
+        // tie-break the caller already computed, this time against reality.
+        let decision = registry_weak
+            .upgrade()
+            .map(|registry| {
+                let keep_existing = registry.should_keep_connection(
+                    peer_id,
+                    rival.direction == ConnectionDirection::Outbound,
+                );
+                let keep_incoming = registry.should_keep_connection(peer_id, true);
+                resolve_connection_conflict(rival.has_live_stream(), keep_existing, keep_incoming)
+            })
+            .unwrap_or(ConnectionConflictDecision::RejectIncoming);
+        match decision {
+            ConnectionConflictDecision::AcceptIncoming => {
+                // The rival is stale/dead by the time we re-resolved and our
+                // outbound is still preferred — one bounded retry against
+                // it. A further nested race here is out of scope, same as
+                // elsewhere in this function.
+                let _ = self.compare_and_publish_peer_connection(
+                    peer_id,
+                    Some(&rival),
+                    connection_arc.clone(),
+                );
+            }
+            ConnectionConflictDecision::ReplaceExisting => {
+                let _ = self.disconnect_connection_instance(peer_id, &rival);
+                self.publish_current_peer_connection(peer_id, connection_arc.clone());
+            }
+            ConnectionConflictDecision::EvictStaleRejectIncoming => {
+                let _ = self.disconnect_connection_instance(peer_id, &rival);
+                debug!(
+                    peer_id = %peer_id,
+                    "outbound finalize compare-and-publish lost to a concurrently published \
+                     rival; evicted the now-stale rival but declined to publish a \
+                     non-preferred outbound as the session"
+                );
+            }
+            ConnectionConflictDecision::RejectIncoming => {
+                debug!(
+                    peer_id = %peer_id,
+                    "outbound finalize compare-and-publish lost to a concurrently published, \
+                     tie-break-preferred rival; leaving the outbound indexed but not current, \
+                     to be retired by its own IO lifecycle"
+                );
+            }
+        }
+    }
+
     pub(crate) fn clear_current_peer_connection(&self, peer_id: &crate::PeerId) {
         self.set_current_peer_connection(peer_id, None);
         let _ = self.connections_by_peer.remove_sync(peer_id);
@@ -1631,6 +1769,32 @@ impl<T> ConnectionPool<T> {
         Some(connection)
     }
 
+    /// Release the `connection_counter` contribution of an instance the
+    /// caller has confirmed is superseded/displaced, in the one case
+    /// `remove_connection_instance_by_id` itself cannot decrement for:
+    /// when that call returns `None` because the instance is no longer the
+    /// entry indexed at `addr` at all (e.g. a fresh reconnect already
+    /// reindexed the same bind address before the failed instance's
+    /// teardown could run).
+    ///
+    /// `remove_connection_instance_by_id` decrements exactly once, but only
+    /// on the branch where it actually finds-and-removes the instance at
+    /// `addr` — its early `removed?` return leaves the counter untouched
+    /// when the addr slot no longer holds this instance. Every instance
+    /// ever passed to that function was, by its own documented contract,
+    /// already published/counted once (`add_lock_free_connection`/
+    /// `add_connection_by_peer_id`/the outbound-finalize counter bump); if
+    /// its retirement is not the one that removed it from the index, no
+    /// other path will EVER decrement it again — that contribution is
+    /// otherwise leaked permanently. Callers must invoke this exactly once
+    /// per superseded instance, and only when `remove_connection_instance_by_id`
+    /// returned `None` for that same instance — never when it returned
+    /// `Some` (which already decremented), and never for a still-live
+    /// current session.
+    pub(crate) fn release_displaced_connection_count(&self) {
+        self.decrement_connection_counter();
+    }
+
     /// Choose the least-recently-used connection eligible for eviction when
     /// the pool is at capacity.
     ///
@@ -2152,17 +2316,18 @@ impl<T> ConnectionPool<T> {
             };
             match decision {
                 ConnectionConflictDecision::AcceptIncoming => {
-                    // Instrumentation: fires unconditionally immediately
-                    // before this publish attempt, letting tests pin a
-                    // concurrent publish into the gap between the
-                    // `existing_before` snapshot above and this call.
-                    crate::lifecycle::record_transport_event(
-                        crate::lifecycle::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
-                            peer: peer_id.clone(),
-                            addr: connection_arc.addr,
-                        },
+                    // Compare-and-publish against the exact `existing_before`
+                    // snapshot this decision was computed from — never an
+                    // unconditional publish. A PREFERRED inbound published
+                    // for this peer in the gap between that snapshot and
+                    // this call must never be overwritten by this fallback
+                    // outbound; see `publish_outbound_or_reresolve`.
+                    self.publish_outbound_or_reresolve(
+                        peer_id,
+                        &connection_arc,
+                        existing_before.as_ref(),
+                        &registry_weak,
                     );
-                    self.publish_current_peer_connection(peer_id, connection_arc.clone());
                 }
                 ConnectionConflictDecision::ReplaceExisting => {
                     // Evict the *specific* rival the decision above was

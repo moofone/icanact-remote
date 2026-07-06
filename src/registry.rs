@@ -5571,6 +5571,23 @@ impl<T: 'static> GossipRegistry<T> {
                     Some(failed_id) if Some(failed_id) != current_instance_id => {
                         let retired =
                             pool.remove_connection_instance_by_id(observed_peer_addr, failed_id);
+                        // `remove_connection_instance_by_id` only decrements
+                        // `connection_counter` when it actually finds and
+                        // removes the failed instance at `observed_peer_addr`.
+                        // In the same-bind-address restart case, a fresh
+                        // inbound has already overwritten that address slot
+                        // by the time this runs, so the lookup finds nothing
+                        // and returns `None` — the old instance was counted
+                        // when it was originally published, but once
+                        // displaced from the index no later path can ever
+                        // find it again to decrement it. Without this
+                        // compensating release, that contribution leaks on
+                        // every same-address failover, permanently inflating
+                        // `connection_counter` against the admission gate
+                        // despite exactly one live session.
+                        if retired.is_none() {
+                            pool.release_displaced_connection_count();
+                        }
                         info!(
                             peer_id = %peer_id,
                             observed_peer = %observed_peer_addr,
