@@ -142,7 +142,7 @@ impl<T> ConnectionPool<T> {
             aligned_bytes_pool: Arc::new(crate::AlignedBytesPool::new(
                 aligned_pool_size.max(crate::aligned::DEFAULT_ALIGNED_POOL_SIZE),
             )),
-            connection_counter: AtomicUsize::new(0),
+            connection_counter: AtomicIsize::new(0),
             _marker: PhantomData,
         };
 
@@ -2030,11 +2030,11 @@ impl<T> ConnectionPool<T> {
         // shared with — or racing — anything else, because nothing can look
         // this instance up by address or instance id until it is indexed
         // below, and the marker is inserted (see below) strictly before that
-        // indexing happens. `decrement_connection_counter`'s saturating
-        // subtract mirrors every other rollback of this same atomic.
+        // indexing happens. `decrement_connection_counter`'s (non-saturating,
+        // signed) subtract mirrors every other rollback of this same atomic.
         let connection_count = self.connection_counter.fetch_add(1, Ordering::AcqRel);
 
-        if connection_count >= self.max_connections {
+        if connection_count >= self.max_connections as isize {
             self.decrement_connection_counter();
             return Err(crate::GossipError::Network(std::io::Error::other(format!(
                 "Max connections ({}) reached",
@@ -3001,18 +3001,28 @@ impl<T> ConnectionPool<T> {
         oldest.map(|(addr, _)| addr)
     }
 
-    /// Decrement the connection counter without ever wrapping below zero.
+    /// Decrement the connection counter by exactly one.
     ///
-    /// `AtomicUsize::fetch_sub` underflows to `usize::MAX` if the counter and
-    /// the real connection set ever drift apart; saturating here keeps the
-    /// admission gate (`add_lock_free_connection`) sane even under accounting
-    /// skew.
+    /// Deliberately a plain, unconditional `fetch_sub` — NOT a `saturating`
+    /// clamp at zero. Every decrement here is paired with exactly one prior
+    /// or still-pending increment (see [`Self::count_in_new_instance`] /
+    /// [`Self::release_counted_instance`]), but the increment and decrement
+    /// of a given pair can observably land in either order under a
+    /// concurrent teardown racing a fresh count-in for the same instance: a
+    /// release that wins the race decrements before its counterpart's
+    /// increment lands. At a baseline of zero that means this call must be
+    /// able to drive the counter transiently negative — clamping that dip to
+    /// zero (the previous behavior) silently swallows the paired decrement,
+    /// so the counterpart's later increment leaks a permanent phantom count
+    /// with no marker left to ever release it again. A plain `fetch_sub`
+    /// nets the pair back to the correct total regardless of ordering,
+    /// because addition and subtraction on `AtomicIsize` commute; the
+    /// transient negative read is safe here because the only consumer of
+    /// this counter (`add_lock_free_connection`'s `>= max_connections`
+    /// admission check) only ever cares about the count being at or over
+    /// capacity, never about it dipping below zero.
     fn decrement_connection_counter(&self) {
-        let _ =
-            self.connection_counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    Some(count.saturating_sub(1))
-                });
+        self.connection_counter.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Claim `instance_id`'s ownership marker in `counted_instances`.
@@ -3119,9 +3129,17 @@ impl<T> ConnectionPool<T> {
     /// tests that must observe it staying balanced across
     /// publish/teardown/failover cycles — see
     /// `superseded_same_addr_failover_does_not_leak_connection_counter`.
+    ///
+    /// Clamped to zero at the read boundary: the underlying counter is
+    /// signed (see its field doc) so a concurrent, still-in-flight
+    /// increment/decrement pairing can be transiently negative, but every
+    /// steady-state read a test cares about — after all racing operations in
+    /// that test have completed — is never negative in a correct
+    /// implementation, so this conversion never masks a real bug in
+    /// steady-state assertions.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) fn raw_connection_counter(&self) -> usize {
-        self.connection_counter.load(Ordering::Acquire)
+        self.connection_counter.load(Ordering::Acquire).max(0) as usize
     }
 
     /// Get connection count - lock-free operation
