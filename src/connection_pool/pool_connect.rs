@@ -378,13 +378,33 @@ impl<T> ConnectionPool<T> {
     /// that snapshot and this call, and this is the fallback outbound's own
     /// publish attempt — it must never unconditionally overwrite whatever a
     /// concurrent publish already installed.
+    ///
+    /// Returns `true` if `connection_arc` ended up published/kept as a
+    /// session candidate the caller should finalize as a live handle
+    /// (`AcceptIncoming`'s happy path, `AcceptIncoming`'s bounded retry
+    /// against a stale rival, or `ReplaceExisting`), and `false` when the
+    /// re-resolve concluded the candidate must be rejected
+    /// (`RejectIncoming` / `EvictStaleRejectIncoming`). On `false` the
+    /// candidate has NOT been unpublished here — that is address-keyed
+    /// cleanup the caller performs via `unpublish_rejected_outbound_candidate`,
+    /// identical to the eager-reject call sites in
+    /// `finalize_new_outbound_connection`, so a `false` return must never be
+    /// treated as "safe to finalize" the way the earlier version of this
+    /// function silently was.
+    #[must_use = "a `false` return means the candidate lost its re-resolved \
+                  tie-break and the caller MUST unpublish it and reject the \
+                  finalize, exactly like the eager RejectIncoming/\
+                  EvictStaleRejectIncoming call sites — silently discarding \
+                  this result reproduces the reviewer finding where a \
+                  rejected outbound candidate stayed indexed/counted and was \
+                  handed back as a live Ok handle"]
     fn publish_outbound_or_reresolve(
         &self,
         peer_id: &crate::PeerId,
         connection_arc: &Arc<LockFreeConnection>,
         expected: Option<&Arc<LockFreeConnection>>,
         registry_weak: &std::sync::Weak<GossipRegistry>,
-    ) {
+    ) -> bool {
         crate::lifecycle::record_transport_event(
             crate::lifecycle::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
                 peer: peer_id.clone(),
@@ -394,7 +414,7 @@ impl<T> ConnectionPool<T> {
         let Err(rival) =
             self.compare_and_publish_peer_connection(peer_id, expected, connection_arc.clone())
         else {
-            return;
+            return true;
         };
         let Some(rival) = rival else {
             // The CAS failed but the slot is empty now too: a concurrent
@@ -403,7 +423,7 @@ impl<T> ConnectionPool<T> {
             // matching the tolerance the `EvictStaleRejectIncoming` arm
             // above already documents for narrower races.
             let _ = self.compare_and_publish_peer_connection(peer_id, None, connection_arc.clone());
-            return;
+            return true;
         };
         // A rival is actually installed now (e.g. a fresh preferred inbound
         // published concurrently). Re-resolve the identical, address-blind
@@ -430,27 +450,30 @@ impl<T> ConnectionPool<T> {
                     Some(&rival),
                     connection_arc.clone(),
                 );
+                true
             }
             ConnectionConflictDecision::ReplaceExisting => {
                 let _ = self.disconnect_connection_instance(peer_id, &rival);
                 self.publish_current_peer_connection(peer_id, connection_arc.clone());
+                true
             }
             ConnectionConflictDecision::EvictStaleRejectIncoming => {
                 let _ = self.disconnect_connection_instance(peer_id, &rival);
                 debug!(
                     peer_id = %peer_id,
                     "outbound finalize compare-and-publish lost to a concurrently published \
-                     rival; evicted the now-stale rival but declined to publish a \
-                     non-preferred outbound as the session"
+                     rival; evicted the now-stale rival and rejecting our own candidate — \
+                     it was not the tie-break-preferred direction either"
                 );
+                false
             }
             ConnectionConflictDecision::RejectIncoming => {
                 debug!(
                     peer_id = %peer_id,
                     "outbound finalize compare-and-publish lost to a concurrently published, \
-                     tie-break-preferred rival; leaving the outbound indexed but not current, \
-                     to be retired by its own IO lifecycle"
+                     tie-break-preferred rival; rejecting our own candidate"
                 );
+                false
             }
         }
     }
@@ -1769,6 +1792,77 @@ impl<T> ConnectionPool<T> {
         Some(connection)
     }
 
+    /// Peer-identity-aware variant of [`Self::remove_connection_instance_by_id`]
+    /// for callers (ask-timeout recovery, ask-cancellation eviction) that
+    /// already know which peer the failing instance belongs to, and so must
+    /// not depend on `addr_to_peer_id[addr]` still holding that peer's alias
+    /// to clear its current session.
+    ///
+    /// `remove_connection_instance_by_id` derives the peer id to clear
+    /// `peer_sessions`/`connections_by_peer` for from `addr_to_peer_id[addr]`
+    /// — read BEFORE the address-indexed removal even runs. If that alias
+    /// row is missing or already stale (e.g. raced by an unrelated reindex,
+    /// or simply never re-added after some earlier cleanup), current-session
+    /// cleanup was silently skipped even when this instance genuinely was
+    /// the peer's live session — leaving a dead current session published
+    /// (`peer_sessions`/`connections_by_peer` still pointing at a
+    /// disconnected/exited stream). Threading the caller's own `peer_id`
+    /// closes that gap without reopening the address-vs-identity hole this
+    /// whole file exists to close: it never trusts `peer_id` blindly to
+    /// evict "whatever is currently indexed" — it only ever acts on the
+    /// connection instance actually identified by `instance_id`.
+    ///
+    /// Resolution of the target `Arc` is itself alias-independent: it is
+    /// whatever is indexed at `addr` if that still matches `instance_id`,
+    /// OR — if `addr` no longer matches (e.g. the alias metadata is stale) —
+    /// whatever is the peer's current session, but ONLY if THAT also matches
+    /// `instance_id`. A concurrently reconnected FRESH session for the same
+    /// peer is a different `Arc`/instance id and is therefore never matched,
+    /// never touched, regardless of which branch resolves the target.
+    ///
+    /// Once resolved, teardown prefers the fully identity-scoped
+    /// [`Self::disconnect_connection_instance`] (CAS-clears `peer_sessions`
+    /// by `Arc` identity, mirrors into `connections_by_peer`, and sweeps
+    /// every `connections_by_addr` alias by `Arc` identity — no
+    /// `addr_to_peer_id` dependency at all). If the target was NOT (or is no
+    /// longer) the peer's current session — e.g. already superseded before
+    /// this call — that CAS declines harmlessly, and this falls back to the
+    /// address-keyed [`Self::remove_connection_instance_by_id`] to retire
+    /// the still address-indexed, non-current instance without touching the
+    /// peer's actual current session.
+    pub(crate) fn remove_connection_instance_for_peer(
+        &self,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+        instance_id: u64,
+    ) -> Option<Arc<LockFreeConnection>> {
+        let matches_instance = |conn: &Arc<LockFreeConnection>| {
+            conn.stream_handle.as_ref().map(|h| h.instance_id()) == Some(instance_id)
+        };
+
+        let by_addr = self
+            .connections_by_addr
+            .read_sync(&addr, |_, v| v.clone())
+            .filter(matches_instance);
+        let target = by_addr.or_else(|| {
+            self.peer_sessions
+                .read_sync(peer_id, |_, session| session.current_connection())
+                .flatten()
+                .filter(matches_instance)
+        })?;
+
+        if self.disconnect_connection_instance(peer_id, &target) {
+            return Some(target);
+        }
+
+        // `target` was not (or no longer) the current session for `peer_id`
+        // — already superseded by the time we got here. It may still be
+        // address-indexed (matched purely by `instance_id`, never merely by
+        // `peer_id`); retire it there without touching whatever the peer's
+        // actual current session now is.
+        self.remove_connection_instance_by_id(addr, instance_id)
+    }
+
     /// Release the `connection_counter` contribution of an instance the
     /// caller has confirmed is superseded/displaced, in the one case
     /// `remove_connection_instance_by_id` itself cannot decrement for:
@@ -2322,12 +2416,35 @@ impl<T> ConnectionPool<T> {
                     // for this peer in the gap between that snapshot and
                     // this call must never be overwritten by this fallback
                     // outbound; see `publish_outbound_or_reresolve`.
-                    self.publish_outbound_or_reresolve(
+                    //
+                    // A `false` return means the compare-and-publish lost to
+                    // a concurrently published rival AND the re-resolved,
+                    // address-blind tie-break rejected our own candidate
+                    // (`RejectIncoming`/`EvictStaleRejectIncoming`). That is
+                    // the SAME reject outcome as the eager decision arms
+                    // below, so it gets the IDENTICAL cleanup: fully
+                    // unpublish the provisionally-indexed candidate (never
+                    // bump `connection_counter`, never send FullSync) and
+                    // propagate the rejection to the caller. Before this
+                    // fix, a `false` here was silently ignored and execution
+                    // fell through to the counter bump / FullSync / `Ok`
+                    // below for the LOSING candidate — leaving it indexed in
+                    // `connections_by_addr` where it could shadow the
+                    // preferred rival in address lookups.
+                    if !self.publish_outbound_or_reresolve(
                         peer_id,
                         &connection_arc,
                         existing_before.as_ref(),
                         &registry_weak,
-                    );
+                    ) {
+                        self.unpublish_rejected_outbound_candidate(
+                            addr,
+                            &connection_arc,
+                            peer_id,
+                            existing_before.as_ref(),
+                        );
+                        return Err(crate::GossipError::ConnectionExists);
+                    }
                 }
                 ConnectionConflictDecision::ReplaceExisting => {
                     // Evict the *specific* rival the decision above was

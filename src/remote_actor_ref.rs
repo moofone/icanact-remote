@@ -366,10 +366,14 @@ impl Drop for ActorAskCancellationGuard {
         // cancellation has nothing to do with. `instance_id == None` means
         // the connection this ask ran on had no live stream handle to begin
         // with, so there is nothing identifiable to retire.
+        // Peer-id-aware: `self.peer_id` is known here (captured at guard
+        // creation), so current-session cleanup does not depend on
+        // `addr_to_peer_id[self.addr]` still holding this peer's alias — see
+        // `ConnectionPool::remove_connection_instance_for_peer`.
         let evicted = self.instance_id.is_some_and(|instance_id| {
             self.registry
                 .connection_pool
-                .remove_connection_instance_by_id(self.addr, instance_id)
+                .remove_connection_instance_for_peer(&self.peer_id, self.addr, instance_id)
                 .is_some()
         });
         tracing::warn!(
@@ -501,10 +505,14 @@ impl<T> RemoteActorRef<T> {
         // be indexed for the peer at this moment — a concurrent reconnect
         // landing here must not be collaterally destroyed by a timeout on a
         // now-superseded instance.
+        // Peer-id-aware: `peer_id` is known here, so current-session cleanup
+        // does not depend on `addr_to_peer_id[failed_conn.addr]` still
+        // holding this peer's alias — see
+        // `ConnectionPool::remove_connection_instance_for_peer`.
         let evicted = failed_conn.instance_id().is_some_and(|instance_id| {
             registry
                 .connection_pool
-                .remove_connection_instance_by_id(failed_conn.addr, instance_id)
+                .remove_connection_instance_for_peer(peer_id, failed_conn.addr, instance_id)
                 .is_some()
         });
         tracing::warn!(
