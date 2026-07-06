@@ -416,18 +416,49 @@ impl<T> ConnectionPool<T> {
         else {
             return true;
         };
-        let Some(rival) = rival else {
-            // The CAS failed but the slot is empty now too: a concurrent
-            // CLEAR (not a publish) raced us. Safe to retry once against
-            // the now-empty slot; further nested races are out of scope,
-            // matching the tolerance the `EvictStaleRejectIncoming` arm
-            // above already documents for narrower races.
-            let _ = self.compare_and_publish_peer_connection(peer_id, None, connection_arc.clone());
-            return true;
+        let rival = match rival {
+            Some(rival) => rival,
+            None => {
+                // The CAS failed but the slot is empty now too: a concurrent
+                // CLEAR (not a publish) raced us. Safe to retry once against
+                // the now-empty slot; further nested races are out of scope,
+                // matching the tolerance the `EvictStaleRejectIncoming` arm
+                // above already documents for narrower races.
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::OutboundFinalizeClearRaceRetry {
+                        peer: peer_id.clone(),
+                        addr: connection_arc.addr,
+                    },
+                );
+                let _ = self.compare_and_publish_peer_connection(
+                    peer_id,
+                    None,
+                    connection_arc.clone(),
+                );
+                return true;
+            }
         };
         // A rival is actually installed now (e.g. a fresh preferred inbound
-        // published concurrently). Re-resolve the identical, address-blind
-        // tie-break the caller already computed, this time against reality.
+        // published concurrently, either in the original CAS window or in
+        // the clear-race retry window above). Re-resolve the identical,
+        // address-blind tie-break the caller already computed, this time
+        // against reality.
+        self.resolve_and_act_on_outbound_rival(peer_id, connection_arc, &rival, registry_weak)
+    }
+
+    /// Re-resolve the address-blind tie-break for `connection_arc` against an
+    /// actually-installed `rival` and act on the outcome exactly like the
+    /// eager decision arms in `finalize_new_outbound_connection` do. Shared
+    /// by both `publish_outbound_or_reresolve` CAS-loss shapes: a rival
+    /// observed directly by the primary compare-and-publish, and a rival
+    /// observed only after its bounded clear-race retry.
+    fn resolve_and_act_on_outbound_rival(
+        &self,
+        peer_id: &crate::PeerId,
+        connection_arc: &Arc<LockFreeConnection>,
+        rival: &Arc<LockFreeConnection>,
+        registry_weak: &std::sync::Weak<GossipRegistry>,
+    ) -> bool {
         let decision = registry_weak
             .upgrade()
             .map(|registry| {
@@ -447,18 +478,18 @@ impl<T> ConnectionPool<T> {
                 // elsewhere in this function.
                 let _ = self.compare_and_publish_peer_connection(
                     peer_id,
-                    Some(&rival),
+                    Some(rival),
                     connection_arc.clone(),
                 );
                 true
             }
             ConnectionConflictDecision::ReplaceExisting => {
-                let _ = self.disconnect_connection_instance(peer_id, &rival);
+                let _ = self.disconnect_connection_instance(peer_id, rival);
                 self.publish_current_peer_connection(peer_id, connection_arc.clone());
                 true
             }
             ConnectionConflictDecision::EvictStaleRejectIncoming => {
-                let _ = self.disconnect_connection_instance(peer_id, &rival);
+                let _ = self.disconnect_connection_instance(peer_id, rival);
                 debug!(
                     peer_id = %peer_id,
                     "outbound finalize compare-and-publish lost to a concurrently published \
@@ -1889,6 +1920,70 @@ impl<T> ConnectionPool<T> {
         self.decrement_connection_counter();
     }
 
+    /// Retire a FAILED connection instance identified directly by its own
+    /// `Arc` (`current`) after `disconnect_connection_instance(peer_id,
+    /// current)` has already declined (CAS loss): a fresh session for this
+    /// peer was published between the caller's snapshot and that CAS, so
+    /// `peer_sessions`/`connections_by_peer` already correctly point at the
+    /// fresh winner and must NOT be touched here. `current` — the failed
+    /// instance — was never retired by anything else, though: its address
+    /// aliases and `connection_counter` contribution are still outstanding
+    /// and must be released here, by `current`'s own identity, without going
+    /// anywhere near the peer-keyed indices the fresh winner now occupies.
+    ///
+    /// First tries the address-keyed, single-alias-plus-sweep path
+    /// (`remove_connection_instance_by_id`), which also decrements the
+    /// counter when it succeeds. That call's own internal sweep can only run
+    /// once it has found `current` still indexed at `current.addr` in the
+    /// first place, though — if the fresh publish's own reindexing already
+    /// displaced `current` from `current.addr` too (e.g. a same-bind-address
+    /// takeover), that lookup finds nothing and returns `None` before ever
+    /// reaching its alias sweep. In that case this falls back to an
+    /// identity-only sweep of every `connections_by_addr` entry that still
+    /// points at `current` by `Arc::ptr_eq`, then performs the exact single
+    /// compensating `release_displaced_connection_count()` release the
+    /// same-address-failover path above already documents: `current` was
+    /// counted exactly once when originally published, and once its CAS
+    /// against `peer_sessions` has declined, no other path will ever find
+    /// and decrement it again.
+    ///
+    /// Callers must invoke this exactly once per lost
+    /// `disconnect_connection_instance` CAS — never when that CAS succeeded
+    /// (it already released the counter and swept aliases itself).
+    pub(crate) fn retire_lost_cas_matched_instance(
+        &self,
+        current: &Arc<LockFreeConnection>,
+        failed_instance_id: u64,
+    ) {
+        if self
+            .remove_connection_instance_by_id(current.addr, failed_instance_id)
+            .is_some()
+        {
+            return;
+        }
+
+        let mut alias_addrs: Vec<SocketAddr> = Vec::new();
+        self.connections_by_addr.iter_sync(|addr, v| {
+            if Arc::ptr_eq(v, current) {
+                alias_addrs.push(*addr);
+            }
+            true
+        });
+        for addr in alias_addrs {
+            let removed = self
+                .connections_by_addr
+                .remove_if_sync(&addr, |v| Arc::ptr_eq(v, current))
+                .is_some();
+            if removed {
+                let _ = self.addr_to_peer_id.remove_sync(&addr);
+                self.clear_capabilities_for_addr(&addr);
+            }
+        }
+
+        self.release_displaced_connection_count();
+        current.abort_tasks();
+    }
+
     /// Choose the least-recently-used connection eligible for eviction when
     /// the pool is at capacity.
     ///
@@ -2370,6 +2465,15 @@ impl<T> ConnectionPool<T> {
         let existing_before = peer_id_opt
             .as_ref()
             .and_then(|peer_id| self.get_connection_by_peer_id(peer_id));
+
+        if let Some(peer_id) = peer_id_opt.as_ref() {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken {
+                    peer: peer_id.clone(),
+                    addr,
+                },
+            );
+        }
 
         // Insert into lock-free map before spawning.
         let _ = self

@@ -5598,7 +5598,7 @@ impl<T: 'static> GossipRegistry<T> {
                         );
                         return Ok(());
                     }
-                    Some(_) => {
+                    Some(failed_id) => {
                         // The failed instance IS the current session. Retire
                         // it here by CAS'd instance identity
                         // (`disconnect_connection_instance`) rather than
@@ -5612,12 +5612,15 @@ impl<T: 'static> GossipRegistry<T> {
                         // instead of surviving it. `disconnect_connection_instance`
                         // performs a single atomic compare-and-clear against
                         // `current` and declines (a safe no-op) if a
-                        // concurrent publish has already superseded it —
-                        // that "already superseded" outcome is handled
-                        // identically to a successful retirement here: either
-                        // way, this instance must never be retired again via
-                        // the peer-wide path below.
+                        // concurrent publish has already superseded it.
+                        crate::lifecycle::record_transport_event(
+                            crate::lifecycle::TransportLifecycleEvent::SocketFailureMatchedInstanceTeardownAttempt {
+                                peer: peer_id.clone(),
+                                addr: current.addr,
+                            },
+                        );
                         let retired = pool.disconnect_connection_instance(peer_id, &current);
+                        let _ = failed_id;
                         info!(
                             peer_id = %peer_id,
                             observed_peer = %observed_peer_addr,
@@ -5627,6 +5630,12 @@ impl<T: 'static> GossipRegistry<T> {
                              retiring by CAS'd instance identity, not peer-wide, so a \
                              concurrently published fresh session survives"
                         );
+                        // Either the CAS retired `current` directly, or the
+                        // fallback above retired it by identity after the
+                        // CAS lost to a fresh publish — the failed instance
+                        // is fully handled either way. Never fall through to
+                        // the peer-wide sweep below, which would now
+                        // collaterally tear down the fresh winner.
                         instance_teardown_done = true;
                     }
                     None => {
@@ -10564,6 +10573,191 @@ mod tests {
                 .unwrap_or(false),
             "`connections_by_peer` must still point at the fresh instance after the matched \
              failed instance is retired"
+        );
+    }
+
+    /// RED (review finding, matched-instance CAS-LOSS fallback): when
+    /// `failed_instance_id` matches the CURRENT session's own instance id,
+    /// but a FRESH session for the same peer is published in the gap
+    /// between that match and `disconnect_connection_instance`'s own CAS —
+    /// so the CAS itself observably LOSES (`retired == false`) — the fresh
+    /// session must survive as current AND the old, now-orphaned failed
+    /// instance must be fully retired by its own identity: no lingering
+    /// `connections_by_addr` alias, and its `connection_counter`
+    /// contribution released so it does not leak. At HEAD, `retired == false`
+    /// was treated identically to a successful retirement
+    /// (`instance_teardown_done = true` unconditionally) with no fallback
+    /// cleanup at all, leaving the old instance's address alias indexed
+    /// forever and its counter contribution permanently leaked.
+    ///
+    /// Pinned deterministically via `set_transport_lifecycle_recorder` on
+    /// `SocketFailureMatchedInstanceTeardownAttempt`, which fires
+    /// immediately before the matched-instance branch's
+    /// `disconnect_connection_instance` CAS attempt — publishing the fresh
+    /// session from inside that hook lands it in the exact gap between the
+    /// instance-id match and the CAS, guaranteeing the CAS loses on every
+    /// run.
+    ///
+    /// RED at HEAD: a `connections_by_addr` entry for `old_addr` still
+    /// points at `conn_old` (zombie alias) and/or `connection_counter`
+    /// stays inflated above the correct single-live-session baseline. GREEN
+    /// after the fix: no alias for `conn_old` remains, and the counter
+    /// returns to exactly one live session.
+    #[tokio::test]
+    async fn socket_failure_matched_instance_cas_loss_retires_failed_instance_without_leak() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        // Serializes against the SAME global lock
+        // `connection_pool::tests::RECORDER_TEST_LOCK` uses: both modules'
+        // tests install the single global `set_transport_lifecycle_recorder`
+        // hook, so a per-module lock would not prevent this test and a
+        // `connection_pool::tests` recorder test from clobbering each
+        // other's registration under the default multi-threaded harness.
+        struct RecorderGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+        impl RecorderGuard {
+            fn acquire() -> Self {
+                Self(
+                    crate::connection_pool::tests::RECORDER_TEST_LOCK
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                )
+            }
+        }
+        impl Drop for RecorderGuard {
+            fn drop(&mut self) {
+                crate::set_transport_lifecycle_recorder(None);
+            }
+        }
+
+        let registry = GossipRegistry::<()>::new(test_addr(9400), test_config());
+        let peer_id = test_peer_id("matched_instance_cas_loss_peer");
+        let old_addr = test_addr(9401);
+        let fresh_addr = test_addr(9402);
+        let pool = registry.connection_pool.clone();
+        pool.set_configured_peer_addr(&peer_id, old_addr);
+
+        // Current, live session whose IO task is about to fail.
+        let (io_old, _p_old) = tokio::io::duplex(1024);
+        let (sh_old, _w_old, _r_old) = LockFreeStreamHandle::new(
+            io_old,
+            old_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn_old = LockFreeConnection::new(old_addr, ConnectionDirection::Outbound);
+        conn_old.stream_handle = Some(Arc::new(sh_old));
+        conn_old.embedded_peer_id = Some(peer_id.clone());
+        conn_old.set_state(ConnectionState::Connected);
+        let conn_old = Arc::new(conn_old);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn_old.clone()));
+
+        let old_instance_id = conn_old
+            .stream_handle
+            .as_ref()
+            .map(|h| h.instance_id())
+            .expect("conn_old must have a stream handle");
+
+        let baseline = pool.raw_connection_counter();
+        assert_eq!(
+            baseline, 1,
+            "test precondition: exactly one counted, live session before the race"
+        );
+
+        // The FRESH replacement session a concurrent inbound publishes for
+        // the same peer identity WHILE `conn_old`'s teardown CAS is about to
+        // run — this is the exact race that makes the CAS lose.
+        let (io_fresh, _p_fresh) = tokio::io::duplex(1024);
+        let (sh_fresh, _w_fresh, _r_fresh) = LockFreeStreamHandle::new(
+            io_fresh,
+            fresh_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn_fresh = LockFreeConnection::new(fresh_addr, ConnectionDirection::Inbound);
+        conn_fresh.stream_handle = Some(Arc::new(sh_fresh));
+        conn_fresh.embedded_peer_id = Some(peer_id.clone());
+        conn_fresh.set_state(ConnectionState::Connected);
+        let conn_fresh = Arc::new(conn_fresh);
+
+        let _guard = RecorderGuard::acquire();
+        {
+            let pool = pool.clone();
+            let peer_id = peer_id.clone();
+            let conn_fresh = conn_fresh.clone();
+            crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::SocketFailureMatchedInstanceTeardownAttempt {
+                    peer,
+                    ..
+                } = &event
+                    && *peer == peer_id
+                {
+                    // Deregister first: `add_connection_by_peer_id` below
+                    // fires its own (non-matching) `SessionPublished` event
+                    // through this same global hook, and this avoids any
+                    // reentrant/recursive invocation of this closure.
+                    crate::set_transport_lifecycle_recorder(None);
+                    // Models a real concurrently-published fresh session:
+                    // publishes AND counts it, exactly like a real
+                    // accept/finalize would.
+                    assert!(pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        fresh_addr,
+                        conn_fresh.clone()
+                    ));
+                }
+            })));
+        }
+
+        // conn_old's IO task exits and reports failure, identifying itself by
+        // its OWN captured instance id — which matched the current session
+        // at the moment the handler made its decision, but the CAS below
+        // will observe the fresh session installed instead and lose.
+        registry
+            .handle_peer_connection_failure(old_addr, Some(old_instance_id))
+            .await
+            .unwrap();
+
+        let after = pool.get_connection_by_peer_id(&peer_id);
+        assert!(
+            after.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn_fresh)),
+            "the fresh session published into the CAS-loss race must survive as current \
+             (got {after:?})"
+        );
+
+        let mut lingering_old_alias = false;
+        pool.connections_by_addr.iter_sync(|_, v| {
+            if Arc::ptr_eq(v, &conn_old) {
+                lingering_old_alias = true;
+            }
+            true
+        });
+        assert!(
+            !lingering_old_alias,
+            "the old failed instance must leave NO lingering `connections_by_addr` alias once \
+             its CAS against `peer_sessions` has lost"
+        );
+
+        assert!(
+            !conn_old.has_live_stream(),
+            "the old failed instance's background tasks must be aborted even when its CAS \
+             against `peer_sessions` loses"
+        );
+
+        let final_count = pool.raw_connection_counter();
+        assert_eq!(
+            final_count,
+            baseline,
+            "connection_counter must return to exactly one live session after the CAS-lost \
+             failed instance is retired by identity — got {final_count}, baseline {baseline} \
+             (leaked {} if unfixed)",
+            final_count.saturating_sub(baseline)
         );
     }
 

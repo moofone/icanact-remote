@@ -67,6 +67,42 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired immediately before `publish_outbound_or_reresolve`'s bounded
+    /// retry against an observed-empty peer-session slot (the "first
+    /// compare-and-publish lost to a concurrent CLEAR, not a publish" case).
+    /// Purely instrumentation: lets tests deterministically pin a further
+    /// concurrent publish — e.g. a preferred rival — into the narrow gap
+    /// between that first CAS loss and this retry, the same technique
+    /// `OutboundFinalizePublishAttempt` uses for the wider gap around the
+    /// whole publish attempt.
+    OutboundFinalizeClearRaceRetry {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
+    /// Fired immediately after `finalize_new_outbound_connection` snapshots
+    /// `existing_before` (the pre-existing rival, if any, for this peer) and
+    /// before the tie-break decision is computed from it a few lines below.
+    /// Purely instrumentation: lets tests deterministically pin a genuine
+    /// concurrent liveness change — e.g. `existing_before`'s own IO task
+    /// exiting between the snapshot and the decision — into that narrow real
+    /// gap, the same technique `OutboundFinalizePublishAttempt` uses for the
+    /// wider publish gap.
+    OutboundFinalizeExistingSnapshotTaken {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
+    /// Fired immediately before `GossipRegistry::handle_peer_connection_failure`'s
+    /// matched-instance branch calls `disconnect_connection_instance` to
+    /// retire the failed current session by CAS'd identity. Purely
+    /// instrumentation: lets tests deterministically pin a concurrent fresh
+    /// publish for the same peer into the gap between the instance-id match
+    /// above and this CAS attempt, so the CAS observably loses — the same
+    /// technique `OutboundFinalizePublishAttempt` uses for the outbound-finalize
+    /// side.
+    SocketFailureMatchedInstanceTeardownAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
     SessionRemoved {
         peer: PeerId,
         addr: SocketAddr,
