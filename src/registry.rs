@@ -10774,6 +10774,196 @@ mod tests {
         );
     }
 
+    /// RED (P1 finding, `stream_writer.rs` `ExitGuard::drop`, the ONLY
+    /// production caller that passes `failed_instance_id` to
+    /// `handle_peer_connection_failure`): unlike every other test in this
+    /// module, which calls `handle_peer_connection_failure` directly, this
+    /// drives the REAL production seam — a genuine
+    /// `LockFreeStreamHandle`/`io_task` wired to this registry via a real
+    /// `ReadContext`, whose IO task is made to exit by closing its peer
+    /// socket (an actual `UnexpectedEof`), exercising `ExitGuard::drop`
+    /// itself rather than the handler it eventually (or, at HEAD, does not)
+    /// call.
+    ///
+    /// Setup: `old` is a stale/superseded instance for `peer_id`, still
+    /// indexed at `old_addr` in `connections_by_addr` and still contributing
+    /// to `connection_counter`. `fresh` has since become the peer's current,
+    /// published session at a different address — the ordinary "reconnected
+    /// while the old link was still dying" shape. `old`'s own IO task then
+    /// exits (peer socket closed).
+    ///
+    /// At HEAD: the exiting IO task resolves the peer's current session,
+    /// sees it is a DIFFERENT instance (`fresh`, not `old`), and sets
+    /// `should_cancel_pending = false` — which at HEAD also skips the ONLY
+    /// call in this code path that could retire `old`'s own bookkeeping.
+    /// `old` is never handed to any cleanup: its `connections_by_addr[old_addr]`
+    /// alias and its `connection_counter` contribution both leak forever
+    /// (RED), while `fresh` and any pending requests on it are untouched
+    /// either way. GREEN after the fix: `old`'s alias and counter
+    /// contribution are retired, `fresh` remains exactly as published, and
+    /// no peer-wide failure accounting fires (verified via the peer's
+    /// `gossip_state` failure counter staying at zero and `fresh` never
+    /// being disconnected).
+    #[tokio::test]
+    async fn superseded_io_exit_retires_own_instance_without_peer_wide_accounting() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle, MASTER_BUFFER_SIZE, ReadContext,
+        };
+
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(9600), test_config()));
+        let peer_id = test_peer_id("superseded_io_exit_peer");
+        let old_addr = test_addr(9601);
+        let fresh_addr = test_addr(9602);
+        let pool = &registry.connection_pool;
+        pool.set_configured_peer_addr(&peer_id, old_addr);
+
+        // The registry must be tracking this peer for the gossip-state
+        // failure-accounting assertion below to be meaningful (only tracked
+        // peers can have `failures` bumped at all).
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                old_addr,
+                crate::registry::PeerInfo {
+                    peer_address: Some(old_addr),
+                    ..crate::registry::PeerInfo::local(old_addr)
+                },
+            );
+        }
+
+        // `old`: a real, registry-wired stream instance — the production
+        // seam this finding is about. Its IO task's `ExitGuard` captures
+        // `registry_weak`/`peer_addr`/`peer_id` from this `ReadContext`,
+        // exactly as a real accepted/dialed connection would.
+        let (old_io, old_peer_io) = tokio::io::duplex(1024);
+        let old_read_ctx = ReadContext {
+            registry_weak: Arc::downgrade(&registry),
+            peer_addr: old_addr,
+            peer_id: Some(peer_id.clone()),
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: pool.aligned_bytes_pool(),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (old_handle, old_writer_task, _old_reader_task) = LockFreeStreamHandle::new(
+            old_io,
+            old_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            Some(old_read_ctx),
+        );
+        let mut conn_old = LockFreeConnection::new(old_addr, ConnectionDirection::Outbound);
+        conn_old.stream_handle = Some(Arc::new(old_handle));
+        conn_old.embedded_peer_id = Some(peer_id.clone());
+        conn_old.set_state(ConnectionState::Connected);
+        let conn_old = Arc::new(conn_old);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn_old.clone()));
+
+        // `fresh`: the peer's current, winning session — a different
+        // instance at a different address. Publishing it does not touch
+        // `old`'s own `connections_by_addr[old_addr]` alias or its
+        // counted contribution; only `old`'s own retirement can do that.
+        let (fresh_io, _fresh_peer_io) = tokio::io::duplex(1024);
+        let (fresh_handle, _fresh_writer_task, _fresh_reader_task) = LockFreeStreamHandle::new(
+            fresh_io,
+            fresh_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn_fresh = LockFreeConnection::new(fresh_addr, ConnectionDirection::Inbound);
+        conn_fresh.stream_handle = Some(Arc::new(fresh_handle));
+        conn_fresh.embedded_peer_id = Some(peer_id.clone());
+        conn_fresh.set_state(ConnectionState::Connected);
+        let conn_fresh = Arc::new(conn_fresh);
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), fresh_addr, conn_fresh.clone()));
+
+        assert!(
+            pool.get_connection_by_peer_id(&peer_id)
+                .is_some_and(|c| Arc::ptr_eq(&c, &conn_fresh)),
+            "test precondition: `fresh` must be the peer's current session"
+        );
+        assert_eq!(
+            pool.raw_connection_counter(),
+            2,
+            "test precondition: two counted, live instances before `old` exits"
+        );
+
+        // `old`'s IO task exits for real: close its peer socket, producing a
+        // genuine `UnexpectedEof` inside `io_task`, which returns and drops
+        // its `ExitGuard` — the actual production trigger, not a direct
+        // handler call.
+        drop(old_peer_io);
+        old_writer_task
+            .await
+            .expect("old instance's IO task must not panic");
+
+        // The current, winning session must be completely untouched.
+        assert!(
+            pool.get_connection_by_peer_id(&peer_id)
+                .is_some_and(|c| Arc::ptr_eq(&c, &conn_fresh)),
+            "the superseded exit must never touch the peer's current session"
+        );
+        assert!(
+            pool.connections_by_peer
+                .read_sync(&peer_id, |_, v| Arc::ptr_eq(v, &conn_fresh))
+                .unwrap_or(false),
+            "`connections_by_peer` must still point at `fresh`"
+        );
+        assert!(
+            conn_fresh.has_live_stream(),
+            "`fresh`'s background tasks must never be aborted by a superseded sibling's exit"
+        );
+
+        // The superseded `old` instance must be fully retired: no lingering
+        // `connections_by_addr` alias...
+        let old_alias_survives = pool
+            .connections_by_addr
+            .read_sync(&old_addr, |_, v| Arc::ptr_eq(v, &conn_old))
+            .unwrap_or(false);
+        assert!(
+            !old_alias_survives,
+            "RED at HEAD: the superseded `old` instance's own `connections_by_addr[old_addr]` \
+             alias must be retired by its own exiting IO task — the ONLY production caller for \
+             this cleanup — not left as a zombie forever"
+        );
+
+        // ...and its `connection_counter` contribution released, back down
+        // to exactly the one live session (`fresh`).
+        let final_count = pool.raw_connection_counter();
+        assert_eq!(
+            final_count, 1,
+            "RED at HEAD: `old`'s `connection_counter` contribution must be released when its \
+             own IO task retires it — got {final_count}, expected 1 (leaked otherwise)"
+        );
+
+        // No peer-wide failure accounting/consensus/gossip-failure signalling
+        // may fire for a superseded exit: the peer's tracked failure count
+        // must stay at zero.
+        {
+            let gossip_state = registry.gossip_state.lock().await;
+            let failures = gossip_state
+                .peers
+                .get(&old_addr)
+                .map(|info| info.failures)
+                .unwrap_or(0);
+            assert_eq!(
+                failures, 0,
+                "a superseded instance's own IO exit must never mark the peer as failed \
+                 (peer-wide accounting must only fire for the CURRENT session's own failure)"
+            );
+        }
+    }
+
     /// RED (absence-of-alias misread as superseded): a socket failure for an
     /// INBOUND current session's *ephemeral* peer address — which was never
     /// (or is no longer) indexed in `connections_by_addr` — must NOT be
