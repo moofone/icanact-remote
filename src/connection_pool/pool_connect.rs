@@ -830,9 +830,14 @@ impl<T> ConnectionPool<T> {
                 .upsert_sync(ephemeral_addr, connection.clone());
         }
 
-        self.connection_counter.fetch_add(1, Ordering::AcqRel);
         let instance_id = connection.stream_handle.as_ref().map(|h| h.instance_id());
+        self.connection_counter.fetch_add(1, Ordering::AcqRel);
         if let Some(instance_id) = instance_id {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::ConnectionCountMarkerAttempt {
+                    instance_id,
+                },
+            );
             self.mark_instance_counted(instance_id);
         }
 

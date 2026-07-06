@@ -194,6 +194,20 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired at every production `connection_counter` count-in site, exactly
+    /// at the pairing point between that instance's ownership-marker
+    /// (`counted_instances`) mutation and its `connection_counter`
+    /// mutation — the two operations that MUST move together for exactly
+    /// one `+1` to be paired with exactly one eventual `-1`. Purely
+    /// instrumentation: lets tests deterministically pin a concurrent
+    /// teardown (`disconnect_connection_instance`, an IO-exit release, or
+    /// any other `release_counted_instance` caller) for THIS exact instance
+    /// into the narrow window the review finding depends on — a teardown
+    /// that races between the counter increment and the marker insert (or,
+    /// symmetrically, before either has happened yet) must never leave a
+    /// `connection_counter` contribution with no marker ever able to
+    /// release it.
+    ConnectionCountMarkerAttempt { instance_id: u64 },
 }
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;

@@ -11289,6 +11289,108 @@ mod tests {
         );
     }
 
+    /// RED (P1 finding, atomicity of the `connection_counter`/`counted_instances`
+    /// pairing): `finish_indexing_accepted_connection` bumps
+    /// `connection_counter` FIRST and only inserts the instance's ownership
+    /// marker into `counted_instances` afterward. A concurrent teardown
+    /// (`disconnect_connection_instance`) for this exact, already-published
+    /// candidate that lands in the window between those two operations finds
+    /// no marker yet, so `release_counted_connection` releases nothing — then
+    /// the marker is inserted moments later regardless, over a connection
+    /// that has already been fully evicted (its address aliases removed, its
+    /// tasks aborted). Nothing is ever left to release that marker again:
+    /// the revalidation cleanup below only decrements through
+    /// `remove_connection_instance_by_id`, which finds nothing at either
+    /// address (the concurrent teardown already removed them), so the
+    /// `connection_counter` contribution just bumped leaks permanently.
+    /// Repeated reconnect churn leaks the counter until the admission gate
+    /// (`add_lock_free_connection`'s `connection_count >= max_connections`
+    /// check) is falsely reached despite no real growth in live connections.
+    ///
+    /// Pinned deterministically via
+    /// `TransportLifecycleEvent::ConnectionCountMarkerAttempt`, which fires
+    /// exactly at the counter/marker pairing point, guaranteeing the
+    /// concurrent teardown lands in the exact window the finding describes
+    /// on every run.
+    #[tokio::test]
+    async fn count_marker_teardown_race_does_not_leak_connection_counter() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9750), test_config());
+        let peer_id = test_peer_id("count_marker_race_peer");
+        let addr = test_addr(9751);
+        let pool = registry.connection_pool.clone();
+
+        let baseline = pool.raw_connection_counter();
+        assert_eq!(baseline, 0, "test precondition: a fresh pool has no live sessions");
+
+        let (io, _keep) = tokio::io::duplex(1024);
+        let (sh, _w, _r) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(sh));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+
+        // `finish_indexing_accepted_connection`'s own contract: it is only
+        // ever called AFTER a successful compare-and-publish has already
+        // installed `conn` as the peer's current session.
+        pool.publish_current_peer_connection(&peer_id, conn.clone());
+
+        // The mid-window teardown: fires exactly between the
+        // `connection_counter` increment and the `counted_instances` marker
+        // insert, mirroring `disconnect_connection_instance` racing this
+        // exact, just-published instance (e.g. the IO-exit path, or another
+        // tie-break's eviction) in that gap.
+        let _guard = {
+            let pool = pool.clone();
+            let peer_id = peer_id.clone();
+            let conn = conn.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::ConnectionCountMarkerAttempt { .. } = &event
+                {
+                    // Deregister first: `disconnect_connection_instance`
+                    // below fires its own `SessionRemoved` event through
+                    // this same global hook, and this avoids any
+                    // reentrant/recursive invocation of this closure.
+                    crate::set_transport_lifecycle_recorder(None);
+                    assert!(
+                        pool.disconnect_connection_instance(&peer_id, &conn),
+                        "test precondition: `conn` must still be current at the moment of \
+                         the mid-window teardown"
+                    );
+                }
+            }))
+        };
+
+        let indexed = pool.finish_indexing_accepted_connection(&peer_id, addr, None, &conn);
+        assert!(
+            !indexed,
+            "the mid-window teardown must be observed by the revalidation and this \
+             candidate treated as rejected, exactly like a re-resolved tie-break loss"
+        );
+
+        let final_count = pool.raw_connection_counter();
+        assert_eq!(
+            final_count,
+            baseline,
+            "connection_counter must return to baseline ({baseline}) after a mid-window \
+             teardown raced the counter/marker pairing — got {final_count} (leaked {} if \
+             unfixed)",
+            final_count.saturating_sub(baseline)
+        );
+    }
+
     /// RED (absence-of-alias misread as superseded): a socket failure for an
     /// INBOUND current session's *ephemeral* peer address — which was never
     /// (or is no longer) indexed in `connections_by_addr` — must NOT be
