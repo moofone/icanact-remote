@@ -13806,6 +13806,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_rejects_delta_without_authenticated_identity() {
+        // Fail-closed: a gossip delta carrying a claimed sender must be dropped
+        // when the connection has no authenticated identity to verify it
+        // against, not accepted with the forgeable `sender_peer_id` trusted.
+        let reg = Arc::new(GossipRegistry::<()>::new(test_addr(7066), test_config()));
+        let actor = "actor.delta.unauthenticated";
+        let owner = test_peer_id("delta-unauth-owner");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let loc = RemoteActorLocation::new_with_peer(test_addr(9266), owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        let removal_clock = loc.vector_clock.clone();
+        removal_clock.increment(observer_node);
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
+
+        let mut streaming_state = crate::protocol::StreamingState::new();
+        crate::protocol::process_read_result(
+            crate::handle::MessageReadResult::Gossip(
+                RegistryMessage::DeltaGossip {
+                    delta: RegistryDelta {
+                        since_sequence: 0,
+                        current_sequence: 1,
+                        changes: vec![RegistryChange::ActorAdded {
+                            name: actor.to_string(),
+                            location: loc,
+                            priority: RegistrationPriority::Normal,
+                        }],
+                        sender_peer_id: owner,
+                        wall_clock_time: 0,
+                        precise_timing_nanos: 0,
+                    },
+                    extensions: None,
+                },
+                None,
+            ),
+            &mut streaming_state,
+            &reg,
+            test_addr(7067),
+            None,
+            None,
+            None, // no authenticated identity: must fail closed
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "delta carrying a claimed sender must be dropped when unauthenticated"
+        );
+        assert!(reg.actor_state.removed_actors.contains_sync(actor));
+    }
+
+    #[tokio::test]
     async fn apply_delta_allows_direct_owner_recovery_after_transient_disconnect() {
         let reg = GossipRegistry::<()>::new(test_addr(7062), test_config());
         let actor = "actor.delta.stale-direct-owner";

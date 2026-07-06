@@ -4971,13 +4971,18 @@ pub(crate) fn handle_incoming_message(
             RegistryMessage::PeerListGossip {
                 peers,
                 timestamp,
-                sender_addr,
+                // The wire `sender_addr` is an unauthenticated, sender-chosen
+                // string. Never use it for attribution — bind everything to the
+                // authenticated connection address (`peer_state_addr`) instead so
+                // logs/merge cannot be misattributed to another peer.
+                sender_addr: _wire_sender_addr,
             } => {
                 let peer_state_addr = resolve_peer_state_addr(&registry, None, _peer_addr).await;
+                let authenticated_sender = peer_state_addr.to_string();
                 debug!(
                     peer_count = peers.len(),
                     timestamp = timestamp,
-                    sender = %sender_addr,
+                    sender = %authenticated_sender,
                     "received peer list gossip message"
                 );
 
@@ -4999,7 +5004,7 @@ pub(crate) fn handle_incoming_message(
                 }
 
                 let candidates = registry
-                    .on_peer_list_gossip(peers, &sender_addr, timestamp)
+                    .on_peer_list_gossip(peers, &authenticated_sender, timestamp)
                     .await;
 
                 if candidates.is_empty() {
