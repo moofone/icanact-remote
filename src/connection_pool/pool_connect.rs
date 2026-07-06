@@ -747,6 +747,12 @@ impl<T> ConnectionPool<T> {
         addr: SocketAddr,
         connection: &Arc<LockFreeConnection>,
     ) {
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::InboundAcceptIndexAttempt {
+                peer: peer_id.clone(),
+                addr,
+            },
+        );
         self.set_discovered_peer_addr(peer_id, addr);
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
         let _ = self

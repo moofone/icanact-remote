@@ -160,6 +160,23 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired immediately at the top of `finish_indexing_accepted_connection`,
+    /// i.e. immediately AFTER `publish_inbound_or_reresolve`'s
+    /// compare-and-publish has already won the peer-session slot for this
+    /// candidate but BEFORE any of `finish_indexing_accepted_connection`'s
+    /// own address-index / `connection_counter` side effects have run.
+    /// Purely instrumentation: lets tests deterministically pin a concurrent
+    /// evict/supersede of THIS exact just-published candidate into that
+    /// narrow window, the window the reviewer finding (stale
+    /// `connections_by_addr`/`addr_to_peer_id` alias plus a zombie
+    /// `connection_counter` contribution for an already-evicted instance)
+    /// depends on — the alias-sweep half of any such eviction runs before
+    /// this candidate has any alias to sweep, so without a post-indexing
+    /// revalidation it is missed entirely.
+    InboundAcceptIndexAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
 }
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;
