@@ -13,6 +13,20 @@ pub struct ConnectionPool<T = ()> {
     pub connections_by_addr: SccHashMap<SocketAddr, Arc<LockFreeConnection>>,
     /// Stable per-peer session state that survives reconnects.
     peer_sessions: SccHashMap<crate::PeerId, Arc<PeerSession>>,
+    /// Ownership table for outstanding `connection_counter` contributions,
+    /// keyed by stream-handle `instance_id`. Presence of a key IS the fact
+    /// "this instance's count is still outstanding and un-released" — set by
+    /// `mark_instance_counted` at the exact moment (and only at the moment)
+    /// an instance's count is actually added, consumed by
+    /// `release_counted_instance`'s single atomic `remove_sync`. This lets
+    /// any caller who only has an `instance_id` (a socket-failure handler, an
+    /// aborted IO task's exit guard) determine and consume ownership
+    /// correctly without ever needing to resolve the instance through an
+    /// index that may already have discarded it — and makes releases
+    /// exactly-once regardless of which teardown path notices a given
+    /// instance first, closing both the double-decrement (underflow) and
+    /// leaked-count classes structurally rather than by convention.
+    counted_instances: SccHashMap<u64, ()>,
     /// Cold-path dial ownership gate keyed by address so concurrent callers share one outbound dial.
     outbound_dial_gates: SccHashMap<SocketAddr, Arc<OutboundDialGate>>,
     max_connections: usize,

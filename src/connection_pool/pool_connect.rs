@@ -133,6 +133,7 @@ impl<T> ConnectionPool<T> {
             peer_id_to_addr: SccHashMap::default(),
             connections_by_addr: SccHashMap::default(),
             peer_sessions: SccHashMap::default(),
+            counted_instances: SccHashMap::default(),
             outbound_dial_gates: SccHashMap::default(),
             max_connections,
             connection_timeout,
@@ -1112,10 +1113,15 @@ impl<T> ConnectionPool<T> {
 
         self.publish_current_peer_connection(&peer_id, connection.clone());
 
+        let instance_id = connection.stream_handle.as_ref().map(|h| h.instance_id());
+
         // Also index by address for direct lookups
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
 
         self.connection_counter.fetch_add(1, Ordering::AcqRel);
+        if let Some(instance_id) = instance_id {
+            self.mark_instance_counted(instance_id);
+        }
         true
     }
 
@@ -1290,6 +1296,7 @@ impl<T> ConnectionPool<T> {
         if let Some(response_writer) = response_writer.as_ref() {
             response_writer.bind_stream_handle(stream_handle.clone());
         }
+        let instance_id = stream_handle.instance_id();
 
         let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
         connection.stream_handle = Some(stream_handle);
@@ -1313,6 +1320,10 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_addr
             .upsert_sync(addr, connection_arc.clone());
+        // This instance now owns the admission-gate count taken above —
+        // record it so whichever teardown path retires this instance later
+        // can release it exactly once (see `release_counted_instance`).
+        self.mark_instance_counted(instance_id);
         debug!(
             "CONNECTION POOL: Added lock-free connection to {} - pool now has {} connections",
             addr,
@@ -1433,7 +1444,7 @@ impl<T> ConnectionPool<T> {
                 );
             }
 
-            self.decrement_connection_counter();
+            self.release_counted_connection(&connection);
             self.clear_capabilities_for_addr(&addr);
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
@@ -1616,7 +1627,7 @@ impl<T> ConnectionPool<T> {
                 self.clear_capabilities_for_addr(addr);
             }
 
-            self.decrement_connection_counter();
+            self.release_counted_connection(&connection);
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
             connection.abort_tasks();
@@ -1810,7 +1821,7 @@ impl<T> ConnectionPool<T> {
             }
         }
 
-        self.decrement_connection_counter();
+        self.release_counted_connection(target);
 
         // H-004: Abort background tasks (writer, reader) to prevent resource leaks.
         target.abort_tasks();
@@ -1934,7 +1945,7 @@ impl<T> ConnectionPool<T> {
             }
         }
 
-        self.decrement_connection_counter();
+        self.release_counted_connection(&connection);
         connection.abort_tasks();
         Some(connection)
     }
@@ -2010,30 +2021,26 @@ impl<T> ConnectionPool<T> {
         self.remove_connection_instance_by_id(addr, instance_id)
     }
 
-    /// Release the `connection_counter` contribution of an instance the
-    /// caller has confirmed is superseded/displaced, in the one case
-    /// `remove_connection_instance_by_id` itself cannot decrement for:
+    /// Release the `connection_counter` contribution of `instance_id`, an
+    /// instance the caller has confirmed is superseded/displaced, in the one
+    /// case `remove_connection_instance_by_id` itself cannot decrement for:
     /// when that call returns `None` because the instance is no longer the
     /// entry indexed at `addr` at all (e.g. a fresh reconnect already
     /// reindexed the same bind address before the failed instance's
     /// teardown could run).
     ///
-    /// `remove_connection_instance_by_id` decrements exactly once, but only
-    /// on the branch where it actually finds-and-removes the instance at
-    /// `addr` — its early `removed?` return leaves the counter untouched
-    /// when the addr slot no longer holds this instance. Every instance
-    /// ever passed to that function was, by its own documented contract,
-    /// already published/counted once (`add_lock_free_connection`/
-    /// `add_connection_by_peer_id`/the outbound-finalize counter bump); if
-    /// its retirement is not the one that removed it from the index, no
-    /// other path will EVER decrement it again — that contribution is
-    /// otherwise leaked permanently. Callers must invoke this exactly once
-    /// per superseded instance, and only when `remove_connection_instance_by_id`
-    /// returned `None` for that same instance — never when it returned
-    /// `Some` (which already decremented), and never for a still-live
-    /// current session.
-    pub(crate) fn release_displaced_connection_count(&self) {
-        self.decrement_connection_counter();
+    /// Routed through [`Self::release_counted_instance`] rather than an
+    /// unconditional decrement: `instance_id` here is frequently ALSO
+    /// reachable through a completely different teardown path racing this
+    /// one (e.g. a `ReplaceExisting` tie-break already retired the very same
+    /// instance via `disconnect_connection_instance` moments earlier, or a
+    /// superseded IO-task exit is deciding this concurrently). The
+    /// `counted_instances` table makes whichever caller notices first the
+    /// one that actually decrements — a caller for an instance already
+    /// released (or, for a rejected candidate, never counted at all) safely
+    /// observes nothing to release.
+    pub(crate) fn release_displaced_connection_count(&self, instance_id: u64) {
+        self.release_counted_instance(instance_id);
     }
 
     /// Retire a FAILED connection instance identified directly by its own
@@ -2056,12 +2063,13 @@ impl<T> ConnectionPool<T> {
     /// takeover), that lookup finds nothing and returns `None` before ever
     /// reaching its alias sweep. In that case this falls back to an
     /// identity-only sweep of every `connections_by_addr` entry that still
-    /// points at `current` by `Arc::ptr_eq`, then performs the exact single
-    /// compensating `release_displaced_connection_count()` release the
-    /// same-address-failover path above already documents: `current` was
-    /// counted exactly once when originally published, and once its CAS
-    /// against `peer_sessions` has declined, no other path will ever find
-    /// and decrement it again.
+    /// points at `current` by `Arc::ptr_eq`, then performs the compensating
+    /// `release_displaced_connection_count(failed_instance_id)` release: if
+    /// no other path has raced this one and already released `current`'s
+    /// count, this is the one that does; if one has (e.g. a concurrent
+    /// `ReplaceExisting` already retired the same instance by
+    /// `disconnect_connection_instance`), this observes the count already
+    /// released and is a safe no-op.
     ///
     /// Callers must invoke this exactly once per lost
     /// `disconnect_connection_instance` CAS — never when that CAS succeeded
@@ -2096,7 +2104,7 @@ impl<T> ConnectionPool<T> {
             }
         }
 
-        self.release_displaced_connection_count();
+        self.release_displaced_connection_count(failed_instance_id);
         current.abort_tasks();
     }
 
@@ -2144,6 +2152,57 @@ impl<T> ConnectionPool<T> {
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                     Some(count.saturating_sub(1))
                 });
+    }
+
+    /// Mark `instance_id`'s `connection_counter` contribution as
+    /// outstanding. Call exactly once, exactly at the moment that
+    /// contribution's increment happens — the three production counting
+    /// sites: `add_connection_by_peer_id`, `add_lock_free_connection`'s
+    /// successful admission, and `finalize_new_outbound_connection`'s
+    /// non-reject paths. A rejected outbound candidate
+    /// (`unpublish_rejected_outbound_candidate`) never calls this for its own
+    /// instance id, by construction: it is aborted before ever reaching a
+    /// counting site.
+    fn mark_instance_counted(&self, instance_id: u64) {
+        let _ = self.counted_instances.upsert_sync(instance_id, ());
+    }
+
+    /// Release `instance_id`'s `connection_counter` contribution exactly
+    /// once, no matter which teardown path ends up calling this for a given
+    /// instance, and no matter whether that instance is still reachable
+    /// through any index (`connections_by_addr`, `connections_by_peer`,
+    /// `peer_sessions`) at all.
+    ///
+    /// A single `remove_sync` on `counted_instances` is the entire
+    /// mechanism: it is one atomic remove-and-test-existence per key, so of
+    /// any number of concurrent or sequential callers passing the same
+    /// `instance_id` — a normal teardown path that found-and-removed the
+    /// instance from its index, a compensating release for one that was
+    /// already displaced from its index by something else, and a
+    /// superseded-exit fallback that raced either of those — EXACTLY ONE
+    /// observes the entry present and performs the compensating
+    /// `decrement_connection_counter`; every other caller, including one for
+    /// an instance that was never counted in the first place (a rejected
+    /// outbound candidate), observes it already gone and does nothing. This
+    /// is what makes releases exactly-once and closes both failure classes
+    /// at once: no leaked count (whichever teardown path notices a counted
+    /// instance first releases it) and no underflow (an instance that was
+    /// never counted, or whose count was already released by a different
+    /// path, can never be decremented a second — or first — time).
+    pub(crate) fn release_counted_instance(&self, instance_id: u64) {
+        if self.counted_instances.remove_sync(&instance_id).is_some() {
+            self.decrement_connection_counter();
+        }
+    }
+
+    /// Convenience wrapper over [`Self::release_counted_instance`] for
+    /// connection-Arc-shaped callers (most pool-internal teardown paths):
+    /// releases the exact instance identified by `connection`'s own stream
+    /// handle, or does nothing if `connection` never had one (never counted).
+    fn release_counted_connection(&self, connection: &Arc<LockFreeConnection>) {
+        if let Some(instance_id) = connection.stream_handle.as_ref().map(|h| h.instance_id()) {
+            self.release_counted_instance(instance_id);
+        }
     }
 
     /// Raw admission-gate counter (`add_lock_free_connection`'s
@@ -2756,6 +2815,7 @@ impl<T> ConnectionPool<T> {
         // Without this the outbound path published a live connection that the
         // teardown paths later decremented, underflowing `connection_counter`.
         self.connection_counter.fetch_add(1, Ordering::AcqRel);
+        self.mark_instance_counted(stream_handle.instance_id());
         debug!(
             "CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections",
             addr,

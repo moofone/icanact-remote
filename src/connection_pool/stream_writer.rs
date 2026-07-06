@@ -390,11 +390,24 @@ impl LockFreeStreamHandle {
                         let retired =
                             pool.remove_connection_instance_by_id(peer_addr, expected_instance);
                         if retired.is_none() {
-                            // Not found at `peer_addr` (e.g. a fresh
-                            // reconnect already reindexed that address) —
-                            // release the compensating counter contribution
-                            // that will otherwise never be decremented.
-                            pool.release_displaced_connection_count();
+                            // Not found at `peer_addr` — either a fresh
+                            // reconnect already reindexed that address, or a
+                            // different teardown path (e.g. a concurrent
+                            // `ReplaceExisting` tie-break's
+                            // `disconnect_connection_instance`) already
+                            // retired this exact instance. Route through the
+                            // shared ownership table rather than
+                            // decrementing unconditionally: it releases the
+                            // compensating count exactly once if it is still
+                            // outstanding, and is a safe no-op both when
+                            // another path already released it and when this
+                            // instance (a rejected outbound candidate that
+                            // `unpublish_rejected_outbound_candidate` aborted
+                            // without ever counting it) was never counted at
+                            // all — which is exactly what prevents this
+                            // fallback from underflowing `connection_counter`
+                            // for a candidate that never bumped it.
+                            pool.release_displaced_connection_count(expected_instance);
                         }
                     }
 

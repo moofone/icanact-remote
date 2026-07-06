@@ -5577,16 +5577,19 @@ impl<T: 'static> GossipRegistry<T> {
                         // In the same-bind-address restart case, a fresh
                         // inbound has already overwritten that address slot
                         // by the time this runs, so the lookup finds nothing
-                        // and returns `None` — the old instance was counted
-                        // when it was originally published, but once
-                        // displaced from the index no later path can ever
-                        // find it again to decrement it. Without this
-                        // compensating release, that contribution leaks on
-                        // every same-address failover, permanently inflating
-                        // `connection_counter` against the admission gate
-                        // despite exactly one live session.
+                        // and returns `None`. `release_displaced_connection_count`
+                        // routes through the shared per-instance ownership
+                        // table: if `failed_id`'s count is still outstanding
+                        // (the common case — displaced from the index but
+                        // never actually retired by anything else), this is
+                        // the release. If some OTHER teardown path already
+                        // retired this exact instance concurrently (e.g. the
+                        // IO task's own `ExitGuard` superseded-exit fallback
+                        // in `stream_writer.rs` raced this call), the table
+                        // already shows it released and this is a safe
+                        // no-op — never a second decrement.
                         if retired.is_none() {
-                            pool.release_displaced_connection_count();
+                            pool.release_displaced_connection_count(failed_id);
                         }
                         info!(
                             peer_id = %peer_id,
@@ -5633,6 +5636,38 @@ impl<T: 'static> GossipRegistry<T> {
                             // touching the fresh winner. See
                             // `retire_lost_cas_matched_instance`.
                             pool.retire_lost_cas_matched_instance(&current, failed_id);
+                            info!(
+                                peer_id = %peer_id,
+                                observed_peer = %observed_peer_addr,
+                                current_addr = %current.addr,
+                                "socket failure raced a fresh publish for this peer; the fresh \
+                                 session survives as current, and only the superseded failed \
+                                 instance's own identity/counter are retired — no peer-wide \
+                                 failure accounting, notification, or consensus fires for what \
+                                 is, from the peer's perspective, a perfectly live session"
+                            );
+                            // This is the SAME shape as the already-superseded
+                            // branch above (`Some(failed_id) if Some(failed_id)
+                            // != current_instance_id`): the failed instance
+                            // never was, or no longer is, the peer's actual
+                            // live session, so this must return here, exactly
+                            // like that branch does, rather than falling
+                            // through to `instance_teardown_done`'s tail
+                            // below. That tail only skips the redundant
+                            // peer-wide POOL SWEEP
+                            // (`disconnect_connection_by_peer_id`); it does
+                            // NOT skip the peer-wide FAILURE ACCOUNTING further
+                            // down (marking `failures = max_peer_failures`,
+                            // invoking the peer-disconnect handler, and
+                            // driving actor-invalidation consensus) — falling
+                            // through into that unconditionally would make the
+                            // currently-connected, healthy peer look dead.
+                            // Only a genuine current-session teardown (the
+                            // `retired == true` case below) may reach that
+                            // accounting; a CAS loss must be structurally
+                            // unable to reach it, not merely discouraged by a
+                            // flag some later block remembers to check.
+                            return Ok(());
                         }
                         info!(
                             peer_id = %peer_id,
@@ -5643,12 +5678,15 @@ impl<T: 'static> GossipRegistry<T> {
                              retiring by CAS'd instance identity, not peer-wide, so a \
                              concurrently published fresh session survives"
                         );
-                        // Either the CAS retired `current` directly, or the
-                        // fallback above retired it by identity after the
-                        // CAS lost to a fresh publish — the failed instance
-                        // is fully handled either way. Never fall through to
-                        // the peer-wide sweep below, which would now
-                        // collaterally tear down the fresh winner.
+                        // The CAS retired `current` directly: this genuinely
+                        // was the peer's live session and it has genuinely
+                        // just been torn down, so — unlike the CAS-loss case
+                        // above — the peer-wide failure accounting further
+                        // down IS applicable and must still run. Only the
+                        // redundant peer-wide POOL SWEEP
+                        // (`disconnect_connection_by_peer_id`) is skipped,
+                        // since `disconnect_connection_instance` already
+                        // performed the equivalent teardown by CAS'd identity.
                         instance_teardown_done = true;
                     }
                     None => {
