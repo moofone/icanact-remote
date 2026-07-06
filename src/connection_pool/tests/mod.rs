@@ -6013,6 +6013,209 @@ async fn ask_timeout_eviction_current_session_survives_stale_alias_without_destr
     );
 }
 
+/// RED-first (Finding A, P2, `remove_connection_instance_for_peer`,
+/// `pool_connect.rs` ~2755): the ask-timeout/hard-fault eviction helper
+/// resolves its target either via `connections_by_addr[addr]` or, as a
+/// fallback, via the peer's current-connection slot — both filtered by
+/// `instance_id`. When a same-address reconnect has ALREADY displaced the
+/// failed ask's instance from BOTH indices (a fresh session now occupies
+/// `connections_by_addr[addr]` AND the peer's current slot) neither lookup
+/// matches, the `?` returns `None`, and the function returns WITHOUT ever
+/// releasing the failed instance's `counted_instances` marker — the fresh
+/// session survives correctly, but the old instance's `connection_counter`
+/// contribution is permanently orphaned (unreachable by `Arc` from anywhere
+/// else), a capacity leak.
+///
+/// RED (observed at `cceadd9`, pre-fix): `raw_connection_counter()` stays at
+/// 2 after the eviction call (the stale instance's marker plus the fresh
+/// instance's marker), instead of returning to 1 (just the fresh, live
+/// session). GREEN (post-fix): the `None` branch releases the failed
+/// instance's marker directly via `release_displaced_connection_count`
+/// before returning, so the counter returns to 1.
+#[tokio::test]
+async fn ask_eviction_already_displaced_instance_releases_counter_marker() {
+    let peer_id = crate::KeyPair::new_for_testing("ask-eviction-displaced-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7492".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // The instance the (now-failed) ask actually ran on: established and
+    // counted exactly like a real accepted/finalized connection.
+    let stale = make_live_connection(addr, ConnectionDirection::Outbound).await;
+    let stale_instance_id = stale
+        .stream_handle
+        .as_ref()
+        .map(|h| h.instance_id())
+        .expect("stale connection must have a stream instance");
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, stale.clone()));
+    assert_eq!(
+        pool.raw_connection_counter(),
+        1,
+        "test precondition: exactly one counted session (the stale one)"
+    );
+    // The ask that ran on `stale` has since timed out / hard-faulted.
+    if let Some(sh) = stale.stream_handle.as_ref() {
+        sh.exit_flag.store(true, Ordering::Release);
+    }
+
+    // A fresh reconnect at the SAME bind address lands before the failed
+    // ask's own eviction runs — reindexed and published exactly like a real
+    // accept/finalize, which displaces `stale` from BOTH the addr index and
+    // the peer's current slot in one unconditional publish.
+    let fresh = make_live_connection(addr, ConnectionDirection::Inbound).await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, fresh.clone()));
+    assert_eq!(
+        pool.raw_connection_counter(),
+        2,
+        "test precondition: both the stale and fresh instances are counted"
+    );
+    assert!(
+        pool.connections_by_addr
+            .read_sync(&addr, |_, v| Arc::ptr_eq(v, &fresh))
+            .unwrap_or(false),
+        "test precondition: the addr index must already point at the fresh instance"
+    );
+    assert!(
+        pool.peer_sessions
+            .read_sync(&peer_id, |_, s| s
+                .current_connection()
+                .is_some_and(|c| Arc::ptr_eq(&c, &fresh)))
+            .unwrap_or(false),
+        "test precondition: the peer's current slot must already point at the fresh instance"
+    );
+
+    let before = pool.raw_connection_counter();
+
+    // The failed ask's own recovery path now runs, naming the OLD instance
+    // it actually observed — which is unreachable by `Arc` through either
+    // index any more.
+    let evicted = pool.remove_connection_instance_for_peer(&peer_id, addr, stale_instance_id);
+    assert!(
+        evicted.is_none(),
+        "an instance already displaced from both the addr index and the peer's current slot \
+         must not be reported as evicted (nothing matching it remains indexed anywhere)"
+    );
+
+    let after = pool.raw_connection_counter();
+    assert_eq!(
+        after,
+        1,
+        "the stale instance's connection_counter marker must be released even though it was \
+         unreachable by Arc through either index — before={before}, after={after} (leaked \
+         {} if unfixed)",
+        before.saturating_sub(1)
+    );
+
+    // The fresh session must never be disturbed by cleanup for the
+    // already-superseded failed ask.
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+        "the fresh session must survive untouched (got {current:?})"
+    );
+    assert!(
+        fresh.has_live_stream(),
+        "the fresh session's background tasks must survive untouched"
+    );
+}
+
+/// RED-first (Finding B, P1, `compare_and_publish_peer_connection` /
+/// `pool_connect.rs` ~334-368): the `AcceptIncoming` call shape — used when
+/// `expected` is a known stale/dead existing connection that was never
+/// separately evicted first (e.g. `finalize_new_outbound_connection`'s eager
+/// `existing_before` rival, or the nested outbound/inbound re-resolve
+/// retries' `Some(rival)`) — displaces `expected` from the peer's
+/// current-connection slot on CAS success, but (pre-fix) never sweeps
+/// `expected`'s own `connections_by_addr`/`addr_to_peer_id` aliases and never
+/// releases its `counted_instances` marker the way `ReplaceExisting` does via
+/// `evict_before_replace`/`disconnect_connection_instance`. The displaced
+/// instance's address aliases go stale (a later lookup by that address would
+/// find a dead connection) and its `connection_counter` contribution leaks
+/// forever.
+///
+/// RED (observed at `cceadd9`, pre-fix): after the CAS succeeds,
+/// `connections_by_addr[addr]`/`addr_to_peer_id[addr]` still point at the
+/// displaced `expected` instance, and `raw_connection_counter()` is 2 (the
+/// leaked `expected` marker plus the freshly-counted incoming winner) instead
+/// of 1. GREEN (post-fix): both aliases are gone and the counter is exactly
+/// 1.
+#[tokio::test]
+async fn accept_incoming_preferred_over_stale_expected_retires_displaced_instance() {
+    let peer_id = crate::KeyPair::new_for_testing("accept-incoming-stale-expected-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7493".parse().unwrap();
+    let other_addr: SocketAddr = "127.0.0.1:7494".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // `expected`: a stale/dead current session, established and counted
+    // exactly like a real accepted/finalized connection — never separately
+    // evicted before the compare-and-publish below, exactly like the
+    // `AcceptIncoming` call sites' own `Some(rival)`/`existing_before`.
+    let expected = make_live_connection(addr, ConnectionDirection::Outbound).await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, expected.clone()));
+    if let Some(sh) = expected.stream_handle.as_ref() {
+        sh.exit_flag.store(true, Ordering::Release);
+    }
+    assert!(
+        !expected.has_live_stream(),
+        "test precondition: `expected` must be stale/dead"
+    );
+
+    // The freshly-dialed/accepted incoming candidate the tie-break prefers.
+    let incoming = make_live_connection(addr, ConnectionDirection::Inbound).await;
+
+    // The exact primitive every `AcceptIncoming` call site routes through.
+    let result =
+        pool.compare_and_publish_peer_connection(&peer_id, Some(&expected), incoming.clone());
+    assert!(
+        result.is_ok(),
+        "compare-and-publish against the still-installed stale `expected` must succeed: \
+         {result:?}"
+    );
+
+    // The incoming winner must be intact/current.
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &incoming)),
+        "the incoming winner must be published as the peer's current session (got {current:?})"
+    );
+    assert!(
+        incoming.has_live_stream(),
+        "the incoming winner's background tasks must never be swept"
+    );
+
+    // `expected`'s own address aliases must be gone — no
+    // connections_by_addr/addr_to_peer_id entry pointing at it any more.
+    let addr_alias_is_expected = pool
+        .connections_by_addr
+        .read_sync(&addr, |_, v| Arc::ptr_eq(v, &expected))
+        .unwrap_or(false);
+    assert!(
+        !addr_alias_is_expected,
+        "the displaced `expected` instance's connections_by_addr alias must be swept, not left \
+         pointing at a dead connection"
+    );
+    assert!(
+        pool.addr_to_peer_id.read_sync(&addr, |_, _| ()).is_none(),
+        "the displaced `expected` instance's addr_to_peer_id alias must be swept"
+    );
+
+    // Count the incoming winner via the public API (a distinct bind address
+    // so this does not disturb the assertions above), mirroring how a real
+    // caller separately indexes/counts an accepted/finalized connection.
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), other_addr, incoming.clone()));
+
+    let counter = pool.raw_connection_counter();
+    assert_eq!(
+        counter,
+        1,
+        "the displaced `expected` instance's counted_instances marker must be released exactly \
+         once, leaving exactly one live session counted (the incoming winner) — got {counter} \
+         (leaked {} if unfixed)",
+        counter.saturating_sub(1)
+    );
+}
+
 /// Test helper: a `LockFreeConnection` with a real, live stream handle (so
 /// `has_live_stream()`/`get_connection_by_peer_id`'s usability filter treats
 /// it as usable), backed by an in-memory `tokio::io::duplex` pair.
