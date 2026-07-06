@@ -177,6 +177,23 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired in `handle_incoming_connection_tls`, immediately before the
+    /// separate ephemeral TCP-source-address (`peer_addr`) alias is written
+    /// into `connections_by_addr`/`addr_to_peer_id` — a write that today
+    /// happens AFTER `finish_indexing_accepted_connection` has already
+    /// returned `true` (i.e. after its own `peer_state_addr` alias write
+    /// and revalidation), entirely outside that guard. Purely
+    /// instrumentation: lets tests deterministically pin a concurrent
+    /// evict/supersede of THIS exact candidate into the window between
+    /// `finish_indexing_accepted_connection` returning and this later,
+    /// unguarded write — the window in which a concurrent eviction's own
+    /// alias-sweep can find and remove the already-durable `peer_state_addr`
+    /// alias while the not-yet-written ephemeral alias survives the sweep,
+    /// only to be written moments later regardless.
+    InboundAcceptEphemeralAliasAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
 }
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;

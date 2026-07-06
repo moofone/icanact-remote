@@ -1501,6 +1501,244 @@ mod tests {
         Ok(())
     }
 
+    /// RED (review finding P1, `finish_indexing_accepted_connection` /
+    /// `handle_incoming_connection_tls`'s `AcceptIncoming`/`ReplaceExisting`
+    /// arms): `finish_indexing_accepted_connection` indexes + counts
+    /// `peer_state_addr` and revalidates against a concurrent evict — but
+    /// AFTER it returns `true`, `handle_incoming_connection_tls` adds a
+    /// SEPARATE, unconditional `peer_addr` (ephemeral TCP source address)
+    /// alias into `connections_by_addr`/`addr_to_peer_id`, entirely OUTSIDE
+    /// that guarded/revalidated operation. A concurrent evict of this exact
+    /// instance landing in the window between the helper's own
+    /// `peer_state_addr` write and that later, unguarded `peer_addr` write
+    /// can only sweep whichever alias exists at that moment
+    /// (`peer_state_addr` — the eviction removes it, releases the count,
+    /// aborts tasks) and has no way to reach the not-yet-written `peer_addr`
+    /// alias at all. The caller then resurrects
+    /// `connections_by_addr[peer_addr]`/`addr_to_peer_id[peer_addr]` for the
+    /// already-evicted, already-aborted connection regardless — a stale
+    /// ephemeral alias for a dead session that later lookups/failure-handling
+    /// can observe.
+    ///
+    /// Uses a `sender_bind_addr` that resolves to an address DIFFERENT from
+    /// the raw TCP source address passed to `handle_incoming_connection_tls`,
+    /// so `peer_state_addr` and the ephemeral `peer_addr` genuinely differ.
+    /// Pins the concurrent evict via the new
+    /// `InboundAcceptEphemeralAliasAttempt` instrumentation event, which
+    /// fires immediately before the separate ephemeral alias write, with the
+    /// `peer_state_addr` alias already durable. The hook evicts the
+    /// candidate's own just-published session at that exact point, modelling
+    /// a genuine concurrent evict landing in the narrow window between the
+    /// two alias writes.
+    ///
+    /// RED at HEAD (before the fix folds both writes into one guarded,
+    /// revalidated operation): `connections_by_addr[peer_addr]` and
+    /// `addr_to_peer_id[peer_addr]` both end up pointing at the evicted,
+    /// already-aborted instance (the caller's separate unconditional insert
+    /// runs after the evict and has no guard to consult), while
+    /// `connections_by_addr[peer_state_addr]` / `addr_to_peer_id[peer_state_addr]`
+    /// are correctly absent (the evict's own sweep found and removed those)
+    /// and `connection_counter` correctly carries no zombie contribution —
+    /// i.e. only the ephemeral alias is left stale. GREEN after the fix:
+    /// neither address's `connections_by_addr` nor `addr_to_peer_id` entry
+    /// points at the evicted instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_accept_ephemeral_alias_evicted_midwindow_leaves_no_stale_alias()
+    -> crate::Result<()> {
+        // `ordered_keypairs` returns `(lower, higher)` regardless of
+        // argument order, so bind `local_keypair` to the HIGHER NodeId
+        // (preferring inbound for this remote) by taking the pair reversed.
+        let (remote_keypair, local_keypair) = ordered_keypairs(
+            "ephemeral-alias-mw-remote-lower",
+            "ephemeral-alias-mw-local-higher",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            !handle
+                .registry
+                .should_keep_connection(&remote_peer_id, true),
+            "test precondition: local's higher GossipNodeId must not prefer outbound for this \
+             remote"
+        );
+        assert!(
+            handle
+                .registry
+                .should_keep_connection(&remote_peer_id, false),
+            "test precondition: local's higher GossipNodeId must prefer inbound for this remote"
+        );
+
+        // The existing, live, WRONG-DIRECTION outbound connection the
+        // `ReplaceExisting` decision below is computed about.
+        let existing_addr: SocketAddr = "127.0.0.1:41221".parse().unwrap();
+        let (existing_io, _existing_peer) = tokio::io::duplex(1024);
+        let (existing_stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                existing_io,
+                existing_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut existing = crate::connection_pool::LockFreeConnection::new(
+            existing_addr,
+            crate::connection_pool::ConnectionDirection::Outbound,
+        );
+        existing.stream_handle = Some(Arc::new(existing_stream_handle));
+        existing.set_state(crate::connection_pool::ConnectionState::Connected);
+        let existing = Arc::new(existing);
+        assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            existing_addr,
+            existing.clone(),
+        ));
+
+        let baseline = handle.registry.connection_pool.raw_connection_counter();
+        assert_eq!(
+            baseline, 1,
+            "test precondition: exactly one counted session"
+        );
+
+        // The raw TCP source address (`peer_addr`) the accept arrives from —
+        // deliberately different from the advertised bind address below, so
+        // `peer_state_addr` and the ephemeral `peer_addr` genuinely differ.
+        let attacker_addr: SocketAddr = "127.0.0.1:41223".parse().unwrap();
+        // The advertised `sender_bind_addr`, loopback (matching
+        // `attacker_addr`'s loopback source, so it resolves) with a
+        // non-zero port distinct from `attacker_addr` — this becomes
+        // `peer_state_addr`.
+        let advertised_bind_addr: SocketAddr = "127.0.0.1:41224".parse().unwrap();
+        assert_ne!(
+            attacker_addr, advertised_bind_addr,
+            "test precondition: peer_addr and peer_state_addr must genuinely differ"
+        );
+
+        let _guard = {
+            let pool = handle.registry.connection_pool.clone();
+            let peer_id = remote_peer_id.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::InboundAcceptEphemeralAliasAttempt {
+                    peer: event_peer,
+                    ..
+                } = &event
+                    && *event_peer == peer_id
+                {
+                    // Deregister first: `disconnect_connection_instance`
+                    // below fires its own (non-matching) `SessionRemoved`
+                    // event through this same global hook, avoiding
+                    // reentrant invocation.
+                    crate::set_transport_lifecycle_recorder(None);
+                    // The candidate's own `peer_state_addr` alias is
+                    // already durable by the time this event fires, but the
+                    // ephemeral `peer_addr` alias has not been written yet.
+                    // Evict the candidate's own just-published session by
+                    // identity, modelling a genuine concurrent evict landing
+                    // in exactly this narrow window.
+                    if let Some(current) = pool.get_connection_by_peer_id(&peer_id) {
+                        let evicted = pool.disconnect_connection_instance(&peer_id, &current);
+                        assert!(
+                            evicted,
+                            "test setup: the simulated concurrent evict must actually match \
+                             and clear the candidate's own just-published session"
+                        );
+                    }
+                }
+            }))
+        };
+
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: remote_peer_id.clone(),
+            sender_bind_addr: Some(advertised_bind_addr.to_string()),
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let _outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_incoming_connection_tls(
+                reader,
+                attacker_addr,
+                handle.registry.clone(),
+                Some(Arc::downgrade(&handle.registry)),
+                Some(remote_keypair.peer_id().to_node_id()),
+                None,
+            ),
+        )
+        .await
+        .expect(
+            "handle_incoming_connection_tls must not hang after the candidate's own tasks were \
+             aborted by the simulated mid-window evict",
+        );
+
+        // The candidate was evicted before it was ever fully, durably
+        // indexed, and nothing re-published for this peer afterward: the
+        // session must be provably empty.
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_connection_by_peer_id(&remote_peer_id)
+                .is_none(),
+            "no connection must remain the peer's current session: the candidate was evicted \
+             in the mid-window race and never re-published"
+        );
+
+        // Neither address's `connections_by_addr` nor `addr_to_peer_id` may
+        // retain a stale alias for the evicted candidate — checked against
+        // the RAW tables directly, not via `get_existing_connection`, which
+        // lazily self-heals a disconnected entry it happens to read and
+        // would silently mask exactly the stale-alias condition this test
+        // exists to catch.
+        for addr in [advertised_bind_addr, attacker_addr] {
+            assert!(
+                handle
+                    .registry
+                    .connection_pool
+                    .connections_by_addr
+                    .read_sync(&addr, |_, _| ())
+                    .is_none(),
+                "connections_by_addr[{addr}] must not retain a stale alias for an instance \
+                 evicted before this indexing was ever fully, durably completed"
+            );
+            assert!(
+                handle
+                    .registry
+                    .connection_pool
+                    .addr_to_peer_id
+                    .read_sync(&addr, |_, _| ())
+                    .is_none(),
+                "addr_to_peer_id[{addr}] must not retain a stale alias for an instance evicted \
+                 before this indexing was ever fully, durably completed"
+            );
+        }
+
+        // `connection_counter` must reflect only the eviction of the
+        // original `existing` outbound (its own count released) — the
+        // candidate that was evicted mid-window must never leave a zombie
+        // contribution behind under either address.
+        assert_eq!(
+            handle.registry.connection_pool.raw_connection_counter(),
+            0,
+            "connection_counter must not carry a zombie contribution for a candidate evicted \
+             mid-window, before its ephemeral alias was ever durably indexed"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inbound_gossip_rejects_sender_not_bound_to_tls_certificate() -> crate::Result<()> {
         let (local_keypair, claimed_keypair) =
@@ -2970,6 +3208,12 @@ where
         // by the configured bind address.
         if peer_addr != peer_state_addr {
             let pool = &registry.connection_pool;
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::InboundAcceptEphemeralAliasAttempt {
+                    peer: peer_id.clone(),
+                    addr: peer_addr,
+                },
+            );
             pool.index_connection_by_addr(peer_addr, connection_arc.clone());
             // Also add the addr_to_peer_id mapping so handle_response_message can look up
             // the shared correlation tracker via peer_id
