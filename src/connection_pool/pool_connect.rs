@@ -3459,17 +3459,26 @@ impl<T> ConnectionPool<T> {
     {
         // Determine peer ID (if known) before creating the stream handle.
         //
-        // R2 (TLS identity binding): when no GossipNodeId was pinned for this address,
-        // the caller passes the identity it extracted from the peer's
-        // signature-verified TLS certificate (`tofu_node_id`). We bind the
-        // connection's `embedded_peer_id` to that learned identity so every
-        // subsequent per-message gossip frame on this link IS cert-identity
-        // checked (the protocol guard requires `embedded_peer_id.is_some()`).
-        // Without this, bootstrap (placeholder-SNI) dials left `embedded_peer_id`
-        // as `None` and gossip on the link was never identity-checked.
-        let peer_id_opt = self
-            .addr_to_peer_id
-            .read_sync(&addr, |_, v| v.clone())
+        // R2 (TLS identity binding): the identity the caller extracted from the
+        // peer's signature-verified TLS certificate (`tofu_node_id`) is
+        // cryptographic proof of who is actually on the wire, so it takes
+        // precedence over the `addr -> peer` cache. That cache can be STALE after
+        // a rekey/restart: if a different peer previously occupied this address,
+        // an unpinned (placeholder-SNI) dial would otherwise bind the old
+        // identity while the wire is cryptographically the new one, and the
+        // per-message identity guard (which requires the frame's sender to equal
+        // `embedded_peer_id`) would then black-hole every frame. The cached maps
+        // are consulted only as a fallback for non-TLS paths that carry no cert
+        // identity. The `addr -> peer` row is refreshed to the bound identity
+        // below (see `addr_to_peer_id.upsert_sync`). Binding `embedded_peer_id`
+        // is also what makes every subsequent per-message gossip frame on this
+        // link cert-identity checked (the protocol guard requires
+        // `embedded_peer_id.is_some()`); bootstrap dials previously left it
+        // `None` and gossip on the link was never identity-checked.
+        let peer_id_opt = tofu_node_id
+            .as_ref()
+            .map(crate::PeerId::from_public_key)
+            .or_else(|| self.addr_to_peer_id.read_sync(&addr, |_, v| v.clone()))
             .or_else(|| {
                 // Try reverse lookup: find peer ID that maps to this address.
                 let mut found: Option<crate::PeerId> = None;
@@ -3481,8 +3490,7 @@ impl<T> ConnectionPool<T> {
                     true
                 });
                 found
-            })
-            .or_else(|| tofu_node_id.as_ref().map(crate::PeerId::from_public_key));
+            });
 
         let correlation_tracker = peer_id_opt
             .as_ref()
