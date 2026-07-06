@@ -6599,3 +6599,108 @@ async fn connect_via_stream_still_dials_distinct_peer_id_normally() {
         "self-dial guard must never fire for a distinct peer_id, got: {err}"
     );
 }
+
+/// Guard 2b (investigate-self-connect-loop, address-only path, codex P1
+/// completeness gap): Guard 2 above only fires when `resolved_node_id` is
+/// already populated *before* dialing. For an address-only outbound dial —
+/// a bootstrap/configured-seed mistake, a DNS refresh that lands on a self
+/// address, or a stale `connections_by_addr`/discovery entry with no
+/// `node_id` attached — `resolved_node_id` is `None` on entry, so Guard 2 is
+/// skipped entirely and (pre-fix) the dial proceeds through TCP/TLS all the
+/// way to `finalize_new_outbound_connection`, publishing a connection keyed
+/// to this registry's OWN `PeerId`.
+///
+/// This drives that exact path against a real TLS listener that happens to
+/// be serving *this same node's own* identity (the production scenario a
+/// stale/misconfigured address-only entry produces: the address just
+/// happens to route back to yourself). The listener performs a genuine TLS
+/// accept + Hello handshake, so the dialer runs exactly as far as
+/// production code does before the post-cert guard must intervene.
+///
+/// Before the fix: `discovered_node_id` is populated from the peer
+/// certificate but never re-checked against identity, so the dial proceeds
+/// to `finalize_new_outbound_connection` and succeeds — a genuine self-dial
+/// gets indexed/published under this registry's own `PeerId`. After the
+/// fix: the cert-verified identity is checked immediately after extraction
+/// and the connection is refused before `finalize_new_outbound_connection`
+/// is ever reached — never indexed by peer_id or by address, and no
+/// retry/wait machinery is armed (the error returns immediately, well under
+/// `connection_timeout`).
+#[tokio::test]
+async fn connect_via_stream_rejects_self_after_cert_identity_discovery_on_address_only_dial() {
+    let key_pair = crate::KeyPair::new_for_testing("guard2b_address_only_self_dial");
+    let self_addr: SocketAddr = "127.0.0.1:40994".parse().unwrap();
+
+    let mut registry = crate::registry::GossipRegistry::<()>::new(
+        self_addr,
+        crate::GossipConfig {
+            key_pair: Some(key_pair.clone()),
+            ..crate::GossipConfig::default()
+        },
+    );
+    registry
+        .enable_tls(key_pair.to_secret_key())
+        .expect("enable tls");
+    let registry = Arc::new(registry);
+
+    // Stand-in for a real inbound listener presenting THIS SAME node's
+    // identity — modelling a stale discovery/config entry whose address
+    // happens to route back to ourselves. It performs a genuine TLS accept
+    // + Hello handshake (mirroring `handle_connection` in handle.rs) so the
+    // dialer proceeds exactly as far as production code would.
+    let listener = tokio::net::TcpListener::bind(self_addr)
+        .await
+        .expect("bind self listener");
+    let acceptor = registry.tls_config.clone().unwrap().acceptor();
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept inbound tcp");
+        let mut tls_stream = acceptor.accept(stream).await.expect("tls accept");
+        let alpn = tls_stream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|proto| proto.to_vec());
+        // Best-effort: after the fix, the dialer never sends its Hello (it
+        // returns before reaching the handshake), so this will simply not
+        // complete — the task is aborted by the test, not awaited to
+        // success.
+        let _ = crate::handshake::perform_hello_handshake(&mut tls_stream, alpn.as_deref(), false)
+            .await;
+    });
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let registry_weak = Arc::downgrade(&registry);
+    let connection_timeout = Duration::from_secs(5);
+
+    let start = std::time::Instant::now();
+    let result = pool
+        .connect_via_stream(self_addr, None, 8, connection_timeout, registry_weak)
+        .await;
+    let elapsed = start.elapsed();
+
+    server_task.abort();
+
+    let err = result.expect_err(
+        "an address-only dial whose TLS cert proves the peer is this node itself must be \
+         refused, never finalized/published as a self-keyed connection",
+    );
+    assert!(
+        err.to_string().contains("refusing to dial self peer_id"),
+        "expected the post-cert self-dial guard error, got: {err}"
+    );
+    assert!(
+        pool.get_connection_by_peer_id(&registry.peer_id).is_none(),
+        "a rejected self-dial must never be indexed/published under this registry's own peer_id"
+    );
+    assert_eq!(
+        pool.connections_by_addr.len(),
+        0,
+        "a rejected self-dial must never be indexed by address either"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the post-cert self-dial guard must reject immediately once the TLS handshake \
+         completes, not after waiting on connection_timeout or arming a retry/wait path; \
+         took {elapsed:?}"
+    );
+}
