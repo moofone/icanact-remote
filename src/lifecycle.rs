@@ -55,6 +55,18 @@ pub enum TransportLifecycleEvent {
         addr: SocketAddr,
         direction: TransportDirection,
     },
+    /// Fired immediately before an outbound-finalize `AcceptIncoming`
+    /// decision attempts to enact its publish via compare-and-publish —
+    /// unconditionally, regardless of whether that attempt goes on to
+    /// succeed or lose a re-resolution against a concurrently published
+    /// rival. Purely instrumentation: lets tests deterministically pin a
+    /// concurrent publish into the gap between the decision's snapshot and
+    /// this attempt, the same gap that produced the tie-break reconnect
+    /// thrash from the outbound-finalize side.
+    OutboundFinalizePublishAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
     SessionRemoved {
         peer: PeerId,
         addr: SocketAddr,

@@ -1677,6 +1677,16 @@ impl<T> ConnectionPool<T> {
                 });
     }
 
+    /// Raw admission-gate counter (`add_lock_free_connection`'s
+    /// `connection_count >= max_connections` check), exposed read-only for
+    /// tests that must observe it staying balanced across
+    /// publish/teardown/failover cycles — see
+    /// `superseded_same_addr_failover_does_not_leak_connection_counter`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn raw_connection_counter(&self) -> usize {
+        self.connection_counter.load(Ordering::Acquire)
+    }
+
     /// Get connection count - lock-free operation
     pub fn connection_count(&self) -> usize {
         let mut count = 0usize;
@@ -2142,6 +2152,16 @@ impl<T> ConnectionPool<T> {
             };
             match decision {
                 ConnectionConflictDecision::AcceptIncoming => {
+                    // Instrumentation: fires unconditionally immediately
+                    // before this publish attempt, letting tests pin a
+                    // concurrent publish into the gap between the
+                    // `existing_before` snapshot above and this call.
+                    crate::lifecycle::record_transport_event(
+                        crate::lifecycle::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                            peer: peer_id.clone(),
+                            addr: connection_arc.addr,
+                        },
+                    );
                     self.publish_current_peer_connection(peer_id, connection_arc.clone());
                 }
                 ConnectionConflictDecision::ReplaceExisting => {

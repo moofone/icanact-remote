@@ -3926,6 +3926,113 @@ fn hi_lo_keypairs(a: &str, b: &str) -> (crate::KeyPair, crate::KeyPair) {
     }
 }
 
+/// RED (review finding P1, outbound-finalize `AcceptIncoming` publish gap):
+/// when `existing_before` is `None` at snapshot time, the outbound-finalize
+/// decision is unconditionally `AcceptIncoming` and (before the fix) enacted
+/// via a plain, unconditional `publish_current_peer_connection`. That publish
+/// is computed from a snapshot taken *before* this candidate was indexed —
+/// if a PREFERRED inbound is published for the same peer in the gap between
+/// that snapshot and this call, the unconditional publish silently
+/// overwrites it, reproducing the exact concurrent-inbound/fallback-dial
+/// clobber this whole file's tie-break work exists to stop.
+///
+/// Pinned deterministically via `set_transport_lifecycle_recorder` on the new
+/// `OutboundFinalizePublishAttempt` instrumentation event, which fires
+/// unconditionally immediately before the outbound's own publish attempt
+/// (success or failure) — the same technique
+/// `hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide`
+/// and `stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_session`
+/// use to pin a concurrent publish into a specific check-then-act gap.
+#[tokio::test]
+async fn outbound_finalize_accept_incoming_compare_and_publishes_against_snapshot() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    // Local uses the HIGHER NodeId keypair, so for this remote peer identity
+    // the tie-break prefers INBOUND (`should_keep_connection(remote, is_outbound=false) == true`,
+    // `should_keep_connection(remote, is_outbound=true) == false`) — the
+    // freshly-dialed OUTBOUND candidate below is never the preferred
+    // direction, so if it wins the peer session slot at all, it can only be
+    // through the unconditional-publish bug, never through a legitimate
+    // re-resolved tie-break.
+    let (hi_kp, lo_kp) = hi_lo_keypairs("accept-incoming-cas-gap-hi", "accept-incoming-cas-gap-lo");
+    let remote_peer_id = lo_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+
+    // No prior session for this peer at all: `existing_before` snapshots to
+    // `None`, and the decision is `AcceptIncoming` unconditionally.
+    assert!(pool.get_connection_by_peer_id(&remote_peer_id).is_none());
+
+    let dial_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+
+    // The PREFERRED inbound that will be published concurrently, in the gap
+    // between the `existing_before` snapshot and the outbound's own publish
+    // attempt.
+    let inbound_addr: SocketAddr = "127.0.0.1:7481".parse().unwrap();
+    let inbound = make_live_connection(inbound_addr, ConnectionDirection::Inbound).await;
+
+    let _guard = RecorderGuard;
+    {
+        let pool = pool.clone();
+        let peer_id = remote_peer_id.clone();
+        let inbound = inbound.clone();
+        crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+            if let crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                peer: event_peer,
+                ..
+            } = &event
+                && *event_peer == peer_id
+            {
+                // Deregister first: the nested `publish_current_peer_connection`
+                // call below fires its own (non-matching) `SessionPublished`
+                // event through this same global hook, and this avoids any
+                // reentrant/recursive invocation of this closure.
+                crate::set_transport_lifecycle_recorder(None);
+                pool.publish_current_peer_connection(&peer_id, inbound.clone());
+            }
+        })));
+    }
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .await;
+
+    // The candidate lost the compare-and-publish/re-resolve, but it is not
+    // an error the way `RejectIncoming`/`EvictStaleRejectIncoming` decided
+    // eagerly are: it was still indexed by address and is handed back as a
+    // usable (just not current) handle, exactly like any other outbound
+    // finalize whose candidate does not become the session.
+    assert!(
+        result.is_ok(),
+        "an AcceptIncoming candidate that loses its compare-and-publish re-resolution must \
+         still finalize successfully (indexed-but-not-current), not error out: {result:?}"
+    );
+
+    let current = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &inbound)),
+        "the PREFERRED inbound published concurrently in the compare-and-publish gap must \
+         remain the peer's current session — the fallback outbound's own publish, computed \
+         from a stale `existing_before == None` snapshot, must never overwrite it \
+         (got {current:?})"
+    );
+    assert!(
+        inbound.has_live_stream(),
+        "the preferred inbound's background tasks must survive untouched"
+    );
+}
+
 /// RED (review finding P1, outbound-finalize impure rival lookup):
 /// `finalize_new_outbound_connection` used to call
 /// `get_connection_by_peer_id` for its tie-break rival lookup *after* the
