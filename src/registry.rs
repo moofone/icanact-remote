@@ -10440,7 +10440,7 @@ mod tests {
             spawn_live_connection(addr, ConnectionDirection::Outbound, &peer_id).await;
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, initial.clone()));
 
-        let baseline = pool.raw_connection_counter();
+        let baseline = pool.raw_connection_counter_signed();
         assert_eq!(
             baseline, 1,
             "test precondition: exactly one counted, live session"
@@ -10489,7 +10489,7 @@ mod tests {
             old_instance_id = fresh_instance_id;
         }
 
-        let final_count = pool.raw_connection_counter();
+        let final_count = pool.raw_connection_counter_signed();
         assert_eq!(
             final_count,
             baseline,
@@ -11214,7 +11214,7 @@ mod tests {
         let conn_old = Arc::new(conn_old);
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), old_addr, conn_old.clone()));
 
-        let baseline = pool.raw_connection_counter();
+        let baseline = pool.raw_connection_counter_signed();
         assert_eq!(
             baseline, 1,
             "test precondition: exactly one counted, live session before the tie-break"
@@ -11227,8 +11227,12 @@ mod tests {
             pool.disconnect_connection_instance(&peer_id, &conn_old),
             "test precondition: `old` must still be current at the moment of eviction"
         );
+        // Asserted via the signed accessor: this precondition's expected
+        // value is exactly 0, the one steady-state count the clamped
+        // `raw_connection_counter()` view cannot distinguish from an
+        // unfixed underflow.
         assert_eq!(
-            pool.raw_connection_counter(),
+            pool.raw_connection_counter_signed(),
             0,
             "test precondition: evicting `old` must release its counted contribution \
              immediately"
@@ -11252,7 +11256,7 @@ mod tests {
         let conn_fresh = Arc::new(conn_fresh);
         assert!(pool.add_connection_by_peer_id(peer_id.clone(), fresh_addr, conn_fresh.clone()));
 
-        let before_exit = pool.raw_connection_counter();
+        let before_exit = pool.raw_connection_counter_signed();
         assert_eq!(
             before_exit, 1,
             "test precondition: exactly one counted, live session (`fresh`) after the \
@@ -11270,7 +11274,7 @@ mod tests {
             .await
             .expect("old instance's IO task must not panic");
 
-        let final_count = pool.raw_connection_counter();
+        let final_count = pool.raw_connection_counter_signed();
         assert_eq!(
             final_count,
             before_exit,
@@ -11324,7 +11328,12 @@ mod tests {
         let addr = test_addr(9751);
         let pool = registry.connection_pool.clone();
 
-        let baseline = pool.raw_connection_counter();
+        // Asserted via the signed accessor: a baseline of exactly 0 is the
+        // one steady-state value the clamped `raw_connection_counter()` view
+        // cannot distinguish from an unfixed underflow (both read as 0), so
+        // this precondition — and the final comparison below — must pin the
+        // signed value, not the clamped one.
+        let baseline = pool.raw_connection_counter_signed();
         assert_eq!(
             baseline, 0,
             "test precondition: a fresh pool has no live sessions"
@@ -11383,13 +11392,115 @@ mod tests {
              candidate treated as rejected, exactly like a re-resolved tie-break loss"
         );
 
-        let final_count = pool.raw_connection_counter();
+        let final_count = pool.raw_connection_counter_signed();
         assert_eq!(
             final_count,
             baseline,
             "connection_counter must return to baseline ({baseline}) after a mid-window \
              teardown raced the counter/marker pairing — got {final_count} (leaked {} if \
-             unfixed)",
+             unfixed; a negative steady-state value would otherwise clamp to 0 and hide the \
+             regression)",
+            final_count.saturating_sub(baseline)
+        );
+    }
+
+    /// RED (re-review residual of the #86 fix above): `count_in_new_instance`
+    /// fires `ConnectionCountMarkerAttempt` and inserts the `counted_instances`
+    /// marker BEFORE it bumps `connection_counter` — so a concurrent teardown
+    /// of the SAME instance can land strictly *after* the insert but *before*
+    /// the increment: `remove_sync` finds the marker (present), decrements,
+    /// and only THEN does the original caller's `fetch_add` run. At a
+    /// baseline of 0 this used to leak permanently: the decrement used a
+    /// `saturating_sub`, which clamps the transient `0 -> -1` down to `0`
+    /// instead of letting it go net-negative, so the following `+1` landed on
+    /// `0` and produced `1` — with the marker already gone, nothing can ever
+    /// release that phantom unit again. Reconnect/failover churn compounds
+    /// this until the admission gate (`add_lock_free_connection`'s
+    /// `connection_count >= max_connections` check) falsely trips with no
+    /// real growth in live connections.
+    ///
+    /// Pinned deterministically via
+    /// `TransportLifecycleEvent::ConnectionCountIncrementAttempt`, fired
+    /// immediately after the marker insert succeeds and immediately before
+    /// the paired `fetch_add` — the exact insert-then-teardown-then-increment
+    /// window this finding depends on, distinct from
+    /// `ConnectionCountMarkerAttempt` (fired before the insert, and already
+    /// covered by `count_marker_teardown_race_does_not_leak_connection_counter`
+    /// above).
+    #[tokio::test]
+    async fn count_marker_teardown_between_insert_and_increment_does_not_leak() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(9760), test_config());
+        let peer_id = test_peer_id("count_marker_insert_increment_race_peer");
+        let addr = test_addr(9761);
+        let pool = registry.connection_pool.clone();
+
+        // Asserted via the signed accessor: a baseline of exactly 0 is the
+        // one steady-state value the clamped `raw_connection_counter()` view
+        // cannot distinguish from an unfixed underflow (both read as 0), so
+        // this precondition — and the final comparison below — must pin the
+        // signed value, not the clamped one.
+        let baseline = pool.raw_connection_counter_signed();
+        assert_eq!(
+            baseline, 0,
+            "test precondition: a fresh pool has no live sessions"
+        );
+
+        let (io, _keep) = tokio::io::duplex(1024);
+        let (sh, _w, _r) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(sh));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        let instance_id = conn
+            .stream_handle
+            .as_ref()
+            .expect("stream handle set above")
+            .instance_id();
+
+        // The mid-window teardown: fires exactly between the
+        // `counted_instances` marker insert and the `connection_counter`
+        // increment (inside `count_in_new_instance`, reached here via
+        // `add_connection_by_peer_id`), mirroring a concurrent
+        // `release_counted_instance` racing this exact instance in that gap.
+        let _guard = {
+            let pool = pool.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::ConnectionCountIncrementAttempt {
+                    instance_id: fired_id,
+                } = &event
+                    && *fired_id == instance_id
+                {
+                    // Deregister first: this closure must fire exactly once
+                    // for this exact instance.
+                    crate::set_transport_lifecycle_recorder(None);
+                    pool.release_counted_instance(instance_id);
+                }
+            }))
+        };
+
+        assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, conn.clone()));
+
+        let final_count = pool.raw_connection_counter_signed();
+        assert_eq!(
+            final_count,
+            baseline,
+            "connection_counter must return to baseline ({baseline}) after a mid-window \
+             teardown raced the marker-insert/counter-increment pairing — got {final_count} \
+             (permanently leaked {} if unfixed by a saturating clamp; a negative steady-state \
+             value would otherwise clamp to 0 and hide the regression)",
             final_count.saturating_sub(baseline)
         );
     }

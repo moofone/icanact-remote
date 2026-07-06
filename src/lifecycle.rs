@@ -210,6 +210,18 @@ pub enum TransportLifecycleEvent {
     ConnectionCountMarkerAttempt {
         instance_id: u64,
     },
+    /// Fired at every production `connection_counter` count-in site
+    /// (`count_in_new_instance`), immediately AFTER that instance's
+    /// `counted_instances` ownership marker has been newly inserted and
+    /// immediately BEFORE the paired `connection_counter` increment runs.
+    /// Purely instrumentation: lets tests deterministically pin a concurrent
+    /// `release_counted_instance` for THIS exact, already-marked instance
+    /// into that narrow window — the window a non-`saturating` decrement
+    /// depends on netting out correctly, since the release's decrement now
+    /// runs strictly before this call's own increment.
+    ConnectionCountIncrementAttempt {
+        instance_id: u64,
+    },
     /// Fired unconditionally, immediately before `get_connection_by_peer_id`
     /// attempts its internal self-heal clear of an observed-unusable current
     /// session — i.e. right after it has decided "this session is dead, I'm

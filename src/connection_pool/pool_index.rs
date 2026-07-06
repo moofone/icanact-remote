@@ -37,8 +37,24 @@ pub struct ConnectionPool<T = ()> {
     message_buffer_pool: Arc<MessageBufferPool>,
     /// Shared aligned bytes pool for zero-copy receive buffers
     aligned_bytes_pool: Arc<crate::AlignedBytesPool>,
-    /// Connection counter for load balancing
-    connection_counter: AtomicUsize,
+    /// Connection counter for load balancing.
+    ///
+    /// Signed, not `AtomicUsize`: every count-in site pairs its increment
+    /// with a `counted_instances` marker mutation (see
+    /// [`ConnectionPool::count_in_new_instance`] /
+    /// [`ConnectionPool::release_counted_instance`]), and those two sides can
+    /// observably run in either order under a concurrent teardown racing a
+    /// fresh count-in for the same instance. At a baseline of zero, a release
+    /// that wins the race decrements before the paired increment lands,
+    /// which needs to be representable as transiently negative so the
+    /// following `+1` nets back to exactly zero. An unsigned counter cannot
+    /// represent that and must clamp (losing the paired decrement forever,
+    /// see `decrement_connection_counter`'s history) or wrap to a huge
+    /// positive value (falsely tripping the `max_connections` admission
+    /// gate). `isize` lets the transient dip read as a small negative number
+    /// instead — safe for the `>= max_connections` admission check, which
+    /// only cares about "at or over the cap", never "did we dip below zero".
+    connection_counter: AtomicIsize,
     _marker: PhantomData<fn() -> T>,
 }
 
