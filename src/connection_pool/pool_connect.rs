@@ -830,15 +830,16 @@ impl<T> ConnectionPool<T> {
                 .upsert_sync(ephemeral_addr, connection.clone());
         }
 
+        // Paired, insert-gated: `count_in_new_instance` only bumps
+        // `connection_counter` if it is the call that newly creates this
+        // instance's `counted_instances` marker, so a concurrent teardown
+        // racing anywhere around this call nets to the correct total
+        // regardless of interleaving — see that function's own comment. A
+        // connection with no stream handle is never counted at all (nothing
+        // to mark it by), mirroring the `None` arm's cleanup below.
         let instance_id = connection.stream_handle.as_ref().map(|h| h.instance_id());
-        self.connection_counter.fetch_add(1, Ordering::AcqRel);
         if let Some(instance_id) = instance_id {
-            crate::lifecycle::record_transport_event(
-                crate::lifecycle::TransportLifecycleEvent::ConnectionCountMarkerAttempt {
-                    instance_id,
-                },
-            );
-            self.mark_instance_counted(instance_id);
+            self.count_in_new_instance(instance_id);
         }
 
         let still_current = self
@@ -874,8 +875,33 @@ impl<T> ConnectionPool<T> {
                 let removed_via_peer_state_addr = self
                     .remove_connection_instance_by_id(peer_state_addr, instance_id)
                     .is_some();
-                if !removed_via_peer_state_addr && let Some(ephemeral_addr) = distinct_ephemeral {
-                    let _ = self.remove_connection_instance_by_id(ephemeral_addr, instance_id);
+                let removed_via_ephemeral_addr = !removed_via_peer_state_addr
+                    && distinct_ephemeral.is_some_and(|ephemeral_addr| {
+                        self.remove_connection_instance_by_id(ephemeral_addr, instance_id)
+                            .is_some()
+                    });
+                if !removed_via_peer_state_addr && !removed_via_ephemeral_addr {
+                    // Neither address-keyed removal found this instance
+                    // still indexed at all — a concurrent teardown (e.g.
+                    // `disconnect_connection_instance` racing in the window
+                    // between the counter/marker pairing above and this
+                    // revalidation) already swept both aliases itself. That
+                    // teardown's own `release_counted_connection` call can
+                    // only have run BEFORE `count_in_new_instance` inserted
+                    // the marker above (this candidate's aliases were still
+                    // present for it to find at all, which is only possible
+                    // pre-insert — see `count_in_new_instance`'s own
+                    // comment), so it found no marker and released nothing.
+                    // Fall back to a direct, instance-identity-scoped release
+                    // so the marker/counter pairing just established above is
+                    // never left permanently orphaned — the same
+                    // `release_displaced_connection_count` idiom
+                    // `retire_lost_cas_matched_instance` and the IO-exit
+                    // superseded-exit fallback use for this exact shape. Safe
+                    // even if some OTHER path already released it (e.g. one
+                    // that raced AFTER the insert): `counted_instances`
+                    // removal is idempotent, so this is then a no-op.
+                    self.release_displaced_connection_count(instance_id);
                 }
             }
             None => {
@@ -1661,9 +1687,11 @@ impl<T> ConnectionPool<T> {
         // Also index by address for direct lookups
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
 
-        self.connection_counter.fetch_add(1, Ordering::AcqRel);
+        // Paired, insert-gated via `count_in_new_instance` — see its comment.
+        // A connection with no stream handle is never counted (nothing to
+        // mark it by).
         if let Some(instance_id) = instance_id {
-            self.mark_instance_counted(instance_id);
+            self.count_in_new_instance(instance_id);
         }
         true
     }
@@ -1782,10 +1810,21 @@ impl<T> ConnectionPool<T> {
         addr: SocketAddr,
         tcp_stream: TcpStream,
     ) -> Result<Arc<LockFreeConnection>> {
+        // Eager admission-gate reservation: unlike every other count-in site,
+        // this one must reserve capacity BEFORE an `instance_id` exists to
+        // mark, so it cannot go through `count_in_new_instance`'s
+        // insert-gated pairing. That is still race-free for its own purpose
+        // (concurrent admissions never over-admit past `max_connections`):
+        // this `fetch_add` is unconditional and this reservation is not
+        // shared with — or racing — anything else, because nothing can look
+        // this instance up by address or instance id until it is indexed
+        // below, and the marker is inserted (see below) strictly before that
+        // indexing happens. `decrement_connection_counter`'s saturating
+        // subtract mirrors every other rollback of this same atomic.
         let connection_count = self.connection_counter.fetch_add(1, Ordering::AcqRel);
 
         if connection_count >= self.max_connections {
-            self.connection_counter.fetch_sub(1, Ordering::AcqRel);
+            self.decrement_connection_counter();
             return Err(crate::GossipError::Network(std::io::Error::other(format!(
                 "Max connections ({}) reached",
                 self.max_connections
@@ -1859,14 +1898,23 @@ impl<T> ConnectionPool<T> {
 
         let connection_arc = Arc::new(connection);
 
+        // This instance now owns the admission-gate count taken above —
+        // record it so whichever teardown path retires this instance later
+        // can release it exactly once (see `release_counted_instance`).
+        // Marked BEFORE this instance is indexed anywhere below: no
+        // concurrent teardown can find-and-release it by address or instance
+        // id until then, so there is no window in which a release could ever
+        // observe the reservation above without this marker already present
+        // to pair it with.
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::ConnectionCountMarkerAttempt { instance_id },
+        );
+        self.mark_instance_counted(instance_id);
+
         // Insert into lock-free hash map.
         let _ = self
             .connections_by_addr
             .upsert_sync(addr, connection_arc.clone());
-        // This instance now owns the admission-gate count taken above —
-        // record it so whichever teardown path retires this instance later
-        // can release it exactly once (see `release_counted_instance`).
-        self.mark_instance_counted(instance_id);
         debug!(
             "CONNECTION POOL: Added lock-free connection to {} - pool now has {} connections",
             addr,
@@ -2697,17 +2745,60 @@ impl<T> ConnectionPool<T> {
                 });
     }
 
-    /// Mark `instance_id`'s `connection_counter` contribution as
-    /// outstanding. Call exactly once, exactly at the moment that
-    /// contribution's increment happens — the three production counting
-    /// sites: `add_connection_by_peer_id`, `add_lock_free_connection`'s
-    /// successful admission, and `finalize_new_outbound_connection`'s
-    /// non-reject paths. A rejected outbound candidate
-    /// (`unpublish_rejected_outbound_candidate`) never calls this for its own
-    /// instance id, by construction: it is aborted before ever reaching a
-    /// counting site.
-    fn mark_instance_counted(&self, instance_id: u64) {
-        let _ = self.counted_instances.upsert_sync(instance_id, ());
+    /// Claim `instance_id`'s ownership marker in `counted_instances`.
+    /// Returns `true` only when this call is the one that newly created the
+    /// entry (a plain `insert`, never an `upsert`) — the single
+    /// linearization point every count-in site gates its
+    /// `connection_counter` increment on, via [`Self::count_in_new_instance`].
+    /// A caller that observes `false` (the entry already existed) must NEVER
+    /// also increment: doing so would be the double-count this insert-gated
+    /// design exists to prevent. In production every `instance_id` is
+    /// generated fresh per stream handle, so this only ever returns `false`
+    /// if this exact instance is (incorrectly) counted twice — a bug in the
+    /// caller, not a race this function needs to tolerate silently.
+    fn mark_instance_counted(&self, instance_id: u64) -> bool {
+        self.counted_instances.insert_sync(instance_id, ()).is_ok()
+    }
+
+    /// Pair a newly-created instance's `connection_counter` contribution
+    /// with its `counted_instances` ownership marker, race-free under any
+    /// interleaving with a concurrent release.
+    ///
+    /// This is the ONLY way `connection_counter` is ever incremented in
+    /// production (`add_connection_by_peer_id`, `finish_indexing_accepted_connection`,
+    /// and `finalize_new_outbound_connection`'s non-reject paths all funnel
+    /// through this): the marker insert is the linearization point, and the
+    /// increment happens if-and-only-if this call's insert is the one that
+    /// newly created it. `add_lock_free_connection` is the one exception —
+    /// its increment is an eager admission-gate reservation taken before an
+    /// `instance_id` even exists, so it cannot go through this helper; see
+    /// its own comment for why that early reservation is still race-free.
+    ///
+    /// Fires [`crate::lifecycle::TransportLifecycleEvent::ConnectionCountMarkerAttempt`]
+    /// immediately before the marker insert so tests can deterministically
+    /// pin a concurrent release into the exact pairing point.
+    ///
+    /// Closes the review finding at its root: previously, sites bumped
+    /// `connection_counter` first and inserted the marker afterward, so a
+    /// concurrent teardown landing in that gap found no marker to release,
+    /// and the marker inserted moments later over an already-evicted
+    /// connection was orphaned — a permanent leak. With the marker as the
+    /// gate, EVERY increment is paired with a `counted_instances` entry at
+    /// the instant it happens: a release racing anywhere before or after
+    /// this call either finds nothing yet (and correctly declines to
+    /// decrement, since this call's `fetch_add` — which always follows a
+    /// successful insert — has not landed yet either) or removes the entry
+    /// this call just inserted and decrements to match. Either ordering
+    /// nets to the same correct total, because `fetch_add`/`fetch_sub` are
+    /// commutative and each is strictly gated on its own map mutation
+    /// succeeding.
+    fn count_in_new_instance(&self, instance_id: u64) {
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::ConnectionCountMarkerAttempt { instance_id },
+        );
+        if self.mark_instance_counted(instance_id) {
+            self.connection_counter.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Release `instance_id`'s `connection_counter` contribution exactly
@@ -3377,11 +3468,12 @@ impl<T> ConnectionPool<T> {
                 }
             }
         }
-        // Count this connection exactly once, mirroring `add_connection_by_peer_id`.
-        // Without this the outbound path published a live connection that the
-        // teardown paths later decremented, underflowing `connection_counter`.
-        self.connection_counter.fetch_add(1, Ordering::AcqRel);
-        self.mark_instance_counted(stream_handle.instance_id());
+        // Count this connection exactly once, mirroring `add_connection_by_peer_id`,
+        // paired and insert-gated via `count_in_new_instance` — see its
+        // comment. Without this the outbound path published a live
+        // connection that the teardown paths later decremented, underflowing
+        // `connection_counter`.
+        self.count_in_new_instance(stream_handle.instance_id());
         debug!(
             "CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections",
             addr,

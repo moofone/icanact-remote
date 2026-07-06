@@ -11325,7 +11325,10 @@ mod tests {
         let pool = registry.connection_pool.clone();
 
         let baseline = pool.raw_connection_counter();
-        assert_eq!(baseline, 0, "test precondition: a fresh pool has no live sessions");
+        assert_eq!(
+            baseline, 0,
+            "test precondition: a fresh pool has no live sessions"
+        );
 
         let (io, _keep) = tokio::io::duplex(1024);
         let (sh, _w, _r) = LockFreeStreamHandle::new(

@@ -207,7 +207,9 @@ pub enum TransportLifecycleEvent {
     /// symmetrically, before either has happened yet) must never leave a
     /// `connection_counter` contribution with no marker ever able to
     /// release it.
-    ConnectionCountMarkerAttempt { instance_id: u64 },
+    ConnectionCountMarkerAttempt {
+        instance_id: u64,
+    },
 }
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;
