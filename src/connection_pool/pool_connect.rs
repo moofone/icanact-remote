@@ -367,6 +367,44 @@ impl<T> ConnectionPool<T> {
         Ok(())
     }
 
+    /// Evict `rival` for a `ReplaceExisting` decision, and return the
+    /// correct `expected` snapshot the FOLLOW-UP compare-and-publish must
+    /// use to enact that decision — never `Some(rival)` unconditionally.
+    ///
+    /// `disconnect_connection_instance` is itself a self-validating,
+    /// idempotent CAS: it either finds `rival` still installed and
+    /// atomically clears + tears it down (`true`), or finds it already
+    /// superseded by a concurrent publish and declines untouched (`false`).
+    /// That boolean tells the caller exactly what the peer session slot
+    /// looks like right now, without a second read that could itself race:
+    ///   - eviction succeeded: the slot is now provably `None` (we just
+    ///     cleared it ourselves) — `expected` for the follow-up publish
+    ///     must be `None`, never the stale `Some(rival)`, or the publish
+    ///     would spuriously "lose" to a clear that was actually our own.
+    ///   - eviction declined: `rival` was already superseded by whatever is
+    ///     actually current now, so `rival` remains the honest `expected`
+    ///     snapshot — the follow-up compare-and-publish will (correctly)
+    ///     also fail to match it and report the REAL current occupant for
+    ///     re-resolution, exactly like the `AcceptIncoming` arm's own CAS
+    ///     loss.
+    ///
+    /// This is the single evict-then-choose-expected step shared by every
+    /// `ReplaceExisting` call site (outbound-finalize's eager decision, its
+    /// own nested re-resolve, and inbound-accept) so none of them can revert
+    /// to the "evict, then unconditionally publish" shape that clobbers a
+    /// concurrently published fresh session.
+    fn evict_before_replace(
+        &self,
+        peer_id: &crate::PeerId,
+        rival: &Arc<LockFreeConnection>,
+    ) -> Option<Arc<LockFreeConnection>> {
+        if self.disconnect_connection_instance(peer_id, rival) {
+            None
+        } else {
+            Some(rival.clone())
+        }
+    }
+
     /// Enact an `AcceptIncoming` outbound-finalize decision via
     /// compare-and-publish against the exact snapshot (`expected`) the
     /// decision was computed from, re-resolving against reality if a
@@ -601,9 +639,75 @@ impl<T> ConnectionPool<T> {
                 }
             }
             ConnectionConflictDecision::ReplaceExisting => {
-                let _ = self.disconnect_connection_instance(peer_id, rival);
-                self.publish_current_peer_connection(peer_id, connection_arc.clone());
-                true
+                // Same defect, one level deeper: the re-resolved decision
+                // against the ACTUALLY-installed `rival` can itself be
+                // `ReplaceExisting` (a live but non-preferred rival). Evict
+                // it, then compare-and-publish against the correct `expected`
+                // `evict_before_replace` derives from that eviction's own
+                // outcome — never an unconditional publish — and, on a CAS
+                // loss to yet another concurrently published session, bound
+                // the re-resolve exactly like the `AcceptIncoming` arm above
+                // rather than looping indefinitely.
+                let expected = self.evict_before_replace(peer_id, rival);
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::OutboundFinalizeReplaceExistingRetryAttempt {
+                        peer: peer_id.clone(),
+                        addr: connection_arc.addr,
+                    },
+                );
+                match self.compare_and_publish_peer_connection(
+                    peer_id,
+                    expected.as_ref(),
+                    connection_arc.clone(),
+                ) {
+                    Ok(()) => true,
+                    Err(Some(new_rival)) => {
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "outbound finalize ReplaceExisting retry lost to yet another \
+                                 concurrently published rival and the bounded nested-re-resolve \
+                                 budget is exhausted; rejecting our own candidate rather than \
+                                 retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        self.resolve_and_act_on_outbound_rival_bounded(
+                            peer_id,
+                            connection_arc,
+                            &new_rival,
+                            registry_weak,
+                            nested_retries_remaining - 1,
+                        )
+                    }
+                    Err(None) => {
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "outbound finalize ReplaceExisting retry lost to a concurrent \
+                                 clear and the bounded nested-re-resolve budget is exhausted; \
+                                 rejecting our own candidate rather than retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        match self.compare_and_publish_peer_connection(
+                            peer_id,
+                            None,
+                            connection_arc.clone(),
+                        ) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                debug!(
+                                    peer_id = %peer_id,
+                                    "outbound finalize ReplaceExisting retry's own empty-slot \
+                                     retry also lost; rejecting our own candidate rather than \
+                                     retrying indefinitely"
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
             }
             ConnectionConflictDecision::EvictStaleRejectIncoming => {
                 let _ = self.disconnect_connection_instance(peer_id, rival);
@@ -619,6 +723,304 @@ impl<T> ConnectionPool<T> {
                 debug!(
                     peer_id = %peer_id,
                     "outbound finalize compare-and-publish lost to a concurrently published, \
+                     tie-break-preferred rival; rejecting our own candidate"
+                );
+                false
+            }
+        }
+    }
+
+    /// Finish indexing + counting a connection that has ALREADY been
+    /// successfully installed as the peer's current session via
+    /// `compare_and_publish_peer_connection` (directly, or through
+    /// `publish_inbound_or_reresolve`/`publish_outbound_or_reresolve`) — the
+    /// address-index / `connection_counter` side effects
+    /// `add_connection_by_peer_id` otherwise bundles together with its own
+    /// unconditional publish. Callers that route their publish through
+    /// compare-and-publish call this exactly once, and only after that
+    /// compare-and-publish actually succeeded — never for a candidate that
+    /// lost its tie-break re-resolution, mirroring
+    /// `finalize_new_outbound_connection`'s own non-reject-path counting.
+    pub(crate) fn finish_indexing_accepted_connection(
+        &self,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+        connection: &Arc<LockFreeConnection>,
+    ) {
+        self.set_discovered_peer_addr(peer_id, addr);
+        let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+        let _ = self
+            .connections_by_addr
+            .upsert_sync(addr, connection.clone());
+        self.connection_counter.fetch_add(1, Ordering::AcqRel);
+        if let Some(instance_id) = connection.stream_handle.as_ref().map(|h| h.instance_id()) {
+            self.mark_instance_counted(instance_id);
+        }
+    }
+
+    /// Inbound-accept counterpart of `publish_outbound_or_reresolve`: enact
+    /// an `AcceptIncoming`/`ReplaceExisting` inbound-accept decision via
+    /// compare-and-publish against the exact snapshot (`expected`) the
+    /// decision was computed from, re-resolving against reality if a
+    /// concurrent publish (outbound OR inbound) beat this call to the peer
+    /// session slot. Closes the inbound-side counterpart of the
+    /// outbound-finalize publish gap: `handle_incoming_connection_tls`'s
+    /// `existing_conn` snapshot can be superseded by a concurrent
+    /// accept/finalize between that snapshot and this call, and this
+    /// candidate's own publish must never unconditionally overwrite
+    /// whatever that concurrent publish already installed.
+    ///
+    /// Returns `true` if `connection_arc` ended up published/kept as the
+    /// peer's current session, `false` when the re-resolve concluded the
+    /// candidate must be rejected. On `false` the candidate has NOT been
+    /// indexed by address or counted here — the caller must not do so
+    /// either, mirroring the pre-existing `RejectIncoming`/
+    /// `EvictStaleRejectIncoming` arms that never called
+    /// `add_connection_by_peer_id` in the first place.
+    #[must_use = "a `false` return means the candidate lost its re-resolved \
+                  tie-break and must never be indexed by address, counted, or \
+                  reported as the accepted session — silently discarding this \
+                  result reproduces the reviewer finding where a displaced \
+                  fresh session was clobbered by an unconditional publish"]
+    pub(crate) fn publish_inbound_or_reresolve(
+        &self,
+        peer_id: &crate::PeerId,
+        connection_arc: &Arc<LockFreeConnection>,
+        expected: Option<&Arc<LockFreeConnection>>,
+        registry_weak: &std::sync::Weak<GossipRegistry>,
+    ) -> bool {
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::InboundAcceptPublishAttempt {
+                peer: peer_id.clone(),
+                addr: connection_arc.addr,
+            },
+        );
+        let Err(rival) =
+            self.compare_and_publish_peer_connection(peer_id, expected, connection_arc.clone())
+        else {
+            return true;
+        };
+        let rival = match rival {
+            Some(rival) => rival,
+            None => {
+                // The CAS failed but the slot is empty now too: a concurrent
+                // CLEAR (not a publish) raced us. One bounded retry against
+                // the now-empty slot, instrumented so a test can
+                // deterministically pin a further concurrent publish into
+                // this exact retry gap.
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::InboundAcceptClearRaceRetry {
+                        peer: peer_id.clone(),
+                        addr: connection_arc.addr,
+                    },
+                );
+                match self.compare_and_publish_peer_connection(
+                    peer_id,
+                    None,
+                    connection_arc.clone(),
+                ) {
+                    Ok(()) => return true,
+                    Err(Some(retry_rival)) => retry_rival,
+                    Err(None) => {
+                        debug!(
+                            peer_id = %peer_id,
+                            "inbound accept compare-and-publish retry also lost to a second \
+                             concurrent clear; rejecting our own candidate rather than retrying \
+                             indefinitely"
+                        );
+                        return false;
+                    }
+                }
+            }
+        };
+        self.resolve_and_act_on_inbound_rival(peer_id, connection_arc, &rival, registry_weak)
+    }
+
+    /// Re-resolve the address-blind tie-break for an inbound `connection_arc`
+    /// against an actually-installed `rival` and act on the outcome exactly
+    /// like `handle_incoming_connection_tls`'s eager decision arms do — the
+    /// inbound counterpart of `resolve_and_act_on_outbound_rival`.
+    fn resolve_and_act_on_inbound_rival(
+        &self,
+        peer_id: &crate::PeerId,
+        connection_arc: &Arc<LockFreeConnection>,
+        rival: &Arc<LockFreeConnection>,
+        registry_weak: &std::sync::Weak<GossipRegistry>,
+    ) -> bool {
+        self.resolve_and_act_on_inbound_rival_bounded(
+            peer_id,
+            connection_arc,
+            rival,
+            registry_weak,
+            1,
+        )
+    }
+
+    /// Implementation of `resolve_and_act_on_inbound_rival` with an explicit
+    /// `nested_retries_remaining` budget — the inbound counterpart of
+    /// `resolve_and_act_on_outbound_rival_bounded`, bounding nested re-resolve
+    /// retries identically so a chain of concurrent publishes is rejected
+    /// rather than chased indefinitely.
+    fn resolve_and_act_on_inbound_rival_bounded(
+        &self,
+        peer_id: &crate::PeerId,
+        connection_arc: &Arc<LockFreeConnection>,
+        rival: &Arc<LockFreeConnection>,
+        registry_weak: &std::sync::Weak<GossipRegistry>,
+        nested_retries_remaining: u8,
+    ) -> bool {
+        let decision = registry_weak
+            .upgrade()
+            .map(|registry| {
+                let keep_existing = registry.should_keep_connection(
+                    peer_id,
+                    rival.direction == ConnectionDirection::Outbound,
+                );
+                // The candidate here is always the freshly-accepted INBOUND
+                // connection — `is_outbound == false`, mirroring
+                // `handle_incoming_connection_tls`'s own `keep_new_inbound`.
+                let keep_incoming = registry.should_keep_connection(peer_id, false);
+                resolve_connection_conflict(rival.has_live_stream(), keep_existing, keep_incoming)
+            })
+            .unwrap_or(ConnectionConflictDecision::RejectIncoming);
+        match decision {
+            ConnectionConflictDecision::AcceptIncoming => {
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::InboundAcceptAcceptIncomingRetryAttempt {
+                        peer: peer_id.clone(),
+                        addr: connection_arc.addr,
+                    },
+                );
+                match self.compare_and_publish_peer_connection(
+                    peer_id,
+                    Some(rival),
+                    connection_arc.clone(),
+                ) {
+                    Ok(()) => true,
+                    Err(Some(new_rival)) => {
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "inbound accept AcceptIncoming retry lost to yet another \
+                                 concurrently published rival and the bounded nested-re-resolve \
+                                 budget is exhausted; rejecting our own candidate rather than \
+                                 retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        self.resolve_and_act_on_inbound_rival_bounded(
+                            peer_id,
+                            connection_arc,
+                            &new_rival,
+                            registry_weak,
+                            nested_retries_remaining - 1,
+                        )
+                    }
+                    Err(None) => {
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "inbound accept AcceptIncoming retry lost to a concurrent clear \
+                                 and the bounded nested-re-resolve budget is exhausted; rejecting \
+                                 our own candidate rather than retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        match self.compare_and_publish_peer_connection(
+                            peer_id,
+                            None,
+                            connection_arc.clone(),
+                        ) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                debug!(
+                                    peer_id = %peer_id,
+                                    "inbound accept AcceptIncoming retry's own empty-slot retry \
+                                     also lost; rejecting our own candidate rather than retrying \
+                                     indefinitely"
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
+            }
+            ConnectionConflictDecision::ReplaceExisting => {
+                let expected = self.evict_before_replace(peer_id, rival);
+                crate::lifecycle::record_transport_event(
+                    crate::lifecycle::TransportLifecycleEvent::InboundAcceptReplaceExistingRetryAttempt {
+                        peer: peer_id.clone(),
+                        addr: connection_arc.addr,
+                    },
+                );
+                match self.compare_and_publish_peer_connection(
+                    peer_id,
+                    expected.as_ref(),
+                    connection_arc.clone(),
+                ) {
+                    Ok(()) => true,
+                    Err(Some(new_rival)) => {
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "inbound accept ReplaceExisting retry lost to yet another \
+                                 concurrently published rival and the bounded nested-re-resolve \
+                                 budget is exhausted; rejecting our own candidate rather than \
+                                 retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        self.resolve_and_act_on_inbound_rival_bounded(
+                            peer_id,
+                            connection_arc,
+                            &new_rival,
+                            registry_weak,
+                            nested_retries_remaining - 1,
+                        )
+                    }
+                    Err(None) => {
+                        if nested_retries_remaining == 0 {
+                            debug!(
+                                peer_id = %peer_id,
+                                "inbound accept ReplaceExisting retry lost to a concurrent clear \
+                                 and the bounded nested-re-resolve budget is exhausted; rejecting \
+                                 our own candidate rather than retrying indefinitely"
+                            );
+                            return false;
+                        }
+                        match self.compare_and_publish_peer_connection(
+                            peer_id,
+                            None,
+                            connection_arc.clone(),
+                        ) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                debug!(
+                                    peer_id = %peer_id,
+                                    "inbound accept ReplaceExisting retry's own empty-slot retry \
+                                     also lost; rejecting our own candidate rather than retrying \
+                                     indefinitely"
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
+            }
+            ConnectionConflictDecision::EvictStaleRejectIncoming => {
+                let _ = self.disconnect_connection_instance(peer_id, rival);
+                debug!(
+                    peer_id = %peer_id,
+                    "inbound accept compare-and-publish lost to a concurrently published rival; \
+                     evicted the now-stale rival and rejecting our own candidate — it was not \
+                     the tie-break-preferred direction either"
+                );
+                false
+            }
+            ConnectionConflictDecision::RejectIncoming => {
+                debug!(
+                    peer_id = %peer_id,
+                    "inbound accept compare-and-publish lost to a concurrently published, \
                      tie-break-preferred rival; rejecting our own candidate"
                 );
                 false
@@ -2729,14 +3131,37 @@ impl<T> ConnectionPool<T> {
                     // Evict the *specific* rival the decision above was
                     // computed about — instance-scoped, so a rival already
                     // superseded by a concurrent publish (e.g. a fresh
-                    // preferred inbound) is left alone. We still publish our
-                    // outbound afterward: the tie-break already decided we
-                    // win regardless of exactly what is indexed at this
-                    // instant.
-                    if let Some(existing) = existing_before.as_ref() {
-                        let _ = self.disconnect_connection_instance(peer_id, existing);
+                    // preferred inbound) is left alone. The follow-up publish
+                    // must NOT be unconditional, though: the tie-break
+                    // decided THIS outbound beats `existing_before`, not that
+                    // it beats whatever might have superseded it in the gap
+                    // between the eviction attempt above and this publish —
+                    // that is exactly the reviewer finding (a fresh session
+                    // already published for this peer left the eviction a
+                    // harmless no-op, but the old unconditional publish still
+                    // clobbered it). Route through the SAME compare-and-
+                    // publish + bounded re-resolve `AcceptIncoming` uses,
+                    // with `expected` derived from the eviction's own outcome
+                    // via `evict_before_replace`, and treat a re-resolved
+                    // loss identically to the eager reject arms below: fully
+                    // unpublish this candidate and surface the error.
+                    let expected = existing_before
+                        .as_ref()
+                        .and_then(|existing| self.evict_before_replace(peer_id, existing));
+                    if !self.publish_outbound_or_reresolve(
+                        peer_id,
+                        &connection_arc,
+                        expected.as_ref(),
+                        &registry_weak,
+                    ) {
+                        self.unpublish_rejected_outbound_candidate(
+                            addr,
+                            &connection_arc,
+                            peer_id,
+                            existing_before.as_ref(),
+                        );
+                        return Err(crate::GossipError::ConnectionExists);
                     }
-                    self.publish_current_peer_connection(peer_id, connection_arc.clone());
                 }
                 ConnectionConflictDecision::RejectIncoming => {
                     debug!(

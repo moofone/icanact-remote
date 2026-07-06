@@ -2515,6 +2515,7 @@ where
         // this side happens to be the lower-NodeId side.
         let keep_connection = {
             let pool = &registry.connection_pool;
+            let registry_weak = Arc::downgrade(&registry);
 
             match pool.get_connection_by_peer_id(&peer_id) {
                 None => {
@@ -2564,13 +2565,46 @@ where
                             // published between the decision above and this
                             // call — reproducing the tie-break reconnect
                             // thrash from the inbound-accept side.
-                            let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
-                            pool.add_connection_by_peer_id(
-                                peer_id.clone(),
-                                peer_state_addr,
-                                connection_arc.clone(),
-                            );
-                            true
+                            //
+                            // The follow-up publish must NOT be unconditional
+                            // either: `disconnect_connection_instance` above
+                            // can decline (a fresh session already superseded
+                            // `existing_conn`), and an unconditional
+                            // `add_connection_by_peer_id` afterward would
+                            // still clobber that fresh session — the exact
+                            // reviewer finding this closes. Route through the
+                            // same compare-and-publish + bounded re-resolve
+                            // `finalize_new_outbound_connection` uses, with
+                            // `expected` derived from the eviction's own
+                            // outcome. A `false` return means the candidate
+                            // lost its re-resolved tie-break: it must not be
+                            // indexed, counted, or accepted, mirroring the
+                            // `RejectIncoming`/`EvictStaleRejectIncoming` arms
+                            // below.
+                            let evicted =
+                                pool.disconnect_connection_instance(&peer_id, &existing_conn);
+                            let expected = if evicted {
+                                None
+                            } else {
+                                Some(existing_conn.clone())
+                            };
+                            if pool.publish_inbound_or_reresolve(
+                                &peer_id,
+                                &connection_arc,
+                                expected.as_ref(),
+                                &registry_weak,
+                            ) {
+                                pool.finish_indexing_accepted_connection(
+                                    &peer_id,
+                                    peer_state_addr,
+                                    &connection_arc,
+                                );
+                                true
+                            } else {
+                                registry.clear_peer_capabilities(&peer_addr);
+                                registry.note_tie_break_eviction(&peer_id);
+                                false
+                            }
                         }
                         crate::connection_pool::ConnectionConflictDecision::EvictStaleRejectIncoming => {
                             info!(
@@ -2620,18 +2654,42 @@ where
                                 },
                             );
                             // Instance-scoped for the same reason as the
-                            // `AcceptIncoming` arm above.
-                            let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
-                            pool.add_connection_by_peer_id(
-                                peer_id.clone(),
-                                peer_state_addr,
-                                connection_arc.clone(),
+                            // `AcceptIncoming` arm above; the follow-up
+                            // publish is compare-and-publish + bounded
+                            // re-resolve for the identical reason — see the
+                            // `AcceptIncoming` arm's comment above for the
+                            // full race this closes.
+                            let evicted =
+                                pool.disconnect_connection_instance(&peer_id, &existing_conn);
+                            let expected = if evicted {
+                                None
+                            } else {
+                                Some(existing_conn.clone())
+                            };
+                            let accepted = pool.publish_inbound_or_reresolve(
+                                &peer_id,
+                                &connection_arc,
+                                expected.as_ref(),
+                                &registry_weak,
                             );
+                            if accepted {
+                                pool.finish_indexing_accepted_connection(
+                                    &peer_id,
+                                    peer_state_addr,
+                                    &connection_arc,
+                                );
+                            } else {
+                                registry.clear_peer_capabilities(&peer_addr);
+                            }
                             // Direct, local evidence of a duplicate-connection
                             // conflict for this peer — arm the storm-prevention
-                            // cooldown (narrow: not on generic socket failures).
+                            // cooldown (narrow: not on generic socket failures)
+                            // regardless of whether the re-resolve ultimately
+                            // accepted or rejected this candidate: a live
+                            // wrong-direction rival was observed and evicted
+                            // either way.
                             registry.note_tie_break_eviction(&peer_id);
-                            true
+                            accepted
                         }
                         crate::connection_pool::ConnectionConflictDecision::RejectIncoming => {
                             info!(
