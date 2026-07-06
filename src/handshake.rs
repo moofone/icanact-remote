@@ -217,34 +217,14 @@ where
     Ok(caps)
 }
 
-/// Perform Hello handshake on authenticated non-TLS transports.
-///
-/// This keeps capability/version negotiation identical to TLS mode but skips ALPN checks.
-pub async fn perform_hello_handshake_no_alpn<S>(
-    stream: &mut S,
-    enable_peer_discovery: bool,
-) -> Result<PeerCapabilities>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let local_hello = hello_for_config(enable_peer_discovery);
-    send_hello_message(stream, &local_hello).await?;
-    let remote_hello = read_hello_message(stream).await?;
-    if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
-        return Err(GossipError::TlsHandshakeFailed(format!(
-            "unsupported protocol version: {}",
-            remote_hello.protocol_version
-        )));
-    }
-    let caps = PeerCapabilities::from_hello_exchange(&local_hello, &remote_hello);
-    debug!(
-        negotiated_version = caps.version,
-        peer_list = caps.can_send_peer_list(),
-        clock_calibration = caps.can_calibrate_clock(),
-        "Hello handshake negotiated capabilities"
-    );
-    Ok(caps)
-}
+// NOTE: a no-ALPN Hello variant for "authenticated non-TLS transports" was
+// removed. It performed only version/feature negotiation — no identity, no key
+// possession, no ALPN — so any transport wired through it would produce a
+// connection with `embedded_peer_id = None`, and the per-message gossip guard
+// only fires when an authenticated identity exists. It had no callers, so
+// rather than leave an unauthenticated footgun in the public surface, identity
+// binding is kept mandatory: all Hello handshakes run over the mutually
+// authenticated TLS path (`perform_hello_handshake`).
 
 #[cfg(test)]
 mod tests {

@@ -79,6 +79,27 @@ impl StreamingState {
 
         // Only insert if not already exists to avoid resetting progress on duplicate start frames
         if !self.active_streams.contains_key(&header.stream_id) {
+            // Bound aggregate eager allocation across all in-flight streams on
+            // this connection. A StreamStart pre-allocates its full declared
+            // size, so cap the sum to keep a peer from opening many max-size
+            // streams and forcing ~1 GiB of eager allocation (DoS). Summed on
+            // demand over the (<= max_concurrent_streams) active entries.
+            let inflight_bytes: usize = self
+                .active_streams
+                .values()
+                .map(|s| s.total_size as usize)
+                .sum();
+            if inflight_bytes.saturating_add(total_size) > crate::MAX_INFLIGHT_STREAM_BYTES {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    format!(
+                        "per-connection in-flight stream budget exceeded: {} in flight + {} requested > {}",
+                        inflight_bytes,
+                        total_size,
+                        crate::MAX_INFLIGHT_STREAM_BYTES
+                    ),
+                )));
+            }
             let buffer = crate::PooledAlignedBuffer::with_len(total_size, pool);
             let stream = InProgressStream {
                 stream_id: header.stream_id,
@@ -310,17 +331,35 @@ pub(crate) async fn process_read_result(
 
             let authenticated_peer_id = authenticated_peer_id
                 .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));
-            if let (Some(authenticated), Some(claimed)) =
-                (authenticated_peer_id, registry_message_sender_peer_id(&msg))
-                && claimed != authenticated
-            {
-                warn!(
-                    peer = %peer_addr,
-                    authenticated_peer_id = %authenticated,
-                    claimed_peer_id = %claimed,
-                    "Dropping gossip message with mismatched authenticated peer identity"
-                );
-                return Ok(());
+            // Fail-closed: any gossip frame that carries a claimed sender
+            // identity must be attributable to this connection's authenticated
+            // identity. Drop if it mismatches OR if there is no authenticated
+            // identity to verify against — mirroring the fail-closed PubSub path
+            // below. On the live mutually-authenticated TLS path
+            // `authenticated_peer_id` is always present, so this only closes
+            // non-TLS / pre-identification paths where a forged `sender_peer_id`
+            // would otherwise be accepted unchecked.
+            if let Some(claimed) = registry_message_sender_peer_id(&msg) {
+                match authenticated_peer_id {
+                    Some(authenticated) if authenticated == claimed => {}
+                    Some(authenticated) => {
+                        warn!(
+                            peer = %peer_addr,
+                            authenticated_peer_id = %authenticated,
+                            claimed_peer_id = %claimed,
+                            "Dropping gossip message with mismatched authenticated peer identity"
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        warn!(
+                            peer = %peer_addr,
+                            claimed_peer_id = %claimed,
+                            "Dropping gossip message with a claimed sender but no authenticated peer identity"
+                        );
+                        return Ok(());
+                    }
+                }
             }
 
             if let Err(e) =
@@ -849,6 +888,46 @@ mod tests {
             state
                 .start_stream_with_correlation(header, 1, pool, None)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn streaming_enforces_per_connection_inflight_budget() {
+        // A peer must not be able to force unbounded eager allocation by opening
+        // many max-size streams: the SUM of declared in-flight sizes is capped.
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let per = crate::MAX_STREAM_SIZE as u64;
+        let allowed = crate::MAX_INFLIGHT_STREAM_BYTES / crate::MAX_STREAM_SIZE;
+
+        for i in 0..allowed as u64 {
+            let header = crate::StreamHeader {
+                stream_id: i,
+                total_size: per,
+                chunk_size: 0,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .start_stream_with_correlation(header, 1, pool.clone(), None)
+                .expect("streams within the budget are accepted");
+        }
+
+        // One more max-size stream would push the aggregate over the budget.
+        let header = crate::StreamHeader {
+            stream_id: 9999,
+            total_size: per,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        assert!(
+            state
+                .start_stream_with_correlation(header, 1, pool, None)
+                .is_err(),
+            "aggregate in-flight stream allocation must be bounded per connection"
         );
     }
 

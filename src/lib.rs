@@ -71,6 +71,15 @@ pub use dns::{DnsResolver, TokioDnsResolver};
 
 /// Maximum allowed size for streaming payloads (hard cap).
 pub const MAX_STREAM_SIZE: usize = 64 * 1024 * 1024; // 64MB
+
+/// Maximum aggregate bytes a single connection may hold in eagerly-allocated
+/// in-flight stream reassembly buffers at once. A `StreamStart` frame
+/// pre-allocates its whole declared `total_size`, so without this cap a peer
+/// could open `max_concurrent_streams` (16) streams each declaring
+/// `MAX_STREAM_SIZE` and force ~1 GiB of eager allocation per connection at
+/// near-zero cost. Bounding the *sum* of declared sizes caps that at a couple
+/// of max-size streams' worth while still admitting many small streams.
+pub const MAX_INFLIGHT_STREAM_BYTES: usize = 2 * MAX_STREAM_SIZE; // 128MB
 pub use handle::{GossipClient, GossipRegistryHandle};
 pub use handle_builder::{BuilderTlsBootstrap, GossipRegistryBuilder};
 pub use lifecycle::{
