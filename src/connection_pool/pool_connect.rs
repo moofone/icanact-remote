@@ -363,8 +363,81 @@ impl<T> ConnectionPool<T> {
         );
         let _ = self
             .connections_by_peer
-            .upsert_sync(peer_id.clone(), connection);
+            .upsert_sync(peer_id.clone(), connection.clone());
+
+        // The CAS above just displaced `expected` (if `Some`) from the
+        // peer's current-connection slot in favor of `connection`. The
+        // `ReplaceExisting` call sites (`evict_before_replace`) already
+        // fully retire a live rival's address aliases + `counted_instances`
+        // marker via `disconnect_connection_instance` BEFORE calling here,
+        // and pass `expected = None` once that succeeds — so there is
+        // nothing left for this to do for them, and if that eviction
+        // instead DECLINED (the rival was already superseded by some other
+        // concurrent publish), the CAS above cannot succeed against a
+        // stale `Some(rival)` either, so this is never reached in that
+        // case. The AcceptIncoming shape — a known stale/dead `expected`
+        // that was never separately evicted first (e.g.
+        // `finalize_new_outbound_connection`'s eager `existing_before`
+        // rival, or the nested re-resolve retries' `Some(rival)`) — relies
+        // on THIS CAS success being the one place that retires it: without
+        // this, the old session survived being displaced from the peer
+        // slot but kept its address aliases and its `connection_counter`
+        // contribution forever outstanding (reviewer finding). Keying the
+        // retire on "the CAS just displaced a known, non-`None` `expected`"
+        // closes every such call site through this single primitive
+        // instead of a fix scattered across each one, and can never
+        // double-retire for the reasons above.
+        if let Some(expected) = expected {
+            self.retire_displaced_expected(expected, &connection);
+        }
         Ok(())
+    }
+
+    /// After [`Self::compare_and_publish_peer_connection`] succeeds
+    /// displacing a known, live `expected` from the peer session slot in
+    /// favor of `winner`, fully retire `expected` BY IDENTITY: sweep every
+    /// `connections_by_addr`/`addr_to_peer_id` alias that still points at
+    /// `expected` (never `winner`, which this must never touch) and release
+    /// `expected`'s `counted_instances` marker exactly once — mirroring what
+    /// [`Self::disconnect_connection_instance`] already does for the
+    /// `ReplaceExisting` path via [`Self::evict_before_replace`], for the
+    /// AcceptIncoming shape where the caller never separately evicted
+    /// `expected` first.
+    ///
+    /// The peer_sessions/`connections_by_peer` slot itself needs no cleanup
+    /// here: the compare-and-publish that already succeeded is what
+    /// overwrote both of those with `winner`, atomically. Only `expected`'s
+    /// OWN address aliases and `connection_counter` contribution are left
+    /// outstanding, which is exactly what this closes.
+    fn retire_displaced_expected(
+        &self,
+        expected: &Arc<LockFreeConnection>,
+        winner: &Arc<LockFreeConnection>,
+    ) {
+        debug_assert!(
+            !Arc::ptr_eq(expected, winner),
+            "retire_displaced_expected must never be asked to retire the connection it was just \
+             asked to publish"
+        );
+        let mut alias_addrs: Vec<SocketAddr> = Vec::new();
+        self.connections_by_addr.iter_sync(|addr, v| {
+            if Arc::ptr_eq(v, expected) {
+                alias_addrs.push(*addr);
+            }
+            true
+        });
+        for addr in alias_addrs {
+            let removed = self
+                .connections_by_addr
+                .remove_if_sync(&addr, |v| Arc::ptr_eq(v, expected))
+                .is_some();
+            if removed {
+                let _ = self.addr_to_peer_id.remove_sync(&addr);
+                self.clear_capabilities_for_addr(&addr);
+            }
+        }
+        self.release_counted_connection(expected);
+        expected.abort_tasks();
     }
 
     /// Evict `rival` for a `ReplaceExisting` decision, and return the
@@ -2766,12 +2839,36 @@ impl<T> ConnectionPool<T> {
             .connections_by_addr
             .read_sync(&addr, |_, v| v.clone())
             .filter(matches_instance);
-        let target = by_addr.or_else(|| {
+        let target = match by_addr.or_else(|| {
             self.peer_sessions
                 .read_sync(peer_id, |_, session| session.current_connection())
                 .flatten()
                 .filter(matches_instance)
-        })?;
+        }) {
+            Some(target) => target,
+            None => {
+                // `instance_id` is no longer reachable by `Arc` through
+                // EITHER the addr index or the peer's current slot — it was
+                // already displaced from both (e.g. a same-address reconnect
+                // reindexed `addr` under a fresh instance and concurrently
+                // published over the peer's current slot before this
+                // ask-timeout/hard-fault eviction got here). Nothing above
+                // can find it to run its own release, so its
+                // `counted_instances` marker would otherwise be permanently
+                // orphaned — a capacity leak. Release it directly by id,
+                // mirroring the exact `release_displaced_connection_count`
+                // idiom `retire_lost_cas_matched_instance` and the IO-exit
+                // superseded-exit fallback already use for this shape. Safe
+                // / idempotent: `release_counted_instance`'s
+                // `counted_instances` removal only decrements if the marker
+                // is still actually present, so this is a no-op if some
+                // other path already released it, and never
+                // double-decrements a live/current instance's own marker
+                // (only `instance_id`'s own is ever touched here).
+                self.release_displaced_connection_count(instance_id);
+                return None;
+            }
+        };
 
         if self.disconnect_connection_instance(peer_id, &target) {
             return Some(target);
