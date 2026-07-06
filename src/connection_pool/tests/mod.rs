@@ -6489,3 +6489,113 @@ fn streaming_queue_push_unblocks_on_teardown() {
         }
     });
 }
+
+/// Guard 2 (investigate-self-connect-loop, defense-in-depth): when the
+/// target identity resolved for a dial is this node's own peer_id,
+/// `connect_via_stream` must refuse immediately at the top, before it ever
+/// reaches the tie-break / `should_keep_connection` /
+/// `wait_for_preferred_connection` machinery. `should_keep_connection` is
+/// unconditionally `false` for self in both directions, so without this
+/// short-circuit a self-dial free-runs
+/// `outbound_connect_wait_preferred_inbound` ->
+/// `outbound_connect_preferred_inbound_timeout_fallback_dial` every
+/// `connection_timeout`, forever. This test proves convergence is
+/// immediate (well under `connection_timeout`), not merely eventual.
+#[tokio::test]
+async fn connect_via_stream_short_circuits_self_dial_without_waiting_or_fallback_dial() {
+    let self_addr: SocketAddr = "127.0.0.1:40997".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        self_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "self_dial_short_circuit_guard2",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let self_node_id = registry.peer_id.to_node_id();
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let registry_weak = Arc::downgrade(&registry);
+
+    // connection_timeout is deliberately long: if the short-circuit did not
+    // fire, `wait_for_preferred_connection` would block for (up to) this
+    // entire duration before falling back to a dial that would also self-loop.
+    let connection_timeout = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    let result = pool
+        .connect_via_stream(
+            self_addr,
+            Some(self_node_id),
+            8,
+            connection_timeout,
+            registry_weak,
+        )
+        .await;
+    let elapsed = start.elapsed();
+
+    let err = result.expect_err("dialing self must be refused, never silently succeed");
+    assert!(
+        err.to_string().contains("refusing to dial self peer_id"),
+        "expected the self-dial short-circuit error, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "self-dial must be refused immediately (no wait_for_preferred_connection, \
+         no timeout_fallback_dial); took {elapsed:?} against a {connection_timeout:?} timeout"
+    );
+}
+
+/// Guard 2 companion: the self-dial identity check must never misfire on a
+/// distinct, legitimate peer_id. With a peer_id that differs from the
+/// registry's own, `connect_via_stream` must proceed past the guard and
+/// attempt a genuine dial (which fails here only because nothing is
+/// listening at the target address, not because of the self-dial guard).
+#[tokio::test]
+async fn connect_via_stream_still_dials_distinct_peer_id_normally() {
+    // Order the two generated keys so the local (self) side has the lower
+    // GossipNodeId, matching `should_keep_connection`'s NodeId-ordering
+    // comparator (`Ordering::Less => is_outbound`) — this keeps the
+    // dial-vs-wait-for-preferred-inbound tie-break out of the way so the
+    // test observes the guard's pass-through, not tie-break scheduling.
+    let key_a = crate::KeyPair::new_for_testing("guard2_real_peer_side_a");
+    let key_b = crate::KeyPair::new_for_testing("guard2_real_peer_side_b");
+    let (self_key, remote_key) =
+        if key_a.peer_id().to_node_id().as_bytes() < key_b.peer_id().to_node_id().as_bytes() {
+            (key_a, key_b)
+        } else {
+            (key_b, key_a)
+        };
+
+    let self_addr: SocketAddr = "127.0.0.1:40996".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        self_addr,
+        crate::GossipConfig {
+            key_pair: Some(self_key),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let remote_node_id = remote_key.peer_id().to_node_id();
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(2));
+    let registry_weak = Arc::downgrade(&registry);
+
+    // Nothing listens here: the dial itself must fail, but with a genuine
+    // connect error, never the self-dial short-circuit — proving the
+    // identity-keyed guard is specific to true self-dials.
+    let unreachable_addr: SocketAddr = "127.0.0.1:40995".parse().unwrap();
+
+    let result = pool
+        .connect_via_stream(
+            unreachable_addr,
+            Some(remote_node_id),
+            8,
+            Duration::from_secs(2),
+            registry_weak,
+        )
+        .await;
+
+    let err = result.expect_err("dialing an unreachable address must fail");
+    assert!(
+        !err.to_string().contains("refusing to dial self peer_id"),
+        "self-dial guard must never fire for a distinct peer_id, got: {err}"
+    );
+}

@@ -26,6 +26,43 @@ impl<T> ConnectionPool<T> {
             "outbound_connect_start"
         );
 
+        // Guard 2 (defense-in-depth self-dial short-circuit): if the
+        // target's identity is already known and it is our own, refuse
+        // immediately — never enter the eviction-for-room, tie-break,
+        // should_keep_connection, or wait-for-preferred-inbound machinery
+        // for a self-dial. Guard 1 (identity-keyed self-filtering in
+        // GossipRegistry::on_peer_list_gossip / add_peer_with_node_id)
+        // should prevent a self-dial from ever being attempted in the first
+        // place; this is the last-resort chokepoint for any other path that
+        // might still hand us our own peer_id (e.g. a stale configured-peer
+        // entry). should_keep_connection already returns `false` for self
+        // in both directions unconditionally, so without this guard a
+        // self-dial would free-run outbound_connect_wait_preferred_inbound
+        // -> outbound_connect_preferred_inbound_timeout_fallback_dial every
+        // `connection_timeout`, forever — wait_for_preferred_connection can
+        // never see a legitimately "preferred" inbound from ourselves. This
+        // check is purely identity-keyed (PeerId equality) so it can never
+        // misfire on a real, distinct peer, and it does not touch
+        // should_keep_connection's NodeId-ordering tie-break at all.
+        if let Some(node_id_value) = resolved_node_id.as_ref() {
+            let target_peer_id = crate::PeerId::from(node_id_value);
+            if let Some(registry_arc) = registry_weak.upgrade()
+                && target_peer_id == registry_arc.peer_id
+            {
+                warn!(
+                    target: "icanact_remote_lifecycle",
+                    attempt_id,
+                    addr = %addr,
+                    peer_id = %target_peer_id,
+                    "outbound_connect_refused_self_dial"
+                );
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to dial self peer_id",
+                )));
+            }
+        }
+
         // Make room if necessary - evict the least-recently-used connection
         // that is safe to drop. Configured/required peers are never chosen, so
         // a new (often transient/discovered) dial cannot disconnect a live
