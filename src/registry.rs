@@ -1681,7 +1681,15 @@ impl<T: 'static> GossipRegistry<T> {
                 last_peer_gossip_time: 0,
                 peer_discovery: if config.enable_peer_discovery {
                     Some(PeerDiscovery::new(
-                        bind_addr,
+                        // Self-filtering in `PeerDiscovery::on_peer_list_gossip`
+                        // compares gossiped addresses against `local_addr`. A
+                        // peer relaying gossip about this node describes it by
+                        // its *advertised* address, which can differ from
+                        // `bind_addr` under NAT/K8s/mesh overlays. Using the
+                        // advertised address here (falling back to bind_addr
+                        // when unset) closes that gap; it only ever filters
+                        // this node's own address, never a distinct real peer.
+                        config.advertise_address.unwrap_or(bind_addr),
                         PeerDiscoveryConfig {
                             max_peers: config.max_peers,
                             allow_private_discovery: config.allow_private_discovery,
@@ -2333,6 +2341,16 @@ impl<T: 'static> GossipRegistry<T> {
             debug!(
                 peer = %peer_addr,
                 "refusing to add peer with unspecified address or zero port"
+            );
+            return;
+        }
+        // Identity self-filter (authoritative — address alone is not
+        // sufficient when advertise_address != bind_addr; see
+        // `on_peer_list_gossip`'s matching filter for the full rationale).
+        if node_id == Some(self.peer_id.to_node_id()) {
+            debug!(
+                peer = %peer_addr,
+                "refusing to add self as peer (node_id identifies this node)"
             );
             return;
         }
@@ -7349,6 +7367,32 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         let _now = current_timestamp();
+
+        // Identity self-filter: a peer may relay gossip describing THIS
+        // node under its *advertised* address (which can differ from
+        // `bind_addr` under NAT/K8s/mesh — see `advertised_addr()`). The
+        // address-keyed self-filter in `PeerDiscovery` only ever knew about
+        // `bind_addr`, so a relayed entry naming our own advertised address
+        // slipped through as a dial candidate and fed a self-dial livelock
+        // (`should_keep_connection` is unconditionally `false` for self in
+        // both directions, so `wait_for_preferred_connection` never
+        // converges). Identity is the authoritative signal here — filter by
+        // `node_id` first, independent of whatever address is attached.
+        let self_node_id = self.peer_id.to_node_id();
+        let peers: Vec<PeerInfoGossip> = peers
+            .into_iter()
+            .filter(|peer_gossip| {
+                if peer_gossip.node_id == Some(self_node_id) {
+                    debug!(
+                        addr = %peer_gossip.address,
+                        sender = %sender_addr,
+                        "dropping relayed gossip describing this node's own identity (self node_id)"
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect();
 
         // DON'T PENALIZE THE MESSENGER:
         // Count bogon IPs to detect if sender is sending suspicious data
