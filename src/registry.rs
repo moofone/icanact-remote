@@ -10487,13 +10487,6 @@ mod tests {
             LockFreeStreamHandle,
         };
 
-        struct RecorderGuard;
-        impl Drop for RecorderGuard {
-            fn drop(&mut self) {
-                crate::set_transport_lifecycle_recorder(None);
-            }
-        }
-
         let registry = GossipRegistry::<()>::new(test_addr(9400), test_config());
         let peer_id = test_peer_id("matched_instance_peer");
         let old_addr = test_addr(9401);
@@ -10542,12 +10535,11 @@ mod tests {
         conn_fresh.set_state(ConnectionState::Connected);
         let conn_fresh = Arc::new(conn_fresh);
 
-        let _guard = RecorderGuard;
-        {
+        let _guard = {
             let pool = pool.clone();
             let peer_id = peer_id.clone();
             let conn_fresh = conn_fresh.clone();
-            crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
                 if let crate::TransportLifecycleEvent::SessionRemoved {
                     peer,
                     reason: crate::SessionRemovalReason::DisconnectByPeerId,
@@ -10562,8 +10554,8 @@ mod tests {
                     crate::set_transport_lifecycle_recorder(None);
                     pool.publish_current_peer_connection(&peer_id, conn_fresh.clone());
                 }
-            })));
-        }
+            }))
+        };
 
         // conn_old's IO task exits and reports failure, identifying itself
         // by its OWN captured instance id — which matches the current
@@ -10623,28 +10615,6 @@ mod tests {
             LockFreeStreamHandle,
         };
 
-        // Serializes against the SAME global lock
-        // `connection_pool::tests::RECORDER_TEST_LOCK` uses: both modules'
-        // tests install the single global `set_transport_lifecycle_recorder`
-        // hook, so a per-module lock would not prevent this test and a
-        // `connection_pool::tests` recorder test from clobbering each
-        // other's registration under the default multi-threaded harness.
-        struct RecorderGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-        impl RecorderGuard {
-            fn acquire() -> Self {
-                Self(
-                    crate::connection_pool::tests::RECORDER_TEST_LOCK
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                )
-            }
-        }
-        impl Drop for RecorderGuard {
-            fn drop(&mut self) {
-                crate::set_transport_lifecycle_recorder(None);
-            }
-        }
-
         let registry = GossipRegistry::<()>::new(test_addr(9400), test_config());
         let peer_id = test_peer_id("matched_instance_cas_loss_peer");
         let old_addr = test_addr(9401);
@@ -10699,12 +10669,11 @@ mod tests {
         conn_fresh.set_state(ConnectionState::Connected);
         let conn_fresh = Arc::new(conn_fresh);
 
-        let _guard = RecorderGuard::acquire();
-        {
+        let _guard = {
             let pool = pool.clone();
             let peer_id = peer_id.clone();
             let conn_fresh = conn_fresh.clone();
-            crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
                 if let crate::TransportLifecycleEvent::SocketFailureMatchedInstanceTeardownAttempt {
                     peer,
                     ..
@@ -10725,8 +10694,8 @@ mod tests {
                         conn_fresh.clone()
                     ));
                 }
-            })));
-        }
+            }))
+        };
 
         // conn_old's IO task exits and reports failure, identifying itself by
         // its OWN captured instance id — which matched the current session

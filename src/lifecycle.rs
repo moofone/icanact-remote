@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::PeerId;
 
@@ -136,6 +136,47 @@ pub fn set_transport_lifecycle_recorder(recorder: Option<TransportLifecycleRecor
     *recorder_cell()
         .write()
         .expect("transport lifecycle recorder lock poisoned") = recorder;
+}
+
+/// Process-wide lock serializing every installation of the global
+/// [`set_transport_lifecycle_recorder`] hook. The recorder is shared, mutable,
+/// global state (a single `OnceLock<RwLock<Option<...>>>` above); the default
+/// parallel test harness runs many `#[test]`/`#[tokio::test]` functions
+/// concurrently, so without a single shared lock, two such tests can install/
+/// deregister each other's closures mid-test.
+///
+/// This is intentionally private: the only supported way to acquire it is
+/// through [`TransportLifecycleRecorderGuard::install`], so a test cannot
+/// install a recorder without holding the lock for the guard's entire
+/// lifetime — correct by construction rather than by every call site
+/// remembering to take a lock.
+static RECORDER_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII installer for [`set_transport_lifecycle_recorder`]. Acquires the
+/// process-wide [`RECORDER_INSTALL_LOCK`] for its entire lifetime and
+/// deregisters the recorder on drop, so concurrently running tests that each
+/// install a recorder are fully serialized against one another and can never
+/// observe or clobber each other's hook — this is the only sanctioned way to
+/// install a recorder in tests.
+#[must_use = "the recorder is uninstalled when this guard is dropped"]
+pub struct TransportLifecycleRecorderGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl TransportLifecycleRecorderGuard {
+    pub fn install(recorder: TransportLifecycleRecorder) -> Self {
+        let lock = RECORDER_INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_transport_lifecycle_recorder(Some(recorder));
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for TransportLifecycleRecorderGuard {
+    fn drop(&mut self) {
+        set_transport_lifecycle_recorder(None);
+    }
 }
 
 pub(crate) fn record_transport_event(event: TransportLifecycleEvent) {

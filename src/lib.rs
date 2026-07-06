@@ -75,7 +75,7 @@ pub use handle::{GossipClient, GossipRegistryHandle};
 pub use handle_builder::{BuilderTlsBootstrap, GossipRegistryBuilder};
 pub use lifecycle::{
     SessionRemovalReason, TransportDirection, TransportLifecycleEvent, TransportLifecycleRecorder,
-    set_transport_lifecycle_recorder,
+    TransportLifecycleRecorderGuard, set_transport_lifecycle_recorder,
 };
 pub use priority::{ConsistencyLevel, RegistrationPriority};
 pub use pubsub::{

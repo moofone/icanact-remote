@@ -3555,12 +3555,11 @@ fn hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide() {
         let fresh_addr: SocketAddr = "127.0.0.1:7315".parse().unwrap();
         let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
 
-        let _guard = RecorderGuard::acquire();
-        {
+        let _guard = {
             let pool = pool.clone();
             let peer = peer.clone();
             let fresh = fresh.clone();
-            crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
                 if let crate::TransportLifecycleEvent::SessionRemoved {
                     peer: event_peer,
                     reason: crate::SessionRemovalReason::DisconnectByPeerId,
@@ -3571,8 +3570,8 @@ fn hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide() {
                     crate::set_transport_lifecycle_recorder(None);
                     pool.publish_current_peer_connection(&peer, fresh.clone());
                 }
-            })));
-        }
+            }))
+        };
 
         // A hard transport fault pinned to the (currently live) instance —
         // models the caller's ask having actually failed on `live_instance`.
@@ -4000,12 +3999,11 @@ async fn outbound_finalize_accept_incoming_compare_and_publishes_against_snapsho
     let inbound_addr: SocketAddr = "127.0.0.1:7481".parse().unwrap();
     let inbound = make_live_connection(inbound_addr, ConnectionDirection::Inbound).await;
 
-    let _guard = RecorderGuard::acquire();
-    {
+    let _guard = {
         let pool = pool.clone();
         let peer_id = remote_peer_id.clone();
         let inbound = inbound.clone();
-        crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
             if let crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
                 peer: event_peer,
                 ..
@@ -4019,8 +4017,8 @@ async fn outbound_finalize_accept_incoming_compare_and_publishes_against_snapsho
                 crate::set_transport_lifecycle_recorder(None);
                 pool.publish_current_peer_connection(&peer_id, inbound.clone());
             }
-        })));
-    }
+        }))
+    };
 
     let counter_before = pool.connection_counter.load(Ordering::SeqCst);
 
@@ -4135,12 +4133,11 @@ async fn outbound_finalize_evict_stale_reject_incoming_cas_lost_fully_unpublishe
         "test precondition: rival must be stale/dead"
     );
 
-    let _guard = RecorderGuard::acquire();
-    {
+    let _guard = {
         let pool = pool.clone();
         let peer_id = remote_peer_id.clone();
         let rival = rival.clone();
-        crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
             if let crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
                 peer: event_peer,
                 ..
@@ -4150,8 +4147,8 @@ async fn outbound_finalize_evict_stale_reject_incoming_cas_lost_fully_unpublishe
                 crate::set_transport_lifecycle_recorder(None);
                 pool.publish_current_peer_connection(&peer_id, rival.clone());
             }
-        })));
-    }
+        }))
+    };
 
     let counter_before = pool.connection_counter.load(Ordering::SeqCst);
 
@@ -4296,54 +4293,55 @@ async fn outbound_finalize_clear_race_retry_loss_to_second_rival_fully_unpublish
     let preferred_addr: SocketAddr = "127.0.0.1:7491".parse().unwrap();
     let preferred_rival = make_live_connection(preferred_addr, ConnectionDirection::Outbound).await;
 
-    let _guard = RecorderGuard::acquire();
-    {
+    let _guard = {
         let pool = pool.clone();
         let peer_id = remote_peer_id.clone();
         let existing_before = existing_before.clone();
         let preferred_rival = preferred_rival.clone();
-        crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| match &event {
-            crate::TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken {
-                peer: event_peer,
-                ..
-            } if *event_peer == peer_id => {
-                // `existing_before`'s own link dies in the real gap between
-                // the snapshot and the tie-break decision computed from it —
-                // the decision a few lines below now observes it as dead.
-                if let Some(sh) = existing_before.stream_handle.as_ref() {
-                    sh.exit_flag.store(true, Ordering::Release);
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            match &event {
+                crate::TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    // `existing_before`'s own link dies in the real gap between
+                    // the snapshot and the tie-break decision computed from it —
+                    // the decision a few lines below now observes it as dead.
+                    if let Some(sh) = existing_before.stream_handle.as_ref() {
+                        sh.exit_flag.store(true, Ordering::Release);
+                    }
                 }
+                crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    // A concurrent CLEAR (not a publish) races the FIRST
+                    // compare-and-publish: the slot is empty by the time that
+                    // CAS actually runs, so it loses with `rival == None`.
+                    pool.clear_current_peer_connection(&peer_id);
+                }
+                crate::TransportLifecycleEvent::OutboundFinalizeClearRaceRetry {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    // Deregister first: `add_connection_by_peer_id` below fires
+                    // its own (non-matching) `SessionPublished` event through
+                    // this same global hook, and this avoids any
+                    // reentrant/recursive invocation of this closure.
+                    crate::set_transport_lifecycle_recorder(None);
+                    // A PREFERRED rival publishes — for real, counted — into the
+                    // exact gap between the first CAS loss and the retry, so the
+                    // retry ALSO loses, this time to an actually-installed rival.
+                    assert!(pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        preferred_addr,
+                        preferred_rival.clone()
+                    ));
+                }
+                _ => {}
             }
-            crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
-                peer: event_peer,
-                ..
-            } if *event_peer == peer_id => {
-                // A concurrent CLEAR (not a publish) races the FIRST
-                // compare-and-publish: the slot is empty by the time that
-                // CAS actually runs, so it loses with `rival == None`.
-                pool.clear_current_peer_connection(&peer_id);
-            }
-            crate::TransportLifecycleEvent::OutboundFinalizeClearRaceRetry {
-                peer: event_peer,
-                ..
-            } if *event_peer == peer_id => {
-                // Deregister first: `add_connection_by_peer_id` below fires
-                // its own (non-matching) `SessionPublished` event through
-                // this same global hook, and this avoids any
-                // reentrant/recursive invocation of this closure.
-                crate::set_transport_lifecycle_recorder(None);
-                // A PREFERRED rival publishes — for real, counted — into the
-                // exact gap between the first CAS loss and the retry, so the
-                // retry ALSO loses, this time to an actually-installed rival.
-                assert!(pool.add_connection_by_peer_id(
-                    peer_id.clone(),
-                    preferred_addr,
-                    preferred_rival.clone()
-                ));
-            }
-            _ => {}
-        })));
-    }
+        }))
+    };
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
@@ -4500,55 +4498,56 @@ async fn outbound_finalize_evict_replace_retry_loss_to_new_rival_fully_unpublish
     let preferred_addr: SocketAddr = "127.0.0.1:7494".parse().unwrap();
     let preferred_rival = make_live_connection(preferred_addr, ConnectionDirection::Outbound).await;
 
-    let _guard = RecorderGuard::acquire();
-    {
+    let _guard = {
         let pool = pool.clone();
         let peer_id = remote_peer_id.clone();
         let existing_before = existing_before.clone();
         let stale_rival = stale_rival.clone();
         let preferred_rival = preferred_rival.clone();
-        crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| match &event {
-            crate::TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken {
-                peer: event_peer,
-                ..
-            } if *event_peer == peer_id => {
-                // `existing_before`'s own link dies in the real gap between
-                // the snapshot and the tie-break decision computed from it.
-                if let Some(sh) = existing_before.stream_handle.as_ref() {
-                    sh.exit_flag.store(true, Ordering::Release);
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            match &event {
+                crate::TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    // `existing_before`'s own link dies in the real gap between
+                    // the snapshot and the tie-break decision computed from it.
+                    if let Some(sh) = existing_before.stream_handle.as_ref() {
+                        sh.exit_flag.store(true, Ordering::Release);
+                    }
                 }
+                crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    // A different, already-stale session replaces `existing_before`
+                    // in the peer's slot before the FIRST compare-and-publish
+                    // actually runs, so that CAS loses directly to
+                    // `Some(stale_rival)` — not a clear.
+                    pool.publish_current_peer_connection(&peer_id, stale_rival.clone());
+                }
+                crate::TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt {
+                    peer: event_peer,
+                    ..
+                } if *event_peer == peer_id => {
+                    // Deregister first: `add_connection_by_peer_id` below fires
+                    // its own (non-matching) `SessionPublished` event through
+                    // this same global hook, avoiding reentrant invocation.
+                    crate::set_transport_lifecycle_recorder(None);
+                    // A PREFERRED rival publishes — for real, counted — into the
+                    // exact gap between the re-resolved `AcceptIncoming` decision
+                    // and its own retry, so that retry ALSO loses, this time to
+                    // an actually-installed, preferred rival.
+                    assert!(pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        preferred_addr,
+                        preferred_rival.clone()
+                    ));
+                }
+                _ => {}
             }
-            crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
-                peer: event_peer,
-                ..
-            } if *event_peer == peer_id => {
-                // A different, already-stale session replaces `existing_before`
-                // in the peer's slot before the FIRST compare-and-publish
-                // actually runs, so that CAS loses directly to
-                // `Some(stale_rival)` — not a clear.
-                pool.publish_current_peer_connection(&peer_id, stale_rival.clone());
-            }
-            crate::TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt {
-                peer: event_peer,
-                ..
-            } if *event_peer == peer_id => {
-                // Deregister first: `add_connection_by_peer_id` below fires
-                // its own (non-matching) `SessionPublished` event through
-                // this same global hook, avoiding reentrant invocation.
-                crate::set_transport_lifecycle_recorder(None);
-                // A PREFERRED rival publishes — for real, counted — into the
-                // exact gap between the re-resolved `AcceptIncoming` decision
-                // and its own retry, so that retry ALSO loses, this time to
-                // an actually-installed, preferred rival.
-                assert!(pool.add_connection_by_peer_id(
-                    peer_id.clone(),
-                    preferred_addr,
-                    preferred_rival.clone()
-                ));
-            }
-            _ => {}
-        })));
-    }
+        }))
+    };
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
@@ -5254,37 +5253,12 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
 /// connection synchronously from within that event callback lands the
 /// concurrent publish in that exact window on every run, with no scheduling
 /// luck required.
-/// Process-wide lock serializing every test that installs the global
-/// `set_transport_lifecycle_recorder` hook. The recorder is shared, mutable,
-/// global state (a single `OnceLock<RwLock<Option<...>>>` in `lifecycle.rs`);
-/// the default multi-threaded test harness runs `#[test]`/`#[tokio::test]`
-/// functions concurrently, so without this lock two such tests can install/
-/// deregister each other's closures mid-test — a race entirely orthogonal to
-/// (and far more likely to fire than) the specific check-then-act gap each
-/// test pins deterministically. Acquired for the guard's entire lifetime,
-/// alongside its deregister-on-drop behavior below.
-// `pub(crate)` so other modules' tests that also install the global
-// `set_transport_lifecycle_recorder` hook (e.g. `registry::tests`) can
-// serialize against these tests via the SAME lock — a per-module lock would
-// not prevent two different modules' recorder-installing tests from
-// clobbering each other under the default multi-threaded test harness.
-pub(crate) static RECORDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct RecorderGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-impl RecorderGuard {
-    fn acquire() -> Self {
-        Self(
-            RECORDER_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-    }
-}
-impl Drop for RecorderGuard {
-    fn drop(&mut self) {
-        crate::set_transport_lifecycle_recorder(None);
-    }
-}
+// Every recorder installation in this module goes through
+// `crate::lifecycle::TransportLifecycleRecorderGuard::install`, which holds
+// the single process-wide install lock (owned by `lifecycle.rs`) for its
+// entire lifetime and deregisters on drop — so concurrently running tests
+// that each install a recorder can never clobber each other's registration
+// under the default parallel test harness. See that type's doc comment.
 
 #[tokio::test]
 async fn stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_session() {
@@ -5306,12 +5280,11 @@ async fn stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_sess
     // Install the injection hook, guarded so it is always uninstalled again
     // (including on panic/assertion failure) — this is process-global state
     // shared with every other test in the binary.
-    let _guard = RecorderGuard::acquire();
-    {
+    let _guard = {
         let pool = pool.clone();
         let peer_id = peer_id.clone();
         let fresh = fresh.clone();
-        crate::set_transport_lifecycle_recorder(Some(Arc::new(move |event| {
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
             if let crate::TransportLifecycleEvent::SessionRemoved {
                 peer,
                 reason: crate::SessionRemovalReason::CurrentConnectionCleared,
@@ -5326,8 +5299,8 @@ async fn stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_sess
                 crate::set_transport_lifecycle_recorder(None);
                 pool.publish_current_peer_connection(&peer_id, fresh.clone());
             }
-        })));
-    }
+        }))
+    };
 
     // The defensive stale-instance cleanup path
     // (`remove_connection_instance_by_id`) retiring the OLD `stale`
