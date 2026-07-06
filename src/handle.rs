@@ -1282,6 +1282,185 @@ mod tests {
         Ok(())
     }
 
+    /// RED (reviewer finding, P1, `handle_incoming_connection_tls`'s
+    /// `None => ...` inbound-accept fast path): before this fix, observing
+    /// `pool.get_connection_by_peer_id(&peer_id) == None` was treated as a
+    /// stable snapshot and unconditionally published/indexed/counted via a
+    /// bare `add_connection_by_peer_id` — with no compare-and-publish at all.
+    /// TWO concurrent first inbound accepts for the SAME peer can both
+    /// observe `None`; the later `add_connection_by_peer_id` silently
+    /// overwrites the earlier one's already-installed session while BOTH
+    /// sides' own indexing/counting proceed independently, leaving a
+    /// duplicate counted/indexed zombie — the identical snapshot-to-publish
+    /// race the existing-connection arms already close via
+    /// `publish_inbound_or_reresolve` + `finish_indexing_accepted_connection`.
+    ///
+    /// Pinned deterministically via `InboundAcceptPublishAttempt` (fires
+    /// unconditionally right before this candidate's own compare-and-publish
+    /// attempt, regardless of which arm reached it): when it fires, a SECOND,
+    /// genuinely live, concurrent first-accept for the same peer is published
+    /// for real (counted) into the peer's session slot, standing in for the
+    /// other concurrent accept winning the race in the gap between this
+    /// candidate's own `None` snapshot and its publish attempt. Local and
+    /// remote use the SAME direction (both candidates are inbound) so the
+    /// address-blind tie-break's `keep_existing`/`keep_incoming` computation
+    /// is identical on both sides and `resolve_connection_conflict` returns
+    /// `RejectIncoming` deterministically: the already-installed rival stays
+    /// current and this candidate must be dropped.
+    ///
+    /// RED at HEAD (before this fix): the `None` arm calls
+    /// `add_connection_by_peer_id` unconditionally, clobbering `second` —
+    /// `get_connection_by_peer_id` returns the STALE first candidate instead
+    /// of `second`, `connection_counter` double-counts both, and `second`'s
+    /// own `connections_by_addr`/`addr_to_peer_id` aliases are silently
+    /// orphaned underneath the overwritten peer-session pointer. GREEN after
+    /// the fix: `second` remains the peer's current session, the first
+    /// candidate is dropped (`ConnectionCloseOutcome::DroppedByTieBreaker`)
+    /// and never indexed/counted, and `connection_counter` reflects exactly
+    /// one live session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_concurrent_first_inbound_accepts_leave_exactly_one_counted_session()
+    -> crate::Result<()> {
+        let (remote_keypair, local_keypair) =
+            ordered_keypairs("two-first-accepts-remote", "two-first-accepts-local");
+        let remote_peer_id = remote_keypair.peer_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_connection_by_peer_id(&remote_peer_id)
+                .is_none(),
+            "test precondition: no existing connection for this peer at all"
+        );
+        let baseline = handle.registry.connection_pool.raw_connection_counter();
+        assert_eq!(baseline, 0, "test precondition: nothing counted yet");
+
+        // The SECOND, genuinely live, concurrent first-accept for the same
+        // peer — published for real (counted) into the exact gap between
+        // this candidate's own `None` snapshot and its publish attempt.
+        let second_addr: SocketAddr = "127.0.0.1:41201".parse().unwrap();
+        let (second_io, _second_peer) = tokio::io::duplex(1024);
+        let (second_stream_handle, _second_writer_task, _second_reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                second_io,
+                second_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut second = crate::connection_pool::LockFreeConnection::new(
+            second_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        second.stream_handle = Some(Arc::new(second_stream_handle));
+        second.set_state(crate::connection_pool::ConnectionState::Connected);
+        let second = Arc::new(second);
+
+        let _guard = {
+            let pool = handle.registry.connection_pool.clone();
+            let peer_id = remote_peer_id.clone();
+            let second = second.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::InboundAcceptPublishAttempt {
+                    peer: event_peer,
+                    ..
+                } = &event
+                    && *event_peer == peer_id
+                {
+                    // Deregister first: `add_connection_by_peer_id` below
+                    // fires its own (non-matching) `SessionPublished` event
+                    // through this same global hook, avoiding reentrant
+                    // invocation.
+                    crate::set_transport_lifecycle_recorder(None);
+                    assert!(pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        second_addr,
+                        second.clone()
+                    ));
+                }
+            }))
+        };
+
+        // The FIRST candidate: dials in from a third address, hitting the
+        // `None` fast path since no connection existed for this peer at the
+        // time of its own snapshot.
+        let first_addr: SocketAddr = "127.0.0.1:41202".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: remote_peer_id.clone(),
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            first_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_keypair.peer_id().to_node_id()),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ConnectionCloseOutcome::DroppedByTieBreaker),
+            "the first candidate's re-resolved compare-and-publish must lose to the \
+             concurrently published, already-installed second candidate and be dropped"
+        );
+
+        let current = handle
+            .registry
+            .connection_pool
+            .get_connection_by_peer_id(&remote_peer_id);
+        assert!(
+            current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &second)),
+            "the SECOND candidate, published concurrently in the None-arm's own \
+             compare-and-publish gap, must remain the peer's current session — the first \
+             candidate's own publish must never overwrite it (got {current:?})"
+        );
+        assert!(
+            second.has_live_stream(),
+            "the second candidate's background tasks must survive untouched"
+        );
+
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_existing_connection(first_addr)
+                .is_none(),
+            "the first (losing) candidate must not remain indexed by its own address in \
+             connections_by_addr (the separate `addr_to_peer_id` identity mapping written by \
+             `add_peer_with_node_id`'s Hello-time address-book bookkeeping is unconditional \
+             for every inbound Hello on every arm, accepted or rejected, so it is out of scope \
+             for this finding)"
+        );
+
+        assert_eq!(
+            handle.registry.connection_pool.raw_connection_counter(),
+            baseline + 1,
+            "connection_counter must reflect only the SECOND candidate — the first candidate \
+             that lost its re-resolved compare-and-publish must never be counted, so exactly \
+             one live session is ever counted for this peer's first contact"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     /// RED (review finding P2, `finish_indexing_accepted_connection`): the
     /// compare-and-publish inside `publish_inbound_or_reresolve` only proves
     /// this candidate won the peer-session slot AT THAT INSTANT. Before this
@@ -2963,52 +3142,78 @@ where
 
         // Routed through the shared identity-only chokepoint
         // (`resolve_connection_conflict`, `connection_pool/pool_connect.rs`)
-        // for every case where a concrete existing connection is present. The
-        // "no existing connection at all" fast path below is intentionally
-        // NOT routed: it always accepts unconditionally (matching
+        // for every case, including the "no existing connection observed"
+        // fast path below. It still always ACCEPTS a peer's very first
+        // connection unconditionally (matching
         // `finalize_new_outbound_connection`'s own `None => AcceptIncoming`
-        // precedent) rather than tie-break-checking a peer's very first
-        // connection, which would reject legitimate first contact whenever
-        // this side happens to be the lower-NodeId side.
+        // precedent) rather than tie-break-checking it, so a legitimate
+        // first contact is never rejected merely because this side happens
+        // to be the lower-NodeId side.
+        //
+        // What it must NOT do is treat the `None` snapshot from
+        // `get_connection_by_peer_id` as stable and unconditionally publish
+        // over it: two concurrent first inbound accepts for the SAME peer
+        // can both observe `None` here, and an unconditional
+        // `add_connection_by_peer_id` would let the later one silently
+        // overwrite the earlier one's already-published session while both
+        // sides' indexing/counting proceed independently — a duplicate
+        // counted/indexed zombie, the same snapshot-to-publish race the
+        // existing-connection arms below close via compare-and-publish. So
+        // this arm is routed through the identical
+        // `publish_inbound_or_reresolve` + `finish_indexing_accepted_connection`
+        // chokepoint with `expected = None`: it installs this candidate only
+        // if the peer session slot is still genuinely empty; on CAS-loss
+        // (another first-accept won the race) it re-resolves the
+        // address-blind tie-break against whichever connection actually won,
+        // exactly like the existing-connection arms.
         let keep_connection = {
             let pool = &registry.connection_pool;
             let registry_weak = Arc::downgrade(&registry);
 
             match pool.get_connection_by_peer_id(&peer_id) {
                 None => {
-                    pool.add_connection_by_peer_id(
-                        peer_id.clone(),
-                        peer_state_addr,
-                        connection_arc.clone(),
-                    );
-                    // No existing connection for this peer at all — nothing
-                    // to tie-break/re-resolve against, so this fast path is
-                    // intentionally not routed through the guarded
-                    // compare-and-publish + `finish_indexing_accepted_connection`
-                    // chokepoint (see the comment on `keep_connection` above).
-                    // Still index the separate ephemeral TCP source address
-                    // alias directly here, matching the ephemeral-aliasing
-                    // `finish_indexing_accepted_connection` performs for the
-                    // guarded arms below.
-                    if peer_addr != peer_state_addr {
-                        pool.index_connection_by_addr(peer_addr, connection_arc.clone());
-                        pool.add_addr_to_peer_id(peer_addr, peer_id.clone());
-                        debug!(
-                            node_id = %sender_node_id,
+                    // KNOWN BUG under test below (reviewer finding, closed in
+                    // the immediately following commit): this snapshot is
+                    // treated as stable and the accepted candidate is
+                    // published/indexed/counted unconditionally, so two
+                    // concurrent first inbound accepts for the same peer can
+                    // both observe `None` here and clobber each other.
+                    let accepted = {
+                        crate::lifecycle::record_transport_event(
+                            crate::lifecycle::TransportLifecycleEvent::InboundAcceptPublishAttempt {
+                                peer: peer_id.clone(),
+                                addr: connection_arc.addr,
+                            },
+                        );
+                        pool.add_connection_by_peer_id(
+                            peer_id.clone(),
+                            peer_state_addr,
+                            connection_arc.clone(),
+                        );
+                        if peer_addr != peer_state_addr {
+                            pool.index_connection_by_addr(peer_addr, connection_arc.clone());
+                            pool.add_addr_to_peer_id(peer_addr, peer_id.clone());
+                        }
+                        true
+                    };
+                    if accepted {
+                        info!(
+                            target: "icanact_remote_lifecycle",
+                            peer_id = %peer_id,
                             peer_addr = %peer_addr,
                             peer_state_addr = %peer_state_addr,
-                            "Also indexed incoming connection by ephemeral address for response \
-                             delivery"
+                            "inbound_connection_accepted"
                         );
+                    } else {
+                        // Lost the re-resolved tie-break against a
+                        // concurrently published rival (or a mid-window
+                        // evict raced this candidate out before it was
+                        // durably indexed): never indexed, never counted,
+                        // rejected exactly like the existing-connection
+                        // reject arms below.
+                        registry.clear_peer_capabilities(&peer_addr);
                     }
-                    info!(
-                        target: "icanact_remote_lifecycle",
-                        peer_id = %peer_id,
-                        peer_addr = %peer_addr,
-                        peer_state_addr = %peer_state_addr,
-                        "inbound_connection_accepted"
-                    );
-                    true
+                    accepted
                 }
                 Some(existing_conn) => {
                     let existing_usable = existing_conn.has_live_stream();
