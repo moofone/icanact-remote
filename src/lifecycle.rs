@@ -210,6 +210,26 @@ pub enum TransportLifecycleEvent {
     ConnectionCountMarkerAttempt {
         instance_id: u64,
     },
+    /// Fired unconditionally, immediately before `get_connection_by_peer_id`
+    /// attempts its internal self-heal clear of an observed-unusable current
+    /// session — i.e. right after it has decided "this session is dead, I'm
+    /// about to clear it" but before the clear itself runs. Purely
+    /// instrumentation: lets tests deterministically pin a concurrent
+    /// publish (e.g. a fresh preferred inbound landing for the same peer)
+    /// into this exact gap, so the clear attempt below observably has to
+    /// re-validate against reality instead of clobbering it.
+    ///
+    /// `get_connection_by_peer_id` is called from many places purely to
+    /// decide "what does this peer currently have" — including, at one time,
+    /// `finalize_new_outbound_connection`'s `existing_before` tie-break
+    /// snapshot. This event is the seam that let a test prove that snapshot
+    /// used to be able to erase a concurrently published fresh session as a
+    /// side effect of merely being read, and that a CAS-based self-heal (or,
+    /// better, a pure snapshot that never self-heals at all) closes the gap.
+    GetConnectionSelfHealClearAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
 }
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;
