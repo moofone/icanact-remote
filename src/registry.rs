@@ -2526,10 +2526,9 @@ impl<T: 'static> GossipRegistry<T> {
             // `connect_to_peer` establishes a TCP connection, reuses a healthy
             // pooled connection, and refreshes the gossip liveness state from the
             // result. Bounded so the 1Hz cadence holds even when a peer is down.
-            let budget = self
-                .config
-                .connection_timeout
-                .min(Duration::from_millis(900));
+            let budget = self.config.connection_timeout.min(Duration::from_millis(
+                crate::config::SUPERVISOR_PER_ATTEMPT_BUDGET_MS,
+            ));
             match tokio::time::timeout(budget, self.connect_to_peer(&peer_id)).await {
                 Ok(Ok(())) => {
                     self.note_peer_liveness(&peer_id, addr, true, "established")

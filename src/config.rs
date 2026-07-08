@@ -28,6 +28,30 @@ pub const DEFAULT_MAX_INFLIGHT_INBOUND_HANDSHAKES: usize = 256;
 /// redial the same peer. See `GossipConfig::tie_break_reconnect_cooldown`.
 pub const DEFAULT_TIE_BREAK_RECONNECT_COOLDOWN_MS: u64 = 250;
 
+/// Default bound on how long the higher-NodeId (preferred-inbound) side of a
+/// duplicate-connection tie-break waits for the peer's inbound dial before
+/// falling back to its own outbound dial. See
+/// `GossipConfig::preferred_inbound_wait`.
+///
+/// Deliberately well under the supervisor per-attempt budget
+/// (`min(connection_timeout, 900ms)`, see `supervise_configured_peers`) so a
+/// single supervisor tick can both wait out this window AND complete the
+/// fallback dial — otherwise the higher-NodeId side never reaches the fallback
+/// under the supervisor and reconnect stalls for the full `connection_timeout`
+/// (the SWIM Dead-verdict reconnect amplifier). Must also stay under a SWIM
+/// consumer's disconnect-debounce window so a falsely-`Dead` peer re-establishes
+/// before the next teardown.
+pub const DEFAULT_PREFERRED_INBOUND_WAIT_MS: u64 = 500;
+
+/// Per-attempt budget the configured-peer supervisor wraps around each reconnect
+/// (`supervise_configured_peers`): the effective budget is
+/// `min(connection_timeout, SUPERVISOR_PER_ATTEMPT_BUDGET_MS)`, keeping the 1Hz
+/// supervisor cadence even when a peer is down. `preferred_inbound_wait` is
+/// clamped below this so a single supervisor tick can wait out the
+/// preferred-inbound window AND still reach the fallback dial (see
+/// `validate_and_normalize`).
+pub const SUPERVISOR_PER_ATTEMPT_BUDGET_MS: u64 = 900;
+
 /// Default small cluster threshold - clusters with this many nodes or fewer use full sync
 /// Set to 0 to always use delta sync when possible
 pub const DEFAULT_SMALL_CLUSTER_THRESHOLD: usize = 5;
@@ -156,6 +180,14 @@ pub struct GossipConfig {
     /// surfaces a liveness signal. Point-to-point only — no gossip, no
     /// broadcast. Defaults to 1s.
     pub peer_supervisor_interval: Duration,
+    /// How long the higher-NodeId (preferred-inbound) side of a
+    /// duplicate-connection tie-break waits for the peer's inbound dial before
+    /// falling back to dialing outbound itself. Decoupled from
+    /// `connection_timeout` on purpose: bound this to a small value (default
+    /// 500ms) so the supervisor's bounded per-attempt budget can still reach
+    /// the fallback dial in a single tick. See
+    /// `DEFAULT_PREFERRED_INBOUND_WAIT_MS`.
+    pub preferred_inbound_wait: Duration,
     /// Maximum number of deltas to keep in history
     pub max_delta_history: usize,
     /// Force full sync after this many delta exchanges
@@ -337,6 +369,7 @@ impl Default for GossipConfig {
             max_peer_failures: DEFAULT_MAX_PEER_FAILURES,
             peer_retry_interval: Duration::from_secs(DEFAULT_PEER_RETRY_SECONDS),
             peer_supervisor_interval: Duration::from_secs(DEFAULT_PEER_SUPERVISOR_SECONDS),
+            preferred_inbound_wait: Duration::from_millis(DEFAULT_PREFERRED_INBOUND_WAIT_MS),
             max_delta_history: 100,
             full_sync_interval: 50,     // Force full sync every 50 deltas
             max_pooled_connections: 20, // Allow up to 20 pooled connections
@@ -444,6 +477,30 @@ impl GossipConfig {
 false-failing healthy peers on a single delayed inbound gossip response"
             );
             self.peer_liveness_window = min_window;
+        }
+
+        // Keep the preferred-inbound wait strictly under the supervisor's
+        // per-attempt budget so a single supervisor tick can wait out the
+        // preferred-inbound window AND still complete the fallback dial. If the
+        // wait were >= the budget, the supervisor would cancel it every tick and
+        // the higher-NodeId side would never reach the fallback dial — the SWIM
+        // Dead-verdict reconnect amplifier. Cap at 2/3 of the budget, leaving
+        // the remaining third for the fallback TCP+TLS dial within the same
+        // tick.
+        let supervisor_budget = self
+            .connection_timeout
+            .min(Duration::from_millis(SUPERVISOR_PER_ATTEMPT_BUDGET_MS));
+        let wait_cap = (supervisor_budget * 2) / 3;
+        if self.preferred_inbound_wait > wait_cap {
+            tracing::warn!(
+                preferred_inbound_wait_ms = self.preferred_inbound_wait.as_millis(),
+                supervisor_budget_ms = supervisor_budget.as_millis(),
+                clamped_to_ms = wait_cap.as_millis(),
+                "preferred_inbound_wait >= 2/3 of the supervisor per-attempt \
+budget; clamping down so the higher-NodeId side can reach the fallback dial \
+within one supervisor tick (avoids the Dead-verdict reconnect stall)"
+            );
+            self.preferred_inbound_wait = wait_cap;
         }
     }
 }
@@ -627,6 +684,64 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
             config.peer_liveness_window,
             Duration::from_secs(30),
             "conforming window must be left unchanged"
+        );
+    }
+
+    #[test]
+    fn default_preferred_inbound_wait_is_under_supervisor_budget() {
+        // The invariant that defuses the SWIM Dead-verdict reconnect amplifier:
+        // a single supervisor tick (budget = min(connection_timeout, 900ms))
+        // must be able to wait out the preferred-inbound window AND still reach
+        // the fallback dial. If this ever fails, the higher-NodeId side stalls
+        // for the full connection_timeout on every supervisor-driven reconnect.
+        let config = GossipConfig::default();
+        let supervisor_budget = config
+            .connection_timeout
+            .min(Duration::from_millis(SUPERVISOR_PER_ATTEMPT_BUDGET_MS));
+        assert!(
+            config.preferred_inbound_wait < supervisor_budget,
+            "default preferred_inbound_wait {}ms must stay under the supervisor \
+             per-attempt budget {}ms",
+            config.preferred_inbound_wait.as_millis(),
+            supervisor_budget.as_millis(),
+        );
+    }
+
+    #[test]
+    fn validate_and_normalize_clamps_oversized_preferred_inbound_wait() {
+        let mut config = GossipConfig::default();
+        // A consumer sets the wait above the supervisor budget — this would
+        // re-introduce the amplifier.
+        config.preferred_inbound_wait = Duration::from_secs(10);
+
+        config.validate_and_normalize();
+
+        let supervisor_budget = config
+            .connection_timeout
+            .min(Duration::from_millis(SUPERVISOR_PER_ATTEMPT_BUDGET_MS));
+        assert!(
+            config.preferred_inbound_wait < supervisor_budget,
+            "oversized preferred_inbound_wait must be clamped under the \
+             supervisor budget, got {}ms vs budget {}ms",
+            config.preferred_inbound_wait.as_millis(),
+            supervisor_budget.as_millis(),
+        );
+    }
+
+    #[test]
+    fn validate_and_normalize_tightens_wait_when_connection_timeout_is_small() {
+        let mut config = GossipConfig::default();
+        // Small connection_timeout shrinks the supervisor budget below the
+        // default wait; the wait must follow it down.
+        config.connection_timeout = Duration::from_millis(300);
+
+        config.validate_and_normalize();
+
+        assert!(
+            config.preferred_inbound_wait < config.connection_timeout,
+            "with a 300ms connection_timeout the wait ({}ms) must be clamped \
+             under it",
+            config.preferred_inbound_wait.as_millis(),
         );
     }
 
