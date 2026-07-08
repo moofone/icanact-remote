@@ -215,12 +215,27 @@ impl<T> ConnectionPool<T> {
             }
 
             if !keep_outbound_dial {
+                // Bound the preferred-inbound wait by `preferred_inbound_wait`,
+                // NOT `connection_timeout`. Under the configured-peer supervisor
+                // each reconnect attempt is wrapped in a bounded budget
+                // (`min(connection_timeout, 900ms)`); if this wait were the full
+                // `connection_timeout` (10s default) the budget would cancel it
+                // every tick and the higher-NodeId side would never reach the
+                // fallback dial below — it would stall for the whole
+                // `connection_timeout` waiting for the peer to dial in. That is
+                // the SWIM Dead-verdict reconnect amplifier: a falsely-`Dead`
+                // peer whose session a consumer tore down cannot re-establish
+                // inside the consumer's disconnect-debounce window, so it is
+                // re-torn-down before recovery. A short wait lets a single
+                // supervisor tick wait out the window and still fall back to
+                // dialing, so reconnect completes in ~1-2 ticks.
+                let preferred_inbound_wait = registry_arc.config.preferred_inbound_wait;
                 info!(
                     target: "icanact_remote_lifecycle",
                     attempt_id,
                     remote = %remote_peer_id,
                     addr = %addr,
-                    timeout_ms = connection_timeout.as_millis(),
+                    timeout_ms = preferred_inbound_wait.as_millis(),
                     "outbound_connect_wait_preferred_inbound"
                 );
                 crate::lifecycle::record_transport_event(
@@ -234,7 +249,7 @@ impl<T> ConnectionPool<T> {
                     .wait_for_preferred_connection(
                         &remote_peer_id,
                         &registry_arc,
-                        connection_timeout,
+                        preferred_inbound_wait,
                     )
                     .await
                 {
