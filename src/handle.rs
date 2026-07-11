@@ -970,6 +970,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_wait_breaks_callback_registry_cycle() -> crate::Result<()> {
+        use futures::future::BoxFuture;
+
+        struct CyclicHandler {
+            _registry: Arc<GossipRegistry>,
+        }
+
+        impl crate::registry::PeerDisconnectHandler for CyclicHandler {
+            fn handle_peer_disconnect(
+                &self,
+                _peer_addr: SocketAddr,
+                _peer_id: Option<crate::PeerId>,
+            ) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let keypair = crate::KeyPair::new_for_testing("shutdown-release-callback-cycle");
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            keypair.to_secret_key(),
+            Some(test_cfg()),
+            TestNoopBootstrap,
+        )
+        .await?;
+        let weak = Arc::downgrade(&handle.registry);
+        handle
+            .registry
+            .set_peer_disconnect_handler(Arc::new(CyclicHandler {
+                _registry: Arc::clone(&handle.registry),
+            }))
+            .await;
+
+        handle.shutdown_and_wait().await;
+
+        assert!(
+            weak.upgrade().is_none(),
+            "terminal shutdown must clear callbacks that retain the registry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inbound_duplicate_rejects_non_preferred_inbound_replacement() -> crate::Result<()> {
         let (local_keypair, remote_keypair) = ordered_keypairs(
             "inbound-duplicate-local-lower-a",
