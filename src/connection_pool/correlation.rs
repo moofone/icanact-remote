@@ -445,3 +445,29 @@ impl std::fmt::Debug for SlotGuard<'_> {
         f.debug_struct("SlotGuard").field("id", &self.id).finish()
     }
 }
+
+#[cfg(test)]
+mod correlation_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn dropping_guard_after_a_raced_response_releases_the_slot() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
+        assert!(tracker.complete(id, &mut response));
+        assert!(response.is_none());
+
+        drop(guard);
+        let slot = CorrelationTracker::slot_index(id);
+        assert_eq!(
+            tracker.pending[slot].state.load(Ordering::Acquire),
+            SLOT_EMPTY,
+            "error-path guard drop must clear a raced ready response"
+        );
+    }
+}
