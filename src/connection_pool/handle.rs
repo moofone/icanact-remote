@@ -1145,13 +1145,15 @@ impl<T> ConnectionHandle<T> {
             correlation_id,
             schema_hash,
         );
-        if stream_handle
+        if let Err(error) = stream_handle
             .streaming_queue
             .try_push(StreamingCommand::WriteBytes(start_msg))
-            .is_err()
         {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-            return Err(GossipError::WriteQueueFull);
+            return Err(match error {
+                StreamingTryPushError::Closed(addr) => GossipError::ConnectionClosed(addr),
+                StreamingTryPushError::Full(_) => GossipError::WriteQueueFull,
+            });
         }
 
         // Stream chunks using zero-copy slicing
@@ -1180,16 +1182,19 @@ impl<T> ConnectionHandle<T> {
 
             // Send header + chunk data via OwnedChunks for vectored I/O
             // This avoids copying the chunk data into the header buffer
-            if stream_handle
-                .streaming_queue
-                .try_push(StreamingCommand::OwnedChunks(vec![
-                    header_bytes,
-                    chunk_data,
-                ]))
-                .is_err()
+            if let Err(error) =
+                stream_handle
+                    .streaming_queue
+                    .try_push(StreamingCommand::OwnedChunks(vec![
+                        header_bytes,
+                        chunk_data,
+                    ]))
             {
                 // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-                return Err(GossipError::WriteQueueFull);
+                return Err(match error {
+                    StreamingTryPushError::Closed(addr) => GossipError::ConnectionClosed(addr),
+                    StreamingTryPushError::Full(_) => GossipError::WriteQueueFull,
+                });
             }
 
             // Yield periodically to prevent blocking
@@ -1211,13 +1216,15 @@ impl<T> ConnectionHandle<T> {
             correlation_id,
             schema_hash,
         );
-        if stream_handle
+        if let Err(error) = stream_handle
             .streaming_queue
             .try_push(StreamingCommand::WriteBytes(end_msg))
-            .is_err()
         {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-            return Err(GossipError::WriteQueueFull);
+            return Err(match error {
+                StreamingTryPushError::Closed(addr) => GossipError::ConnectionClosed(addr),
+                StreamingTryPushError::Full(_) => GossipError::WriteQueueFull,
+            });
         }
         let _ = stream_handle
             .streaming_queue
