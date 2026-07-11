@@ -2653,14 +2653,15 @@ impl LockFreeStreamHandle {
             .try_push(StreamingCommand::VectoredWrite(command))
         {
             Ok(()) => Ok(()),
-            Err(StreamingCommand::VectoredWrite(vectored_cmd)) => {
+            Err(StreamingTryPushError::Full(StreamingCommand::VectoredWrite(vectored_cmd))) => {
                 self.enqueue_write(WritePayload::HeaderPayload {
                     header: vectored_cmd.header,
                     payload: vectored_cmd.payload,
                 })
                 .await
             }
-            Err(_) => Err(GossipError::Shutdown),
+            Err(StreamingTryPushError::Closed(addr)) => Err(GossipError::ConnectionClosed(addr)),
+            Err(StreamingTryPushError::Full(_)) => Err(GossipError::Shutdown),
         }
     }
 

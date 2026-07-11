@@ -687,8 +687,22 @@ struct StreamingQueue {
     /// Set true when the owning IO writer task has exited (teardown). See
     /// `WriteQueue::closed`. Hot path never reads this flag.
     closed: AtomicBool,
+    /// Coordinates non-blocking enqueues with teardown. The high bit is the
+    /// closed flag; lower bits count enqueues that have started but not yet
+    /// committed their result. An enqueue overlapping teardown must return
+    /// `Closed`, even if it managed to append a command before the writer quit.
+    try_push_state: AtomicUsize,
     /// Peer address used to construct the `ConnectionClosed` error on teardown.
     addr: SocketAddr,
+}
+
+const STREAMING_QUEUE_CLOSED: usize = 1usize << (usize::BITS - 1);
+const STREAMING_QUEUE_PUSHERS: usize = !STREAMING_QUEUE_CLOSED;
+
+#[derive(Debug)]
+enum StreamingTryPushError {
+    Closed(SocketAddr),
+    Full(StreamingCommand),
 }
 
 impl StreamingQueue {
@@ -698,18 +712,42 @@ impl StreamingQueue {
             data_notify: Notify::new(),
             space_notify: Notify::new(),
             closed: AtomicBool::new(false),
+            try_push_state: AtomicUsize::new(0),
             addr,
         })
     }
 
-    fn try_push(&self, command: StreamingCommand) -> std::result::Result<(), StreamingCommand> {
-        match self.queue.push(command) {
+    fn try_push(
+        &self,
+        command: StreamingCommand,
+    ) -> std::result::Result<(), StreamingTryPushError> {
+        loop {
+            let state = self.try_push_state.load(Ordering::Acquire);
+            if state & STREAMING_QUEUE_CLOSED != 0 {
+                return Err(StreamingTryPushError::Closed(self.addr));
+            }
+            debug_assert!(state & STREAMING_QUEUE_PUSHERS != STREAMING_QUEUE_PUSHERS);
+            if self
+                .try_push_state
+                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let result = match self.queue.push(command) {
             Ok(()) => {
                 self.notify_data_if_empty_to_non_empty();
                 Ok(())
             }
-            Err(cmd) => Err(cmd),
+            Err(cmd) => Err(StreamingTryPushError::Full(cmd)),
+        };
+        let state = self.try_push_state.fetch_sub(1, Ordering::AcqRel);
+        if state & STREAMING_QUEUE_CLOSED != 0 {
+            return Err(StreamingTryPushError::Closed(self.addr));
         }
+        result
     }
 
     #[inline]
@@ -721,6 +759,8 @@ impl StreamingQueue {
 
     /// Mark the queue closed and wake every task parked in `push()`. Teardown-only.
     fn mark_closed_and_wake(&self) {
+        self.try_push_state
+            .fetch_or(STREAMING_QUEUE_CLOSED, Ordering::AcqRel);
         self.closed.store(true, Ordering::Release);
         self.space_notify.notify_waiters();
     }

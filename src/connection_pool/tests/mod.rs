@@ -6554,6 +6554,20 @@ fn streaming_queue_push_unblocks_on_teardown() {
     });
 }
 
+/// T8 regression: non-blocking streaming sends must reject a writer that has
+/// already exited instead of accepting work that can only time out.
+#[test]
+fn streaming_queue_try_push_rejects_teardown() {
+    let addr: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+    let queue = StreamingQueue::new(1, addr);
+    queue.mark_closed_and_wake();
+
+    match queue.try_push(StreamingCommand::Flush) {
+        Err(StreamingTryPushError::Closed(actual)) => assert_eq!(actual, addr),
+        other => panic!("expected closed streaming queue, got {other:?}"),
+    }
+}
+
 /// Guard 2 (investigate-self-connect-loop, defense-in-depth): when the
 /// target identity resolved for a dial is this node's own peer_id,
 /// `connect_via_stream` must refuse immediately at the top, before it ever
