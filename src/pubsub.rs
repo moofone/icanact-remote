@@ -215,10 +215,22 @@ impl TypeSubscriberEntry {
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
 pub enum PubSubDeliveryMode {
     #[default]
-    AtMostOnce,
-    AtLeastOnceHopAck,
+    AtMostOnce = 0,
+    AtLeastOnceHopAck = 1,
+}
+
+#[cfg(test)]
+mod delivery_mode_tests {
+    use super::*;
+
+    #[test]
+    fn delivery_mode_discriminants_are_stable() {
+        assert_eq!(PubSubDeliveryMode::AtMostOnce as u8, 0);
+        assert_eq!(PubSubDeliveryMode::AtLeastOnceHopAck as u8, 1);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

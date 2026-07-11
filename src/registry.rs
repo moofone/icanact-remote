@@ -803,20 +803,21 @@ pub trait PeerLivenessHandler: Send + Sync {
 
 /// Registry change types for delta tracking with vector clocks
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
+#[repr(u8)]
 pub enum RegistryChange {
     /// Actor was added or updated
     ActorAdded {
         name: String,
         location: RemoteActorLocation,
         priority: RegistrationPriority,
-    },
+    } = 0,
     /// Actor was removed
     ActorRemoved {
         name: String,
         vector_clock: crate::VectorClock,
         removing_node_id: crate::GossipNodeId, // Node that performed the removal
         priority: RegistrationPriority,
-    },
+    } = 1,
 }
 
 /// Delta representing changes since a specific sequence number
@@ -1036,24 +1037,25 @@ impl Drop for PendingAckGuard {
 
 /// Message types for the gossip protocol
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
+#[repr(u8)]
 pub enum RegistryMessage {
     /// Delta gossip message containing only changes
     DeltaGossip {
         delta: RegistryDelta,
         extensions: Option<GossipExtensionsV1>,
-    },
+    } = 0,
     /// Response to delta gossip with our own delta
     DeltaGossipResponse {
         delta: RegistryDelta,
         extensions: Option<GossipExtensionsV1>,
-    },
+    } = 1,
     /// Request for full sync (fallback when deltas are unavailable)
     FullSyncRequest {
         sender_peer_id: crate::PeerId,    // Peer's unique identifier
         sender_bind_addr: Option<String>, // Sender's listening address (optional for backwards compat)
         sequence: u64,
         wall_clock_time: u64,
-    },
+    } = 2,
     /// Full synchronization message
     FullSync {
         local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
@@ -1063,7 +1065,7 @@ pub enum RegistryMessage {
         sequence: u64,
         wall_clock_time: u64,
         extensions: Option<GossipExtensionsV1>,
-    },
+    } = 3,
     /// Response to full sync
     FullSyncResponse {
         local_actors: Vec<(String, RemoteActorLocation)>, // Use Vec for rkyv serialization
@@ -1073,28 +1075,28 @@ pub enum RegistryMessage {
         sequence: u64,
         wall_clock_time: u64,
         extensions: Option<GossipExtensionsV1>,
-    },
+    } = 4,
     /// Peer health status report
     PeerHealthReport {
         reporter: crate::PeerId,
         peer_statuses: Vec<(String, PeerHealthStatus)>, // Use Vec for rkyv serialization
         timestamp: u64,
-    },
+    } = 5,
     /// Lightweight ACK for immediate registrations
-    ImmediateAck { actor_name: String, success: bool },
+    ImmediateAck { actor_name: String, success: bool } = 6,
     /// Query for peer health consensus
     PeerHealthQuery {
         sender: crate::PeerId,
         target_peer: String,
         timestamp: u64,
-    },
+    } = 7,
     /// Direct actor message (tell or ask)
     ActorMessage {
         actor_id: String,
         type_hash: u32,
         payload: Vec<u8>,
         correlation_id: Option<u16>,
-    },
+    } = 8,
     /// Peer list gossip for automatic peer discovery
     /// Contains list of known peers with their connection info
     PeerListGossip {
@@ -1104,7 +1106,7 @@ pub enum RegistryMessage {
         timestamp: u64,
         /// Sender's advertised address (so receiver can add us to their peer list)
         sender_addr: String,
-    },
+    } = 9,
 }
 
 /// Statistics about the gossip registry

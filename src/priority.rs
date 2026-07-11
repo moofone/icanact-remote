@@ -52,14 +52,15 @@ impl RegistrationPriority {
 
 /// Consistency levels for read operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize, Default)]
+#[repr(u8)]
 pub enum ConsistencyLevel {
     /// Eventual consistency - may read stale data
     #[default]
-    Eventual,
+    Eventual = 0,
     /// Causal consistency - respects causality
-    Causal,
+    Causal = 1,
     /// Strong consistency - reads most recent data
-    Strong,
+    Strong = 2,
 }
 
 #[cfg(test)]
@@ -132,6 +133,13 @@ mod tests {
         let deserialized: ConsistencyLevel =
             rkyv::from_bytes::<ConsistencyLevel, rkyv::rancor::Error>(&serialized).unwrap(); // ALLOW_RKYV_FROM_BYTES
         assert_eq!(level, deserialized);
+    }
+
+    #[test]
+    fn consistency_level_discriminants_are_stable() {
+        assert_eq!(ConsistencyLevel::Eventual as u8, 0);
+        assert_eq!(ConsistencyLevel::Causal as u8, 1);
+        assert_eq!(ConsistencyLevel::Strong as u8, 2);
     }
 
     #[test]

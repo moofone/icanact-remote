@@ -22,11 +22,12 @@ pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
 
 /// Feature flags for capability negotiation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, RkyvSerialize, RkyvDeserialize)]
+#[repr(u8)]
 pub enum Feature {
     /// Peer list gossip for automatic peer discovery
-    PeerListGossip,
+    PeerListGossip = 0,
     /// Optional pairwise clock calibration piggybacked on normal gossip frames.
-    ClockCalibration,
+    ClockCalibration = 1,
 }
 
 impl Feature {
@@ -312,6 +313,12 @@ mod tests {
             rkyv::from_bytes::<Feature, rkyv::rancor::Error>(&serialized).unwrap(); // ALLOW_RKYV_FROM_BYTES
 
         assert_eq!(deserialized, feature);
+    }
+
+    #[test]
+    fn feature_discriminants_are_stable() {
+        assert_eq!(Feature::PeerListGossip as u8, 0);
+        assert_eq!(Feature::ClockCalibration as u8, 1);
     }
 
     #[test]
