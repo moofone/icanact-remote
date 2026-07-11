@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::{GossipError, PeerId, RegistrationPriority, RemoteActorLocation, Result};
@@ -19,6 +21,9 @@ const FAST_FRAME_HEADER_LEN: usize = 120;
 const FAST_FRAME_DEST_PEER_LEN: usize = 32;
 const FAST_FRAME_POOL_BUFFERS: usize = 4096;
 const FAST_FRAME_POOL_BUFFER_CAPACITY: usize = 4096;
+/// A subscriber must not be able to stall transport ingress.  A full queue
+/// drops that subscriber's newest delivery rather than blocking the reader.
+const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
 #[cfg(test)]
 const UDP_MAX_DATAGRAM_SIZE: usize = 65_507;
 
@@ -28,22 +33,16 @@ type SubscriberKey = (TopicKey, TypeHash);
 #[derive(Clone)]
 struct SubscriberEntry {
     id: u64,
-    owner: Arc<dyn Send + Sync + 'static>,
-    ptr: usize,
-    call: unsafe fn(usize, Bytes),
+    worker: Arc<SubscriberWorker<Bytes>>,
 }
 #[derive(Clone)]
 struct BorrowedSubscriberEntry {
     id: u64,
-    owner: Arc<dyn Send + Sync + 'static>,
-    ptr: usize,
-    call: unsafe fn(usize, &[u8], PubSubFrameMetadata),
+    worker: Arc<SubscriberWorker<(Bytes, PubSubFrameMetadata)>>,
 }
 #[derive(Clone)]
 struct TypeSubscriberEntry {
-    owner: Arc<dyn Send + Sync + 'static>,
-    ptr: usize,
-    call: unsafe fn(usize, u64, Bytes),
+    worker: Arc<SubscriberWorker<(u64, Bytes)>>,
 }
 type SubscriberMap = HashMap<SubscriberKey, Arc<[SubscriberEntry]>>;
 type BorrowedSubscriberMap = HashMap<SubscriberKey, Arc<[BorrowedSubscriberEntry]>>;
@@ -70,118 +69,148 @@ struct HotRouteEntry {
     conn: crate::RemoteConnection,
 }
 
-impl SubscriberEntry {
-    fn new<F>(id: u64, deliver: F) -> Self
-    where
-        F: Fn(Bytes) + Send + Sync + 'static,
-    {
-        unsafe fn call_impl<F>(ptr: usize, payload: Bytes)
-        where
-            F: Fn(Bytes) + Send + Sync + 'static,
-        {
-            let deliver = unsafe { &*(ptr as *const F) };
-            deliver(payload);
-        }
+struct SubscriberWorker<T> {
+    sender: mpsc::Sender<T>,
+    abort: Option<tokio::task::AbortHandle>,
+}
 
-        let owner = Arc::new(deliver);
-        let ptr = Arc::as_ptr(&owner) as usize;
-        let owner: Arc<dyn Send + Sync + 'static> = owner;
-        Self {
-            id,
-            owner,
-            ptr,
-            call: call_impl::<F>,
+impl<T> Drop for SubscriberWorker<T> {
+    fn drop(&mut self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+}
+
+fn spawn_pubsub_background<F>(runtime: Option<&tokio::runtime::Handle>, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if let Some(runtime) = runtime {
+        runtime.spawn(future);
+    } else if std::thread::Builder::new()
+        .name("icanact-pubsub-background".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                warn!("failed to create fallback pubsub background runtime");
+                return;
+            };
+            runtime.block_on(future);
+        })
+        .is_err()
+    {
+        warn!("failed to spawn fallback pubsub background worker");
+    }
+}
+
+fn spawn_subscriber_worker<T, F>(
+    runtime: Option<&tokio::runtime::Handle>,
+    deliver: F,
+) -> Arc<SubscriberWorker<T>>
+where
+    T: Send + 'static,
+    F: Fn(T) + Send + Sync + 'static,
+{
+    async fn drain<T, F>(mut receiver: mpsc::Receiver<T>, deliver: Arc<F>)
+    where
+        T: Send + 'static,
+        F: Fn(T) + Send + Sync + 'static,
+    {
+        while let Some(message) = receiver.recv().await {
+            let deliver = Arc::clone(&deliver);
+            let _ = tokio::task::spawn_blocking(move || deliver(message)).await;
         }
     }
 
+    let (sender, receiver) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
+    let deliver = Arc::new(deliver);
+    let abort = if let Some(runtime) = runtime {
+        Some(runtime.spawn(drain(receiver, deliver)).abort_handle())
+    } else {
+        if std::thread::Builder::new()
+            .name("icanact-pubsub-delivery".into())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    warn!("failed to create fallback pubsub delivery runtime");
+                    return;
+                };
+                runtime.block_on(drain(receiver, deliver));
+            })
+            .is_err()
+        {
+            warn!("failed to spawn fallback pubsub delivery worker");
+        }
+        None
+    };
+    Arc::new(SubscriberWorker { sender, abort })
+}
+
+impl SubscriberEntry {
+    fn new<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
+    where
+        F: Fn(Bytes) + Send + Sync + 'static,
+    {
+        let worker = spawn_subscriber_worker(runtime, deliver);
+        Self { id, worker }
+    }
+
     #[inline]
-    fn deliver(&self, payload: Bytes) {
-        let _keepalive = &self.owner;
-        unsafe { (self.call)(self.ptr, payload) }
+    fn enqueue(&self, payload: Bytes) -> bool {
+        self.worker.sender.try_send(payload).is_ok()
     }
 }
 
 impl BorrowedSubscriberEntry {
-    fn new<F>(id: u64, deliver: F) -> Self
+    fn new<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
     where
         F: Fn(&[u8]) + Send + Sync + 'static,
     {
-        unsafe fn call_impl<F>(ptr: usize, payload: &[u8], _metadata: PubSubFrameMetadata)
-        where
-            F: Fn(&[u8]) + Send + Sync + 'static,
-        {
-            let deliver = unsafe { &*(ptr as *const F) };
-            deliver(payload);
-        }
-
-        let owner = Arc::new(deliver);
-        let ptr = Arc::as_ptr(&owner) as usize;
-        let owner: Arc<dyn Send + Sync + 'static> = owner;
-        Self {
-            id,
-            owner,
-            ptr,
-            call: call_impl::<F>,
-        }
+        let worker = spawn_subscriber_worker(
+            runtime,
+            move |(payload, _metadata): (Bytes, PubSubFrameMetadata)| deliver(payload.as_ref()),
+        );
+        Self { id, worker }
     }
 
-    fn new_with_metadata<F>(id: u64, deliver: F) -> Self
+    fn new_with_metadata<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
     where
         F: Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
     {
-        unsafe fn call_impl<F>(ptr: usize, payload: &[u8], metadata: PubSubFrameMetadata)
-        where
-            F: Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
-        {
-            let deliver = unsafe { &*(ptr as *const F) };
-            deliver(payload, metadata);
-        }
-
-        let owner = Arc::new(deliver);
-        let ptr = Arc::as_ptr(&owner) as usize;
-        let owner: Arc<dyn Send + Sync + 'static> = owner;
-        Self {
-            id,
-            owner,
-            ptr,
-            call: call_impl::<F>,
-        }
+        let worker = spawn_subscriber_worker(
+            runtime,
+            move |(payload, metadata): (Bytes, PubSubFrameMetadata)| {
+                deliver(payload.as_ref(), metadata)
+            },
+        );
+        Self { id, worker }
     }
 
     #[inline]
-    fn deliver(&self, payload: &[u8], metadata: PubSubFrameMetadata) {
-        let _keepalive = &self.owner;
-        unsafe { (self.call)(self.ptr, payload, metadata) }
+    fn enqueue(&self, payload: Bytes, metadata: PubSubFrameMetadata) -> bool {
+        self.worker.sender.try_send((payload, metadata)).is_ok()
     }
 }
 
 impl TypeSubscriberEntry {
-    fn new<F>(deliver: F) -> Self
+    fn new<F>(runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
     where
         F: Fn(u64, Bytes) + Send + Sync + 'static,
     {
-        unsafe fn call_impl<F>(ptr: usize, topic_key: u64, payload: Bytes)
-        where
-            F: Fn(u64, Bytes) + Send + Sync + 'static,
-        {
-            let deliver = unsafe { &*(ptr as *const F) };
-            deliver(topic_key, payload);
-        }
-
-        let owner = Arc::new(deliver);
-        let ptr = Arc::as_ptr(&owner) as usize;
-        let owner: Arc<dyn Send + Sync + 'static> = owner;
-        Self {
-            owner,
-            ptr,
-            call: call_impl::<F>,
-        }
+        let worker = spawn_subscriber_worker(runtime, move |(topic_key, payload)| {
+            deliver(topic_key, payload)
+        });
+        Self { worker }
     }
 
     #[inline]
-    fn deliver(&self, topic_key: u64, payload: Bytes) {
-        let _keepalive = &self.owner;
-        unsafe { (self.call)(self.ptr, topic_key, payload) }
+    fn enqueue(&self, topic_key: u64, payload: Bytes) -> bool {
+        self.worker.sender.try_send((topic_key, payload)).is_ok()
     }
 }
 
@@ -243,6 +272,7 @@ pub struct PubSubIngressStats {
     pub route_miss_drops: u64,
     pub decode_drops: u64,
     pub queue_full_drops: u64,
+    pub subscriber_queue_drops: u64,
 }
 
 #[derive(Default)]
@@ -256,6 +286,7 @@ struct PubSubIngressCounters {
     route_miss_drops: AtomicU64,
     decode_drops: AtomicU64,
     queue_full_drops: AtomicU64,
+    subscriber_queue_drops: AtomicU64,
 }
 
 impl PubSubIngressCounters {
@@ -270,6 +301,7 @@ impl PubSubIngressCounters {
             route_miss_drops: self.route_miss_drops.load(Ordering::Relaxed),
             decode_drops: self.decode_drops.load(Ordering::Relaxed),
             queue_full_drops: self.queue_full_drops.load(Ordering::Relaxed),
+            subscriber_queue_drops: self.subscriber_queue_drops.load(Ordering::Relaxed),
         }
     }
 }
@@ -436,7 +468,8 @@ impl RoutedPubSub {
         let key = (topic_key, type_hash);
         let mut next = (*self.subscribers.load_full()).clone();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
-        topic_subs.push(SubscriberEntry::new(id, deliver));
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        topic_subs.push(SubscriberEntry::new(id, runtime.as_ref(), deliver));
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
         self.note_interest(topic_key, true);
@@ -457,7 +490,8 @@ impl RoutedPubSub {
         let key = (topic_key, type_hash);
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
-        let entry = BorrowedSubscriberEntry::new(id, deliver);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let entry = BorrowedSubscriberEntry::new(id, runtime.as_ref(), deliver);
         topic_subs.push(entry);
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
@@ -480,7 +514,8 @@ impl RoutedPubSub {
         let key = (topic_key, type_hash);
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
-        let entry = BorrowedSubscriberEntry::new_with_metadata(id, deliver);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let entry = BorrowedSubscriberEntry::new_with_metadata(id, runtime.as_ref(), deliver);
         topic_subs.push(entry);
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
@@ -504,7 +539,8 @@ impl RoutedPubSub {
             .get(&type_hash)
             .map(|subs| subs.to_vec())
             .unwrap_or_default();
-        subs.push(TypeSubscriberEntry::new(deliver));
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        subs.push(TypeSubscriberEntry::new(runtime.as_ref(), deliver));
         next.insert(type_hash, Arc::from(subs.into_boxed_slice()));
         self.type_subscribers.store(Arc::new(next));
         id
@@ -933,8 +969,13 @@ impl RoutedPubSub {
         let borrowed_subscribers = self.borrowed_subscribers.load();
         if let Some(callbacks) = borrowed_subscribers.get(&(topic_key, type_hash)).cloned() {
             for entry in callbacks.iter() {
-                entry.deliver(payload.as_ref(), PubSubFrameMetadata::default());
-                delivered = delivered.saturating_add(1);
+                if entry.enqueue(Bytes::clone(&payload), PubSubFrameMetadata::default()) {
+                    delivered = delivered.saturating_add(1);
+                } else {
+                    self.counters
+                        .subscriber_queue_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         drop(borrowed_subscribers);
@@ -942,8 +983,13 @@ impl RoutedPubSub {
         let subscribers = self.subscribers.load();
         if let Some(callbacks) = subscribers.get(&(topic_key, type_hash)).cloned() {
             for entry in callbacks.iter() {
-                entry.deliver(Bytes::clone(&payload));
-                delivered = delivered.saturating_add(1);
+                if entry.enqueue(Bytes::clone(&payload)) {
+                    delivered = delivered.saturating_add(1);
+                } else {
+                    self.counters
+                        .subscriber_queue_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         drop(subscribers);
@@ -951,8 +997,13 @@ impl RoutedPubSub {
         let type_subscribers = self.type_subscribers.load();
         if let Some(callbacks) = type_subscribers.get(&type_hash).cloned() {
             for callback in callbacks.iter() {
-                callback.deliver(topic_key, Bytes::clone(&payload));
-                delivered = delivered.saturating_add(1);
+                if callback.enqueue(topic_key, Bytes::clone(&payload)) {
+                    delivered = delivered.saturating_add(1);
+                } else {
+                    self.counters
+                        .subscriber_queue_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         delivered
@@ -982,8 +1033,13 @@ impl RoutedPubSub {
             drop(type_subscribers);
 
             if !has_owned_subscribers && !has_type_subscribers {
-                hot.entry.deliver(payload, metadata);
-                return 1;
+                if hot.entry.enqueue(Bytes::copy_from_slice(payload), metadata) {
+                    return 1;
+                }
+                self.counters
+                    .subscriber_queue_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                return 0;
             }
         }
         drop(hot_subscriber);
@@ -991,9 +1047,15 @@ impl RoutedPubSub {
         let mut delivered = 0u32;
         let borrowed_subscribers = self.borrowed_subscribers.load();
         if let Some(callbacks) = borrowed_subscribers.get(&(topic_key, type_hash)).cloned() {
+            let owned = Bytes::copy_from_slice(payload);
             for entry in callbacks.iter() {
-                entry.deliver(payload, metadata);
-                delivered = delivered.saturating_add(1);
+                if entry.enqueue(Bytes::clone(&owned), metadata) {
+                    delivered = delivered.saturating_add(1);
+                } else {
+                    self.counters
+                        .subscriber_queue_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         drop(borrowed_subscribers);
@@ -1002,8 +1064,13 @@ impl RoutedPubSub {
         if let Some(callbacks) = subscribers.get(&(topic_key, type_hash)).cloned() {
             let owned = Bytes::copy_from_slice(payload);
             for entry in callbacks.iter() {
-                entry.deliver(Bytes::clone(&owned));
-                delivered = delivered.saturating_add(1);
+                if entry.enqueue(Bytes::clone(&owned)) {
+                    delivered = delivered.saturating_add(1);
+                } else {
+                    self.counters
+                        .subscriber_queue_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         drop(subscribers);
@@ -1012,8 +1079,13 @@ impl RoutedPubSub {
         if let Some(callbacks) = type_subscribers.get(&type_hash).cloned() {
             let owned = Bytes::copy_from_slice(payload);
             for callback in callbacks.iter() {
-                callback.deliver(topic_key, Bytes::clone(&owned));
-                delivered = delivered.saturating_add(1);
+                if callback.enqueue(topic_key, Bytes::clone(&owned)) {
+                    delivered = delivered.saturating_add(1);
+                } else {
+                    self.counters
+                        .subscriber_queue_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         delivered
@@ -1106,7 +1178,8 @@ impl RoutedPubSub {
             let registry = Arc::clone(&self.registry);
             let peer = self.local_peer_id.clone();
             let interest_state = Arc::clone(&self.interest_state);
-            tokio::spawn(async move {
+            let runtime = tokio::runtime::Handle::try_current().ok();
+            spawn_pubsub_background(runtime.as_ref(), async move {
                 let (current_present, current_generation) = {
                     let state = match interest_state.lock() {
                         Ok(g) => g,
@@ -1793,13 +1866,20 @@ mod tests {
         let mut next = (*pubsub.subscribers.load_full()).clone();
         next.insert(
             (topic, type_hash),
-            Arc::from(vec![SubscriberEntry::new(1, deliver)].into_boxed_slice()),
+            Arc::from(
+                vec![SubscriberEntry::new(
+                    1,
+                    tokio::runtime::Handle::try_current().ok().as_ref(),
+                    deliver,
+                )]
+                .into_boxed_slice(),
+            ),
         );
         pubsub.subscribers.store(Arc::new(next));
     }
 
-    #[test]
-    fn pubsub_msg_ids_do_not_reuse_after_same_peer_restarts() {
+    #[tokio::test]
+    async fn pubsub_msg_ids_do_not_reuse_after_same_peer_restarts() {
         let first = test_pubsub("pubsub-restart-msg-id");
         let second = test_pubsub("pubsub-restart-msg-id");
 
@@ -1816,8 +1896,8 @@ mod tests {
         assert_ne!(second_msg_id >> 64, 0);
     }
 
-    #[test]
-    fn oversized_pubsub_payload_skips_datagram_but_encodes_stream_frame() {
+    #[tokio::test]
+    async fn oversized_pubsub_payload_skips_datagram_but_encodes_stream_frame() {
         let pubsub = test_pubsub("pubsub-oversize-stream-fallback");
         let topic = topic_key("oversize-stream-fallback");
         let type_hash = 77;
@@ -1859,8 +1939,8 @@ mod tests {
         assert_eq!(frame.remaining(), payload_len);
     }
 
-    #[test]
-    fn pubsub_rejects_source_peer_id_that_does_not_match_authenticated_peer() {
+    #[tokio::test]
+    async fn pubsub_rejects_source_peer_id_that_does_not_match_authenticated_peer() {
         let pubsub = test_pubsub("pubsub-local-auth-mismatch");
         let victim = crate::KeyPair::new_for_testing("pubsub-victim-auth-mismatch").peer_id();
         let attacker = crate::KeyPair::new_for_testing("pubsub-attacker-auth-mismatch").peer_id();
@@ -1897,8 +1977,8 @@ mod tests {
         assert_eq!(delivered.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn rejected_spoofed_pubsub_frame_does_not_poison_seen_entries() {
+    #[tokio::test]
+    async fn rejected_spoofed_pubsub_frame_does_not_poison_seen_entries() {
         let pubsub = test_pubsub("pubsub-local-no-poison");
         let victim = crate::KeyPair::new_for_testing("pubsub-victim-no-poison").peer_id();
         let attacker = crate::KeyPair::new_for_testing("pubsub-attacker-no-poison").peer_id();
@@ -1949,6 +2029,13 @@ mod tests {
         assert_eq!(stats.delivered_local, 1);
         assert_eq!(stats.duplicate_drops, 0);
         assert_eq!(stats.reflection_drops, 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while delivered.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued subscriber should receive the legitimate frame");
         let deliveries = delivered.lock().unwrap();
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].as_ref(), b"legitimate");
@@ -1981,6 +2068,13 @@ mod tests {
             )
             .unwrap();
 
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while delivered.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued subscriber should receive the local publication");
         assert_eq!(
             delivered.lock().unwrap().as_slice(),
             &["second"],
@@ -1995,6 +2089,113 @@ mod tests {
                 .local_counts
                 .contains_key(&topic),
             "interest count must be removed after the final unsubscribe"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_aborts_the_subscriber_worker() {
+        let pubsub = test_pubsub("pubsub-unsubscribe-worker");
+        let captured = Arc::new(());
+        let weak = Arc::downgrade(&captured);
+        let captured_by_callback = Arc::clone(&captured);
+        let subscription = pubsub.subscribe_bytes(77, 205, move |_| {
+            let _keepalive = &captured_by_callback;
+        });
+        drop(captured);
+
+        assert!(pubsub.unsubscribe(subscription));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unsubscribing must release the callback held by its worker");
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_does_not_block_local_pubsub_ingress() {
+        let pubsub = test_pubsub("pubsub-slow-subscriber");
+        let topic = topic_key("slow-subscriber");
+        let type_hash = 203;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_for_subscriber = Arc::clone(&started);
+        let release_for_subscriber = Arc::clone(&release);
+        pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            started_for_subscriber.store(true, Ordering::Release);
+            while !release_for_subscriber.load(Ordering::Acquire) {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        });
+
+        pubsub
+            .publish_bytes(
+                topic,
+                type_hash,
+                Bytes::from_static(b"first"),
+                PubSubScope::LocalOnly,
+                PubSubDeliveryPolicy::default(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscriber worker should start");
+
+        let started_at = std::time::Instant::now();
+        for _ in 0..=SUBSCRIBER_QUEUE_CAPACITY {
+            pubsub
+                .publish_bytes(
+                    topic,
+                    type_hash,
+                    Bytes::from_static(b"queued"),
+                    PubSubScope::LocalOnly,
+                    PubSubDeliveryPolicy::default(),
+                )
+                .unwrap();
+        }
+        assert!(
+            started_at.elapsed() < Duration::from_millis(100),
+            "a blocked subscriber must not hold pubsub ingress"
+        );
+        assert!(
+            pubsub.stats().subscriber_queue_drops > 0,
+            "a full subscriber queue must drop rather than blocking ingress"
+        );
+        release.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn subscriptions_created_outside_tokio_use_fallback_worker() {
+        let pubsub = test_pubsub("pubsub-no-runtime");
+        let topic = topic_key("no-runtime");
+        let type_hash = 204;
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered_for_subscriber = Arc::clone(&delivered);
+        pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            delivered_for_subscriber.store(true, Ordering::Release);
+        });
+
+        pubsub
+            .publish_bytes(
+                topic,
+                type_hash,
+                Bytes::from_static(b"fallback"),
+                PubSubScope::LocalOnly,
+                PubSubDeliveryPolicy::default(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !delivered.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            delivered.load(Ordering::Acquire),
+            "fallback subscriber worker should deliver without a Tokio runtime"
         );
     }
 
