@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use rand::Rng;
 use tracing::{debug, warn};
 
 use crate::current_timestamp;
@@ -19,6 +20,18 @@ pub const MAX_PEER_FAILURES: u8 = 10;
 
 /// Maximum backoff time in seconds (1 hour)
 pub const MAX_BACKOFF_SECONDS: u64 = 3600;
+/// Lower bound for decorrelated retry jitter. Every retry, including the
+/// first, is sampled above this floor to avoid a partition-heal dial herd.
+pub const MIN_BACKOFF_SECONDS: u64 = 2;
+
+fn decorrelated_backoff_seconds(previous: u64, entropy: u64) -> u64 {
+    let upper = previous
+        .max(MIN_BACKOFF_SECONDS)
+        .saturating_mul(3)
+        .min(MAX_BACKOFF_SECONDS);
+    MIN_BACKOFF_SECONDS
+        .saturating_add(entropy % upper.saturating_sub(MIN_BACKOFF_SECONDS).saturating_add(1))
+}
 
 /// Failure state for tracking backoff
 #[derive(Debug, Clone)]
@@ -27,6 +40,9 @@ pub struct FailureState {
     pub consecutive_failures: u8,
     /// Timestamp of last failure
     pub last_failure: u64,
+    /// Delay selected for this retry window. Kept with the failure state so
+    /// repeated eligibility checks cannot re-roll the deadline.
+    pub retry_delay_seconds: u64,
 }
 
 impl FailureState {
@@ -35,14 +51,16 @@ impl FailureState {
         Self {
             consecutive_failures: 1,
             last_failure: current_timestamp(),
+            retry_delay_seconds: decorrelated_backoff_seconds(
+                MIN_BACKOFF_SECONDS,
+                rand::rng().random(),
+            ),
         }
     }
 
-    /// Calculate backoff time in seconds using exponential backoff
-    /// Formula: 2^failures seconds, capped at MAX_BACKOFF_SECONDS
+    /// Return the stored decorrelated retry delay in seconds.
     pub fn backoff_seconds(&self) -> u64 {
-        let backoff = 2u64.saturating_pow(self.consecutive_failures as u32);
-        backoff.min(MAX_BACKOFF_SECONDS)
+        self.retry_delay_seconds
     }
 
     /// Check if we should retry connecting to this peer
@@ -76,6 +94,8 @@ pub enum PeerState {
         since: u64,
         /// Number of consecutive failures
         attempts: u8,
+        /// Stable, sampled delay for this failure window.
+        retry_delay_seconds: u64,
     },
     /// Successfully connected
     Connected,
@@ -108,7 +128,9 @@ impl PeerState {
     /// Get failure info if in Failed state
     pub fn failure_info(&self) -> Option<(u64, u8)> {
         match self {
-            PeerState::Failed { since, attempts } => Some((*since, *attempts)),
+            PeerState::Failed {
+                since, attempts, ..
+            } => Some((*since, *attempts)),
             _ => None,
         }
     }
@@ -116,10 +138,10 @@ impl PeerState {
     /// Calculate backoff time for Failed state (same formula as FailureState)
     pub fn backoff_seconds(&self) -> u64 {
         match self {
-            PeerState::Failed { attempts, .. } => {
-                let backoff = 2u64.saturating_pow(*attempts as u32);
-                backoff.min(MAX_BACKOFF_SECONDS)
-            }
+            PeerState::Failed {
+                retry_delay_seconds,
+                ..
+            } => *retry_delay_seconds,
             _ => 0,
         }
     }
@@ -127,12 +149,11 @@ impl PeerState {
     /// Check if we should retry (for Failed state)
     pub fn should_retry(&self, now: u64) -> bool {
         match self {
-            PeerState::Failed { since, attempts } => {
-                let backoff = 2u64
-                    .saturating_pow(*attempts as u32)
-                    .min(MAX_BACKOFF_SECONDS);
-                now >= since.saturating_add(backoff)
-            }
+            PeerState::Failed {
+                since,
+                retry_delay_seconds,
+                ..
+            } => now >= since.saturating_add(*retry_delay_seconds),
             _ => true, // Non-failed states can always "retry"
         }
     }
@@ -375,9 +396,13 @@ impl PeerDiscovery {
         let now = current_timestamp();
 
         // Get current attempts from unified state
-        let current_attempts = match self.peer_states.get(&addr) {
-            Some(PeerState::Failed { attempts, .. }) => *attempts,
-            _ => 0, // Any other state or no state means first failure
+        let (current_attempts, previous_delay) = match self.peer_states.get(&addr) {
+            Some(PeerState::Failed {
+                attempts,
+                retry_delay_seconds,
+                ..
+            }) => (*attempts, *retry_delay_seconds),
+            _ => (0, MIN_BACKOFF_SECONDS), // Any other state or no state means first failure
         };
 
         let new_attempts = current_attempts.saturating_add(1);
@@ -395,10 +420,13 @@ impl PeerDiscovery {
             self.pending_peers.remove(&addr);
             self.failed_peers.remove(&addr);
         } else {
+            let retry_delay_seconds =
+                decorrelated_backoff_seconds(previous_delay, rand::rng().random());
             // Atomically transition to Failed state
             let new_state = PeerState::Failed {
                 since: now,
                 attempts: new_attempts,
+                retry_delay_seconds,
             };
             self.peer_states.insert(addr, new_state);
 
@@ -413,6 +441,7 @@ impl PeerDiscovery {
                     FailureState {
                         consecutive_failures: new_attempts,
                         last_failure: now,
+                        retry_delay_seconds,
                     },
                 );
             }
@@ -670,34 +699,57 @@ mod tests {
     }
 
     #[test]
-    fn test_exponential_backoff() {
-        let mut state = FailureState {
+    fn test_decorrelated_backoff() {
+        let state = FailureState {
             consecutive_failures: 0,
             last_failure: 0,
+            retry_delay_seconds: MIN_BACKOFF_SECONDS,
         };
 
-        // Test exponential backoff: 2^n
-        state.consecutive_failures = 1;
-        assert_eq!(state.backoff_seconds(), 2); // 2^1 = 2
+        assert_eq!(state.backoff_seconds(), MIN_BACKOFF_SECONDS);
+        assert_eq!(decorrelated_backoff_seconds(2, 0), 2);
+        assert_eq!(decorrelated_backoff_seconds(2, 4), 6);
+        assert_eq!(decorrelated_backoff_seconds(MAX_BACKOFF_SECONDS, 0), 2);
+        assert_eq!(
+            decorrelated_backoff_seconds(MAX_BACKOFF_SECONDS, MAX_BACKOFF_SECONDS - 2),
+            MAX_BACKOFF_SECONDS
+        );
+    }
 
-        state.consecutive_failures = 2;
-        assert_eq!(state.backoff_seconds(), 4); // 2^2 = 4
+    #[test]
+    fn retry_deadline_is_sampled_once_per_failure() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::with_defaults(local);
+        let peer = test_addr(9000);
 
-        state.consecutive_failures = 3;
-        assert_eq!(state.backoff_seconds(), 8); // 2^3 = 8
+        discovery.on_peer_failure(peer);
+        let first_delay = discovery
+            .get_peer_state(&peer)
+            .expect("failed peer state")
+            .backoff_seconds();
+        assert!(
+            (MIN_BACKOFF_SECONDS..=MIN_BACKOFF_SECONDS * 3).contains(&first_delay),
+            "first retry must be jittered within the decorrelated base window"
+        );
+        assert_eq!(
+            discovery
+                .get_peer_state(&peer)
+                .expect("state remains present")
+                .backoff_seconds(),
+            first_delay,
+            "eligibility checks must not re-roll the sampled deadline"
+        );
 
-        state.consecutive_failures = 5;
-        assert_eq!(state.backoff_seconds(), 32); // 2^5 = 32
-
-        state.consecutive_failures = 10;
-        assert_eq!(state.backoff_seconds(), 1024); // 2^10 = 1024
-
-        // Test cap at MAX_BACKOFF_SECONDS (3600)
-        state.consecutive_failures = 12;
-        assert_eq!(state.backoff_seconds(), 3600); // 2^12 = 4096, capped at 3600
-
-        state.consecutive_failures = 20;
-        assert_eq!(state.backoff_seconds(), 3600); // Still capped
+        discovery.on_peer_failure(peer);
+        let second_delay = discovery
+            .get_peer_state(&peer)
+            .expect("second failed peer state")
+            .backoff_seconds();
+        assert!(
+            (MIN_BACKOFF_SECONDS..=first_delay.saturating_mul(3).min(MAX_BACKOFF_SECONDS))
+                .contains(&second_delay),
+            "each later retry must derive from the preceding sampled delay"
+        );
     }
 
     #[test]
@@ -885,15 +937,15 @@ mod tests {
         // No failure record - should retry
         assert!(discovery.should_retry(&peer));
 
-        // Add failure (backoff = 2 seconds)
+        // Add failure (first retry is decorrelated within the base window)
         discovery.on_peer_failure(peer);
 
         // Immediately after failure - should NOT retry
-        // (depends on timing, but backoff is at least 2 seconds)
+        // (depends on timing, but backoff is within the base jitter window)
         // We check the state directly
         let state = discovery.failed_peers.get(&peer).unwrap();
         assert_eq!(state.consecutive_failures, 1);
-        assert_eq!(state.backoff_seconds(), 2);
+        assert!((MIN_BACKOFF_SECONDS..=MIN_BACKOFF_SECONDS * 3).contains(&state.backoff_seconds()));
     }
 
     #[test]
@@ -973,6 +1025,7 @@ mod tests {
             PeerState::Failed {
                 since: 1,
                 attempts: 1,
+                retry_delay_seconds: MIN_BACKOFF_SECONDS,
             },
         );
         discovery.pending_peers.insert(pending_peer, 0);
@@ -981,6 +1034,7 @@ mod tests {
             FailureState {
                 consecutive_failures: 1,
                 last_failure: 1,
+                retry_delay_seconds: MIN_BACKOFF_SECONDS,
             },
         );
 
@@ -1258,6 +1312,7 @@ mod tests {
             PeerState::Failed {
                 since: 1,
                 attempts: 1,
+                retry_delay_seconds: MIN_BACKOFF_SECONDS,
             },
         );
         // Also update legacy for consistency
@@ -1267,6 +1322,7 @@ mod tests {
             FailureState {
                 consecutive_failures: 1,
                 last_failure: 1,
+                retry_delay_seconds: MIN_BACKOFF_SECONDS,
             },
         );
 
