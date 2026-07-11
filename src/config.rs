@@ -19,6 +19,11 @@ pub const DEFAULT_DEAD_PEER_TIMEOUT_SECS: u64 = 900;
 /// Default max concurrent ask inflight
 pub const DEFAULT_ASK_WINDOW: usize = 128;
 
+/// Stable v3 actor/stream frame schema guard. Every default transport writes
+/// and requires this value, making layout drift a fail-closed wire reject.
+pub const DEFAULT_SCHEMA_HASH: u64 =
+    crate::typed::fnv1a_hash("icanact-remote/v3/actor-stream-frame-schema/v1");
+
 /// Default cap on simultaneous in-flight (post-accept, pre-identified) inbound
 /// handshakes. Bounds half-open inbound tasks.
 pub const DEFAULT_MAX_INFLIGHT_INBOUND_HANDSHAKES: usize = 256;
@@ -365,7 +370,7 @@ impl Default for GossipConfig {
             connection_timeout: Duration::from_secs(10),
             response_timeout: Duration::from_secs(5),
             max_message_size: 10 * 1024 * 1024, // 10MB
-            schema_hash: None,
+            schema_hash: Some(DEFAULT_SCHEMA_HASH),
             max_peer_failures: DEFAULT_MAX_PEER_FAILURES,
             peer_retry_interval: Duration::from_secs(DEFAULT_PEER_RETRY_SECONDS),
             peer_supervisor_interval: Duration::from_secs(DEFAULT_PEER_SUPERVISOR_SECONDS),
@@ -520,6 +525,7 @@ mod tests {
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
         assert_eq!(config.response_timeout, Duration::from_secs(5));
         assert_eq!(config.max_message_size, 10 * 1024 * 1024);
+        assert_eq!(config.schema_hash, Some(DEFAULT_SCHEMA_HASH));
         assert_eq!(config.max_peer_failures, 2);
         assert_eq!(
             config.peer_retry_interval,

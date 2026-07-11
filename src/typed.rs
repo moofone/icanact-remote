@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_unchecked_body_is_aligned_in_debug_prefix_mode() {
+    fn archived_body_is_validated_in_debug_prefix_mode() {
         #[cfg(debug_assertions)]
         {
             #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, PartialEq)]
@@ -432,8 +432,15 @@ mod tests {
             let bytes: Bytes = aligned.into();
 
             let archived = decode_typed_archived::<AlignedTest>(bytes).unwrap();
-            let a = unsafe { archived.archived_unchecked() };
+            let a = archived.archived().unwrap();
             assert_eq!(a.v, 7);
+
+            let mut malformed = encoded;
+            malformed.pop();
+            assert!(
+                decode_typed_archived::<AlignedTest>(Bytes::from(malformed)).is_err(),
+                "a matching debug type hash must not bypass archived byte validation"
+            );
         }
     }
 }
@@ -477,27 +484,6 @@ where
             <T as rkyv::Archive>::Archived,
             rkyv::rancor::Error,
         >(self.as_bytes())?)
-    }
-
-    /// Access the archived payload without validation (total zero-copy).
-    ///
-    /// This is the fastest path, but it is unsafe: the caller must guarantee that
-    /// `self.as_bytes()` contains a valid archived `T` at the root position.
-    ///
-    /// Safety is generally achieved by:
-    /// - only accepting bytes produced by `rkyv::to_bytes` on trusted peers, and
-    /// - enforcing alignment at the transport boundary (see `AlignedBytes`).
-    pub unsafe fn archived_unchecked(&self) -> &<T as rkyv::Archive>::Archived {
-        debug_assert_eq!(
-            (self.as_bytes().as_ptr() as usize)
-                % std::mem::align_of::<<T as rkyv::Archive>::Archived>(),
-            0,
-            "misaligned archived root for {} (align={})",
-            T::TYPE_NAME,
-            std::mem::align_of::<<T as rkyv::Archive>::Archived>()
-        );
-        // SAFETY: caller guarantees bytes represent a valid archived `T`.
-        unsafe { rkyv::access_unchecked::<<T as rkyv::Archive>::Archived>(self.as_bytes()) }
     }
 }
 
@@ -590,6 +576,9 @@ where
                 hash
             )));
         }
+        // Validate before exposing the zero-copy wrapper. The wrapper owns the
+        // bytes, so the validated archive remains stable for its lifetime.
+        rkyv::access::<T::Archived, rkyv::rancor::Error>(&payload[DEBUG_PREFIX_LEN..])?;
         Ok(ArchivedBytes {
             bytes: payload,
             offset: DEBUG_PREFIX_LEN,
@@ -599,6 +588,8 @@ where
 
     #[cfg(not(debug_assertions))]
     {
+        // Network payloads must pass bytecheck in release as well as debug.
+        rkyv::access::<T::Archived, rkyv::rancor::Error>(&payload)?;
         Ok(ArchivedBytes {
             bytes: payload,
             offset: 0,
