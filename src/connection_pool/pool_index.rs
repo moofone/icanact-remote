@@ -59,6 +59,9 @@ pub struct ConnectionPool<T = ()> {
 }
 
 struct PeerSession {
+    /// Updated when a caller acquires this session. A disconnected,
+    /// non-required session can be reclaimed only after this grace period.
+    last_touched: std::sync::Mutex<Instant>,
     route_addr: std::sync::RwLock<Option<SocketAddr>>,
     required_addr: std::sync::RwLock<Option<SocketAddr>>,
     required_peer: AtomicBool,
@@ -73,6 +76,7 @@ struct PeerSession {
 impl PeerSession {
     fn new() -> Self {
         Self {
+            last_touched: std::sync::Mutex::new(Instant::now()),
             route_addr: std::sync::RwLock::new(None),
             required_addr: std::sync::RwLock::new(None),
             required_peer: AtomicBool::new(false),
@@ -80,6 +84,21 @@ impl PeerSession {
             current_connection: ArcSwapOption::empty(),
             consecutive_ask_timeouts: AtomicU8::new(0),
         }
+    }
+
+    fn touch(&self) {
+        *self
+            .last_touched
+            .lock()
+            .expect("peer session last_touched poisoned") = Instant::now();
+    }
+
+    fn idle_for(&self, ttl: Duration) -> bool {
+        self.last_touched
+            .lock()
+            .expect("peer session last_touched poisoned")
+            .elapsed()
+            >= ttl
     }
 
     fn reset_ask_timeout_streak(&self) {

@@ -1384,6 +1384,12 @@ pub struct GossipState {
 }
 
 /// Core gossip registry implementation with separated locks
+#[derive(Clone, Copy)]
+struct PeerLivenessStatus {
+    reachable: bool,
+    updated_at: Instant,
+}
+
 #[derive(Clone)]
 pub struct GossipRegistry<T = ()> {
     // Immutable config
@@ -1446,8 +1452,9 @@ pub struct GossipRegistry<T = ()> {
     /// Optional edge-triggered callback for the p2p configured-peer supervisor.
     pub peer_liveness_handler: Arc<ArcSwapOption<PeerLivenessHandlerCell>>,
     /// Last-known reachability per configured peer — used by the supervisor for
-    /// edge detection (handler + one-shot recovery log). Supervisor-owned.
-    peer_liveness_status: Arc<SccHashMap<crate::PeerId, bool>>,
+    /// edge detection (handler + one-shot recovery log). Dynamic peer IDs age
+    /// out after their liveness window so restart churn cannot retain them.
+    peer_liveness_status: Arc<SccHashMap<crate::PeerId, PeerLivenessStatus>>,
 
     // Stream assembly state (lock-free map).
     pub stream_assemblies: Arc<SccHashMap<u64, StreamAssembly>>,
@@ -2562,7 +2569,9 @@ impl<T: 'static> GossipRegistry<T> {
         reachable: bool,
         reason: &str,
     ) {
-        let prev = self.peer_liveness_status.read_sync(peer_id, |_, v| *v);
+        let prev = self
+            .peer_liveness_status
+            .read_sync(peer_id, |_, v| v.reachable);
         let flipped = prev != Some(reachable);
 
         if !reachable {
@@ -2584,9 +2593,13 @@ impl<T: 'static> GossipRegistry<T> {
             );
         }
 
-        let _ = self
-            .peer_liveness_status
-            .upsert_sync(peer_id.clone(), reachable);
+        let _ = self.peer_liveness_status.upsert_sync(
+            peer_id.clone(),
+            PeerLivenessStatus {
+                reachable,
+                updated_at: Instant::now(),
+            },
+        );
 
         if flipped {
             if let Some(cell) = self.peer_liveness_handler.load_full() {
@@ -5186,6 +5199,8 @@ impl<T: 'static> GossipRegistry<T> {
         // Enforce bounds on data structures
         self.enforce_bounds().await;
 
+        self.prune_peer_identity_side_tables();
+
         // Clean up connection pool
         {
             let connection_pool = &self.connection_pool;
@@ -5194,6 +5209,24 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Clean up stale stream assemblies (incomplete streams older than 60 seconds)
         self.cleanup_stale_stream_assemblies().await;
+    }
+
+    /// Side tables keyed by ephemeral `PeerId`s cannot rely on address-based
+    /// gossip cleanup. Retain only the short windows needed for tie-break
+    /// damping and supervisor edge detection; configured peers remain pinned.
+    fn prune_peer_identity_side_tables(&self) {
+        let now = Instant::now();
+        let cooldown = self.config.tie_break_reconnect_cooldown;
+        self.tie_break_cooldown_until
+            .retain_sync(|_, deadline| *deadline > now);
+        self.tie_break_last_eviction_at
+            .retain_sync(|_, last| now.saturating_duration_since(*last) <= cooldown);
+
+        let liveness_ttl = self.config.peer_liveness_window.saturating_mul(3);
+        self.peer_liveness_status.retain_sync(|peer_id, status| {
+            self.connection_pool.is_required_peer(peer_id)
+                || now.saturating_duration_since(status.updated_at) <= liveness_ttl
+        });
     }
 
     /// Clean up incomplete stream assemblies that have been stale for too long.
@@ -14932,5 +14965,65 @@ mod tests {
 
         assert_eq!(names1, names2);
         assert_eq!(names1, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn peer_identity_side_table_pruning_expires_dynamic_peers_but_keeps_required_peers() {
+        let registry = GossipRegistry::<()>::new(test_addr(7014), test_config());
+        let departed = test_peer_id("departed-peer-id");
+        let required = test_peer_id("required-peer-id");
+        let now = Instant::now();
+        let stale_liveness = PeerLivenessStatus {
+            reachable: false,
+            updated_at: now - registry.config.peer_liveness_window.saturating_mul(4),
+        };
+
+        let _ = registry
+            .tie_break_cooldown_until
+            .upsert_sync(departed.clone(), now - Duration::from_secs(1));
+        let _ = registry.tie_break_last_eviction_at.upsert_sync(
+            departed.clone(),
+            now - registry
+                .config
+                .tie_break_reconnect_cooldown
+                .saturating_mul(2),
+        );
+        let _ = registry
+            .peer_liveness_status
+            .upsert_sync(departed.clone(), stale_liveness);
+        let _ = registry
+            .peer_liveness_status
+            .upsert_sync(required.clone(), stale_liveness);
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&required, test_addr(7015));
+
+        registry.prune_peer_identity_side_tables();
+
+        assert!(
+            registry
+                .tie_break_cooldown_until
+                .read_sync(&departed, |_, _| ())
+                .is_none()
+        );
+        assert!(
+            registry
+                .tie_break_last_eviction_at
+                .read_sync(&departed, |_, _| ())
+                .is_none()
+        );
+        assert!(
+            registry
+                .peer_liveness_status
+                .read_sync(&departed, |_, _| ())
+                .is_none()
+        );
+        assert!(
+            registry
+                .peer_liveness_status
+                .read_sync(&required, |_, _| ())
+                .is_some(),
+            "configured-peer liveness edge state must survive periodic pruning"
+        );
     }
 }

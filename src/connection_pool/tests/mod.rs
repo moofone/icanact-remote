@@ -6452,6 +6452,70 @@ fn write_queue_push_unblocks_on_teardown() {
     });
 }
 
+#[test]
+fn idle_non_required_peer_session_is_pruned_without_orphaning_live_state() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(1));
+    let peer_id = crate::KeyPair::new_for_testing("idle-session").peer_id();
+    let addr: SocketAddr = "127.0.0.1:9111".parse().unwrap();
+
+    pool.set_discovered_peer_addr(&peer_id, addr);
+    let session = pool
+        .peer_sessions
+        .read_sync(&peer_id, |_, session| Arc::clone(session))
+        .expect("discovered peer has a session");
+    *session.last_touched.lock().unwrap() = Instant::now() - Duration::from_secs(301);
+    drop(session);
+
+    pool.prune_idle_peer_sessions();
+
+    assert!(
+        pool.peer_sessions.read_sync(&peer_id, |_, _| ()).is_none(),
+        "idle non-required session must not survive churn indefinitely"
+    );
+    assert!(
+        pool.peer_id_to_addr
+            .read_sync(&peer_id, |_, _| ())
+            .is_some(),
+        "session reclamation must not delete the independently owned route"
+    );
+}
+
+#[test]
+fn idle_session_with_external_tracker_or_required_route_is_retained() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(1));
+    let peer_id = crate::KeyPair::new_for_testing("retained-session").peer_id();
+    let addr: SocketAddr = "127.0.0.1:9112".parse().unwrap();
+
+    pool.set_discovered_peer_addr(&peer_id, addr);
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let session = pool
+        .peer_sessions
+        .read_sync(&peer_id, |_, session| Arc::clone(session))
+        .unwrap();
+    *session.last_touched.lock().unwrap() = Instant::now() - Duration::from_secs(301);
+    drop(session);
+
+    pool.prune_idle_peer_sessions();
+    assert!(
+        pool.peer_sessions.read_sync(&peer_id, |_, _| ()).is_some(),
+        "an externally held correlation tracker must fence eviction"
+    );
+    drop(tracker);
+
+    pool.set_configured_peer_addr(&peer_id, addr);
+    let session = pool
+        .peer_sessions
+        .read_sync(&peer_id, |_, session| Arc::clone(session))
+        .unwrap();
+    *session.last_touched.lock().unwrap() = Instant::now() - Duration::from_secs(301);
+    drop(session);
+    pool.prune_idle_peer_sessions();
+    assert!(
+        pool.peer_sessions.read_sync(&peer_id, |_, _| ()).is_some(),
+        "configured peer sessions must remain available for the supervisor"
+    );
+}
+
 /// R1 regression for the streaming queue (same teardown contract).
 #[test]
 fn streaming_queue_push_unblocks_on_teardown() {
