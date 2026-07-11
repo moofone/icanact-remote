@@ -629,7 +629,9 @@ impl<T> ConnectionHandle<T> {
                 _ => {}
             }
         }
-        let _ = slot.disarm();
+        if result.is_ok() {
+            let _ = slot.disarm();
+        }
         result
     }
 
@@ -677,7 +679,9 @@ impl<T> ConnectionHandle<T> {
             .correlation
             .wait_for_response_no_timeout(correlation_id)
             .await;
-        let _ = slot.disarm();
+        if result.is_ok() {
+            let _ = slot.disarm();
+        }
         result
     }
 
