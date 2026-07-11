@@ -22,6 +22,40 @@ pub struct ReadContext {
     pub(crate) sync_actor_handler: Option<Arc<crate::registry::ActorMessageHandlerSyncCell>>,
 }
 
+#[cfg(test)]
+mod read_pipeline_tests {
+    use std::sync::Arc;
+
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn zero_length_frame_is_rejected_before_body_read() {
+        let (mut writer, mut reader) = tokio::io::duplex(crate::framing::LENGTH_PREFIX_LEN);
+        writer.write_all(&0u32.to_be_bytes()).await.unwrap();
+
+        let ctx = super::ReadContext {
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: "127.0.0.1:9000".parse().unwrap(),
+            peer_id: None,
+            max_message_size: 1024,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+
+        let error = super::read_message_step(&mut reader, &mut super::ReadState::new(), &ctx)
+            .await
+            .expect_err("zero-length frames must be rejected before entering ReadBody");
+        assert!(matches!(error, crate::GossipError::Network(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
+    }
+}
+
 enum ReadState {
     ReadLen {
         buf: [u8; crate::framing::LENGTH_PREFIX_LEN],
@@ -32,6 +66,14 @@ enum ReadState {
         buffer: crate::PooledAlignedBuffer,
         read: usize,
     },
+}
+
+#[inline]
+fn reject_zero_length_frame() -> GossipError {
+    GossipError::Network(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "zero-length frame is invalid",
+    ))
 }
 
 impl ReadState {
@@ -67,6 +109,9 @@ where
             }
 
             let msg_len = u32::from_be_bytes(*buf) as usize;
+            if msg_len == 0 {
+                return Err(reject_zero_length_frame());
+            }
             if msg_len > ctx.max_message_size {
                 return Err(GossipError::MessageTooLarge {
                     size: msg_len,
@@ -372,6 +417,9 @@ where
                     }
 
                     let msg_len = u32::from_be_bytes(*buf) as usize;
+                    if msg_len == 0 {
+                        return Poll::Ready(Err(reject_zero_length_frame()));
+                    }
                     if msg_len > ctx.max_message_size {
                         return Poll::Ready(Err(GossipError::MessageTooLarge {
                             size: msg_len,
@@ -513,6 +561,9 @@ where
                     }
 
                     let msg_len = u32::from_be_bytes(*buf) as usize;
+                    if msg_len == 0 {
+                        return Poll::Ready(Err(reject_zero_length_frame()));
+                    }
                     if msg_len > ctx.max_message_size {
                         return Poll::Ready(Err(GossipError::MessageTooLarge {
                             size: msg_len,
