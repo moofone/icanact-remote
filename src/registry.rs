@@ -2247,6 +2247,25 @@ impl<T: 'static> GossipRegistry<T> {
         info!("peer liveness handler cleared");
     }
 
+    /// Drop every application callback retained by this registry.
+    ///
+    /// Handler implementations commonly own routers, actor refs, or clients
+    /// that point back to this registry. Keeping them installed after terminal
+    /// shutdown therefore forms a strong ownership cycle and retains the full
+    /// connection pool. Shutdown is final, so no callback can be invoked again.
+    fn clear_runtime_handlers(&self) {
+        self.actor_message_handler.store(None);
+        self.actor_tell_handler_sync.store(None);
+        self.actor_tell_handler_sync_context.store(None);
+        self.actor_ask_immediate_handler_sync.store(None);
+        self.actor_ask_handler_sync.store(None);
+        self.actor_message_handler_sync.store(None);
+        self.pubsub_ingress_handler.store(None);
+        self.peer_disconnect_handler.store(None);
+        self.peer_connect_handler.store(None);
+        self.peer_liveness_handler.store(None);
+    }
+
     /// Handle an incoming actor message by forwarding to the registered callback
     pub async fn handle_actor_message(
         &self,
@@ -5478,6 +5497,10 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
             gossip_state.shutdown = true;
         }
+
+        // Break callback -> client/router -> registry ownership cycles before
+        // connection teardown can emit any terminal disconnect notifications.
+        self.clear_runtime_handlers();
 
         // Close all connections in the pool
         {
