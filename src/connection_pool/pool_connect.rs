@@ -200,7 +200,8 @@ impl<T> ConnectionPool<T> {
     }
 
     fn get_or_create_peer_session(&self, peer_id: &crate::PeerId) -> Arc<PeerSession> {
-        self.peer_sessions
+        let session = self
+            .peer_sessions
             .entry_sync(peer_id.clone())
             .or_insert_with(|| {
                 debug!(
@@ -210,7 +211,9 @@ impl<T> ConnectionPool<T> {
                 Arc::new(PeerSession::new())
             })
             .get()
-            .clone()
+            .clone();
+        session.touch();
+        session
     }
 
     pub(crate) fn get_configured_peer_addr(&self, peer_id: &crate::PeerId) -> Option<SocketAddr> {
@@ -3980,6 +3983,45 @@ impl<T> ConnectionPool<T> {
         for peer_id in stale_peer_ids {
             if let Some(_conn) = self.disconnect_connection_by_peer_id(&peer_id) {
                 debug!(peer_id = %peer_id, "cleaned up disconnected connection (all aliases)");
+            }
+        }
+
+        self.prune_idle_peer_sessions();
+    }
+
+    /// Bound restart-churn state without racing a reconnect. `remove_if_sync`
+    /// holds the map bucket across the final eligibility check and removal;
+    /// a concurrent `get_or_create_peer_session` therefore either holds an
+    /// extra Arc (making this predicate false) or observes the removal and
+    /// creates a fresh session. The correlation Arc check keeps an in-flight
+    /// ask's tracker routable even after its connection has gone away.
+    fn prune_idle_peer_sessions(&self) {
+        const SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
+        let mut candidates = Vec::new();
+        self.peer_sessions.iter_sync(|peer_id, session| {
+            if !session.is_required_peer()
+                && session.current_connection().is_none()
+                && session.idle_for(SESSION_IDLE_TTL)
+            {
+                candidates.push(peer_id.clone());
+            }
+            true
+        });
+
+        for peer_id in candidates {
+            let removed = self.peer_sessions.remove_if_sync(&peer_id, |session| {
+                !session.is_required_peer()
+                    && session.current_connection().is_none()
+                    && session.idle_for(SESSION_IDLE_TTL)
+                    && Arc::strong_count(session) == 1
+                    && Arc::strong_count(&session.correlation) == 1
+            });
+            if removed.is_some() {
+                // `peer_id_to_addr` is an independent route authority and
+                // may already be serving a freshly-created replacement
+                // session. Do not couple its lifecycle to a best-effort
+                // cache eviction from a separate map.
+                debug!(peer_id = %peer_id, "pruned idle peer session");
             }
         }
     }
