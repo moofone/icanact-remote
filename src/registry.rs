@@ -13,7 +13,7 @@ use futures::task::AtomicWaker;
 use lru::LruCache;
 use scc::HashMap as SccHashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::{Mutex, Notify};
 
@@ -1466,6 +1466,10 @@ pub struct GossipRegistry<T = ()> {
     /// and `evict_peer_side_tables`.
     pub inflight_streams_per_peer:
         Arc<SccHashMap<std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>>>,
+    /// Process-wide reservation for eagerly allocated stream reassembly
+    /// buffers. Per-peer and per-connection caps cannot bound many distinct
+    /// authenticated peers, so admission reserves this before allocation.
+    inflight_stream_bytes: Arc<AtomicUsize>,
 
     // Pending ACKs for synchronous registrations (bounded, lock-free map).
     pub pending_acks: Arc<SccHashMap<String, Arc<PendingAck>>>,
@@ -1751,6 +1755,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_liveness_status: Arc::new(SccHashMap::default()),
             stream_assemblies: Arc::new(SccHashMap::default()),
             inflight_streams_per_peer: Arc::new(SccHashMap::default()),
+            inflight_stream_bytes: Arc::new(AtomicUsize::new(0)),
             pending_acks: Arc::new(SccHashMap::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
             peer_gossip_notify: Arc::new(Notify::new()),
@@ -5240,7 +5245,7 @@ impl<T: 'static> GossipRegistry<T> {
         // counter outside the retain callback. retain_sync holds the
         // bucket lock while invoking the predicate; calling the
         // decrement helper inside would re-enter the same map shape.
-        let mut victims: Vec<std::net::SocketAddr> = Vec::new();
+        let mut victims: Vec<(Option<std::net::SocketAddr>, usize)> = Vec::new();
         self.stream_assemblies.retain_sync(|stream_id, assembly| {
             let age = assembly.started_at.elapsed();
             if age > STREAM_ASSEMBLY_TIMEOUT {
@@ -5252,15 +5257,16 @@ impl<T: 'static> GossipRegistry<T> {
                     chunks_received = assembly.received_indices.len(),
                     "Cleaning up stale stream assembly - StreamEnd never arrived"
                 );
-                if let Some(p) = assembly.peer_addr {
-                    victims.push(p);
-                }
+                victims.push((assembly.peer_addr, assembly.header.total_size as usize));
                 return false;
             }
             true
         });
-        for peer in victims {
-            self.decrement_inflight_streams(peer);
+        for (peer, bytes) in victims {
+            if let Some(peer) = peer {
+                self.decrement_inflight_streams(peer);
+            }
+            self.release_inflight_stream_bytes(bytes);
         }
 
         let removed = before_count.saturating_sub(self.stream_assemblies.len());
@@ -7050,6 +7056,22 @@ impl<T: 'static> GossipRegistry<T> {
             None
         };
 
+        if !self.reserve_inflight_stream_bytes(total_size) {
+            if let Some(peer) = admitted_peer {
+                self.decrement_inflight_streams(peer);
+            }
+            warn!(
+                stream_id = header.stream_id,
+                requested_bytes = total_size,
+                reserved_bytes = self
+                    .inflight_stream_bytes
+                    .load(std::sync::atomic::Ordering::Acquire),
+                cap = crate::MAX_INFLIGHT_STREAM_BYTES,
+                "rejecting stream assembly: global byte budget reached"
+            );
+            return;
+        }
+
         let stream_id = header.stream_id;
         let insert_result = self.stream_assemblies.insert_sync(
             stream_id,
@@ -7070,6 +7092,7 @@ impl<T: 'static> GossipRegistry<T> {
             if let Some(peer) = admitted_peer {
                 self.decrement_inflight_streams(peer);
             }
+            self.release_inflight_stream_bytes(total_size);
             warn!(
                 stream_id = stream_id,
                 "Stream assembly already in progress for stream_id"
@@ -7103,6 +7126,36 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_if_sync(&peer, |v| v.load(std::sync::atomic::Ordering::Acquire) == 0);
             }
         }
+    }
+
+    fn reserve_inflight_stream_bytes(&self, bytes: usize) -> bool {
+        let mut current = self
+            .inflight_stream_bytes
+            .load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > crate::MAX_INFLIGHT_STREAM_BYTES {
+                return false;
+            }
+            match self.inflight_stream_bytes.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release_inflight_stream_bytes(&self, bytes: usize) {
+        let previous = self
+            .inflight_stream_bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous >= bytes, "global stream byte counter underflow");
     }
 
     /// Add a chunk to stream assembly
@@ -7169,6 +7222,7 @@ impl<T: 'static> GossipRegistry<T> {
             if let Some(peer) = assembly.peer_addr {
                 self.decrement_inflight_streams(peer);
             }
+            self.release_inflight_stream_bytes(assembly.header.total_size as usize);
 
             // Verify we have all chunks with proper gap detection
             if !assembly.is_complete() {
@@ -12790,6 +12844,88 @@ mod tests {
             .expect("stream assembly should complete");
 
         assert_eq!(result.data.as_ref(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn stream_assembly_enforces_global_byte_budget_and_releases_on_completion() {
+        let registry = GossipRegistry::<()>::new(test_addr(8081), test_config());
+        registry.inflight_stream_bytes.store(
+            crate::MAX_INFLIGHT_STREAM_BYTES - 1,
+            std::sync::atomic::Ordering::Release,
+        );
+        let rejected = crate::StreamHeader {
+            stream_id: 991,
+            total_size: 2,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        registry.start_stream_assembly(rejected, None, None).await;
+        assert!(registry.stream_assemblies.get_sync(&991).is_none());
+        assert_eq!(
+            registry
+                .inflight_stream_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            crate::MAX_INFLIGHT_STREAM_BYTES - 1,
+            "rejected starts must not consume global bytes"
+        );
+
+        registry
+            .inflight_stream_bytes
+            .store(0, std::sync::atomic::Ordering::Release);
+        let accepted = crate::StreamHeader {
+            stream_id: 992,
+            total_size: 1,
+            chunk_size: 1,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        registry.start_stream_assembly(accepted, None, None).await;
+        assert_eq!(
+            registry
+                .inflight_stream_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        registry.add_stream_chunk(accepted, vec![7]).await;
+        assert!(
+            registry
+                .complete_stream_assembly(accepted.stream_id)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            registry
+                .inflight_stream_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "completion must release the global reservation"
+        );
+
+        let stale = crate::StreamHeader {
+            stream_id: 993,
+            total_size: 1,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        registry.start_stream_assembly(stale, None, None).await;
+        registry
+            .stream_assemblies
+            .update_sync(&stale.stream_id, |_, assembly| {
+                assembly.started_at = Instant::now() - Duration::from_secs(61);
+            });
+        registry.cleanup_stale_stream_assemblies().await;
+        assert_eq!(
+            registry
+                .inflight_stream_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "stale cleanup must release the global reservation"
+        );
     }
 
     #[tokio::test]
