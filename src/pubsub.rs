@@ -217,8 +217,16 @@ impl TypeSubscriberEntry {
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum PubSubDeliveryMode {
+    /// Best-effort delivery: no acknowledgement, no retry. Frames may be
+    /// dropped under backpressure / TTL exhaustion. The default.
     #[default]
     AtMostOnce = 0,
+    /// RESERVED — NOT YET IMPLEMENTED (ACTOR_REM_2 R12). The discriminant is
+    /// stable on the wire so the variant round-trips, but there is no pending-
+    /// ack table, ack frame, or retry timer anywhere: selecting this mode
+    /// currently behaves **exactly** like [`Self::AtMostOnce`] (a frame may be
+    /// silently dropped with no retry). Do NOT rely on it for at-least-once
+    /// delivery. A publish that selects it logs a one-time warning.
     AtLeastOnceHopAck = 1,
 }
 
@@ -699,6 +707,20 @@ impl RoutedPubSub {
         metadata: PubSubFrameMetadata,
         stats: &mut PubSubPublishStats,
     ) -> Result<()> {
+        // ACTOR_REM_2 R12: AtLeastOnceHopAck has no delivery machinery yet; warn
+        // once so a caller is not silently given a false reliability guarantee
+        // (the frame is still delivered best-effort, exactly like AtMostOnce).
+        if matches!(policy.mode, PubSubDeliveryMode::AtLeastOnceHopAck) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    "PubSubDeliveryMode::AtLeastOnceHopAck is not implemented; frames are \
+                     delivered best-effort like AtMostOnce (no hop-ack/retry). Do not rely \
+                     on at-least-once delivery."
+                );
+            }
+        }
         if matches!(scope, PubSubScope::LocalOnly) || policy.hops_limit == 0 {
             return Ok(());
         }
@@ -1808,10 +1830,23 @@ fn write_fast_frame(
     out.extend_from_slice(&msg_id.to_be_bytes());
     out.extend_from_slice(origin_peer_id.as_bytes());
     out.extend_from_slice(source_peer_id.as_bytes());
-    out.extend_from_slice(&(destination_peers.len() as u16).to_be_bytes());
+    // ACTOR_REM_2 R16h: the destination count is a u16. Writing more than
+    // u16::MAX peers would truncate the header count while the body still
+    // carried every peer, so the receiver would parse the tail of the
+    // destination array as payload (silent corruption). Cap the written peers
+    // to what the header can represent so header and body always agree.
+    let dest_count = destination_peers.len().min(u16::MAX as usize);
+    if dest_count != destination_peers.len() {
+        warn!(
+            total = destination_peers.len(),
+            written = dest_count,
+            "fast pubsub frame destination list exceeds u16::MAX; extra destinations dropped"
+        );
+    }
+    out.extend_from_slice(&(dest_count as u16).to_be_bytes());
     out.extend_from_slice(&[0u8; 6]);
     out.extend_from_slice(&metadata.publisher_enqueued_ns.to_be_bytes());
-    for peer in destination_peers {
+    for peer in &destination_peers[..dest_count] {
         out.extend_from_slice(peer.as_bytes());
     }
     out.extend_from_slice(payload);
