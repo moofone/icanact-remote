@@ -6481,6 +6481,44 @@ fn idle_non_required_peer_session_is_pruned_without_orphaning_live_state() {
 }
 
 #[test]
+fn route_index_reclaims_superseded_identity_but_keeps_live_routes() {
+    // ACTOR_REM_2 R7: `peer_id_to_addr` must not grow unbounded under identity
+    // churn. When a NEW peer_id takes over an address (e.g. a pod restarting
+    // with a fresh key at the same endpoint), the old identity's route entry is
+    // reclaimed; a route whose address is not superseded is retained — the
+    // independent-route-authority invariant checked by the test above.
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(1));
+    let old = crate::KeyPair::new_for_testing("r7-old").peer_id();
+    let new = crate::KeyPair::new_for_testing("r7-new").peer_id();
+    let live = crate::KeyPair::new_for_testing("r7-live").peer_id();
+    let shared_addr: SocketAddr = "127.0.0.1:9311".parse().unwrap();
+    let live_addr: SocketAddr = "127.0.0.1:9312".parse().unwrap();
+
+    pool.set_discovered_peer_addr(&old, shared_addr);
+    pool.set_discovered_peer_addr(&live, live_addr);
+    assert!(pool.peer_id_to_addr.read_sync(&old, |_, _| ()).is_some());
+    assert!(pool.peer_id_to_addr.read_sync(&live, |_, _| ()).is_some());
+
+    // A new identity takes over `shared_addr` in the bounded address index.
+    let _ = pool.addr_to_peer_id.upsert_sync(shared_addr, new.clone());
+
+    pool.prune_idle_peer_sessions(); // runs reconcile_route_index
+
+    assert!(
+        pool.peer_id_to_addr.read_sync(&old, |_, _| ()).is_none(),
+        "R7: a route superseded by a new identity at the same addr must be reclaimed"
+    );
+    assert!(
+        pool.peer_id_to_addr.read_sync(&live, |_, _| ()).is_some(),
+        "a route whose address is not superseded must be retained"
+    );
+    assert!(
+        pool.peer_id_to_addr.read_sync(&new, |_, _| ()).is_none(),
+        "the superseding identity has no route entry it did not create"
+    );
+}
+
+#[test]
 fn idle_session_with_external_tracker_or_required_route_is_retained() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(1));
     let peer_id = crate::KeyPair::new_for_testing("retained-session").peer_id();

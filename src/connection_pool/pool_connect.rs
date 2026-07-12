@@ -4024,6 +4024,39 @@ impl<T> ConnectionPool<T> {
                 debug!(peer_id = %peer_id, "pruned idle peer session");
             }
         }
+
+        // ACTOR_REM_2 R7: also reclaim route entries whose address has been
+        // taken over by a different identity, so the (session-independent)
+        // route index stays bounded under identity churn.
+        self.reconcile_route_index();
+    }
+
+    /// ACTOR_REM_2 R7: bound `peer_id_to_addr`. It is deliberately an
+    /// independent route authority that outlives sessions (see
+    /// `prune_idle_peer_sessions`), but a peer that restarts with a NEW identity
+    /// at the same address leaves its old `peer_id -> addr` entry orphaned for
+    /// the process lifetime — an unbounded leak under identity churn (e.g.
+    /// Kubernetes pods restarting with fresh keys). Drop any entry whose address
+    /// is now owned by a DIFFERENT peer_id in the bounded, address-keyed
+    /// `addr_to_peer_id` index. Entries whose address is unclaimed (or still
+    /// self-owned) are retained, preserving the route-authority invariant.
+    fn reconcile_route_index(&self) {
+        let mut entries: Vec<(crate::PeerId, SocketAddr)> = Vec::new();
+        self.peer_id_to_addr.iter_sync(|peer_id, addr| {
+            entries.push((peer_id.clone(), *addr));
+            true
+        });
+        for (peer_id, addr) in entries {
+            let superseded = self
+                .addr_to_peer_id
+                .read_sync(&addr, |_, owner| *owner != peer_id)
+                .unwrap_or(false);
+            if superseded {
+                let _ = self
+                    .peer_id_to_addr
+                    .remove_if_sync(&peer_id, |cur| *cur == addr);
+            }
+        }
     }
 
     /// Close all connections (for shutdown)
