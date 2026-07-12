@@ -5,6 +5,7 @@ use std::sync::{
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 
@@ -64,7 +65,7 @@ impl AskForwarder {
                 loop {
                     while inflight.len() < max_inflight {
                         match rx.try_recv() {
-                            Ok(task) => inflight.push(Box::pin(run_forward_task(task))),
+                            Ok(task) => inflight.push(Box::pin(run_forward_task_isolated(task))),
                             Err(mpsc::error::TryRecvError::Empty) => break,
                             Err(mpsc::error::TryRecvError::Disconnected) => {
                                 rx_closed = true;
@@ -80,12 +81,14 @@ impl AskForwarder {
                     tokio::select! {
                         maybe_task = rx.recv(), if can_receive_more(rx_closed, inflight.len(), max_inflight) => {
                             match maybe_task {
-                                Some(task) => inflight.push(Box::pin(run_forward_task(task))),
+                                Some(task) => inflight.push(Box::pin(run_forward_task_isolated(task))),
                                 None => rx_closed = true,
                             }
                         }
                         Some(completed) = inflight.next(), if !inflight.is_empty() => {
-                            handle_completed_forward(completed, worker_observer.as_deref());
+                            if let Some(completed) = completed {
+                                handle_completed_forward(completed, worker_observer.as_deref());
+                            }
                         }
                     }
                 }
@@ -193,6 +196,20 @@ struct CompletedForward {
 
 fn can_receive_more(rx_closed: bool, inflight_len: usize, max_inflight: usize) -> bool {
     !rx_closed && inflight_len < max_inflight
+}
+
+/// ACTOR_REM_2 R16k: isolate a panicking forwarded-ask future so it kills only
+/// that one forward, not the shared worker task. Without this, a panic anywhere
+/// in the awaited forward chain unwinds the whole worker; every subsequent send
+/// to that worker's channel then maps to `GossipError::Shutdown`, permanently
+/// losing `1/workers` of forwarding capacity per panic. Returns `None` when the
+/// forward panicked (its responder is dropped, so the caller fails/times out as
+/// it would for any transport error).
+async fn run_forward_task_isolated(task: ForwardTask) -> Option<CompletedForward> {
+    std::panic::AssertUnwindSafe(run_forward_task(task))
+        .catch_unwind()
+        .await
+        .ok()
 }
 
 async fn run_forward_task(task: ForwardTask) -> CompletedForward {

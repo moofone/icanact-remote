@@ -160,7 +160,19 @@ impl<T> GossipRegistryHandle<T> {
                 //
                 // We set `SO_REUSEADDR` so tests and local dev can restart a server on the same
                 // port without spurious `AddrInUse` (common on macOS due to TIME_WAIT).
-                let listener = bind_with_reuseaddr(bind_addr)?;
+                //
+                // ACTOR_REM_2 R16j: `bind_with_reuseaddr` does a blocking
+                // std::thread::sleep backoff loop under sandbox EPERM (up to
+                // ~10 s). Run it on the blocking pool so an EPERM burst at
+                // startup cannot stall this async worker (which would freeze the
+                // whole executor on a single-thread runtime).
+                let listener = tokio::task::spawn_blocking(move || bind_with_reuseaddr(bind_addr))
+                    .await
+                    .map_err(|err| {
+                        GossipError::Network(std::io::Error::other(format!(
+                            "bind task failed to join: {err}"
+                        )))
+                    })??;
                 let actual_bind_addr = listener.local_addr()?;
                 (listener, actual_bind_addr)
             }
