@@ -1064,19 +1064,8 @@ impl<T> ConnectionHandle<T> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
 
-        // Acquire streaming mode atomically
-        while stream_handle
-            .streaming_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::task::yield_now().await;
-        }
-
-        // Ensure we release streaming mode on exit
-        let _guard = StreamingGuard {
-            flag: stream_handle.streaming_active.clone(),
-        };
+        // Acquire exclusive streaming mode by parking on the gate (R16e).
+        let _guard = stream_handle.acquire_streaming_mode().await?;
 
         // Generate unique stream ID
         let stream_id = current_timestamp_nanos();
@@ -1349,111 +1338,6 @@ impl<T> ConnectionHandle<T> {
             })
             .collect();
         Ok(handles)
-    }
-
-    /// High-performance streaming API - send structured data with custom framing - LOCK-FREE
-    pub async fn stream_send<M>(&self, data: &M) -> Result<()>
-    where
-        M: for<'a> rkyv::Serialize<
-                rkyv::rancor::Strategy<
-                    rkyv::ser::Serializer<
-                        rkyv::util::AlignedVec,
-                        rkyv::ser::allocator::ArenaHandle<'a>,
-                        rkyv::ser::sharing::Share,
-                    >,
-                    rkyv::rancor::Error,
-                >,
-            >,
-    {
-        let stream_handle = self.stream_handle().map_err(|_| {
-            GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "stream_send requires a stream-based connection",
-            ))
-        })?;
-        // Serialize the data using rkyv for maximum performance
-        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(data)
-            .map_err(crate::GossipError::Serialization)?;
-
-        // Create stream frame: [frame_type, channel_id, flags, seq_id[2], payload_len[4]]
-        let frame_header = StreamFrameHeader {
-            frame_type: StreamFrameType::Data as u8,
-            channel_id: ChannelId::TellAsk as u8,
-            flags: 0,
-            sequence_id: stream_handle.next_frame_sequence_id(),
-            payload_len: payload.len() as u32,
-        };
-
-        let header_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&frame_header)
-            .map_err(crate::GossipError::Serialization)?;
-
-        // Combine header and payload for single write
-        let mut combined = bytes::BytesMut::with_capacity(header_bytes.len() + payload.len());
-        combined.extend_from_slice(&header_bytes); // ALLOW_COPY
-        combined.extend_from_slice(&payload); // ALLOW_COPY
-
-        // Enqueue into the background writer - NO MUTEX!
-        stream_handle.write_bytes_nonblocking(combined.freeze())
-    }
-
-    /// High-performance streaming API - send batch of structured data - LOCK-FREE
-    pub async fn stream_send_batch<M>(&self, batch: &[M]) -> Result<()>
-    where
-        M: for<'a> rkyv::Serialize<
-                rkyv::rancor::Strategy<
-                    rkyv::ser::Serializer<
-                        rkyv::util::AlignedVec,
-                        rkyv::ser::allocator::ArenaHandle<'a>,
-                        rkyv::ser::sharing::Share,
-                    >,
-                    rkyv::rancor::Error,
-                >,
-            >,
-    {
-        let stream_handle = self.stream_handle().map_err(|_| {
-            GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "stream_send_batch requires a stream-based connection",
-            ))
-        })?;
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        // Pre-allocate buffer for entire batch
-        let mut total_payload = Vec::new();
-
-        for item in batch {
-            let payload = rkyv::to_bytes::<rkyv::rancor::Error>(item)
-                .map_err(crate::GossipError::Serialization)?;
-
-            let frame_header = StreamFrameHeader {
-                frame_type: StreamFrameType::Data as u8,
-                channel_id: ChannelId::TellAsk as u8,
-                flags: if std::ptr::eq(item, batch.last().unwrap()) {
-                    0
-                } else {
-                    StreamFrameFlags::More as u8
-                },
-                sequence_id: stream_handle.next_frame_sequence_id(),
-                payload_len: payload.len() as u32,
-            };
-
-            let header_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&frame_header)
-                .map_err(crate::GossipError::Serialization)?;
-            total_payload.extend_from_slice(&header_bytes); // ALLOW_COPY
-            total_payload.extend_from_slice(&payload); // ALLOW_COPY
-        }
-
-        // Enqueue into the background writer - NO MUTEX!
-        stream_handle.write_bytes_nonblocking(bytes::Bytes::from(total_payload))
-    }
-
-    /// Get truly lock-free streaming handle - direct access to the internal handle
-    pub fn get_lock_free_stream(&self) -> &Arc<LockFreeStreamHandle> {
-        self.stream_handle
-            .as_ref()
-            .expect("lock-free stream handle is unavailable for this connection")
     }
 
     /// Zero-copy vectored write for header + payload in single syscall

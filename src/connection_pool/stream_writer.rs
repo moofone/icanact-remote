@@ -6,14 +6,20 @@ pub struct LockFreeStreamHandle {
     addr: SocketAddr,
     channel_id: ChannelId,
     sequence_counter: Arc<AtomicUsize>,
-    frame_sequence: Arc<AtomicUsize>,
     bytes_written: Arc<AtomicUsize>, // This tracks actual TCP bytes written
     shutdown_signal: Arc<AtomicBool>,
     exit_flag: Arc<AtomicBool>,
     exit_notify: Arc<Notify>,
     flush_pending: Arc<AtomicBool>,
-    /// Atomic flag for coordinating streaming mode
+    /// Atomic flag for coordinating streaming mode. Read by the IO task and
+    /// `is_streaming_active` as a cheap observability signal; the actual mutual
+    /// exclusion is enforced by `stream_gate`.
     streaming_active: Arc<AtomicBool>,
+    /// ACTOR_REM_2 R16e: single-permit gate serializing `stream_large_message` /
+    /// `stream_response` on this handle. Losers park on the permit instead of
+    /// busy-spinning a failed CAS + `yield_now` for the winner's entire stream
+    /// duration (which starved the loser and burned a scheduler slot per poll).
+    stream_gate: Arc<tokio::sync::Semaphore>,
     /// Lock-free write queue for payload writes
     write_queue: Arc<WriteQueue>,
     /// Bounded streaming command queue for background task.
@@ -56,6 +62,7 @@ impl LockFreeStreamHandle {
         let instance_id = Self::next_instance_id();
         let shutdown_signal = Arc::new(AtomicBool::new(false));
         let streaming_active = Arc::new(AtomicBool::new(false));
+        let stream_gate = Arc::new(tokio::sync::Semaphore::new(1));
         let flush_pending = Arc::new(AtomicBool::new(false));
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_notify = Arc::new(Notify::new());
@@ -119,13 +126,13 @@ impl LockFreeStreamHandle {
                 addr,
                 channel_id,
                 sequence_counter: Arc::new(AtomicUsize::new(0)),
-                frame_sequence: Arc::new(AtomicUsize::new(0)),
                 bytes_written, // This now tracks actual TCP bytes written
                 shutdown_signal,
                 flush_pending,
                 exit_flag,
                 exit_notify,
                 streaming_active,
+                stream_gate,
                 write_queue,
                 streaming_queue,
                 buffer_config,
@@ -486,6 +493,14 @@ impl LockFreeStreamHandle {
         const OWNER_BATCH_SIZE: usize = 64;
         const READ_BATCH_LIMIT: usize = 2048;
         const ASK_READ_BATCH_LIMIT: usize = 8192;
+        // ACTOR_REM_2 R8: while a large stream is in flight, service the normal
+        // write queue after every ~256 KiB of stream data rather than draining
+        // the whole stream first, so latency-sensitive tell/ask/control frames
+        // are not starved behind a long stream (head-of-line blocking). The
+        // per-turn control-frame batch is kept small during active streaming so
+        // stream throughput stays dominant.
+        const STREAM_INTERLEAVE_BYTES: usize = 256 * 1024;
+        const STREAM_ACTIVE_WRITE_BATCH: usize = 16;
 
         let mut bytes_since_flush = 0;
 
@@ -514,6 +529,10 @@ impl LockFreeStreamHandle {
             response_batch.clear();
             direct_response_batch.clear();
 
+            // ACTOR_REM_2 R8: bound the stream chunks written per turn so the
+            // normal write queue below is serviced periodically instead of only
+            // after the whole stream drains.
+            let stream_turn_start = total_bytes_written;
             while let Some(cmd) = streaming_queue.pop() {
                 did_work = true;
                 match cmd {
@@ -645,9 +664,28 @@ impl LockFreeStreamHandle {
                     }
                 }
                 streaming_queue.notify_space();
+                if total_bytes_written.saturating_sub(stream_turn_start)
+                    >= STREAM_INTERLEAVE_BYTES
+                {
+                    // Yield to the normal write queue before writing more of the
+                    // stream (ACTOR_REM_2 R8). `did_work` stays true, so the
+                    // outer loop re-enters and resumes the stream next turn.
+                    break;
+                }
             }
 
-            if !streaming_active.load(Ordering::Acquire) {
+            // ACTOR_REM_2 R8: always service the normal write queue — even while
+            // a stream is active — so latency-sensitive frames interleave rather
+            // than being starved for the stream's whole duration. The batch is
+            // kept small during active streaming so the stream stays dominant;
+            // when the queue is empty (the common case mid-stream) this is a
+            // cheap no-op.
+            {
+                let write_batch_limit = if streaming_active.load(Ordering::Acquire) {
+                    STREAM_ACTIVE_WRITE_BATCH
+                } else {
+                    OWNER_BATCH_SIZE
+                };
                 // Reuse pre-allocated buffers instead of creating new ones
                 write_chunks.clear();
                 owner_batch.clear();
@@ -658,7 +696,7 @@ impl LockFreeStreamHandle {
                     owner_batch.push(cmd);
                 }
 
-                while owner_batch.len() < OWNER_BATCH_SIZE {
+                while owner_batch.len() < write_batch_limit {
                     match write_queue.pop() {
                         Some(command) => owner_batch.push(command),
                         None => break,
@@ -2170,11 +2208,6 @@ impl LockFreeStreamHandle {
         self.enqueue_write_nonblocking(WritePayload::HeaderPayload { header, payload })
     }
 
-    /// Enqueue bytes (legacy name kept for compatibility).
-    pub fn write_bytes_nonblocking_checked(&self, data: bytes::Bytes) -> Result<()> {
-        self.enqueue_write_nonblocking(WritePayload::Single(data))
-    }
-
     /// Enqueue header + payload (legacy name kept for compatibility).
     pub fn write_header_and_payload_nonblocking_checked(
         &self,
@@ -2259,11 +2292,6 @@ impl LockFreeStreamHandle {
         self.sequence_counter.load(Ordering::Relaxed)
     }
 
-    /// Get next stream frame sequence ID (wraps at u16::MAX)
-    fn next_frame_sequence_id(&self) -> u16 {
-        (self.frame_sequence.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16
-    }
-
     /// Get socket address
     pub fn addr(&self) -> SocketAddr {
         self.addr
@@ -2308,6 +2336,25 @@ impl LockFreeStreamHandle {
         Ok(std::cmp::min(STREAM_CHUNK_SIZE, max_chunk))
     }
 
+    /// ACTOR_REM_2 R16e: acquire exclusive streaming mode on this handle without
+    /// busy-spinning. A concurrent streamer parks on the single-permit gate (FIFO,
+    /// no CPU burn) instead of looping `compare_exchange` + `yield_now` for the
+    /// holder's entire stream. The returned guard releases the permit and clears
+    /// the `streaming_active` observability flag on drop.
+    async fn acquire_streaming_mode(&self) -> Result<StreamingGuard> {
+        let permit = self
+            .stream_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GossipError::Shutdown)?;
+        self.streaming_active.store(true, Ordering::Release);
+        Ok(StreamingGuard {
+            flag: self.streaming_active.clone(),
+            _permit: permit,
+        })
+    }
+
     /// Stream a large message directly to the socket, bypassing the write queue
     /// This provides maximum performance for large messages like PreBacktest
     pub async fn stream_large_message(
@@ -2320,19 +2367,8 @@ impl LockFreeStreamHandle {
 
         let chunk_size = self.max_stream_chunk_size()?;
 
-        // Acquire streaming mode atomically
-        while self
-            .streaming_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::task::yield_now().await;
-        }
-
-        // Ensure we release streaming mode on exit
-        let _guard = StreamingGuard {
-            flag: self.streaming_active.clone(),
-        };
+        // Acquire exclusive streaming mode by parking on the gate (R16e).
+        let _guard = self.acquire_streaming_mode().await?;
 
         // Generate unique stream ID using nanoseconds to avoid collisions
         let stream_id = current_timestamp_nanos();
@@ -2466,19 +2502,8 @@ impl LockFreeStreamHandle {
 
         let chunk_size = self.max_stream_chunk_size()?;
 
-        // Acquire streaming mode atomically
-        while self
-            .streaming_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::task::yield_now().await;
-        }
-
-        // Ensure we release streaming mode on exit
-        let _guard = StreamingGuard {
-            flag: self.streaming_active.clone(),
-        };
+        // Acquire exclusive streaming mode by parking on the gate (R16e).
+        let _guard = self.acquire_streaming_mode().await?;
 
         // Generate unique stream ID for this response stream
         let stream_id = current_timestamp_nanos();
@@ -2681,9 +2706,12 @@ impl LockFreeStreamHandle {
     }
 }
 
-/// Guard to ensure streaming_active is released on drop
+/// Guard to ensure streaming_active is released on drop. Holds the streaming
+/// gate permit (R16e) so the next waiter is admitted, and clears the
+/// observability flag, when the stream finishes or is dropped/cancelled.
 struct StreamingGuard {
     flag: Arc<AtomicBool>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for StreamingGuard {

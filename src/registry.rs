@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -8,13 +7,11 @@ use std::{
 use tokio::task::AbortHandle;
 
 use arc_swap::ArcSwapOption;
-use futures::future::{BoxFuture, poll_fn};
-use futures::task::AtomicWaker;
+use futures::future::BoxFuture;
 use lru::LruCache;
 use scc::HashMap as SccHashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use rand::seq::SliceRandom;
@@ -942,99 +939,6 @@ pub struct PendingFailure {
     pub query_sent: bool,
 }
 
-/// Pending ACK state for synchronous registrations.
-///
-/// This avoids `tokio::sync::oneshot` and does not require holding any locks while awaiting
-/// a network callback.
-#[derive(Debug)]
-pub struct PendingAck {
-    // 0 = pending, 1 = success, 2 = failure, 3 = canceled (timeout/shutdown).
-    state: AtomicU8,
-    waker: AtomicWaker,
-}
-
-impl PendingAck {
-    const PENDING: u8 = 0;
-    const SUCCESS: u8 = 1;
-    const FAILURE: u8 = 2;
-    const CANCELED: u8 = 3;
-
-    pub fn new() -> Self {
-        Self {
-            state: AtomicU8::new(Self::PENDING),
-            waker: AtomicWaker::new(),
-        }
-    }
-
-    /// Completes the ACK (idempotent). Late completions after `cancel()` are ignored.
-    pub fn complete(&self, success: bool) {
-        let target = if success {
-            Self::SUCCESS
-        } else {
-            Self::FAILURE
-        };
-        let _ =
-            self.state
-                .compare_exchange(Self::PENDING, target, Ordering::AcqRel, Ordering::Acquire);
-        self.waker.wake();
-    }
-
-    /// Cancels the ACK (idempotent), typically used when timing out.
-    pub fn cancel(&self) {
-        let _ = self.state.compare_exchange(
-            Self::PENDING,
-            Self::CANCELED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.waker.wake();
-    }
-
-    /// Wait for completion. Returns `Some(success)` when completed, or `None` if canceled.
-    pub async fn wait(&self) -> Option<bool> {
-        poll_fn(|cx| self.poll_wait(cx)).await
-    }
-
-    fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<Option<bool>> {
-        match self.state.load(Ordering::Acquire) {
-            Self::SUCCESS => return Poll::Ready(Some(true)),
-            Self::FAILURE => return Poll::Ready(Some(false)),
-            Self::CANCELED => return Poll::Ready(None),
-            _ => {}
-        }
-
-        self.waker.register(cx.waker());
-
-        match self.state.load(Ordering::Acquire) {
-            Self::SUCCESS => Poll::Ready(Some(true)),
-            Self::FAILURE => Poll::Ready(Some(false)),
-            Self::CANCELED => Poll::Ready(None),
-            _ => Poll::Pending,
-        }
-    }
-}
-
-/// RAII drop guard for a `pending_acks` entry. Ensures the entry is
-/// removed from the map and the `PendingAck` is cancelled even when the
-/// owning future is dropped before completing (caller cancellation,
-/// shutdown). Without this the entry leaks for the lifetime of the
-/// process.
-struct PendingAckGuard {
-    map: Arc<SccHashMap<String, Arc<PendingAck>>>,
-    name: String,
-    pending: Arc<PendingAck>,
-}
-
-impl Drop for PendingAckGuard {
-    fn drop(&mut self) {
-        let _ = self.map.remove_sync(self.name.as_str());
-        // Idempotent: completes() are no-ops if PendingAck already in a
-        // terminal state, so signalling cancellation here unblocks any
-        // sibling waiter without overwriting a real outcome.
-        self.pending.cancel();
-    }
-}
-
 /// Message types for the gossip protocol
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 #[repr(u8)]
@@ -1082,21 +986,12 @@ pub enum RegistryMessage {
         peer_statuses: Vec<(String, PeerHealthStatus)>, // Use Vec for rkyv serialization
         timestamp: u64,
     } = 5,
-    /// Lightweight ACK for immediate registrations
-    ImmediateAck { actor_name: String, success: bool } = 6,
     /// Query for peer health consensus
     PeerHealthQuery {
         sender: crate::PeerId,
         target_peer: String,
         timestamp: u64,
     } = 7,
-    /// Direct actor message (tell or ask)
-    ActorMessage {
-        actor_id: String,
-        type_hash: u32,
-        payload: Vec<u8>,
-        correlation_id: Option<u16>,
-    } = 8,
     /// Peer list gossip for automatic peer discovery
     /// Contains list of known peers with their connection info
     PeerListGossip {
@@ -1458,24 +1353,6 @@ pub struct GossipRegistry<T = ()> {
     /// out after their liveness window so restart churn cannot retain them.
     peer_liveness_status: Arc<SccHashMap<crate::PeerId, PeerLivenessStatus>>,
 
-    // Stream assembly state (lock-free map).
-    pub stream_assemblies: Arc<SccHashMap<u64, StreamAssembly>>,
-    /// Per-peer in-flight stream count. CAS-style counter so the
-    /// per-peer cap (`MAX_INFLIGHT_STREAMS_PER_PEER`) is enforced
-    /// atomically — count-then-insert lets N concurrent admissions
-    /// all pass the check before any insert. Decremented on
-    /// `complete_stream_assembly`, `cleanup_stale_stream_assemblies`,
-    /// and `evict_peer_side_tables`.
-    pub inflight_streams_per_peer:
-        Arc<SccHashMap<std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>>>,
-    /// Process-wide reservation for eagerly allocated stream reassembly
-    /// buffers. Per-peer and per-connection caps cannot bound many distinct
-    /// authenticated peers, so admission reserves this before allocation.
-    inflight_stream_bytes: Arc<AtomicUsize>,
-
-    // Pending ACKs for synchronous registrations (bounded, lock-free map).
-    pub pending_acks: Arc<SccHashMap<String, Arc<PendingAck>>>,
-
     /// Tracks the currently-running peer discovery dial task (H-004).
     pub discovery_task: Arc<DiscoveryTaskTracker>,
     peer_gossip_notify: Arc<Notify>,
@@ -1507,58 +1384,6 @@ impl Drop for DiscoveryTaskTracker {
     fn drop(&mut self) {
         self.abort();
     }
-}
-
-/// State for assembling streamed messages
-#[derive(Debug)]
-pub struct StreamAssembly {
-    pub header: crate::StreamHeader,
-    pub received_indices: std::collections::BTreeSet<u32>,
-    pub received_bytes: usize,
-    pub buffer: crate::PooledAlignedBuffer,
-    pub chunk_stride: Option<usize>,
-    /// Timestamp when stream assembly started (for stale cleanup)
-    pub started_at: std::time::Instant,
-    /// Correlation ID for ask_streaming (to send response back)
-    pub correlation_id: Option<u16>,
-    /// Peer address to send response to (for ask_streaming)
-    pub peer_addr: Option<std::net::SocketAddr>,
-}
-
-impl StreamAssembly {
-    /// Check if the stream assembly is complete (all chunks received with no gaps)
-    pub fn is_complete(&self) -> bool {
-        let Some(stride) = self.chunk_stride else {
-            return false;
-        };
-        let expected_chunks = self.header.total_size.div_ceil(stride as u64);
-
-        if self.received_indices.len() as u64 != expected_chunks {
-            return false;
-        }
-
-        // Verify all indices 0..N-1 are present (no gaps)
-        for i in 0..expected_chunks as u32 {
-            if !self.received_indices.contains(&i) {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-/// Result of completing a stream assembly
-#[derive(Debug)]
-pub struct StreamAssemblyResult {
-    /// The assembled complete message
-    pub data: crate::AlignedBytes,
-    /// Correlation ID for ask_streaming responses
-    pub correlation_id: Option<u16>,
-    /// Peer address to send response to
-    pub peer_addr: Option<std::net::SocketAddr>,
-    /// Original stream header
-    pub header: crate::StreamHeader,
 }
 
 impl<T: 'static> GossipRegistry<T> {
@@ -1675,7 +1500,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_id,
             config: config.clone(),
             start_time: current_timestamp(),
-            start_instant: crate::current_instant(),
+            start_instant: std::time::Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
             actor_state: Arc::new(ActorState::default()),
             gossip_state: Arc::new(Mutex::new(GossipState {
@@ -1755,10 +1580,6 @@ impl<T: 'static> GossipRegistry<T> {
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_status: Arc::new(SccHashMap::default()),
-            stream_assemblies: Arc::new(SccHashMap::default()),
-            inflight_streams_per_peer: Arc::new(SccHashMap::default()),
-            inflight_stream_bytes: Arc::new(AtomicUsize::new(0)),
-            pending_acks: Arc::new(SccHashMap::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
             peer_gossip_notify: Arc::new(Notify::new()),
             dns_resolver: Arc::new(tokio::sync::RwLock::new(Arc::new(
@@ -1783,18 +1604,6 @@ impl<T: 'static> GossipRegistry<T> {
         Ok(())
     }
 
-    /// Enable signed Noise-style authentication for plain TCP connections.
-    ///
-    /// Noise-protocol authentication is not implemented in this build. This
-    /// must fail closed: a caller that explicitly requested authenticated
-    /// transport must never be silently handed an unauthenticated plain
-    /// stream connection.
-    pub fn enable_noise_auth(&mut self, _secret_key: crate::SecretKey) -> Result<()> {
-        Err(GossipError::InvalidConfig(
-            "Noise transport auth is not implemented in this build: refusing to fall back to unauthenticated plain stream transport".to_string(),
-        ))
-    }
-
     /// Track negotiated peer capabilities for a peer connection
     pub fn set_peer_capabilities(&self, addr: SocketAddr, caps: PeerCapabilities) {
         let _ = self.peer_capabilities.upsert_sync(addr, caps);
@@ -1816,6 +1625,18 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Remove stored capabilities for a peer (e.g., when connection closes)
+    /// ACTOR_REM_2 R13(c): reap the per-peer clock-calibration side tables when
+    /// a peer is removed. These addr-keyed tables (probe state, pending echoes,
+    /// and the calibration snapshot) were the only per-peer tables NOT threaded
+    /// through the dead-peer / eviction / DNS-migration cleanups, so they leaked
+    /// one orphan per departed peer for the process lifetime. `pending_clock_
+    /// probes` is sample-id-keyed and already age-reaped, so it is not included.
+    pub(crate) fn remove_clock_state_for_addr(&self, addr: &SocketAddr) {
+        let _ = self.clock_probe_state.remove_sync(addr);
+        let _ = self.pending_clock_echoes.remove_sync(addr);
+        let _ = self.peer_clock_snapshots.remove_sync(addr);
+    }
+
     pub fn clear_peer_capabilities(&self, addr: &SocketAddr) {
         let _ = self.peer_capabilities.remove_sync(addr);
         if let Some((_, node_id)) = self.peer_capability_addr_to_node.remove_sync(addr) {
@@ -1999,6 +1820,44 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         (!extensions.is_empty()).then_some(extensions)
+    }
+
+    /// ACTOR_REM_2 R16i: If we owe `peer_addr` a clock echo (it probed us) *and*
+    /// we will never send it a scheduled outbound gossip round — because outbound
+    /// retry to it is suppressed (inbound-only / NAT'd, not dialable from here) —
+    /// consume and return the owed echo so the caller can answer inline on the
+    /// connection the probe arrived on. Returns `None` (leaving the echo queued
+    /// for the normal outbound flush) for peers we do dial, and never initiates a
+    /// probe, so it has no probe-scheduling side effects. Without this, a
+    /// permanently inbound-only peer's owed echo waits forever for an outbound
+    /// round that `should_suppress_outbound_retry_for_peer` prevents.
+    pub async fn take_clock_echo_for_undialable_peer(
+        &self,
+        peer_addr: SocketAddr,
+        send_wall_ns: u64,
+    ) -> Option<GossipExtensionsV1> {
+        if !self.pending_clock_echoes.contains_sync(&peer_addr) {
+            return None;
+        }
+        let peer_info = {
+            let gossip_state = self.gossip_state.lock().await;
+            gossip_state.peers.get(&peer_addr).cloned()
+        };
+        let suppressed = peer_info
+            .map(|peer| self.should_suppress_outbound_retry_for_peer(&peer))
+            .unwrap_or(false);
+        if !suppressed {
+            return None;
+        }
+        let (_, pending) = self.pending_clock_echoes.remove_sync(&peer_addr)?;
+        let mut extensions = GossipExtensionsV1::default();
+        extensions.clock_echo = Some(ClockEchoV1 {
+            sample_id: pending.sample_id,
+            origin_sender_wall_ns: pending.origin_sender_wall_ns,
+            responder_recv_wall_ns: pending.responder_recv_wall_ns,
+            responder_send_wall_ns: send_wall_ns,
+        });
+        Some(extensions)
     }
 
     pub fn record_inbound_gossip_extensions(
@@ -2925,6 +2784,12 @@ impl<T: 'static> GossipRegistry<T> {
             );
         }
 
+        // ACTOR_REM_2 R13(c): drop the old address's clock-calibration state on a
+        // DNS migration. Calibration (RTT / clock offset) is specific to the
+        // endpoint, so the new address must be re-probed rather than inheriting
+        // stale samples; not removing it also leaks the old-addr entries.
+        self.remove_clock_state_for_addr(&peer_addr);
+
         Some(new_addr)
     }
 
@@ -2998,101 +2863,6 @@ impl<T: 'static> GossipRegistry<T> {
         let _ = self.actor_state.known_actors.remove_sync(name.as_str());
         self.register_actor_with_priority(name, location, RegistrationPriority::Normal)
             .await
-    }
-
-    /// Register actor with confirmation from at least one peer
-    /// Returns when first peer ACKs or timeout
-    pub async fn register_actor_sync(
-        &self,
-        name: String,
-        location: RemoteActorLocation,
-        timeout: Duration,
-    ) -> Result<()> {
-        // Step 1: Check if we have any healthy peers
-        let peer_count = {
-            let gossip_state = self.gossip_state.lock().await;
-            gossip_state
-                .peers
-                .iter()
-                .filter(|(_, info)| info.failures < self.config.max_peer_failures)
-                .count()
-        };
-
-        if peer_count == 0 {
-            // No peers - just do local registration and return
-            self.register_actor_with_priority(name, location, RegistrationPriority::Immediate)
-                .await?;
-
-            info!("Sync registration completed immediately (no peers to confirm)");
-            return Ok(());
-        }
-
-        // Have peers - wait for ACK from at least one.
-        let pending = Arc::new(PendingAck::new());
-        if self
-            .pending_acks
-            .insert_sync(name.clone(), pending.clone())
-            .is_err()
-        {
-            return Err(GossipError::Network(io::Error::other(
-                "Another synchronous registration is already pending for this actor",
-            )));
-        }
-
-        // RAII guard so the pending_acks entry is removed even if this
-        // future is dropped mid-await (e.g. caller-side cancellation).
-        // Without this, cancellation between the insert above and the
-        // explicit remove below leaks the entry permanently.
-        let _ack_guard = PendingAckGuard {
-            map: self.pending_acks.clone(),
-            name: name.clone(),
-            pending: pending.clone(),
-        };
-
-        // Register with immediate priority (triggers instant gossip to peers).
-        if let Err(err) = self
-            .register_actor_with_priority(name.clone(), location, RegistrationPriority::Immediate)
-            .await
-        {
-            // _ack_guard's Drop will remove + cancel.
-            return Err(err);
-        }
-
-        // Wait for first ACK or timeout.
-        let outcome = tokio::time::timeout(timeout, pending.wait()).await;
-
-        match outcome {
-            Ok(Some(true)) => {
-                info!("Sync registration confirmed by peer for actor '{}'", name);
-                Ok(())
-            }
-            Ok(Some(false)) => {
-                warn!(
-                    "Sync registration failed according to peer for actor '{}'",
-                    name
-                );
-                Err(GossipError::Network(io::Error::other(
-                    "Peer rejected registration",
-                )))
-            }
-            Ok(None) => {
-                // Canceled locally (shouldn't usually happen unless shutdown/cleanup raced).
-                warn!(
-                    "Sync registration canceled while waiting for peer ACK for actor '{}'",
-                    name
-                );
-                Ok(())
-            }
-            Err(_) => {
-                // Timeout - maybe peer is slow or disconnected.
-                pending.cancel();
-                warn!(
-                    "Sync registration timed out waiting for peer ACK for actor '{}', continuing anyway",
-                    name
-                );
-                Ok(()) // Still return Ok - gossip will eventually propagate
-            }
-        }
     }
 
     /// Get the current number of actors in the registry (both local and known)
@@ -3448,10 +3218,9 @@ impl<T: 'static> GossipRegistry<T> {
     /// Apply delta changes from a peer.
     ///
     /// Returns the names of immediate-priority `ActorAdded` changes that were
-    /// actually applied (i.e. passed vector-clock conflict resolution). Used
-    /// by the receive path to decide whether to send `ImmediateAck`: a
-    /// duplicate delta whose contents were all suppressed must not generate
-    /// fresh acks.
+    /// actually applied (i.e. passed vector-clock conflict resolution).
+    /// Duplicate deltas whose contents were all suppressed return an empty
+    /// list, making delta application observably idempotent.
     pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<Vec<String>> {
         self.apply_delta_from(delta, None).await
     }
@@ -5232,9 +5001,6 @@ impl<T: 'static> GossipRegistry<T> {
             let connection_pool = &self.connection_pool;
             connection_pool.cleanup_stale_connections();
         }
-
-        // Clean up stale stream assemblies (incomplete streams older than 60 seconds)
-        self.cleanup_stale_stream_assemblies().await;
     }
 
     /// Side tables keyed by ephemeral `PeerId`s cannot rely on address-based
@@ -5253,51 +5019,6 @@ impl<T: 'static> GossipRegistry<T> {
             self.connection_pool.is_required_peer(peer_id)
                 || now.saturating_duration_since(status.updated_at) <= liveness_ttl
         });
-    }
-
-    /// Clean up incomplete stream assemblies that have been stale for too long.
-    /// This prevents memory leaks when StreamStart arrives but StreamEnd never comes.
-    pub async fn cleanup_stale_stream_assemblies(&self) {
-        const STREAM_ASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-        let before_count = self.stream_assemblies.len();
-
-        // Collect victims first so we can decrement the per-peer
-        // counter outside the retain callback. retain_sync holds the
-        // bucket lock while invoking the predicate; calling the
-        // decrement helper inside would re-enter the same map shape.
-        let mut victims: Vec<(Option<std::net::SocketAddr>, usize)> = Vec::new();
-        self.stream_assemblies.retain_sync(|stream_id, assembly| {
-            let age = assembly.started_at.elapsed();
-            if age > STREAM_ASSEMBLY_TIMEOUT {
-                warn!(
-                    stream_id = *stream_id,
-                    age_secs = age.as_secs(),
-                    received_bytes = assembly.received_bytes,
-                    expected_bytes = assembly.header.total_size,
-                    chunks_received = assembly.received_indices.len(),
-                    "Cleaning up stale stream assembly - StreamEnd never arrived"
-                );
-                victims.push((assembly.peer_addr, assembly.header.total_size as usize));
-                return false;
-            }
-            true
-        });
-        for (peer, bytes) in victims {
-            if let Some(peer) = peer {
-                self.decrement_inflight_streams(peer);
-            }
-            self.release_inflight_stream_bytes(bytes);
-        }
-
-        let removed = before_count.saturating_sub(self.stream_assemblies.len());
-        if removed > 0 {
-            info!(
-                removed_count = removed,
-                remaining = self.stream_assemblies.len(),
-                "Cleaned up stale stream assemblies"
-            );
-        }
     }
 
     /// Clean up actors from peers that have been disconnected for longer than dead_peer_timeout
@@ -5383,6 +5104,7 @@ impl<T: 'static> GossipRegistry<T> {
             // tables that have their own locks.
             for peer_addr in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
+                self.remove_clock_state_for_addr(peer_addr);
             }
         }
     }
@@ -6022,6 +5744,7 @@ impl<T: 'static> GossipRegistry<T> {
         (observed_peer_addr, peer_id)
     }
 
+
     /// Handle a peer connection failure by peer ID instead of address
     pub async fn handle_peer_connection_failure_by_peer_id(
         &self,
@@ -6608,6 +6331,7 @@ impl<T: 'static> GossipRegistry<T> {
         if !evicted_addrs.is_empty() {
             for addr in &evicted_addrs {
                 self.clear_peer_capabilities(addr);
+                self.remove_clock_state_for_addr(addr);
             }
         }
     }
@@ -6915,384 +6639,10 @@ impl<T: 'static> GossipRegistry<T> {
         Ok(())
     }
 
-    /// Immediately invalidate all actors from a failed peer
-    pub async fn invalidate_peer_actors(&self, failed_peer_addr: SocketAddr) -> Result<()> {
-        info!(failed_peer = %failed_peer_addr, "invalidating actors from failed peer");
-
-        // Get the list of actors to invalidate from this peer
-        let (actors_to_remove, should_trigger_immediate) = {
-            let mut gossip_state = self.gossip_state.lock().await;
-
-            // Get actors belonging to the failed peer
-            let actors_to_remove = gossip_state
-                .peer_to_actors
-                .remove(&failed_peer_addr)
-                .unwrap_or_default();
-
-            if actors_to_remove.is_empty() {
-                debug!(failed_peer = %failed_peer_addr, "no actors to invalidate");
-                return Ok(());
-            }
-
-            // Create removal changes for each actor with proper vector clocks
-            let mut removal_changes = Vec::new();
-
-            // We need to get the current vector clocks for these actors
-            for actor_name in &actors_to_remove {
-                // Get the existing vector clock for this actor if it exists
-                let removal_clock = self
-                    .actor_state
-                    .known_actors
-                    .read_sync(actor_name.as_str(), |_, location| {
-                        // Use the actor's current vector clock and increment it.
-                        let clock = location.vector_clock.clone();
-                        clock.increment(self.peer_id.to_node_id());
-                        clock
-                    })
-                    .unwrap_or_else(|| {
-                        // If actor not found (shouldn't happen), create a new clock with our increment.
-                        let clock = crate::VectorClock::new();
-                        clock.increment(self.peer_id.to_node_id());
-                        clock
-                    });
-
-                let change = RegistryChange::ActorRemoved {
-                    name: actor_name.clone(),
-                    vector_clock: removal_clock,
-                    removing_node_id: self.peer_id.to_node_id(),
-                    priority: RegistrationPriority::Immediate, // Node failures are always immediate
-                };
-                removal_changes.push(change);
-            }
-
-            // Add all removal changes to urgent queue
-            gossip_state.urgent_changes.extend(removal_changes);
-
-            (actors_to_remove, !gossip_state.urgent_changes.is_empty())
-        };
-
-        // Remove actors from known_actors (they shouldn't be in local_actors if they're from a failed node)
-        let removed_count = {
-            let mut removed = 0;
-
-            for actor_name in &actors_to_remove {
-                if self
-                    .actor_state
-                    .known_actors
-                    .remove_sync(actor_name.as_str())
-                    .is_some()
-                {
-                    removed += 1;
-                }
-                // Also remove from local_actors if somehow present (defensive)
-                if self
-                    .actor_state
-                    .local_actors
-                    .remove_sync(actor_name.as_str())
-                    .is_some()
-                {
-                    removed += 1;
-                }
-            }
-            removed
-        };
-
-        info!(
-            failed_peer = %failed_peer_addr,
-            actors_removed = removed_count,
-            actors_invalidated = ?actors_to_remove,
-            "PEER_FAILURE_INVALIDATION"
-        );
-
-        // Trigger immediate gossip to propagate the failures
-        if should_trigger_immediate {
-            if let Err(err) = self.trigger_immediate_gossip().await {
-                warn!(error = %err, "failed to trigger immediate gossip for node failure");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Start assembling a streamed message
-    ///
-    /// # Arguments
-    /// * `header` - Stream header with metadata
-    /// * `correlation_id` - Optional correlation ID for ask_streaming responses
-    /// * `peer_addr` - Optional peer address to send response to
-    pub async fn start_stream_assembly(
-        &self,
-        header: crate::StreamHeader,
-        correlation_id: Option<u16>,
-        peer_addr: Option<std::net::SocketAddr>,
-    ) {
-        let total_size = match usize::try_from(header.total_size) {
-            Ok(size) => size,
-            Err(_) => {
-                warn!(
-                    stream_id = header.stream_id,
-                    total_size = header.total_size,
-                    "Stream assembly size overflows usize"
-                );
-                return;
-            }
-        };
-
-        if total_size > crate::MAX_STREAM_SIZE {
-            warn!(
-                stream_id = header.stream_id,
-                total_size = total_size,
-                max_size = crate::MAX_STREAM_SIZE,
-                "Stream assembly size exceeds MAX_STREAM_SIZE"
-            );
-            return;
-        }
-
-        // Per-peer assembly cap. Without this, a single misbehaving peer
-        // can hold up to MAX_INFLIGHT_STREAMS_PER_PEER × MAX_STREAM_SIZE
-        // in pooled buffers for the full 60s stale-assembly TTL.
-        //
-        // Atomic CAS-style admission: fetch_add the per-peer counter
-        // and roll back on overrun. This closes the count-then-insert
-        // TOCTOU window where N concurrent admissions could all read
-        // count < cap before any of them inserted.
-        let admitted_peer = if let Some(peer) = peer_addr {
-            let counter = {
-                let entry = self
-                    .inflight_streams_per_peer
-                    .entry_sync(peer)
-                    .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
-                entry.get().clone()
-            };
-            let prev = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            if prev >= Self::MAX_INFLIGHT_STREAMS_PER_PEER {
-                counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                warn!(
-                    peer = %peer,
-                    stream_id = header.stream_id,
-                    inflight = prev,
-                    cap = Self::MAX_INFLIGHT_STREAMS_PER_PEER,
-                    "rejecting stream assembly: per-peer cap reached"
-                );
-                return;
-            }
-            Some(peer)
-        } else {
-            None
-        };
-
-        if !self.reserve_inflight_stream_bytes(total_size) {
-            if let Some(peer) = admitted_peer {
-                self.decrement_inflight_streams(peer);
-            }
-            warn!(
-                stream_id = header.stream_id,
-                requested_bytes = total_size,
-                reserved_bytes = self
-                    .inflight_stream_bytes
-                    .load(std::sync::atomic::Ordering::Acquire),
-                cap = crate::MAX_INFLIGHT_STREAM_BYTES,
-                "rejecting stream assembly: global byte budget reached"
-            );
-            return;
-        }
-
-        let stream_id = header.stream_id;
-        let insert_result = self.stream_assemblies.insert_sync(
-            stream_id,
-            StreamAssembly {
-                header,
-                received_indices: std::collections::BTreeSet::new(),
-                received_bytes: 0,
-                buffer: self.connection_pool.make_pooled_aligned_buffer(total_size),
-                chunk_stride: None,
-                started_at: std::time::Instant::now(),
-                correlation_id,
-                peer_addr,
-            },
-        );
-        if insert_result.is_err() {
-            // A stream with this id already exists. Roll back the
-            // reservation so we don't leak count against the cap.
-            if let Some(peer) = admitted_peer {
-                self.decrement_inflight_streams(peer);
-            }
-            self.release_inflight_stream_bytes(total_size);
-            warn!(
-                stream_id = stream_id,
-                "Stream assembly already in progress for stream_id"
-            );
-            return;
-        }
-        debug!(
-            stream_id = stream_id,
-            ?correlation_id,
-            ?peer_addr,
-            "Started stream assembly"
-        );
-    }
-
-    /// Decrement the per-peer in-flight stream counter and drop the
-    /// map entry if it reaches zero. Called from every removal path
-    /// (`complete_stream_assembly`, `cleanup_stale_stream_assemblies`).
-    fn decrement_inflight_streams(&self, peer: std::net::SocketAddr) {
-        if let Some(entry) = self
-            .inflight_streams_per_peer
-            .read_sync(&peer, |_, v| v.clone())
-        {
-            let prev = entry.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            debug_assert!(prev > 0, "inflight stream counter underflow for {peer}");
-            if prev == 1 {
-                // Best-effort GC: only drop when still observably 0.
-                // A concurrent admission may have re-incremented; the
-                // CAS-protected entry_sync re-creates the slot if so.
-                let _ = self
-                    .inflight_streams_per_peer
-                    .remove_if_sync(&peer, |v| v.load(std::sync::atomic::Ordering::Acquire) == 0);
-            }
-        }
-    }
-
-    fn reserve_inflight_stream_bytes(&self, bytes: usize) -> bool {
-        let mut current = self
-            .inflight_stream_bytes
-            .load(std::sync::atomic::Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_add(bytes) else {
-                return false;
-            };
-            if next > crate::MAX_INFLIGHT_STREAM_BYTES {
-                return false;
-            }
-            match self.inflight_stream_bytes.compare_exchange_weak(
-                current,
-                next,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    fn release_inflight_stream_bytes(&self, bytes: usize) {
-        let previous = self
-            .inflight_stream_bytes
-            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
-        debug_assert!(previous >= bytes, "global stream byte counter underflow");
-    }
-
-    /// Add a chunk to stream assembly
-    pub async fn add_stream_chunk(&self, header: crate::StreamHeader, chunk_data: Vec<u8>) {
-        let stream_id = header.stream_id;
-        let res = self.stream_assemblies.update_sync(
-            &stream_id,
-            |_, assembly| -> std::result::Result<(), &'static str> {
-                if header.total_size != assembly.header.total_size {
-                    return Err("Stream assembly total_size mismatch");
-                }
-
-                if header.chunk_size as usize != chunk_data.len() {
-                    return Err("Stream assembly chunk_size mismatch");
-                }
-
-                if assembly.chunk_stride.is_none() && header.chunk_size > 0 {
-                    assembly.chunk_stride = Some(header.chunk_size as usize);
-                }
-
-                // Drop duplicate chunks so received_bytes stays accurate
-                // and a hostile peer cannot inflate it via retransmits.
-                if assembly.received_indices.contains(&header.chunk_index) {
-                    return Ok(());
-                }
-
-                let stride = assembly.chunk_stride.unwrap_or(header.chunk_size as usize);
-                let offset = header.chunk_index as usize * stride;
-                let end = offset + chunk_data.len();
-                if end > assembly.header.total_size as usize {
-                    return Err("Stream assembly chunk overflow");
-                }
-
-                // CRITICAL_PATH: write chunk directly into final buffer.
-                assembly.buffer.as_mut_slice()[offset..end].copy_from_slice(&chunk_data);
-                assembly.received_bytes += chunk_data.len();
-                assembly.received_indices.insert(header.chunk_index);
-
-                Ok(())
-            },
-        );
-
-        match res {
-            Some(Ok(())) => {}
-            Some(Err(msg)) => {
-                warn!(
-                    stream_id = stream_id,
-                    msg = msg,
-                    "Stream assembly chunk rejected"
-                );
-            }
-            None => {
-                warn!(stream_id = stream_id, "Stream assembly not found for chunk");
-            }
-        }
-    }
-
-    /// Complete stream assembly and return the complete message with metadata
-    pub async fn complete_stream_assembly(&self, stream_id: u64) -> Option<StreamAssemblyResult> {
-        if let Some((_, assembly)) = self.stream_assemblies.remove_sync(&stream_id) {
-            // Release the per-peer admission slot regardless of
-            // whether the assembly is complete (incomplete completions
-            // still consumed admission at start_stream_assembly).
-            if let Some(peer) = assembly.peer_addr {
-                self.decrement_inflight_streams(peer);
-            }
-            self.release_inflight_stream_bytes(assembly.header.total_size as usize);
-
-            // Verify we have all chunks with proper gap detection
-            if !assembly.is_complete() {
-                warn!(
-                    stream_id = stream_id,
-                    received = assembly.received_indices.len(),
-                    "Incomplete stream assembly"
-                );
-                return None;
-            }
-
-            info!(
-                stream_id = stream_id,
-                total_size = assembly.header.total_size,
-                correlation_id = ?assembly.correlation_id,
-                "Completed stream assembly"
-            );
-
-            let complete = assembly.buffer.into_aligned_bytes();
-
-            Some(StreamAssemblyResult {
-                data: complete,
-                correlation_id: assembly.correlation_id,
-                peer_addr: assembly.peer_addr,
-                header: assembly.header,
-            })
-        } else {
-            warn!(
-                stream_id = stream_id,
-                "Stream assembly not found for completion"
-            );
-            None
-        }
-    }
-
     // =================== Peer Discovery Methods ===================
 
     /// Maximum size of peer list in gossip messages (resource exhaustion protection)
     pub const MAX_PEER_LIST_SIZE: usize = 1000;
-
-    /// Maximum number of simultaneous in-flight stream assemblies a single
-    /// peer may hold open. A buggy or malicious peer cannot exceed this
-    /// product of MAX_STREAM_SIZE × this cap in pooled buffer memory,
-    /// regardless of the stale-assembly TTL.
-    pub const MAX_INFLIGHT_STREAMS_PER_PEER: usize = 64;
 
     /// Create a snapshot of current peers for gossip
     /// Includes self (using advertised_address from config)
@@ -9147,26 +8497,6 @@ mod tests {
     }
 
     #[test]
-    fn enable_noise_auth_fails_closed_instead_of_silently_downgrading_to_plain_stream() {
-        let keypair = KeyPair::new_for_testing("noise-auth-registry");
-        let mut config = test_config();
-        config.key_pair = Some(keypair.clone());
-        let mut registry = GossipRegistry::<()>::new(test_addr(0), config);
-
-        let err = registry
-            .enable_noise_auth(keypair.to_secret_key())
-            .expect_err(
-                "enable_noise_auth must not silently deliver an unauthenticated connection",
-            );
-
-        assert!(
-            err.to_string()
-                .contains("Noise transport auth is not implemented"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn test_registry_change_serialization() {
         let location = test_location(test_addr(8080));
         let change = RegistryChange::ActorAdded {
@@ -9270,10 +8600,6 @@ mod tests {
                 sequence: 42,
                 wall_clock_time: 1_700_000_001,
             },
-            RegistryMessage::ImmediateAck {
-                actor_name: "fixture_actor".to_string(),
-                success: true,
-            },
             RegistryMessage::PeerHealthQuery {
                 sender: test_peer_id("fixture-peer-b"),
                 target_peer: test_peer_id("fixture-peer-c").to_string(),
@@ -9291,7 +8617,7 @@ mod tests {
         let digest = hex::encode(hasher.finalize());
         assert_eq!(
             digest,
-            "a5718d29d55eace0a7d5782622f04270358729cf3af11a07a3741755561c520f"
+            "410133a9bd50aee88fc0da1b30ece8a53313492dfcf3a8c4ff5f3048121c1d85"
         );
     }
 
@@ -10114,8 +9440,8 @@ mod tests {
         );
     }
 
-    /// Duplicate immediate deltas must not produce repeat `ImmediateAck`
-    /// frames. Regression for the devnet stratum trace where a single batch
+    /// Duplicate immediate deltas must be observably idempotent.
+    /// Regression for the devnet stratum trace where a single batch
     /// from sender `f4061522…` was delivered three times in ~130μs; the
     /// first delivery returned the immediate-priority names, the next two
     /// returned an empty list so the connection handler skipped the redundant
@@ -12549,6 +11875,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_dead_peers_reaps_clock_calibration_side_tables() {
+        // ACTOR_REM_2 R13(c): the per-peer clock-calibration tables must be
+        // reaped when a peer is cleaned up, or they leak one orphan per departed
+        // peer for the process lifetime.
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7160), config));
+        let dead_peer = test_peer_id("r13c-dead");
+        let dead_addr = test_addr(7161);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(
+                dead_addr,
+                PeerInfo {
+                    address: dead_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(dead_peer.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 1,
+                    last_sent_sequence: 1,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+        }
+
+        // Seed all three addr-keyed clock tables for the dead peer.
+        let _ = registry
+            .clock_probe_state
+            .upsert_sync(dead_addr, PeerClockProbeState { last_probe_sent_wall_ns: 1 });
+        let _ = registry.pending_clock_echoes.upsert_sync(
+            dead_addr,
+            PendingClockEcho {
+                sample_id: 1,
+                origin_sender_wall_ns: 1,
+                responder_recv_wall_ns: 2,
+            },
+        );
+        let _ = registry.peer_clock_snapshots.upsert_sync(
+            dead_addr,
+            PeerClockSnapshot {
+                peer_addr: dead_addr,
+                sample_id: 1,
+                offset_ns: 0,
+                rtt_ns: 1,
+                error_bound_ns: 0,
+                sampled_at_wall_ns: 1,
+                sample_count: 1,
+            },
+        );
+        assert!(registry.clock_probe_state.contains_sync(&dead_addr));
+
+        registry.cleanup_dead_peers().await;
+
+        assert!(
+            !registry.clock_probe_state.contains_sync(&dead_addr),
+            "R13(c): clock_probe_state leaked after peer cleanup"
+        );
+        assert!(
+            !registry.pending_clock_echoes.contains_sync(&dead_addr),
+            "R13(c): pending_clock_echoes leaked after peer cleanup"
+        );
+        assert!(
+            !registry.peer_clock_snapshots.contains_sync(&dead_addr),
+            "R13(c): peer_clock_snapshots leaked after peer cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_clock_echo_flushes_owed_echo_for_undialable_inbound_only_peer() {
+        // ACTOR_REM_2 R16i: a permanently inbound-only / NAT'd peer is never
+        // dialed outbound (`should_suppress_outbound_retry_for_peer`), so an echo
+        // owed from its probe never flushes via `gossip_extensions_for_outbound`.
+        // `take_clock_echo_for_undialable_peer` must hand that echo back so the
+        // caller can answer inline; for a dialable peer it must leave the echo
+        // queued for the normal outbound flush.
+        let mut config = test_config();
+        config.nat_role_reconnect_enabled = true;
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7180), config));
+
+        // Private-IP peer while we bind loopback => not practically dialable.
+        let nat_addr: SocketAddr = "10.44.0.9:9000".parse().unwrap();
+        // Loopback peer => dialable from our loopback bind.
+        let dialable_addr = test_addr(7181);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            for addr in [nat_addr, dialable_addr] {
+                state.peers.insert(
+                    addr,
+                    PeerInfo {
+                        address: addr,
+                        peer_address: None,
+                        inbound_observed: true,
+                        outbound_dial_success: false,
+                        node_id: None,
+                        dns_name: None,
+                        failures: 0,
+                        last_attempt: 0,
+                        last_success: 0,
+                        last_sequence: 0,
+                        last_sent_sequence: 0,
+                        consecutive_deltas: 0,
+                        last_failure_time: None,
+                        last_dns_refresh_attempt: None,
+                        last_response_received_ms: crate::current_timestamp_millis(),
+                    },
+                );
+            }
+        }
+
+        // Both peers owe an echo (they each just probed us).
+        for addr in [nat_addr, dialable_addr] {
+            let _ = registry.pending_clock_echoes.upsert_sync(
+                addr,
+                PendingClockEcho {
+                    sample_id: 42,
+                    origin_sender_wall_ns: 1_000,
+                    responder_recv_wall_ns: 1_200,
+                },
+            );
+        }
+
+        // Undialable inbound-only peer: echo is flushed inline.
+        let flushed = registry
+            .take_clock_echo_for_undialable_peer(nat_addr, 5_000)
+            .await
+            .expect("owed echo for an undialable inbound-only peer must be handed back");
+        let echo = flushed.clock_echo.expect("must carry the clock echo");
+        assert_eq!(echo.sample_id, 42);
+        assert_eq!(echo.origin_sender_wall_ns, 1_000);
+        assert_eq!(echo.responder_recv_wall_ns, 1_200);
+        assert_eq!(echo.responder_send_wall_ns, 5_000);
+        assert!(
+            flushed.clock_probe.is_none(),
+            "inline answer must not initiate a probe"
+        );
+        assert!(
+            !registry.pending_clock_echoes.contains_sync(&nat_addr),
+            "flushed echo must be consumed"
+        );
+
+        // Dialable peer: leave the echo queued for the normal outbound round.
+        assert!(
+            registry
+                .take_clock_echo_for_undialable_peer(dialable_addr, 5_000)
+                .await
+                .is_none(),
+            "a dialable peer's echo must remain queued for the outbound flush"
+        );
+        assert!(
+            registry.pending_clock_echoes.contains_sync(&dialable_addr),
+            "dialable peer's echo must not be consumed"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_dead_peers_does_not_prune_actor_that_moved_to_another_peer() {
         let mut config = test_config();
         config.dead_peer_timeout = Duration::from_millis(50);
@@ -12839,118 +12331,6 @@ mod tests {
         // (current implementation takes changes before checking for peers)
         let gossip_state = registry.gossip_state.lock().await;
         assert!(gossip_state.urgent_changes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_stream_assembly_copies_chunks_into_buffer() {
-        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
-
-        let header0 = crate::StreamHeader {
-            stream_id: 42,
-            total_size: 6,
-            chunk_size: 3,
-            chunk_index: 0,
-            type_hash: 0,
-            actor_id: 0,
-        };
-
-        registry.start_stream_assembly(header0, None, None).await;
-        registry.add_stream_chunk(header0, vec![1, 2, 3]).await;
-
-        let header1 = crate::StreamHeader {
-            chunk_index: 1,
-            ..header0
-        };
-        registry.add_stream_chunk(header1, vec![4, 5, 6]).await;
-
-        let result = registry
-            .complete_stream_assembly(header0.stream_id)
-            .await
-            .expect("stream assembly should complete");
-
-        assert_eq!(result.data.as_ref(), &[1, 2, 3, 4, 5, 6]);
-    }
-
-    #[tokio::test]
-    async fn stream_assembly_enforces_global_byte_budget_and_releases_on_completion() {
-        let registry = GossipRegistry::<()>::new(test_addr(8081), test_config());
-        registry.inflight_stream_bytes.store(
-            crate::MAX_INFLIGHT_STREAM_BYTES - 1,
-            std::sync::atomic::Ordering::Release,
-        );
-        let rejected = crate::StreamHeader {
-            stream_id: 991,
-            total_size: 2,
-            chunk_size: 0,
-            chunk_index: 0,
-            type_hash: 0,
-            actor_id: 0,
-        };
-        registry.start_stream_assembly(rejected, None, None).await;
-        assert!(registry.stream_assemblies.get_sync(&991).is_none());
-        assert_eq!(
-            registry
-                .inflight_stream_bytes
-                .load(std::sync::atomic::Ordering::Acquire),
-            crate::MAX_INFLIGHT_STREAM_BYTES - 1,
-            "rejected starts must not consume global bytes"
-        );
-
-        registry
-            .inflight_stream_bytes
-            .store(0, std::sync::atomic::Ordering::Release);
-        let accepted = crate::StreamHeader {
-            stream_id: 992,
-            total_size: 1,
-            chunk_size: 1,
-            chunk_index: 0,
-            type_hash: 0,
-            actor_id: 0,
-        };
-        registry.start_stream_assembly(accepted, None, None).await;
-        assert_eq!(
-            registry
-                .inflight_stream_bytes
-                .load(std::sync::atomic::Ordering::Acquire),
-            1
-        );
-        registry.add_stream_chunk(accepted, vec![7]).await;
-        assert!(
-            registry
-                .complete_stream_assembly(accepted.stream_id)
-                .await
-                .is_some()
-        );
-        assert_eq!(
-            registry
-                .inflight_stream_bytes
-                .load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "completion must release the global reservation"
-        );
-
-        let stale = crate::StreamHeader {
-            stream_id: 993,
-            total_size: 1,
-            chunk_size: 0,
-            chunk_index: 0,
-            type_hash: 0,
-            actor_id: 0,
-        };
-        registry.start_stream_assembly(stale, None, None).await;
-        registry
-            .stream_assemblies
-            .update_sync(&stale.stream_id, |_, assembly| {
-                assembly.started_at = Instant::now() - Duration::from_secs(61);
-            });
-        registry.cleanup_stale_stream_assemblies().await;
-        assert_eq!(
-            registry
-                .inflight_stream_bytes
-                .load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "stale cleanup must release the global reservation"
-        );
     }
 
     #[tokio::test]
@@ -14739,7 +14119,6 @@ mod tests {
             | RegistryMessage::PeerListGossip { timestamp, .. } => {
                 *timestamp = 0;
             }
-            RegistryMessage::ImmediateAck { .. } | RegistryMessage::ActorMessage { .. } => {}
         }
         msg
     }

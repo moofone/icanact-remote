@@ -5249,6 +5249,80 @@ async fn outbound_finalize_decision_snapshot_does_not_clear_fresh_session() {
     );
 }
 
+/// ACTOR_REM_2 R10: a concurrent `get_connection_by_peer_id` address-fallback
+/// can publish finalize's OWN provisionally-addr-indexed candidate into the peer
+/// session slot (out of band, via the non-CAS `publish_current_peer_connection`)
+/// exactly as finalize is about to publish it. Finalize's compare-and-publish
+/// then finds its own candidate installed as the slot value; without the fix it
+/// treated that as a "rival", re-resolved the address-blind tie-break against it,
+/// and — since a higher-NodeId local's own outbound is never the preferred
+/// direction — REJECTED and `abort_tasks()`d its own uncontested connection,
+/// returning `ConnectionExists` to the caller. The fix makes compare-and-publish
+/// recognize "the slot already holds THIS connection" as idempotent success.
+#[tokio::test]
+async fn outbound_finalize_does_not_abort_its_own_out_of_band_published_candidate() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("r10-hi", "r10-lo");
+    let remote_peer_id = lo_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let dial_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = {
+        let pool = pool.clone();
+        let peer = remote_peer_id.clone();
+        let fired = fired.clone();
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            if let crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                peer: event_peer,
+                ..
+            } = &event
+                && *event_peer == peer
+            {
+                fired.store(true, Ordering::Release);
+                // T1: the address fallback adopts finalize's own candidate
+                // (still only indexed by address at this instant) as the
+                // peer's session, out of band.
+                let _ = pool.get_connection_by_peer_id(&peer);
+            }
+        }))
+    };
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None)
+        .await;
+    drop(_guard);
+
+    assert!(
+        fired.load(Ordering::Acquire),
+        "test precondition: the outbound-finalize publish attempt must have fired"
+    );
+    assert!(
+        result.is_ok(),
+        "R10: finalize must accept its own out-of-band-published candidate, not \
+         re-resolve and abort it as a rival: got {result:?}"
+    );
+    let session = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        session.as_ref().is_some_and(|c| c.has_live_stream()),
+        "R10: the accepted candidate must remain the peer's live session, not aborted: \
+         got {session:?}"
+    );
+}
+
 /// RED (review finding P1, `transport_stream.rs` stale-rival branch): the
 /// `!alive` branch used to retire `existing_conn` by ADDRESS
 /// (`remove_connection(existing_conn.addr)`), never by `Arc` instance
@@ -6477,6 +6551,44 @@ fn idle_non_required_peer_session_is_pruned_without_orphaning_live_state() {
             .read_sync(&peer_id, |_, _| ())
             .is_some(),
         "session reclamation must not delete the independently owned route"
+    );
+}
+
+#[test]
+fn route_index_reclaims_superseded_identity_but_keeps_live_routes() {
+    // ACTOR_REM_2 R7: `peer_id_to_addr` must not grow unbounded under identity
+    // churn. When a NEW peer_id takes over an address (e.g. a pod restarting
+    // with a fresh key at the same endpoint), the old identity's route entry is
+    // reclaimed; a route whose address is not superseded is retained — the
+    // independent-route-authority invariant checked by the test above.
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(1));
+    let old = crate::KeyPair::new_for_testing("r7-old").peer_id();
+    let new = crate::KeyPair::new_for_testing("r7-new").peer_id();
+    let live = crate::KeyPair::new_for_testing("r7-live").peer_id();
+    let shared_addr: SocketAddr = "127.0.0.1:9311".parse().unwrap();
+    let live_addr: SocketAddr = "127.0.0.1:9312".parse().unwrap();
+
+    pool.set_discovered_peer_addr(&old, shared_addr);
+    pool.set_discovered_peer_addr(&live, live_addr);
+    assert!(pool.peer_id_to_addr.read_sync(&old, |_, _| ()).is_some());
+    assert!(pool.peer_id_to_addr.read_sync(&live, |_, _| ()).is_some());
+
+    // A new identity takes over `shared_addr` in the bounded address index.
+    let _ = pool.addr_to_peer_id.upsert_sync(shared_addr, new.clone());
+
+    pool.prune_idle_peer_sessions(); // runs reconcile_route_index
+
+    assert!(
+        pool.peer_id_to_addr.read_sync(&old, |_, _| ()).is_none(),
+        "R7: a route superseded by a new identity at the same addr must be reclaimed"
+    );
+    assert!(
+        pool.peer_id_to_addr.read_sync(&live, |_, _| ()).is_some(),
+        "a route whose address is not superseded must be retained"
+    );
+    assert!(
+        pool.peer_id_to_addr.read_sync(&new, |_, _| ()).is_none(),
+        "the superseding identity has no route entry it did not create"
     );
 }
 

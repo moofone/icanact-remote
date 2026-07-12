@@ -421,18 +421,6 @@ impl<T> RemoteActorRef<T> {
         })
     }
 
-    /// Create a new RemoteActorRef from location and connection
-    /// Note: This creates a RemoteActorRef without a registry reference (cannot auto-reconnect)
-    /// Prefer using `with_registry()` which is called by `lookup()`
-    pub fn new(location: RemoteActorLocation, connection: RemoteConnection) -> Self {
-        Self {
-            location,
-            connection: Some(connection),
-            registry: Weak::new(), // No registry reference - cannot reconnect
-            _marker: PhantomData,
-        }
-    }
-
     /// Create a new RemoteActorRef with optional connection and registry reference (for auto-reconnection)
     /// Called by `lookup()` - uses Weak to prevent reference cycles
     pub(crate) fn with_registry(
@@ -611,12 +599,23 @@ impl<T> RemoteActorRef<T> {
         }
         match result {
             Err(crate::GossipError::Timeout) => {
+                // ACTOR_REM_2 R11: the first ask consumed the entire budget, so
+                // the original `deadline` is already in the past. Running the
+                // evict+reconnect+retry recovery against it makes every
+                // `remaining_until(deadline)` return `Timeout`, so the retry was
+                // dead code and the documented `retry_actor_ask_once_after_timeout`
+                // never fired. Give the single retry a FRESH budget (the same
+                // configured `timeout`) so the reconnect and retry can actually
+                // run. (Note: the reconnected handle serves only this retry; it
+                // is not written back into the ref — persisting it across future
+                // calls is a separate change, F3.)
+                let retry_deadline = tokio::time::Instant::now() + timeout;
                 if let Some(reconnected) = self
-                    .recover_connection_after_actor_ask_timeout(deadline, conn)
+                    .recover_connection_after_actor_ask_timeout(retry_deadline, conn)
                     .await?
                 {
                     let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
-                    let remaining = Self::remaining_until(deadline)?;
+                    let remaining = Self::remaining_until(retry_deadline)?;
                     let retry_result = Self::ask_actor_frame_with_deadline(
                         &reconnected,
                         actor_id,

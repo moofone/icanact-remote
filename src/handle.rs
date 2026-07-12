@@ -160,7 +160,19 @@ impl<T> GossipRegistryHandle<T> {
                 //
                 // We set `SO_REUSEADDR` so tests and local dev can restart a server on the same
                 // port without spurious `AddrInUse` (common on macOS due to TIME_WAIT).
-                let listener = bind_with_reuseaddr(bind_addr)?;
+                //
+                // ACTOR_REM_2 R16j: `bind_with_reuseaddr` does a blocking
+                // std::thread::sleep backoff loop under sandbox EPERM (up to
+                // ~10 s). Run it on the blocking pool so an EPERM burst at
+                // startup cannot stall this async worker (which would freeze the
+                // whole executor on a single-thread runtime).
+                let listener = tokio::task::spawn_blocking(move || bind_with_reuseaddr(bind_addr))
+                    .await
+                    .map_err(|err| {
+                        GossipError::Network(std::io::Error::other(format!(
+                            "bind task failed to join: {err}"
+                        )))
+                    })??;
                 let actual_bind_addr = listener.local_addr()?;
                 (listener, actual_bind_addr)
             }
@@ -2895,17 +2907,6 @@ where
                 }
                 RegistryMessage::PeerHealthQuery { sender, .. } => (sender.to_hex(), None),
                 RegistryMessage::PeerHealthReport { reporter, .. } => (reporter.to_hex(), None),
-                RegistryMessage::ImmediateAck { .. } => {
-                    warn!("Received ImmediateAck as first message - cannot identify sender");
-                    return ConnectionCloseOutcome::Normal { node_id: None };
-                }
-                RegistryMessage::ActorMessage { .. } => {
-                    warn!(
-                        peer = %peer_addr,
-                        "Registry ActorMessage is no longer supported in v3; closing connection"
-                    );
-                    return ConnectionCloseOutcome::Normal { node_id: None };
-                }
                 RegistryMessage::PeerListGossip { sender_addr, .. } => (sender_addr.clone(), None),
             };
             (node_id, *correlation_id, bind_addr)
@@ -4092,6 +4093,17 @@ where
     reader.read_exact(&mut len_buf).await?;
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
+    // ACTOR_REM_2 R16g: reject zero-length frames before allocating/parsing, the
+    // same guard the live read path (read_pipeline.rs) already applies. Without
+    // it, a looping caller of this reader would spin on empty reads — a
+    // zero-length-frame livelock / DoS-amplification landmine.
+    if msg_len == 0 {
+        return Err(crate::GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zero-length frame rejected",
+        )));
+    }
+
     if msg_len > max_message_size {
         return Err(crate::GossipError::MessageTooLarge {
             size: msg_len,
@@ -4605,9 +4617,10 @@ mod framing_tests {
 
     #[tokio::test]
     async fn gossip_registry_payload_deserializes_from_aligned_buffer() {
-        let message = RegistryMessage::ImmediateAck {
-            actor_name: "test_actor".to_string(),
-            success: true,
+        let message = RegistryMessage::PeerListGossip {
+            peers: Vec::new(),
+            timestamp: 1_700_000_123,
+            sender_addr: "127.0.0.1:9200".to_string(),
         };
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&message).unwrap();
         let header = framing::write_gossip_frame_prefix(payload.len());
@@ -4619,12 +4632,13 @@ mod framing_tests {
             MessageReadResult::Gossip(parsed, correlation_id) => {
                 assert!(correlation_id.is_none());
                 match parsed {
-                    RegistryMessage::ImmediateAck {
-                        actor_name,
-                        success,
+                    RegistryMessage::PeerListGossip {
+                        timestamp,
+                        sender_addr,
+                        ..
                     } => {
-                        assert_eq!(actor_name, "test_actor");
-                        assert!(success);
+                        assert_eq!(timestamp, 1_700_000_123);
+                        assert_eq!(sender_addr, "127.0.0.1:9200");
                     }
                     other => panic!("unexpected gossip payload: {:?}", other),
                 }
