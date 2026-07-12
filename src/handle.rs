@@ -4092,6 +4092,17 @@ where
     reader.read_exact(&mut len_buf).await?;
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
+    // ACTOR_REM_2 R16g: reject zero-length frames before allocating/parsing, the
+    // same guard the live read path (read_pipeline.rs) already applies. Without
+    // it, a looping caller of this reader would spin on empty reads — a
+    // zero-length-frame livelock / DoS-amplification landmine.
+    if msg_len == 0 {
+        return Err(crate::GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zero-length frame rejected",
+        )));
+    }
+
     if msg_len > max_message_size {
         return Err(crate::GossipError::MessageTooLarge {
             size: msg_len,
