@@ -486,6 +486,14 @@ impl LockFreeStreamHandle {
         const OWNER_BATCH_SIZE: usize = 64;
         const READ_BATCH_LIMIT: usize = 2048;
         const ASK_READ_BATCH_LIMIT: usize = 8192;
+        // ACTOR_REM_2 R8: while a large stream is in flight, service the normal
+        // write queue after every ~256 KiB of stream data rather than draining
+        // the whole stream first, so latency-sensitive tell/ask/control frames
+        // are not starved behind a long stream (head-of-line blocking). The
+        // per-turn control-frame batch is kept small during active streaming so
+        // stream throughput stays dominant.
+        const STREAM_INTERLEAVE_BYTES: usize = 256 * 1024;
+        const STREAM_ACTIVE_WRITE_BATCH: usize = 16;
 
         let mut bytes_since_flush = 0;
 
@@ -514,6 +522,10 @@ impl LockFreeStreamHandle {
             response_batch.clear();
             direct_response_batch.clear();
 
+            // ACTOR_REM_2 R8: bound the stream chunks written per turn so the
+            // normal write queue below is serviced periodically instead of only
+            // after the whole stream drains.
+            let stream_turn_start = total_bytes_written;
             while let Some(cmd) = streaming_queue.pop() {
                 did_work = true;
                 match cmd {
@@ -645,9 +657,28 @@ impl LockFreeStreamHandle {
                     }
                 }
                 streaming_queue.notify_space();
+                if total_bytes_written.saturating_sub(stream_turn_start)
+                    >= STREAM_INTERLEAVE_BYTES
+                {
+                    // Yield to the normal write queue before writing more of the
+                    // stream (ACTOR_REM_2 R8). `did_work` stays true, so the
+                    // outer loop re-enters and resumes the stream next turn.
+                    break;
+                }
             }
 
-            if !streaming_active.load(Ordering::Acquire) {
+            // ACTOR_REM_2 R8: always service the normal write queue — even while
+            // a stream is active — so latency-sensitive frames interleave rather
+            // than being starved for the stream's whole duration. The batch is
+            // kept small during active streaming so the stream stays dominant;
+            // when the queue is empty (the common case mid-stream) this is a
+            // cheap no-op.
+            {
+                let write_batch_limit = if streaming_active.load(Ordering::Acquire) {
+                    STREAM_ACTIVE_WRITE_BATCH
+                } else {
+                    OWNER_BATCH_SIZE
+                };
                 // Reuse pre-allocated buffers instead of creating new ones
                 write_chunks.clear();
                 owner_batch.clear();
@@ -658,7 +689,7 @@ impl LockFreeStreamHandle {
                     owner_batch.push(cmd);
                 }
 
-                while owner_batch.len() < OWNER_BATCH_SIZE {
+                while owner_batch.len() < write_batch_limit {
                     match write_queue.pop() {
                         Some(command) => owner_batch.push(command),
                         None => break,

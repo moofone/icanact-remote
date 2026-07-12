@@ -207,6 +207,106 @@ fn test_streaming_request_large_payload() {
     });
 }
 
+/// ACTOR_REM_2 R8 before/after benchmark: measure small-ask latency while a
+/// large outbound stream is in flight (the head-of-line-blocking scenario), and
+/// the large stream's own throughput. Prints metrics; asserts no throughput
+/// regression and that ask latency stays bounded. Run with `--nocapture`.
+#[test]
+fn bench_ask_latency_and_throughput_under_large_stream() {
+    run_streaming_test("r8-hol-bench", || async {
+        use std::time::Instant;
+        init_tracing();
+
+        let addr_a: SocketAddr = "127.0.0.1:7971".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:7972".parse().unwrap();
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("r8_bench_a", "r8_bench_b");
+        let peer_id_b = key_pair_b.peer_id();
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            ..Default::default()
+        };
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handler = Arc::new(AskTestHandler {
+            message_received: AtomicBool::new(false),
+            payload_size: AtomicU32::new(0),
+        });
+        handle_b.registry.set_actor_message_handler(handler).await;
+        let peer_b = handle_a.add_peer(&peer_id_b).await;
+        peer_b.connect(&addr_b).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        let conn = Arc::new(handle_a.lookup_address(addr_b).await.unwrap());
+
+        // Warm the connection.
+        let _ = conn.ask(Bytes::from_static(b"warm")).await.unwrap();
+
+        // Task A: stream a large payload repeatedly to keep the write path busy.
+        const STREAM_BYTES: usize = 48 * 1024 * 1024;
+        const STREAM_REPEATS: usize = 4;
+        let stream_conn = Arc::clone(&conn);
+        let stream_task = tokio::spawn(async move {
+            let payload = Bytes::from(create_test_payload(STREAM_BYTES));
+            let start = Instant::now();
+            for _ in 0..STREAM_REPEATS {
+                stream_conn
+                    .ask_streaming_bytes(payload.clone(), 0, 0, Duration::from_secs(60))
+                    .await
+                    .unwrap();
+            }
+            start.elapsed()
+        });
+
+        // Task B: fire small asks while the stream is in flight; record latency.
+        sleep(Duration::from_millis(5)).await;
+        let mut latencies = Vec::new();
+        for _ in 0..40 {
+            let t0 = Instant::now();
+            let _ = conn.ask(Bytes::from_static(b"ping-small")).await.unwrap();
+            latencies.push(t0.elapsed());
+            sleep(Duration::from_millis(1)).await;
+        }
+
+        let stream_elapsed = stream_task.await.unwrap();
+        latencies.sort();
+        let p50 = latencies[latencies.len() / 2];
+        let p99 = latencies[(latencies.len() * 99 / 100).min(latencies.len() - 1)];
+        let max = *latencies.last().unwrap();
+        let total_mb = (STREAM_BYTES * STREAM_REPEATS) as f64 / (1024.0 * 1024.0);
+        let mbps = total_mb / stream_elapsed.as_secs_f64();
+        eprintln!(
+            "R8 BENCH: stream {:.0} MB in {:?} = {:.0} MB/s | ask latency during stream p50={:?} p99={:?} max={:?}",
+            total_mb, stream_elapsed, mbps, p50, p99, max
+        );
+
+        // Guardrails: stream must sustain real throughput (no collapse) and the
+        // small ask must not be starved for seconds behind the stream.
+        assert!(mbps > 50.0, "stream throughput collapsed: {mbps:.0} MB/s");
+        assert!(
+            max < Duration::from_secs(2),
+            "ask starved behind stream: max latency {max:?}"
+        );
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+    });
+}
+
 /// Test zero-copy streaming request with Bytes
 #[test]
 fn test_streaming_request_zero_copy() {
