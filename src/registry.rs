@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -8,13 +7,11 @@ use std::{
 use tokio::task::AbortHandle;
 
 use arc_swap::ArcSwapOption;
-use futures::future::{BoxFuture, poll_fn};
-use futures::task::AtomicWaker;
+use futures::future::BoxFuture;
 use lru::LruCache;
 use scc::HashMap as SccHashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use rand::seq::SliceRandom;
@@ -942,99 +939,6 @@ pub struct PendingFailure {
     pub query_sent: bool,
 }
 
-/// Pending ACK state for synchronous registrations.
-///
-/// This avoids `tokio::sync::oneshot` and does not require holding any locks while awaiting
-/// a network callback.
-#[derive(Debug)]
-pub struct PendingAck {
-    // 0 = pending, 1 = success, 2 = failure, 3 = canceled (timeout/shutdown).
-    state: AtomicU8,
-    waker: AtomicWaker,
-}
-
-impl PendingAck {
-    const PENDING: u8 = 0;
-    const SUCCESS: u8 = 1;
-    const FAILURE: u8 = 2;
-    const CANCELED: u8 = 3;
-
-    pub fn new() -> Self {
-        Self {
-            state: AtomicU8::new(Self::PENDING),
-            waker: AtomicWaker::new(),
-        }
-    }
-
-    /// Completes the ACK (idempotent). Late completions after `cancel()` are ignored.
-    pub fn complete(&self, success: bool) {
-        let target = if success {
-            Self::SUCCESS
-        } else {
-            Self::FAILURE
-        };
-        let _ =
-            self.state
-                .compare_exchange(Self::PENDING, target, Ordering::AcqRel, Ordering::Acquire);
-        self.waker.wake();
-    }
-
-    /// Cancels the ACK (idempotent), typically used when timing out.
-    pub fn cancel(&self) {
-        let _ = self.state.compare_exchange(
-            Self::PENDING,
-            Self::CANCELED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.waker.wake();
-    }
-
-    /// Wait for completion. Returns `Some(success)` when completed, or `None` if canceled.
-    pub async fn wait(&self) -> Option<bool> {
-        poll_fn(|cx| self.poll_wait(cx)).await
-    }
-
-    fn poll_wait(&self, cx: &mut Context<'_>) -> Poll<Option<bool>> {
-        match self.state.load(Ordering::Acquire) {
-            Self::SUCCESS => return Poll::Ready(Some(true)),
-            Self::FAILURE => return Poll::Ready(Some(false)),
-            Self::CANCELED => return Poll::Ready(None),
-            _ => {}
-        }
-
-        self.waker.register(cx.waker());
-
-        match self.state.load(Ordering::Acquire) {
-            Self::SUCCESS => Poll::Ready(Some(true)),
-            Self::FAILURE => Poll::Ready(Some(false)),
-            Self::CANCELED => Poll::Ready(None),
-            _ => Poll::Pending,
-        }
-    }
-}
-
-/// RAII drop guard for a `pending_acks` entry. Ensures the entry is
-/// removed from the map and the `PendingAck` is cancelled even when the
-/// owning future is dropped before completing (caller cancellation,
-/// shutdown). Without this the entry leaks for the lifetime of the
-/// process.
-struct PendingAckGuard {
-    map: Arc<SccHashMap<String, Arc<PendingAck>>>,
-    name: String,
-    pending: Arc<PendingAck>,
-}
-
-impl Drop for PendingAckGuard {
-    fn drop(&mut self) {
-        let _ = self.map.remove_sync(self.name.as_str());
-        // Idempotent: completes() are no-ops if PendingAck already in a
-        // terminal state, so signalling cancellation here unblocks any
-        // sibling waiter without overwriting a real outcome.
-        self.pending.cancel();
-    }
-}
-
 /// Message types for the gossip protocol
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 #[repr(u8)]
@@ -1082,8 +986,6 @@ pub enum RegistryMessage {
         peer_statuses: Vec<(String, PeerHealthStatus)>, // Use Vec for rkyv serialization
         timestamp: u64,
     } = 5,
-    /// Lightweight ACK for immediate registrations
-    ImmediateAck { actor_name: String, success: bool } = 6,
     /// Query for peer health consensus
     PeerHealthQuery {
         sender: crate::PeerId,
@@ -1451,9 +1353,6 @@ pub struct GossipRegistry<T = ()> {
     /// out after their liveness window so restart churn cannot retain them.
     peer_liveness_status: Arc<SccHashMap<crate::PeerId, PeerLivenessStatus>>,
 
-    // Pending ACKs for synchronous registrations (bounded, lock-free map).
-    pub pending_acks: Arc<SccHashMap<String, Arc<PendingAck>>>,
-
     /// Tracks the currently-running peer discovery dial task (H-004).
     pub discovery_task: Arc<DiscoveryTaskTracker>,
     peer_gossip_notify: Arc<Notify>,
@@ -1681,7 +1580,6 @@ impl<T: 'static> GossipRegistry<T> {
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_status: Arc::new(SccHashMap::default()),
-            pending_acks: Arc::new(SccHashMap::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
             peer_gossip_notify: Arc::new(Notify::new()),
             dns_resolver: Arc::new(tokio::sync::RwLock::new(Arc::new(
@@ -3282,10 +3180,9 @@ impl<T: 'static> GossipRegistry<T> {
     /// Apply delta changes from a peer.
     ///
     /// Returns the names of immediate-priority `ActorAdded` changes that were
-    /// actually applied (i.e. passed vector-clock conflict resolution). Used
-    /// by the receive path to decide whether to send `ImmediateAck`: a
-    /// duplicate delta whose contents were all suppressed must not generate
-    /// fresh acks.
+    /// actually applied (i.e. passed vector-clock conflict resolution).
+    /// Duplicate deltas whose contents were all suppressed return an empty
+    /// list, making delta application observably idempotent.
     pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<Vec<String>> {
         self.apply_delta_from(delta, None).await
     }
@@ -8665,10 +8562,6 @@ mod tests {
                 sequence: 42,
                 wall_clock_time: 1_700_000_001,
             },
-            RegistryMessage::ImmediateAck {
-                actor_name: "fixture_actor".to_string(),
-                success: true,
-            },
             RegistryMessage::PeerHealthQuery {
                 sender: test_peer_id("fixture-peer-b"),
                 target_peer: test_peer_id("fixture-peer-c").to_string(),
@@ -8686,7 +8579,7 @@ mod tests {
         let digest = hex::encode(hasher.finalize());
         assert_eq!(
             digest,
-            "a5718d29d55eace0a7d5782622f04270358729cf3af11a07a3741755561c520f"
+            "410133a9bd50aee88fc0da1b30ece8a53313492dfcf3a8c4ff5f3048121c1d85"
         );
     }
 
@@ -9509,8 +9402,8 @@ mod tests {
         );
     }
 
-    /// Duplicate immediate deltas must not produce repeat `ImmediateAck`
-    /// frames. Regression for the devnet stratum trace where a single batch
+    /// Duplicate immediate deltas must be observably idempotent.
+    /// Regression for the devnet stratum trace where a single batch
     /// from sender `f4061522…` was delivered three times in ~130μs; the
     /// first delivery returned the immediate-priority names, the next two
     /// returned an empty list so the connection handler skipped the redundant
@@ -14100,7 +13993,6 @@ mod tests {
             | RegistryMessage::PeerListGossip { timestamp, .. } => {
                 *timestamp = 0;
             }
-            RegistryMessage::ImmediateAck { .. } => {}
         }
         msg
     }

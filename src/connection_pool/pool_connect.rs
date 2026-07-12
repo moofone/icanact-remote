@@ -3943,47 +3943,11 @@ pub(crate) fn handle_incoming_message(
                 // multiple conflict-resolution implementations depending on lock contention,
                 // which could cause nodes to diverge.
                 //
-                // Only ACK immediate-priority actor additions that actually
-                // mutated local state. Duplicate deltas (same vector clock or
-                // already-tombstoned) return an empty list, so we don't emit
-                // redundant `ImmediateAck` frames for senders that broadcast
-                // the same change more than once.
-                //
                 // `_peer_addr` is the verified socket address of the
                 // connection this delta arrived on — the §1.6 trust anchor
                 // for advertised-address repair (outranks configured/
                 // discovered route state, which may be stale).
-                let immediate_actors = registry.apply_delta_from(delta, Some(_peer_addr)).await?;
-
-                // NEW: Send ACK back for immediate registrations
-                if !immediate_actors.is_empty() {
-                    // Send ACKs for immediate priority actor additions
-                    // Use lock-free send since we're responding on the same connection
-                    for actor_name in immediate_actors {
-                        // Send lightweight ACK immediately
-                        let ack = crate::registry::RegistryMessage::ImmediateAck {
-                            actor_name: actor_name.clone(),
-                            success: true,
-                        };
-
-                        // Serialize and send
-                        if let Ok(serialized) = rkyv::to_bytes::<rkyv::rancor::Error>(&ack) {
-                            let pool = &registry.connection_pool;
-                            let payload = bytes::Bytes::from_owner(serialized);
-                            let header = bytes::Bytes::copy_from_slice(
-                                &framing::write_gossip_frame_prefix(payload.len()),
-                            );
-                            // Use send_lock_free_parts to send directly without copying payload bytes.
-                            if let Err(e) =
-                                pool.send_lock_free_parts(sender_socket_addr, header, payload)
-                            {
-                                warn!("Failed to send ImmediateAck: {}", e);
-                            } else {
-                                info!("Sent ImmediateAck for actor '{}'", actor_name);
-                            }
-                        }
-                    }
-                }
+                registry.apply_delta_from(delta, Some(_peer_addr)).await?;
 
                 // Note: Response will be sent during regular gossip rounds
                 Ok(())
@@ -4628,34 +4592,6 @@ pub(crate) fn handle_incoming_message(
 
                 Ok(())
             }
-            RegistryMessage::ImmediateAck {
-                actor_name,
-                success,
-            } => {
-                debug!(
-                    actor_name = %actor_name,
-                    success = success,
-                    "received immediate ACK for synchronous registration"
-                );
-
-                // Look up and complete the pending ACK waiter for this actor.
-                if let Some((_, pending)) = registry.pending_acks.remove_sync(&actor_name) {
-                    pending.complete(success);
-                    info!(
-                        actor_name = %actor_name,
-                        success = success,
-                        "✅ Completed ACK for waiting synchronous registration"
-                    );
-                } else {
-                    debug!(
-                        actor_name = %actor_name,
-                        "Received ACK but no pending registration found (may have timed out)"
-                    );
-                }
-
-                Ok(())
-            }
-
             RegistryMessage::PeerListGossip {
                 peers,
                 timestamp,

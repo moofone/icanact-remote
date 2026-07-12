@@ -2895,10 +2895,6 @@ where
                 }
                 RegistryMessage::PeerHealthQuery { sender, .. } => (sender.to_hex(), None),
                 RegistryMessage::PeerHealthReport { reporter, .. } => (reporter.to_hex(), None),
-                RegistryMessage::ImmediateAck { .. } => {
-                    warn!("Received ImmediateAck as first message - cannot identify sender");
-                    return ConnectionCloseOutcome::Normal { node_id: None };
-                }
                 RegistryMessage::PeerListGossip { sender_addr, .. } => (sender_addr.clone(), None),
             };
             (node_id, *correlation_id, bind_addr)
@@ -4609,9 +4605,10 @@ mod framing_tests {
 
     #[tokio::test]
     async fn gossip_registry_payload_deserializes_from_aligned_buffer() {
-        let message = RegistryMessage::ImmediateAck {
-            actor_name: "test_actor".to_string(),
-            success: true,
+        let message = RegistryMessage::PeerListGossip {
+            peers: Vec::new(),
+            timestamp: 1_700_000_123,
+            sender_addr: "127.0.0.1:9200".to_string(),
         };
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&message).unwrap();
         let header = framing::write_gossip_frame_prefix(payload.len());
@@ -4623,12 +4620,13 @@ mod framing_tests {
             MessageReadResult::Gossip(parsed, correlation_id) => {
                 assert!(correlation_id.is_none());
                 match parsed {
-                    RegistryMessage::ImmediateAck {
-                        actor_name,
-                        success,
+                    RegistryMessage::PeerListGossip {
+                        timestamp,
+                        sender_addr,
+                        ..
                     } => {
-                        assert_eq!(actor_name, "test_actor");
-                        assert!(success);
+                        assert_eq!(timestamp, 1_700_000_123);
+                        assert_eq!(sender_addr, "127.0.0.1:9200");
                     }
                     other => panic!("unexpected gossip payload: {:?}", other),
                 }
