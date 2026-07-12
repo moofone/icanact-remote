@@ -964,6 +964,17 @@ impl RoutedPubSub {
                 next_routes.insert(topic, Arc::new(routable));
             }
         }
+        // ACTOR_REM_2 R13(b): the conns cache is cloned forward each tick and
+        // only next-hops in the current interest set are visited above, so a
+        // peer that stops being any topic's next-hop would be carried forever.
+        // Retain only next-hops referenced by a current route (they are
+        // re-added by the loop above when interest and a live connection
+        // return), keeping the cache bounded by live routes, not history.
+        let live_next_hops: std::collections::HashSet<PeerId> = next_routes
+            .values()
+            .flat_map(|groups| groups.keys().cloned())
+            .collect();
+        next_conns.retain(|next_hop, _| live_next_hops.contains(next_hop));
         self.refresh_hot_route_groups(&next_routes, &next_conns);
         self.route_groups.store(Arc::new(next_routes));
         self.conns.store(Arc::new(next_conns));
