@@ -1,3 +1,13 @@
+/// ACTOR_REM_2 R16f: milliseconds from a process-global monotonic start, stored
+/// in `last_used` for LRU eviction. Monotonic (never steps backward), unlike the
+/// wall-clock `current_timestamp()` it replaces there.
+fn monotonic_now_millis() -> usize {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as usize
+}
+
 /// Stream frame types for high-performance streaming protocol
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,8 +181,13 @@ impl LockFreeConnection {
     }
 
     pub fn update_last_used(&self) {
+        // ACTOR_REM_2 R16f: `last_used` feeds `select_lru_eviction_victim`, which
+        // only ever compares these values against each other. Use a MONOTONIC
+        // clock so a backward wall-clock step (NTP correction) cannot make a
+        // recently-used connection look like the least-recently-used eviction
+        // victim. `last_touched` in pool_index already uses a monotonic Instant.
         self.last_used
-            .store(crate::current_timestamp() as usize, Ordering::Release);
+            .store(monotonic_now_millis(), Ordering::Release);
     }
 
     pub fn increment_failure_count(&self) -> usize {
