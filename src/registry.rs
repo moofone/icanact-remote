@@ -1734,6 +1734,18 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Remove stored capabilities for a peer (e.g., when connection closes)
+    /// ACTOR_REM_2 R13(c): reap the per-peer clock-calibration side tables when
+    /// a peer is removed. These addr-keyed tables (probe state, pending echoes,
+    /// and the calibration snapshot) were the only per-peer tables NOT threaded
+    /// through the dead-peer / eviction / DNS-migration cleanups, so they leaked
+    /// one orphan per departed peer for the process lifetime. `pending_clock_
+    /// probes` is sample-id-keyed and already age-reaped, so it is not included.
+    pub(crate) fn remove_clock_state_for_addr(&self, addr: &SocketAddr) {
+        let _ = self.clock_probe_state.remove_sync(addr);
+        let _ = self.pending_clock_echoes.remove_sync(addr);
+        let _ = self.peer_clock_snapshots.remove_sync(addr);
+    }
+
     pub fn clear_peer_capabilities(&self, addr: &SocketAddr) {
         let _ = self.peer_capabilities.remove_sync(addr);
         if let Some((_, node_id)) = self.peer_capability_addr_to_node.remove_sync(addr) {
@@ -2842,6 +2854,12 @@ impl<T: 'static> GossipRegistry<T> {
                 "DNS refresh: migrated peer_capability_addr_to_node"
             );
         }
+
+        // ACTOR_REM_2 R13(c): drop the old address's clock-calibration state on a
+        // DNS migration. Calibration (RTT / clock offset) is specific to the
+        // endpoint, so the new address must be re-probed rather than inheriting
+        // stale samples; not removing it also leaks the old-addr entries.
+        self.remove_clock_state_for_addr(&peer_addr);
 
         Some(new_addr)
     }
@@ -5158,6 +5176,7 @@ impl<T: 'static> GossipRegistry<T> {
             // tables that have their own locks.
             for peer_addr in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
+                self.remove_clock_state_for_addr(peer_addr);
             }
         }
     }
@@ -6384,6 +6403,7 @@ impl<T: 'static> GossipRegistry<T> {
         if !evicted_addrs.is_empty() {
             for addr in &evicted_addrs {
                 self.clear_peer_capabilities(addr);
+                self.remove_clock_state_for_addr(addr);
             }
         }
     }
@@ -11927,6 +11947,84 @@ mod tests {
         assert_eq!(
             got.peer_id, fresh.peer_id,
             "stale delta must not overwrite actor ownership that changed while it waited for gossip_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_dead_peers_reaps_clock_calibration_side_tables() {
+        // ACTOR_REM_2 R13(c): the per-peer clock-calibration tables must be
+        // reaped when a peer is cleaned up, or they leak one orphan per departed
+        // peer for the process lifetime.
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7160), config));
+        let dead_peer = test_peer_id("r13c-dead");
+        let dead_addr = test_addr(7161);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(
+                dead_addr,
+                PeerInfo {
+                    address: dead_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(dead_peer.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 1,
+                    last_sent_sequence: 1,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+        }
+
+        // Seed all three addr-keyed clock tables for the dead peer.
+        let _ = registry
+            .clock_probe_state
+            .upsert_sync(dead_addr, PeerClockProbeState { last_probe_sent_wall_ns: 1 });
+        let _ = registry.pending_clock_echoes.upsert_sync(
+            dead_addr,
+            PendingClockEcho {
+                sample_id: 1,
+                origin_sender_wall_ns: 1,
+                responder_recv_wall_ns: 2,
+            },
+        );
+        let _ = registry.peer_clock_snapshots.upsert_sync(
+            dead_addr,
+            PeerClockSnapshot {
+                peer_addr: dead_addr,
+                sample_id: 1,
+                offset_ns: 0,
+                rtt_ns: 1,
+                error_bound_ns: 0,
+                sampled_at_wall_ns: 1,
+                sample_count: 1,
+            },
+        );
+        assert!(registry.clock_probe_state.contains_sync(&dead_addr));
+
+        registry.cleanup_dead_peers().await;
+
+        assert!(
+            !registry.clock_probe_state.contains_sync(&dead_addr),
+            "R13(c): clock_probe_state leaked after peer cleanup"
+        );
+        assert!(
+            !registry.pending_clock_echoes.contains_sync(&dead_addr),
+            "R13(c): pending_clock_echoes leaked after peer cleanup"
+        );
+        assert!(
+            !registry.peer_clock_snapshots.contains_sync(&dead_addr),
+            "R13(c): peer_clock_snapshots leaked after peer cleanup"
         );
     }
 
