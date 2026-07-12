@@ -1822,6 +1822,44 @@ impl<T: 'static> GossipRegistry<T> {
         (!extensions.is_empty()).then_some(extensions)
     }
 
+    /// ACTOR_REM_2 R16i: If we owe `peer_addr` a clock echo (it probed us) *and*
+    /// we will never send it a scheduled outbound gossip round — because outbound
+    /// retry to it is suppressed (inbound-only / NAT'd, not dialable from here) —
+    /// consume and return the owed echo so the caller can answer inline on the
+    /// connection the probe arrived on. Returns `None` (leaving the echo queued
+    /// for the normal outbound flush) for peers we do dial, and never initiates a
+    /// probe, so it has no probe-scheduling side effects. Without this, a
+    /// permanently inbound-only peer's owed echo waits forever for an outbound
+    /// round that `should_suppress_outbound_retry_for_peer` prevents.
+    pub async fn take_clock_echo_for_undialable_peer(
+        &self,
+        peer_addr: SocketAddr,
+        send_wall_ns: u64,
+    ) -> Option<GossipExtensionsV1> {
+        if !self.pending_clock_echoes.contains_sync(&peer_addr) {
+            return None;
+        }
+        let peer_info = {
+            let gossip_state = self.gossip_state.lock().await;
+            gossip_state.peers.get(&peer_addr).cloned()
+        };
+        let suppressed = peer_info
+            .map(|peer| self.should_suppress_outbound_retry_for_peer(&peer))
+            .unwrap_or(false);
+        if !suppressed {
+            return None;
+        }
+        let (_, pending) = self.pending_clock_echoes.remove_sync(&peer_addr)?;
+        let mut extensions = GossipExtensionsV1::default();
+        extensions.clock_echo = Some(ClockEchoV1 {
+            sample_id: pending.sample_id,
+            origin_sender_wall_ns: pending.origin_sender_wall_ns,
+            responder_recv_wall_ns: pending.responder_recv_wall_ns,
+            responder_send_wall_ns: send_wall_ns,
+        });
+        Some(extensions)
+    }
+
     pub fn record_inbound_gossip_extensions(
         &self,
         peer_addr: SocketAddr,
@@ -11911,6 +11949,94 @@ mod tests {
         assert!(
             !registry.peer_clock_snapshots.contains_sync(&dead_addr),
             "R13(c): peer_clock_snapshots leaked after peer cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_clock_echo_flushes_owed_echo_for_undialable_inbound_only_peer() {
+        // ACTOR_REM_2 R16i: a permanently inbound-only / NAT'd peer is never
+        // dialed outbound (`should_suppress_outbound_retry_for_peer`), so an echo
+        // owed from its probe never flushes via `gossip_extensions_for_outbound`.
+        // `take_clock_echo_for_undialable_peer` must hand that echo back so the
+        // caller can answer inline; for a dialable peer it must leave the echo
+        // queued for the normal outbound flush.
+        let mut config = test_config();
+        config.nat_role_reconnect_enabled = true;
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7180), config));
+
+        // Private-IP peer while we bind loopback => not practically dialable.
+        let nat_addr: SocketAddr = "10.44.0.9:9000".parse().unwrap();
+        // Loopback peer => dialable from our loopback bind.
+        let dialable_addr = test_addr(7181);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            for addr in [nat_addr, dialable_addr] {
+                state.peers.insert(
+                    addr,
+                    PeerInfo {
+                        address: addr,
+                        peer_address: None,
+                        inbound_observed: true,
+                        outbound_dial_success: false,
+                        node_id: None,
+                        dns_name: None,
+                        failures: 0,
+                        last_attempt: 0,
+                        last_success: 0,
+                        last_sequence: 0,
+                        last_sent_sequence: 0,
+                        consecutive_deltas: 0,
+                        last_failure_time: None,
+                        last_dns_refresh_attempt: None,
+                        last_response_received_ms: crate::current_timestamp_millis(),
+                    },
+                );
+            }
+        }
+
+        // Both peers owe an echo (they each just probed us).
+        for addr in [nat_addr, dialable_addr] {
+            let _ = registry.pending_clock_echoes.upsert_sync(
+                addr,
+                PendingClockEcho {
+                    sample_id: 42,
+                    origin_sender_wall_ns: 1_000,
+                    responder_recv_wall_ns: 1_200,
+                },
+            );
+        }
+
+        // Undialable inbound-only peer: echo is flushed inline.
+        let flushed = registry
+            .take_clock_echo_for_undialable_peer(nat_addr, 5_000)
+            .await
+            .expect("owed echo for an undialable inbound-only peer must be handed back");
+        let echo = flushed.clock_echo.expect("must carry the clock echo");
+        assert_eq!(echo.sample_id, 42);
+        assert_eq!(echo.origin_sender_wall_ns, 1_000);
+        assert_eq!(echo.responder_recv_wall_ns, 1_200);
+        assert_eq!(echo.responder_send_wall_ns, 5_000);
+        assert!(
+            flushed.clock_probe.is_none(),
+            "inline answer must not initiate a probe"
+        );
+        assert!(
+            !registry.pending_clock_echoes.contains_sync(&nat_addr),
+            "flushed echo must be consumed"
+        );
+
+        // Dialable peer: leave the echo queued for the normal outbound round.
+        assert!(
+            registry
+                .take_clock_echo_for_undialable_peer(dialable_addr, 5_000)
+                .await
+                .is_none(),
+            "a dialable peer's echo must remain queued for the outbound flush"
+        );
+        assert!(
+            registry.pending_clock_echoes.contains_sync(&dialable_addr),
+            "dialable peer's echo must not be consumed"
         );
     }
 

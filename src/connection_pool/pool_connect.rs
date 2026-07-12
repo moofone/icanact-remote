@@ -3822,6 +3822,58 @@ async fn resolve_peer_state_addr(
     socket_addr
 }
 
+/// R16i: answer an inbound-only / NAT'd peer's clock probe inline on the
+/// connection it arrived on. Such a peer is never dialed outbound, so the owed
+/// echo would otherwise never be flushed by a scheduled gossip round. The
+/// carrier is an empty-changes `DeltaGossipResponse`; the receiver processes
+/// its `extensions` (the echo) exactly as it does for any delta response, and
+/// the empty change set is a no-op for actor state.
+async fn answer_inbound_clock_probe(
+    registry: &Arc<GossipRegistry>,
+    peer_id: &crate::PeerId,
+    peer_addr: SocketAddr,
+    extensions: crate::registry::GossipExtensionsV1,
+) {
+    let current_sequence = {
+        let gossip_state = registry.gossip_state.lock().await;
+        gossip_state.gossip_sequence
+    };
+    let response = RegistryMessage::DeltaGossipResponse {
+        delta: crate::registry::RegistryDelta {
+            since_sequence: current_sequence,
+            current_sequence,
+            changes: Vec::new(),
+            sender_peer_id: registry.peer_id.clone(),
+            wall_clock_time: crate::current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        },
+        extensions: Some(extensions),
+    };
+    let response_data = match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(error = %e, "R16i: failed to serialize inline clock-echo response");
+            return;
+        }
+    };
+    let payload = bytes::Bytes::from_owner(response_data);
+    let header =
+        bytes::Bytes::copy_from_slice(&framing::write_gossip_frame_prefix(payload.len()));
+    let pool = &registry.connection_pool;
+    let send_result = match pool.send_to_peer_id_parts(peer_id, header, payload.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let fallback_header = bytes::Bytes::copy_from_slice(
+                &framing::write_gossip_frame_prefix(payload.len()),
+            );
+            pool.send_lock_free_parts(peer_addr, fallback_header, payload)
+        }
+    };
+    if let Err(e) = send_result {
+        debug!(peer = %peer_addr, error = %e, "R16i: could not answer inbound clock probe inline");
+    }
+}
+
 /// Handle an incoming message on a bidirectional connection
 pub(crate) fn handle_incoming_message(
     registry: Arc<GossipRegistry>,
@@ -3947,9 +3999,32 @@ pub(crate) fn handle_incoming_message(
                 // connection this delta arrived on — the §1.6 trust anchor
                 // for advertised-address repair (outranks configured/
                 // discovered route state, which may be stale).
+                let sender_peer_id = delta.sender_peer_id.clone();
                 registry.apply_delta_from(delta, Some(_peer_addr)).await?;
 
-                // Note: Response will be sent during regular gossip rounds
+                // R16i: An inbound-only / NAT'd peer we never dial outbound will
+                // never receive a scheduled gossip round from us, so a clock echo
+                // owed from its probe (recorded above) would wait forever. Answer
+                // it inline on the connection it arrived on. `take_clock_echo_*`
+                // returns `None` for peers we do dial, so normal peers still flush
+                // the echo on their next outbound round (no extra traffic).
+                if let Some(extensions) = registry
+                    .take_clock_echo_for_undialable_peer(
+                        sender_socket_addr,
+                        crate::current_timestamp_nanos(),
+                    )
+                    .await
+                {
+                    answer_inbound_clock_probe(
+                        &registry,
+                        &sender_peer_id,
+                        sender_socket_addr,
+                        extensions,
+                    )
+                    .await;
+                }
+
+                // Note: the actor-state response is sent during regular gossip rounds
                 Ok(())
             }
             RegistryMessage::FullSync {
