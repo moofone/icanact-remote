@@ -68,11 +68,14 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
 
     let delivered = Arc::new(AtomicU64::new(0));
     let delivered_clone = Arc::clone(&delivered);
-    pubsub.subscribe_type_bytes(BenchMsg::TYPE_HASH, move |_topic, payload| {
-        if let Ok(msg) = icanact_remote::decode_typed::<BenchMsg>(payload.as_ref()) {
-            delivered_clone.fetch_add(msg.v, Ordering::Relaxed);
-        }
-    });
+    // RAII subscription handle: must stay bound for the remaining benches;
+    // dropping it would unsubscribe immediately.
+    let _type_subscription =
+        pubsub.subscribe_type_bytes(BenchMsg::TYPE_HASH, move |_topic, payload| {
+            if let Ok(msg) = icanact_remote::decode_typed::<BenchMsg>(payload.as_ref()) {
+                delivered_clone.fetch_add(msg.v, Ordering::Relaxed);
+            }
+        });
 
     c.bench_function("pubsub_local_type_delivery", |b| {
         b.iter(|| {

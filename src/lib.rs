@@ -86,9 +86,9 @@ pub use lifecycle::{
 };
 pub use priority::RegistrationPriority;
 pub use pubsub::{
-    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameMetadata, PubSubFrameV1,
-    PubSubIngressHandler, PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope,
-    PubSubSubscription, RoutedPubSub, topic_key,
+    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameMetadata, PubSubIngressHandler,
+    PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope, PubSubSubscription,
+    RoutedPubSub, topic_key,
 };
 pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;

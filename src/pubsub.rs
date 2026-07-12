@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -42,6 +42,7 @@ struct BorrowedSubscriberEntry {
 }
 #[derive(Clone)]
 struct TypeSubscriberEntry {
+    id: u64,
     worker: Arc<SubscriberWorker<(u64, Bytes)>>,
 }
 type SubscriberMap = HashMap<SubscriberKey, Arc<[SubscriberEntry]>>;
@@ -198,14 +199,14 @@ impl BorrowedSubscriberEntry {
 }
 
 impl TypeSubscriberEntry {
-    fn new<F>(runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
+    fn new<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
     where
         F: Fn(u64, Bytes) + Send + Sync + 'static,
     {
         let worker = spawn_subscriber_worker(runtime, move |(topic_key, payload)| {
             deliver(topic_key, payload)
         });
-        Self { worker }
+        Self { id, worker }
     }
 
     #[inline]
@@ -326,42 +327,6 @@ impl PubSubIngressCounters {
     }
 }
 
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug)]
-pub struct PubSubFrameV1 {
-    pub topic_key: u64,
-    pub type_hash: u64,
-    pub msg_id: u128,
-    pub origin_peer_id: PeerId,
-    pub source_peer_id: PeerId,
-    pub hops_remaining: u8,
-    pub mode: PubSubDeliveryMode,
-    pub destination_peers: Vec<PeerId>,
-    pub payload: Vec<u8>,
-}
-
-const PUBSUB_FRAME_V1_WIRE_NAME: &str = "icanact-remote.pubsub.Frame/v1";
-crate::wire_type!(PubSubFrameV1, PUBSUB_FRAME_V1_WIRE_NAME);
-
-#[derive(Archive, RkyvSerialize)]
-struct PubSubFrameV1Encode<'a> {
-    topic_key: u64,
-    type_hash: u64,
-    msg_id: u128,
-    origin_peer_id: PeerId,
-    source_peer_id: PeerId,
-    hops_remaining: u8,
-    mode: PubSubDeliveryMode,
-    #[rkyv(with = rkyv::with::AsVec)]
-    destination_peers: &'a [PeerId],
-    #[rkyv(with = rkyv::with::AsVec)]
-    payload: &'a [u8],
-}
-
-impl<'a> crate::WireType for PubSubFrameV1Encode<'a> {
-    const TYPE_HASH: u64 = crate::typed::fnv1a_hash(PUBSUB_FRAME_V1_WIRE_NAME);
-    const TYPE_NAME: &'static str = PUBSUB_FRAME_V1_WIRE_NAME;
-}
-
 pub trait PubSubIngressHandler: Send + Sync {
     fn handle_pubsub_frame(
         &self,
@@ -392,18 +357,49 @@ pub trait PubSubRouteProvider: Send + Sync {
     ) -> HashMap<PeerId, Arc<[PeerId]>>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct PubSubSubscription {
-    topic_key: u64,
-    type_hash: u64,
-    id: u64,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionKind {
+    Owned { topic_key: u64, type_hash: u64 },
+    Borrowed { topic_key: u64, type_hash: u64 },
+    Type { type_hash: u64 },
 }
 
-#[derive(Clone, Debug)]
-pub struct PubSubBorrowedSubscription {
-    topic_key: u64,
-    type_hash: u64,
+/// RAII handle for a routed-pubsub subscription (ACTOR_REM_2 R13a).
+///
+/// Dropping the handle unsubscribes: the subscriber entry is removed from the
+/// map and its worker task is torn down. Holding the handle does NOT keep the
+/// [`RoutedPubSub`] engine alive — it holds only a `Weak` back-reference, so
+/// engine shutdown is never blocked by a forgotten handle.
+///
+/// Explicit [`RoutedPubSub::unsubscribe`] consumes the handle and is
+/// idempotent with `Drop` (release happens exactly once, guarded by an
+/// atomic flag).
+#[derive(Debug)]
+pub struct PubSubSubscription {
+    kind: SubscriptionKind,
     id: u64,
+    pubsub: Weak<RoutedPubSub>,
+    released: AtomicBool,
+}
+
+impl PubSubSubscription {
+    /// Removes the subscription exactly once. Returns whether an entry was
+    /// actually removed (false on second release or when the engine is gone).
+    fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let Some(pubsub) = self.pubsub.upgrade() else {
+            return false;
+        };
+        pubsub.remove_subscription(self.kind, self.id)
+    }
+}
+
+impl Drop for PubSubSubscription {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[derive(Default)]
@@ -413,6 +409,10 @@ struct InterestState {
 }
 
 pub struct RoutedPubSub {
+    /// Back-reference handed to RAII subscription handles so their `Drop`
+    /// can unsubscribe without keeping the engine alive. Always set: every
+    /// constructor goes through `Arc::new_cyclic`.
+    weak_self: Weak<RoutedPubSub>,
     registry: Arc<crate::registry::GossipRegistry>,
     client: crate::GossipClient,
     local_peer_id: PeerId,
@@ -439,7 +439,8 @@ impl RoutedPubSub {
             FAST_FRAME_POOL_BUFFER_CAPACITY,
         );
         let msg_id_epoch = new_msg_id_epoch(&registry.peer_id);
-        let this = Arc::new(Self {
+        let this = Arc::new_cyclic(|weak_self| Self {
+            weak_self: Weak::clone(weak_self),
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
             registry,
@@ -493,11 +494,13 @@ impl RoutedPubSub {
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
         self.note_interest(topic_key, true);
-        PubSubSubscription {
-            topic_key,
-            type_hash,
+        self.make_handle(
+            SubscriptionKind::Owned {
+                topic_key,
+                type_hash,
+            },
             id,
-        }
+        )
     }
 
     pub fn subscribe_borrowed_bytes(
@@ -505,7 +508,7 @@ impl RoutedPubSub {
         topic_key: u64,
         type_hash: u64,
         deliver: impl Fn(&[u8]) + Send + Sync + 'static,
-    ) -> PubSubBorrowedSubscription {
+    ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
@@ -517,11 +520,13 @@ impl RoutedPubSub {
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
         self.note_interest(topic_key, true);
-        PubSubBorrowedSubscription {
-            topic_key,
-            type_hash,
+        self.make_handle(
+            SubscriptionKind::Borrowed {
+                topic_key,
+                type_hash,
+            },
             id,
-        }
+        )
     }
 
     pub fn subscribe_borrowed_bytes_with_metadata(
@@ -529,7 +534,7 @@ impl RoutedPubSub {
         topic_key: u64,
         type_hash: u64,
         deliver: impl Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
-    ) -> PubSubBorrowedSubscription {
+    ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
@@ -541,18 +546,20 @@ impl RoutedPubSub {
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
         self.note_interest(topic_key, true);
-        PubSubBorrowedSubscription {
-            topic_key,
-            type_hash,
+        self.make_handle(
+            SubscriptionKind::Borrowed {
+                topic_key,
+                type_hash,
+            },
             id,
-        }
+        )
     }
 
     pub fn subscribe_type_bytes(
         &self,
         type_hash: u64,
         deliver: impl Fn(u64, Bytes) + Send + Sync + 'static,
-    ) -> u64 {
+    ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let mut next = (*self.type_subscribers.load_full()).clone();
         let mut subs = next
@@ -560,14 +567,45 @@ impl RoutedPubSub {
             .map(|subs| subs.to_vec())
             .unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
-        subs.push(TypeSubscriberEntry::new(runtime.as_ref(), deliver));
+        subs.push(TypeSubscriberEntry::new(id, runtime.as_ref(), deliver));
         next.insert(type_hash, Arc::from(subs.into_boxed_slice()));
         self.type_subscribers.store(Arc::new(next));
-        id
+        self.make_handle(SubscriptionKind::Type { type_hash }, id)
     }
 
+    fn make_handle(&self, kind: SubscriptionKind, id: u64) -> PubSubSubscription {
+        PubSubSubscription {
+            kind,
+            id,
+            pubsub: Weak::clone(&self.weak_self),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Explicitly releases a subscription. Consumes the handle; equivalent to
+    /// dropping it, and idempotent with `Drop` (the handle's release flag
+    /// guarantees the removal runs at most once). Returns whether a live
+    /// subscription entry was removed.
     pub fn unsubscribe(&self, sub: PubSubSubscription) -> bool {
-        let key = (sub.topic_key, sub.type_hash);
+        sub.release()
+    }
+
+    fn remove_subscription(&self, kind: SubscriptionKind, id: u64) -> bool {
+        match kind {
+            SubscriptionKind::Owned {
+                topic_key,
+                type_hash,
+            } => self.remove_owned_subscriber(topic_key, type_hash, id),
+            SubscriptionKind::Borrowed {
+                topic_key,
+                type_hash,
+            } => self.remove_borrowed_subscriber(topic_key, type_hash, id),
+            SubscriptionKind::Type { type_hash } => self.remove_type_subscriber(type_hash, id),
+        }
+    }
+
+    fn remove_owned_subscriber(&self, topic_key: u64, type_hash: u64, id: u64) -> bool {
+        let key = (topic_key, type_hash);
         let current = self.subscribers.load_full();
         let Some(existing) = current.get(&key) else {
             return false;
@@ -577,7 +615,7 @@ impl RoutedPubSub {
         }
         let mut next = current.as_ref().clone();
         let mut topic_subs = existing.to_vec();
-        let Some(pos) = topic_subs.iter().position(|entry| entry.id == sub.id) else {
+        let Some(pos) = topic_subs.iter().position(|entry| entry.id == id) else {
             return false;
         };
         topic_subs.remove(pos);
@@ -587,12 +625,12 @@ impl RoutedPubSub {
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
         self.subscribers.store(Arc::new(next));
-        self.note_interest(sub.topic_key, false);
+        self.note_interest(topic_key, false);
         true
     }
 
-    pub fn unsubscribe_borrowed(&self, sub: PubSubBorrowedSubscription) -> bool {
-        let key = (sub.topic_key, sub.type_hash);
+    fn remove_borrowed_subscriber(&self, topic_key: u64, type_hash: u64, id: u64) -> bool {
+        let key = (topic_key, type_hash);
         let current = self.borrowed_subscribers.load_full();
         let Some(existing) = current.get(&key) else {
             return false;
@@ -602,7 +640,7 @@ impl RoutedPubSub {
         }
         let mut next = current.as_ref().clone();
         let mut topic_subs = existing.to_vec();
-        let Some(pos) = topic_subs.iter().position(|entry| entry.id == sub.id) else {
+        let Some(pos) = topic_subs.iter().position(|entry| entry.id == id) else {
             return false;
         };
         topic_subs.remove(pos);
@@ -616,7 +654,27 @@ impl RoutedPubSub {
             self.refresh_hot_borrowed_subscriber(key, &[]);
         }
         self.borrowed_subscribers.store(Arc::new(next));
-        self.note_interest(sub.topic_key, false);
+        self.note_interest(topic_key, false);
+        true
+    }
+
+    fn remove_type_subscriber(&self, type_hash: u64, id: u64) -> bool {
+        let current = self.type_subscribers.load_full();
+        let Some(existing) = current.get(&type_hash) else {
+            return false;
+        };
+        let Some(pos) = existing.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let mut next = current.as_ref().clone();
+        let mut subs = existing.to_vec();
+        subs.remove(pos);
+        if subs.is_empty() {
+            next.remove(&type_hash);
+        } else {
+            next.insert(type_hash, Arc::from(subs.into_boxed_slice()));
+        }
+        self.type_subscribers.store(Arc::new(next));
         true
     }
 
@@ -1171,10 +1229,6 @@ impl RoutedPubSub {
         Err(GossipError::ActorNotFound("missing pubsub next-hop".into()))
     }
 
-    fn try_send_next_hop(&self, next_hop: &PeerId, frame: Bytes) -> Result<()> {
-        self.lookup_next_hop_conn(next_hop)?.try_pubsub_frame(frame)
-    }
-
     fn try_send_next_hop_pooled(
         &self,
         next_hop: &PeerId,
@@ -1299,11 +1353,6 @@ impl RoutedPubSub {
         });
     }
 
-    fn accept_seen(&self, origin: &PeerId, msg_id: u128) -> bool {
-        let fingerprint = seen_fingerprint(origin, msg_id);
-        self.accept_seen_fingerprint(fingerprint)
-    }
-
     fn accept_seen_bytes(&self, origin: &[u8; 32], msg_id: u128) -> bool {
         let fingerprint = seen_fingerprint_bytes(origin, msg_id);
         self.accept_seen_fingerprint(fingerprint)
@@ -1340,11 +1389,16 @@ impl PubSubIngressHandler for RoutedPubSub {
             return self.handle_fast_pubsub_frame(authenticated_source_peer_id, payload);
         }
 
-        let owned = crate::AlignedBytes::from_pooled_slice(
-            payload,
-            Arc::new(crate::AlignedBytesPool::default()),
+        // Only PSF1 fast frames exist on the wire; the legacy rkyv
+        // `PubSubFrameV1` decode shim was removed (zero-back-compat policy).
+        // Anything else is dropped with a decode stat.
+        self.counters.decode_drops.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            source = %authenticated_source_peer_id,
+            len = payload.len(),
+            "dropping unrecognized pubsub frame (not PSF1; legacy rkyv V1 frames unsupported)"
         );
-        self.handle_pubsub_frame(authenticated_source_peer_id, owned)
+        Ok(())
     }
 
     fn handle_pubsub_frame(
@@ -1352,106 +1406,7 @@ impl PubSubIngressHandler for RoutedPubSub {
         authenticated_source_peer_id: &PeerId,
         payload: crate::AlignedBytes,
     ) -> Result<()> {
-        if payload.as_ref().starts_with(FAST_FRAME_MAGIC) {
-            return self.handle_fast_pubsub_frame(authenticated_source_peer_id, payload.as_ref());
-        }
-
-        let frame = match crate::decode_typed::<PubSubFrameV1>(payload.as_ref()) {
-            Ok(frame) => frame,
-            Err(err) => {
-                self.counters.decode_drops.fetch_add(1, Ordering::Relaxed);
-                return Err(err);
-            }
-        };
-        if frame.hops_remaining == 0 {
-            self.counters.ttl_drops.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        if frame.source_peer_id != *authenticated_source_peer_id {
-            self.counters
-                .reflection_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        if frame.origin_peer_id == self.local_peer_id || frame.source_peer_id == self.local_peer_id
-        {
-            self.counters
-                .reflection_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        if !self.accept_seen(&frame.origin_peer_id, frame.msg_id) {
-            self.counters
-                .duplicate_drops
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        self.counters.accepted.fetch_add(1, Ordering::Relaxed);
-
-        if frame
-            .destination_peers
-            .iter()
-            .any(|peer| peer == &self.local_peer_id)
-        {
-            let delivered = self.deliver_local(
-                frame.topic_key,
-                frame.type_hash,
-                Bytes::from(frame.payload.clone()),
-            );
-            self.counters
-                .delivered_local
-                .fetch_add(delivered as u64, Ordering::Relaxed);
-        }
-
-        if frame.hops_remaining <= 1 {
-            return Ok(());
-        }
-        let remaining: Vec<PeerId> = frame
-            .destination_peers
-            .iter()
-            .filter(|peer| *peer != &self.local_peer_id)
-            .cloned()
-            .collect();
-        if remaining.is_empty() {
-            return Ok(());
-        }
-        let grouped = if let Some(provider) = self.route_provider.load().as_ref() {
-            provider.group_destinations(frame.topic_key, &remaining)
-        } else {
-            remaining
-                .into_iter()
-                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                .collect()
-        };
-        for (next_hop, peers) in grouped {
-            let encoded = encode_frame(
-                frame.topic_key,
-                frame.type_hash,
-                frame.msg_id,
-                frame.origin_peer_id.clone(),
-                self.local_peer_id.clone(),
-                frame.hops_remaining.saturating_sub(1),
-                frame.mode,
-                peers.as_ref(),
-                frame.payload.as_ref(),
-            )?;
-            match self.try_send_next_hop(&next_hop, encoded) {
-                Ok(()) => {
-                    self.counters
-                        .forwarded_frames
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(GossipError::WriteQueueFull) => {
-                    self.counters
-                        .queue_full_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(err) => {
-                    warn!(error = %err, "failed to forward routed pubsub frame");
-                }
-            }
-        }
-        Ok(())
+        self.handle_pubsub_frame_borrowed(authenticated_source_peer_id, payload.as_ref())
     }
 }
 
@@ -1579,31 +1534,6 @@ impl RoutedPubSub {
     }
 }
 
-fn encode_frame(
-    topic_key: u64,
-    type_hash: u64,
-    msg_id: u128,
-    origin_peer_id: PeerId,
-    source_peer_id: PeerId,
-    hops_remaining: u8,
-    mode: PubSubDeliveryMode,
-    destination_peers: &[PeerId],
-    payload: &[u8],
-) -> Result<Bytes> {
-    let frame = PubSubFrameV1Encode {
-        topic_key,
-        type_hash,
-        msg_id,
-        origin_peer_id,
-        source_peer_id,
-        hops_remaining,
-        mode,
-        destination_peers,
-        payload,
-    };
-    crate::encode_typed(&frame)
-}
-
 struct FastFrameView<'a> {
     topic_key: u64,
     type_hash: u64,
@@ -1716,10 +1646,6 @@ fn fnv1a_hash_bytes_with_seed(bytes: &[u8], seed: u64) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
-}
-
-fn seen_fingerprint(origin: &PeerId, msg_id: u128) -> u64 {
-    seen_fingerprint_bytes(origin.as_bytes(), msg_id)
 }
 
 fn seen_fingerprint_bytes(origin: &[u8; 32], msg_id: u128) -> u64 {
@@ -1884,7 +1810,7 @@ mod tests {
     use super::*;
     use bytes::Buf;
 
-    fn test_pubsub(registry_peer_seed: &str) -> RoutedPubSub {
+    fn test_pubsub(registry_peer_seed: &str) -> Arc<RoutedPubSub> {
         crate::typed::prewarm_pooled_byte_buffers(
             FAST_FRAME_POOL_BUFFERS,
             FAST_FRAME_POOL_BUFFER_CAPACITY,
@@ -1896,7 +1822,8 @@ mod tests {
             config,
         ));
         let msg_id_epoch = new_msg_id_epoch(&registry.peer_id);
-        RoutedPubSub {
+        Arc::new_cyclic(|weak_self| RoutedPubSub {
+            weak_self: Weak::clone(weak_self),
             local_peer_id: registry.peer_id.clone(),
             client: crate::GossipClient::from_registry(Arc::clone(&registry)),
             registry,
@@ -1914,7 +1841,7 @@ mod tests {
             msg_id_epoch,
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
-        }
+        })
     }
 
     fn add_test_subscriber<F>(pubsub: &RoutedPubSub, topic: u64, type_hash: u64, deliver: F)
@@ -2180,7 +2107,7 @@ mod tests {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started_for_subscriber = Arc::clone(&started);
         let release_for_subscriber = Arc::clone(&release);
-        pubsub.subscribe_bytes(topic, type_hash, move |_| {
+        let _subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
             started_for_subscriber.store(true, Ordering::Release);
             while !release_for_subscriber.load(Ordering::Acquire) {
                 std::thread::park_timeout(Duration::from_millis(1));
@@ -2234,7 +2161,7 @@ mod tests {
         let type_hash = 204;
         let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delivered_for_subscriber = Arc::clone(&delivered);
-        pubsub.subscribe_bytes(topic, type_hash, move |_| {
+        let _subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
             delivered_for_subscriber.store(true, Ordering::Release);
         });
 
@@ -2265,31 +2192,130 @@ mod tests {
         assert_eq!(parse_interest_name(&name), Some((topic, peer)));
     }
 
-    #[cfg_attr(
-        feature = "strict-zero-copy",
-        ignore = "legacy copying encoder is rejected"
-    )]
-    #[test]
-    fn pubsub_frame_v1_borrowed_encoder_is_wire_compatible() {
-        let peer = crate::KeyPair::new_for_testing("pubsub-frame").peer_id();
-        let payload = Bytes::from_static(b"hello");
-        let encoded = encode_frame(
-            7,
-            9,
-            11,
-            peer.clone(),
-            peer.clone(),
-            3,
-            PubSubDeliveryMode::AtMostOnce,
-            std::slice::from_ref(&peer),
-            payload.as_ref(),
-        )
-        .unwrap();
-        let decoded = crate::decode_typed::<PubSubFrameV1>(encoded.as_ref()).unwrap();
-        assert_eq!(decoded.topic_key, 7);
-        assert_eq!(decoded.type_hash, 9);
-        assert_eq!(decoded.msg_id, 11);
-        assert_eq!(decoded.destination_peers, vec![peer]);
-        assert_eq!(decoded.payload, b"hello");
+    #[tokio::test]
+    async fn dropping_subscription_handle_unsubscribes_and_releases_worker() {
+        let pubsub = test_pubsub("pubsub-raii-drop");
+        let topic = topic_key("raii-drop");
+        let type_hash = 301;
+        let captured = Arc::new(());
+        let weak_callback = Arc::downgrade(&captured);
+        let captured_by_callback = Arc::clone(&captured);
+        let subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            let _keepalive = &captured_by_callback;
+        });
+        drop(captured);
+        assert!(pubsub.subscribers.load().contains_key(&(topic, type_hash)));
+
+        drop(subscription);
+        assert!(
+            !pubsub.subscribers.load().contains_key(&(topic, type_hash)),
+            "dropping the RAII handle must remove the subscriber entry"
+        );
+        assert!(
+            !pubsub
+                .interest_state
+                .lock()
+                .unwrap()
+                .local_counts
+                .contains_key(&topic),
+            "dropping the RAII handle must release topic interest"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak_callback.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the RAII handle must tear down the subscriber worker");
+    }
+
+    #[tokio::test]
+    async fn dropping_handles_unsubscribes_every_variant() {
+        let pubsub = test_pubsub("pubsub-raii-all-variants");
+        let topic = topic_key("raii-all-variants");
+        let type_hash = 302;
+
+        let borrowed = pubsub.subscribe_borrowed_bytes(topic, type_hash, |_| {});
+        let borrowed_meta =
+            pubsub.subscribe_borrowed_bytes_with_metadata(topic, type_hash, |_, _| {});
+        let typed = pubsub.subscribe_type_bytes(type_hash, |_, _| {});
+        assert_eq!(
+            pubsub
+                .borrowed_subscribers
+                .load()
+                .get(&(topic, type_hash))
+                .map(|subs| subs.len()),
+            Some(2)
+        );
+        assert!(pubsub.type_subscribers.load().contains_key(&type_hash));
+
+        drop(borrowed);
+        drop(borrowed_meta);
+        drop(typed);
+        assert!(
+            !pubsub
+                .borrowed_subscribers
+                .load()
+                .contains_key(&(topic, type_hash)),
+            "dropping borrowed handles must remove borrowed subscriber entries"
+        );
+        assert!(
+            pubsub.hot_borrowed_subscriber.load().is_none(),
+            "dropping the final borrowed handle must clear the hot subscriber cache"
+        );
+        assert!(
+            !pubsub.type_subscribers.load().contains_key(&type_hash),
+            "dropping the type handle must remove the type subscriber entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_unsubscribe_is_idempotent_with_drop() {
+        let pubsub = test_pubsub("pubsub-raii-idempotent");
+        let topic = topic_key("raii-idempotent");
+        let type_hash = 303;
+        let subscription = pubsub.subscribe_bytes(topic, type_hash, |_| {});
+        assert!(pubsub.unsubscribe(subscription));
+        // `unsubscribe` consumed the handle; its Drop ran after release() had
+        // already fired and must not have removed anything twice. A fresh
+        // subscription proves the interest counter did not underflow.
+        let second = pubsub.subscribe_bytes(topic, type_hash, |_| {});
+        assert_eq!(
+            pubsub
+                .interest_state
+                .lock()
+                .unwrap()
+                .local_counts
+                .get(&topic),
+            Some(&1)
+        );
+        assert!(pubsub.unsubscribe(second));
+    }
+
+    #[tokio::test]
+    async fn subscription_handle_does_not_keep_pubsub_alive() {
+        let pubsub = test_pubsub("pubsub-raii-weak");
+        let weak = Arc::downgrade(&pubsub);
+        let subscription = pubsub.subscribe_bytes(topic_key("raii-weak"), 304, |_| {});
+        drop(pubsub);
+        assert!(
+            weak.upgrade().is_none(),
+            "a subscription handle must hold only a Weak back-reference"
+        );
+        // Dropping the handle after the engine is gone must be a no-op.
+        drop(subscription);
+    }
+
+    #[tokio::test]
+    async fn non_psf1_frame_is_dropped_with_decode_stat() {
+        let pubsub = test_pubsub("pubsub-legacy-frame-drop");
+        let source = crate::KeyPair::new_for_testing("pubsub-legacy-source").peer_id();
+        pubsub
+            .handle_pubsub_frame_borrowed(&source, b"not-a-psf1-frame")
+            .expect("unrecognized frames are dropped, not errored");
+        let stats = pubsub.stats();
+        assert_eq!(stats.decode_drops, 1);
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.delivered_local, 0);
     }
 }

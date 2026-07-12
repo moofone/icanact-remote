@@ -9,7 +9,7 @@ use bytes::{Buf, Bytes};
 use criterion::{Criterion, criterion_group, criterion_main};
 use icanact_remote::{
     BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PubSubDeliveryPolicy,
-    PubSubScope, RoutedPubSub, WireType, topic_key,
+    PubSubScope, PubSubSubscription, RoutedPubSub, WireType, topic_key,
 };
 
 const TOPIC: &str = "icemining.job-broadcast.v1.bench";
@@ -75,6 +75,9 @@ struct BenchMesh {
     _subscriber: GossipRegistryHandle,
     publisher_pubsub: Arc<RoutedPubSub>,
     _subscriber_pubsub: Arc<RoutedPubSub>,
+    /// RAII subscription handle: dropping it unsubscribes, so it must live as
+    /// long as the mesh.
+    _subscription: PubSubSubscription,
     delivered: Arc<AtomicU64>,
     checksum: Arc<AtomicU64>,
 }
@@ -124,21 +127,25 @@ async fn setup_mesh(decode_on_receive: bool) -> Arc<BenchMesh> {
     let topic = topic_key(TOPIC);
     let delivered_for_sub = Arc::clone(&delivered);
     let checksum_for_sub = Arc::clone(&checksum);
-    subscriber_pubsub.subscribe_borrowed_bytes(topic, JobBroadcastV1::TYPE_HASH, move |payload| {
-        if decode_on_receive {
-            let msg = icanact_remote::decode_typed::<JobBroadcastV1>(payload).unwrap();
-            checksum_for_sub.fetch_add(
-                msg.epoch ^ msg.job_id ^ msg.proxy_published_at_ns ^ u64::from(msg.coin_id),
-                Ordering::Relaxed,
-            );
-        } else {
-            checksum_for_sub.fetch_add(
-                payload.len() as u64 + u64::from(payload.first().copied().unwrap_or_default()),
-                Ordering::Relaxed,
-            );
-        }
-        delivered_for_sub.fetch_add(1, Ordering::Release);
-    });
+    let subscription = subscriber_pubsub.subscribe_borrowed_bytes(
+        topic,
+        JobBroadcastV1::TYPE_HASH,
+        move |payload| {
+            if decode_on_receive {
+                let msg = icanact_remote::decode_typed::<JobBroadcastV1>(payload).unwrap();
+                checksum_for_sub.fetch_add(
+                    msg.epoch ^ msg.job_id ^ msg.proxy_published_at_ns ^ u64::from(msg.coin_id),
+                    Ordering::Relaxed,
+                );
+            } else {
+                checksum_for_sub.fetch_add(
+                    payload.len() as u64 + u64::from(payload.first().copied().unwrap_or_default()),
+                    Ordering::Relaxed,
+                );
+            }
+            delivered_for_sub.fetch_add(1, Ordering::Release);
+        },
+    );
 
     let peer = publisher.add_peer(&subscriber.registry.peer_id).await;
     peer.connect(&subscriber.registry.bind_addr).await.unwrap();
@@ -148,6 +155,7 @@ async fn setup_mesh(decode_on_receive: bool) -> Arc<BenchMesh> {
         _subscriber: subscriber,
         publisher_pubsub,
         _subscriber_pubsub: subscriber_pubsub,
+        _subscription: subscription,
         delivered,
         checksum,
     });
