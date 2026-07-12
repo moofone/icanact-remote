@@ -231,6 +231,22 @@ impl StreamingState {
             ))
         })?;
 
+        // ACTOR_REM_2 R9: the buffer is pre-allocated (zero-filled) to the
+        // declared `total_size`. A StreamEnd that arrives before every byte was
+        // received must NOT deliver that partially-filled buffer as if it were a
+        // complete message — a malicious peer (StreamStart(N) then an immediate
+        // StreamEnd) or a sender that aborts mid-transfer would otherwise inject
+        // zero-padded / truncated payloads. Reject the incomplete assembly.
+        if (stream.received_size as u64) < stream.total_size {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "stream_id={} finalized incomplete: {} of {} bytes received",
+                    stream_id, stream.received_size, stream.total_size
+                ),
+            )));
+        }
+
         let correlation_id = stream.correlation_id;
         let schema_hash = stream.schema_hash;
         let complete_data = stream.buffer.into_aligned_bytes().into_bytes();
@@ -977,6 +993,74 @@ mod tests {
         assert_eq!(assembled.0.as_ref(), b"abcdefgh");
         assert_eq!(assembled.1, 9);
         assert_eq!(assembled.2, None);
+    }
+
+    #[test]
+    fn finalize_incomplete_stream_is_rejected() {
+        // ACTOR_REM_2 R9: a StreamEnd arriving before all declared bytes are
+        // received must NOT deliver the pre-allocated, zero-padded buffer as a
+        // complete message.
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let start = crate::StreamHeader {
+            stream_id: 7,
+            total_size: 8,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 1,
+            actor_id: 2,
+        };
+        state
+            .start_stream_with_correlation(start, 3, pool.clone(), None)
+            .unwrap();
+
+        // Only 4 of the declared 8 bytes are delivered.
+        let chunk0 = crate::StreamHeader {
+            stream_id: 7,
+            total_size: 8,
+            chunk_size: 4,
+            chunk_index: 0,
+            type_hash: 1,
+            actor_id: 2,
+        };
+        assert!(
+            state
+                .add_chunk_with_correlation(chunk0, Bytes::from_static(b"abcd"), None)
+                .unwrap()
+                .is_none(),
+            "a 4-of-8 stream is not complete"
+        );
+
+        // StreamEnd (finalize) arrives early: must error, not deliver padding.
+        assert!(
+            state.finalize_stream_with_correlation(7, None).is_err(),
+            "R9: finalizing an incomplete stream must be rejected"
+        );
+    }
+
+    #[test]
+    fn finalize_empty_stream_is_allowed() {
+        // A legitimately zero-length payload (total_size == 0) is complete on
+        // finalize and must not be rejected by the R9 completeness check.
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let start = crate::StreamHeader {
+            stream_id: 8,
+            total_size: 0,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 1,
+            actor_id: 2,
+        };
+        state
+            .start_stream_with_correlation(start, 5, pool.clone(), None)
+            .unwrap();
+        let out = state
+            .finalize_stream_with_correlation(8, None)
+            .expect("empty stream finalizes")
+            .expect("empty stream yields a message");
+        assert_eq!(out.0.as_ref(), b"");
+        assert_eq!(out.1, 5);
     }
 
     #[tokio::test]
