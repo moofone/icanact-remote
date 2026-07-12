@@ -831,6 +831,67 @@ mod tests {
         assert!(discovery.is_safe_to_dial(&ipv6_link_local_addr(8080)));
     }
 
+    fn ipv4_mapped_addr(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        // IPv4-mapped IPv6 form (::ffff:a.b.c.d) of the given v4 address.
+        SocketAddr::new(IpAddr::V6(Ipv4Addr::new(a, b, c, d).to_ipv6_mapped()), port)
+    }
+
+    #[test]
+    fn test_ipv4_mapped_loopback_blocked_by_default() {
+        // ACTOR_REM_2 R3: bogon filter must unwrap IPv4-mapped IPv6 so a
+        // smuggled ::ffff:127.0.0.1 cannot bypass the loopback gate.
+        let local = public_addr(8080);
+        let discovery = PeerDiscovery::with_defaults(local);
+        assert!(
+            !discovery.is_safe_to_dial(&ipv4_mapped_addr(127, 0, 0, 1, 8080)),
+            "::ffff:127.0.0.1 must be treated as loopback"
+        );
+
+        let config = PeerDiscoveryConfig {
+            allow_loopback_discovery: true,
+            ..Default::default()
+        };
+        let discovery = PeerDiscovery::new(local, config);
+        assert!(discovery.is_safe_to_dial(&ipv4_mapped_addr(127, 0, 0, 1, 8080)));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_link_local_blocked_by_default() {
+        let local = public_addr(8080);
+        let discovery = PeerDiscovery::with_defaults(local);
+        assert!(
+            !discovery.is_safe_to_dial(&ipv4_mapped_addr(169, 254, 1, 1, 8080)),
+            "::ffff:169.254.1.1 must be treated as link-local"
+        );
+    }
+
+    #[test]
+    fn test_ipv4_mapped_private_respects_private_flag() {
+        let local = public_addr(8080);
+        // Private allowed by default -> mapped private allowed too.
+        let discovery = PeerDiscovery::with_defaults(local);
+        assert!(discovery.is_safe_to_dial(&ipv4_mapped_addr(10, 0, 0, 5, 8080)));
+
+        let config = PeerDiscoveryConfig {
+            allow_private_discovery: false,
+            ..Default::default()
+        };
+        let discovery = PeerDiscovery::new(local, config);
+        assert!(
+            !discovery.is_safe_to_dial(&ipv4_mapped_addr(10, 0, 0, 5, 8080)),
+            "::ffff:10.0.0.5 must be treated as private when private discovery is off"
+        );
+    }
+
+    #[test]
+    fn test_ipv6_documentation_prefix_blocked() {
+        // ACTOR_REM_2 R3 sub-finding: 2001:db8::/32 documentation prefix.
+        let local = public_addr(8080);
+        let discovery = PeerDiscovery::with_defaults(local);
+        let doc = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 8080);
+        assert!(!discovery.is_safe_to_dial(&doc));
+    }
+
     #[test]
     fn test_ipv6_unique_local_respects_private_flag() {
         let local = public_addr(8080);
