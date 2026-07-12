@@ -1064,19 +1064,8 @@ impl<T> ConnectionHandle<T> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
 
-        // Acquire streaming mode atomically
-        while stream_handle
-            .streaming_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::task::yield_now().await;
-        }
-
-        // Ensure we release streaming mode on exit
-        let _guard = StreamingGuard {
-            flag: stream_handle.streaming_active.clone(),
-        };
+        // Acquire exclusive streaming mode by parking on the gate (R16e).
+        let _guard = stream_handle.acquire_streaming_mode().await?;
 
         // Generate unique stream ID
         let stream_id = current_timestamp_nanos();

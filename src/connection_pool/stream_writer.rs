@@ -11,8 +11,15 @@ pub struct LockFreeStreamHandle {
     exit_flag: Arc<AtomicBool>,
     exit_notify: Arc<Notify>,
     flush_pending: Arc<AtomicBool>,
-    /// Atomic flag for coordinating streaming mode
+    /// Atomic flag for coordinating streaming mode. Read by the IO task and
+    /// `is_streaming_active` as a cheap observability signal; the actual mutual
+    /// exclusion is enforced by `stream_gate`.
     streaming_active: Arc<AtomicBool>,
+    /// ACTOR_REM_2 R16e: single-permit gate serializing `stream_large_message` /
+    /// `stream_response` on this handle. Losers park on the permit instead of
+    /// busy-spinning a failed CAS + `yield_now` for the winner's entire stream
+    /// duration (which starved the loser and burned a scheduler slot per poll).
+    stream_gate: Arc<tokio::sync::Semaphore>,
     /// Lock-free write queue for payload writes
     write_queue: Arc<WriteQueue>,
     /// Bounded streaming command queue for background task.
@@ -55,6 +62,7 @@ impl LockFreeStreamHandle {
         let instance_id = Self::next_instance_id();
         let shutdown_signal = Arc::new(AtomicBool::new(false));
         let streaming_active = Arc::new(AtomicBool::new(false));
+        let stream_gate = Arc::new(tokio::sync::Semaphore::new(1));
         let flush_pending = Arc::new(AtomicBool::new(false));
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_notify = Arc::new(Notify::new());
@@ -124,6 +132,7 @@ impl LockFreeStreamHandle {
                 exit_flag,
                 exit_notify,
                 streaming_active,
+                stream_gate,
                 write_queue,
                 streaming_queue,
                 buffer_config,
@@ -2327,6 +2336,25 @@ impl LockFreeStreamHandle {
         Ok(std::cmp::min(STREAM_CHUNK_SIZE, max_chunk))
     }
 
+    /// ACTOR_REM_2 R16e: acquire exclusive streaming mode on this handle without
+    /// busy-spinning. A concurrent streamer parks on the single-permit gate (FIFO,
+    /// no CPU burn) instead of looping `compare_exchange` + `yield_now` for the
+    /// holder's entire stream. The returned guard releases the permit and clears
+    /// the `streaming_active` observability flag on drop.
+    async fn acquire_streaming_mode(&self) -> Result<StreamingGuard> {
+        let permit = self
+            .stream_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GossipError::Shutdown)?;
+        self.streaming_active.store(true, Ordering::Release);
+        Ok(StreamingGuard {
+            flag: self.streaming_active.clone(),
+            _permit: permit,
+        })
+    }
+
     /// Stream a large message directly to the socket, bypassing the write queue
     /// This provides maximum performance for large messages like PreBacktest
     pub async fn stream_large_message(
@@ -2339,19 +2367,8 @@ impl LockFreeStreamHandle {
 
         let chunk_size = self.max_stream_chunk_size()?;
 
-        // Acquire streaming mode atomically
-        while self
-            .streaming_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::task::yield_now().await;
-        }
-
-        // Ensure we release streaming mode on exit
-        let _guard = StreamingGuard {
-            flag: self.streaming_active.clone(),
-        };
+        // Acquire exclusive streaming mode by parking on the gate (R16e).
+        let _guard = self.acquire_streaming_mode().await?;
 
         // Generate unique stream ID using nanoseconds to avoid collisions
         let stream_id = current_timestamp_nanos();
@@ -2485,19 +2502,8 @@ impl LockFreeStreamHandle {
 
         let chunk_size = self.max_stream_chunk_size()?;
 
-        // Acquire streaming mode atomically
-        while self
-            .streaming_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::task::yield_now().await;
-        }
-
-        // Ensure we release streaming mode on exit
-        let _guard = StreamingGuard {
-            flag: self.streaming_active.clone(),
-        };
+        // Acquire exclusive streaming mode by parking on the gate (R16e).
+        let _guard = self.acquire_streaming_mode().await?;
 
         // Generate unique stream ID for this response stream
         let stream_id = current_timestamp_nanos();
@@ -2700,9 +2706,12 @@ impl LockFreeStreamHandle {
     }
 }
 
-/// Guard to ensure streaming_active is released on drop
+/// Guard to ensure streaming_active is released on drop. Holds the streaming
+/// gate permit (R16e) so the next waiter is admitted, and clears the
+/// observability flag, when the stream finishes or is dropped/cancelled.
 struct StreamingGuard {
     flag: Arc<AtomicBool>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for StreamingGuard {
