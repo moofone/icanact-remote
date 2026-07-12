@@ -43,8 +43,6 @@ pub mod pubsub;
 pub mod registry;
 pub mod remote_actor_location;
 pub mod remote_actor_ref;
-pub mod reply_to;
-pub mod stream_writer;
 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
 pub mod test_helpers;
 pub mod tls;
@@ -95,7 +93,6 @@ pub use pubsub::{
 pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
-pub use reply_to::{ReplyTo, TimeoutReplyTo};
 pub use transport::{
     AuthContext, PeerAuthenticator, RegistryTransportBootstrap, RemoteAddrMeta, TargetAddr,
     TransportConnector, TransportListener, TransportStack, TransportWireKind,

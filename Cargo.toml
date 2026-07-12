@@ -5,7 +5,6 @@ edition = "2024"
 
 [features]
 test-helpers = []
-io_uring = ["tokio-uring", "io-uring"]
 strict-zero-copy = []
 # Enable verbose `trace!` logging from CorrelationTracker::allocate (success
 # and contention messages). Off by default because the dispatcher filter
@@ -41,11 +40,6 @@ data-encoding = "2.5"  # For BASE32 DNS encoding
 zeroize = { version = "1.7", features = ["derive"] }  # For secure key handling
 x509-parser = "0.16"  # For parsing X.509 certificates
 sha2 = "0.10"  # For deterministic NodeId generation fallback
-
-# Platform-specific dependencies for io_uring support
-[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
-tokio-uring = { version = "0.5", optional = true }
-io-uring = { version = "0.6", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0"
