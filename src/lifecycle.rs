@@ -37,10 +37,6 @@ pub enum TransportLifecycleEvent {
         addr: SocketAddr,
         attempt_id: u64,
     },
-    OutboundSuppressedPreferInbound {
-        peer: PeerId,
-        addr: SocketAddr,
-    },
     WrongDirectionEvicted {
         peer: PeerId,
         addr: SocketAddr,

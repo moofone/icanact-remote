@@ -104,8 +104,6 @@ async fn test_two_node_gossip_propagation() {
     let config = GossipConfig {
         gossip_interval: Duration::from_millis(200),
         immediate_propagation_enabled: true,
-        bootstrap_readiness_timeout: Duration::from_secs(5),
-        bootstrap_readiness_check_interval: Duration::from_millis(50),
         ..Default::default()
     };
 
@@ -150,8 +148,6 @@ async fn test_immediate_vs_normal_priority() {
         gossip_interval: Duration::from_millis(1000),
         immediate_propagation_enabled: true,
         urgent_gossip_fanout: 1,
-        bootstrap_readiness_timeout: Duration::from_secs(5),
-        bootstrap_readiness_check_interval: Duration::from_millis(50),
         ..Default::default()
     };
 

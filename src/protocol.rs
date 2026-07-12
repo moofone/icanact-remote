@@ -312,9 +312,7 @@ fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
         | RegistryMessage::FullSyncResponse { sender_peer_id, .. } => Some(sender_peer_id),
         RegistryMessage::PeerHealthReport { reporter, .. } => Some(reporter),
         RegistryMessage::PeerHealthQuery { sender, .. } => Some(sender),
-        RegistryMessage::ImmediateAck { .. }
-        | RegistryMessage::ActorMessage { .. }
-        | RegistryMessage::PeerListGossip { .. } => None,
+        RegistryMessage::ImmediateAck { .. } | RegistryMessage::PeerListGossip { .. } => None,
     }
 }
 
@@ -337,14 +335,6 @@ pub(crate) async fn process_read_result(
 ) -> Result<()> {
     match result {
         MessageReadResult::Gossip(msg, _correlation_id) => {
-            if matches!(msg, RegistryMessage::ActorMessage { .. }) {
-                warn!(
-                    peer = %peer_addr,
-                    "Registry ActorMessage is no longer supported in v3; use ActorTell/ActorAsk frames"
-                );
-                return Ok(());
-            }
-
             let authenticated_peer_id = authenticated_peer_id
                 .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));
             // Fail-closed: any gossip frame that carries a claimed sender

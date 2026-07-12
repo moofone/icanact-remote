@@ -2899,13 +2899,6 @@ where
                     warn!("Received ImmediateAck as first message - cannot identify sender");
                     return ConnectionCloseOutcome::Normal { node_id: None };
                 }
-                RegistryMessage::ActorMessage { .. } => {
-                    warn!(
-                        peer = %peer_addr,
-                        "Registry ActorMessage is no longer supported in v3; closing connection"
-                    );
-                    return ConnectionCloseOutcome::Normal { node_id: None };
-                }
                 RegistryMessage::PeerListGossip { sender_addr, .. } => (sender_addr.clone(), None),
             };
             (node_id, *correlation_id, bind_addr)

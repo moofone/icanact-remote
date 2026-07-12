@@ -79,12 +79,12 @@ pub const MAX_STREAM_SIZE: usize = 64 * 1024 * 1024; // 64MB
 /// of max-size streams' worth while still admitting many small streams.
 pub const MAX_INFLIGHT_STREAM_BYTES: usize = 2 * MAX_STREAM_SIZE; // 128MB
 pub use handle::{GossipClient, GossipRegistryHandle};
-pub use handle_builder::{BuilderTlsBootstrap, GossipRegistryBuilder};
+pub use handle_builder::BuilderTlsBootstrap;
 pub use lifecycle::{
     SessionRemovalReason, TransportDirection, TransportLifecycleEvent, TransportLifecycleRecorder,
     TransportLifecycleRecorderGuard, set_transport_lifecycle_recorder,
 };
-pub use priority::{ConsistencyLevel, RegistrationPriority};
+pub use priority::RegistrationPriority;
 pub use pubsub::{
     PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameMetadata, PubSubFrameV1,
     PubSubIngressHandler, PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope,
@@ -93,10 +93,7 @@ pub use pubsub::{
 pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
-pub use transport::{
-    AuthContext, PeerAuthenticator, RegistryTransportBootstrap, RemoteAddrMeta, TargetAddr,
-    TransportConnector, TransportListener, TransportStack, TransportWireKind,
-};
+pub use transport::{RegistryTransportBootstrap, TransportWireKind};
 pub use typed::{
     ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,
 };
@@ -1081,56 +1078,6 @@ impl<T: 'static> Peer<T> {
         }
     }
 
-    /// Connect to this peer with retry attempts
-    pub async fn connect_with_retry(
-        &self,
-        addr: &SocketAddr,
-        max_retries: u32,
-        retry_delay: std::time::Duration,
-    ) -> Result<()> {
-        let mut last_error = None;
-
-        for attempt in 0..=max_retries {
-            match self.connect(addr).await {
-                Ok(()) => return Ok(()),
-                Err(GossipError::Shutdown) => {
-                    // Don't retry if registry is shutting down
-                    return Err(GossipError::Shutdown);
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                    if attempt < max_retries {
-                        tracing::warn!(
-                            peer_id = %self.peer_id,
-                            addr = %addr,
-                            attempt = attempt + 1,
-                            max_retries = max_retries,
-                            "Connection attempt failed, retrying in {:?}",
-                            retry_delay
-                        );
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                }
-            }
-        }
-
-        // All retries failed
-        let final_error = last_error.unwrap_or_else(|| {
-            GossipError::Network(std::io::Error::other(
-                "Unknown error during connection attempts",
-            ))
-        });
-
-        tracing::error!(
-            peer_id = %self.peer_id,
-            addr = %addr,
-            max_retries = max_retries,
-            "All connection attempts failed"
-        );
-
-        Err(final_error)
-    }
-
     /// Check if this peer is currently connected
     pub async fn is_connected(&self) -> bool {
         let pool = &self.registry.connection_pool;
@@ -1176,65 +1123,6 @@ impl<T: 'static> Peer<T> {
         &self.peer_id
     }
 
-    /// Wait for the initial sync with this peer to complete
-    ///
-    /// This waits for:
-    /// 1. The connection to be established
-    /// 2. The initial FullSync to be exchanged
-    /// 3. The actor registry to be updated
-    pub async fn wait_for_sync(&self, timeout: Duration) -> Result<()> {
-        let start = tokio::time::Instant::now();
-        let deadline = start + timeout;
-
-        // Wait for the connection to be established
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                return Err(GossipError::Timeout);
-            }
-
-            // Check if we have a connection to this peer
-            {
-                let pool = &self.registry.connection_pool;
-                if pool.get_connection_by_peer_id(&self.peer_id).is_some() {
-                    break;
-                }
-            }
-
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        // Wait for gossip sync to complete by checking if we've received actors
-        let mut last_actor_count = 0;
-        let mut stable_iterations = 0;
-
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                return Err(GossipError::Timeout);
-            }
-
-            // Get current actor count
-            let current_count = self.registry.get_actor_count().await;
-
-            // If the count is stable for 3 iterations (30ms), we're synced
-            if current_count == last_actor_count && current_count > 0 {
-                stable_iterations += 1;
-                if stable_iterations >= 3 {
-                    tracing::info!(
-                        peer_id = %self.peer_id,
-                        actor_count = current_count,
-                        elapsed = ?start.elapsed(),
-                        "Initial sync completed"
-                    );
-                    return Ok(());
-                }
-            } else {
-                stable_iterations = 0;
-                last_actor_count = current_count;
-            }
-
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
 }
 
 /// Message types for the request-response protocol
@@ -1489,11 +1377,6 @@ pub fn current_timestamp_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_nanos() as u64
-}
-
-/// Get high resolution instant for precise timing measurements
-pub fn current_instant() -> std::time::Instant {
-    std::time::Instant::now()
 }
 
 #[cfg(test)]

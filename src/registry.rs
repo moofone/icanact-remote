@@ -1090,13 +1090,6 @@ pub enum RegistryMessage {
         target_peer: String,
         timestamp: u64,
     } = 7,
-    /// Direct actor message (tell or ask)
-    ActorMessage {
-        actor_id: String,
-        type_hash: u32,
-        payload: Vec<u8>,
-        correlation_id: Option<u16>,
-    } = 8,
     /// Peer list gossip for automatic peer discovery
     /// Contains list of known peers with their connection info
     PeerListGossip {
@@ -1608,7 +1601,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_id,
             config: config.clone(),
             start_time: current_timestamp(),
-            start_instant: crate::current_instant(),
+            start_instant: std::time::Instant::now(),
             shutdown: Arc::new(AtomicBool::new(false)),
             actor_state: Arc::new(ActorState::default()),
             gossip_state: Arc::new(Mutex::new(GossipState {
@@ -14107,7 +14100,7 @@ mod tests {
             | RegistryMessage::PeerListGossip { timestamp, .. } => {
                 *timestamp = 0;
             }
-            RegistryMessage::ImmediateAck { .. } | RegistryMessage::ActorMessage { .. } => {}
+            RegistryMessage::ImmediateAck { .. } => {}
         }
         msg
     }

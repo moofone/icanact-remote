@@ -125,8 +125,6 @@ impl<T> ConnectionPool<T> {
         connection_timeout: Duration,
         aligned_pool_size: usize,
     ) -> Self {
-        const POOL_SIZE: usize = 256;
-        const BUFFER_SIZE: usize = TCP_BUFFER_SIZE / 128; // Smaller pool buffers (8KB default)
         let pool = Self {
             connections_by_peer: SccHashMap::default(),
             addr_to_peer_id: SccHashMap::default(),
@@ -138,7 +136,6 @@ impl<T> ConnectionPool<T> {
             max_connections,
             connection_timeout,
             registry: ArcSwapWeak::new(std::sync::Weak::new()),
-            message_buffer_pool: Arc::new(MessageBufferPool::new(POOL_SIZE, BUFFER_SIZE)),
             aligned_bytes_pool: Arc::new(crate::AlignedBytesPool::new(
                 aligned_pool_size.max(crate::aligned::DEFAULT_ALIGNED_POOL_SIZE),
             )),
@@ -341,7 +338,31 @@ impl<T> ConnectionPool<T> {
         connection: Arc<LockFreeConnection>,
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
         let session = self.get_or_create_peer_session(peer_id);
-        session.compare_and_set_current_connection(expected, connection.clone())?;
+        if let Err(current) =
+            session.compare_and_set_current_connection(expected, connection.clone())
+        {
+            // ACTOR_REM_2 R10: the CAS failed because the slot already holds
+            // exactly THIS connection — it was published out of band (e.g.
+            // `get_connection_by_peer_id`'s address fallback adopting this
+            // connection while it was provisionally indexed at its addr, before
+            // this finalize decided its fate). The publish is already done, so
+            // report idempotent success instead of handing our OWN candidate
+            // back to the caller as a "rival", which made outbound finalize
+            // re-resolve and abort its own uncontested connection. We do NOT
+            // retire `expected` here — we did not displace it, whoever installed
+            // `connection` did. Keep the `connections_by_peer` mirror consistent
+            // (a plain idempotent upsert).
+            if current
+                .as_ref()
+                .is_some_and(|cur| Arc::ptr_eq(cur, &connection))
+            {
+                let _ = self
+                    .connections_by_peer
+                    .upsert_sync(peer_id.clone(), connection);
+                return Ok(());
+            }
+            return Err(current);
+        }
 
         let stream_instance_id = connection
             .stream_handle
@@ -1562,33 +1583,6 @@ impl<T> ConnectionPool<T> {
         }
     }
 
-    /// Store or update the address for a peer
-    /// Only updates if no address is already configured for this peer
-    pub fn update_node_address(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
-        // Check if we already have a configured address for this node
-        if let Some(existing_addr) = self.get_configured_peer_addr(peer_id) {
-            debug!(
-                "CONNECTION POOL: Node {} already has configured address {}, not updating to ephemeral port {}",
-                peer_id, existing_addr, addr
-            );
-            return;
-        }
-
-        // Only update if no address is configured
-        if self
-            .peer_id_to_addr
-            .insert_sync(peer_id.clone(), addr)
-            .is_ok()
-        {
-            self.set_discovered_peer_addr(peer_id, addr);
-            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
-        }
-        debug!(
-            "CONNECTION POOL: Set initial address for node {} to {}",
-            peer_id, addr
-        );
-    }
-
     /// Reindex an existing connection under a new logical address for the peer.
     ///
     /// This is needed when a peer connects FROM an ephemeral TCP port but advertises
@@ -1923,36 +1917,6 @@ impl<T> ConnectionPool<T> {
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
     }
 
-    /// Send data to a peer by ID.
-    pub fn send_to_peer_id(&self, peer_id: &crate::PeerId, data: bytes::Bytes) -> Result<()> {
-        debug!(
-            "CONNECTION POOL: send_to_peer_id called for peer '{}', pool has {} peer connections",
-            peer_id,
-            self.connections_by_peer.len()
-        );
-        if let Some(connection) = self.get_connection_by_peer_id(peer_id) {
-            if let Some(ref stream_handle) = connection.stream_handle {
-                debug!(
-                    "CONNECTION POOL: Sending {} bytes to peer '{}'",
-                    data.len(),
-                    peer_id
-                );
-                return stream_handle.write_bytes_nonblocking(data);
-            } else {
-                warn!(peer_id = %peer_id, "Connection found but no stream handle");
-            }
-        } else {
-            // Caller already gets a `GossipError::Network(NotFound)`
-            // below; logging here was redundant and turned every send
-            // to an offline peer into a per-call warning (#root-cause).
-            debug!(peer_id = %peer_id, "send: no connection for peer");
-        }
-        Err(crate::GossipError::Network(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Connection not found for peer {}", peer_id),
-        )))
-    }
-
     /// Send header + payload to a peer by ID without concatenating payload bytes.
     pub fn send_to_peer_id_parts(
         &self,
@@ -1983,182 +1947,9 @@ impl<T> ConnectionPool<T> {
         )))
     }
 
-    /// Send bytes to a peer by its ID (zero-copy version)
-    pub fn send_bytes_to_peer_id(&self, peer_id: &crate::PeerId, data: bytes::Bytes) -> Result<()> {
-        debug!(
-            "CONNECTION POOL: send_bytes_to_peer_id called for peer '{}', pool has {} peer connections",
-            peer_id,
-            self.connections_by_peer.len()
-        );
-        if let Some(connection) = self.get_connection_by_peer_id(peer_id) {
-            if let Some(ref stream_handle) = connection.stream_handle {
-                debug!(
-                    "CONNECTION POOL: Sending {} bytes to peer '{}'",
-                    data.len(),
-                    peer_id
-                );
-                return stream_handle.write_bytes_nonblocking(data);
-            } else {
-                warn!(peer_id = %peer_id, "Connection found but no stream handle");
-            }
-        } else {
-            // Caller already gets a `GossipError::Network(NotFound)`
-            // below; logging here was redundant and turned every send
-            // to an offline peer into a per-call warning (#root-cause).
-            debug!(peer_id = %peer_id, "send: no connection for peer");
-        }
-        Err(crate::GossipError::Network(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Connection not found for peer {}", peer_id),
-        )))
-    }
-
     /// Get or create a lock-free connection - NO MUTEX NEEDED
     pub fn get_lock_free_connection(&self, addr: SocketAddr) -> Option<Arc<LockFreeConnection>> {
         self.connections_by_addr.read_sync(&addr, |_, v| v.clone())
-    }
-
-    /// Add a new lock-free connection - completely lock-free operation
-    pub fn add_lock_free_connection(
-        &self,
-        addr: SocketAddr,
-        tcp_stream: TcpStream,
-    ) -> Result<Arc<LockFreeConnection>> {
-        // Eager admission-gate reservation: unlike every other count-in site,
-        // this one must reserve capacity BEFORE an `instance_id` exists to
-        // mark, so it cannot go through `count_in_new_instance`'s
-        // insert-gated pairing. That is still race-free for its own purpose
-        // (concurrent admissions never over-admit past `max_connections`):
-        // this `fetch_add` is unconditional and this reservation is not
-        // shared with — or racing — anything else, because nothing can look
-        // this instance up by address or instance id until it is indexed
-        // below, and the marker is inserted (see below) strictly before that
-        // indexing happens. `decrement_connection_counter`'s (non-saturating,
-        // signed) subtract mirrors every other rollback of this same atomic.
-        let connection_count = self.connection_counter.fetch_add(1, Ordering::AcqRel);
-
-        if connection_count >= self.max_connections as isize {
-            self.decrement_connection_counter();
-            return Err(crate::GossipError::Network(std::io::Error::other(format!(
-                "Max connections ({}) reached",
-                self.max_connections
-            ))));
-        }
-
-        let correlation_tracker = CorrelationTracker::new();
-
-        // Create lock-free streaming handle with exclusive socket ownership.
-        let (buffer_config, schema_hash, read_context, response_writer) = self
-            .registry
-            .load()
-            .upgrade()
-            .map(|registry| {
-                let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(addr));
-                let read_context = ReadContext {
-                    registry_weak: Arc::downgrade(&registry),
-                    peer_addr: addr,
-                    peer_id: None,
-                    max_message_size: registry.config.max_message_size,
-                    expected_schema_hash: registry.config.schema_hash,
-                    aligned_pool: registry.connection_pool.aligned_bytes_pool(),
-                    response_correlation: Some(correlation_tracker.clone()),
-                    response_writer: Some(response_writer.clone()),
-                    tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
-                    tell_handler_sync_context: registry.actor_tell_handler_sync_context.load_full(),
-                    ask_immediate_handler_sync: registry
-                        .actor_ask_immediate_handler_sync
-                        .load_full(),
-                    ask_handler_sync: registry.actor_ask_handler_sync.load_full(),
-                    sync_actor_handler: registry.actor_message_handler_sync.load_full(),
-                };
-                (
-                    BufferConfig::default().with_ask_window(registry.config.ask_window),
-                    registry.config.schema_hash,
-                    Some(read_context),
-                    Some(response_writer),
-                )
-            })
-            .unwrap_or((BufferConfig::default(), None, None, None));
-
-        let (stream_handle, writer_task_handle, reader_task_handle) = LockFreeStreamHandle::new(
-            tcp_stream,
-            addr,
-            ChannelId::Global,
-            buffer_config,
-            schema_hash,
-            read_context,
-        );
-        let stream_handle = Arc::new(stream_handle);
-        if let Some(response_writer) = response_writer.as_ref() {
-            response_writer.bind_stream_handle(stream_handle.clone());
-        }
-        let instance_id = stream_handle.instance_id();
-
-        let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
-        connection.stream_handle = Some(stream_handle);
-        connection.correlation = Some(correlation_tracker);
-        connection.set_state(ConnectionState::Connected);
-        connection.update_last_used();
-
-        // Track the writer task handle (H-004).
-        connection
-            .task_tracker
-            .set_writer(writer_task_handle.abort_handle());
-        if let Some(reader_task_handle) = reader_task_handle {
-            connection
-                .task_tracker
-                .set_reader(reader_task_handle.abort_handle());
-        }
-
-        let connection_arc = Arc::new(connection);
-
-        // This instance now owns the admission-gate count taken above —
-        // record it so whichever teardown path retires this instance later
-        // can release it exactly once (see `release_counted_instance`).
-        // Marked BEFORE this instance is indexed anywhere below: no
-        // concurrent teardown can find-and-release it by address or instance
-        // id until then, so there is no window in which a release could ever
-        // observe the reservation above without this marker already present
-        // to pair it with.
-        crate::lifecycle::record_transport_event(
-            crate::lifecycle::TransportLifecycleEvent::ConnectionCountMarkerAttempt { instance_id },
-        );
-        self.mark_instance_counted(instance_id);
-
-        // Insert into lock-free hash map.
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(addr, connection_arc.clone());
-        debug!(
-            "CONNECTION POOL: Added lock-free connection to {} - pool now has {} connections",
-            addr,
-            self.connections_by_addr.len()
-        );
-
-        Ok(connection_arc)
-    }
-
-    /// Send data through lock-free connection - NO BLOCKING.
-    pub fn send_lock_free(&self, addr: SocketAddr, data: bytes::Bytes) -> Result<()> {
-        if let Some(connection) = self.get_lock_free_connection(addr) {
-            if let Some(ref stream_handle) = connection.stream_handle {
-                return stream_handle.write_bytes_nonblocking(data);
-            } else {
-                warn!(addr = %addr, "Connection found but no stream handle");
-            }
-        } else {
-            warn!(addr = %addr, "No connection found for address");
-            let mut addrs: Vec<SocketAddr> = Vec::new();
-            self.connections_by_addr.iter_sync(|addr, _| {
-                addrs.push(*addr);
-                true
-            });
-            warn!("Available connections: {:?}", addrs);
-        }
-        Err(crate::GossipError::Network(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Connection not found",
-        )))
     }
 
     /// Send header + payload without copying the payload.
@@ -2181,30 +1972,6 @@ impl<T> ConnectionPool<T> {
         Err(crate::GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "Connection not found",
-        )))
-    }
-
-    /// Try to send data through any available connection for a node
-    /// This handles cases where we might have multiple connections (incoming/outgoing)
-    pub fn send_to_node(
-        &self,
-        node_addr: SocketAddr,
-        data: bytes::Bytes,
-        _registry: &GossipRegistry,
-    ) -> Result<()> {
-        // First try direct lookup
-        if let Ok(()) = self.send_lock_free(node_addr, data) {
-            return Ok(());
-        }
-
-        // If that fails, look for any connection that could reach this node
-        // This could be enhanced with a node ID -> connections mapping
-        debug!(node_addr = %node_addr, "Direct send failed, looking for alternative connections");
-
-        // For now, we'll rely on the caller to handle fallback strategies
-        Err(crate::GossipError::Network(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("No connection found for node {}", node_addr),
         )))
     }
 
@@ -3189,54 +2956,6 @@ impl<T> ConnectionPool<T> {
         peers
     }
 
-    /// Get all connections (including disconnected) - for debugging
-    pub fn get_all_connections(&self) -> Vec<SocketAddr> {
-        let mut peers: Vec<SocketAddr> = Vec::new();
-        self.connections_by_addr.iter_sync(|addr, _| {
-            peers.push(*addr);
-            true
-        });
-        peers
-    }
-
-    /// Get a buffer from the pool or create a new one
-    pub fn get_buffer(&mut self, min_capacity: usize) -> Vec<u8> {
-        // Use the message buffer pool for lock-free buffer management
-        if let Some(buffer) = self.message_buffer_pool.get_buffer() {
-            if buffer.capacity() >= min_capacity {
-                return buffer;
-            }
-            // Buffer too small, return it and create new one
-            self.message_buffer_pool.return_buffer(buffer);
-        }
-        Vec::with_capacity(min_capacity.max(1024)) // Minimum 1KB buffers
-    }
-
-    /// Return a buffer to the pool for reuse
-    pub fn return_buffer(&mut self, buffer: Vec<u8>) {
-        if buffer.capacity() >= 1024 && buffer.capacity() <= TCP_BUFFER_SIZE {
-            // Return to the lock-free message buffer pool (up to TCP_BUFFER_SIZE)
-            self.message_buffer_pool.return_buffer(buffer);
-        }
-        // Otherwise let the buffer drop
-    }
-
-    /// Get a message buffer from the pool for zero-copy processing
-    pub fn get_message_buffer(&self) -> Vec<u8> {
-        self.message_buffer_pool
-            .get_buffer()
-            .unwrap_or_else(|| Vec::with_capacity(TCP_BUFFER_SIZE / 256)) // Default small buffer
-    }
-
-    /// Return a message buffer to the pool
-    pub fn return_message_buffer(&self, buffer: Vec<u8>) {
-        if buffer.capacity() >= 1024 && buffer.capacity() <= TCP_BUFFER_SIZE {
-            // Keep buffers with reasonable size (up to TCP_BUFFER_SIZE)
-            self.message_buffer_pool.return_buffer(buffer);
-        }
-        // Otherwise let the buffer drop
-    }
-
     /// Get or create a persistent connection to a peer
     /// Fast path: Check for existing connection without creating new ones
     pub fn get_existing_connection(&self, addr: SocketAddr) -> Option<ConnectionHandle<T>> {
@@ -3449,7 +3168,6 @@ impl<T> ConnectionPool<T> {
         }
     }
 
-    #[allow(dead_code)]
     async fn finalize_new_outbound_connection<S>(
         &self,
         addr: SocketAddr,
@@ -3925,20 +3643,6 @@ impl<T> ConnectionPool<T> {
         }
     }
 
-    /// Remove a connection from the pool by address
-    pub fn remove_connection_mut(&mut self, addr: SocketAddr) {
-        if let Some((_, conn)) = self.connections_by_addr.remove_sync(&addr) {
-            // H-004: Abort background tasks (writer, reader) to prevent resource leaks
-            conn.abort_tasks();
-
-            info!(addr = %addr, "removed connection from pool");
-            // Dropping the sender will cause the receiver to return None,
-            // signaling the connection handler to shut down
-            // No need to drop writer
-            self.clear_capabilities_for_addr(&addr);
-        }
-    }
-
     /// Check if we have a connection to a peer by address
     pub fn has_connection(&self, addr: &SocketAddr) -> bool {
         self.connections_by_addr
@@ -3957,12 +3661,6 @@ impl<T> ConnectionPool<T> {
             })
             .unwrap_or(false)
             || self.aliased_connection_by_peer_id(peer_id).is_some()
-    }
-
-    /// Check health of all connections
-    pub async fn check_connection_health(&self) -> Vec<SocketAddr> {
-        // Health checking is now done by the persistent connection handlers
-        Vec::new()
     }
 
     /// Clean up stale connections
@@ -4088,83 +3786,6 @@ impl<T> ConnectionPool<T> {
             count,
             addr_count
         );
-    }
-    /// Handle persistent connection reader - only reads messages, no channels
-    #[allow(dead_code)]
-    pub(crate) async fn handle_persistent_connection_reader(
-        mut reader: tokio::net::tcp::OwnedReadHalf,
-        _writer: Option<tokio::net::tcp::OwnedWriteHalf>,
-        peer_addr: SocketAddr,
-        registry_weak: Option<std::sync::Weak<GossipRegistry>>,
-    ) {
-        let max_message_size = registry_weak
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
-            .map(|registry| registry.config.max_message_size)
-            .unwrap_or(10 * 1024 * 1024);
-        let aligned_pool = registry_weak
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
-            .map(|registry| registry.connection_pool.aligned_bytes_pool());
-
-        let mut streaming_state = crate::protocol::StreamingState::new();
-        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            let msg_result = tokio::select! {
-                result = crate::handle::read_message_from_tls_reader(&mut reader, max_message_size, aligned_pool.as_ref()) => result,
-                _ = cleanup_interval.tick() => {
-                    streaming_state.cleanup_stale();
-                    continue;
-                }
-            };
-
-            match msg_result {
-                Ok(result) => {
-                    if let Some(registry) = registry_weak.as_ref().and_then(|w| w.upgrade()) {
-                        let authenticated_peer_id =
-                            registry.connection_pool.get_peer_id_by_addr(&peer_addr);
-                        if let Err(e) = crate::protocol::process_read_result(
-                            result,
-                            &mut streaming_state,
-                            &registry,
-                            peer_addr,
-                            None,
-                            None,
-                            authenticated_peer_id.as_ref(),
-                        )
-                        .await
-                        {
-                            warn!(peer = %peer_addr, error = %e, "Failed to process message on persistent connection");
-                        }
-                    } else {
-                        warn!(peer = %peer_addr, "Registry dropped, stopping persistent connection reader");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!(peer = %peer_addr, error = %e, "Persistent connection reader error");
-                    break;
-                }
-            }
-        }
-
-        info!(peer = %peer_addr, "CONNECTION_POOL: Triggering peer failure handling");
-        if let Some(ref registry_weak) = registry_weak {
-            if let Some(registry) = registry_weak.upgrade() {
-                // Dead-code path (`#[allow(dead_code)]`, no call sites): no
-                // stream-handle instance id is available here, so this
-                // conservatively falls back to the "may be the current
-                // session" path, same as before this parameter existed.
-                if let Err(e) = registry
-                    .handle_peer_connection_failure(peer_addr, None)
-                    .await
-                {
-                    warn!(error = %e, peer = %peer_addr, "CONNECTION_POOL: Failed to handle peer connection failure");
-                }
-            }
-        }
     }
 }
 
@@ -5007,14 +4628,6 @@ pub(crate) fn handle_incoming_message(
 
                 Ok(())
             }
-            RegistryMessage::ActorMessage { .. } => {
-                warn!(
-                    peer = %_peer_addr,
-                    "Registry ActorMessage is no longer supported in v3; use ActorTell/ActorAsk frames"
-                );
-                Ok(())
-            }
-
             RegistryMessage::ImmediateAck {
                 actor_name,
                 success,

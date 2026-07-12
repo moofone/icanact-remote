@@ -5249,6 +5249,80 @@ async fn outbound_finalize_decision_snapshot_does_not_clear_fresh_session() {
     );
 }
 
+/// ACTOR_REM_2 R10: a concurrent `get_connection_by_peer_id` address-fallback
+/// can publish finalize's OWN provisionally-addr-indexed candidate into the peer
+/// session slot (out of band, via the non-CAS `publish_current_peer_connection`)
+/// exactly as finalize is about to publish it. Finalize's compare-and-publish
+/// then finds its own candidate installed as the slot value; without the fix it
+/// treated that as a "rival", re-resolved the address-blind tie-break against it,
+/// and — since a higher-NodeId local's own outbound is never the preferred
+/// direction — REJECTED and `abort_tasks()`d its own uncontested connection,
+/// returning `ConnectionExists` to the caller. The fix makes compare-and-publish
+/// recognize "the slot already holds THIS connection" as idempotent success.
+#[tokio::test]
+async fn outbound_finalize_does_not_abort_its_own_out_of_band_published_candidate() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("r10-hi", "r10-lo");
+    let remote_peer_id = lo_kp.peer_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let dial_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = {
+        let pool = pool.clone();
+        let peer = remote_peer_id.clone();
+        let fired = fired.clone();
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            if let crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                peer: event_peer,
+                ..
+            } = &event
+                && *event_peer == peer
+            {
+                fired.store(true, Ordering::Release);
+                // T1: the address fallback adopts finalize's own candidate
+                // (still only indexed by address at this instant) as the
+                // peer's session, out of band.
+                let _ = pool.get_connection_by_peer_id(&peer);
+            }
+        }))
+    };
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None)
+        .await;
+    drop(_guard);
+
+    assert!(
+        fired.load(Ordering::Acquire),
+        "test precondition: the outbound-finalize publish attempt must have fired"
+    );
+    assert!(
+        result.is_ok(),
+        "R10: finalize must accept its own out-of-band-published candidate, not \
+         re-resolve and abort it as a rival: got {result:?}"
+    );
+    let session = pool.get_connection_by_peer_id(&remote_peer_id);
+    assert!(
+        session.as_ref().is_some_and(|c| c.has_live_stream()),
+        "R10: the accepted candidate must remain the peer's live session, not aborted: \
+         got {session:?}"
+    );
+}
+
 /// RED (review finding P1, `transport_stream.rs` stale-rival branch): the
 /// `!alive` branch used to retire `existing_conn` by ADDRESS
 /// (`remove_connection(existing_conn.addr)`), never by `Arc` instance

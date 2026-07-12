@@ -98,22 +98,30 @@ impl PeerCapabilities {
         mask
     }
 
-    /// Create capabilities from a Hello exchange
-    /// Takes the intersection of features and minimum version
+    /// Create capabilities from a Hello exchange.
+    ///
+    /// Takes the intersection of features. `PROTOCOL_VERSION_V3` is the only
+    /// protocol version that exists and `perform_hello_handshake` rejects any
+    /// Hello whose version differs from `CURRENT_PROTOCOL_VERSION`, so the
+    /// negotiated version is always `PROTOCOL_VERSION_V3` (the former
+    /// `min()` negotiation and the `>= PROTOCOL_VERSION_V3` guards below were
+    /// unreachable).
     pub fn from_hello_exchange(local: &Hello, remote: &Hello) -> Self {
-        let version = local.protocol_version.min(remote.protocol_version);
         let features = Self::features_mask(&local.features) & Self::features_mask(&remote.features);
-        Self { version, features }
+        Self {
+            version: PROTOCOL_VERSION_V3,
+            features,
+        }
     }
 
     /// Check if we can send peer list gossip to this peer
     pub fn can_send_peer_list(&self) -> bool {
-        self.version >= PROTOCOL_VERSION_V3 && self.supports_feature(Feature::PeerListGossip)
+        self.supports_feature(Feature::PeerListGossip)
     }
 
     /// Check if we can piggyback clock calibration on gossip frames with this peer.
     pub fn can_calibrate_clock(&self) -> bool {
-        self.version >= PROTOCOL_VERSION_V3 && self.supports_feature(Feature::ClockCalibration)
+        self.supports_feature(Feature::ClockCalibration)
     }
 
     /// Check if a specific feature is supported

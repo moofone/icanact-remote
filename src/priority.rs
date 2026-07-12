@@ -50,19 +50,6 @@ impl RegistrationPriority {
     }
 }
 
-/// Consistency levels for read operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize, Default)]
-#[repr(u8)]
-pub enum ConsistencyLevel {
-    /// Eventual consistency - may read stale data
-    #[default]
-    Eventual = 0,
-    /// Causal consistency - respects causality
-    Causal = 1,
-    /// Strong consistency - reads most recent data
-    Strong = 2,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,34 +102,6 @@ mod tests {
     }
 
     #[test]
-    fn test_consistency_level_default() {
-        assert_eq!(ConsistencyLevel::default(), ConsistencyLevel::Eventual);
-    }
-
-    #[test]
-    fn test_consistency_level_equality() {
-        assert_eq!(ConsistencyLevel::Eventual, ConsistencyLevel::Eventual);
-        assert_ne!(ConsistencyLevel::Eventual, ConsistencyLevel::Strong);
-        assert_ne!(ConsistencyLevel::Causal, ConsistencyLevel::Strong);
-    }
-
-    #[test]
-    fn test_consistency_level_serialization() {
-        let level = ConsistencyLevel::Strong;
-        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&level).unwrap();
-        let deserialized: ConsistencyLevel =
-            rkyv::from_bytes::<ConsistencyLevel, rkyv::rancor::Error>(&serialized).unwrap(); // ALLOW_RKYV_FROM_BYTES
-        assert_eq!(level, deserialized);
-    }
-
-    #[test]
-    fn consistency_level_discriminants_are_stable() {
-        assert_eq!(ConsistencyLevel::Eventual as u8, 0);
-        assert_eq!(ConsistencyLevel::Causal as u8, 1);
-        assert_eq!(ConsistencyLevel::Strong as u8, 2);
-    }
-
-    #[test]
     fn test_registration_priority_debug() {
         let priority = RegistrationPriority::Immediate;
         let debug_str = format!("{:?}", priority);
@@ -150,23 +109,9 @@ mod tests {
     }
 
     #[test]
-    fn test_consistency_level_debug() {
-        let level = ConsistencyLevel::Causal;
-        let debug_str = format!("{:?}", level);
-        assert_eq!(debug_str, "Causal");
-    }
-
-    #[test]
     fn test_registration_priority_clone() {
         let priority = RegistrationPriority::Immediate;
         let cloned = priority;
         assert_eq!(priority, cloned);
-    }
-
-    #[test]
-    fn test_consistency_level_clone() {
-        let level = ConsistencyLevel::Strong;
-        let cloned = level;
-        assert_eq!(level, cloned);
     }
 }

@@ -199,11 +199,7 @@ pub struct GossipConfig {
     pub full_sync_interval: u64,
     /// Maximum number of pooled connections
     pub max_pooled_connections: usize,
-    /// Idle connection timeout for pool
-    pub idle_connection_timeout: Duration,
-    /// Timeout for connections checked out too long
-    pub checkout_timeout: Duration,
-    /// How often to run vector clock garbage collection  
+    /// How often to run vector clock garbage collection
     pub vector_clock_gc_frequency: Duration,
     /// How long to retain node entries in vector clocks after last seen
     pub vector_clock_retention_period: Duration,
@@ -211,22 +207,12 @@ pub struct GossipConfig {
     pub max_vector_clock_size: usize,
     /// Threshold for small clusters
     pub small_cluster_threshold: usize,
-    /// Maximum time to wait for server to become ready before bootstrap
-    pub bootstrap_readiness_timeout: Duration,
-    /// Interval between readiness checks
-    pub bootstrap_readiness_check_interval: Duration,
-    /// Maximum bootstrap retry attempts
-    pub bootstrap_max_retries: usize,
-    /// Delay between bootstrap retry attempts
-    pub bootstrap_retry_delay: Duration,
     /// Enable immediate propagation for urgent changes
     pub immediate_propagation_enabled: bool,
     /// Gossip fanout multiplier for urgent changes
     pub urgent_gossip_fanout: usize,
     /// Maximum retries for immediate propagation
     pub max_immediate_retries: usize,
-    /// Timeout for causal consistency operations
-    pub causal_consistency_timeout: Duration,
     /// Target in-flight ask window per connection (used for queue/pool sizing)
     pub ask_window: usize,
     /// How long to keep disconnected peers before removing them (default: 15 minutes)
@@ -258,8 +244,6 @@ pub struct GossipConfig {
     pub enable_peer_discovery: bool,
     /// Maximum number of peers to maintain via discovery (soft cap, default: 100)
     pub max_peers: usize,
-    /// Maximum consecutive peer connection failures before removal (default: 10)
-    pub max_peer_discovery_failures: usize,
     /// Interval between peer list gossip (default: 30s)
     pub peer_gossip_interval: Option<Duration>,
     /// Maximum number of peers to send peer list gossip to (default: 3)
@@ -378,20 +362,13 @@ impl Default for GossipConfig {
             max_delta_history: 100,
             full_sync_interval: 50,     // Force full sync every 50 deltas
             max_pooled_connections: 20, // Allow up to 20 pooled connections
-            idle_connection_timeout: Duration::from_secs(300),
-            checkout_timeout: Duration::from_secs(60),
             vector_clock_gc_frequency: Duration::from_secs(300), // 5 minutes
             vector_clock_retention_period: Duration::from_secs(7200), // 2 hours (was 1 hour)
             max_vector_clock_size: 1000,                         // Compact after 1000 entries
             small_cluster_threshold: DEFAULT_SMALL_CLUSTER_THRESHOLD,
-            bootstrap_readiness_timeout: Duration::from_secs(30),
-            bootstrap_readiness_check_interval: Duration::from_millis(100),
-            bootstrap_max_retries: 5, // Increased from 3 to handle startup race conditions
-            bootstrap_retry_delay: Duration::from_secs(5),
             immediate_propagation_enabled: true,
             urgent_gossip_fanout: 5,
             max_immediate_retries: 3,
-            causal_consistency_timeout: Duration::from_millis(500),
             ask_window: DEFAULT_ASK_WINDOW,
             dead_peer_timeout: Duration::from_secs(DEFAULT_DEAD_PEER_TIMEOUT_SECS),
             nat_role_reconnect_enabled: DEFAULT_NAT_ROLE_RECONNECT_ENABLED,
@@ -406,7 +383,6 @@ impl Default for GossipConfig {
             advertise_address: None,
             enable_peer_discovery: false, // Safe rollout: disabled by default
             max_peers: 100,
-            max_peer_discovery_failures: 10,
             peer_gossip_interval: Some(Duration::from_secs(5)),
             max_peer_gossip_targets: 3,
             allow_private_discovery: true,
@@ -534,28 +510,15 @@ mod tests {
         assert_eq!(config.max_delta_history, 100);
         assert_eq!(config.full_sync_interval, 50);
         assert_eq!(config.max_pooled_connections, 20);
-        assert_eq!(config.idle_connection_timeout, Duration::from_secs(300));
-        assert_eq!(config.checkout_timeout, Duration::from_secs(60));
         assert_eq!(config.vector_clock_gc_frequency, Duration::from_secs(300));
         assert_eq!(
             config.vector_clock_retention_period,
             Duration::from_secs(7200)
         );
         assert_eq!(config.small_cluster_threshold, 5);
-        assert_eq!(config.bootstrap_readiness_timeout, Duration::from_secs(30));
-        assert_eq!(
-            config.bootstrap_readiness_check_interval,
-            Duration::from_millis(100)
-        );
-        assert_eq!(config.bootstrap_max_retries, 5);
-        assert_eq!(config.bootstrap_retry_delay, Duration::from_secs(5));
         assert!(config.immediate_propagation_enabled);
         assert_eq!(config.urgent_gossip_fanout, 5);
         assert_eq!(config.max_immediate_retries, 3);
-        assert_eq!(
-            config.causal_consistency_timeout,
-            Duration::from_millis(500)
-        );
         assert_eq!(config.ask_window, DEFAULT_ASK_WINDOW);
         assert_eq!(config.dead_peer_timeout, Duration::from_secs(900));
         assert!(!config.nat_role_reconnect_enabled);
@@ -572,7 +535,6 @@ mod tests {
         assert!(config.advertise_address.is_none());
         assert!(!config.enable_peer_discovery); // Disabled by default for safe rollout
         assert_eq!(config.max_peers, 100);
-        assert_eq!(config.max_peer_discovery_failures, 10);
         assert_eq!(config.peer_gossip_interval, Some(Duration::from_secs(5)));
         assert_eq!(config.max_peer_gossip_targets, 3);
         assert!(config.allow_private_discovery);

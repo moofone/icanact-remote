@@ -33,8 +33,6 @@ pub struct ConnectionPool<T = ()> {
     connection_timeout: Duration,
     /// Registry reference for handling incoming messages
     registry: ArcSwapWeak<GossipRegistry>,
-    /// Shared message buffer pool for zero-allocation processing
-    message_buffer_pool: Arc<MessageBufferPool>,
     /// Shared aligned bytes pool for zero-copy receive buffers
     aligned_bytes_pool: Arc<crate::AlignedBytesPool>,
     /// Connection counter for load balancing.

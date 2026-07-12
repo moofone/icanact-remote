@@ -56,8 +56,6 @@ async fn test_node_b_killed_a_detects_immediately() {
         connection_timeout: Duration::from_secs(2),
         response_timeout: Duration::from_secs(2),
         immediate_propagation_enabled: true, // Enable immediate propagation
-        bootstrap_readiness_timeout: Duration::from_secs(5),
-        bootstrap_readiness_check_interval: Duration::from_millis(50),
         ..Default::default()
     };
 

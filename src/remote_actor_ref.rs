@@ -421,18 +421,6 @@ impl<T> RemoteActorRef<T> {
         })
     }
 
-    /// Create a new RemoteActorRef from location and connection
-    /// Note: This creates a RemoteActorRef without a registry reference (cannot auto-reconnect)
-    /// Prefer using `with_registry()` which is called by `lookup()`
-    pub fn new(location: RemoteActorLocation, connection: RemoteConnection) -> Self {
-        Self {
-            location,
-            connection: Some(connection),
-            registry: Weak::new(), // No registry reference - cannot reconnect
-            _marker: PhantomData,
-        }
-    }
-
     /// Create a new RemoteActorRef with optional connection and registry reference (for auto-reconnection)
     /// Called by `lookup()` - uses Weak to prevent reference cycles
     pub(crate) fn with_registry(

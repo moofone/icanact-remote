@@ -4,7 +4,6 @@
 pub const MASTER_BUFFER_SIZE: usize = 1024 * 1024; // 1MB - THE source of truth
 
 // All other buffer sizes derive from the master constant - NO MAGIC NUMBERS!
-pub const TCP_BUFFER_SIZE: usize = MASTER_BUFFER_SIZE; // BufWriter & io_uring buffer
 pub const STREAM_CHUNK_SIZE: usize = MASTER_BUFFER_SIZE; // Streaming chunk size
 pub const STREAMING_THRESHOLD: usize = MASTER_BUFFER_SIZE.saturating_sub(1024); // Just under buffer limit
 

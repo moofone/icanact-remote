@@ -1,19 +1,10 @@
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tracing::warn;
 
 use crate::GossipConfig;
 
-#[cfg(test)]
-static KEEPALIVE_APPLY_CALLS: AtomicUsize = AtomicUsize::new(0);
-
 pub(crate) fn apply_tcp_keepalive(stream: &TcpStream, config: &GossipConfig) {
-    #[cfg(test)]
-    KEEPALIVE_APPLY_CALLS.fetch_add(1, Ordering::Relaxed);
-
     let Some(keepalive) = config.tcp_keepalive.as_ref() else {
         return;
     };

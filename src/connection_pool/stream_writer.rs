@@ -6,7 +6,6 @@ pub struct LockFreeStreamHandle {
     addr: SocketAddr,
     channel_id: ChannelId,
     sequence_counter: Arc<AtomicUsize>,
-    frame_sequence: Arc<AtomicUsize>,
     bytes_written: Arc<AtomicUsize>, // This tracks actual TCP bytes written
     shutdown_signal: Arc<AtomicBool>,
     exit_flag: Arc<AtomicBool>,
@@ -119,7 +118,6 @@ impl LockFreeStreamHandle {
                 addr,
                 channel_id,
                 sequence_counter: Arc::new(AtomicUsize::new(0)),
-                frame_sequence: Arc::new(AtomicUsize::new(0)),
                 bytes_written, // This now tracks actual TCP bytes written
                 shutdown_signal,
                 flush_pending,
@@ -2201,11 +2199,6 @@ impl LockFreeStreamHandle {
         self.enqueue_write_nonblocking(WritePayload::HeaderPayload { header, payload })
     }
 
-    /// Enqueue bytes (legacy name kept for compatibility).
-    pub fn write_bytes_nonblocking_checked(&self, data: bytes::Bytes) -> Result<()> {
-        self.enqueue_write_nonblocking(WritePayload::Single(data))
-    }
-
     /// Enqueue header + payload (legacy name kept for compatibility).
     pub fn write_header_and_payload_nonblocking_checked(
         &self,
@@ -2288,11 +2281,6 @@ impl LockFreeStreamHandle {
     /// Get sequence counter
     pub fn sequence_number(&self) -> usize {
         self.sequence_counter.load(Ordering::Relaxed)
-    }
-
-    /// Get next stream frame sequence ID (wraps at u16::MAX)
-    fn next_frame_sequence_id(&self) -> u16 {
-        (self.frame_sequence.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16
     }
 
     /// Get socket address

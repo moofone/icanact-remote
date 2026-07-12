@@ -8,52 +8,12 @@ fn monotonic_now_millis() -> usize {
     START.get_or_init(Instant::now).elapsed().as_millis() as usize
 }
 
-/// Stream frame types for high-performance streaming protocol
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum StreamFrameType {
-    Data = 0x01,
-    Ack = 0x02,
-    Close = 0x03,
-    Heartbeat = 0x04,
-    TellAsk = 0x05,    // Regular tell/ask messages
-    StreamData = 0x06, // Dedicated streaming data
-}
-
 /// Channel IDs for stream multiplexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ChannelId {
-    TellAsk = 0x00,  // Regular tell/ask channel
-    Stream1 = 0x01,  // Dedicated streaming channel 1
-    Stream2 = 0x02,  // Dedicated streaming channel 2
-    Stream3 = 0x03,  // Dedicated streaming channel 3
-    Bulk = 0x04,     // Bulk data channel
-    Priority = 0x05, // Priority streaming channel
-    Global = 0xFF,   // Global channel for all operations
-}
-
-/// Stream frame flags
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum StreamFrameFlags {
-    None = 0x00,
-    More = 0x01,       // More frames to follow
-    Compressed = 0x02, // Frame is compressed
-    Encrypted = 0x04,  // Frame is encrypted
-}
-
-/// Stream frame header for structured messaging
-#[derive(Debug, Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(derive(Debug))]
-pub struct StreamFrameHeader {
-    pub frame_type: u8,
-    pub channel_id: u8,
-    pub flags: u8,
-    pub sequence_id: u16,
-    pub payload_len: u32,
+    TellAsk = 0x00, // Regular tell/ask channel
+    Global = 0xFF,  // Global channel for all operations
 }
 
 /// Lock-free connection state representation
