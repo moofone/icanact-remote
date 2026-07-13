@@ -2907,7 +2907,7 @@ impl<T> ConnectionPool<T> {
     /// that test have completed — is never negative in a correct
     /// implementation, so this conversion never masks a real bug in
     /// steady-state assertions.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub(crate) fn raw_connection_counter(&self) -> usize {
         self.connection_counter.load(Ordering::Acquire).max(0) as usize
     }
@@ -2923,7 +2923,7 @@ impl<T> ConnectionPool<T> {
     /// of `0` — must assert against this signed value instead, so that a
     /// negative regression fails loudly rather than reading as a correct
     /// zero balance.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub(crate) fn raw_connection_counter_signed(&self) -> isize {
         self.connection_counter.load(Ordering::Acquire)
     }
