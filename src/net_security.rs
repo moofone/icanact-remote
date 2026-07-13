@@ -48,6 +48,11 @@ fn is_safe_ipv4(
         return false;
     }
 
+    // Multicast (224.0.0.0/4) is never a valid unicast peer target.
+    if ipv4.is_multicast() {
+        return false;
+    }
+
     // Documentation ranges (RFC5737)
     if ipv4.is_documentation() {
         return false;
@@ -78,6 +83,11 @@ fn is_safe_ipv6(
         return false;
     }
 
+    // Multicast (ff00::/8) is never a valid unicast peer target.
+    if ipv6.is_multicast() {
+        return false;
+    }
+
     if ipv6.is_unicast_link_local() && !allow_link_local {
         return false;
     }
@@ -93,4 +103,131 @@ fn is_safe_ipv6(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(ip: IpAddr) -> SocketAddr {
+        SocketAddr::new(ip, 443)
+    }
+
+    #[test]
+    fn multicast_is_never_safe_to_dial() {
+        let multicast = [
+            addr(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))),
+            addr(IpAddr::V6("ff02::1".parse().expect("IPv6 multicast"))),
+        ];
+
+        for candidate in multicast {
+            for allow_private in [false, true] {
+                for allow_loopback in [false, true] {
+                    for allow_link_local in [false, true] {
+                        assert!(
+                            !is_safe_to_dial(
+                                &candidate,
+                                allow_private,
+                                allow_loopback,
+                                allow_link_local,
+                            ),
+                            "multicast address {candidate} must remain non-dialable"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_ranges_follow_only_their_matching_flag() {
+        #[derive(Clone, Copy)]
+        enum Gate {
+            Private,
+            Loopback,
+            LinkLocal,
+        }
+
+        let cases = [
+            (addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))), Gate::Private),
+            (addr(IpAddr::V4(Ipv4Addr::LOCALHOST)), Gate::Loopback),
+            (
+                addr(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))),
+                Gate::LinkLocal,
+            ),
+            (addr(IpAddr::V6(Ipv6Addr::LOCALHOST)), Gate::Loopback),
+            (
+                addr(IpAddr::V6("fc00::1".parse().expect("IPv6 ULA"))),
+                Gate::Private,
+            ),
+            (
+                addr(IpAddr::V6("fe80::1".parse().expect("IPv6 link-local"))),
+                Gate::LinkLocal,
+            ),
+            (
+                addr(IpAddr::V6(
+                    "::ffff:10.0.0.1".parse().expect("mapped private IPv4"),
+                )),
+                Gate::Private,
+            ),
+        ];
+
+        for (candidate, gate) in cases {
+            for allow_private in [false, true] {
+                for allow_loopback in [false, true] {
+                    for allow_link_local in [false, true] {
+                        let expected = match gate {
+                            Gate::Private => allow_private,
+                            Gate::Loopback => allow_loopback,
+                            Gate::LinkLocal => allow_link_local,
+                        };
+                        assert_eq!(
+                            is_safe_to_dial(
+                                &candidate,
+                                allow_private,
+                                allow_loopback,
+                                allow_link_local,
+                            ),
+                            expected,
+                            "unexpected policy for {candidate} with private={allow_private}, loopback={allow_loopback}, link_local={allow_link_local}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unconditional_bogons_remain_blocked_when_all_flags_are_enabled() {
+        let bogons = [
+            addr(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            addr(IpAddr::V4(Ipv4Addr::BROADCAST)),
+            addr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            addr(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            addr(IpAddr::V6(
+                "2001:db8::1".parse().expect("IPv6 documentation address"),
+            )),
+        ];
+
+        for candidate in bogons {
+            assert!(
+                !is_safe_to_dial(&candidate, true, true, true),
+                "unconditional bogon {candidate} must remain non-dialable"
+            );
+        }
+    }
+
+    #[test]
+    fn public_unicast_is_safe_with_restrictive_flags() {
+        let public = [
+            addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            addr(IpAddr::V6(
+                "2606:4700:4700::1111".parse().expect("public IPv6 address"),
+            )),
+        ];
+
+        for candidate in public {
+            assert!(is_safe_to_dial(&candidate, false, false, false));
+        }
+    }
 }
