@@ -476,7 +476,13 @@ mod tests {
 
     #[test]
     fn archived_decode_rejects_misaligned_caller_bytes() {
-        let encoded = encode_typed(&TestMsg { value: 9 }).unwrap();
+        let payload = encode_typed_pooled(&TestMsg { value: 9 }).unwrap();
+        let (payload, prefix, total_len) = typed_payload_parts::<TestMsg>(payload);
+        let mut encoded = Vec::with_capacity(total_len);
+        if let Some(prefix) = prefix {
+            encoded.extend_from_slice(&prefix);
+        }
+        encoded.extend_from_slice(payload.chunk());
         let archive_alignment = std::mem::align_of::<<TestMsg as rkyv::Archive>::Archived>();
         assert!(archive_alignment > 1);
         let body_offset = if cfg!(debug_assertions) { 16 } else { 0 };
