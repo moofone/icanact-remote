@@ -35,8 +35,8 @@ fn checked_payload_len(payload_len: usize) -> u32 {
 
 /// Write ActorTell/ActorAsk header with padded 16-byte alignment.
 ///
-/// V4 wire format: [length:4][type:1][correlation_id:4][schema_hash:8]
-/// [reserved:3][actor_id:8][type_hash:4]. The outer frame length determines
+/// V4 wire format: `[length:4][type:1][correlation_id:4][schema_hash:8]`
+/// `[reserved:3][actor_id:8][type_hash:4]`. The outer frame length determines
 /// payload length, avoiding extra header growth while widening correlation IDs.
 pub fn write_actor_frame_header(
     msg_type: MessageType,
@@ -126,7 +126,7 @@ pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER
 }
 
 /// Write DirectAsk header - fast path for direct ask without actor message handler
-/// V4 wire format: [length:4][type:1][correlation_id:4][payload_len:4][pad:3][payload:N]
+/// V4 wire format: `[length:4][type:1][correlation_id:4][payload_len:4][pad:3][payload:N]`
 pub fn write_direct_ask_header(
     correlation_id: u32,
     payload_len: usize,
@@ -143,7 +143,7 @@ pub fn write_direct_ask_header(
 }
 
 /// Write DirectResponse header - fast path for direct response
-/// V4 wire format: [length:4][type:1][correlation_id:4][payload_len:4][pad:3][payload:N]
+/// V4 wire format: `[length:4][type:1][correlation_id:4][payload_len:4][pad:3][payload:N]`
 pub fn write_direct_response_header(
     correlation_id: u32,
     payload_len: usize,

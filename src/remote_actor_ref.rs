@@ -650,7 +650,7 @@ impl<T> RemoteActorRef<T> {
     /// Send a request and wait for a response.
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
-    /// ZERO-COPY: Returns Bytes instead of Vec<u8> to avoid allocation.
+    /// ZERO-COPY: Returns `Bytes` instead of `Vec<u8>` to avoid allocation.
     /// ConnectionHandle internally uses lock-free stream operations.
     ///
     /// Returns error if registry has shut down or no connection is available.
