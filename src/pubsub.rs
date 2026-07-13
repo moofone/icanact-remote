@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
+use lru::LruCache;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -14,7 +16,7 @@ use crate::{GossipError, PeerId, RegistrationPriority, RemoteActorLocation, Resu
 
 const CONTROL_PLANE_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_TTL: u8 = 8;
-const SEEN_FINGERPRINT_SLOTS: usize = 16_384;
+const SEEN_MESSAGE_CAPACITY: usize = 16_384;
 const INTEREST_PREFIX: &str = "icanact/pubsub/interest/v1";
 const FAST_FRAME_MAGIC: &[u8; 4] = b"PSF1";
 const FAST_FRAME_HEADER_LEN: usize = 120;
@@ -50,6 +52,12 @@ type BorrowedSubscriberMap = HashMap<SubscriberKey, Arc<[BorrowedSubscriberEntry
 type TypeSubscriberMap = HashMap<TypeHash, Arc<[TypeSubscriberEntry]>>;
 type RouteGroups = HashMap<PeerId, Arc<[PeerId]>>;
 type TopicRouteGroups = HashMap<TopicKey, Arc<RouteGroups>>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SeenMessageKey {
+    origin_peer_id: [u8; 32],
+    msg_id: u128,
+}
 
 #[derive(Clone)]
 struct HotBorrowedSubscriber {
@@ -423,7 +431,7 @@ pub struct RoutedPubSub {
     route_groups: ArcSwap<TopicRouteGroups>,
     hot_route_groups: ArcSwapOption<HotRouteGroups>,
     conns: ArcSwap<HashMap<PeerId, crate::RemoteConnection>>,
-    seen_fingerprints: Box<[AtomicU64]>,
+    seen_messages: Mutex<LruCache<SeenMessageKey, ()>>,
     counters: PubSubIngressCounters,
     next_sub_id: AtomicU64,
     msg_id_epoch: u64,
@@ -451,7 +459,7 @@ impl RoutedPubSub {
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
             conns: ArcSwap::from_pointee(HashMap::new()),
-            seen_fingerprints: new_seen_fingerprints(),
+            seen_messages: new_seen_messages(),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
             msg_id_epoch,
@@ -1350,28 +1358,19 @@ impl RoutedPubSub {
     }
 
     fn accept_seen_bytes(&self, origin: &[u8; 32], msg_id: u128) -> bool {
-        let fingerprint = seen_fingerprint_bytes(origin, msg_id);
-        self.accept_seen_fingerprint(fingerprint)
-    }
-
-    fn accept_seen_fingerprint(&self, fingerprint: u64) -> bool {
-        let slot =
-            &self.seen_fingerprints[(fingerprint as usize) & (self.seen_fingerprints.len() - 1)];
-        let mut current = slot.load(Ordering::Relaxed);
-        loop {
-            if current == fingerprint {
-                return false;
-            }
-            match slot.compare_exchange_weak(
-                current,
-                fingerprint,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(next) => current = next,
-            }
+        let key = SeenMessageKey {
+            origin_peer_id: *origin,
+            msg_id,
+        };
+        let mut seen = self.seen_messages.lock().unwrap_or_else(|error| {
+            warn!(%error, "pubsub seen-message cache lock poisoned, recovering");
+            error.into_inner()
+        });
+        if seen.get(&key).is_some() {
+            return false;
         }
+        seen.put(key, ());
+        true
     }
 }
 
@@ -1617,12 +1616,10 @@ fn decode_delivery_mode(mode: u8) -> Option<PubSubDeliveryMode> {
     }
 }
 
-fn new_seen_fingerprints() -> Box<[AtomicU64]> {
-    debug_assert!(SEEN_FINGERPRINT_SLOTS.is_power_of_two());
-    (0..SEEN_FINGERPRINT_SLOTS)
-        .map(|_| AtomicU64::new(0))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+fn new_seen_messages() -> Mutex<LruCache<SeenMessageKey, ()>> {
+    Mutex::new(LruCache::new(
+        NonZeroUsize::new(SEEN_MESSAGE_CAPACITY).expect("seen-message capacity must be non-zero"),
+    ))
 }
 
 fn new_msg_id_epoch() -> u64 {
@@ -1633,7 +1630,8 @@ fn new_msg_id_epoch_with(entropy: impl FnOnce() -> u64) -> u64 {
     entropy().max(1)
 }
 
-fn seen_fingerprint_bytes(origin: &[u8; 32], msg_id: u128) -> u64 {
+#[cfg(test)]
+fn legacy_seen_fingerprint_bytes(origin: &[u8; 32], msg_id: u128) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -1820,7 +1818,7 @@ mod tests {
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
             conns: ArcSwap::from_pointee(HashMap::new()),
-            seen_fingerprints: new_seen_fingerprints(),
+            seen_messages: new_seen_messages(),
             counters: PubSubIngressCounters::default(),
             next_sub_id: AtomicU64::new(1),
             msg_id_epoch,
@@ -1875,6 +1873,60 @@ mod tests {
     #[test]
     fn msg_id_epoch_reserves_zero() {
         assert_eq!(new_msg_id_epoch_with(|| 0), 1);
+    }
+
+    #[test]
+    fn slot_collision_does_not_make_an_earlier_message_replay_acceptable() {
+        let pubsub = test_pubsub("pubsub-exact-dedup");
+        let origin = *crate::KeyPair::new_for_testing("pubsub-dedup-origin")
+            .peer_id()
+            .as_bytes();
+        let mut by_slot = HashMap::new();
+        let (first, second) = (1_u128..=u128::from(SEEN_MESSAGE_CAPACITY as u64 + 1))
+            .find_map(|msg_id| {
+                let fingerprint = legacy_seen_fingerprint_bytes(&origin, msg_id);
+                let slot = (fingerprint as usize) & (SEEN_MESSAGE_CAPACITY - 1);
+                match by_slot.insert(slot, (msg_id, fingerprint)) {
+                    Some((previous_id, previous_fingerprint))
+                        if previous_fingerprint != fingerprint =>
+                    {
+                        Some((previous_id, msg_id))
+                    }
+                    _ => None,
+                }
+            })
+            .expect("pigeonhole principle guarantees a slot collision");
+
+        assert!(pubsub.accept_seen_bytes(&origin, first));
+        assert!(pubsub.accept_seen_bytes(&origin, second));
+        assert!(
+            !pubsub.accept_seen_bytes(&origin, first),
+            "a colliding message must not evict a recent exact identity"
+        );
+    }
+
+    #[test]
+    fn exact_dedup_cache_stays_bounded_and_evicts_least_recent_identity() {
+        let pubsub = test_pubsub("pubsub-bounded-dedup");
+        let origin = *crate::KeyPair::new_for_testing("pubsub-bounded-dedup-origin")
+            .peer_id()
+            .as_bytes();
+
+        for msg_id in 1..=SEEN_MESSAGE_CAPACITY as u128 + 1 {
+            assert!(pubsub.accept_seen_bytes(&origin, msg_id));
+        }
+        assert_eq!(
+            pubsub.seen_messages.lock().unwrap().len(),
+            SEEN_MESSAGE_CAPACITY
+        );
+        assert!(
+            pubsub.accept_seen_bytes(&origin, 1),
+            "the oldest identity should leave the finite dedup window"
+        );
+        assert!(
+            !pubsub.accept_seen_bytes(&origin, SEEN_MESSAGE_CAPACITY as u128 + 1),
+            "a recent identity must remain deduplicated after LRU eviction"
+        );
     }
 
     #[tokio::test]
