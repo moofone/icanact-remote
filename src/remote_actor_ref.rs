@@ -308,16 +308,23 @@ impl RemoteConnection {
 /// This provides **self-healing** behavior - no manual re-lookup needed!
 ///
 /// # Example
-/// ```ignore
+/// ```no_run
+/// # use bytes::Bytes;
+/// # use icanact_remote::{GossipRegistryHandle, Result};
+/// # async fn send_messages(registry: &GossipRegistryHandle) -> Result<()> {
 /// // Step 1: Lookup does ALL the work - finds actor AND caches connection
-/// let remote_actor = registry.lookup("chat_service").await?;
+/// let Some(remote_actor) = registry.lookup("chat_service").await else {
+///     return Ok(());
+/// };
 ///
 /// // Step 2: tell/ask use cached connection - ZERO lookups, just pointer deref
-/// remote_actor.tell(message1).await?;
-/// remote_actor.tell(message2).await?;
-/// remote_actor.ask(request).await?;
+/// remote_actor.tell(Bytes::from_static(b"message1")).await?;
+/// remote_actor.tell(Bytes::from_static(b"message2")).await?;
+/// let _response = remote_actor.ask(Bytes::from_static(b"request")).await?;
 ///
 /// // Even if peer's IP changes (pod restart), RemoteActorRef auto-reconnects!
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct RemoteActorRef<T = ()> {
