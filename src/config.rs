@@ -140,18 +140,13 @@ impl ConnectionRecoveryPolicy {
 /// should use `TransportOnly` so SWIM remains the only cluster-membership
 /// authority while icanact-remote still owns connection retry, backoff, and
 /// registry route cleanup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PeerHealthMode {
     /// Preserve the historical peer-health query/report path.
+    #[default]
     LegacyConsensus,
     /// Treat peer failures as transport-local state only.
     TransportOnly,
-}
-
-impl Default for PeerHealthMode {
-    fn default() -> Self {
-        Self::LegacyConsensus
-    }
 }
 
 /// Configuration for the gossip registry

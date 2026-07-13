@@ -174,7 +174,7 @@ async fn wildcard_bind_interest_advertises_routable_address() -> icanact_remote:
     // Register routed-pubsub interest on A through the real public surface.
     let pubsub_a = RoutedPubSub::install(Arc::clone(&a.registry)).await;
     let topic = topic_key("coins/wildcard-interest-storm/prices");
-    let type_hash: u64 = 0xC01E_5;
+    let type_hash: u64 = 0x000C_01E5;
     let _subscription = pubsub_a.subscribe_bytes(topic, type_hash, |_bytes| {});
 
     let interest_name = interest_actor_name(topic, &a_peer_id);
@@ -291,7 +291,7 @@ async fn wildcard_bind_interest_storm_settles_to_quiet_steady_state() -> icanact
 
     let pubsub_a = RoutedPubSub::install(Arc::clone(&a_final.registry)).await;
     let topic = topic_key("coins/wildcard-interest-storm/steady-state");
-    let type_hash: u64 = 0xC01E_6;
+    let type_hash: u64 = 0x000C_01E6;
     let _subscription = pubsub_a.subscribe_bytes(topic, type_hash, |_bytes| {});
     let interest_name = interest_actor_name(topic, &a_peer_id);
 
