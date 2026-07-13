@@ -524,7 +524,12 @@ fn test_tls_reconnection() {
         let location = registry_b.lookup("persistent_actor").await;
         assert!(location.is_some(), "B should know about A's actor");
 
-        // Shutdown B
+        // Shut B down through the lifecycle API so active transport tasks and
+        // peer sessions close before the same identity is restarted. A bare
+        // handle drop only aborts owned background loops; detached connection
+        // tasks may otherwise keep the old session alive long enough to race
+        // replacement publication.
+        registry_b.shutdown().await;
         drop(registry_b);
 
         // Wait for A to detect disconnection and reach max retry failures
@@ -562,12 +567,21 @@ fn test_tls_reconnection() {
         // deterministic transport direction rule.
         connect_preferred(&registry_a, &registry_b_new).await;
 
-        // Wait for reconnection and gossip propagation
-        // With 100ms gossip interval, need a few seconds for:
-        // - Connection to be re-established
-        // - Gossip rounds to propagate the actor info
-        // Wait for reconnection and gossip propagation
-        // Poll for actor discovery instead of fixed sleep for robustness
+        // `Peer::connect` returns when the outbound side is ready; the inbound
+        // registry can still be finalizing identity publication. Gate the
+        // propagation assertion on both registries observing the replacement
+        // session, then request a fresh gossip round from the actor owner.
+        assert!(
+            wait_for_peers(&registry_a, &registry_b_new, Duration::from_secs(5)).await,
+            "both registries should publish the replacement peer session"
+        );
+        registry_a
+            .registry
+            .trigger_immediate_gossip()
+            .await
+            .expect("trigger post-reconnect actor sync");
+
+        // Poll for actor discovery instead of relying on scheduler timing.
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(10);
         let mut location = None;
