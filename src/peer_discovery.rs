@@ -388,6 +388,41 @@ impl PeerDiscovery {
         }
     }
 
+    /// Keep attacker-controlled failed-address history bounded independently
+    /// from its TTL. Connected and pending peers already share `max_peers`;
+    /// allowing at most the same number of failed entries therefore bounds
+    /// discovery state to at most twice the configured peer capacity.
+    fn make_room_for_failed_peer(&mut self, addr: SocketAddr) {
+        if matches!(self.peer_states.get(&addr), Some(PeerState::Failed { .. })) {
+            return;
+        }
+
+        let failed_cap = self.config.max_peers.max(1);
+        if self.failed_count_unified() < failed_cap {
+            return;
+        }
+
+        let oldest = self
+            .peer_states
+            .iter()
+            .filter_map(|(candidate, state)| match state {
+                PeerState::Failed { since, .. } => Some((*since, *candidate)),
+                _ => None,
+            })
+            .min();
+
+        if let Some((_, evicted_addr)) = oldest {
+            self.peer_states.remove(&evicted_addr);
+            self.pending_peers.remove(&evicted_addr);
+            self.failed_peers.remove(&evicted_addr);
+            warn!(
+                addr = %evicted_addr,
+                failed_cap,
+                "evicted oldest failed peer at discovery state cap"
+            );
+        }
+    }
+
     /// Record a connection failure for a peer
     ///
     /// Atomically transitions peer to Failed state.
@@ -420,6 +455,7 @@ impl PeerDiscovery {
             self.pending_peers.remove(&addr);
             self.failed_peers.remove(&addr);
         } else {
+            self.make_room_for_failed_peer(addr);
             let retry_delay_seconds =
                 decorrelated_backoff_seconds(previous_delay, rand::rng().random());
             // Atomically transition to Failed state
@@ -928,6 +964,32 @@ mod tests {
             MAX_PEER_FAILURES
         );
         assert!(!discovery.failed_peers.contains_key(&peer));
+    }
+
+    #[test]
+    fn failed_peer_state_is_hard_capped() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::new(
+            local,
+            PeerDiscoveryConfig {
+                max_peers: 3,
+                ..Default::default()
+            },
+        );
+
+        for port in 9000..9010 {
+            assert!(!discovery.on_peer_failure(test_addr(port)));
+        }
+
+        assert_eq!(discovery.failed_count_unified(), 3);
+        assert_eq!(discovery.failed_peer_count(), 3);
+        assert!(discovery.peer_states.len() <= 3);
+        for port in 9000..9007 {
+            assert!(discovery.get_peer_state(&test_addr(port)).is_none());
+        }
+        for port in 9007..9010 {
+            assert!(discovery.get_peer_state(&test_addr(port)).is_some());
+        }
     }
 
     #[test]
