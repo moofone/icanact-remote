@@ -173,7 +173,11 @@ pub struct GossipConfig {
     pub response_timeout: Duration,
     /// Maximum message size in bytes
     pub max_message_size: usize,
-    /// Optional schema/version hash for protocol guardrails (v3 header).
+    /// Maximum number of remotely learned actors retained globally.
+    pub max_known_actors: usize,
+    /// Maximum number of remotely learned actors accepted from one peer.
+    pub max_known_actors_per_peer: usize,
+    /// Optional schema/version hash for protocol guardrails.
     pub schema_hash: Option<u64>,
     /// Maximum number of failed connection attempts before marking peer as failed
     pub max_peer_failures: usize,
@@ -354,6 +358,8 @@ impl Default for GossipConfig {
             connection_timeout: Duration::from_secs(10),
             response_timeout: Duration::from_secs(5),
             max_message_size: 10 * 1024 * 1024, // 10MB
+            max_known_actors: 100_000,
+            max_known_actors_per_peer: 10_000,
             schema_hash: Some(DEFAULT_SCHEMA_HASH),
             max_peer_failures: DEFAULT_MAX_PEER_FAILURES,
             peer_retry_interval: Duration::from_secs(DEFAULT_PEER_RETRY_SECONDS),
@@ -501,6 +507,8 @@ mod tests {
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
         assert_eq!(config.response_timeout, Duration::from_secs(5));
         assert_eq!(config.max_message_size, 10 * 1024 * 1024);
+        assert_eq!(config.max_known_actors, 100_000);
+        assert_eq!(config.max_known_actors_per_peer, 10_000);
         assert_eq!(config.schema_hash, Some(DEFAULT_SCHEMA_HASH));
         assert_eq!(config.max_peer_failures, 2);
         assert_eq!(

@@ -1264,6 +1264,10 @@ pub struct GossipState {
     pub shutdown: bool,
     /// Track which actors are connected from which peer address
     pub peer_to_actors: HashMap<SocketAddr, HashSet<String>>,
+    /// Remote-actor admission accounting keyed by authenticated identity.
+    pub actor_admissions_by_peer: HashMap<crate::PeerId, HashSet<String>>,
+    /// Reverse index used to release per-peer admission capacity on removal.
+    pub actor_admission_peer_by_name: HashMap<String, crate::PeerId>,
     /// Legacy peer-health consensus reports from different observers.
     pub peer_health_reports: HashMap<SocketAddr, HashMap<SocketAddr, PeerHealthStatus>>,
     /// Legacy pending peer failures that need consensus.
@@ -1278,6 +1282,53 @@ pub struct GossipState {
     pub known_peers: LruCache<SocketAddr, PeerInfo>,
     /// Timestamp (in millis since start_time) when mesh formation completed
     pub mesh_formation_time_ms: Option<u64>,
+}
+
+impl GossipState {
+    fn actor_admission_count(&self, peer_id: &crate::PeerId) -> usize {
+        self.actor_admissions_by_peer
+            .get(peer_id)
+            .map_or(0, HashSet::len)
+    }
+
+    fn record_actor_admission(&mut self, peer_id: &crate::PeerId, name: &str) {
+        if let Some(previous_peer) = self
+            .actor_admission_peer_by_name
+            .insert(name.to_string(), peer_id.clone())
+            && previous_peer != *peer_id
+        {
+            let remove_previous = self
+                .actor_admissions_by_peer
+                .get_mut(&previous_peer)
+                .is_some_and(|names| {
+                    names.remove(name);
+                    names.is_empty()
+                });
+            if remove_previous {
+                self.actor_admissions_by_peer.remove(&previous_peer);
+            }
+        }
+        self.actor_admissions_by_peer
+            .entry(peer_id.clone())
+            .or_default()
+            .insert(name.to_string());
+    }
+
+    fn release_actor_admission(&mut self, name: &str) {
+        let Some(peer_id) = self.actor_admission_peer_by_name.remove(name) else {
+            return;
+        };
+        let remove_peer = self
+            .actor_admissions_by_peer
+            .get_mut(&peer_id)
+            .is_some_and(|names| {
+                names.remove(name);
+                names.is_empty()
+            });
+        if remove_peer {
+            self.actor_admissions_by_peer.remove(&peer_id);
+        }
+    }
 }
 
 /// Core gossip registry implementation with separated locks
@@ -1513,6 +1564,8 @@ impl<T: 'static> GossipRegistry<T> {
                 full_sync_exchanges: 0,
                 shutdown: false,
                 peer_to_actors: HashMap::new(),
+                actor_admissions_by_peer: HashMap::new(),
+                actor_admission_peer_by_name: HashMap::new(),
                 peer_health_reports: HashMap::new(),
                 pending_peer_failures: HashMap::new(),
                 // Peer discovery state
@@ -2860,7 +2913,15 @@ impl<T: 'static> GossipRegistry<T> {
         name: String,
         location: RemoteActorLocation,
     ) -> Result<()> {
-        let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+        if self
+            .actor_state
+            .known_actors
+            .remove_sync(name.as_str())
+            .is_some()
+        {
+            let mut gossip_state = self.gossip_state.lock().await;
+            gossip_state.release_actor_admission(&name);
+        }
         self.register_actor_with_priority(name, location, RegistrationPriority::Normal)
             .await
     }
@@ -2903,7 +2964,15 @@ impl<T: 'static> GossipRegistry<T> {
             .read_sync(name.as_str(), |_, location| location.clone())
         {
             if loc.node_id == self_node_id || loc.address == location.address {
-                let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+                if self
+                    .actor_state
+                    .known_actors
+                    .remove_sync(name.as_str())
+                    .is_some()
+                {
+                    let mut gossip_state = self.gossip_state.lock().await;
+                    gossip_state.release_actor_admission(&name);
+                }
             }
         }
 
@@ -3035,7 +3104,10 @@ impl<T: 'static> GossipRegistry<T> {
             .read_sync(name, |_, location| location.clone())
         {
             if loc.node_id == self_node_id {
-                let _ = self.actor_state.known_actors.remove_sync(name);
+                if self.actor_state.known_actors.remove_sync(name).is_some() {
+                    let mut gossip_state = self.gossip_state.lock().await;
+                    gossip_state.release_actor_admission(name);
+                }
             }
         }
 
@@ -3285,12 +3357,16 @@ impl<T: 'static> GossipRegistry<T> {
         // `known_actors` entries that the second half of this delta is
         // about to re-track in `peer_to_actors`.
         let mut applied_count = 0usize;
-        let mut peer_actors_added = std::collections::HashSet::new();
-        let mut peer_actors_removed = std::collections::HashSet::new();
+        let mut peer_actor_names_changed = std::collections::HashSet::new();
         let mut applied_immediate: Vec<String> = Vec::new();
         let log_adds: Vec<(String, RemoteActorLocation)> = {
             let mut gossip_state = self.gossip_state.lock().await;
             let mut log_adds = Vec::new();
+            let mut sender_actors = bookkeeping_addr
+                .and_then(|addr| gossip_state.peer_to_actors.get(&addr).cloned())
+                .unwrap_or_default();
+            let mut rejected_by_peer_cap = 0usize;
+            let mut rejected_by_global_cap = 0usize;
             for change in delta.changes {
                 match change {
                     RegistryChange::ActorAdded {
@@ -3332,13 +3408,34 @@ impl<T: 'static> GossipRegistry<T> {
                             None => wire_addr,
                         };
                         location.address = resolved.to_string();
-                        let Some((clear_tombstone, _is_update)) = self.current_actor_upsert_plan(
+                        let Some((clear_tombstone, is_update)) = self.current_actor_upsert_plan(
                             name.as_str(),
                             &location,
                             &sender_peer_id,
                         ) else {
                             continue;
                         };
+                        let transfers_admission = gossip_state
+                            .actor_admission_peer_by_name
+                            .get(&name)
+                            != Some(&sender_peer_id);
+                        if transfers_admission
+                            && gossip_state.actor_admission_count(&sender_peer_id)
+                                >= self.config.max_known_actors_per_peer
+                        {
+                            rejected_by_peer_cap += 1;
+                            continue;
+                        }
+                        if !is_update
+                            // `known_actors` is the remote-only map; locally
+                            // registered actors live in `local_actors` and do
+                            // not consume this admission budget.
+                            && self.actor_state.known_actors.len()
+                                >= self.config.max_known_actors
+                        {
+                            rejected_by_global_cap += 1;
+                            continue;
+                        }
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                         }
@@ -3346,7 +3443,9 @@ impl<T: 'static> GossipRegistry<T> {
                             .actor_state
                             .known_actors
                             .upsert_sync(name.clone(), location.clone());
-                        peer_actors_added.insert(name.clone());
+                        gossip_state.record_actor_admission(&sender_peer_id, &name);
+                        sender_actors.insert(name.clone());
+                        peer_actor_names_changed.insert(name.clone());
                         applied_count += 1;
                         if priority.should_trigger_immediate_gossip() {
                             applied_immediate.push(name.clone());
@@ -3393,7 +3492,9 @@ impl<T: 'static> GossipRegistry<T> {
                             .remove_sync(name.as_str())
                             .is_some()
                         {
-                            peer_actors_removed.insert(name.clone());
+                            gossip_state.release_actor_admission(&name);
+                            sender_actors.remove(&name);
+                            peer_actor_names_changed.insert(name.clone());
                             applied_count += 1;
                             let _ = self
                                 .actor_state
@@ -3407,17 +3508,21 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             }
 
+            if rejected_by_peer_cap > 0 || rejected_by_global_cap > 0 {
+                warn!(
+                    sender = %sender_peer_id,
+                    rejected_by_peer_cap,
+                    rejected_by_global_cap,
+                    max_known_actors = self.config.max_known_actors,
+                    max_known_actors_per_peer = self.config.max_known_actors_per_peer,
+                    "rejected remote actor registrations at configured admission caps"
+                );
+            }
+
             if let Some(bookkeeping_addr) = bookkeeping_addr {
-                let entry = gossip_state
+                gossip_state
                     .peer_to_actors
-                    .entry(bookkeeping_addr)
-                    .or_insert_with(std::collections::HashSet::new);
-                for name in &peer_actors_removed {
-                    entry.remove(name);
-                }
-                for name in &peer_actors_added {
-                    entry.insert(name.clone());
-                }
+                    .insert(bookkeeping_addr, sender_actors);
             } else {
                 debug!(
                     sender = %sender_peer_id,
@@ -3455,7 +3560,7 @@ impl<T: 'static> GossipRegistry<T> {
             );
         }
 
-        let peer_actor_changes = peer_actors_added.len() + peer_actors_removed.len();
+        let peer_actor_changes = peer_actor_names_changed.len();
 
         debug!(
             sender = %sender_peer_id,
@@ -4757,7 +4862,6 @@ impl<T: 'static> GossipRegistry<T> {
         // overwrite newer gossip.
         // Process remote local actors
         for (name, location) in remote_local {
-            peer_actors.insert(name.clone());
             if location.peer_id == self.peer_id {
                 debug!(
                     actor_name = %name,
@@ -4804,6 +4908,11 @@ impl<T: 'static> GossipRegistry<T> {
             updates_to_apply.push((name, location, owner_is_sender.then_some(resolved)));
         }
 
+        // HashMap iteration order is intentionally unstable. Sort before
+        // admission so every node retains the same names when a sender
+        // advertises more actors than its configured allowance.
+        updates_to_apply.sort_by(|left, right| left.0.cmp(&right.0));
+
         // STEP 2: Apply known_actors upserts, peer_to_actors update,
         // and stale-actor removal under a SINGLE gossip_state lock so
         // the "every name in peer_to_actors[sender] is in known_actors"
@@ -4814,13 +4923,47 @@ impl<T: 'static> GossipRegistry<T> {
         let mut routes_to_configure: Vec<(String, crate::PeerId, SocketAddr)> = Vec::new();
         {
             let mut gossip_state = self.gossip_state.lock().await;
+            let mut rejected_by_peer_cap = 0usize;
+            let mut rejected_by_global_cap = 0usize;
 
             for (name, location, addr) in &updates_to_apply {
-                let Some((clear_tombstone, is_update)) =
-                    self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id)
-                else {
+                let known_exists = self
+                    .actor_state
+                    .known_actors
+                    .contains_sync(name.as_str());
+                let transfers_admission = gossip_state
+                    .actor_admission_peer_by_name
+                    .get(name.as_str())
+                    != Some(&sender_peer_id);
+                if transfers_admission
+                    && gossip_state.actor_admission_count(&sender_peer_id)
+                        >= self.config.max_known_actors_per_peer
+                {
+                    rejected_by_peer_cap += 1;
                     continue;
-                };
+                }
+                if !known_exists
+                    // `known_actors` is remote-only; local registrations are
+                    // stored separately and never consume this budget.
+                    && self.actor_state.known_actors.len() >= self.config.max_known_actors
+                {
+                    rejected_by_global_cap += 1;
+                    continue;
+                }
+                let upsert_plan =
+                    self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id);
+                if upsert_plan.is_none() {
+                    // An exact duplicate is still an admitted advertisement
+                    // when the actor already exists. Other rejected candidates
+                    // must not create phantom peer_to_actors entries.
+                    if known_exists {
+                        peer_actors.insert(name.clone());
+                    }
+                    continue;
+                }
+                peer_actors.insert(name.clone());
+                let (clear_tombstone, is_update) =
+                    upsert_plan.expect("upsert plan checked above");
                 if clear_tombstone {
                     let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                 }
@@ -4828,6 +4971,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .actor_state
                     .known_actors
                     .upsert_sync(name.clone(), location.clone());
+                gossip_state.record_actor_admission(&sender_peer_id, name);
                 if is_update {
                     updated_actors += 1;
                 } else {
@@ -4841,6 +4985,17 @@ impl<T: 'static> GossipRegistry<T> {
                 {
                     routes_to_configure.push((name.clone(), location.peer_id.clone(), *addr));
                 }
+            }
+
+            if rejected_by_peer_cap > 0 || rejected_by_global_cap > 0 {
+                warn!(
+                    sender = %sender_peer_id,
+                    rejected_by_peer_cap,
+                    rejected_by_global_cap,
+                    max_known_actors = self.config.max_known_actors,
+                    max_known_actors_per_peer = self.config.max_known_actors_per_peer,
+                    "rejected full-sync actor registrations at configured admission caps"
+                );
             }
 
             let removed_now: Vec<String> = match gossip_state
@@ -4889,6 +5044,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(actor_name.as_str())
                     .is_some()
                 {
+                    gossip_state.release_actor_admission(actor_name);
                     info!(
                         actor_name = %actor_name,
                         peer = %sender_addr,
@@ -4942,8 +5098,16 @@ impl<T: 'static> GossipRegistry<T> {
                 true
             });
 
+            let mut gossip_state = self.gossip_state.lock().await;
             for name in &to_remove {
-                let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+                if self
+                    .actor_state
+                    .known_actors
+                    .remove_sync(name.as_str())
+                    .is_some()
+                {
+                    gossip_state.release_actor_admission(name);
+                }
             }
 
             let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
@@ -5056,13 +5220,17 @@ impl<T: 'static> GossipRegistry<T> {
                 // current ownership first because peer_to_actors is a side table and
                 // may still contain a stale entry after the actor moved to another peer.
                 if let Some(actor_names) = gossip_state.peer_to_actors.get(peer_addr).cloned() {
-                    let peer_info = gossip_state.peers.get(peer_addr);
+                    let peer_info = gossip_state.peers.get(peer_addr).cloned();
                     let mut actors_removed = 0usize;
                     for actor_name in &actor_names {
                         let should_remove = self.actor_state.known_actors.read_sync(
                             actor_name.as_str(),
                             |_, location| {
-                                actor_location_belongs_to_peer(location, *peer_addr, peer_info)
+                                actor_location_belongs_to_peer(
+                                    location,
+                                    *peer_addr,
+                                    peer_info.as_ref(),
+                                )
                             },
                         );
 
@@ -5073,6 +5241,7 @@ impl<T: 'static> GossipRegistry<T> {
                                 .remove_sync(actor_name.as_str())
                                 .is_some()
                         {
+                            gossip_state.release_actor_admission(actor_name);
                             actors_removed += 1;
                         }
                     }
@@ -9437,6 +9606,247 @@ mod tests {
                 .known_actors
                 .contains_sync("remote_actor")
         );
+    }
+
+    #[tokio::test]
+    async fn delta_actor_admission_is_capped_globally_and_per_sender() {
+        let mut config = test_config();
+        config.max_known_actors = 4;
+        config.max_known_actors_per_peer = 2;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+
+        for (sender_index, port) in [(0, 8100), (1, 8101), (2, 8102)] {
+            let sender = test_peer_id(&format!("actor-cap-sender-{sender_index}"));
+            let sender_addr = test_addr(port);
+            registry
+                .connection_pool
+                .set_configured_peer_addr(&sender, sender_addr);
+            let changes = (0..5)
+                .map(|actor_index| RegistryChange::ActorAdded {
+                    name: format!("sender-{sender_index}-actor-{actor_index}"),
+                    location: RemoteActorLocation::new_with_peer(sender_addr, sender.clone()),
+                    priority: RegistrationPriority::Normal,
+                })
+                .collect();
+            registry
+                .apply_delta(RegistryDelta {
+                    since_sequence: 0,
+                    current_sequence: 1,
+                    changes,
+                    sender_peer_id: sender,
+                    wall_clock_time: current_timestamp(),
+                    precise_timing_nanos: crate::current_timestamp_nanos(),
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(registry.actor_state.known_actors.len(), 4);
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(gossip_state.peer_to_actors[&test_addr(8100)].len(), 2);
+        assert_eq!(gossip_state.peer_to_actors[&test_addr(8101)].len(), 2);
+        assert!(gossip_state.peer_to_actors[&test_addr(8102)].is_empty());
+    }
+
+    #[tokio::test]
+    async fn delta_peer_cap_persists_without_address_bookkeeping() {
+        let mut config = test_config();
+        config.max_known_actors = 10;
+        config.max_known_actors_per_peer = 2;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+        let sender = test_peer_id("unmapped-actor-cap-sender");
+
+        for batch in 0..3 {
+            let changes = (0..2)
+                .map(|actor_index| RegistryChange::ActorAdded {
+                    name: format!("batch-{batch}-actor-{actor_index}"),
+                    location: RemoteActorLocation::new_with_peer(
+                        test_addr(8300),
+                        sender.clone(),
+                    ),
+                    priority: RegistrationPriority::Normal,
+                })
+                .collect();
+            registry
+                .apply_delta(RegistryDelta {
+                    since_sequence: batch,
+                    current_sequence: batch + 1,
+                    changes,
+                    sender_peer_id: sender.clone(),
+                    wall_clock_time: current_timestamp(),
+                    precise_timing_nanos: crate::current_timestamp_nanos(),
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(registry.actor_state.known_actors.len(), 2);
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(gossip_state.actor_admission_count(&sender), 2);
+    }
+
+    #[tokio::test]
+    async fn local_actors_do_not_consume_remote_admission_capacity() {
+        let mut config = test_config();
+        config.max_known_actors = 1;
+        config.max_known_actors_per_peer = 1;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+        for index in 0..3 {
+            registry
+                .register_actor(
+                    format!("local-{index}"),
+                    test_location(test_addr(8500 + index)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let sender = test_peer_id("remote-cap-after-locals");
+        registry
+            .apply_delta(RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: "remote-after-locals".to_string(),
+                    location: RemoteActorLocation::new_with_peer(test_addr(8600), sender.clone()),
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: sender,
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: crate::current_timestamp_nanos(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(registry.actor_state.local_actors.len(), 3);
+        assert_eq!(registry.actor_state.known_actors.len(), 1);
+        assert!(
+            registry
+                .actor_state
+                .known_actors
+                .contains_sync("remote-after-locals")
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_update_transfers_per_peer_admission_charge() {
+        let mut config = test_config();
+        config.max_known_actors = 2;
+        config.max_known_actors_per_peer = 1;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+        let sender_a = test_peer_id("admission-owner-a");
+        let sender_b = test_peer_id("admission-owner-b");
+        let initial = RemoteActorLocation::new_with_peer(test_addr(8700), sender_a.clone());
+        initial.vector_clock.increment(sender_a.to_node_id());
+        registry
+            .apply_delta(RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: "moved-actor".to_string(),
+                    location: initial.clone(),
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: sender_a.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: crate::current_timestamp_nanos(),
+            })
+            .await
+            .unwrap();
+
+        let mut moved = RemoteActorLocation::new_with_peer(test_addr(8701), sender_b.clone());
+        moved.vector_clock = initial.vector_clock.clone();
+        moved.vector_clock.increment(sender_b.to_node_id());
+        registry
+            .apply_delta(RegistryDelta {
+                since_sequence: 1,
+                current_sequence: 2,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: "moved-actor".to_string(),
+                    location: moved,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: sender_b.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: crate::current_timestamp_nanos(),
+            })
+            .await
+            .unwrap();
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(gossip_state.actor_admission_count(&sender_a), 0);
+        assert_eq!(gossip_state.actor_admission_count(&sender_b), 1);
+        assert_eq!(
+            gossip_state.actor_admission_peer_by_name["moved-actor"],
+            sender_b
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_actor_admission_is_capped_globally_and_per_sender() {
+        let mut config = test_config();
+        config.max_known_actors = 4;
+        config.max_known_actors_per_peer = 2;
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+
+        for (sender_index, port) in [(0, 8200), (1, 8201), (2, 8202)] {
+            let sender = test_peer_id(&format!("full-sync-cap-sender-{sender_index}"));
+            let sender_addr = test_addr(port);
+            let actors = (0..5)
+                .map(|actor_index| {
+                    (
+                        format!("full-sync-{sender_index}-actor-{actor_index}"),
+                        RemoteActorLocation::new_with_peer(sender_addr, sender.clone()),
+                    )
+                })
+                .collect();
+            registry
+                .merge_full_sync(
+                    actors,
+                    HashMap::new(),
+                    sender,
+                    sender_addr,
+                    1,
+                    current_timestamp(),
+                )
+                .await;
+        }
+
+        assert_eq!(registry.actor_state.known_actors.len(), 4);
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(gossip_state.peer_to_actors[&test_addr(8200)].len(), 2);
+        assert_eq!(gossip_state.peer_to_actors[&test_addr(8201)].len(), 2);
+        assert!(gossip_state.peer_to_actors[&test_addr(8202)].is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_full_sync_actor_does_not_create_phantom_peer_attribution() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        registry
+            .register_actor("local-wins".to_string(), test_location(test_addr(8400)))
+            .await
+            .unwrap();
+        let sender = test_peer_id("rejected-full-sync-sender");
+        let sender_addr = test_addr(8401);
+        let remote = HashMap::from([(
+            "local-wins".to_string(),
+            RemoteActorLocation::new_with_peer(sender_addr, sender.clone()),
+        )]);
+
+        registry
+            .merge_full_sync(
+                remote,
+                HashMap::new(),
+                sender,
+                sender_addr,
+                1,
+                current_timestamp(),
+            )
+            .await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(gossip_state.peer_to_actors[&sender_addr].is_empty());
+        assert!(!registry.actor_state.known_actors.contains_sync("local-wins"));
     }
 
     /// Duplicate immediate deltas must be observably idempotent.
