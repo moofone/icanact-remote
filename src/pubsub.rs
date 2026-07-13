@@ -223,11 +223,10 @@ pub enum PubSubDeliveryMode {
     #[default]
     AtMostOnce = 0,
     /// RESERVED — NOT YET IMPLEMENTED (ACTOR_REM_2 R12). The discriminant is
-    /// stable on the wire so the variant round-trips, but there is no pending-
-    /// ack table, ack frame, or retry timer anywhere: selecting this mode
-    /// currently behaves **exactly** like [`Self::AtMostOnce`] (a frame may be
-    /// silently dropped with no retry). Do NOT rely on it for at-least-once
-    /// delivery. A publish that selects it logs a one-time warning.
+    /// stable on the wire so the variant round-trips, but local publish APIs
+    /// reject this mode because there is no pending-ack table, ack frame, or
+    /// retry timer. This prevents callers from receiving a false reliability
+    /// guarantee.
     AtLeastOnceHopAck = 1,
 }
 
@@ -700,6 +699,7 @@ impl RoutedPubSub {
         scope: PubSubScope,
         policy: PubSubDeliveryPolicy,
     ) -> Result<PubSubPublishStats> {
+        Self::validate_delivery_mode(policy.mode)?;
         let mut stats = PubSubPublishStats::default();
         stats.local_delivered = self.deliver_local(topic_key, type_hash, Bytes::clone(&payload));
         self.publish_remote_bytes_inner(topic_key, type_hash, payload, scope, policy, &mut stats)?;
@@ -765,20 +765,7 @@ impl RoutedPubSub {
         metadata: PubSubFrameMetadata,
         stats: &mut PubSubPublishStats,
     ) -> Result<()> {
-        // ACTOR_REM_2 R12: AtLeastOnceHopAck has no delivery machinery yet; warn
-        // once so a caller is not silently given a false reliability guarantee
-        // (the frame is still delivered best-effort, exactly like AtMostOnce).
-        if matches!(policy.mode, PubSubDeliveryMode::AtLeastOnceHopAck) {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                warn!(
-                    "PubSubDeliveryMode::AtLeastOnceHopAck is not implemented; frames are \
-                     delivered best-effort like AtMostOnce (no hop-ack/retry). Do not rely \
-                     on at-least-once delivery."
-                );
-            }
-        }
+        Self::validate_delivery_mode(policy.mode)?;
         if matches!(scope, PubSubScope::LocalOnly) || policy.hops_limit == 0 {
             return Ok(());
         }
@@ -854,6 +841,15 @@ impl RoutedPubSub {
                 Ok(())
             }
         }
+    }
+
+    fn validate_delivery_mode(mode: PubSubDeliveryMode) -> Result<()> {
+        if matches!(mode, PubSubDeliveryMode::AtLeastOnceHopAck) {
+            return Err(GossipError::InvalidConfig(
+                "PubSubDeliveryMode::AtLeastOnceHopAck is not implemented".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn publish_frame_to_next_hop(
@@ -2075,6 +2071,40 @@ mod tests {
                 .contains_key(&topic),
             "interest count must be removed after the final unsubscribe"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_hop_ack_mode_is_rejected_before_local_delivery() {
+        let pubsub = test_pubsub("pubsub-hop-ack-rejected");
+        let topic = topic_key("hop-ack-rejected");
+        let type_hash = 206;
+        let delivered = Arc::new(AtomicU64::new(0));
+        let delivered_for_subscriber = Arc::clone(&delivered);
+        let _subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
+            delivered_for_subscriber.fetch_add(1, Ordering::Relaxed);
+        });
+        let policy = PubSubDeliveryPolicy {
+            mode: PubSubDeliveryMode::AtLeastOnceHopAck,
+            ..PubSubDeliveryPolicy::default()
+        };
+
+        let error = pubsub
+            .publish_bytes(
+                topic,
+                type_hash,
+                Bytes::from_static(b"must-not-deliver"),
+                PubSubScope::LocalOnly,
+                policy,
+            )
+            .expect_err("an unimplemented reliability mode must fail closed");
+
+        assert!(matches!(
+            error,
+            GossipError::InvalidConfig(message)
+                if message == "PubSubDeliveryMode::AtLeastOnceHopAck is not implemented"
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
