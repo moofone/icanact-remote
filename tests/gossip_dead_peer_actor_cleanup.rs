@@ -921,7 +921,7 @@ fn socket_close_does_not_trigger_actor_removed_broadcast() -> Result<(), DynErro
 #[test]
 fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), DynError> {
     run_gossip_test(async {
-        let config = GossipConfig {
+        let mut config = GossipConfig {
             // Quiet background gossip on BOTH nodes: no automatic round can
             // reset `last_response_received_ms` (which would defeat the
             // no-response simulation) or redial. The connection is established
@@ -934,6 +934,11 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
             max_peer_failures: 3,
             ..Default::default()
         };
+        // Required peers floor the response-asymmetry window to two regular
+        // gossip intervals. Normalize the test's deliberately quiesced
+        // cadence before deriving the synthetic silence below, matching the
+        // configuration the registry actually enforces.
+        config.validate_and_normalize();
 
         let publisher = create_node(config.clone()).await?;
         let subscriber = create_node(config.clone()).await?;
@@ -987,11 +992,19 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 .entry(sub_addr)
                 .or_default()
                 .insert(DEAD_ACTOR_NAME.to_string());
-            // Make the last response look stale so the no-response rounds below
-            // trip the response-asymmetry detector.
+            // Make the last response older than the normalized liveness window
+            // so the no-response rounds below trip the response-asymmetry
+            // detector even though regular gossip is deliberately quiesced.
             if let Some(peer) = state.peers.get_mut(&sub_addr) {
+                let silence_ms = u64::try_from(
+                    config
+                        .peer_liveness_window
+                        .saturating_add(Duration::from_millis(1))
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX);
                 peer.last_response_received_ms =
-                    icanact_remote::current_timestamp_millis().saturating_sub(60 * 1000);
+                    icanact_remote::current_timestamp_millis().saturating_sub(silence_ms);
             }
         }
 
