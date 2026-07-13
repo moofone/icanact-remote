@@ -63,7 +63,7 @@ impl ActorMessageHandler for ExactlyOnceTestHandler {
         _actor_id: u64,
         _type_hash: u32,
         payload: AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
         Box::pin(async move {
             // Payload format: [request_id:16][body:N]
@@ -165,7 +165,7 @@ impl ActorMessageHandler for ExactlyOnceTestHandler {
 }
 
 fn build_actor_ask_frame(
-    correlation_id: u16,
+    correlation_id: u32,
     actor_id: u64,
     type_hash: u32,
     schema_hash: Option<u64>,
@@ -261,7 +261,7 @@ async fn write_all<S: AsyncWriteExt + Unpin>(mut s: S, frame: &[u8]) {
 
 async fn read_response_payload<S: AsyncReadExt + Unpin>(
     mut s: S,
-    expected_corr: u16,
+    expected_corr: u32,
     read_timeout: Duration,
 ) -> Result<Bytes, String> {
     // The server might emit gossip frames (e.g. as part of registry sync). Skip anything
@@ -293,7 +293,7 @@ async fn read_response_payload<S: AsyncReadExt + Unpin>(
             return Err(format!("response frame too short: {total_len}"));
         }
 
-        let corr = u16::from_be_bytes([body[1], body[2]]);
+        let corr = u32::from_be_bytes(body[1..5].try_into().expect("correlation id"));
         if corr != expected_corr {
             continue;
         }
@@ -358,7 +358,7 @@ async fn main() {
     println!("\n[1] stutter + lost-ack retry");
     let mut rng = rand::rng();
     let request_id_1: u128 = rng.random();
-    let corr1: u16 = rng.random_range(1..u16::MAX);
+    let corr1: u32 = rng.random_range(1..u32::MAX);
     let payload1 = make_payload(request_id_1, b"ECHO:hello");
     let frame1 = build_actor_ask_frame(corr1, actor_id, type_hash, schema_hash, payload1.as_ref());
 
@@ -369,7 +369,7 @@ async fn main() {
     }
 
     // Retry: reconnect and re-send the exact same request_id + payload.
-    let corr1b: u16 = rng.random_range(1..u16::MAX);
+    let corr1b: u32 = rng.random_range(1..u32::MAX);
     let frame1b =
         build_actor_ask_frame(corr1b, actor_id, type_hash, schema_hash, payload1.as_ref());
     let response1 = {
@@ -398,7 +398,7 @@ async fn main() {
     // Scenario 2: Payload tampering with same request_id.
     // Expectation: server returns INTEGRITY_ERROR and does not apply a second time.
     println!("\n[2] tamper (same id, different payload)");
-    let corr2: u16 = rng.random_range(1..u16::MAX);
+    let corr2: u32 = rng.random_range(1..u32::MAX);
     let tampered = make_payload(request_id_1, b"ECHO:evil");
     let frame2 = build_actor_ask_frame(corr2, actor_id, type_hash, schema_hash, tampered.as_ref());
     let response2 = {
@@ -424,7 +424,7 @@ async fn main() {
     println!("\n[3] zombie (server stalls, client timeout + retry)");
     let request_id_3: u128 = rng.random();
     let payload3 = make_payload(request_id_3, b"STALL:slow");
-    let corr3: u16 = rng.random_range(1..u16::MAX);
+    let corr3: u32 = rng.random_range(1..u32::MAX);
     let frame3 = build_actor_ask_frame(corr3, actor_id, type_hash, schema_hash, payload3.as_ref());
 
     // First attempt: should time out before server responds.
@@ -441,7 +441,7 @@ async fn main() {
     // Retry loop: expect either PENDING or eventual OK applied=2.
     let mut ok_seen = None::<usize>;
     for attempt in 0..10 {
-        let corr = rng.random_range(1..u16::MAX);
+        let corr = rng.random_range(1..u32::MAX);
         let frame =
             build_actor_ask_frame(corr, actor_id, type_hash, schema_hash, payload3.as_ref());
 
@@ -493,8 +493,8 @@ async fn main() {
     println!("\n[4] concurrent duplicates");
     let request_id_4: u128 = rng.random();
     let payload4 = make_payload(request_id_4, b"ECHO:race");
-    let corr_a: u16 = rng.random_range(1..u16::MAX);
-    let corr_b: u16 = rng.random_range(1..u16::MAX);
+    let corr_a: u32 = rng.random_range(1..u32::MAX);
+    let corr_b: u32 = rng.random_range(1..u32::MAX);
     let frame_a =
         build_actor_ask_frame(corr_a, actor_id, type_hash, schema_hash, payload4.as_ref());
     let frame_b =

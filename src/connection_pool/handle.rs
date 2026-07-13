@@ -27,14 +27,14 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
 /// - the returned handle can be moved to another task and awaited later,
 /// - dropping the handle cancels the pending slot to keep resources bounded.
 pub(crate) struct PendingAsk {
-    correlation_id: u16,
+    correlation_id: u32,
     correlation: Arc<CorrelationTracker>,
     timeout: Duration,
     active: bool,
 }
 
 impl PendingAsk {
-    pub(crate) fn correlation_id(&self) -> u16 {
+    pub(crate) fn correlation_id(&self) -> u32 {
         self.correlation_id
     }
 
@@ -280,7 +280,7 @@ impl<T> ConnectionHandle<T> {
     /// Send a response payload with framing, without copying the payload.
     pub async fn send_response_bytes(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
         let header = framing::write_ask_response_header(
@@ -360,7 +360,7 @@ impl<T> ConnectionHandle<T> {
     /// Send a response using the inline write queue (never streaming).
     pub async fn send_response_auto(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
@@ -379,7 +379,7 @@ impl<T> ConnectionHandle<T> {
     /// * `payload` - The response payload as owned Bytes
     pub async fn send_response_auto_bytes(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
@@ -394,7 +394,7 @@ impl<T> ConnectionHandle<T> {
     /// Send a response payload using a Buf without copying.
     pub async fn send_response_buf<B>(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         mut payload: B,
         payload_len: usize,
     ) -> Result<()>
@@ -418,7 +418,7 @@ impl<T> ConnectionHandle<T> {
     /// Send a response payload using a pooled payload without dynamic dispatch.
     pub async fn send_response_pooled(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         payload: crate::typed::PooledPayload,
         prefix: Option<[u8; 16]>,
         payload_len: usize,
@@ -977,7 +977,7 @@ impl<T> ConnectionHandle<T> {
     /// This is optimized for high-throughput request-response scenarios where
     /// the server can generate responses directly without spawning actor tasks.
     ///
-    /// Wire format: [length:4][type:1][correlation_id:2][payload_len:4][payload:N]
+    /// Wire format: [length:4][type:1][correlation_id:4][payload_len:4][payload:N]
     pub async fn ask_direct(
         &self,
         request: bytes::Bytes,
@@ -1072,23 +1072,22 @@ impl<T> ConnectionHandle<T> {
 
         let schema_hash = stream_handle.schema_hash();
 
-        // Helper to build stream header bytes (52 bytes total for header-only messages)
+        // Helper to build V4 stream header bytes.
         fn build_stream_header_bytes(
             msg_type: MessageType,
             header: &StreamHeader,
-            correlation_id: u16,
+            correlation_id: u32,
             schema_hash: Option<u64>,
         ) -> bytes::Bytes {
-            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
-            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE;
+            let inner_size = crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE;
             let mut message = bytes::BytesMut::with_capacity(4 + inner_size);
 
             message.extend_from_slice(&(inner_size as u32).to_be_bytes()); // ALLOW_COPY
             message.put_u8(msg_type as u8);
             message.extend_from_slice(&correlation_id.to_be_bytes()); // ALLOW_COPY
-            let mut reserved = [0u8; 9];
+            let mut reserved = [0u8; 8];
             crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            message.extend_from_slice(&reserved); // ALLOW_COPY 9 reserved bytes
+            message.extend_from_slice(&reserved); // ALLOW_COPY
             message.extend_from_slice(&header.to_bytes()); // ALLOW_COPY
             message.freeze()
         }
@@ -1096,22 +1095,23 @@ impl<T> ConnectionHandle<T> {
         // Helper to build chunk header bytes (for use with vectored write)
         fn build_chunk_header_bytes(
             header: &StreamHeader,
-            correlation_id: u16,
+            correlation_id: u32,
             chunk_len: usize,
             schema_hash: Option<u64>,
         ) -> bytes::Bytes {
-            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
-            // (chunk data follows separately via vectored write)
-            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE + chunk_len;
-            let mut message =
-                bytes::BytesMut::with_capacity(4 + 12 + StreamHeader::SERIALIZED_SIZE);
+            // Chunk data follows separately via vectored write.
+            let inner_size =
+                crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE + chunk_len;
+            let mut message = bytes::BytesMut::with_capacity(
+                4 + crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE,
+            );
 
             message.extend_from_slice(&(inner_size as u32).to_be_bytes()); // ALLOW_COPY
             message.put_u8(MessageType::StreamData as u8);
             message.extend_from_slice(&correlation_id.to_be_bytes()); // ALLOW_COPY
-            let mut reserved = [0u8; 9];
+            let mut reserved = [0u8; 8];
             crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            message.extend_from_slice(&reserved); // ALLOW_COPY 9 reserved bytes
+            message.extend_from_slice(&reserved); // ALLOW_COPY
             message.extend_from_slice(&header.to_bytes()); // ALLOW_COPY
             message.freeze()
         }

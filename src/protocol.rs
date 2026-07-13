@@ -26,7 +26,7 @@ struct InProgressStream {
     total_size: u64,
     type_hash: u32,
     actor_id: u64,
-    correlation_id: u16,
+    correlation_id: u32,
     schema_hash: Option<u64>,
     received_size: usize,
     /// Pre-allocated aligned buffer for final message assembly.
@@ -48,7 +48,7 @@ impl StreamingState {
     pub fn start_stream_with_correlation(
         &mut self,
         header: crate::StreamHeader,
-        correlation_id: u16,
+        correlation_id: u32,
         pool: Arc<crate::AlignedBytesPool>,
         schema_hash: Option<u64>,
     ) -> Result<()> {
@@ -123,7 +123,7 @@ impl StreamingState {
         header: crate::StreamHeader,
         chunk_data: Bytes,
         schema_hash: Option<u64>,
-    ) -> Result<Option<(Bytes, u16, Option<u64>)>> {
+    ) -> Result<Option<(Bytes, u32, Option<u64>)>> {
         // If stream doesn't exist, we might have missed the start frame or it was cleaned up
         if !self.active_streams.contains_key(&header.stream_id) {
             return Err(GossipError::Network(std::io::Error::new(
@@ -207,7 +207,7 @@ impl StreamingState {
         &mut self,
         stream_id: u64,
         schema_hash: Option<u64>,
-    ) -> Result<Option<(Bytes, u16, Option<u64>)>> {
+    ) -> Result<Option<(Bytes, u32, Option<u64>)>> {
         // StreamEnd received - assemble the message
         if let Some(stream) = self.active_streams.get(&stream_id) {
             if stream.schema_hash != schema_hash {
@@ -223,7 +223,7 @@ impl StreamingState {
     fn assemble_complete_message_with_correlation(
         &mut self,
         stream_id: u64,
-    ) -> Result<Option<(Bytes, u16, Option<u64>)>> {
+    ) -> Result<Option<(Bytes, u32, Option<u64>)>> {
         let stream = self.active_streams.remove(&stream_id).ok_or_else(|| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -575,7 +575,7 @@ pub(crate) async fn process_read_result(
             payload,
         } => {
             // Fast-path DirectAsk - bypasses handler and RegistryMessage overhead
-            // Wire format from sender: [type:1][correlation_id:2][payload_len:4][payload:N]
+            // V4 wire format carries a 32-bit correlation id.
             // But 'payload' here contains only the [payload:N] part
             // For benchmarking: echo the payload back immediately using DirectResponse
             let header =
@@ -601,7 +601,7 @@ pub(crate) async fn process_read_result(
         } => {
             // Fast-path DirectResponse
             // The payload is the raw response data (no length prefix)
-            // Wire format from sender: [type:1][correlation_id:2][payload_len:4][payload:N]
+            // V4 wire format carries a 32-bit correlation id.
             // But 'payload' here contains only the [payload:N] part
             // Deliver to correlation tracker - zero-copy using the payload directly
             handle_response_message(
@@ -657,7 +657,7 @@ async fn handle_assembled_message(
     actor_id: u64,
     type_hash: u32,
     complete_data: crate::AlignedBytes,
-    corr_id: u16,
+    corr_id: u32,
     schema_hash: Option<u64>,
     response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
     response_mode: ResponseMode,
@@ -1067,7 +1067,7 @@ mod tests {
                 _actor_id: u64,
                 _type_hash: u32,
                 _payload: crate::AlignedBytes,
-                _correlation_id: Option<u16>,
+                _correlation_id: Option<u32>,
             ) -> crate::registry::ActorMessageFuture<'_> {
                 let hits = self.hits.clone();
                 Box::pin(async move {

@@ -92,7 +92,7 @@ async fn read_length_prefixed_frame<S: tokio::io::AsyncRead + Unpin>(stream: &mu
 
 async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
-    correlation_id: u16,
+    correlation_id: u32,
 ) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -105,7 +105,7 @@ async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
             .await
             .expect("timeout");
         if frame.first().copied() == Some(icanact_remote::MessageType::DirectResponse as u8) {
-            let got_corr = u16::from_be_bytes([frame[1], frame[2]]);
+            let got_corr = u32::from_be_bytes(frame[1..5].try_into().expect("correlation id"));
             if got_corr == correlation_id {
                 return frame;
             }
@@ -137,7 +137,7 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
     let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
     send_fullsync(&mut tls, client_peer_id).await;
 
-    let correlation_id: u16 = 42;
+    let correlation_id: u32 = 0x1_0000;
     let payload = b"hello-bad-client".to_vec();
     let header = icanact_remote::framing::write_direct_ask_header(correlation_id, payload.len());
 
@@ -152,9 +152,9 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
 
     let frame = read_until_direct_response(&mut tls, correlation_id).await;
     assert_eq!(frame[0], icanact_remote::MessageType::DirectResponse as u8);
-    let got_corr = u16::from_be_bytes([frame[1], frame[2]]);
+    let got_corr = u32::from_be_bytes(frame[1..5].try_into().expect("correlation id"));
     assert_eq!(got_corr, correlation_id);
-    let got_len = u32::from_be_bytes([frame[3], frame[4], frame[5], frame[6]]) as usize;
+    let got_len = u32::from_be_bytes(frame[5..9].try_into().expect("payload length")) as usize;
     assert_eq!(got_len, payload.len());
     let got_payload = &frame[icanact_remote::framing::DIRECT_RESPONSE_HEADER_LEN..];
     assert_eq!(got_payload, payload.as_slice());
@@ -185,7 +185,7 @@ async fn truncated_frame_does_not_crash_server() {
     {
         let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
         send_fullsync(&mut tls, client_peer_id).await;
-        let correlation_id: u16 = 7;
+        let correlation_id: u32 = 7;
         let header = icanact_remote::framing::write_direct_ask_header(correlation_id, 32);
         tls.write_all(&header).await.expect("write header");
         tls.write_all(b"x").await.expect("write partial payload");

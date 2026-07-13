@@ -9,13 +9,13 @@ const SLOT_READY: u8 = 3;
 /// Pending response slot
 struct PendingResponseSlot {
     state: AtomicU8,
-    /// Full 16-bit correlation id of the request currently occupying this
+    /// Full 32-bit correlation id of the request currently occupying this
     /// slot (meaningful whenever `state != SLOT_EMPTY`). Because `id` and
     /// `id + 8192*k` alias to the same slot index, the 13-bit slot index is
     /// not by itself a sufficient match — `complete()` verifies this full id
     /// so a stale/delayed response for a recycled id cannot complete a
     /// *different* in-flight request occupying the same slot.
-    id: AtomicU16,
+    id: AtomicU32,
     response: UnsafeCell<MaybeUninit<crate::AlignedBytes>>,
     waker: AtomicWaker,
 }
@@ -27,7 +27,7 @@ unsafe impl Sync for PendingResponseSlot {}
 /// Shared state for correlation tracking
 pub(crate) struct CorrelationTracker {
     /// Next correlation ID to use
-    next_id: AtomicU16,
+    next_id: AtomicU32,
     /// Fixed-size pending responses (boxed to avoid large stack allocations)
     pending: Box<[PendingResponseSlot]>,
 }
@@ -42,7 +42,7 @@ impl std::fmt::Debug for CorrelationTracker {
 
 impl CorrelationTracker {
     #[inline]
-    fn slot_index(correlation_id: u16) -> usize {
+    fn slot_index(correlation_id: u32) -> usize {
         (correlation_id as usize) & PENDING_RESPONSES_MASK
     }
 
@@ -65,12 +65,12 @@ impl CorrelationTracker {
         let mut pending = Vec::with_capacity(PENDING_RESPONSES_SIZE);
         pending.resize_with(PENDING_RESPONSES_SIZE, || PendingResponseSlot {
             state: AtomicU8::new(SLOT_EMPTY),
-            id: AtomicU16::new(0),
+            id: AtomicU32::new(0),
             response: UnsafeCell::new(MaybeUninit::uninit()),
             waker: AtomicWaker::new(),
         });
         Arc::new(Self {
-            next_id: AtomicU16::new(1),
+            next_id: AtomicU32::new(1),
             pending: pending.into_boxed_slice(),
         })
     }
@@ -146,7 +146,7 @@ impl CorrelationTracker {
     /// Returns true when the response was consumed and published.
     pub(crate) fn complete(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         response: &mut Option<crate::AlignedBytes>,
     ) -> bool {
         let slot = Self::slot_index(correlation_id);
@@ -191,7 +191,7 @@ impl CorrelationTracker {
     }
 
     /// Cancel a pending request (used when send fails).
-    pub(crate) fn cancel(&self, correlation_id: u16) {
+    pub(crate) fn cancel(&self, correlation_id: u32) {
         let slot = Self::slot_index(correlation_id);
         let slot_ref = &self.pending[slot];
         loop {
@@ -287,7 +287,7 @@ impl CorrelationTracker {
 
     async fn wait_for_response(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         timeout: Duration,
     ) -> Result<crate::AlignedBytes> {
         if timeout.is_zero() {
@@ -349,7 +349,7 @@ impl CorrelationTracker {
 
     async fn wait_for_response_no_timeout(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
     ) -> Result<crate::AlignedBytes> {
         let slot = Self::slot_index(correlation_id);
         let slot_ref = &self.pending[slot];
@@ -397,7 +397,7 @@ impl std::error::Error for NoFreeSlots {}
 
 /// RAII guard for a correlation slot reservation.
 ///
-/// Holds a shared borrow of the tracker (no Arc clone) and a single 16-bit
+/// Holds a shared borrow of the tracker (no Arc clone) and a single 32-bit
 /// id. On drop the slot is cancelled — this is what closes the production
 /// leak where a future awaiting [`CorrelationTracker::wait_for_response`]
 /// could be cancelled mid-await (outer `tokio::time::timeout`, `select!`
@@ -406,16 +406,16 @@ impl std::error::Error for NoFreeSlots {}
 /// Call [`SlotGuard::disarm`] on the success path to consume the guard
 /// without running the cancellation Drop. The disarm path uses
 /// `mem::forget`, so the success path adds zero atomic ops over the
-/// previous bare-`u16` API.
+/// previous bare-id API.
 #[must_use = "dropping a SlotGuard cancels the slot; call .disarm() on success"]
 pub(crate) struct SlotGuard<'a> {
     tracker: &'a CorrelationTracker,
-    id: u16,
+    id: u32,
 }
 
 impl<'a> SlotGuard<'a> {
     #[inline(always)]
-    pub(crate) fn id(&self) -> u16 {
+    pub(crate) fn id(&self) -> u32 {
         self.id
     }
 
@@ -423,7 +423,7 @@ impl<'a> SlotGuard<'a> {
     /// after the consumer has moved the slot out of `SLOT_WAITING`
     /// (i.e. on the success path of `wait_for_response`).
     #[inline(always)]
-    pub(crate) fn disarm(self) -> u16 {
+    pub(crate) fn disarm(self) -> u32 {
         let id = self.id;
         std::mem::forget(self);
         id
@@ -468,6 +468,24 @@ mod correlation_tests {
             tracker.pending[slot].state.load(Ordering::Acquire),
             SLOT_EMPTY,
             "error-path guard drop must clear a raced ready response"
+        );
+    }
+
+    #[test]
+    fn correlation_ids_do_not_repeat_at_the_u16_boundary() {
+        let tracker = CorrelationTracker::new();
+        tracker
+            .next_id
+            .store(u32::from(u16::MAX), Ordering::Relaxed);
+
+        let last_u16 = tracker.allocate().expect("u16::MAX should allocate");
+        assert_eq!(last_u16.id(), u32::from(u16::MAX));
+        drop(last_u16);
+
+        let after_boundary = tracker.allocate().expect("next id should allocate");
+        assert!(
+            after_boundary.id() > u32::from(u16::MAX),
+            "a correlation id must never repeat after the old 16-bit space is exhausted"
         );
     }
 }

@@ -36,7 +36,7 @@ impl ActorMessageHandlerSync for EchoHandler {
         actor_id: u64,
         type_hash: u32,
         payload: AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> icanact_remote::Result<Option<ActorResponse>> {
         assert_eq!(actor_id, TEST_ACTOR_ID);
         assert_eq!(type_hash, TEST_TYPE_HASH);

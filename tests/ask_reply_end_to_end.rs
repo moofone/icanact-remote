@@ -24,7 +24,7 @@ impl ActorMessageHandler for TestActorHandler {
         _actor_id: u64,
         _type_hash: u32,
         payload: icanact_remote::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
         let payload_len = payload.len();
         Box::pin(async move {
@@ -54,7 +54,7 @@ impl ActorMessageHandler for LargeResponseHandler {
         _actor_id: u64,
         _type_hash: u32,
         _payload: icanact_remote::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
         let response = self.response.clone();
         Box::pin(async move {

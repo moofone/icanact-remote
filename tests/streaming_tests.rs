@@ -113,7 +113,7 @@ impl ActorMessageHandler for AskTestHandler {
         _actor_id: u64,
         _type_hash: u32,
         payload: icanact_remote::AlignedBytes,
-        _correlation_id: Option<u16>,
+        _correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
         self.message_received.store(true, Ordering::SeqCst);
         self.payload_size
@@ -759,7 +759,7 @@ fn test_streaming_tell_no_response() {
                 _actor_id: u64,
                 _type_hash: u32,
                 payload: icanact_remote::AlignedBytes,
-                correlation_id: Option<u16>,
+                correlation_id: Option<u32>,
             ) -> ActorMessageFuture<'_> {
                 self.message_received.store(true, Ordering::SeqCst);
                 self.correlation_was_none
