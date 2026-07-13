@@ -1518,17 +1518,36 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Create a new gossip registry
-    pub fn new(bind_addr: SocketAddr, mut config: GossipConfig) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics when `config` is invalid. Use [`Self::try_new`] when invalid
+    /// consumer-supplied configuration must be reported without panicking.
+    pub fn new(bind_addr: SocketAddr, config: GossipConfig) -> Self {
+        Self::try_new(bind_addr, config).expect("invalid GossipConfig")
+    }
+
+    /// Create a new gossip registry after validating all startup invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GossipError::InvalidConfig`] when a required startup
+    /// invariant is missing, including the TLS identity key.
+    pub fn try_new(bind_addr: SocketAddr, mut config: GossipConfig) -> Result<Self> {
         // R5: enforce runtime config invariants (e.g. liveness window >=
         // gossip interval * 2) at the point config enters the registry, clamping
         // unsafe consumer-supplied values with a warning. One-time at startup.
-        config.validate_and_normalize();
+        config.validate_and_normalize()?;
 
         // Use public key from config (required for TLS identity)
         let peer_id = config
             .key_pair
             .as_ref()
-            .expect("GossipConfig.key_pair is required for TLS-only mode")
+            .ok_or_else(|| {
+                GossipError::InvalidConfig(
+                    "GossipConfig.key_pair is required for TLS-only mode".to_owned(),
+                )
+            })?
             .peer_id();
 
         info!(
@@ -1546,7 +1565,7 @@ impl<T: 'static> GossipRegistry<T> {
         );
         let peer_capabilities = Arc::new(SccHashMap::default());
 
-        Self {
+        Ok(Self {
             bind_addr,
             peer_id,
             config: config.clone(),
@@ -1639,7 +1658,7 @@ impl<T: 'static> GossipRegistry<T> {
                 crate::TokioDnsResolver::default(),
             )
                 as Arc<dyn crate::dns::DnsResolver>)),
-        }
+        })
     }
 
     /// Override the DNS resolver used for peer refreshes (primarily for deterministic tests).
@@ -7650,6 +7669,16 @@ mod tests {
                 crate::handshake::Feature::ClockCalibration,
             ]),
         )
+    }
+
+    #[test]
+    fn try_new_rejects_missing_identity_key_without_panicking() {
+        let result = GossipRegistry::<()>::try_new(test_addr(10_099), GossipConfig::default());
+        assert!(matches!(
+            result,
+            Err(crate::GossipError::InvalidConfig(message))
+                if message.contains("key_pair")
+        ));
     }
 
     #[test]

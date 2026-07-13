@@ -451,7 +451,26 @@ impl GossipConfig {
     /// gossip response can false-fail an otherwise healthy peer. A consumer
     /// that sets a too-small window would silently lose this protection;
     /// clamp it up instead.
-    pub fn validate_and_normalize(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::GossipError::InvalidConfig`] when the TLS identity
+    /// key is missing.
+    pub fn validate_and_normalize(&mut self) -> crate::Result<()> {
+        if self.key_pair.is_none() {
+            return Err(crate::GossipError::InvalidConfig(
+                "GossipConfig.key_pair is required for TLS-only mode".to_owned(),
+            ));
+        }
+
+        self.normalize();
+        Ok(())
+    }
+
+    /// Clamp timing invariants that do not depend on transport-injected
+    /// identity. Builders may call this while assembling a partial config;
+    /// registry construction still uses [`Self::validate_and_normalize`].
+    pub fn normalize(&mut self) {
         let min_window_ms =
             required_peer_liveness_floor_ms(self.gossip_interval, self.peer_gossip_interval);
         let min_window = Duration::from_millis(min_window_ms);
@@ -489,12 +508,33 @@ within one supervisor tick (avoids the Dead-verdict reconnect stall)"
             );
             self.preferred_inbound_wait = wait_cap;
         }
+
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_config() -> GossipConfig {
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("config-validation")),
+            ..GossipConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_and_normalize_rejects_missing_identity_key() {
+        let mut config = GossipConfig::default();
+        let error = config
+            .validate_and_normalize()
+            .expect_err("TLS-only gossip requires an identity key");
+        assert!(matches!(
+            error,
+            crate::GossipError::InvalidConfig(message)
+                if message.contains("key_pair")
+        ));
+    }
 
     #[test]
     fn test_default_config() {
@@ -562,13 +602,13 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
 
     #[test]
     fn validate_and_normalize_clamps_too_small_liveness_window() {
-        let mut config = GossipConfig::default();
+        let mut config = valid_config();
         config.peer_gossip_interval = Some(Duration::from_secs(5));
         // Violate the invariant: window < gossip_interval*2 (10s, since the
         // default `gossip_interval` is 5s).
         config.peer_liveness_window = Duration::from_secs(3);
 
-        config.validate_and_normalize();
+        config.validate_and_normalize().expect("valid config");
 
         assert_eq!(
             config.peer_liveness_window,
@@ -585,12 +625,12 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
         // via delta/full-sync responses) far above `peer_gossip_interval`,
         // while `peer_liveness_window` stays at a value that was only safe
         // relative to the old (incorrect) `peer_gossip_interval*2` floor.
-        let mut config = GossipConfig::default();
+        let mut config = valid_config();
         config.gossip_interval = Duration::from_secs(30);
         config.peer_gossip_interval = Some(Duration::from_secs(5));
         config.peer_liveness_window = Duration::from_secs(10);
 
-        config.validate_and_normalize();
+        config.validate_and_normalize().expect("valid config");
 
         assert!(
             config.peer_liveness_window >= Duration::from_secs(60),
@@ -607,12 +647,12 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
         // (it is fire-and-forget with no response message), so the floor
         // must be enforced purely from `gossip_interval`, even when peer
         // discovery is disabled entirely.
-        let mut config = GossipConfig::default();
+        let mut config = valid_config();
         config.peer_gossip_interval = None;
         config.gossip_interval = Duration::from_secs(10);
         config.peer_liveness_window = Duration::from_secs(1);
 
-        config.validate_and_normalize();
+        config.validate_and_normalize().expect("valid config");
 
         assert_eq!(
             config.peer_liveness_window,
@@ -650,11 +690,11 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
 
     #[test]
     fn validate_and_normalize_leaves_conforming_config_unchanged() {
-        let mut config = GossipConfig::default();
+        let mut config = valid_config();
         config.peer_gossip_interval = Some(Duration::from_secs(5));
         config.peer_liveness_window = Duration::from_secs(30); // >= 10s, conforming.
 
-        config.validate_and_normalize();
+        config.validate_and_normalize().expect("valid config");
 
         assert_eq!(
             config.peer_liveness_window,
@@ -685,12 +725,12 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
 
     #[test]
     fn validate_and_normalize_clamps_oversized_preferred_inbound_wait() {
-        let mut config = GossipConfig::default();
+        let mut config = valid_config();
         // A consumer sets the wait above the supervisor budget — this would
         // re-introduce the amplifier.
         config.preferred_inbound_wait = Duration::from_secs(10);
 
-        config.validate_and_normalize();
+        config.validate_and_normalize().expect("valid config");
 
         let supervisor_budget = config
             .connection_timeout
@@ -706,12 +746,12 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
 
     #[test]
     fn validate_and_normalize_tightens_wait_when_connection_timeout_is_small() {
-        let mut config = GossipConfig::default();
+        let mut config = valid_config();
         // Small connection_timeout shrinks the supervisor budget below the
         // default wait; the wait must follow it down.
         config.connection_timeout = Duration::from_millis(300);
 
-        config.validate_and_normalize();
+        config.validate_and_normalize().expect("valid config");
 
         assert!(
             config.preferred_inbound_wait < config.connection_timeout,

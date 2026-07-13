@@ -938,7 +938,7 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
         // gossip intervals. Normalize the test's deliberately quiesced
         // cadence before deriving the synthetic silence below, matching the
         // configuration the registry actually enforces.
-        config.validate_and_normalize();
+        config.normalize();
 
         let publisher = create_node(config.clone()).await?;
         let subscriber = create_node(config.clone()).await?;
