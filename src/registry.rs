@@ -2965,10 +2965,7 @@ impl<T: 'static> GossipRegistry<T> {
             return Err(GossipError::Shutdown);
         }
 
-        let register_start_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let register_start_time = crate::current_timestamp_nanos();
 
         // Update the location with current wall time and priority
         location.wall_clock_time = current_timestamp();
@@ -3067,12 +3064,10 @@ impl<T: 'static> GossipRegistry<T> {
         };
 
         if priority.should_trigger_immediate_gossip() {
-            let gossip_trigger_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let registration_duration_ms =
-                (gossip_trigger_time - register_start_time) as f64 / 1_000_000.0;
+            let gossip_trigger_time = crate::current_timestamp_nanos();
+            let registration_duration_ms = gossip_trigger_time
+                .saturating_sub(register_start_time) as f64
+                / 1_000_000.0;
 
             info!(
                 actor_name = %name,
@@ -3348,10 +3343,7 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // Pre-capture timing info outside lock for better performance
-        let received_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let received_timestamp = crate::current_timestamp_nanos();
 
         // Resolve the sender's addresses before taking the lock so the
         // lock section is short. TWO distinct roles (never conflate them):
@@ -6648,10 +6640,7 @@ impl<T: 'static> GossipRegistry<T> {
         let precise_timing_nanos = crate::current_timestamp_nanos(); // High precision timing
 
         // Serialize message(s), chunking if we exceed max_message_size
-        let serialization_start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let serialization_start = crate::current_timestamp_nanos();
 
         let mut serialized_messages: Vec<bytes::Bytes> = Vec::new();
         let mut current_changes: Vec<RegistryChange> = Vec::new();
@@ -6715,12 +6704,10 @@ impl<T: 'static> GossipRegistry<T> {
             serialized_messages.push(serialized);
         }
 
-        let serialization_end = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let serialization_duration_ms =
-            (serialization_end - serialization_start) as f64 / 1_000_000.0;
+        let serialization_end = crate::current_timestamp_nanos();
+        let serialization_duration_ms = serialization_end
+            .saturating_sub(serialization_start) as f64
+            / 1_000_000.0;
 
         if serialized_messages.len() > 1 {
             warn!(
@@ -6773,20 +6760,14 @@ impl<T: 'static> GossipRegistry<T> {
             let payloads = payloads.clone();
             let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
                 // Measure pure network send time
-                let send_start = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
+                let send_start = crate::current_timestamp_nanos();
 
                 for payload in payloads.iter() {
                     conn.send_gossip_payload(payload.clone()).await?;
                 }
 
-                let send_end = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-                let send_time_ms = (send_end - send_start) as f64 / 1_000_000.0;
+                let send_end = crate::current_timestamp_nanos();
+                let send_time_ms = send_end.saturating_sub(send_start) as f64 / 1_000_000.0;
 
                 debug!(peer = %peer_addr, send_time_ms = send_time_ms, "Network send completed");
 

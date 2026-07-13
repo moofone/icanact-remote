@@ -1372,10 +1372,15 @@ pub fn current_timestamp_millis() -> u64 {
 
 /// Get current timestamp in nanoseconds for high precision timing
 pub fn current_timestamp_nanos() -> u64 {
-    SystemTime::now()
+    timestamp_nanos_at(SystemTime::now())
+}
+
+fn timestamp_nanos_at(time: SystemTime) -> u64 {
+    let nanos = time
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_nanos() as u64
+        .as_nanos();
+    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1383,17 +1388,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timestamp_nanos_saturates_before_unix_epoch() {
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("representable pre-epoch time");
+        assert_eq!(timestamp_nanos_at(before_epoch), 0);
+    }
+
+    #[test]
     fn test_current_timestamp() {
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::ZERO)
             .as_secs();
 
         let timestamp = current_timestamp();
 
         let after = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::ZERO)
             .as_secs();
 
         assert!(timestamp >= before);

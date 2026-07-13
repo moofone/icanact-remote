@@ -235,10 +235,14 @@ pub fn extract_node_id_from_cert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn now() -> UnixTime {
-        UnixTime::since_unix_epoch(SystemTime::now().duration_since(UNIX_EPOCH).unwrap())
+        UnixTime::since_unix_epoch(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO),
+        )
     }
 
     #[test]

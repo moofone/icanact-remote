@@ -1,4 +1,7 @@
-use crate::{GossipNodeId, RegistrationPriority, VectorClock, current_timestamp};
+use crate::{
+    GossipNodeId, RegistrationPriority, VectorClock, current_timestamp,
+    current_timestamp_nanos,
+};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::net::SocketAddr;
 
@@ -62,10 +65,7 @@ impl RemoteActorLocation {
             vector_clock: VectorClock::with_node(node_id),
             wall_clock_time: current_timestamp(),
             priority: RegistrationPriority::Normal,
-            local_registration_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
+            local_registration_time: u128::from(current_timestamp_nanos()),
             metadata: Vec::new(),
         }
     }
@@ -86,10 +86,7 @@ impl RemoteActorLocation {
             vector_clock: VectorClock::with_node(node_id),
             wall_clock_time: current_timestamp(),
             priority: RegistrationPriority::Normal,
-            local_registration_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
+            local_registration_time: u128::from(current_timestamp_nanos()),
             metadata,
         }
     }
