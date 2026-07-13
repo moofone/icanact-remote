@@ -269,7 +269,7 @@ pub fn set_transport_lifecycle_recorder(recorder: Option<TransportLifecycleRecor
 static RECORDER_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII installer for [`set_transport_lifecycle_recorder`]. Acquires the
-/// process-wide [`RECORDER_INSTALL_LOCK`] for its entire lifetime and
+/// process-wide recorder-install lock for its entire lifetime and
 /// deregisters the recorder on drop, so concurrently running tests that each
 /// install a recorder are fully serialized against one another and can never
 /// observe or clobber each other's hook — this is the only sanctioned way to
