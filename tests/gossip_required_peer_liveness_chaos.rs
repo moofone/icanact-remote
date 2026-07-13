@@ -445,7 +445,7 @@ async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconne
     // gossip intervals. Keep the synthetic silence aligned with the effective
     // runtime configuration while the one-hour cadence suppresses background
     // rounds during this deterministic test.
-    config.validate_and_normalize();
+    config.normalize();
 
     let asks_a = Arc::new(AtomicU64::new(0));
     let asks_b = Arc::new(AtomicU64::new(0));
