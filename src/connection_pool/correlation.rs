@@ -48,10 +48,29 @@ impl CorrelationTracker {
 
     #[inline]
     fn try_take_ready(slot_ref: &PendingResponseSlot) -> Option<crate::AlignedBytes> {
-        let state = slot_ref.state.load(Ordering::Acquire);
-        if state == SLOT_READY {
-            slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
+        Self::try_take_ready_before_release(slot_ref, || {})
+    }
+
+    #[inline]
+    fn try_take_ready_before_release(
+        slot_ref: &PendingResponseSlot,
+        before_slot_release: impl FnOnce(),
+    ) -> Option<crate::AlignedBytes> {
+        if slot_ref
+            .state
+            .compare_exchange(
+                SLOT_READY,
+                SLOT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // SAFETY: READY -> WRITING gives this reader exclusive ownership;
+            // allocation requires EMPTY and cancellation spins on WRITING.
             let response = unsafe { (*slot_ref.response.get()).assume_init_read() };
+            before_slot_release();
+            slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
             return Some(response);
         }
         None
@@ -487,5 +506,29 @@ mod correlation_tests {
             after_boundary.id() > u32::from(u16::MAX),
             "a correlation id must never repeat after the old 16-bit space is exhausted"
         );
+    }
+
+    #[test]
+    fn ready_slot_remains_exclusively_owned_until_response_is_read() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+        let slot = CorrelationTracker::slot_index(id);
+        let slot_ref = &tracker.pending[slot];
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
+        assert!(tracker.complete(id, &mut response));
+
+        let taken = CorrelationTracker::try_take_ready_before_release(slot_ref, || {
+            assert_eq!(
+                slot_ref.state.load(Ordering::Acquire),
+                SLOT_WRITING,
+                "the slot must not be reusable while its response is being read"
+            );
+        });
+
+        assert_eq!(taken.expect("ready response").as_ref(), b"reply");
+        assert_eq!(slot_ref.state.load(Ordering::Acquire), SLOT_EMPTY);
+        guard.disarm();
     }
 }
