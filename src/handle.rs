@@ -309,13 +309,20 @@ impl<T> GossipRegistryHandle<T> {
     /// - Returns RemoteActorRef for zero-lookup message sending
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use bytes::Bytes;
+    /// # use icanact_remote::{GossipRegistryHandle, Result};
+    /// # async fn send_message(registry: &GossipRegistryHandle) -> Result<()> {
     /// // Step 1: Lookup does ALL the work - finds actor AND caches connection
-    /// let remote_actor = registry.lookup("chat_service").await?;
+    /// let Some(remote_actor) = registry.lookup("chat_service").await else {
+    ///     return Ok(());
+    /// };
     ///
     /// // Step 2: tell/ask use cached connection - ZERO lookups, just pointer deref
-    /// remote_actor.tell(message1).await?;
-    /// remote_actor.ask(request).await?;
+    /// remote_actor.tell(Bytes::from_static(b"message")).await?;
+    /// let _response = remote_actor.ask(Bytes::from_static(b"request")).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn lookup(&self, name: &str) -> Option<crate::RemoteActorRef> {
         // Step 1: Find the actor location
@@ -480,9 +487,13 @@ impl<T> GossipRegistryHandle<T> {
     /// * `dns_name` - The DNS name to use for re-resolution (e.g., "data-feeder-icanact:9400")
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use icanact_remote::GossipRegistryHandle;
+    /// # use std::net::SocketAddr;
+    /// # async fn configure_dns(handle: &GossipRegistryHandle, resolved_addr: SocketAddr) {
     /// // After connecting to a peer, set its DNS name for automatic re-resolution
     /// handle.set_peer_dns_name(resolved_addr, "data-feeder-icanact:9400".to_string()).await;
+    /// # }
     /// ```
     pub async fn set_peer_dns_name(&self, peer_addr: std::net::SocketAddr, dns_name: String) {
         self.registry.set_peer_dns_name(peer_addr, dns_name).await;
