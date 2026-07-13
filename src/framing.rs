@@ -20,6 +20,19 @@ pub const DIRECT_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_ASK_HE
 pub const DIRECT_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_RESPONSE_HEADER_LEN;
 pub const PUBSUB_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + PUBSUB_HEADER_LEN;
 
+#[inline]
+fn checked_frame_len(header_len: usize, payload_len: usize) -> u32 {
+    header_len
+        .checked_add(payload_len)
+        .and_then(|length| u32::try_from(length).ok())
+        .expect("frame length exceeds u32::MAX")
+}
+
+#[inline]
+fn checked_payload_len(payload_len: usize) -> u32 {
+    u32::try_from(payload_len).expect("payload length exceeds u32::MAX")
+}
+
 /// Write ActorTell/ActorAsk header with padded 16-byte alignment.
 ///
 /// V4 wire format: [length:4][type:1][correlation_id:4][schema_hash:8]
@@ -38,9 +51,9 @@ pub fn write_actor_frame_header(
         MessageType::ActorTell | MessageType::ActorAsk
     ));
 
-    let total_size = ACTOR_HEADER_LEN + payload_len;
+    let total_size = checked_frame_len(ACTOR_HEADER_LEN, payload_len);
     let mut header = [0u8; ACTOR_FRAME_HEADER_LEN];
-    header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+    header[..4].copy_from_slice(&total_size.to_be_bytes());
     header[4] = msg_type as u8;
     header[5..9].copy_from_slice(&correlation_id.to_be_bytes());
     write_schema_hash(&mut header[9..20], schema_hash);
@@ -85,9 +98,9 @@ pub fn write_ask_response_header(
 ) -> [u8; ASK_RESPONSE_FRAME_HEADER_LEN] {
     debug_assert!(matches!(msg_type, MessageType::Ask | MessageType::Response));
 
-    let total_size = ASK_RESPONSE_HEADER_LEN + payload_len;
+    let total_size = checked_frame_len(ASK_RESPONSE_HEADER_LEN, payload_len);
     let mut header = [0u8; ASK_RESPONSE_FRAME_HEADER_LEN];
-    header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+    header[..4].copy_from_slice(&total_size.to_be_bytes());
     header[4] = msg_type as u8;
     header[5..9].copy_from_slice(&correlation_id.to_be_bytes());
     header[9..16].fill(0); // pad for 16-byte alignment
@@ -95,18 +108,18 @@ pub fn write_ask_response_header(
 }
 
 pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER_LEN] {
-    let total_size = GOSSIP_HEADER_LEN + payload_len;
+    let total_size = checked_frame_len(GOSSIP_HEADER_LEN, payload_len);
     let mut header = [0u8; GOSSIP_FRAME_HEADER_LEN];
-    header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+    header[..4].copy_from_slice(&total_size.to_be_bytes());
     header[4] = MessageType::Gossip as u8;
     header[5..16].fill(0);
     header
 }
 
 pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER_LEN] {
-    let total_size = PUBSUB_HEADER_LEN + payload_len;
+    let total_size = checked_frame_len(PUBSUB_HEADER_LEN, payload_len);
     let mut header = [0u8; PUBSUB_FRAME_HEADER_LEN];
-    header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+    header[..4].copy_from_slice(&total_size.to_be_bytes());
     header[4] = MessageType::PubSub as u8;
     header[5..16].fill(0);
     header
@@ -118,12 +131,13 @@ pub fn write_direct_ask_header(
     correlation_id: u32,
     payload_len: usize,
 ) -> [u8; DIRECT_ASK_FRAME_HEADER_LEN] {
-    let total_size = DIRECT_ASK_HEADER_LEN + payload_len;
+    let total_size = checked_frame_len(DIRECT_ASK_HEADER_LEN, payload_len);
+    let payload_len = checked_payload_len(payload_len);
     let mut header = [0u8; DIRECT_ASK_FRAME_HEADER_LEN];
-    header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+    header[..4].copy_from_slice(&total_size.to_be_bytes());
     header[4] = MessageType::DirectAsk as u8;
     header[5..9].copy_from_slice(&correlation_id.to_be_bytes());
-    header[9..13].copy_from_slice(&(payload_len as u32).to_be_bytes());
+    header[9..13].copy_from_slice(&payload_len.to_be_bytes());
     header[13..16].fill(0);
     header
 }
@@ -134,12 +148,13 @@ pub fn write_direct_response_header(
     correlation_id: u32,
     payload_len: usize,
 ) -> [u8; DIRECT_RESPONSE_FRAME_HEADER_LEN] {
-    let total_size = DIRECT_RESPONSE_HEADER_LEN + payload_len;
+    let total_size = checked_frame_len(DIRECT_RESPONSE_HEADER_LEN, payload_len);
+    let payload_len = checked_payload_len(payload_len);
     let mut header = [0u8; DIRECT_RESPONSE_FRAME_HEADER_LEN];
-    header[..4].copy_from_slice(&(total_size as u32).to_be_bytes());
+    header[..4].copy_from_slice(&total_size.to_be_bytes());
     header[4] = MessageType::DirectResponse as u8;
     header[5..9].copy_from_slice(&correlation_id.to_be_bytes());
-    header[9..13].copy_from_slice(&(payload_len as u32).to_be_bytes());
+    header[9..13].copy_from_slice(&payload_len.to_be_bytes());
     header[13..16].fill(0);
     header
 }
@@ -272,5 +287,27 @@ mod tests {
             // Actor header is now 8-byte aligned (32 % 8 = 0)
             assert!(is_aligned(LENGTH_PREFIX_LEN + ACTOR_HEADER_LEN));
         }
+    }
+
+    #[test]
+    fn oversized_payload_lengths_are_rejected_by_all_writers() {
+        let oversized = u32::MAX as usize;
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                write_actor_frame_header(MessageType::ActorTell, 0, 0, 0, None, oversized)
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                write_ask_response_header(MessageType::Ask, 0, oversized)
+            })
+            .is_err()
+        );
+        assert!(std::panic::catch_unwind(|| write_gossip_frame_prefix(oversized)).is_err());
+        assert!(std::panic::catch_unwind(|| write_pubsub_frame_prefix(oversized)).is_err());
+        assert!(std::panic::catch_unwind(|| write_direct_ask_header(0, oversized)).is_err());
+        assert!(std::panic::catch_unwind(|| write_direct_response_header(0, oversized)).is_err());
     }
 }
