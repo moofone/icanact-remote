@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
@@ -438,7 +438,7 @@ impl RoutedPubSub {
             FAST_FRAME_POOL_BUFFERS,
             FAST_FRAME_POOL_BUFFER_CAPACITY,
         );
-        let msg_id_epoch = new_msg_id_epoch(&registry.peer_id);
+        let msg_id_epoch = new_msg_id_epoch();
         let this = Arc::new_cyclic(|weak_self| Self {
             weak_self: Weak::clone(weak_self),
             local_peer_id: registry.peer_id.clone(),
@@ -1629,23 +1629,12 @@ fn new_seen_fingerprints() -> Box<[AtomicU64]> {
         .into_boxed_slice()
 }
 
-fn new_msg_id_epoch(peer: &PeerId) -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0);
-    let mixed = fnv1a_hash_bytes_with_seed(peer.as_bytes(), now);
-    if mixed == 0 { 1 } else { mixed }
+fn new_msg_id_epoch() -> u64 {
+    new_msg_id_epoch_with(rand::random::<u64>)
 }
 
-fn fnv1a_hash_bytes_with_seed(bytes: &[u8], seed: u64) -> u64 {
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = seed ^ 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+fn new_msg_id_epoch_with(entropy: impl FnOnce() -> u64) -> u64 {
+    entropy().max(1)
 }
 
 fn seen_fingerprint_bytes(origin: &[u8; 32], msg_id: u128) -> u64 {
@@ -1821,7 +1810,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             config,
         ));
-        let msg_id_epoch = new_msg_id_epoch(&registry.peer_id);
+        let msg_id_epoch = new_msg_id_epoch();
         Arc::new_cyclic(|weak_self| RoutedPubSub {
             weak_self: Weak::clone(weak_self),
             local_peer_id: registry.peer_id.clone(),
@@ -1879,6 +1868,17 @@ mod tests {
         );
         assert_ne!(first_msg_id >> 64, 0);
         assert_ne!(second_msg_id >> 64, 0);
+    }
+
+    #[test]
+    fn msg_id_epoch_uses_injected_random_entropy() {
+        let entropy = 0x9e37_79b9_7f4a_7c15;
+        assert_eq!(new_msg_id_epoch_with(|| entropy), entropy);
+    }
+
+    #[test]
+    fn msg_id_epoch_reserves_zero() {
+        assert_eq!(new_msg_id_epoch_with(|| 0), 1);
     }
 
     #[tokio::test]
