@@ -18,8 +18,8 @@ crossbeam-queue = "0.3"
 arc-swap = { version = "1.7", features = ["weak"] }
 bytes = "1.0"
 libc = "0.2"
-scc = "3.5.6"
-lru = "0.12"  # LRU cache for known-peers
+scc = "3.8.4"
+lru = "0.16.3"  # LRU cache for known-peers
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
 futures = "0.3"
 hex = "0.4"
@@ -68,4 +68,3 @@ harness = false
 [[bench]]
 name = "pubsub_job_pattern"
 harness = false
-
