@@ -15,7 +15,7 @@ impl icanact_remote::registry::ActorMessageHandler for TestHandler {
         _actor_id: u64,
         _type_hash: u32,
         _payload: icanact_remote::AlignedBytes,
-        _correlation_id: Option<u16>,
+        _correlation_id: Option<u32>,
     ) -> icanact_remote::registry::ActorMessageFuture<'_> {
         let hits = self.hits.clone();
         let notify = self.notify.clone();

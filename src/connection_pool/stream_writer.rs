@@ -2060,7 +2060,7 @@ impl LockFreeStreamHandle {
     }
 
     /// Write DirectAsk header + payload inline (fast path for direct ask)
-    /// Wire format: [length:4][type:1][correlation_id:2][payload_len:4][payload:N]
+    /// Wire format: [length:4][type:1][correlation_id:4][payload_len:4][payload:N]
     pub async fn write_direct_ask_inline(
         &self,
         header: [u8; 16], // DIRECT_ASK_FRAME_HEADER_LEN
@@ -2071,7 +2071,7 @@ impl LockFreeStreamHandle {
     }
 
     /// Write DirectResponse inline (same format as DirectAsk)
-    /// Wire format: [length:4][type:1][correlation_id:2][payload_len:4][payload:N]
+    /// Wire format: [length:4][type:1][correlation_id:4][payload_len:4][payload:N]
     pub async fn write_direct_response_inline(
         &self,
         header: [u8; 16], // DIRECT_RESPONSE_FRAME_HEADER_LEN
@@ -2323,8 +2323,8 @@ impl LockFreeStreamHandle {
 
     fn max_stream_chunk_size(&self) -> Result<usize> {
         // Streaming frame wire format excludes the 4-byte length prefix from `msg_len`.
-        // `msg_len` for stream data frames is: type(1) + corr(2) + reserved(9) + header(36) + chunk(N).
-        const STREAM_FRAME_OVERHEAD: usize = 12 + crate::StreamHeader::SERIALIZED_SIZE;
+        const STREAM_FRAME_OVERHEAD: usize =
+            crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE;
 
         let max_chunk = self.max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
         if max_chunk == 0 {
@@ -2381,8 +2381,7 @@ impl LockFreeStreamHandle {
             header: &StreamHeader,
             schema_hash: Option<u64>,
         ) -> Vec<u8> {
-            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
-            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE; // type(1) + corr(2) + reserved(9) + header
+            let inner_size = crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE;
             let mut message = Vec::with_capacity(4 + inner_size);
 
             // Length prefix (required by protocol)
@@ -2390,10 +2389,10 @@ impl LockFreeStreamHandle {
 
             // Header
             message.push(msg_type as u8);
-            message.extend_from_slice(&[0, 0]); // ALLOW_COPY correlation_id (not used for streaming)
-            let mut reserved = [0u8; 9];
+            message.extend_from_slice(&0u32.to_be_bytes()); // ALLOW_COPY correlation_id
+            let mut reserved = [0u8; 8];
             crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            message.extend_from_slice(&reserved); // ALLOW_COPY 9 reserved bytes for 32-byte alignment
+            message.extend_from_slice(&reserved); // ALLOW_COPY
             message.extend_from_slice(&header.to_bytes()); // ALLOW_COPY
             message
         }
@@ -2426,8 +2425,8 @@ impl LockFreeStreamHandle {
             };
 
             // Create combined message with proper length prefix
-            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36][chunk_data:N]
-            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE + chunk.len(); // type(1) + corr(2) + reserved(9) + header + data
+            let inner_size =
+                crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE + chunk.len();
             let mut chunk_msg = Vec::with_capacity(4 + inner_size);
 
             // Length prefix (includes header + chunk data)
@@ -2435,10 +2434,10 @@ impl LockFreeStreamHandle {
 
             // Header
             chunk_msg.push(MessageType::StreamData as u8);
-            chunk_msg.extend_from_slice(&[0, 0]); // ALLOW_COPY correlation_id
-            let mut reserved = [0u8; 9];
+            chunk_msg.extend_from_slice(&0u32.to_be_bytes()); // ALLOW_COPY correlation_id
+            let mut reserved = [0u8; 8];
             crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            chunk_msg.extend_from_slice(&reserved); // ALLOW_COPY 9 reserved bytes for 32-byte alignment
+            chunk_msg.extend_from_slice(&reserved); // ALLOW_COPY
             chunk_msg.extend_from_slice(&data_header.to_bytes()); // ALLOW_COPY
 
             // Chunk data
@@ -2480,7 +2479,7 @@ impl LockFreeStreamHandle {
     /// # Arguments
     /// * `payload` - The response payload bytes
     /// * `correlation_id` - The correlation ID from the original request (for response matching)
-    pub async fn stream_response(&self, payload: &[u8], correlation_id: u16) -> Result<()> {
+    pub async fn stream_response(&self, payload: &[u8], correlation_id: u32) -> Result<()> {
         // Convert to Bytes and use zero-copy implementation
         self.stream_response_bytes(bytes::Bytes::copy_from_slice(payload), correlation_id) // ALLOW_COPY
             .await
@@ -2495,7 +2494,7 @@ impl LockFreeStreamHandle {
     pub async fn stream_response_bytes(
         &self,
         payload: bytes::Bytes,
-        correlation_id: u16,
+        correlation_id: u32,
     ) -> Result<()> {
         use crate::{MessageType, StreamHeader, current_timestamp_nanos};
         use bytes::BufMut;
@@ -2514,24 +2513,26 @@ impl LockFreeStreamHandle {
         fn build_stream_response_header(
             msg_type: MessageType,
             header: &StreamHeader,
-            correlation_id: u16,
+            correlation_id: u32,
             chunk_len: usize,
             schema_hash: Option<u64>,
         ) -> bytes::Bytes {
-            // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
-            let inner_size = 12 + StreamHeader::SERIALIZED_SIZE + chunk_len;
-            let mut message =
-                bytes::BytesMut::with_capacity(4 + 12 + StreamHeader::SERIALIZED_SIZE);
+            // V4 format: [length:4][type:1][correlation_id:4][schema_hash:8][header:36]
+            let inner_size =
+                crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE + chunk_len;
+            let mut message = bytes::BytesMut::with_capacity(
+                4 + crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE,
+            );
 
             // Length prefix
             message.put_u32(inner_size as u32);
 
             // Header with correlation ID for response matching
             message.put_u8(msg_type as u8);
-            message.put_u16(correlation_id);
-            let mut reserved = [0u8; 9];
+            message.put_u32(correlation_id);
+            let mut reserved = [0u8; 8];
             crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            message.put_slice(&reserved); // 9 reserved bytes
+            message.put_slice(&reserved);
             message.put_slice(&header.to_bytes());
             message.freeze()
         }
@@ -2628,7 +2629,7 @@ impl LockFreeStreamHandle {
     pub async fn send_response_auto(
         &self,
         payload: bytes::Bytes,
-        correlation_id: u16,
+        correlation_id: u32,
     ) -> Result<()> {
         let header = framing::write_ask_response_header(
             crate::MessageType::Response,
@@ -2649,7 +2650,7 @@ impl LockFreeStreamHandle {
     /// Ok(()) on success, or an error if sending failed
     pub async fn send_response_auto_bytes(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
         let header = framing::write_ask_response_header(

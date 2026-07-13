@@ -107,7 +107,7 @@ pub struct DeferredAsk {
 }
 
 impl DeferredAsk {
-    pub fn correlation_id(&self) -> u16 {
+    pub fn correlation_id(&self) -> u32 {
         self.inner.correlation_id()
     }
 
@@ -1122,7 +1122,6 @@ impl<T: 'static> Peer<T> {
     pub fn id(&self) -> &PeerId {
         &self.peer_id
     }
-
 }
 
 /// Message types for the request-response protocol

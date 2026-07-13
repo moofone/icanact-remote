@@ -43,7 +43,7 @@ enum AskResponseSink {
 }
 
 impl AskResponseSink {
-    async fn send_response_bytes(&self, correlation_id: u16, payload: Bytes) -> Result<()> {
+    async fn send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         match self {
             Self::StreamHandle(stream_handle) => {
                 stream_handle
@@ -56,7 +56,7 @@ impl AskResponseSink {
         }
     }
 
-    fn try_send_response_bytes(&self, correlation_id: u16, payload: Bytes) -> Result<()> {
+    fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         match self {
             Self::StreamHandle(stream_handle) => {
                 let header = framing::write_ask_response_header(
@@ -73,7 +73,7 @@ impl AskResponseSink {
 
     async fn send_response_pooled(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         payload: crate::typed::PooledPayload,
         prefix: Option<[u8; 16]>,
         payload_len: usize,
@@ -105,20 +105,20 @@ enum AskContextSink<'a> {
 }
 
 pub struct AskContext<'a> {
-    correlation_id: u16,
+    correlation_id: u32,
     authenticated_peer_id: Option<&'a crate::PeerId>,
     sink: AskContextSink<'a>,
     /// ACTOR_REM_2 R15: shared single-use guard for this inbound ask. Every
     /// responder minted from this context (and their clones) share it, so at
     /// most one reply for the correlation ever reaches the wire — a second
-    /// would otherwise complete an unrelated ask after `next_id: AtomicU16`
+    /// would otherwise complete an unrelated ask after correlation-id reuse
     /// wraps.
     used: Arc<AtomicBool>,
 }
 
 impl<'a> AskContext<'a> {
     pub(crate) fn from_stream_handle(
-        correlation_id: u16,
+        correlation_id: u32,
         stream_handle: &'a Arc<LockFreeStreamHandle>,
         authenticated_peer_id: Option<&'a crate::PeerId>,
     ) -> Self {
@@ -131,7 +131,7 @@ impl<'a> AskContext<'a> {
     }
 
     pub(crate) fn from_writer(
-        correlation_id: u16,
+        correlation_id: u32,
         writer: &'a Arc<ResponseWriter>,
         authenticated_peer_id: Option<&'a crate::PeerId>,
     ) -> Self {
@@ -143,7 +143,7 @@ impl<'a> AskContext<'a> {
         }
     }
 
-    pub fn correlation_id(&self) -> u16 {
+    pub fn correlation_id(&self) -> u32 {
         self.correlation_id
     }
 
@@ -169,7 +169,7 @@ impl<'a> AskContext<'a> {
 
 #[derive(Clone)]
 pub struct AskResponder {
-    correlation_id: u16,
+    correlation_id: u32,
     sink: AskResponseSink,
     /// ACTOR_REM_2 R15: shared single-use guard (see [`AskContext::used`]).
     /// Clones share the same `Arc`, so only the first reply across all clones
@@ -179,7 +179,7 @@ pub struct AskResponder {
 
 impl AskResponder {
     pub(crate) fn from_stream_handle(
-        correlation_id: u16,
+        correlation_id: u32,
         stream_handle: Arc<LockFreeStreamHandle>,
         used: Arc<AtomicBool>,
     ) -> Self {
@@ -191,7 +191,7 @@ impl AskResponder {
     }
 
     pub(crate) fn from_writer(
-        correlation_id: u16,
+        correlation_id: u32,
         writer: Arc<ResponseWriter>,
         used: Arc<AtomicBool>,
     ) -> Self {
@@ -202,7 +202,7 @@ impl AskResponder {
         }
     }
 
-    pub fn correlation_id(&self) -> u16 {
+    pub fn correlation_id(&self) -> u32 {
         self.correlation_id
     }
 
@@ -270,13 +270,13 @@ impl ResponseWriter {
         })
     }
 
-    async fn send_response_bytes(&self, correlation_id: u16, payload: Bytes) -> Result<()> {
+    async fn send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         self.stream_handle()?
             .send_response_auto_bytes(correlation_id, payload)
             .await
     }
 
-    fn try_send_response_bytes(&self, correlation_id: u16, payload: Bytes) -> Result<()> {
+    fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         let header = framing::write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
@@ -288,7 +288,7 @@ impl ResponseWriter {
 
     async fn send_response_pooled(
         &self,
-        correlation_id: u16,
+        correlation_id: u32,
         payload: crate::typed::PooledPayload,
         prefix: Option<[u8; 16]>,
         payload_len: usize,

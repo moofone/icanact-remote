@@ -1,7 +1,7 @@
 //! Hello handshake protocol for peer capability negotiation
 //!
 //! This module implements the Hello handshake that establishes peer capabilities
-//! at connection time for TLS-only v3 peers.
+//! at connection time for TLS-only v4 peers.
 
 use crate::{GossipError, Result};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -12,13 +12,13 @@ use tracing::debug;
 
 const HELLO_MAX_SIZE: usize = 1024;
 const HELLO_TIMEOUT_MS: u64 = 3_000;
-pub const ALPN_ICANACT_V3: &[u8] = b"icanact-remote-v3";
+pub const ALPN_ICANACT_V4: &[u8] = b"icanact-remote-v4";
 
 /// Protocol version constants
-pub const PROTOCOL_VERSION_V3: u16 = 3;
+pub const PROTOCOL_VERSION_V4: u16 = 4;
 
 /// Current protocol version
-pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
+pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V4;
 
 /// Feature flags for capability negotiation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -100,16 +100,16 @@ impl PeerCapabilities {
 
     /// Create capabilities from a Hello exchange.
     ///
-    /// Takes the intersection of features. `PROTOCOL_VERSION_V3` is the only
+    /// Takes the intersection of features. `PROTOCOL_VERSION_V4` is the only
     /// protocol version that exists and `perform_hello_handshake` rejects any
     /// Hello whose version differs from `CURRENT_PROTOCOL_VERSION`, so the
-    /// negotiated version is always `PROTOCOL_VERSION_V3` (the former
-    /// `min()` negotiation and the `>= PROTOCOL_VERSION_V3` guards below were
+    /// negotiated version is always `PROTOCOL_VERSION_V4` (the former
+    /// `min()` negotiation and version guards below were
     /// unreachable).
     pub fn from_hello_exchange(local: &Hello, remote: &Hello) -> Self {
         let features = Self::features_mask(&local.features) & Self::features_mask(&remote.features);
         Self {
-            version: PROTOCOL_VERSION_V3,
+            version: PROTOCOL_VERSION_V4,
             features,
         }
     }
@@ -200,7 +200,7 @@ where
         GossipError::TlsHandshakeFailed("missing ALPN negotiation result".to_string())
     })?;
 
-    if alpn != ALPN_ICANACT_V3 {
+    if alpn != ALPN_ICANACT_V4 {
         return Err(GossipError::TlsHandshakeFailed(format!(
             "unsupported ALPN: {}",
             String::from_utf8_lossy(alpn)
@@ -271,7 +271,7 @@ mod tests {
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
-        assert_eq!(caps.version, PROTOCOL_VERSION_V3);
+        assert_eq!(caps.version, PROTOCOL_VERSION_V4);
         assert!(caps.supports_feature(Feature::PeerListGossip));
         assert!(caps.supports_feature(Feature::ClockCalibration));
         assert!(caps.can_send_peer_list());
@@ -293,13 +293,13 @@ mod tests {
     fn test_peer_capabilities_from_hello_exchange_partial_features() {
         let local = Hello::with_features(vec![Feature::PeerListGossip]);
         let remote = Hello {
-            protocol_version: PROTOCOL_VERSION_V3,
+            protocol_version: PROTOCOL_VERSION_V4,
             features: vec![], // Remote supports no features
         };
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
-        assert_eq!(caps.version, PROTOCOL_VERSION_V3);
+        assert_eq!(caps.version, PROTOCOL_VERSION_V4);
         assert_eq!(caps.features, 0); // No common features
         assert!(!caps.can_send_peer_list()); // Needs both version and feature
     }
@@ -373,7 +373,7 @@ mod tests {
             server.write_all(&serialized).await.unwrap();
         });
 
-        let err = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V3), true)
+        let err = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V4), true)
             .await
             .expect_err("handshake should reject legacy protocol peers");
 

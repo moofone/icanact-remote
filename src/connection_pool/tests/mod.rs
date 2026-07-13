@@ -15,7 +15,7 @@ impl crate::registry::ActorMessageHandlerSync for TestActor {
         actor_id: u64,
         type_hash: u32,
         payload: crate::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> crate::Result<Option<crate::registry::ActorResponse>> {
         if actor_id != 0xC0DE_BEEF || type_hash != 0xA11C_0001 {
             return Ok(None);
@@ -80,7 +80,7 @@ impl crate::registry::ActorMessageHandlerSync for TestActorCounter {
         actor_id: u64,
         type_hash: u32,
         _payload: crate::AlignedBytes,
-        _correlation_id: Option<u16>,
+        _correlation_id: Option<u32>,
     ) -> crate::Result<Option<crate::registry::ActorResponse>> {
         if actor_id != TEST_TELL_ACTOR_ID {
             return Ok(None);
@@ -1608,8 +1608,8 @@ fn stream_direct_ask_throughput_bench() {
                 if msg_len >= crate::framing::DIRECT_ASK_HEADER_LEN
                     && msg[0] == crate::MessageType::DirectAsk as u8
                 {
-                    let correlation_id = u16::from_be_bytes([msg[1], msg[2]]);
-                    let payload_len = u32::from_be_bytes([msg[3], msg[4], msg[5], msg[6]]) as usize;
+                    let correlation_id = u32::from_be_bytes(msg[1..5].try_into().unwrap());
+                    let payload_len = u32::from_be_bytes(msg[5..9].try_into().unwrap()) as usize;
                     let payload = &msg[crate::framing::DIRECT_ASK_HEADER_LEN
                         ..crate::framing::DIRECT_ASK_HEADER_LEN + payload_len];
                     let header =
@@ -1623,9 +1623,8 @@ fn stream_direct_ask_throughput_bench() {
                 } else if msg_len >= crate::framing::ACTOR_HEADER_LEN
                     && msg[0] == crate::MessageType::ActorAsk as u8
                 {
-                    let correlation_id = u16::from_be_bytes([msg[1], msg[2]]);
-                    let payload_len =
-                        u32::from_be_bytes([msg[24], msg[25], msg[26], msg[27]]) as usize;
+                    let correlation_id = u32::from_be_bytes(msg[1..5].try_into().unwrap());
+                    let payload_len = msg_len - crate::framing::ACTOR_HEADER_LEN;
                     let payload = &msg[crate::framing::ACTOR_HEADER_LEN
                         ..crate::framing::ACTOR_HEADER_LEN + payload_len];
                     let header = crate::framing::write_ask_response_header(
@@ -6433,7 +6432,7 @@ fn complete_rejects_aliased_correlation_id() {
     let tracker = CorrelationTracker::new();
     let guard = tracker.allocate().expect("slot should be available");
     let id = guard.id();
-    let aliased = id.wrapping_add(PENDING_RESPONSES_SIZE as u16);
+    let aliased = id.wrapping_add(PENDING_RESPONSES_SIZE as u32);
     assert_eq!(
         CorrelationTracker::slot_index(id),
         CorrelationTracker::slot_index(aliased),

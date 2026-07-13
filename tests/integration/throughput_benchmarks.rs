@@ -134,7 +134,7 @@ impl ActorMessageHandlerSync for EchoActor {
         actor_id: u64,
         type_hash: u32,
         payload: AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> icanact_remote::Result<Option<ActorResponse>> {
         if actor_id != BENCH_ACTOR_ID || type_hash != BENCH_TYPE_HASH {
             return Ok(None);
@@ -410,7 +410,7 @@ impl ActorMessageHandler for AsyncProxyActor {
         actor_id: u64,
         type_hash: u32,
         payload: AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
         let destination = self.destination.clone();
         Box::pin(async move {

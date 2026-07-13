@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 use std::sync::atomic::{
-    AtomicBool, AtomicIsize, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::task::{Context, Poll};
 use std::{

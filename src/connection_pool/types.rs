@@ -209,7 +209,7 @@ pub enum WritePayload {
         prefix_len: u8,
         payload: crate::typed::PooledPayload,
     },
-    /// DirectAsk fast path - header is [length:4][type:1][correlation_id:2][payload_len:4]
+    /// DirectAsk fast path - header is [length:4][type:1][correlation_id:4][payload_len:4]
     DirectAskInline {
         header: [u8; 16], // DIRECT_ASK_FRAME_HEADER_LEN
         payload: bytes::Bytes,

@@ -105,7 +105,7 @@ impl ActorMessageHandler for ConsoleActorHandler {
         _actor_id: u64,
         _type_hash: u32,
         payload: icanact_remote::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
         Box::pin(async move {
             if correlation_id.is_some() {
@@ -123,7 +123,7 @@ impl ActorMessageHandlerSync for ConsoleActorHandler {
         _actor_id: u64,
         _type_hash: u32,
         payload: icanact_remote::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> icanact_remote::Result<Option<icanact_remote::registry::ActorResponse>> {
         if correlation_id.is_some() {
             Ok(Some(payload.into()))

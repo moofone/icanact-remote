@@ -53,7 +53,7 @@ impl ActorMessageHandler for EchoAskHandler {
         _actor_id: u64,
         _type_hash: u32,
         payload: AlignedBytes,
-        _correlation_id: Option<u16>,
+        _correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
         Box::pin(async move {
             self.asks.fetch_add(1, Ordering::AcqRel);

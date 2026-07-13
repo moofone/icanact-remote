@@ -565,7 +565,7 @@ pub struct ActorMessageHandlerSyncCell {
         u64,
         u32,
         crate::aligned::AlignedBytes,
-        Option<u16>,
+        Option<u32>,
     ) -> Result<Option<ActorResponse>>,
 }
 
@@ -579,7 +579,7 @@ impl ActorMessageHandlerSyncCell {
             actor_id: u64,
             type_hash: u32,
             payload: crate::aligned::AlignedBytes,
-            correlation_id: Option<u16>,
+            correlation_id: Option<u32>,
         ) -> Result<Option<ActorResponse>>
         where
             H: ActorMessageHandlerSync + 'static,
@@ -603,7 +603,7 @@ impl ActorMessageHandlerSyncCell {
         actor_id: u64,
         type_hash: u32,
         payload: crate::aligned::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> Result<Option<ActorResponse>> {
         let _keepalive = &self.owner;
         unsafe { (self.call)(self.ptr, actor_id, type_hash, payload, correlation_id) }
@@ -706,7 +706,7 @@ pub trait ActorMessageHandler: Send + Sync {
         actor_id: u64,
         type_hash: u32,
         payload: crate::aligned::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_>;
 }
 
@@ -763,7 +763,7 @@ pub trait ActorMessageHandlerSync: Send + Sync {
         actor_id: u64,
         type_hash: u32,
         payload: crate::aligned::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> Result<Option<ActorResponse>>;
 }
 
@@ -2131,7 +2131,7 @@ impl<T: 'static> GossipRegistry<T> {
         actor_id: u64,
         type_hash: u32,
         payload: crate::aligned::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
     ) -> Result<Option<ActorResponse>> {
         if let Some(cell) = self.actor_message_handler_sync.load_full() {
             return cell.handle(actor_id, type_hash, payload, correlation_id);
@@ -5743,7 +5743,6 @@ impl<T: 'static> GossipRegistry<T> {
 
         (observed_peer_addr, peer_id)
     }
-
 
     /// Handle a peer connection failure by peer ID instead of address
     pub async fn handle_peer_connection_failure_by_peer_id(

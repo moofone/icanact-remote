@@ -171,11 +171,11 @@ struct ReadPollResult {
 enum ReadIoResult {
     Generic(crate::handle::MessageReadResult),
     DirectAsk {
-        correlation_id: u16,
+        correlation_id: u32,
         payload: crate::AlignedBytes,
     },
     ActorAsk {
-        correlation_id: u16,
+        correlation_id: u32,
         actor_id: u64,
         type_hash: u32,
         payload: crate::AlignedBytes,
@@ -199,7 +199,7 @@ fn try_handle_read_fast_from_pooled(
         if msg_len >= crate::framing::ASK_RESPONSE_HEADER_LEN
             && msg_data[0] == crate::MessageType::Response as u8
         {
-            let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+            let correlation_id = u32::from_be_bytes(msg_data[1..5].try_into().unwrap());
             let payload_len = msg_len - crate::framing::ASK_RESPONSE_HEADER_LEN;
             let payload_offset =
                 crate::framing::LENGTH_PREFIX_LEN + crate::framing::ASK_RESPONSE_HEADER_LEN;
@@ -222,9 +222,8 @@ fn try_handle_read_fast_from_pooled(
         if msg_len >= crate::framing::DIRECT_RESPONSE_HEADER_LEN
             && msg_data[0] == crate::MessageType::DirectResponse as u8
         {
-            let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
-            let payload_len =
-                u32::from_be_bytes([msg_data[3], msg_data[4], msg_data[5], msg_data[6]]) as usize;
+            let correlation_id = u32::from_be_bytes(msg_data[1..5].try_into().unwrap());
+            let payload_len = u32::from_be_bytes(msg_data[5..9].try_into().unwrap()) as usize;
             if msg_data.len() < crate::framing::DIRECT_RESPONSE_HEADER_LEN + payload_len {
                 return Ok(FastReadOutcome::Unhandled(buffer));
             }
@@ -251,9 +250,8 @@ fn try_handle_read_fast_from_pooled(
     if msg_len >= crate::framing::DIRECT_ASK_HEADER_LEN
         && msg_data[0] == crate::MessageType::DirectAsk as u8
     {
-        let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
-        let payload_len =
-            u32::from_be_bytes([msg_data[3], msg_data[4], msg_data[5], msg_data[6]]) as usize;
+        let correlation_id = u32::from_be_bytes(msg_data[1..5].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(msg_data[5..9].try_into().unwrap()) as usize;
         if msg_data.len() < crate::framing::DIRECT_ASK_HEADER_LEN + payload_len {
             return Ok(FastReadOutcome::Unhandled(buffer));
         }
@@ -281,23 +279,19 @@ fn try_handle_read_fast_from_pooled(
         {
             return Ok(FastReadOutcome::Unhandled(buffer));
         }
-        let correlation_id = u16::from_be_bytes([msg_data[1], msg_data[2]]);
+        let correlation_id = u32::from_be_bytes(msg_data[1..5].try_into().unwrap());
         if correlation_id == 0 {
             return Ok(FastReadOutcome::Unhandled(buffer));
         }
         if let Some(expected) = ctx.expected_schema_hash {
-            let schema_hash = crate::framing::read_schema_hash(&msg_data[3..12]);
+            let schema_hash = crate::framing::read_schema_hash(&msg_data[5..16]);
             if schema_hash != Some(expected) {
                 return Ok(FastReadOutcome::Handled);
             }
         }
-        let actor_id = u64::from_be_bytes(msg_data[12..20].try_into().unwrap());
-        let type_hash = u32::from_be_bytes(msg_data[20..24].try_into().unwrap());
-        let payload_len =
-            u32::from_be_bytes([msg_data[24], msg_data[25], msg_data[26], msg_data[27]]) as usize;
-        if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
-            return Ok(FastReadOutcome::Unhandled(buffer));
-        }
+        let actor_id = u64::from_be_bytes(msg_data[16..24].try_into().unwrap());
+        let type_hash = u32::from_be_bytes(msg_data[24..28].try_into().unwrap());
+        let payload_len = msg_len - crate::framing::ACTOR_HEADER_LEN;
         let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::ACTOR_HEADER_LEN;
         let payload =
             crate::AlignedBytes::from_pooled_buffer_range(buffer, payload_offset, payload_len)?;
@@ -314,25 +308,20 @@ fn try_handle_read_fast_from_pooled(
     {
         return Ok(FastReadOutcome::Unhandled(buffer));
     }
-    if msg_data[1] != 0 || msg_data[2] != 0 {
+    if msg_data[1..5].iter().any(|byte| *byte != 0) {
         return Ok(FastReadOutcome::Unhandled(buffer));
     }
 
     if let Some(expected) = ctx.expected_schema_hash {
-        let schema_hash = crate::framing::read_schema_hash(&msg_data[3..12]);
+        let schema_hash = crate::framing::read_schema_hash(&msg_data[5..16]);
         if schema_hash != Some(expected) {
             return Ok(FastReadOutcome::Handled);
         }
     }
 
-    let actor_id = u64::from_be_bytes(msg_data[12..20].try_into().unwrap());
-    let type_hash = u32::from_be_bytes(msg_data[20..24].try_into().unwrap());
-    let payload_len =
-        u32::from_be_bytes([msg_data[24], msg_data[25], msg_data[26], msg_data[27]]) as usize;
-
-    if msg_data.len() < crate::framing::ACTOR_HEADER_LEN + payload_len {
-        return Ok(FastReadOutcome::Unhandled(buffer));
-    }
+    let actor_id = u64::from_be_bytes(msg_data[16..24].try_into().unwrap());
+    let type_hash = u32::from_be_bytes(msg_data[24..28].try_into().unwrap());
+    let payload_len = msg_len - crate::framing::ACTOR_HEADER_LEN;
 
     let payload_offset = crate::framing::LENGTH_PREFIX_LEN + crate::framing::ACTOR_HEADER_LEN;
     let payload =
@@ -726,7 +715,7 @@ async fn write_actor_response_direct<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
-    correlation_id: u16,
+    correlation_id: u32,
     response: crate::registry::ActorResponse,
 ) -> Result<()>
 where
@@ -811,7 +800,7 @@ where
 
 fn ask_context_from_context(
     ctx: &ReadContext,
-    correlation_id: u16,
+    correlation_id: u32,
 ) -> Option<crate::AskContext<'_>> {
     ctx.response_writer
         .as_ref()
@@ -825,7 +814,7 @@ async fn write_ask_disposition_io<S>(
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
     wrote_response_bytes: &mut bool,
-    correlation_id: u16,
+    correlation_id: u32,
     disposition: crate::registry::AskDisposition,
     perf: Option<&IoPerfCounters>,
 ) -> Result<()>
@@ -1059,7 +1048,7 @@ async fn write_streaming_response_direct<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
-    correlation_id: u16,
+    correlation_id: u32,
     payload: bytes::Bytes,
     max_message_size: usize,
     schema_hash: Option<u64>,
@@ -1070,8 +1059,9 @@ where
     use bytes::BufMut;
 
     // Streaming frame wire format excludes the 4-byte length prefix from `msg_len`.
-    // `msg_len` for stream data frames is: type(1) + corr(2) + reserved(9) + header(36) + chunk(N).
-    const STREAM_FRAME_OVERHEAD: usize = 12 + crate::StreamHeader::SERIALIZED_SIZE;
+    // `msg_len` for stream data frames is the V4 prefix plus header and chunk.
+    const STREAM_FRAME_OVERHEAD: usize =
+        crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE;
     let max_chunk = max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
     if max_chunk == 0 {
         return Err(GossipError::InvalidConfig(format!(
@@ -1087,20 +1077,22 @@ where
     fn build_stream_response_header(
         msg_type: crate::MessageType,
         header: &crate::StreamHeader,
-        correlation_id: u16,
+        correlation_id: u32,
         chunk_len: usize,
         schema_hash: Option<u64>,
     ) -> bytes::Bytes {
-        // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
-        let inner_size = 12 + crate::StreamHeader::SERIALIZED_SIZE + chunk_len;
-        let mut message =
-            bytes::BytesMut::with_capacity(4 + 12 + crate::StreamHeader::SERIALIZED_SIZE);
+        // V4 message format: [length:4][type:1][correlation_id:4][schema_hash:8][header:36]
+        let inner_size =
+            crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE + chunk_len;
+        let mut message = bytes::BytesMut::with_capacity(
+            4 + crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE,
+        );
 
         message.put_u32(inner_size as u32);
         message.put_u8(msg_type as u8);
-        message.put_u16(correlation_id);
+        message.put_u32(correlation_id);
 
-        let mut reserved = [0u8; 9];
+        let mut reserved = [0u8; 8];
         crate::framing::write_schema_hash(&mut reserved, schema_hash);
         message.put_slice(&reserved);
         message.put_slice(&header.to_bytes());
@@ -1193,7 +1185,7 @@ async fn write_streaming_response_direct_pooled<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
-    correlation_id: u16,
+    correlation_id: u32,
     mut payload: crate::typed::PooledPayload,
     prefix: Option<[u8; 16]>,
     payload_len: usize,
@@ -1206,8 +1198,9 @@ where
     use bytes::BufMut;
 
     // Streaming frame wire format excludes the 4-byte length prefix from `msg_len`.
-    // `msg_len` for stream data frames is: type(1) + corr(2) + reserved(9) + header(36) + chunk(N).
-    const STREAM_FRAME_OVERHEAD: usize = 12 + crate::StreamHeader::SERIALIZED_SIZE;
+    // `msg_len` for stream data frames is the V4 prefix plus header and chunk.
+    const STREAM_FRAME_OVERHEAD: usize =
+        crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE;
     let max_chunk = max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
     if max_chunk == 0 {
         return Err(GossipError::InvalidConfig(format!(
@@ -1238,20 +1231,22 @@ where
     fn build_stream_response_header(
         msg_type: crate::MessageType,
         header: &crate::StreamHeader,
-        correlation_id: u16,
+        correlation_id: u32,
         chunk_len: usize,
         schema_hash: Option<u64>,
     ) -> bytes::Bytes {
-        // Message format: [length:4][type:1][correlation_id:2][reserved:9][header:36]
-        let inner_size = 12 + crate::StreamHeader::SERIALIZED_SIZE + chunk_len;
-        let mut message =
-            bytes::BytesMut::with_capacity(4 + 12 + crate::StreamHeader::SERIALIZED_SIZE);
+        // V4 message format: [length:4][type:1][correlation_id:4][schema_hash:8][header:36]
+        let inner_size =
+            crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE + chunk_len;
+        let mut message = bytes::BytesMut::with_capacity(
+            4 + crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE,
+        );
 
         message.put_u32(inner_size as u32);
         message.put_u8(msg_type as u8);
-        message.put_u16(correlation_id);
+        message.put_u32(correlation_id);
 
-        let mut reserved = [0u8; 9];
+        let mut reserved = [0u8; 8];
         crate::framing::write_schema_hash(&mut reserved, schema_hash);
         message.put_slice(&reserved);
         message.put_slice(&header.to_bytes());
@@ -1563,7 +1558,7 @@ where
         actor_id: u64,
         type_hash: u32,
         payload: crate::AlignedBytes,
-        correlation_id: Option<u16>,
+        correlation_id: Option<u32>,
         stream: &mut S,
         bytes_written_counter: &Arc<AtomicUsize>,
         bytes_since_flush: &mut usize,

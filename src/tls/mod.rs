@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-pub const ALPN_ICANACT_V3: &[u8] = b"icanact-remote-v3";
+pub const ALPN_ICANACT_V4: &[u8] = b"icanact-remote-v4";
 
 pub fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -62,7 +62,7 @@ fn make_client_config(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NodeIdServerVerifier::new()))
         .with_client_cert_resolver(Arc::new(resolver::AlwaysResolvesCert::new(secret_key)?));
-    config.alpn_protocols = vec![ALPN_ICANACT_V3.to_vec()];
+    config.alpn_protocols = vec![ALPN_ICANACT_V4.to_vec()];
     config.resumption = Resumption::disabled();
     config.cert_compressors.clear();
     config.cert_decompressors.clear();
@@ -80,7 +80,7 @@ fn make_server_config(
     let mut config = ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_client_cert_verifier(Arc::new(NodeIdClientVerifier::new()))
         .with_cert_resolver(Arc::new(resolver::AlwaysResolvesCert::new(secret_key)?));
-    config.alpn_protocols = vec![ALPN_ICANACT_V3.to_vec()];
+    config.alpn_protocols = vec![ALPN_ICANACT_V4.to_vec()];
     config.send_tls13_tickets = 0;
     config.cert_compressors.clear();
     config.cert_decompressors.clear();
