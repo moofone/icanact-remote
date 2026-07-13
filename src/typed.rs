@@ -11,6 +11,22 @@ const MAX_POOLED_ARENA_CAPACITY: usize = 1024 * 1024; // 1MB
 const BYTE_PAYLOAD_POOL_SIZE: usize = 4096;
 const MAX_POOLED_BYTE_CAPACITY: usize = 1024 * 1024; // 1MB
 
+fn validate_archive_alignment<A>(payload: &[u8], type_name: &str) -> Result<()> {
+    let required = std::mem::align_of::<A>();
+    if required > crate::aligned::PAYLOAD_ALIGNMENT {
+        return Err(GossipError::InvalidConfig(format!(
+            "typed archive alignment for {type_name} requires {required} bytes, exceeding the {}-byte payload guarantee",
+            crate::aligned::PAYLOAD_ALIGNMENT
+        )));
+    }
+    if (payload.as_ptr() as usize) % required != 0 {
+        return Err(GossipError::InvalidConfig(format!(
+            "typed archive alignment for {type_name} requires a {required}-byte-aligned payload"
+        )));
+    }
+    Ok(())
+}
+
 struct SerializerCtx {
     writer: rkyv::util::AlignedVec,
     arena: rkyv::ser::allocator::Arena,
@@ -457,6 +473,44 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn archived_decode_rejects_misaligned_caller_bytes() {
+        let encoded = encode_typed(&TestMsg { value: 9 }).unwrap();
+        let archive_alignment = std::mem::align_of::<<TestMsg as rkyv::Archive>::Archived>();
+        assert!(archive_alignment > 1);
+        let body_offset = if cfg!(debug_assertions) { 16 } else { 0 };
+        let mut storage = vec![0_u8; encoded.len() + archive_alignment];
+        let storage_address = storage.as_ptr() as usize;
+        let offset = (0..archive_alignment)
+            .find(|offset| (storage_address + offset + body_offset) % archive_alignment != 0)
+            .expect("an over-allocation must contain a misaligned offset");
+        storage[offset..offset + encoded.len()].copy_from_slice(&encoded);
+        let misaligned = Bytes::from(storage).slice(offset..offset + encoded.len());
+
+        let Err(error) = decode_typed_archived::<TestMsg>(misaligned) else {
+            panic!("misaligned caller bytes must be rejected");
+        };
+        assert!(matches!(
+            error,
+            GossipError::InvalidConfig(message)
+                if message.contains("typed archive alignment")
+        ));
+    }
+
+    #[test]
+    fn archive_alignment_cannot_exceed_transport_guarantee() {
+        #[repr(align(32))]
+        struct OverAligned;
+
+        let error = validate_archive_alignment::<OverAligned>(&[], "OverAligned")
+            .expect_err("over-aligned archives must fail closed");
+        assert!(matches!(
+            error,
+            GossipError::InvalidConfig(message)
+                if message.contains("exceeding the 16-byte payload guarantee")
+        ));
+    }
 }
 
 /// Zero-copy wrapper for archived payloads that keeps the underlying bytes alive.
@@ -590,6 +644,7 @@ where
                 hash
             )));
         }
+        validate_archive_alignment::<T::Archived>(&payload[DEBUG_PREFIX_LEN..], T::TYPE_NAME)?;
         // Validate before exposing the zero-copy wrapper. The wrapper owns the
         // bytes, so the validated archive remains stable for its lifetime.
         rkyv::access::<T::Archived, rkyv::rancor::Error>(&payload[DEBUG_PREFIX_LEN..])?;
@@ -602,6 +657,7 @@ where
 
     #[cfg(not(debug_assertions))]
     {
+        validate_archive_alignment::<T::Archived>(&payload, T::TYPE_NAME)?;
         // Network payloads must pass bytecheck in release as well as debug.
         rkyv::access::<T::Archived, rkyv::rancor::Error>(&payload)?;
         Ok(ArchivedBytes {
