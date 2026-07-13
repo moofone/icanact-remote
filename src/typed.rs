@@ -170,8 +170,11 @@ impl Buf for PooledPayload {
 
     fn advance(&mut self, cnt: usize) {
         let remaining = self.remaining();
-        let to_advance = cnt.min(remaining);
-        self.pos += to_advance;
+        assert!(
+            cnt <= remaining,
+            "cannot advance past remaining bytes: requested {cnt}, remaining {remaining}"
+        );
+        self.pos += cnt;
     }
 }
 
@@ -361,6 +364,17 @@ mod tests {
         let advance_by = 1.min(remaining);
         payload.advance(advance_by);
         assert_eq!(payload.remaining(), remaining - advance_by);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot advance past remaining bytes")]
+    fn pooled_payload_rejects_advance_past_remaining() {
+        let mut payload = PooledPayload::try_from_pooled_bytes(3, |out| {
+            out.extend_from_slice(b"abc");
+        })
+        .expect("small pooled payload");
+
+        payload.advance(4);
     }
 
     #[test]
