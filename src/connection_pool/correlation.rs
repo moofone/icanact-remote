@@ -210,6 +210,13 @@ impl CorrelationTracker {
     }
 
     /// Cancel a pending request (used when send fails).
+    ///
+    /// Mirrors [`complete`](Self::complete): the slot's stored full
+    /// correlation id is verified before the slot is released. `id` and
+    /// `id + 8192*k` alias to the same slot index, so a stale cancel for a
+    /// recycled id must not evict (or drop the ready response of) a
+    /// *different* in-flight request occupying the same slot. On a mismatch
+    /// the previous state is restored and no waker fires.
     pub(crate) fn cancel(&self, correlation_id: u32) {
         let slot = Self::slot_index(correlation_id);
         let slot_ref = &self.pending[slot];
@@ -221,13 +228,19 @@ impl CorrelationTracker {
                         .state
                         .compare_exchange(
                             SLOT_WAITING,
-                            SLOT_EMPTY,
+                            SLOT_WRITING,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
-                        break;
+                        if slot_ref.id.load(Ordering::Relaxed) != correlation_id {
+                            slot_ref.state.store(SLOT_WAITING, Ordering::Release);
+                            return;
+                        }
+                        slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
+                        slot_ref.waker.wake();
+                        return;
                     }
                 }
                 SLOT_READY => {
@@ -235,25 +248,30 @@ impl CorrelationTracker {
                         .state
                         .compare_exchange(
                             SLOT_READY,
-                            SLOT_EMPTY,
+                            SLOT_WRITING,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
+                        if slot_ref.id.load(Ordering::Relaxed) != correlation_id {
+                            slot_ref.state.store(SLOT_READY, Ordering::Release);
+                            return;
+                        }
                         unsafe {
                             (*slot_ref.response.get()).assume_init_drop();
                         }
-                        break;
+                        slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
+                        slot_ref.waker.wake();
+                        return;
                     }
                 }
                 SLOT_WRITING => {
                     std::hint::spin_loop();
                 }
-                _ => break,
+                _ => return,
             }
         }
-        slot_ref.waker.wake();
     }
 
     /// Cancel all pending requests (used when a connection drops).
@@ -506,6 +524,55 @@ mod correlation_tests {
             after_boundary.id() > u32::from(u16::MAX),
             "a correlation id must never repeat after the old 16-bit space is exhausted"
         );
+    }
+
+    #[test]
+    fn stale_cancel_for_an_aliased_id_must_not_evict_a_waiting_request() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+
+        // `id` and `id + 8192` alias to the same slot index. A stale cancel
+        // for the recycled aliased id must be a no-op for the *different*
+        // request currently occupying the slot.
+        tracker.cancel(id + PENDING_RESPONSES_SIZE as u32);
+
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
+        assert!(
+            tracker.complete(id, &mut response),
+            "a stale cancel for an aliased correlation id evicted a waiting request"
+        );
+
+        // Drain the ready response so drop(guard) sees a clean slot.
+        let slot_ref = &tracker.pending[CorrelationTracker::slot_index(id)];
+        let taken = CorrelationTracker::try_take_ready(slot_ref);
+        assert_eq!(taken.expect("ready response").as_ref(), b"reply");
+        guard.disarm();
+    }
+
+    #[test]
+    fn stale_cancel_for_an_aliased_id_must_not_drop_a_ready_response() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
+        assert!(tracker.complete(id, &mut response));
+
+        // The slot is READY with `id`'s response stored; a stale cancel for
+        // the aliased id must not drop it.
+        tracker.cancel(id + PENDING_RESPONSES_SIZE as u32);
+
+        let slot_ref = &tracker.pending[CorrelationTracker::slot_index(id)];
+        let taken = CorrelationTracker::try_take_ready(slot_ref);
+        assert_eq!(
+            taken
+                .expect("a stale cancel for an aliased correlation id dropped a ready response")
+                .as_ref(),
+            b"reply"
+        );
+        guard.disarm();
     }
 
     #[test]
