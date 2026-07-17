@@ -154,6 +154,16 @@ impl<T> GossipRegistryHandle<T> {
         }
         transport_stack.prepare_config(&secret_key, &mut config)?;
 
+        // Flips a cancel flag when dropped. Living across the `spawn_blocking`
+        // await below, it lets a dropped outer future abort the blocking bind
+        // task instead of leaking it (and the bound port).
+        struct BindCancelGuard(Arc<AtomicBool>);
+        impl Drop for BindCancelGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
         let (listener, actual_bind_addr) = match transport_stack.wire_kind() {
             TransportWireKind::TcpStream => {
                 // Create the TCP listener first to get the actual bound address.
@@ -166,13 +176,28 @@ impl<T> GossipRegistryHandle<T> {
                 // ~10 s). Run it on the blocking pool so an EPERM burst at
                 // startup cannot stall this async worker (which would freeze the
                 // whole executor on a single-thread runtime).
-                let listener = tokio::task::spawn_blocking(move || bind_with_reuseaddr(bind_addr))
-                    .await
-                    .map_err(|err| {
-                        GossipError::Network(std::io::Error::other(format!(
-                            "bind task failed to join: {err}"
-                        )))
-                    })??;
+                //
+                // If this future is dropped (outer timeout/select) mid-bind, the
+                // JoinHandle drops but the blocking task keeps running and could
+                // hold the port for the full EPERM window. `BindCancelGuard`
+                // flips `bind_cancel` on drop so the task abandons the loop and
+                // releases any listener it just bound, freeing the port for a
+                // same-addr retry.
+                let bind_cancel = Arc::new(AtomicBool::new(false));
+                let cancel_guard = BindCancelGuard(bind_cancel.clone());
+                let task_cancel = bind_cancel;
+                let listener = tokio::task::spawn_blocking(move || {
+                    bind_with_reuseaddr(bind_addr, task_cancel)
+                })
+                .await
+                .map_err(|err| {
+                    GossipError::Network(std::io::Error::other(format!(
+                        "bind task failed to join: {err}"
+                    )))
+                })??;
+                // Bind completed; disarm the guard so the normal path does not
+                // flip the (now unobserved) cancel flag.
+                drop(cancel_guard);
                 let actual_bind_addr = listener.local_addr()?;
                 (listener, actual_bind_addr)
             }
@@ -2223,6 +2248,37 @@ mod tests {
             "cancelled bind must return GossipError::Shutdown, got {res:?}"
         );
     }
+
+    #[tokio::test]
+    async fn bind_with_backoff_impl_releases_port_when_cancelled_after_bind() {
+        // Reserve a currently-free port, then release it so the bind below can
+        // claim (and must then release) it.
+        let addr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            let addr = probe.local_addr().expect("probe addr");
+            drop(probe);
+            addr
+        };
+
+        // bind_fn succeeds and flips cancel immediately after a successful bind;
+        // the post-bind cancel check must drop the listener and return Shutdown.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let after_bind = cancel.clone();
+        let res = bind_with_backoff_impl(&cancel, move || {
+            let std_listener = std::net::TcpListener::bind(addr)?;
+            std_listener.set_nonblocking(true)?;
+            let listener = TcpListener::from_std(std_listener)?;
+            after_bind.store(true, Ordering::Relaxed);
+            Ok(listener)
+        });
+        assert!(
+            matches!(res, Err(GossipError::Shutdown)),
+            "cancelled-after-bind must return Shutdown, got {res:?}"
+        );
+
+        // The port must be free again immediately: the cancelled bind dropped it.
+        std::net::TcpListener::bind(addr).expect("port must be released after cancelled bind");
+    }
 }
 
 fn is_sandbox_eperm(err: &std::io::Error) -> bool {
@@ -2245,7 +2301,7 @@ fn is_sandbox_eperm(err: &std::io::Error) -> bool {
 /// whose future was dropped abort this otherwise multi-second blocking loop
 /// (honored by the T5 cancellation fix).
 fn bind_with_backoff_impl(
-    _cancel: &Arc<AtomicBool>,
+    cancel: &Arc<AtomicBool>,
     mut bind_fn: impl FnMut() -> std::io::Result<TcpListener>,
 ) -> Result<TcpListener> {
     let max_wait_ms: u64 = std::env::var("ICANACT_EPERM_BIND_MAX_MS")
@@ -2265,8 +2321,21 @@ fn bind_with_backoff_impl(
     let mut backoff = Duration::from_millis(backoff_start_ms);
 
     loop {
+        // A caller whose future was dropped flips `cancel`; abandon the backoff
+        // loop rather than block for the multi-second EPERM window.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(GossipError::Shutdown);
+        }
         match bind_fn() {
-            Ok(listener) => return Ok(listener),
+            Ok(listener) => {
+                // If cancellation raced a successful bind, drop the listener so
+                // the port is released immediately for a same-addr retry.
+                if cancel.load(Ordering::Relaxed) {
+                    drop(listener);
+                    return Err(GossipError::Shutdown);
+                }
+                return Ok(listener);
+            }
             Err(e) => {
                 if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
                     std::thread::sleep(backoff);
@@ -2282,14 +2351,16 @@ fn bind_with_backoff_impl(
     }
 }
 
-pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> {
+pub(crate) fn bind_with_reuseaddr(
+    bind_addr: SocketAddr,
+    cancel: Arc<AtomicBool>,
+) -> Result<TcpListener> {
     use socket2::{Domain, Socket, Type};
 
-    fn bind_fallback_std(bind_addr: SocketAddr) -> Result<TcpListener> {
+    fn bind_fallback_std(bind_addr: SocketAddr, cancel: &Arc<AtomicBool>) -> Result<TcpListener> {
         // One bind attempt (bind + set_nonblocking + tokio conversion); the
         // backoff/retry loop lives in `bind_with_backoff_impl`.
-        let cancel = Arc::new(AtomicBool::new(false));
-        bind_with_backoff_impl(&cancel, move || {
+        bind_with_backoff_impl(cancel, move || {
             let std_listener = std::net::TcpListener::bind(bind_addr)?;
             std_listener.set_nonblocking(true)?;
             TcpListener::from_std(std_listener)
@@ -2299,7 +2370,7 @@ pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> 
     // For ephemeral ports, std's bind path is already fast and reliable, and avoids
     // sandbox-sensitive socket option syscalls (EPERM flakiness in some environments).
     if bind_addr.port() == 0 {
-        return bind_fallback_std(bind_addr);
+        return bind_fallback_std(bind_addr, &cancel);
     }
 
     #[cfg(any(
@@ -2344,7 +2415,7 @@ pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> 
         Ok(s) => s,
         Err(e) if is_sandbox_eperm(&e) => {
             // Some sandbox profiles disallow raw socket creation/config; fall back.
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         Err(e) => return Err(GossipError::Network(e)),
     };
@@ -2369,20 +2440,20 @@ pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> 
 
     if let Err(e) = socket.bind(&bind_addr.into()) {
         if is_sandbox_eperm(&e) {
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         return Err(GossipError::Network(e));
     }
     if let Err(e) = socket.listen(1024) {
         if is_sandbox_eperm(&e) {
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         return Err(GossipError::Network(e));
     }
 
     if let Err(e) = socket.set_nonblocking(true) {
         if is_sandbox_eperm(&e) {
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         return Err(GossipError::Network(e));
     }
