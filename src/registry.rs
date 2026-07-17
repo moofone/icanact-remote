@@ -8694,6 +8694,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forged_clock_echo_cannot_void_another_peers_pending_probe() {
+        let origin = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let responder = GossipRegistry::<()>::new(test_addr(8081), test_config());
+        let peer_a = test_addr(8081);
+        let peer_b = test_addr(8082);
+        origin.set_peer_capabilities(peer_a, clock_caps());
+        responder.set_peer_capabilities(peer_a, clock_caps());
+
+        // Origin probes peer A: pending_clock_probes now holds A's probe.
+        let probe_ext = origin
+            .gossip_extensions_for_outbound(peer_a, 1_000)
+            .await
+            .expect("origin attaches probe for A");
+        let sample_id = probe_ext.clock_probe.expect("probe").sample_id;
+        assert!(origin.pending_clock_probes.contains_sync(&sample_id));
+
+        // A genuine responder builds the echo peer A would return.
+        responder.record_inbound_gossip_extensions(peer_a, Some(probe_ext), 2_550);
+        let echo_ext = responder
+            .gossip_extensions_for_outbound(peer_a, 2_570)
+            .await
+            .expect("responder attaches echo");
+
+        // An authenticated peer B replays/guesses A's sample_id and delivers the
+        // echo from its own address. This forgery must NOT destroy A's probe.
+        origin.record_inbound_gossip_extensions(peer_b, Some(echo_ext), 1_120);
+        assert!(
+            origin.pending_clock_probes.contains_sync(&sample_id),
+            "forged echo from peer B must not void peer A's in-flight probe"
+        );
+        assert!(origin.peer_clock_snapshot(&peer_b).is_none());
+
+        // The genuine echo from A still lands.
+        origin.record_inbound_gossip_extensions(peer_a, Some(echo_ext), 1_120);
+        assert!(
+            origin.peer_clock_snapshot(&peer_a).is_some(),
+            "genuine echo from A must record the calibration snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn clock_calibration_does_not_touch_vector_clock_or_delta_state() {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         let peer = test_addr(8081);
