@@ -2189,86 +2189,75 @@ mod tests {
     }
 }
 
+fn is_sandbox_eperm(err: &std::io::Error) -> bool {
+    // In some sandbox profiles on macOS, networking syscalls can fail with EPERM but
+    // the `ErrorKind` is not consistently `PermissionDenied`. Treat raw OS EPERM as
+    // a soft failure and fall back to std's listener.
+    err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(1)
+}
+
+/// Retry a blocking bind with exponential backoff until it succeeds, hits a
+/// non-EPERM error, or the retry deadline elapses.
+///
+/// macOS sandboxed runs can return transient EPERM for otherwise-valid `bind()`
+/// calls; retrying here is cheap (only on startup) and makes socket-heavy
+/// integration tests deterministic. Some sandbox profiles exhibit long EPERM
+/// bursts under load, so the window is generous. Backoff (not a tight loop) is
+/// important: hammering bind() every ~10ms can prolong the sandbox burst.
+///
+/// Extracted as a seam so cancellation can be injected: `cancel` lets a caller
+/// whose future was dropped abort this otherwise multi-second blocking loop
+/// (honored by the T5 cancellation fix).
+fn bind_with_backoff_impl(
+    _cancel: &Arc<AtomicBool>,
+    mut bind_fn: impl FnMut() -> std::io::Result<TcpListener>,
+) -> Result<TcpListener> {
+    let max_wait_ms: u64 = std::env::var("ICANACT_EPERM_BIND_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let backoff_start_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_START_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let backoff_max_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000);
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
+    let mut backoff = Duration::from_millis(backoff_start_ms);
+
+    loop {
+        match bind_fn() {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(backoff);
+                    backoff = std::cmp::min(
+                        backoff.saturating_mul(2),
+                        Duration::from_millis(backoff_max_ms),
+                    );
+                    continue;
+                }
+                return Err(GossipError::Network(e));
+            }
+        }
+    }
+}
+
 pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> {
     use socket2::{Domain, Socket, Type};
 
-    fn is_sandbox_eperm(err: &std::io::Error) -> bool {
-        // In some sandbox profiles on macOS, networking syscalls can fail with EPERM but
-        // the `ErrorKind` is not consistently `PermissionDenied`. Treat raw OS EPERM as
-        // a soft failure and fall back to std's listener.
-        err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(1)
-    }
-
     fn bind_fallback_std(bind_addr: SocketAddr) -> Result<TcpListener> {
-        // macOS sandboxed runs can return transient EPERM for otherwise-valid `bind()` calls.
-        // Retrying here is cheap (only on startup) and makes socket-heavy integration tests
-        // deterministic.
-        // Some sandbox profiles exhibit long EPERM bursts under load, so allow a longer retry
-        // window. This only impacts startup when EPERM is actually occurring.
-        //
-        // IMPORTANT: use backoff, not a tight loop. Hammering bind() every ~10ms can prolong the
-        // sandbox burst and makes `cargo test --all` retries converge poorly.
-        let max_wait_ms: u64 = std::env::var("ICANACT_EPERM_BIND_MAX_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000);
-        let backoff_start_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_START_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
-        let backoff_max_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_MAX_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1_000);
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
-        let mut backoff = Duration::from_millis(backoff_start_ms);
-
-        loop {
-            match std::net::TcpListener::bind(bind_addr) {
-                Ok(std_listener) => {
-                    if let Err(e) = std_listener.set_nonblocking(true) {
-                        if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
-                            std::thread::sleep(backoff);
-                            backoff = std::cmp::min(
-                                backoff.saturating_mul(2),
-                                Duration::from_millis(backoff_max_ms),
-                            );
-                            continue;
-                        }
-                        return Err(GossipError::Network(e));
-                    }
-
-                    match TcpListener::from_std(std_listener) {
-                        Ok(listener) => return Ok(listener),
-                        Err(e) => {
-                            // Treat tokio's conversion failure the same way as bind flakiness
-                            // in sandboxed environments.
-                            if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
-                                std::thread::sleep(backoff);
-                                backoff = std::cmp::min(
-                                    backoff.saturating_mul(2),
-                                    Duration::from_millis(backoff_max_ms),
-                                );
-                                continue;
-                            }
-                            return Err(GossipError::Network(e));
-                        }
-                    }
-                }
-                Err(e) => {
-                    if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
-                        std::thread::sleep(backoff);
-                        backoff = std::cmp::min(
-                            backoff.saturating_mul(2),
-                            Duration::from_millis(backoff_max_ms),
-                        );
-                        continue;
-                    }
-                    return Err(GossipError::Network(e));
-                }
-            }
-        }
+        // One bind attempt (bind + set_nonblocking + tokio conversion); the
+        // backoff/retry loop lives in `bind_with_backoff_impl`.
+        let cancel = Arc::new(AtomicBool::new(false));
+        bind_with_backoff_impl(&cancel, move || {
+            let std_listener = std::net::TcpListener::bind(bind_addr)?;
+            std_listener.set_nonblocking(true)?;
+            TcpListener::from_std(std_listener)
+        })
     }
 
     // For ephemeral ports, std's bind path is already fast and reliable, and avoids
