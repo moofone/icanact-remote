@@ -635,6 +635,11 @@ struct WriteQueue {
     queue: crossbeam_queue::ArrayQueue<WriteCommand>,
     data_notify: Notify,
     space_notify: Notify,
+    /// True when a producer has published data the consumer has not yet
+    /// prepared to park on. Producers only fire `data_notify` on the
+    /// false -> true transition (wake coalescing); the consumer clears the
+    /// flag in `prepare_park()` immediately before parking.
+    data_pending: AtomicBool,
     /// Set true when the owning IO writer task has exited (teardown). A blocked
     /// `push()` observes this after being woken via the space notifier and
     /// returns `ConnectionClosed` instead of re-parking forever. Hot path never
@@ -650,6 +655,7 @@ impl WriteQueue {
             queue: crossbeam_queue::ArrayQueue::new(capacity.max(128)),
             data_notify: Notify::new(),
             space_notify: Notify::new(),
+            data_pending: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             addr,
         })
@@ -659,15 +665,42 @@ impl WriteQueue {
         self.queue.push(command)
     }
 
+    /// Publish a writer wakeup after a successful push, coalescing wakeups so
+    /// high-throughput tell workloads do not wake-storm the writer.
+    ///
+    /// Only the producer that transitions `data_pending` false -> true fires
+    /// the notify; `Notify::notify_one` stores a permit even when the writer
+    /// is not currently parked, so the wakeup is never lost. This replaces a
+    /// racy `len() == 1` empty->non-empty check: push and len() are separate
+    /// operations, so two producers pushing concurrently into an empty queue
+    /// could both observe len == 2 and neither would notify, leaving the
+    /// writer parked forever with frames queued.
     #[inline]
-    fn notify_data_if_empty_to_non_empty(&self) {
+    fn notify_data(&self) {
         #[cfg(test)]
         queue_notify_hook::fire();
-        // Notify writer only on empty->non-empty transition to avoid wake storms
-        // under high-throughput tell workloads.
-        if self.queue.len() == 1 {
+        if !self.data_pending.swap(true, Ordering::AcqRel) {
             self.data_notify.notify_one();
         }
+    }
+
+    /// Consumer-side pre-park drain: clear `data_pending`, then re-check the
+    /// queue. Must be called by the writer task immediately before parking on
+    /// `data_notify`:
+    /// - a push landing *after* the clear swaps false -> true and stores a
+    ///   wakeup permit, so the park completes immediately;
+    /// - a push landing *before* the clear is caught by the re-check pop.
+    ///
+    /// Returns a popped command the caller must process instead of parking;
+    /// the flag is re-armed in that case so producers keep coalescing while
+    /// the consumer is known-active.
+    fn prepare_park(&self) -> Option<WriteCommand> {
+        self.data_pending.store(false, Ordering::Release);
+        let command = self.pop();
+        if command.is_some() {
+            self.data_pending.store(true, Ordering::Release);
+        }
+        command
     }
 
     /// Mark the queue closed and wake every task parked in `push()` so it can
@@ -686,7 +719,7 @@ impl WriteQueue {
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
-                    self.notify_data_if_empty_to_non_empty();
+                    self.notify_data();
                     return Ok(());
                 }
                 Err(cmd) => {
@@ -729,6 +762,9 @@ struct StreamingQueue {
     queue: crossbeam_queue::ArrayQueue<StreamingCommand>,
     data_notify: Notify,
     space_notify: Notify,
+    /// See `WriteQueue::data_pending`: producer wake coalescing flag, cleared
+    /// by the consumer in `prepare_park()` immediately before parking.
+    data_pending: AtomicBool,
     /// Set true when the owning IO writer task has exited (teardown). See
     /// `WriteQueue::closed`. Hot path never reads this flag.
     closed: AtomicBool,
@@ -756,6 +792,7 @@ impl StreamingQueue {
             queue: crossbeam_queue::ArrayQueue::new(capacity.max(64)),
             data_notify: Notify::new(),
             space_notify: Notify::new(),
+            data_pending: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             try_push_state: AtomicUsize::new(0),
             addr,
@@ -783,7 +820,7 @@ impl StreamingQueue {
 
         let result = match self.queue.push(command) {
             Ok(()) => {
-                self.notify_data_if_empty_to_non_empty();
+                self.notify_data();
                 Ok(())
             }
             Err(cmd) => Err(StreamingTryPushError::Full(cmd)),
@@ -795,13 +832,24 @@ impl StreamingQueue {
         result
     }
 
+    /// See `WriteQueue::notify_data`: coalesced, permit-storing writer wakeup.
     #[inline]
-    fn notify_data_if_empty_to_non_empty(&self) {
+    fn notify_data(&self) {
         #[cfg(test)]
         queue_notify_hook::fire();
-        if self.queue.len() == 1 {
+        if !self.data_pending.swap(true, Ordering::AcqRel) {
             self.data_notify.notify_one();
         }
+    }
+
+    /// See `WriteQueue::prepare_park`: consumer-side pre-park drain.
+    fn prepare_park(&self) -> Option<StreamingCommand> {
+        self.data_pending.store(false, Ordering::Release);
+        let command = self.pop();
+        if command.is_some() {
+            self.data_pending.store(true, Ordering::Release);
+        }
+        command
     }
 
     /// Mark the queue closed and wake every task parked in `push()`. Teardown-only.
@@ -819,7 +867,7 @@ impl StreamingQueue {
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
-                    self.notify_data_if_empty_to_non_empty();
+                    self.notify_data();
                     return Ok(());
                 }
                 Err(cmd) => {
@@ -1042,7 +1090,7 @@ mod queue_notify_tests {
                     HOOK_PARTY.with(|f| f.set(true));
                     // Same call shape as LockFreeStreamHandle::enqueue_write_nonblocking.
                     queue.try_push(frame()).expect("queue has capacity");
-                    queue.notify_data_if_empty_to_non_empty();
+                    queue.notify_data();
                 })
             })
             .collect();
@@ -1089,5 +1137,92 @@ mod queue_notify_tests {
             "two producers pushed into an empty streaming queue but no wakeup \
              was published; the parked writer task would never drain the commands"
         );
+    }
+
+    /// Deterministic walk of the `prepare_park` clear window: a push whose
+    /// wakeup was coalesced away (pending flag still set from an earlier
+    /// burst) must be recovered by the pre-park re-check pop, and after the
+    /// queue drains a fresh push must publish a wakeup again.
+    #[test]
+    fn streaming_queue_prepare_park_recovers_coalesced_push() {
+        let queue = StreamingQueue::new(64, test_addr());
+
+        // First push of a burst: flag transitions false -> true, permit stored.
+        queue
+            .try_push(StreamingCommand::Flush)
+            .expect("queue has capacity");
+        assert!(wakeup_published(&queue.data_notify), "first push must wake");
+
+        // Second push while the flag is still set: coalesced, no new permit.
+        queue
+            .try_push(StreamingCommand::Flush)
+            .expect("queue has capacity");
+        assert!(
+            !wakeup_published(&queue.data_notify),
+            "coalesced push must not publish a second wakeup"
+        );
+
+        // Without prepare_park the writer would now park with frames queued.
+        assert!(
+            queue.prepare_park().is_some(),
+            "pre-park drain must recover the coalesced frame"
+        );
+        assert!(queue.pop().is_some(), "second frame drains normally");
+        assert!(queue.prepare_park().is_none(), "empty queue parks cleanly");
+
+        // Flag was cleared by prepare_park: the next push must wake again.
+        queue
+            .try_push(StreamingCommand::Flush)
+            .expect("queue has capacity");
+        assert!(
+            wakeup_published(&queue.data_notify),
+            "push after a clean park must publish a wakeup"
+        );
+    }
+
+    /// Stress the push / prepare_park race: a producer thread pushes frames
+    /// while the consumer drains and parks exactly like the writer task. If a
+    /// push racing the pending-flag clear window could lose its frame or its
+    /// wakeup, the consumer would park forever and the timeout would fire.
+    #[tokio::test]
+    async fn write_queue_push_racing_prepare_park_never_loses_wakeup() {
+        const FRAMES: usize = 20_000;
+        let queue = WriteQueue::new(FRAMES, test_addr());
+
+        let producer = {
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                for _ in 0..FRAMES {
+                    queue.try_push(frame()).expect("queue has capacity");
+                    queue.notify_data();
+                }
+            })
+        };
+
+        let consumer = async {
+            let mut received = 0usize;
+            while received < FRAMES {
+                // Drain as the writer loop's batch pop does.
+                while queue.pop().is_some() {
+                    received += 1;
+                }
+                if received >= FRAMES {
+                    break;
+                }
+                // Park exactly like the writer: pre-park drain, then wait.
+                if let Some(_command) = queue.prepare_park() {
+                    received += 1;
+                    continue;
+                }
+                queue.data_notify.notified().await;
+            }
+            received
+        };
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), consumer)
+            .await
+            .expect("consumer parked forever: wakeup lost while frames were queued");
+        assert_eq!(received, FRAMES);
+        producer.join().expect("producer thread panicked");
     }
 }

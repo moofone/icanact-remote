@@ -514,6 +514,7 @@ impl LockFreeStreamHandle {
         let mut response_batch = ResponseBatch::new(READ_BATCH_LIMIT);
         let mut direct_response_batch = DirectResponseBatch::new(READ_BATCH_LIMIT);
         let mut pending_cmd: Option<WriteCommand> = None;
+        let mut pending_stream_cmd: Option<StreamingCommand> = None;
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
         let mut streaming_state = read_context
             .as_ref()
@@ -533,7 +534,7 @@ impl LockFreeStreamHandle {
             // normal write queue below is serviced periodically instead of only
             // after the whole stream drains.
             let stream_turn_start = total_bytes_written;
-            while let Some(cmd) = streaming_queue.pop() {
+            while let Some(cmd) = pending_stream_cmd.take().or_else(|| streaming_queue.pop()) {
                 did_work = true;
                 match cmd {
                     StreamingCommand::WriteBytes(data) => match stream.write_all(&data).await {
@@ -1577,6 +1578,18 @@ impl LockFreeStreamHandle {
                     read_state.as_mut(),
                     streaming_state.as_mut(),
                 ) {
+                    // Pre-park drain: clear each queue's pending flag and
+                    // re-check for a command that raced the last drain. A push
+                    // landing after the clear stores a wakeup permit, so the
+                    // select below cannot park forever with frames queued.
+                    if let Some(cmd) = write_queue.prepare_park() {
+                        pending_cmd = Some(cmd);
+                        continue;
+                    }
+                    if let Some(cmd) = streaming_queue.prepare_park() {
+                        pending_stream_cmd = Some(cmd);
+                        continue;
+                    }
                     tokio::select! {
                         // Idle path: block waiting for socket readability.
                         read_result = read_message_step_poll(&mut stream, state, ctx, true) => {
@@ -1807,6 +1820,15 @@ impl LockFreeStreamHandle {
                         }
                     }
                 } else {
+                    // Pre-park drain; see the read-armed variant above.
+                    if let Some(cmd) = write_queue.prepare_park() {
+                        pending_cmd = Some(cmd);
+                        continue;
+                    }
+                    if let Some(cmd) = streaming_queue.prepare_park() {
+                        pending_stream_cmd = Some(cmd);
+                        continue;
+                    }
                     tokio::select! {
                         _ = streaming_queue.data_notify.notified() => {
                             // Wake on streaming commands; drained at the top of the loop.
@@ -1869,7 +1891,7 @@ impl LockFreeStreamHandle {
         let command = WriteCommand::Payload(payload);
         match self.write_queue.try_push(command) {
             Ok(()) => {
-                self.write_queue.notify_data_if_empty_to_non_empty();
+                self.write_queue.notify_data();
                 Ok(())
             }
             Err(command) => self.write_queue.push(command).await,
@@ -1887,7 +1909,7 @@ impl LockFreeStreamHandle {
         let command = WriteCommand::AskPayload(payload);
         match self.write_queue.try_push(command) {
             Ok(()) => {
-                self.write_queue.notify_data_if_empty_to_non_empty();
+                self.write_queue.notify_data();
                 Ok(())
             }
             Err(command) => self.write_queue.push(command).await,
@@ -1904,7 +1926,7 @@ impl LockFreeStreamHandle {
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         match self.write_queue.try_push(WriteCommand::Payload(payload)) {
             Ok(()) => {
-                self.write_queue.notify_data_if_empty_to_non_empty();
+                self.write_queue.notify_data();
                 Ok(())
             }
             Err(_) => Err(GossipError::WriteQueueFull),
@@ -1924,7 +1946,7 @@ impl LockFreeStreamHandle {
             .try_push(WriteCommand::ImmediatePayload(payload))
         {
             Ok(()) => {
-                self.write_queue.notify_data_if_empty_to_non_empty();
+                self.write_queue.notify_data();
                 Ok(())
             }
             Err(_) => Err(GossipError::WriteQueueFull),
