@@ -2187,6 +2187,42 @@ mod tests {
         handle.shutdown_and_wait().await;
         Ok(())
     }
+
+    #[test]
+    fn bind_with_backoff_impl_honors_cancellation() {
+        use std::sync::mpsc;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Flip the cancel flag shortly after the blocking loop starts.
+        let flip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip.store(true, Ordering::Relaxed);
+        });
+
+        // Run the blocking bind on its own thread with a bind_fn that always
+        // reports sandbox EPERM (raw OS error 1), so the backoff loop never
+        // terminates on its own within the test window.
+        let (tx, rx) = mpsc::channel();
+        let bind_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let res =
+                bind_with_backoff_impl(&bind_cancel, || Err(std::io::Error::from_raw_os_error(1)));
+            let _ = tx.send(res);
+        });
+
+        // A cancelled bind must abandon the backoff loop promptly. Without the
+        // cancel check the loop runs to the multi-second EPERM deadline and this
+        // recv times out (the seam-only stage).
+        let res = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("bind_with_backoff_impl must return within 500ms of cancellation");
+        assert!(
+            matches!(res, Err(GossipError::Shutdown)),
+            "cancelled bind must return GossipError::Shutdown, got {res:?}"
+        );
+    }
 }
 
 fn is_sandbox_eperm(err: &std::io::Error) -> bool {
