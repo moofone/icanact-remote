@@ -509,6 +509,55 @@ mod correlation_tests {
     }
 
     #[test]
+    fn stale_cancel_for_an_aliased_id_must_not_evict_a_waiting_request() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+
+        // `id` and `id + 8192` alias to the same slot index. A stale cancel
+        // for the recycled aliased id must be a no-op for the *different*
+        // request currently occupying the slot.
+        tracker.cancel(id + PENDING_RESPONSES_SIZE as u32);
+
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
+        assert!(
+            tracker.complete(id, &mut response),
+            "a stale cancel for an aliased correlation id evicted a waiting request"
+        );
+
+        // Drain the ready response so drop(guard) sees a clean slot.
+        let slot_ref = &tracker.pending[CorrelationTracker::slot_index(id)];
+        let taken = CorrelationTracker::try_take_ready(slot_ref);
+        assert_eq!(taken.expect("ready response").as_ref(), b"reply");
+        guard.disarm();
+    }
+
+    #[test]
+    fn stale_cancel_for_an_aliased_id_must_not_drop_a_ready_response() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
+        assert!(tracker.complete(id, &mut response));
+
+        // The slot is READY with `id`'s response stored; a stale cancel for
+        // the aliased id must not drop it.
+        tracker.cancel(id + PENDING_RESPONSES_SIZE as u32);
+
+        let slot_ref = &tracker.pending[CorrelationTracker::slot_index(id)];
+        let taken = CorrelationTracker::try_take_ready(slot_ref);
+        assert_eq!(
+            taken
+                .expect("a stale cancel for an aliased correlation id dropped a ready response")
+                .as_ref(),
+            b"reply"
+        );
+        guard.disarm();
+    }
+
+    #[test]
     fn ready_slot_remains_exclusively_owned_until_response_is_read() {
         let tracker = CorrelationTracker::new();
         let guard = tracker.allocate().expect("slot should allocate");
