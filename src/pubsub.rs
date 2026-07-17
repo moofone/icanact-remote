@@ -427,6 +427,19 @@ pub struct RoutedPubSub {
     borrowed_subscribers: ArcSwap<BorrowedSubscriberMap>,
     hot_borrowed_subscriber: ArcSwapOption<HotBorrowedSubscriber>,
     type_subscribers: ArcSwap<TypeSubscriberMap>,
+    /// Serializes the seven subscriber-map writers (subscribe_* /
+    /// remove_*_subscriber). Each writer performs a
+    /// `load_full -> clone -> mutate -> store` read-modify-write on an
+    /// `ArcSwap` map; without mutual exclusion two concurrent writers both
+    /// clone the same snapshot and the second `store` silently erases the
+    /// first writer's update (a subscriber then holds a live
+    /// `PubSubSubscription` handle with no map entry — permanent silent
+    /// delivery loss — or a dropped subscription keeps its stale entry).
+    /// Holding the guard across `refresh_hot_borrowed_subscriber` also
+    /// linearizes the hot-cache with the map. Readers stay lock-free
+    /// (`ArcSwap::load`); the guard is always released before
+    /// `note_interest`, which locks `interest_state` internally.
+    subscriber_write_lock: Mutex<()>,
     interest_state: Arc<Mutex<InterestState>>,
     route_groups: ArcSwap<TopicRouteGroups>,
     hot_route_groups: ArcSwapOption<HotRouteGroups>,
@@ -465,6 +478,7 @@ impl RoutedPubSub {
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
             hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            subscriber_write_lock: Mutex::new(()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
@@ -496,6 +510,17 @@ impl RoutedPubSub {
         self.counters.snapshot()
     }
 
+    /// Takes the subscriber-map writer lock (see `subscriber_write_lock`).
+    /// A poisoned lock is recovered: the maps are only ever replaced
+    /// wholesale via `store`, so a writer that panicked mid-window leaves
+    /// the last consistent snapshot in place.
+    fn lock_subscriber_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.subscriber_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     pub fn subscribe_bytes(
         &self,
         topic_key: u64,
@@ -504,6 +529,7 @@ impl RoutedPubSub {
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let mut next = (*self.subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
@@ -511,6 +537,7 @@ impl RoutedPubSub {
         topic_subs.push(SubscriberEntry::new(id, runtime.as_ref(), deliver));
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, true);
         self.make_handle(
             SubscriptionKind::Owned {
@@ -529,6 +556,7 @@ impl RoutedPubSub {
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
@@ -538,6 +566,7 @@ impl RoutedPubSub {
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, true);
         self.make_handle(
             SubscriptionKind::Borrowed {
@@ -556,6 +585,7 @@ impl RoutedPubSub {
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
@@ -565,6 +595,7 @@ impl RoutedPubSub {
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, true);
         self.make_handle(
             SubscriptionKind::Borrowed {
@@ -581,6 +612,7 @@ impl RoutedPubSub {
         deliver: impl Fn(u64, Bytes) + Send + Sync + 'static,
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        let _write_guard = self.lock_subscriber_writes();
         let mut next = (*self.type_subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut subs = next
@@ -627,6 +659,7 @@ impl RoutedPubSub {
 
     fn remove_owned_subscriber(&self, topic_key: u64, type_hash: u64, id: u64) -> bool {
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let current = self.subscribers.load_full();
         subscriber_rmw_window_hook();
         let Some(existing) = current.get(&key) else {
@@ -647,12 +680,14 @@ impl RoutedPubSub {
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
         self.subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, false);
         true
     }
 
     fn remove_borrowed_subscriber(&self, topic_key: u64, type_hash: u64, id: u64) -> bool {
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let current = self.borrowed_subscribers.load_full();
         subscriber_rmw_window_hook();
         let Some(existing) = current.get(&key) else {
@@ -677,11 +712,13 @@ impl RoutedPubSub {
             self.refresh_hot_borrowed_subscriber(key, &[]);
         }
         self.borrowed_subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, false);
         true
     }
 
     fn remove_type_subscriber(&self, type_hash: u64, id: u64) -> bool {
+        let _write_guard = self.lock_subscriber_writes();
         let current = self.type_subscribers.load_full();
         subscriber_rmw_window_hook();
         let Some(existing) = current.get(&type_hash) else {
@@ -1831,6 +1868,7 @@ mod tests {
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
             hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            subscriber_write_lock: Mutex::new(()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
