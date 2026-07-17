@@ -210,6 +210,13 @@ impl CorrelationTracker {
     }
 
     /// Cancel a pending request (used when send fails).
+    ///
+    /// Mirrors [`complete`](Self::complete): the slot's stored full
+    /// correlation id is verified before the slot is released. `id` and
+    /// `id + 8192*k` alias to the same slot index, so a stale cancel for a
+    /// recycled id must not evict (or drop the ready response of) a
+    /// *different* in-flight request occupying the same slot. On a mismatch
+    /// the previous state is restored and no waker fires.
     pub(crate) fn cancel(&self, correlation_id: u32) {
         let slot = Self::slot_index(correlation_id);
         let slot_ref = &self.pending[slot];
@@ -221,13 +228,19 @@ impl CorrelationTracker {
                         .state
                         .compare_exchange(
                             SLOT_WAITING,
-                            SLOT_EMPTY,
+                            SLOT_WRITING,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
-                        break;
+                        if slot_ref.id.load(Ordering::Relaxed) != correlation_id {
+                            slot_ref.state.store(SLOT_WAITING, Ordering::Release);
+                            return;
+                        }
+                        slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
+                        slot_ref.waker.wake();
+                        return;
                     }
                 }
                 SLOT_READY => {
@@ -235,25 +248,30 @@ impl CorrelationTracker {
                         .state
                         .compare_exchange(
                             SLOT_READY,
-                            SLOT_EMPTY,
+                            SLOT_WRITING,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
+                        if slot_ref.id.load(Ordering::Relaxed) != correlation_id {
+                            slot_ref.state.store(SLOT_READY, Ordering::Release);
+                            return;
+                        }
                         unsafe {
                             (*slot_ref.response.get()).assume_init_drop();
                         }
-                        break;
+                        slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
+                        slot_ref.waker.wake();
+                        return;
                     }
                 }
                 SLOT_WRITING => {
                     std::hint::spin_loop();
                 }
-                _ => break,
+                _ => return,
             }
         }
-        slot_ref.waker.wake();
     }
 
     /// Cancel all pending requests (used when a connection drops).
