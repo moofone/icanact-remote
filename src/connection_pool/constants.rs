@@ -587,6 +587,50 @@ pub struct BufferConfig {
     write_queue_capacity: usize,
 }
 
+/// Test-only instrumentation for the writer queues.
+///
+/// The hook fires between a successful queue push and the notify decision so
+/// tests can force a deterministic interleaving of concurrent producers inside
+/// that window. Production builds compile none of this; test builds pay one
+/// atomic load on the notify path while no hook is installed.
+#[cfg(test)]
+mod queue_notify_hook {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// Fast check so the push path is a single load when no hook is installed.
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    fn slot() -> &'static Mutex<Option<Hook>> {
+        static SLOT: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Fired from the queue notify helpers between push and notify decision.
+    #[inline]
+    pub(crate) fn fire() {
+        if !ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        let hook = slot().lock().expect("queue notify hook lock poisoned").clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(crate) fn install(hook: Hook) {
+        *slot().lock().expect("queue notify hook lock poisoned") = Some(hook);
+        ACTIVE.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn uninstall() {
+        ACTIVE.store(false, Ordering::Release);
+        *slot().lock().expect("queue notify hook lock poisoned") = None;
+    }
+}
+
 struct WriteQueue {
     queue: crossbeam_queue::ArrayQueue<WriteCommand>,
     data_notify: Notify,
@@ -617,6 +661,8 @@ impl WriteQueue {
 
     #[inline]
     fn notify_data_if_empty_to_non_empty(&self) {
+        #[cfg(test)]
+        queue_notify_hook::fire();
         // Notify writer only on empty->non-empty transition to avoid wake storms
         // under high-throughput tell workloads.
         if self.queue.len() == 1 {
@@ -751,6 +797,8 @@ impl StreamingQueue {
 
     #[inline]
     fn notify_data_if_empty_to_non_empty(&self) {
+        #[cfg(test)]
+        queue_notify_hook::fire();
         if self.queue.len() == 1 {
             self.data_notify.notify_one();
         }
@@ -920,5 +968,126 @@ impl Default for BufferConfig {
             ask_window: crate::config::DEFAULT_ASK_WINDOW,
             write_queue_capacity: crate::config::DEFAULT_ASK_WINDOW.saturating_mul(8),
         }
+    }
+}
+
+// Named `queue_notify_tests` (not `tests`) because `connection_pool` already
+// declares a `tests` submodule and this file is `include!`d into `mod.rs`.
+#[cfg(test)]
+mod queue_notify_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::{Barrier, Mutex, MutexGuard, OnceLock};
+    use std::task::Waker;
+
+    /// The notify hook is a process-global slot; serialize the tests that
+    /// install one so they cannot observe each other's hooks.
+    fn hook_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    thread_local! {
+        /// Marks the producer threads of the rendezvous tests so hook callers
+        /// from unrelated tests in the same process never join the barrier.
+        static HOOK_PARTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:9".parse().expect("valid test addr")
+    }
+
+    /// Install a 2-party rendezvous in the push->notify window: both producer
+    /// threads must reach the window before either proceeds to the notify
+    /// decision.
+    fn install_two_party_rendezvous() {
+        let barrier = Arc::new(Barrier::new(2));
+        queue_notify_hook::install(Arc::new(move || {
+            if HOOK_PARTY.with(|f| f.get()) {
+                barrier.wait();
+            }
+        }));
+    }
+
+    /// Poll the queue's data notifier once with a no-op waker: a stored wakeup
+    /// permit completes the future immediately, so `Ready` means a producer
+    /// published a wakeup for the parked writer task.
+    fn wakeup_published(notify: &Notify) -> bool {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        let mut cx = Context::from_waker(Waker::noop());
+        notified.as_mut().poll(&mut cx).is_ready()
+    }
+
+    fn frame() -> WriteCommand {
+        WriteCommand::Payload(WritePayload::Single(bytes::Bytes::from_static(b"frame")))
+    }
+
+    /// Two producers pushing concurrently into an EMPTY queue must publish a
+    /// writer wakeup. With the `len() == 1` empty->non-empty heuristic, the
+    /// interleaving pushA, pushB, lenA == 2, lenB == 2 notifies nobody and the
+    /// writer stays parked with frames queued (lost wakeup).
+    #[test]
+    fn write_queue_concurrent_pushes_into_empty_queue_publish_wakeup() {
+        let _guard = hook_lock();
+        let queue = WriteQueue::new(128, test_addr());
+        install_two_party_rendezvous();
+
+        let producers: Vec<_> = (0..2)
+            .map(|_| {
+                let queue = queue.clone();
+                std::thread::spawn(move || {
+                    HOOK_PARTY.with(|f| f.set(true));
+                    // Same call shape as LockFreeStreamHandle::enqueue_write_nonblocking.
+                    queue.try_push(frame()).expect("queue has capacity");
+                    queue.notify_data_if_empty_to_non_empty();
+                })
+            })
+            .collect();
+        for producer in producers {
+            producer.join().expect("producer thread panicked");
+        }
+        queue_notify_hook::uninstall();
+
+        assert_eq!(queue.queue.len(), 2, "both frames must be enqueued");
+        assert!(
+            wakeup_published(&queue.data_notify),
+            "two producers pushed into an empty write queue but no wakeup was \
+             published; the parked writer task would never drain the frames"
+        );
+    }
+
+    /// Same lost-wakeup race for the streaming queue, driven through its
+    /// public `try_push` path (which notifies internally).
+    #[test]
+    fn streaming_queue_concurrent_pushes_into_empty_queue_publish_wakeup() {
+        let _guard = hook_lock();
+        let queue = StreamingQueue::new(64, test_addr());
+        install_two_party_rendezvous();
+
+        let producers: Vec<_> = (0..2)
+            .map(|_| {
+                let queue = queue.clone();
+                std::thread::spawn(move || {
+                    HOOK_PARTY.with(|f| f.set(true));
+                    queue
+                        .try_push(StreamingCommand::Flush)
+                        .expect("queue has capacity");
+                })
+            })
+            .collect();
+        for producer in producers {
+            producer.join().expect("producer thread panicked");
+        }
+        queue_notify_hook::uninstall();
+
+        assert_eq!(queue.queue.len(), 2, "both commands must be enqueued");
+        assert!(
+            wakeup_published(&queue.data_notify),
+            "two producers pushed into an empty streaming queue but no wakeup \
+             was published; the parked writer task would never drain the commands"
+        );
     }
 }
