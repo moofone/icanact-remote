@@ -427,6 +427,19 @@ pub struct RoutedPubSub {
     borrowed_subscribers: ArcSwap<BorrowedSubscriberMap>,
     hot_borrowed_subscriber: ArcSwapOption<HotBorrowedSubscriber>,
     type_subscribers: ArcSwap<TypeSubscriberMap>,
+    /// Serializes the seven subscriber-map writers (subscribe_* /
+    /// remove_*_subscriber). Each writer performs a
+    /// `load_full -> clone -> mutate -> store` read-modify-write on an
+    /// `ArcSwap` map; without mutual exclusion two concurrent writers both
+    /// clone the same snapshot and the second `store` silently erases the
+    /// first writer's update (a subscriber then holds a live
+    /// `PubSubSubscription` handle with no map entry — permanent silent
+    /// delivery loss — or a dropped subscription keeps its stale entry).
+    /// Holding the guard across `refresh_hot_borrowed_subscriber` also
+    /// linearizes the hot-cache with the map. Readers stay lock-free
+    /// (`ArcSwap::load`); the guard is always released before
+    /// `note_interest`, which locks `interest_state` internally.
+    subscriber_write_lock: Mutex<()>,
     interest_state: Arc<Mutex<InterestState>>,
     route_groups: ArcSwap<TopicRouteGroups>,
     hot_route_groups: ArcSwapOption<HotRouteGroups>,
@@ -437,6 +450,16 @@ pub struct RoutedPubSub {
     msg_id_epoch: u64,
     next_msg_id: AtomicU64,
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
+}
+
+/// Fires the test-only subscriber-map RMW hook (see
+/// `test_helpers::fire_pubsub_subscriber_rmw_hook`). Compiles to nothing in
+/// production builds; with test helpers enabled but no hook installed the
+/// cost is a single relaxed atomic load.
+#[inline]
+fn subscriber_rmw_window_hook() {
+    #[cfg(any(test, feature = "test-helpers"))]
+    crate::test_helpers::fire_pubsub_subscriber_rmw_hook();
 }
 
 impl RoutedPubSub {
@@ -455,6 +478,7 @@ impl RoutedPubSub {
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
             hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            subscriber_write_lock: Mutex::new(()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
@@ -486,6 +510,17 @@ impl RoutedPubSub {
         self.counters.snapshot()
     }
 
+    /// Takes the subscriber-map writer lock (see `subscriber_write_lock`).
+    /// A poisoned lock is recovered: the maps are only ever replaced
+    /// wholesale via `store`, so a writer that panicked mid-window leaves
+    /// the last consistent snapshot in place.
+    fn lock_subscriber_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.subscriber_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     pub fn subscribe_bytes(
         &self,
         topic_key: u64,
@@ -494,12 +529,15 @@ impl RoutedPubSub {
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let mut next = (*self.subscribers.load_full()).clone();
+        subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
         topic_subs.push(SubscriberEntry::new(id, runtime.as_ref(), deliver));
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, true);
         self.make_handle(
             SubscriptionKind::Owned {
@@ -518,7 +556,9 @@ impl RoutedPubSub {
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
+        subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
         let entry = BorrowedSubscriberEntry::new(id, runtime.as_ref(), deliver);
@@ -526,6 +566,7 @@ impl RoutedPubSub {
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, true);
         self.make_handle(
             SubscriptionKind::Borrowed {
@@ -544,7 +585,9 @@ impl RoutedPubSub {
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
+        subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
         let entry = BorrowedSubscriberEntry::new_with_metadata(id, runtime.as_ref(), deliver);
@@ -552,6 +595,7 @@ impl RoutedPubSub {
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, true);
         self.make_handle(
             SubscriptionKind::Borrowed {
@@ -568,7 +612,9 @@ impl RoutedPubSub {
         deliver: impl Fn(u64, Bytes) + Send + Sync + 'static,
     ) -> PubSubSubscription {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        let _write_guard = self.lock_subscriber_writes();
         let mut next = (*self.type_subscribers.load_full()).clone();
+        subscriber_rmw_window_hook();
         let mut subs = next
             .get(&type_hash)
             .map(|subs| subs.to_vec())
@@ -613,7 +659,9 @@ impl RoutedPubSub {
 
     fn remove_owned_subscriber(&self, topic_key: u64, type_hash: u64, id: u64) -> bool {
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let current = self.subscribers.load_full();
+        subscriber_rmw_window_hook();
         let Some(existing) = current.get(&key) else {
             return false;
         };
@@ -632,13 +680,16 @@ impl RoutedPubSub {
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
         self.subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, false);
         true
     }
 
     fn remove_borrowed_subscriber(&self, topic_key: u64, type_hash: u64, id: u64) -> bool {
         let key = (topic_key, type_hash);
+        let write_guard = self.lock_subscriber_writes();
         let current = self.borrowed_subscribers.load_full();
+        subscriber_rmw_window_hook();
         let Some(existing) = current.get(&key) else {
             return false;
         };
@@ -661,12 +712,15 @@ impl RoutedPubSub {
             self.refresh_hot_borrowed_subscriber(key, &[]);
         }
         self.borrowed_subscribers.store(Arc::new(next));
+        drop(write_guard);
         self.note_interest(topic_key, false);
         true
     }
 
     fn remove_type_subscriber(&self, type_hash: u64, id: u64) -> bool {
+        let _write_guard = self.lock_subscriber_writes();
         let current = self.type_subscribers.load_full();
+        subscriber_rmw_window_hook();
         let Some(existing) = current.get(&type_hash) else {
             return false;
         };
@@ -1814,6 +1868,7 @@ mod tests {
             borrowed_subscribers: ArcSwap::from_pointee(HashMap::new()),
             hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
+            subscriber_write_lock: Mutex::new(()),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
@@ -2386,6 +2441,167 @@ mod tests {
         );
         // Dropping the handle after the engine is gone must be a no-op.
         drop(subscription);
+    }
+
+    /// Lost-update race (2026-07-17 QA wave, T1): two concurrent
+    /// `subscribe_bytes` calls both `load_full` the same subscriber map,
+    /// mutate private clones, and `store` — the second store erases the
+    /// first writer's entry while its `PubSubSubscription` handle stays
+    /// live, so that subscriber silently never receives anything.
+    ///
+    /// Thread A's first RMW window is widened via the test hook: it signals
+    /// entry and parks ~100ms between `load_full` and `store`, during which
+    /// thread B (the test thread) runs a full subscribe on a distinct
+    /// topic. A delay hook (not a two-party barrier) is used deliberately:
+    /// once writers are serialized, B blocks until A leaves the window, so
+    /// the green run cannot deadlock.
+    #[test]
+    fn concurrent_subscribes_do_not_lose_a_subscriber_entry() {
+        let pubsub = test_pubsub("pubsub-rmw-delay");
+        let topic_a = topic_key("rmw-delay-topic-a");
+        let topic_b = topic_key("rmw-delay-topic-b");
+        let type_hash = 401;
+
+        // Armed thread id: the hook fires for every subscriber-map writer in
+        // the process, so it must self-filter to thread A's first window.
+        let armed: Arc<std::sync::OnceLock<std::thread::ThreadId>> =
+            Arc::new(std::sync::OnceLock::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let fired = AtomicBool::new(false);
+        let armed_for_hook = Arc::clone(&armed);
+        assert!(
+            crate::test_helpers::install_pubsub_subscriber_rmw_hook(Arc::new(move || {
+                if armed_for_hook.get() != Some(&std::thread::current().id()) {
+                    return;
+                }
+                if fired.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let _ = entered_tx.lock().unwrap().send(());
+                std::thread::sleep(Duration::from_millis(100));
+            })),
+            "subscriber RMW hook already installed by another test"
+        );
+
+        let delivered_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let pubsub_for_a = Arc::clone(&pubsub);
+        let delivered_a_cb = Arc::clone(&delivered_a);
+        let armed_for_a = Arc::clone(&armed);
+        let thread_a = std::thread::spawn(move || {
+            armed_for_a
+                .set(std::thread::current().id())
+                .expect("armed thread id set once");
+            pubsub_for_a.subscribe_bytes(topic_a, type_hash, move |_| {
+                delivered_a_cb.store(true, Ordering::Release);
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("thread A must enter the subscriber-map RMW window");
+
+        // Thread B: full subscribe while A is parked inside its window.
+        let delivered_b_cb = Arc::clone(&delivered_b);
+        let _sub_b = pubsub.subscribe_bytes(topic_b, type_hash, move |_| {
+            delivered_b_cb.store(true, Ordering::Release);
+        });
+        let _sub_a = thread_a.join().expect("thread A subscribe must not panic");
+
+        for (topic, payload) in [(topic_a, &b"to-a"[..]), (topic_b, &b"to-b"[..])] {
+            pubsub
+                .publish_bytes(
+                    topic,
+                    type_hash,
+                    Bytes::from_static(payload),
+                    PubSubScope::LocalOnly,
+                    PubSubDeliveryPolicy::default(),
+                )
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while (!delivered_a.load(Ordering::Acquire) || !delivered_b.load(Ordering::Acquire))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            delivered_a.load(Ordering::Acquire),
+            "subscriber A must receive its topic's publication"
+        );
+        assert!(
+            delivered_b.load(Ordering::Acquire),
+            "subscriber B holds a live subscription handle but its entry was \
+             erased by thread A's stale subscriber-map store (lost update)"
+        );
+    }
+
+    /// Barrier-aligned stress: two threads repeatedly subscribe and drop on
+    /// distinct topics. After each quiescent phase, worker 0 checks the map:
+    /// both entries must exist after the concurrent subscribes, and none
+    /// after the concurrent drops (a leftover entry delivers into a dropped
+    /// subscription forever). Failures are recorded and both workers exit
+    /// together so a detected race cannot wedge the barrier.
+    #[test]
+    fn stress_concurrent_subscribe_and_drop_keep_subscriber_map_consistent() {
+        const ITERATIONS: usize = 500;
+        let pubsub = test_pubsub("pubsub-rmw-stress");
+        let type_hash = 402;
+        let keys = [
+            (topic_key("rmw-stress-0"), type_hash),
+            (topic_key("rmw-stress-1"), type_hash),
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let workers: Vec<_> = (0..2)
+            .map(|worker| {
+                let pubsub = Arc::clone(&pubsub);
+                let barrier = Arc::clone(&barrier);
+                let failure = Arc::clone(&failure);
+                std::thread::spawn(move || {
+                    let (topic, type_hash) = keys[worker];
+                    for iteration in 0..ITERATIONS {
+                        barrier.wait();
+                        let sub = pubsub.subscribe_bytes(topic, type_hash, |_| {});
+                        barrier.wait();
+                        if worker == 0 {
+                            let map = pubsub.subscribers.load();
+                            if !keys.iter().all(|key| map.contains_key(key)) {
+                                *failure.lock().unwrap() = Some(format!(
+                                    "iteration {iteration}: concurrent subscribes lost a \
+                                     subscriber-map entry (lost update)"
+                                ));
+                            }
+                        }
+                        barrier.wait();
+                        let abort = failure.lock().unwrap().is_some();
+                        drop(sub);
+                        if abort {
+                            return;
+                        }
+                        barrier.wait();
+                        if worker == 0 && !pubsub.subscribers.load().is_empty() {
+                            *failure.lock().unwrap() = Some(format!(
+                                "iteration {iteration}: concurrent unsubscribes left a stale \
+                                 subscriber-map entry (delivery into a dropped subscription)"
+                            ));
+                        }
+                        barrier.wait();
+                        if failure.lock().unwrap().is_some() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("stress worker must not panic");
+        }
+        if let Some(message) = failure.lock().unwrap().take() {
+            panic!("{message}");
+        }
     }
 
     #[tokio::test]
