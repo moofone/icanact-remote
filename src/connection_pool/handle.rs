@@ -1065,7 +1065,10 @@ impl<T> ConnectionHandle<T> {
         let correlation_id = slot.id();
 
         // Acquire exclusive streaming mode by parking on the gate (R16e).
-        let _guard = stream_handle.acquire_streaming_mode().await?;
+        // Held only while this stream's frames are being queued (dropped
+        // explicitly after the final Flush below); early-error returns
+        // release it on scope exit.
+        let gate_guard = stream_handle.acquire_streaming_mode().await?;
 
         // Generate unique stream ID
         let stream_id = current_timestamp_nanos();
@@ -1218,6 +1221,14 @@ impl<T> ConnectionHandle<T> {
         let _ = stream_handle
             .streaming_queue
             .try_push(StreamingCommand::Flush);
+
+        // T3 (2026-07-17 QA): all frames for this stream are queued, so
+        // release the exclusive gate *before* awaiting the response. Stream
+        // frames are FIFO in the streaming queue and the response matches by
+        // correlation id, not gate ownership — holding the gate across
+        // wait_for_response serialized every other streaming send on this
+        // connection behind the slowest responder's full round-trip.
+        drop(gate_guard);
 
         debug!(
             "✅ STREAMING ASK (zero-copy): Streamed {} bytes in {} chunks, waiting for response",

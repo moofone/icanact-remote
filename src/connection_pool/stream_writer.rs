@@ -13,7 +13,10 @@ pub struct LockFreeStreamHandle {
     flush_pending: Arc<AtomicBool>,
     /// Atomic flag for coordinating streaming mode. Read by the IO task and
     /// `is_streaming_active` as a cheap observability signal; the actual mutual
-    /// exclusion is enforced by `stream_gate`.
+    /// exclusion is enforced by `stream_gate`. True while a stream's frames
+    /// are being queued onto the wire (gate held); an ask that has finished
+    /// queueing its frames releases the gate and clears this flag *before*
+    /// awaiting its response (T3, 2026-07-17 QA).
     streaming_active: Arc<AtomicBool>,
     /// ACTOR_REM_2 R16e: single-permit gate serializing `stream_large_message` /
     /// `stream_response` on this handle. Losers park on the permit instead of

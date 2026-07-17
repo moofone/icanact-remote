@@ -694,6 +694,152 @@ fn test_concurrent_streaming_requests() {
     });
 }
 
+/// T3 regression (2026-07-17 QA wave): the exclusive stream gate must be
+/// released once the final StreamEnd/Flush frames are queued, not held across
+/// the response round-trip. Holding it through `wait_for_response` serializes
+/// every other streaming ask on the connection behind the slowest responder.
+///
+/// Two actors on one connection: ask #1 streams to a slow actor (slower than
+/// ask #1's own 5s timeout, i.e. it never replies in time); 200ms later
+/// ask #2 streams to a fast actor under a 2s outer bound. With the gate held
+/// across ask #1's full round-trip, ask #2 parks on the gate until ask #1's
+/// wait_for_response times out at ~5s, so the 2s bound fires (RED). With the
+/// gate released after the final Flush is queued, ask #2 completes while
+/// ask #1 is still awaiting its response (GREEN).
+///
+/// The slow actor's handler returns immediately with no reply (the receiver's
+/// read loop awaits handler futures inline, so an in-handler sleep would
+/// block delivery of ask #2 and mask the sender-side gate behavior — the only
+/// serialization under test).
+#[test]
+fn test_streaming_gate_released_before_awaiting_response() {
+    run_streaming_test("gate-scope", || async {
+        init_tracing();
+
+        const SLOW_ACTOR_ID: u64 = 1;
+        const FAST_ACTOR_ID: u64 = 2;
+        const SLOW_PAYLOAD_SIZE: usize = 2 * 1024 * 1024;
+        const FAST_PAYLOAD_SIZE: usize = 64 * 1024;
+
+        struct SlowFastHandler;
+
+        impl ActorMessageHandler for SlowFastHandler {
+            fn handle_actor_message(
+                &self,
+                actor_id: u64,
+                _type_hash: u32,
+                payload: icanact_remote::AlignedBytes,
+                _correlation_id: Option<u32>,
+            ) -> ActorMessageFuture<'_> {
+                Box::pin(async move {
+                    if actor_id == SLOW_ACTOR_ID {
+                        // "Slower than the caller's timeout": never reply.
+                        Ok(None)
+                    } else {
+                        Ok(Some(payload.into()))
+                    }
+                })
+            }
+        }
+
+        let addr_a: SocketAddr = "127.0.0.1:7951".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:7952".parse().unwrap();
+
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("gate_scope_node_a", "gate_scope_node_b");
+
+        let peer_id_b = key_pair_b.peer_id();
+
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        handle_b
+            .registry
+            .set_actor_message_handler(Arc::new(SlowFastHandler))
+            .await;
+
+        let peer_b = handle_a.add_peer(&peer_id_b).await;
+        peer_b.connect(&addr_b).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        info!("Test: fast streaming ask must not serialize behind a slow responder");
+
+        let conn = Arc::new(handle_a.lookup_address(addr_b).await.unwrap());
+
+        // Ask #1: large streaming ask to the slow actor. The responder is
+        // slower than this 5s timeout, so the ask ends in Timeout — at HEAD
+        // the gate is held for that entire wait.
+        let slow_conn = conn.clone();
+        let slow_payload = Bytes::from(create_test_payload(SLOW_PAYLOAD_SIZE));
+        let slow_task = tokio::spawn(async move {
+            slow_conn
+                .ask_streaming_bytes(slow_payload, SLOW_ACTOR_ID, 0, Duration::from_secs(5))
+                .await
+        });
+
+        // Let ask #1 queue all of its stream frames and start awaiting.
+        sleep(Duration::from_millis(200)).await;
+
+        // Ask #2: small streaming ask to the fast actor. The outer timeout
+        // bounds the gate wait — the inner ask timeout only covers
+        // wait_for_response, not parking on the stream gate.
+        let fast_payload = Bytes::from(create_test_payload(FAST_PAYLOAD_SIZE));
+        let fast_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            conn.ask_streaming_bytes(fast_payload, FAST_ACTOR_ID, 0, Duration::from_secs(10)),
+        )
+        .await;
+
+        let fast_response = fast_result
+            .expect(
+                "fast streaming ask parked behind the slow ask's response round-trip \
+                 (stream gate held across wait_for_response)",
+            )
+            .expect("fast streaming ask should succeed");
+        assert_eq!(
+            fast_response.len(),
+            FAST_PAYLOAD_SIZE,
+            "fast actor should echo its payload"
+        );
+        assert!(
+            !slow_task.is_finished(),
+            "fast ask must complete while the slow ask is still awaiting its response"
+        );
+
+        // Ask #1 times out on its own — the slow responder never replied.
+        let slow_result = slow_task.await.unwrap();
+        assert!(
+            matches!(slow_result, Err(icanact_remote::GossipError::Timeout)),
+            "slow streaming ask should time out waiting for its response: {slow_result:?}"
+        );
+
+        info!("✅ Fast streaming ask completed while slow ask awaited its response");
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+    });
+}
+
 /// Test MessageType enum includes streaming response types
 #[test]
 fn test_message_type_streaming_response_variants() {
