@@ -61,6 +61,29 @@ mod read_pipeline_tests {
         assert!(matches!(error, crate::GossipError::Network(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
     }
 
+    #[tokio::test]
+    async fn stream_abort_uses_complete_frame_path_without_reservation() {
+        let frame = crate::framing::write_stream_abort_header(7, 9);
+        let (mut writer, mut reader) = tokio::io::duplex(frame.len());
+        writer.write_all(&frame).await.unwrap();
+        let ctx = super::ReadContext {
+            registry_weak: std::sync::Weak::new(), peer_addr: "127.0.0.1:9001".parse().unwrap(),
+            peer_id: None, max_message_size: 1024, expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()), response_correlation: None,
+            response_writer: None, tell_handler_sync: None, tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None, ask_handler_sync: None, sync_actor_handler: None,
+        };
+        let mut state = super::ReadState::new();
+        let mut streams = crate::protocol::StreamingState::new();
+        let _ = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+            .await.unwrap();
+        let result = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+            .await.unwrap().expect("StreamAbort must produce a result");
+        assert!(matches!(result,
+            crate::handle::MessageReadResult::StreamAbort { stream_id: 7, reason: 9 }
+        ));
+    }
+
     #[test]
     fn direct_response_stream_ids_restart_after_wrap() {
         let previous = super::NEXT_DIRECT_RESPONSE_STREAM_ID.swap(u32::MAX, Ordering::SeqCst);
