@@ -500,7 +500,7 @@ async fn isolated_static_peer_reconnect_converges_under_500ms() -> icanact_remot
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cached_fast_path_handles_fail_closed_after_disconnect_and_fresh_lookup_recovers()
+async fn cached_ref_self_heals_after_disconnect_bare_connection_fails_closed()
 -> icanact_remote::Result<()> {
     let asks_a = Arc::new(AtomicU64::new(0));
     let asks_b = Arc::new(AtomicU64::new(0));
@@ -540,6 +540,10 @@ async fn cached_fast_path_handles_fail_closed_after_disconnect_and_fresh_lookup_
         "cloned fast-path RemoteConnection should observe closure after pool disconnect"
     );
 
+    // A bare `RemoteConnection` (the bytes-in/bytes-out handle returned by
+    // `connection_ref()`) has no ref-level slot to self-heal - it IS the one
+    // specific transport session, and that session is gone. It must keep
+    // failing closed forever; only `RemoteActorRef` re-resolves.
     let stale_conn_result = cached_conn
         .ask_actor_frame(
             TEST_ACTOR_ID,
@@ -553,6 +557,9 @@ async fn cached_fast_path_handles_fail_closed_after_disconnect_and_fresh_lookup_
         "stale cached RemoteConnection must fail closed, got {stale_conn_result:?}"
     );
 
+    // (R3) `RemoteActorRef` self-heals: a transport failure on the cached
+    // connection re-resolves the peer through the registry and retries once,
+    // with no manual re-lookup required.
     let stale_ref_result = cached_ref
         .ask_actor_frame(
             TEST_ACTOR_ID,
@@ -561,9 +568,10 @@ async fn cached_fast_path_handles_fail_closed_after_disconnect_and_fresh_lookup_
             ASK_TIMEOUT,
         )
         .await;
-    assert!(
-        stale_ref_result.is_err(),
-        "stale cached RemoteActorRef must fail closed, got {stale_ref_result:?}"
+    assert_eq!(
+        stale_ref_result.as_deref().ok(),
+        Some(b"b:stale-ref".as_slice()),
+        "cached RemoteActorRef should self-heal after disconnect with no manual re-lookup, got {stale_ref_result:?}"
     );
 
     let (a_to_b, b_to_a) = tokio::join!(

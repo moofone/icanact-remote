@@ -594,8 +594,7 @@ fn test_ask_high_throughput() {
         // NEW API: Lookup to get RemoteActorRef (includes cached connection)
         let api_actor = wait_for_actor(&node1, "api_service", Duration::from_secs(5)).await;
         let api_conn = api_actor
-            .connection
-            .clone()
+            .connection_ref()
             .expect("API service should be connected");
 
         // Test parameters
