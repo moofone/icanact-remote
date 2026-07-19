@@ -334,6 +334,18 @@ mod tests {
     }
 
     #[test]
+    fn control_codec_preserves_boundary_lengths_for_every_kind() {
+        let lengths = [0, 1, 15, 16, 17, CONTROL_BODY_LEN_MASK as usize];
+        for raw_kind in 0..=WireKind::StreamAbort as u8 {
+            let kind = WireKind::from_u8(raw_kind).expect("dense V5 kind");
+            for body_len in lengths {
+                let encoded = encode_control(kind, body_len);
+                assert_eq!(decode_control(encoded), Some(Control { kind, body_len }));
+            }
+        }
+    }
+
+    #[test]
     fn actor_tell_is_sixteen_bytes_for_any_inline_payload_size() {
         for payload_len in [0, 1, 64, 64 * 1024, 10 * 1024 * 1024] {
             let header =
