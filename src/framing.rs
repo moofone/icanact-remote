@@ -347,7 +347,14 @@ mod tests {
 
     #[test]
     fn actor_tell_is_sixteen_bytes_for_any_inline_payload_size() {
-        for payload_len in [0, 1, 64, 64 * 1024, 10 * 1024 * 1024] {
+        for payload_len in [
+            0,
+            1,
+            64,
+            64 * 1024,
+            10 * 1024 * 1024,
+            CONTROL_BODY_LEN_MASK as usize - ACTOR_TELL_HEADER_LEN,
+        ] {
             let header =
                 write_actor_tell_header(0x0102_0304_0506_0708, 0x1122_3344, payload_len);
             assert_eq!(header.len(), 16);
