@@ -139,6 +139,23 @@ impl AlignedBytes {
                 "payload range out of bounds",
             )));
         }
+        // R5: an empty view has no bytes to dereference, so there is nothing
+        // to align. When the shared pool is exhausted, `get_buffer` falls
+        // back to `AlignedBuffer::with_capacity(0)`, and rkyv's `AlignedVec`
+        // represents that as `NonNull::dangling()` (address == align_of::<u8>()
+        // == 1), NOT the declared `PAYLOAD_ALIGNMENT`. That is expected,
+        // benign behavior for a zero-length allocation, not a corrupted
+        // buffer, so skip the pointer-alignment check entirely for `len ==
+        // 0` rather than dereferencing (or even forming a pointer to) a
+        // buffer we will never read. The `len > 0` path below is untouched:
+        // the alignment invariant still holds for every real payload.
+        if len == 0 {
+            return Ok(Self {
+                inner: AlignedBytesInner::Pooled(buffer),
+                offset,
+                len: 0,
+            });
+        }
         let ptr = unsafe { buffer.as_ref().as_ptr().add(offset) };
         if (ptr as usize) % PAYLOAD_ALIGNMENT != 0 {
             return Err(GossipError::Network(std::io::Error::new(
@@ -281,5 +298,102 @@ mod tests {
         drop(bytes);
 
         assert_eq!(pool.available_count(), 2);
+    }
+
+    // R5 RED: with an exhausted pool (empty queue, the state every connection
+    // reaches once ~64+ buffers are checked out under load), `get_buffer`
+    // falls back to `AlignedBuffer::with_capacity(min_capacity)`. For
+    // `min_capacity == 0` (a legitimate zero-length stream — see
+    // `protocol::tests::finalize_empty_stream_is_allowed`), rkyv's
+    // `AlignedVec` stores a `NonNull::dangling()` pointer whose address is
+    // `align_of::<u8>() == 1`, not the declared 16-byte `PAYLOAD_ALIGNMENT`.
+    // `from_pooled_buffer` must not treat that as a misaligned-buffer bug: an
+    // empty view has nothing to dereference, so it must hand back a canonical
+    // empty `AlignedBytes` instead of panicking on the `.expect(..)` alignment
+    // invariant meant for real (non-empty) payloads.
+    #[test]
+    fn empty_pool_zero_len_pooled_buffer_does_not_panic() {
+        // ArrayQueue requires non-zero capacity, so model "pool exhausted
+        // under load" the same way production traffic reaches it: check the
+        // single slot out and hold onto it.
+        let pool = Arc::new(AlignedBytesPool::new(1));
+        let _checked_out = pool.get_buffer(64);
+        assert_eq!(pool.available_count(), 0, "pool must be exhausted");
+
+        let pooled = PooledAlignedBuffer::with_len(0, pool);
+        let bytes = AlignedBytes::from_pooled_buffer(pooled);
+        assert_eq!(bytes.len(), 0);
+        assert!(bytes.is_empty());
+        assert_eq!(bytes.as_ref(), b"");
+    }
+
+    // R5 HARDEN: exhaustively walk every (pool-state x len x offset)
+    // combination that can actually arise in production instead of a single
+    // regression case. No proptest/quickcheck dependency is warranted here —
+    // the reachable state space is small and finite:
+    //
+    //   pool state: freshly seeded (buffers of DEFAULT_ALIGNED_BUFFER_CAPACITY
+    //               available) vs. exhausted (fallback allocation path)
+    //   len:        0 (the historically panicking case), 1, and a spread of
+    //               sizes that cross the default pooled capacity and the
+    //               16-byte alignment boundary
+    //   offset:     0 and non-zero, exercised via `from_pooled_buffer_range`
+    //               directly (the entry point the len==0 special-case lives
+    //               in), always with a matching zero-length range so the
+    //               bounds check (`end > buf_len`) stays satisfied
+    //
+    // For every combination, `from_pooled_buffer_range` must never panic,
+    // and the resulting `len()`/emptiness must match what was requested.
+    #[test]
+    fn from_pooled_buffer_range_never_panics_across_pool_states_and_lens() {
+        let lens = [0usize, 1, 2, 15, 16, 17, 63, 64, 65, 256, 257, 1024];
+
+        for &initial_pool_size in &[1usize, 4] {
+            for &exhaust in &[false, true] {
+                for &len in &lens {
+                    let pool = Arc::new(AlignedBytesPool::new(initial_pool_size));
+                    let mut held = Vec::new();
+                    if exhaust {
+                        // Drain every slot and hold onto the buffers so the
+                        // queue is genuinely empty, forcing `get_buffer` down
+                        // the `AlignedBuffer::with_capacity` fallback path
+                        // for the request under test.
+                        while pool.available_count() > 0 {
+                            held.push(pool.get_buffer(64));
+                        }
+                        assert_eq!(pool.available_count(), 0);
+                    }
+
+                    // Path 1: the real call chain from `start_stream_with_correlation`
+                    // (`with_len` -> `into_aligned_bytes` -> `from_pooled_buffer`),
+                    // covering offset == 0.
+                    let pooled = PooledAlignedBuffer::with_len(len, pool.clone());
+                    let bytes = AlignedBytes::from_pooled_buffer(pooled);
+                    assert_eq!(
+                        bytes.len(),
+                        len,
+                        "pool_size={initial_pool_size} exhaust={exhaust} len={len}: len mismatch"
+                    );
+                    assert_eq!(bytes.is_empty(), len == 0);
+                    assert_eq!(bytes.as_ref().len(), len);
+
+                    // Path 2: `from_pooled_buffer_range` with a non-zero
+                    // offset and a zero-length slice at the end of the
+                    // buffer, the shape used by chunked/partial reads.
+                    let pooled_for_range = PooledAlignedBuffer::with_len(len, pool.clone());
+                    let ranged = AlignedBytes::from_pooled_buffer_range(pooled_for_range, len, 0)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "pool_size={initial_pool_size} exhaust={exhaust} len={len}: \
+                                 zero-length range at end-of-buffer must not error: {e:?}"
+                            )
+                        });
+                    assert_eq!(ranged.len(), 0);
+                    assert!(ranged.is_empty());
+
+                    drop(held);
+                }
+            }
+        }
     }
 }
