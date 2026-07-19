@@ -1,7 +1,7 @@
 //! Hello handshake protocol for peer capability negotiation
 //!
 //! This module implements the Hello handshake that establishes peer capabilities
-//! at connection time for TLS-only v4 peers.
+//! at connection time for V5 peers.
 
 use crate::{GossipError, Result};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -12,13 +12,13 @@ use tracing::debug;
 
 const HELLO_MAX_SIZE: usize = 1024;
 const HELLO_TIMEOUT_MS: u64 = 3_000;
-pub const ALPN_ICANACT_V4: &[u8] = b"icanact-remote-v4";
+pub const ALPN_ICANACT_V5: &[u8] = b"icanact-remote-v5";
 
 /// Protocol version constants
-pub const PROTOCOL_VERSION_V4: u16 = 4;
+pub const PROTOCOL_VERSION_V5: u16 = 5;
 
 /// Current protocol version
-pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V4;
+pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V5;
 
 /// Feature flags for capability negotiation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -46,6 +46,9 @@ pub struct Hello {
     pub protocol_version: u16,
     /// Features this node supports
     pub features: Vec<Feature>,
+    /// Deployment compatibility value. It is authenticated by the TLS channel
+    /// and compared once during Hello, never copied into data frames.
+    pub schema_hash: Option<u64>,
 }
 
 impl Hello {
@@ -54,6 +57,7 @@ impl Hello {
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             features: vec![Feature::PeerListGossip, Feature::ClockCalibration],
+            schema_hash: None,
         }
     }
 
@@ -62,6 +66,7 @@ impl Hello {
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             features,
+            schema_hash: None,
         }
     }
 }
@@ -72,12 +77,14 @@ impl Default for Hello {
     }
 }
 
-fn hello_for_config(enable_peer_discovery: bool) -> Hello {
+fn hello_for_config(enable_peer_discovery: bool, schema_hash: Option<u64>) -> Hello {
     let mut features = vec![Feature::ClockCalibration];
     if enable_peer_discovery {
         features.push(Feature::PeerListGossip);
     }
-    Hello::with_features(features)
+    let mut hello = Hello::with_features(features);
+    hello.schema_hash = schema_hash;
+    hello
 }
 
 /// Negotiated peer capabilities after Hello exchange
@@ -100,16 +107,11 @@ impl PeerCapabilities {
 
     /// Create capabilities from a Hello exchange.
     ///
-    /// Takes the intersection of features. `PROTOCOL_VERSION_V4` is the only
-    /// protocol version that exists and `perform_hello_handshake` rejects any
-    /// Hello whose version differs from `CURRENT_PROTOCOL_VERSION`, so the
-    /// negotiated version is always `PROTOCOL_VERSION_V4` (the former
-    /// `min()` negotiation and version guards below were
-    /// unreachable).
+    /// Takes the intersection of features for the single V5 wire version.
     pub fn from_hello_exchange(local: &Hello, remote: &Hello) -> Self {
         let features = Self::features_mask(&local.features) & Self::features_mask(&remote.features);
         Self {
-            version: PROTOCOL_VERSION_V4,
+            version: PROTOCOL_VERSION_V5,
             features,
         }
     }
@@ -192,6 +194,7 @@ pub async fn perform_hello_handshake<S>(
     stream: &mut S,
     negotiated_alpn: Option<&[u8]>,
     enable_peer_discovery: bool,
+    schema_hash: Option<u64>,
 ) -> Result<PeerCapabilities>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -200,20 +203,26 @@ where
         GossipError::TlsHandshakeFailed("missing ALPN negotiation result".to_string())
     })?;
 
-    if alpn != ALPN_ICANACT_V4 {
+    if alpn != ALPN_ICANACT_V5 {
         return Err(GossipError::TlsHandshakeFailed(format!(
             "unsupported ALPN: {}",
             String::from_utf8_lossy(alpn)
         )));
     }
 
-    let local_hello = hello_for_config(enable_peer_discovery);
+    let local_hello = hello_for_config(enable_peer_discovery, schema_hash);
     send_hello_message(stream, &local_hello).await?;
     let remote_hello = read_hello_message(stream).await?;
     if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
         return Err(GossipError::TlsHandshakeFailed(format!(
             "unsupported protocol version: {}",
             remote_hello.protocol_version
+        )));
+    }
+    if remote_hello.schema_hash != local_hello.schema_hash {
+        return Err(GossipError::TlsHandshakeFailed(format!(
+            "schema hash mismatch: local={:?}, remote={:?}",
+            local_hello.schema_hash, remote_hello.schema_hash
         )));
     }
     let caps = PeerCapabilities::from_hello_exchange(&local_hello, &remote_hello);
@@ -271,7 +280,7 @@ mod tests {
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
-        assert_eq!(caps.version, PROTOCOL_VERSION_V4);
+        assert_eq!(caps.version, PROTOCOL_VERSION_V5);
         assert!(caps.supports_feature(Feature::PeerListGossip));
         assert!(caps.supports_feature(Feature::ClockCalibration));
         assert!(caps.can_send_peer_list());
@@ -280,8 +289,8 @@ mod tests {
 
     #[test]
     fn test_clock_calibration_negotiates_when_peer_discovery_disabled() {
-        let local = hello_for_config(false);
-        let remote = hello_for_config(false);
+        let local = hello_for_config(false, None);
+        let remote = hello_for_config(false, None);
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
@@ -293,13 +302,14 @@ mod tests {
     fn test_peer_capabilities_from_hello_exchange_partial_features() {
         let local = Hello::with_features(vec![Feature::PeerListGossip]);
         let remote = Hello {
-            protocol_version: PROTOCOL_VERSION_V4,
+            protocol_version: PROTOCOL_VERSION_V5,
             features: vec![], // Remote supports no features
+            schema_hash: None,
         };
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
-        assert_eq!(caps.version, PROTOCOL_VERSION_V4);
+        assert_eq!(caps.version, PROTOCOL_VERSION_V5);
         assert_eq!(caps.features, 0); // No common features
         assert!(!caps.can_send_peer_list()); // Needs both version and feature
     }
@@ -361,9 +371,10 @@ mod tests {
             server.read_exact(&mut buf).await.unwrap();
 
             // Send an older-version Hello to trigger rejection.
-            let legacy_hello = Hello {
-                protocol_version: 0,
-                features: vec![],
+        let legacy_hello = Hello {
+            protocol_version: 0,
+            features: vec![],
+            schema_hash: None,
             };
             let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy_hello).unwrap();
             server
@@ -373,7 +384,7 @@ mod tests {
             server.write_all(&serialized).await.unwrap();
         });
 
-        let err = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V4), true)
+        let err = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V5), true, None)
             .await
             .expect_err("handshake should reject legacy protocol peers");
 
@@ -388,5 +399,32 @@ mod tests {
             }
             other => panic!("expected TlsHandshakeFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn hello_rejects_different_present_schema_hashes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let mut len = [0u8; 4];
+            server.read_exact(&mut len).await.unwrap();
+            let mut local = vec![0u8; u32::from_be_bytes(len) as usize];
+            server.read_exact(&mut local).await.unwrap();
+            let remote = Hello {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                features: vec![],
+                schema_hash: Some(2),
+            };
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&remote).unwrap();
+            server.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+            server.write_all(&bytes).await.unwrap();
+        });
+
+        let error = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V5), false, Some(1))
+            .await
+            .expect_err("different present schema hashes must fail");
+        assert!(error.to_string().contains("schema hash mismatch"));
+        server_task.await.unwrap();
     }
 }

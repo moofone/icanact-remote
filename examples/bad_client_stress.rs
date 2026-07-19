@@ -168,15 +168,13 @@ fn build_actor_ask_frame(
     correlation_id: u32,
     actor_id: u64,
     type_hash: u32,
-    schema_hash: Option<u64>,
+    _schema_hash: Option<u64>,
     payload: &[u8],
 ) -> Vec<u8> {
-    let header = icanact_remote::framing::write_actor_frame_header(
-        MessageType::ActorAsk,
+    let header = icanact_remote::framing::write_actor_ask_header(
         correlation_id,
         actor_id,
         type_hash,
-        schema_hash,
         payload.len(),
     );
     let mut frame = Vec::with_capacity(header.len() + payload.len());
@@ -208,6 +206,7 @@ async fn connect_tls(
         &mut tls_stream,
         negotiated_alpn.as_deref(),
         false, // peer discovery disabled by default in GossipConfig
+        None,
     )
     .await
     .expect("hello handshake");

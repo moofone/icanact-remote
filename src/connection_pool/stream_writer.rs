@@ -6,6 +6,8 @@ pub struct LockFreeStreamHandle {
     addr: SocketAddr,
     channel_id: ChannelId,
     sequence_counter: Arc<AtomicUsize>,
+    /// Direction-local stream IDs. IDs never wrap on a live connection.
+    next_stream_id: Arc<AtomicU32>,
     bytes_written: Arc<AtomicUsize>, // This tracks actual TCP bytes written
     shutdown_signal: Arc<AtomicBool>,
     exit_flag: Arc<AtomicBool>,
@@ -46,6 +48,15 @@ impl LockFreeStreamHandle {
 
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    fn allocate_stream_id(&self) -> Result<u32> {
+        let id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u32::MAX {
+            self.shutdown_signal.store(true, Ordering::Release);
+            return Err(GossipError::Shutdown);
+        }
+        Ok(id)
     }
 
     /// Create a new lock-free streaming handle with background writer task
@@ -129,6 +140,7 @@ impl LockFreeStreamHandle {
                 addr,
                 channel_id,
                 sequence_counter: Arc::new(AtomicUsize::new(0)),
+                next_stream_id: Arc::new(AtomicU32::new(1)),
                 bytes_written, // This now tracks actual TCP bytes written
                 shutdown_signal,
                 flush_pending,
@@ -559,7 +571,7 @@ impl LockFreeStreamHandle {
                         // Handle short writes by falling back to sequential write_all
                         // TCP can return partial writes under backpressure
                         let total_len = cmd.header.len() + cmd.payload.len();
-                        let header_slice = std::io::IoSlice::new(&cmd.header);
+                        let header_slice = std::io::IoSlice::new(cmd.header.as_slice());
                         let payload_slice = std::io::IoSlice::new(&cmd.payload);
                         let bufs = &[header_slice, payload_slice];
 
@@ -577,7 +589,7 @@ impl LockFreeStreamHandle {
                                 // Write header portion if needed
                                 if offset < cmd.header.len() {
                                     let h_rem = cmd.header.len() - offset;
-                                    if let Err(_) = stream.write_all(&cmd.header[offset..]).await {
+                                    if let Err(_) = stream.write_all(&cmd.header.as_slice()[offset..]).await {
                                         return;
                                     }
                                     bytes_written_counter.fetch_add(h_rem, Ordering::Relaxed);
@@ -1445,7 +1457,7 @@ impl LockFreeStreamHandle {
                     while reads < read_batch_limit {
                         let read_start = perf.map(|_| Instant::now());
                         let read_result =
-                            match read_message_step_nonblocking(&mut stream, state, ctx).await {
+                            match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
                                 Ok(result) => result,
                                 Err(e) => {
                                     warn!(
@@ -1595,7 +1607,7 @@ impl LockFreeStreamHandle {
                     }
                     tokio::select! {
                         // Idle path: block waiting for socket readability.
-                        read_result = read_message_step_poll(&mut stream, state, ctx, true) => {
+                        read_result = read_message_step_poll(&mut stream, state, ctx, streaming_state, true) => {
                             let read_start = perf.map(|_| Instant::now());
                             let read_result = match read_result {
                                 Ok(result) => result,
@@ -1683,7 +1695,7 @@ impl LockFreeStreamHandle {
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
                             while drained < drain_batch_limit {
                                 let read_start = perf.map(|_| Instant::now());
-                                let next = match read_message_step_nonblocking(&mut stream, state, ctx).await {
+                                let next = match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
                                     Ok(r) => r,
                                     Err(e) => {
                                         warn!(
@@ -2347,9 +2359,9 @@ impl LockFreeStreamHandle {
     }
 
     fn max_stream_chunk_size(&self) -> Result<usize> {
-        // Streaming frame wire format excludes the 4-byte length prefix from `msg_len`.
-        const STREAM_FRAME_OVERHEAD: usize =
-            crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE;
+        // The first request frame has the largest V5 stream metadata header;
+        // every chunk must fit even when it is carried by StreamStartData.
+        const STREAM_FRAME_OVERHEAD: usize = crate::framing::STREAM_REQUEST_START_HEADER_LEN;
 
         let max_chunk = self.max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
         if max_chunk == 0 {
@@ -2380,119 +2392,66 @@ impl LockFreeStreamHandle {
         })
     }
 
-    /// Stream a large message directly to the socket, bypassing the write queue
-    /// This provides maximum performance for large messages like PreBacktest
+    /// Canonical owned-Bytes request/tell stream path. Payload bytes are only
+    /// sliced for vectored TLS writes; no application payload copy is made.
+    pub async fn stream_large_message_bytes(
+        &self,
+        payload: bytes::Bytes,
+        type_hash: u32,
+        actor_id: u64,
+    ) -> Result<()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        let chunk_size = self.max_stream_chunk_size()?;
+        let _guard = self.acquire_streaming_mode().await?;
+        let stream_id = self.allocate_stream_id()?;
+        let total_size = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
+            size: payload.len(),
+            max: u32::MAX as usize,
+        })?;
+        let first_len = payload.len().min(chunk_size);
+        self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
+            header: InlineFrameHeader::from_array(crate::framing::write_stream_request_start_header(
+                stream_id,
+                0,
+                total_size,
+                actor_id,
+                type_hash,
+                first_len,
+            )),
+            payload: payload.slice(..first_len),
+        })).await?;
+        let mut offset = first_len;
+        let mut index = 1u32;
+        while offset < payload.len() {
+            let end = (offset + chunk_size).min(payload.len());
+            self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
+                header: InlineFrameHeader::from_array(crate::framing::write_stream_data_header(
+                    false,
+                    stream_id,
+                    index,
+                    end - offset,
+                )),
+                payload: payload.slice(offset..end),
+            })).await?;
+            offset = end;
+            index = index.checked_add(1).ok_or_else(|| GossipError::Network(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "stream chunk index exhausted"),
+            ))?;
+        }
+        self.streaming_queue.push(StreamingCommand::Flush).await
+    }
+
+    /// Copying convenience wrapper for callers that only own a slice.
     pub async fn stream_large_message(
         &self,
         msg: &[u8],
         type_hash: u32,
         actor_id: u64,
     ) -> Result<()> {
-        use crate::{MessageType, StreamHeader, current_timestamp_nanos};
-
-        let chunk_size = self.max_stream_chunk_size()?;
-
-        // Acquire exclusive streaming mode by parking on the gate (R16e).
-        let _guard = self.acquire_streaming_mode().await?;
-
-        // Generate unique stream ID using nanoseconds to avoid collisions
-        let stream_id = current_timestamp_nanos();
-
-        let schema_hash = self.schema_hash();
-
-        // Helper to serialize message with type and header
-        fn serialize_stream_message(
-            msg_type: MessageType,
-            header: &StreamHeader,
-            schema_hash: Option<u64>,
-        ) -> Vec<u8> {
-            let inner_size = crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE;
-            let mut message = Vec::with_capacity(4 + inner_size);
-
-            // Length prefix (required by protocol)
-            message.extend_from_slice(&(inner_size as u32).to_be_bytes()); // ALLOW_COPY
-
-            // Header
-            message.push(msg_type as u8);
-            message.extend_from_slice(&0u32.to_be_bytes()); // ALLOW_COPY correlation_id
-            let mut reserved = [0u8; 8];
-            crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            message.extend_from_slice(&reserved); // ALLOW_COPY
-            message.extend_from_slice(&header.to_bytes()); // ALLOW_COPY
-            message
-        }
-
-        // Send StreamStart header
-        let start_header = StreamHeader {
-            stream_id,
-            total_size: msg.len() as u64,
-            chunk_size: 0,
-            chunk_index: 0,
-            type_hash,
-            actor_id,
-        };
-
-        let start_msg =
-            serialize_stream_message(MessageType::StreamStart, &start_header, schema_hash);
-        self.streaming_queue
-            .push(StreamingCommand::WriteBytes(start_msg.into()))
-            .await?;
-
-        // Stream chunks directly
-        for (idx, chunk) in msg.chunks(chunk_size).enumerate() {
-            let data_header = StreamHeader {
-                stream_id,
-                total_size: msg.len() as u64,
-                chunk_size: chunk.len() as u32,
-                chunk_index: idx as u32,
-                type_hash,
-                actor_id,
-            };
-
-            // Create combined message with proper length prefix
-            let inner_size =
-                crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE + chunk.len();
-            let mut chunk_msg = Vec::with_capacity(4 + inner_size);
-
-            // Length prefix (includes header + chunk data)
-            chunk_msg.extend_from_slice(&(inner_size as u32).to_be_bytes()); // ALLOW_COPY
-
-            // Header
-            chunk_msg.push(MessageType::StreamData as u8);
-            chunk_msg.extend_from_slice(&0u32.to_be_bytes()); // ALLOW_COPY correlation_id
-            let mut reserved = [0u8; 8];
-            crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            chunk_msg.extend_from_slice(&reserved); // ALLOW_COPY
-            chunk_msg.extend_from_slice(&data_header.to_bytes()); // ALLOW_COPY
-
-            // Chunk data
-            chunk_msg.extend_from_slice(chunk); // ALLOW_COPY
-
-            self.streaming_queue
-                .push(StreamingCommand::WriteBytes(chunk_msg.into()))
-                .await?;
-
-            // Yield periodically to prevent blocking
-            if idx % 10 == 0 {
-                self.streaming_queue.push(StreamingCommand::Flush).await?;
-                tokio::task::yield_now().await;
-            }
-        }
-
-        // Send StreamEnd
-        let end_msg = serialize_stream_message(MessageType::StreamEnd, &start_header, schema_hash);
-        self.streaming_queue
-            .push(StreamingCommand::WriteBytes(end_msg.into()))
-            .await?;
-        self.streaming_queue.push(StreamingCommand::Flush).await?;
-
-        debug!(
-            "✅ STREAMING: Successfully streamed {} MB in {} chunks",
-            msg.len() as f64 / 1_048_576.0,
-            msg.len().div_ceil(chunk_size)
-        );
-
-        Ok(())
+        self.stream_large_message_bytes(bytes::Bytes::copy_from_slice(msg), type_hash, actor_id)
+            .await
     }
 
     /// Stream a response back to the caller, using streaming protocol for large payloads.
@@ -2510,143 +2469,62 @@ impl LockFreeStreamHandle {
             .await
     }
 
-    /// Zero-copy stream a response back to the caller.
-    /// Uses vectored writes to avoid copying the payload data.
-    ///
-    /// # Arguments
-    /// * `payload` - The response payload as owned Bytes
-    /// * `correlation_id` - The correlation ID from the original request
+    /// Stream an owned response using V5 StartData plus zero-copy data chunks.
     pub async fn stream_response_bytes(
         &self,
         payload: bytes::Bytes,
         correlation_id: u32,
     ) -> Result<()> {
-        use crate::{MessageType, StreamHeader, current_timestamp_nanos};
-        use bytes::BufMut;
-
-        let chunk_size = self.max_stream_chunk_size()?;
-
-        // Acquire exclusive streaming mode by parking on the gate (R16e).
-        let _guard = self.acquire_streaming_mode().await?;
-
-        // Generate unique stream ID for this response stream
-        let stream_id = current_timestamp_nanos();
-
-        let schema_hash = self.schema_hash();
-
-        // Helper to build stream response header bytes (zero-copy friendly)
-        fn build_stream_response_header(
-            msg_type: MessageType,
-            header: &StreamHeader,
-            correlation_id: u32,
-            chunk_len: usize,
-            schema_hash: Option<u64>,
-        ) -> bytes::Bytes {
-            // V4 format: [length:4][type:1][correlation_id:4][schema_hash:8][header:36]
-            let inner_size =
-                crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE + chunk_len;
-            let mut message = bytes::BytesMut::with_capacity(
-                4 + crate::framing::STREAM_HEADER_PREFIX_LEN + StreamHeader::SERIALIZED_SIZE,
-            );
-
-            // Length prefix
-            message.put_u32(inner_size as u32);
-
-            // Header with correlation ID for response matching
-            message.put_u8(msg_type as u8);
-            message.put_u32(correlation_id);
-            let mut reserved = [0u8; 8];
-            crate::framing::write_schema_hash(&mut reserved, schema_hash);
-            message.put_slice(&reserved);
-            message.put_slice(&header.to_bytes());
-            message.freeze()
+        if payload.is_empty() {
+            return self.send_response_auto(payload, correlation_id).await;
         }
-
-        // Use StreamResponseStart to indicate this is a streaming response
-        let start_header = StreamHeader {
+        let chunk_size = self.max_stream_chunk_size()?;
+        let _guard = self.acquire_streaming_mode().await?;
+        let stream_id = self.allocate_stream_id()?;
+        let total_size = u32::try_from(payload.len()).map_err(|_| {
+            GossipError::MessageTooLarge {
+                size: payload.len(),
+                max: u32::MAX as usize,
+            }
+        })?;
+        let first_len = payload.len().min(chunk_size);
+        let first_header = crate::framing::write_stream_response_start_header(
             stream_id,
-            total_size: payload.len() as u64,
-            chunk_size: 0,
-            chunk_index: 0,
-            type_hash: 0, // Not needed for responses
-            actor_id: 0,  // Actor ID doesn't matter - message type distinguishes responses
-        };
-
-        // Send StreamResponseStart
-        let start_msg = build_stream_response_header(
-            MessageType::StreamResponseStart,
-            &start_header,
             correlation_id,
-            0,
-            schema_hash,
+            total_size,
+            first_len,
         );
         self.streaming_queue
-            .push(StreamingCommand::WriteBytes(start_msg))
+            .push(StreamingCommand::VectoredWrite(VectoredSendItem {
+                header: InlineFrameHeader::from_array(first_header),
+                payload: payload.slice(..first_len),
+            }))
             .await?;
-
-        // Stream response chunks using zero-copy slices
-        let total_len = payload.len();
-        let num_chunks = total_len.div_ceil(chunk_size);
-
-        for idx in 0..num_chunks {
-            let start = idx * chunk_size;
-            let end = std::cmp::min(start + chunk_size, total_len);
-            let chunk_len = end - start;
-
-            // Zero-copy slice of the payload
-            let chunk_data = payload.slice(start..end);
-
-            let data_header = StreamHeader {
+        let mut offset = first_len;
+        let mut index = 1u32;
+        while offset < payload.len() {
+            let end = (offset + chunk_size).min(payload.len());
+            let header = crate::framing::write_stream_data_header(
+                true,
                 stream_id,
-                total_size: total_len as u64,
-                chunk_size: chunk_len as u32,
-                chunk_index: idx as u32,
-                type_hash: 0,
-                actor_id: 0,
-            };
-
-            // Build header bytes (small, okay to allocate)
-            let header_bytes = build_stream_response_header(
-                MessageType::StreamResponseData,
-                &data_header,
-                correlation_id,
-                chunk_len,
-                schema_hash,
+                index,
+                end - offset,
             );
-
-            // Use vectored write: header + chunk_data (zero-copy)
             self.streaming_queue
-                .push(StreamingCommand::VectoredWrite(VectoredSendItem {
-                    header: header_bytes,
-                    payload: chunk_data,
+            .push(StreamingCommand::VectoredWrite(VectoredSendItem {
+                    header: InlineFrameHeader::from_array(header),
+                    payload: payload.slice(offset..end),
                 }))
                 .await?;
-
-            // Yield periodically to prevent blocking
-            if idx % 10 == 0 {
-                self.streaming_queue.push(StreamingCommand::Flush).await?;
-                tokio::task::yield_now().await;
-            }
+            offset = end;
+            index = index.checked_add(1).ok_or_else(|| {
+                GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream chunk index exhausted",
+                ))
+            })?;
         }
-
-        // Send StreamResponseEnd
-        let end_msg = build_stream_response_header(
-            MessageType::StreamResponseEnd,
-            &start_header,
-            correlation_id,
-            0,
-            schema_hash,
-        );
-        self.streaming_queue
-            .push(StreamingCommand::WriteBytes(end_msg))
-            .await?;
         self.streaming_queue.push(StreamingCommand::Flush).await?;
-
-        debug!(
-            "✅ STREAMING RESPONSE: Successfully streamed {} bytes in {} chunks (correlation_id: {})",
-            total_len, num_chunks, correlation_id
-        );
-
         Ok(())
     }
 
@@ -2687,33 +2565,32 @@ impl LockFreeStreamHandle {
             .await
     }
 
+    /// Cold-path cancellation for a partially queued V5 stream.
+    pub async fn abort_stream(&self, stream_id: u32, reason: u32) -> Result<()> {
+        self.write_bytes_control(bytes::Bytes::copy_from_slice(
+            &crate::framing::write_stream_abort_header(stream_id, reason),
+        ))
+        .await
+    }
+
     /// Zero-copy vectored write for header + payload in single operation
     /// This eliminates copying payload data into frame buffer - optimal for streaming
-    pub async fn write_bytes_vectored(
+    pub async fn write_bytes_vectored<const N: usize>(
         &self,
-        header: bytes::Bytes,
+        header: [u8; N],
         payload: bytes::Bytes,
     ) -> Result<()> {
         // Create vectored command that preserves both header and payload as separate Bytes
-        let command = VectoredSendItem { header, payload };
+        let command = VectoredSendItem {
+            header: InlineFrameHeader::from_array(header),
+            payload,
+        };
 
-        // Prefer the streaming queue for vectored operations; if it's full, fall back
-        // to the normal payload queue (still zero-copy: header + payload remain `Bytes`).
-        match self
-            .streaming_queue
-            .try_push(StreamingCommand::VectoredWrite(command))
-        {
-            Ok(()) => Ok(()),
-            Err(StreamingTryPushError::Full(StreamingCommand::VectoredWrite(vectored_cmd))) => {
-                self.enqueue_write(WritePayload::HeaderPayload {
-                    header: vectored_cmd.header,
-                    payload: vectored_cmd.payload,
-                })
-                .await
-            }
-            Err(StreamingTryPushError::Closed(addr)) => Err(GossipError::ConnectionClosed(addr)),
-            Err(StreamingTryPushError::Full(_)) => Err(GossipError::Shutdown),
-        }
+        // A stream's StartData and Data frames must share one FIFO queue.
+        // Waiting for capacity preserves frame order under backpressure.
+        self.streaming_queue
+            .push(StreamingCommand::VectoredWrite(command))
+            .await
     }
 
     /// Send owned chunks without copying - optimal for streaming large messages

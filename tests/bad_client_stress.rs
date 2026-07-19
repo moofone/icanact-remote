@@ -22,6 +22,7 @@ static BAD_CLIENT_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 async fn connect_tls(
     server_addr: SocketAddr,
     server_node_id: icanact_remote::GossipNodeId,
+    schema_hash: Option<u64>,
 ) -> (
     tokio_rustls::client::TlsStream<TcpStream>,
     icanact_remote::PeerId,
@@ -44,7 +45,12 @@ async fn connect_tls(
     // The server expects the Hello handshake immediately after TLS.
     // Without it, it closes the connection before it will read framed messages.
     let negotiated_alpn = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
-    icanact_remote::handshake::perform_hello_handshake(&mut tls, negotiated_alpn.as_deref(), false)
+    icanact_remote::handshake::perform_hello_handshake(
+        &mut tls,
+        negotiated_alpn.as_deref(),
+        false,
+        schema_hash,
+    )
         .await
         .expect("hello handshake");
 
@@ -81,13 +87,16 @@ async fn send_fullsync<S: tokio::io::AsyncWrite + Unpin>(
     stream.flush().await.expect("flush fullsync");
 }
 
-async fn read_length_prefixed_frame<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
+async fn read_length_prefixed_frame<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> (icanact_remote::framing::Control, Vec<u8>) {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await.expect("read len");
-    let len = u32::from_be_bytes(len_bytes) as usize;
+    let control = icanact_remote::framing::decode_control(len_bytes).expect("V5 control");
+    let len = control.body_len;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await.expect("read frame");
-    buf
+    (control, buf)
 }
 
 async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
@@ -101,11 +110,11 @@ async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
             panic!("timed out waiting for DirectResponse");
         }
         let remaining = deadline - now;
-        let frame = tokio::time::timeout(remaining, read_length_prefixed_frame(stream))
+        let (control, frame) = tokio::time::timeout(remaining, read_length_prefixed_frame(stream))
             .await
             .expect("timeout");
-        if frame.first().copied() == Some(icanact_remote::MessageType::DirectResponse as u8) {
-            let got_corr = u32::from_be_bytes(frame[1..5].try_into().expect("correlation id"));
+        if control.kind == icanact_remote::framing::WireKind::DirectResponse {
+            let got_corr = u32::from_be_bytes(frame[..4].try_into().expect("correlation id"));
             if got_corr == correlation_id {
                 return frame;
             }
@@ -133,8 +142,9 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
     .expect("start server");
     let server_addr = handle.registry.bind_addr;
     let server_node_id = server_secret.public();
+    let schema_hash = handle.registry.config.schema_hash;
 
-    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
+    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
     send_fullsync(&mut tls, client_peer_id).await;
 
     let correlation_id: u32 = 0x1_0000;
@@ -151,12 +161,10 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
     tls.flush().await.expect("flush");
 
     let frame = read_until_direct_response(&mut tls, correlation_id).await;
-    assert_eq!(frame[0], icanact_remote::MessageType::DirectResponse as u8);
-    let got_corr = u32::from_be_bytes(frame[1..5].try_into().expect("correlation id"));
+    let got_corr = u32::from_be_bytes(frame[..4].try_into().expect("correlation id"));
     assert_eq!(got_corr, correlation_id);
-    let got_len = u32::from_be_bytes(frame[5..9].try_into().expect("payload length")) as usize;
-    assert_eq!(got_len, payload.len());
-    let got_payload = &frame[icanact_remote::framing::DIRECT_RESPONSE_HEADER_LEN..];
+    let got_payload = &frame[icanact_remote::framing::DIRECT_RESPONSE_FRAME_HEADER_LEN
+        - icanact_remote::framing::LENGTH_PREFIX_LEN..];
     assert_eq!(got_payload, payload.as_slice());
     handle.shutdown().await;
 }
@@ -180,10 +188,11 @@ async fn truncated_frame_does_not_crash_server() {
     .expect("start server");
     let server_addr = handle.registry.bind_addr;
     let server_node_id = server_secret.public();
+    let schema_hash = handle.registry.config.schema_hash;
 
     // Send a DirectAsk header that claims a payload, then drop before sending payload bytes.
     {
-        let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
+        let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
         send_fullsync(&mut tls, client_peer_id).await;
         let correlation_id: u32 = 7;
         let header = icanact_remote::framing::write_direct_ask_header(correlation_id, 32);
@@ -198,7 +207,7 @@ async fn truncated_frame_does_not_crash_server() {
 
     // Prove server is still alive: open a new connection and complete the normal handshake
     // and peer-identification bootstrap.
-    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
+    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
     send_fullsync(&mut tls, client_peer_id).await;
     handle.shutdown().await;
 }
@@ -222,18 +231,15 @@ async fn unknown_message_type_is_ignored_and_server_continues() {
     .expect("start server");
     let server_addr = handle.registry.bind_addr;
     let server_node_id = server_secret.public();
+    let schema_hash = handle.registry.config.schema_hash;
 
-    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
+    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
     send_fullsync(&mut tls, client_peer_id).await;
 
     // Unknown message with minimal payload.
     let payload = b"zzz".to_vec();
-    let total_size = icanact_remote::framing::ASK_RESPONSE_HEADER_LEN + payload.len();
-    let mut frame = Vec::with_capacity(4 + total_size);
-    frame.extend_from_slice(&(total_size as u32).to_be_bytes());
-    frame.push(0xFF); // unknown msg type
-    frame.extend_from_slice(&0u16.to_be_bytes());
-    frame.extend_from_slice(&[0u8; 9]); // pad to 12-byte ask/response header
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(((31u32) << 27) | payload.len() as u32).to_be_bytes());
     frame.extend_from_slice(&payload);
     tls.write_all(&frame).await.expect("write unknown frame");
     tls.flush().await.expect("flush");
@@ -244,7 +250,7 @@ async fn unknown_message_type_is_ignored_and_server_continues() {
 
     // Then use a fresh connection and ensure the server still accepts TLS, hello, and peer
     // identification bootstrap after the malformed frame.
-    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id).await;
+    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
     send_fullsync(&mut tls, client_peer_id).await;
     handle.shutdown().await;
 }

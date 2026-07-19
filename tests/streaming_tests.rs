@@ -130,9 +130,11 @@ impl ActorMessageHandler for AskTestHandler {
     }
 }
 
-/// Test streaming request with large payload (>1MB)
+/// Named V5 transport proof: a real authenticated TLS connection carries an
+/// owned `Bytes` request and its owned response across the streaming path.
+/// The 2 MiB body forces both directions past the inline threshold.
 #[test]
-fn test_streaming_request_large_payload() {
+fn wire_v5_e2e_zero_copy_proof() {
     run_streaming_test("streaming-request-large", || async {
         init_tracing();
 
@@ -172,7 +174,10 @@ fn test_streaming_request_large_payload() {
             message_received: AtomicBool::new(false),
             payload_size: AtomicU32::new(0),
         });
-        handle_b.registry.set_actor_message_handler(handler).await;
+        handle_b
+            .registry
+            .set_actor_message_handler(handler.clone())
+            .await;
 
         // Connect nodes
         let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -196,8 +201,13 @@ fn test_streaming_request_large_payload() {
         // Default handler echoes back with "PROCESSED:" prefix
         info!("Received response of {} bytes", response.len());
 
-        // Verify we got a response (exact format depends on handler)
-        assert!(!response.is_empty(), "Response should not be empty");
+        assert_eq!(response, payload, "the streamed response must preserve bytes");
+        assert!(handler.message_received.load(Ordering::SeqCst));
+        assert_eq!(
+            handler.payload_size.load(Ordering::SeqCst) as usize,
+            payload_size,
+            "the remote actor must receive the complete streamed request"
+        );
 
         info!("✅ Streaming request test passed");
 
@@ -977,7 +987,7 @@ fn test_streaming_tell_no_response() {
 
         // Create a large payload (>1MB to trigger streaming)
         let payload_size = 1_500_000; // 1.5MB
-        let payload = create_test_payload(payload_size);
+        let payload = Bytes::from(create_test_payload(payload_size));
 
         // Send as a streaming tell (correlation_id = 0)
         // This uses stream_large_message which sends with correlation_id = 0
@@ -985,10 +995,9 @@ fn test_streaming_tell_no_response() {
         let test_actor_id: u64 = 12345;
 
         info!("📤 Sending {} byte streaming tell...", payload_size);
-        conn.connection
-            .as_ref()
-            .unwrap()
-            .stream_large_message(&payload, test_type_hash, test_actor_id)
+        conn.connection_ref()
+            .expect("connection should be cached")
+            .stream_large_message_bytes(payload, test_type_hash, test_actor_id)
             .await
             .expect("stream_large_message should succeed");
 

@@ -201,6 +201,18 @@ impl RemoteConnection {
             .await
     }
 
+    /// Canonical zero-copy streaming tell API for an already-owned payload.
+    pub async fn stream_large_message_bytes(
+        &self,
+        payload: bytes::Bytes,
+        type_hash: u32,
+        actor_id: u64,
+    ) -> crate::Result<()> {
+        self.inner
+            .stream_large_message_bytes(payload, type_hash, actor_id)
+            .await
+    }
+
     pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
         let pending = self.inner.ask_deferred(request).await?;
         Ok(crate::DeferredAsk::from_pending(pending))

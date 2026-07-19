@@ -1596,7 +1596,8 @@ fn stream_direct_ask_throughput_bench() {
                 {
                     break;
                 }
-                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                let control = crate::framing::decode_control(len_buf).expect("valid V5 control");
+                let msg_len = control.body_len;
                 let mut msg = vec![0u8; msg_len];
                 if tokio::io::AsyncReadExt::read_exact(&mut server_io, &mut msg)
                     .await
@@ -1605,11 +1606,11 @@ fn stream_direct_ask_throughput_bench() {
                     break;
                 }
 
-                if msg_len >= crate::framing::DIRECT_ASK_HEADER_LEN
-                    && msg[0] == crate::MessageType::DirectAsk as u8
+                if control.kind == crate::framing::WireKind::DirectAsk
+                    && msg_len >= crate::framing::DIRECT_ASK_HEADER_LEN
                 {
-                    let correlation_id = u32::from_be_bytes(msg[1..5].try_into().unwrap());
-                    let payload_len = u32::from_be_bytes(msg[5..9].try_into().unwrap()) as usize;
+                    let correlation_id = u32::from_be_bytes(msg[..4].try_into().unwrap());
+                    let payload_len = msg_len - crate::framing::DIRECT_ASK_HEADER_LEN;
                     let payload = &msg[crate::framing::DIRECT_ASK_HEADER_LEN
                         ..crate::framing::DIRECT_ASK_HEADER_LEN + payload_len];
                     let header =
@@ -1620,13 +1621,13 @@ fn stream_direct_ask_throughput_bench() {
                     tokio::io::AsyncWriteExt::write_all(&mut server_io, payload)
                         .await
                         .unwrap();
-                } else if msg_len >= crate::framing::ACTOR_HEADER_LEN
-                    && msg[0] == crate::MessageType::ActorAsk as u8
+                } else if control.kind == crate::framing::WireKind::ActorAsk
+                    && msg_len >= crate::framing::ACTOR_ASK_HEADER_LEN
                 {
-                    let correlation_id = u32::from_be_bytes(msg[1..5].try_into().unwrap());
-                    let payload_len = msg_len - crate::framing::ACTOR_HEADER_LEN;
-                    let payload = &msg[crate::framing::ACTOR_HEADER_LEN
-                        ..crate::framing::ACTOR_HEADER_LEN + payload_len];
+                    let correlation_id = u32::from_be_bytes(msg[..4].try_into().unwrap());
+                    let payload_len = msg_len - crate::framing::ACTOR_ASK_HEADER_LEN;
+                    let payload = &msg[crate::framing::ACTOR_ASK_HEADER_LEN
+                        ..crate::framing::ACTOR_ASK_HEADER_LEN + payload_len];
                     let header = crate::framing::write_ask_response_header(
                         crate::MessageType::Response,
                         correlation_id,
@@ -6853,7 +6854,12 @@ async fn connect_via_stream_rejects_self_after_cert_identity_discovery_on_addres
         // returns before reaching the handshake), so this will simply not
         // complete — the task is aborted by the test, not awaited to
         // success.
-        let _ = crate::handshake::perform_hello_handshake(&mut tls_stream, alpn.as_deref(), false)
+        let _ = crate::handshake::perform_hello_handshake(
+            &mut tls_stream,
+            alpn.as_deref(),
+            false,
+            None,
+        )
             .await;
     });
 
