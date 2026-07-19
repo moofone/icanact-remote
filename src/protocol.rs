@@ -69,7 +69,7 @@ struct InProgressStream {
     actor_id: u64,
     correlation_id: u32,
     is_response: bool,
-    schema_hash: Option<u64>,
+    _schema_hash: Option<u64>,
     received_size: usize,
     /// Pre-allocated aligned buffer for final message assembly.
     buffer: crate::PooledAlignedBuffer,
@@ -1071,20 +1071,6 @@ async fn handle_assembled_message(
     // Complete message assembled - route to actor
     // corr_id == 0 means tell (fire-and-forget), non-zero means ask (expects response)
     let correlation_opt = if corr_id == 0 { None } else { Some(corr_id) };
-    if let (Some(expected), Some(received)) = (registry.config.schema_hash, schema_hash) {
-        // V5 authenticates the schema once during Hello. A value here is only
-        // present on a legacy frame, which remains useful as a defensive
-        // consistency check while old peers are retired.
-        if received != expected {
-            warn!(
-                peer = %peer_addr,
-                expected = format_args!("{:016x}", expected),
-                received = format_args!("{received:016x}"),
-                "Rejected actor payload due to schema hash mismatch"
-            );
-            return;
-        }
-    }
     let response = if corr_id == 0 {
         if let Some(cell) = registry.actor_tell_handler_sync_context.load_full() {
             cell.handle(

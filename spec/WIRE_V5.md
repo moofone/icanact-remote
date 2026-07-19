@@ -31,5 +31,4 @@ index one; successful completion is bitmap-driven and there is no StreamEnd.
 
 Schema compatibility is negotiated once in the authenticated V5 Hello. Both
 `Option<u64>` values must match exactly. No V5 data frame carries a schema
-hash. V4 ALPN may be selected only during the observability window and is
-counted then rejected before Hello or frame parsing.
+hash. TLS negotiation advertises and accepts only V5 ALPN.
