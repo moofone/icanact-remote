@@ -6,6 +6,8 @@ pub struct LockFreeStreamHandle {
     addr: SocketAddr,
     channel_id: ChannelId,
     sequence_counter: Arc<AtomicUsize>,
+    /// Direction-local stream IDs. IDs never wrap on a live connection.
+    next_stream_id: Arc<AtomicU32>,
     bytes_written: Arc<AtomicUsize>, // This tracks actual TCP bytes written
     shutdown_signal: Arc<AtomicBool>,
     exit_flag: Arc<AtomicBool>,
@@ -46,6 +48,15 @@ impl LockFreeStreamHandle {
 
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    fn allocate_stream_id(&self) -> Result<u32> {
+        let id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u32::MAX {
+            self.shutdown_signal.store(true, Ordering::Release);
+            return Err(GossipError::Shutdown);
+        }
+        Ok(id)
     }
 
     /// Create a new lock-free streaming handle with background writer task
@@ -129,6 +140,7 @@ impl LockFreeStreamHandle {
                 addr,
                 channel_id,
                 sequence_counter: Arc::new(AtomicUsize::new(0)),
+                next_stream_id: Arc::new(AtomicU32::new(1)),
                 bytes_written, // This now tracks actual TCP bytes written
                 shutdown_signal,
                 flush_pending,
@@ -559,7 +571,7 @@ impl LockFreeStreamHandle {
                         // Handle short writes by falling back to sequential write_all
                         // TCP can return partial writes under backpressure
                         let total_len = cmd.header.len() + cmd.payload.len();
-                        let header_slice = std::io::IoSlice::new(&cmd.header);
+                        let header_slice = std::io::IoSlice::new(cmd.header.as_slice());
                         let payload_slice = std::io::IoSlice::new(&cmd.payload);
                         let bufs = &[header_slice, payload_slice];
 
@@ -577,7 +589,7 @@ impl LockFreeStreamHandle {
                                 // Write header portion if needed
                                 if offset < cmd.header.len() {
                                     let h_rem = cmd.header.len() - offset;
-                                    if let Err(_) = stream.write_all(&cmd.header[offset..]).await {
+                                    if let Err(_) = stream.write_all(&cmd.header.as_slice()[offset..]).await {
                                         return;
                                     }
                                     bytes_written_counter.fetch_add(h_rem, Ordering::Relaxed);
@@ -1445,7 +1457,7 @@ impl LockFreeStreamHandle {
                     while reads < read_batch_limit {
                         let read_start = perf.map(|_| Instant::now());
                         let read_result =
-                            match read_message_step_nonblocking(&mut stream, state, ctx).await {
+                            match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
                                 Ok(result) => result,
                                 Err(e) => {
                                     warn!(
@@ -1595,7 +1607,7 @@ impl LockFreeStreamHandle {
                     }
                     tokio::select! {
                         // Idle path: block waiting for socket readability.
-                        read_result = read_message_step_poll(&mut stream, state, ctx, true) => {
+                        read_result = read_message_step_poll(&mut stream, state, ctx, streaming_state, true) => {
                             let read_start = perf.map(|_| Instant::now());
                             let read_result = match read_result {
                                 Ok(result) => result,
@@ -1683,7 +1695,7 @@ impl LockFreeStreamHandle {
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
                             while drained < drain_batch_limit {
                                 let read_start = perf.map(|_| Instant::now());
-                                let next = match read_message_step_nonblocking(&mut stream, state, ctx).await {
+                                let next = match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
                                     Ok(r) => r,
                                     Err(e) => {
                                         warn!(
@@ -2347,9 +2359,8 @@ impl LockFreeStreamHandle {
     }
 
     fn max_stream_chunk_size(&self) -> Result<usize> {
-        // Streaming frame wire format excludes the 4-byte length prefix from `msg_len`.
-        const STREAM_FRAME_OVERHEAD: usize =
-            crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE;
+        // V5 data frames carry only stream_id and chunk_index before bytes.
+        const STREAM_FRAME_OVERHEAD: usize = crate::framing::STREAM_DATA_HEADER_LEN;
 
         let max_chunk = self.max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
         if max_chunk == 0 {
@@ -2382,7 +2393,8 @@ impl LockFreeStreamHandle {
 
     /// Stream a large message directly to the socket, bypassing the write queue
     /// This provides maximum performance for large messages like PreBacktest
-    pub async fn stream_large_message(
+    #[cfg(any())]
+    pub async fn stream_large_message_v4(
         &self,
         msg: &[u8],
         type_hash: u32,
@@ -2495,6 +2507,70 @@ impl LockFreeStreamHandle {
         Ok(())
     }
 
+    /// Canonical owned-Bytes request/tell stream path. Payload bytes are only
+    /// sliced for vectored TLS writes; no application payload copy is made.
+    pub async fn stream_large_message_bytes(
+        &self,
+        payload: bytes::Bytes,
+        type_hash: u32,
+        actor_id: u64,
+    ) -> Result<()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        let chunk_size = self.max_stream_chunk_size()?;
+        let _guard = self.acquire_streaming_mode().await?;
+        let stream_id = self.allocate_stream_id()?;
+        let total_size = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
+            size: payload.len(),
+            max: u32::MAX as usize,
+        })?;
+        let first_len = payload.len().min(chunk_size);
+        self.write_bytes_vectored(
+            crate::framing::write_stream_request_start_header(
+                stream_id,
+                0,
+                total_size,
+                actor_id,
+                type_hash,
+                first_len,
+            ),
+            payload.slice(..first_len),
+        )
+        .await?;
+        let mut offset = first_len;
+        let mut index = 1u32;
+        while offset < payload.len() {
+            let end = (offset + chunk_size).min(payload.len());
+            self.write_bytes_vectored(
+                crate::framing::write_stream_data_header(
+                    false,
+                    stream_id,
+                    index,
+                    end - offset,
+                ),
+                payload.slice(offset..end),
+            )
+            .await?;
+            offset = end;
+            index = index.checked_add(1).ok_or_else(|| GossipError::Network(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "stream chunk index exhausted"),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Copying convenience wrapper for callers that only own a slice.
+    pub async fn stream_large_message(
+        &self,
+        msg: &[u8],
+        type_hash: u32,
+        actor_id: u64,
+    ) -> Result<()> {
+        self.stream_large_message_bytes(bytes::Bytes::copy_from_slice(msg), type_hash, actor_id)
+            .await
+    }
+
     /// Stream a response back to the caller, using streaming protocol for large payloads.
     /// This is used when a response exceeds the streaming threshold.
     ///
@@ -2516,7 +2592,8 @@ impl LockFreeStreamHandle {
     /// # Arguments
     /// * `payload` - The response payload as owned Bytes
     /// * `correlation_id` - The correlation ID from the original request
-    pub async fn stream_response_bytes(
+    #[cfg(any())]
+    pub async fn stream_response_bytes_v4(
         &self,
         payload: bytes::Bytes,
         correlation_id: u32,
@@ -2650,6 +2727,65 @@ impl LockFreeStreamHandle {
         Ok(())
     }
 
+    /// Stream an owned response using V5 StartData plus zero-copy data chunks.
+    pub async fn stream_response_bytes(
+        &self,
+        payload: bytes::Bytes,
+        correlation_id: u32,
+    ) -> Result<()> {
+        if payload.is_empty() {
+            return self.send_response_auto(payload, correlation_id).await;
+        }
+        let chunk_size = self.max_stream_chunk_size()?;
+        let _guard = self.acquire_streaming_mode().await?;
+        let stream_id = self.allocate_stream_id()?;
+        let total_size = u32::try_from(payload.len()).map_err(|_| {
+            GossipError::MessageTooLarge {
+                size: payload.len(),
+                max: u32::MAX as usize,
+            }
+        })?;
+        let first_len = payload.len().min(chunk_size);
+        let first_header = crate::framing::write_stream_response_start_header(
+            stream_id,
+            correlation_id,
+            total_size,
+            first_len,
+        );
+        self.streaming_queue
+            .push(StreamingCommand::VectoredWrite(VectoredSendItem {
+                header: InlineFrameHeader::from_array(first_header),
+                payload: payload.slice(..first_len),
+            }))
+            .await?;
+        let mut offset = first_len;
+        let mut index = 1u32;
+        while offset < payload.len() {
+            let end = (offset + chunk_size).min(payload.len());
+            let header = crate::framing::write_stream_data_header(
+                true,
+                stream_id,
+                index,
+                end - offset,
+            );
+            self.streaming_queue
+            .push(StreamingCommand::VectoredWrite(VectoredSendItem {
+                    header: InlineFrameHeader::from_array(header),
+                    payload: payload.slice(offset..end),
+                }))
+                .await?;
+            offset = end;
+            index = index.checked_add(1).ok_or_else(|| {
+                GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream chunk index exhausted",
+                ))
+            })?;
+        }
+        self.streaming_queue.push(StreamingCommand::Flush).await?;
+        Ok(())
+    }
+
     /// Send a response using the inline write queue (never streaming).
     pub async fn send_response_auto(
         &self,
@@ -2687,15 +2823,26 @@ impl LockFreeStreamHandle {
             .await
     }
 
+    /// Cold-path cancellation for a partially queued V5 stream.
+    pub async fn abort_stream(&self, stream_id: u32, reason: u32) -> Result<()> {
+        self.write_bytes_control(bytes::Bytes::copy_from_slice(
+            &crate::framing::write_stream_abort_header(stream_id, reason),
+        ))
+        .await
+    }
+
     /// Zero-copy vectored write for header + payload in single operation
     /// This eliminates copying payload data into frame buffer - optimal for streaming
-    pub async fn write_bytes_vectored(
+    pub async fn write_bytes_vectored<const N: usize>(
         &self,
-        header: bytes::Bytes,
+        header: [u8; N],
         payload: bytes::Bytes,
     ) -> Result<()> {
         // Create vectored command that preserves both header and payload as separate Bytes
-        let command = VectoredSendItem { header, payload };
+        let command = VectoredSendItem {
+            header: InlineFrameHeader::from_array(header),
+            payload,
+        };
 
         // Prefer the streaming queue for vectored operations; if it's full, fall back
         // to the normal payload queue (still zero-copy: header + payload remain `Bytes`).
@@ -2706,7 +2853,7 @@ impl LockFreeStreamHandle {
             Ok(()) => Ok(()),
             Err(StreamingTryPushError::Full(StreamingCommand::VectoredWrite(vectored_cmd))) => {
                 self.enqueue_write(WritePayload::HeaderPayload {
-                    header: vectored_cmd.header,
+                    header: vectored_cmd.header.into_bytes(),
                     payload: vectored_cmd.payload,
                 })
                 .await

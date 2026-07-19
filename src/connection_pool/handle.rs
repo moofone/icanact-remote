@@ -465,6 +465,25 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    /// Canonical owned-Bytes stream path; avoids the slice wrapper's copy.
+    pub async fn stream_large_message_bytes(
+        &self,
+        payload: bytes::Bytes,
+        type_hash: u32,
+        actor_id: u64,
+    ) -> Result<()> {
+        if let Some(stream_handle) = self.stream_handle.as_ref() {
+            stream_handle
+                .stream_large_message_bytes(payload, type_hash, actor_id)
+                .await
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "stream_large_message_bytes requires a stream-based connection",
+            )))
+        }
+    }
+
     /// Get the streaming threshold for this connection
     ///
     /// Messages larger than this threshold should be sent via streaming
@@ -505,16 +524,8 @@ impl<T> ConnectionHandle<T> {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
-        let schema_hash = self.schema_hash();
-        let header = crate::framing::write_actor_frame_header(
-            crate::MessageType::ActorTell,
-            0,
-            actor_id,
-            type_hash,
-            schema_hash,
-            payload.len(),
-        );
-        self.write_header_and_payload_control_inline32(header, payload)
+        let header = crate::framing::write_actor_tell_header(actor_id, type_hash, payload.len());
+        self.write_header_and_payload_control_inline(header, 16, payload)
             .await
     }
 
@@ -527,16 +538,8 @@ impl<T> ConnectionHandle<T> {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
-        let schema_hash = self.schema_hash();
-        let header = crate::framing::write_actor_frame_header(
-            crate::MessageType::ActorTell,
-            0,
-            actor_id,
-            type_hash,
-            schema_hash,
-            payload.len(),
-        );
-        self.write_header_and_payload_control_inline32_nonblocking(header, payload)
+        let header = crate::framing::write_actor_tell_header(actor_id, type_hash, payload.len());
+        self.write_header_and_payload_control_inline_nonblocking(header, 16, payload)
     }
 
     /// Ask an actor using the direct actor frame envelope (MessageType::ActorAsk).
@@ -564,15 +567,8 @@ impl<T> ConnectionHandle<T> {
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let schema_hash = self.schema_hash();
-        let header = crate::framing::write_actor_frame_header(
-            crate::MessageType::ActorAsk,
-            correlation_id,
-            actor_id,
-            type_hash,
-            schema_hash,
-            payload.len(),
-        );
+        let header =
+            crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
         if let Err(e) = self
             .write_header_and_payload_ask_inline32(header, payload)
             .await
@@ -657,15 +653,8 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<crate::AlignedBytes> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let schema_hash = self.schema_hash();
-        let header = crate::framing::write_actor_frame_header(
-            crate::MessageType::ActorAsk,
-            correlation_id,
-            actor_id,
-            type_hash,
-            schema_hash,
-            payload.len(),
-        );
+        let header =
+            crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
 
         if let Err(e) = self
             .write_header_and_payload_ask_inline32(header, payload)
@@ -695,15 +684,8 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<PendingAsk> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let schema_hash = self.schema_hash();
-        let header = crate::framing::write_actor_frame_header(
-            crate::MessageType::ActorAsk,
-            correlation_id,
-            actor_id,
-            type_hash,
-            schema_hash,
-            payload.len(),
-        );
+        let header =
+            crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
 
         if let Err(e) = self
             .write_header_and_payload_ask_inline32(header, payload)
@@ -1043,7 +1025,8 @@ impl<T> ConnectionHandle<T> {
     ///
     /// # Returns
     /// The response bytes from the actor
-    pub async fn ask_streaming_bytes(
+    #[cfg(any())]
+    pub async fn ask_streaming_bytes_v4(
         &self,
         payload: bytes::Bytes,
         type_hash: u32,
@@ -1246,6 +1229,69 @@ impl<T> ConnectionHandle<T> {
         Ok(response.into_bytes())
     }
 
+    pub async fn ask_streaming_bytes(
+        &self,
+        payload: bytes::Bytes,
+        type_hash: u32,
+        actor_id: u64,
+        timeout: Duration,
+    ) -> Result<bytes::Bytes> {
+        let stream_handle = self.stream_handle().map_err(|_| {
+            GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "ask_streaming_bytes requires a stream-based connection",
+            ))
+        })?;
+        if payload.is_empty() {
+            return self.ask_actor_frame(actor_id, type_hash, payload, timeout).await;
+        }
+        let chunk_size = stream_handle.max_stream_chunk_size()?;
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
+        let gate_guard = stream_handle.acquire_streaming_mode().await?;
+        let stream_id = stream_handle.allocate_stream_id()?;
+        let total_size = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
+            size: payload.len(),
+            max: u32::MAX as usize,
+        })?;
+        let first_len = payload.len().min(chunk_size);
+        let first_header = crate::framing::write_stream_request_start_header(
+            stream_id,
+            correlation_id,
+            total_size,
+            actor_id,
+            type_hash,
+            first_len,
+        );
+        stream_handle.write_bytes_vectored(
+            first_header,
+            payload.slice(..first_len),
+        ).await?;
+        let mut offset = first_len;
+        let mut index = 1u32;
+        while offset < payload.len() {
+            let end = (offset + chunk_size).min(payload.len());
+            let header = crate::framing::write_stream_data_header(
+                false,
+                stream_id,
+                index,
+                end - offset,
+            );
+            stream_handle.write_bytes_vectored(
+                header,
+                payload.slice(offset..end),
+            ).await?;
+            offset = end;
+            index = index.checked_add(1).ok_or_else(|| GossipError::Network(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "stream chunk index exhausted"),
+            ))?;
+        }
+        drop(gate_guard);
+        let response = self.correlation.wait_for_response(correlation_id, timeout).await?;
+        let _ = slot.disarm();
+        Ok(response.into_bytes())
+    }
+
     /// Send an ask and return a handle that can be awaited later.
     ///
     /// This is useful for:
@@ -1353,9 +1399,9 @@ impl<T> ConnectionHandle<T> {
 
     /// Zero-copy vectored write for header + payload in single syscall
     /// This eliminates the need to copy payload data into frame buffer
-    pub async fn write_bytes_vectored(
+    pub async fn write_bytes_vectored<const N: usize>(
         &self,
-        header: bytes::Bytes,
+        header: [u8; N],
         payload: bytes::Bytes,
     ) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
@@ -1366,6 +1412,11 @@ impl<T> ConnectionHandle<T> {
                 format!("connection {} has no writer path", self.addr),
             )))
         }
+    }
+
+    /// Abort a V5 stream without delivering its partial payload.
+    pub async fn abort_stream(&self, stream_id: u32, reason: u32) -> Result<()> {
+        self.stream_handle()?.abort_stream(stream_id, reason).await
     }
 
     /// Send owned chunks without copying - optimal for streaming large messages

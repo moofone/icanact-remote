@@ -977,7 +977,7 @@ fn test_streaming_tell_no_response() {
 
         // Create a large payload (>1MB to trigger streaming)
         let payload_size = 1_500_000; // 1.5MB
-        let payload = create_test_payload(payload_size);
+        let payload = Bytes::from(create_test_payload(payload_size));
 
         // Send as a streaming tell (correlation_id = 0)
         // This uses stream_large_message which sends with correlation_id = 0
@@ -985,10 +985,9 @@ fn test_streaming_tell_no_response() {
         let test_actor_id: u64 = 12345;
 
         info!("📤 Sending {} byte streaming tell...", payload_size);
-        conn.connection
-            .as_ref()
-            .unwrap()
-            .stream_large_message(&payload, test_type_hash, test_actor_id)
+        conn.connection_ref()
+            .expect("connection should be cached")
+            .stream_large_message_bytes(payload, test_type_hash, test_actor_id)
             .await
             .expect("stream_large_message should succeed");
 

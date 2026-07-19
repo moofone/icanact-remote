@@ -88,7 +88,7 @@ async fn schema_hash_allows_matching_headers() {
 }
 
 #[tokio::test]
-async fn schema_hash_rejects_missing_headers() {
+async fn schema_hash_rejects_mismatched_hello_before_a_session_is_published() {
     let addr_a: SocketAddr = "127.0.0.1:9113".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:9114".parse().unwrap();
     let schema_hash = 0x1122334455667788u64;
@@ -126,20 +126,17 @@ async fn schema_hash_rejects_missing_headers() {
         .await;
 
     let peer_b = handle_a.add_peer(&peer_id_b).await;
-    peer_b.connect(&addr_b).await.unwrap();
-
-    sleep(Duration::from_millis(200)).await;
-
-    let remote_ref = handle_a.lookup_peer(&peer_id_b).await.unwrap();
-    let conn = remote_ref
-        .connection_ref()
-        .expect("connection should be established");
-    conn.tell_actor_frame(2, 0xFEED_FACE, bytes::Bytes::from_static(b"ping"))
+    let error = peer_b
+        .connect(&addr_b)
         .await
-        .unwrap();
-
-    let result = timeout(Duration::from_millis(500), notify.notified()).await;
-    assert!(result.is_err(), "handler should not be invoked");
+        .expect_err("schema mismatch must reject the authenticated Hello");
+    assert!(error.to_string().contains("schema hash mismatch"));
+    assert!(
+        !handle_a.registry.has_connection_to_peer(&peer_id_b).await,
+        "a mismatched schema must never publish a usable connection"
+    );
+    let result = timeout(Duration::from_millis(100), notify.notified()).await;
+    assert!(result.is_err(), "handler must not run after rejected Hello");
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 
     handle_a.shutdown().await;

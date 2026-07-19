@@ -1,5 +1,5 @@
 use arc_swap::{ArcSwapOption, ArcSwapWeak};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use futures::task::AtomicWaker;
 use scc::HashMap as SccHashMap;
 use std::cell::UnsafeCell;

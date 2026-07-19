@@ -457,6 +457,13 @@ impl GossipConfig {
                 "GossipConfig.key_pair is required for TLS-only mode".to_owned(),
             ));
         }
+        if self.max_message_size > crate::framing::CONTROL_BODY_LEN_MASK as usize {
+            return Err(crate::GossipError::InvalidConfig(format!(
+                "max_message_size={} exceeds V5 27-bit frame body limit {}",
+                self.max_message_size,
+                crate::framing::CONTROL_BODY_LEN_MASK,
+            )));
+        }
 
         self.normalize();
         Ok(())
@@ -528,6 +535,17 @@ mod tests {
             error,
             crate::GossipError::InvalidConfig(message)
                 if message.contains("key_pair")
+        ));
+    }
+
+    #[test]
+    fn validate_and_normalize_rejects_a_message_larger_than_v5_control_can_encode() {
+        let mut config = GossipConfig::default();
+        config.key_pair = Some(crate::KeyPair::generate());
+        config.max_message_size = crate::framing::CONTROL_BODY_LEN_MASK as usize + 1;
+        assert!(matches!(
+            config.validate_and_normalize(),
+            Err(crate::GossipError::InvalidConfig(message)) if message.contains("27-bit")
         ));
     }
 

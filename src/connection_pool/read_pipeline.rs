@@ -49,7 +49,12 @@ mod read_pipeline_tests {
             sync_actor_handler: None,
         };
 
-        let error = super::read_message_step(&mut reader, &mut super::ReadState::new(), &ctx)
+        let error = super::read_message_step(
+            &mut reader,
+            &mut super::ReadState::new(),
+            &ctx,
+            &mut crate::protocol::StreamingState::new(),
+        )
             .await
             .expect_err("zero-length frames must be rejected before entering ReadBody");
         assert!(matches!(error, crate::GossipError::Network(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
@@ -66,6 +71,115 @@ enum ReadState {
         buffer: crate::PooledAlignedBuffer,
         read: usize,
     },
+    /// V5 stream metadata is read into a small fixed stack buffer before a
+    /// final assembly range is reserved. This avoids a temporary chunk-sized
+    /// frame allocation.
+    ReadStreamMeta {
+        kind: crate::framing::WireKind,
+        body_len: usize,
+        meta: [u8; crate::framing::STREAM_REQUEST_START_HEADER_LEN],
+        meta_len: usize,
+        read: usize,
+    },
+    /// The TLS reader writes directly into the reservation held by
+    /// `StreamingState`; the bitmap is committed only at frame completion.
+    ReadStreamPayload {
+        reservation: crate::protocol::StreamChunkReservation,
+        read: usize,
+    },
+}
+
+// Direct responses are emitted by the IO owner rather than a public
+// `LockFreeStreamHandle` method. Keep their IDs monotonic as well; global
+// uniqueness is stronger than the required per-direction uniqueness.
+static NEXT_DIRECT_RESPONSE_STREAM_ID: AtomicU32 = AtomicU32::new(1);
+
+fn allocate_direct_response_stream_id() -> Result<u32> {
+    let id = NEXT_DIRECT_RESPONSE_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 || id == u32::MAX {
+        return Err(GossipError::Shutdown);
+    }
+    Ok(id)
+}
+
+fn stream_meta_len(kind: crate::framing::WireKind) -> Option<usize> {
+    match kind {
+        crate::framing::WireKind::StreamStart => Some(crate::framing::STREAM_REQUEST_START_HEADER_LEN),
+        crate::framing::WireKind::StreamResponseStart => Some(crate::framing::STREAM_RESPONSE_START_HEADER_LEN),
+        crate::framing::WireKind::StreamData | crate::framing::WireKind::StreamResponseData => {
+            Some(crate::framing::STREAM_DATA_HEADER_LEN)
+        }
+        _ => None,
+    }
+}
+
+fn completed_v5_stream_result(completed: crate::protocol::CompletedV5Stream) -> crate::handle::MessageReadResult {
+    if completed.is_response {
+        crate::handle::MessageReadResult::Response {
+            correlation_id: completed.correlation_id,
+            payload: completed.payload,
+        }
+    } else {
+        crate::handle::MessageReadResult::Actor {
+            msg_type: if completed.correlation_id == 0 {
+                crate::MessageType::ActorTell as u8
+            } else {
+                crate::MessageType::ActorAsk as u8
+            },
+            correlation_id: completed.correlation_id,
+            actor_id: completed.actor_id,
+            type_hash: completed.type_hash,
+            schema_hash: None,
+            payload: completed.payload,
+        }
+    }
+}
+
+fn reserve_v5_stream_payload(
+    kind: crate::framing::WireKind,
+    body_len: usize,
+    meta: &[u8],
+    streaming_state: &mut crate::protocol::StreamingState,
+    pool: Arc<crate::AlignedBytesPool>,
+) -> Result<crate::protocol::StreamChunkReservation> {
+    let meta_len = stream_meta_len(kind).expect("stream kind has metadata");
+    let payload_len = body_len.checked_sub(meta_len).ok_or_else(|| GossipError::Network(
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated V5 stream metadata"),
+    ))?;
+    match kind {
+        crate::framing::WireKind::StreamStart => {
+            let stream_id = u32::from_be_bytes(meta[..4].try_into().unwrap()) as u64;
+            let correlation_id = u32::from_be_bytes(meta[4..8].try_into().unwrap());
+            let total_size = u32::from_be_bytes(meta[8..12].try_into().unwrap()) as u64;
+            let actor_id = u64::from_be_bytes(meta[12..20].try_into().unwrap());
+            let type_hash = u32::from_be_bytes(meta[20..24].try_into().unwrap());
+            streaming_state.begin_v5_stream(
+                crate::StreamHeader { stream_id, total_size, chunk_size: payload_len as u32, chunk_index: 0, type_hash, actor_id },
+                correlation_id,
+                pool,
+                false,
+                payload_len,
+            )
+        }
+        crate::framing::WireKind::StreamResponseStart => {
+            let stream_id = u32::from_be_bytes(meta[..4].try_into().unwrap()) as u64;
+            let correlation_id = u32::from_be_bytes(meta[4..8].try_into().unwrap());
+            let total_size = u32::from_be_bytes(meta[8..12].try_into().unwrap()) as u64;
+            streaming_state.begin_v5_stream(
+                crate::StreamHeader { stream_id, total_size, chunk_size: payload_len as u32, chunk_index: 0, type_hash: 0, actor_id: 0 },
+                correlation_id,
+                pool,
+                true,
+                payload_len,
+            )
+        }
+        crate::framing::WireKind::StreamData | crate::framing::WireKind::StreamResponseData => {
+            let stream_id = u32::from_be_bytes(meta[..4].try_into().unwrap()) as u64;
+            let chunk_index = u32::from_be_bytes(meta[4..8].try_into().unwrap());
+            streaming_state.reserve_v5_chunk(stream_id, chunk_index, payload_len)
+        }
+        _ => unreachable!("non-stream kind passed to direct stream reservation"),
+    }
 }
 
 #[inline]
@@ -90,6 +204,7 @@ async fn read_message_step<S>(
     stream: &mut S,
     state: &mut ReadState,
     ctx: &ReadContext,
+    streaming_state: &mut crate::protocol::StreamingState,
 ) -> Result<Option<crate::handle::MessageReadResult>>
 where
     S: AsyncRead + Unpin,
@@ -108,7 +223,12 @@ where
                 return Ok(None);
             }
 
-            let msg_len = u32::from_be_bytes(*buf) as usize;
+            let control = crate::framing::decode_control(*buf)
+                .ok_or_else(|| crate::GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unknown V5 wire kind",
+                )))?;
+            let msg_len = control.body_len;
             if msg_len == 0 {
                 return Err(reject_zero_length_frame());
             }
@@ -117,6 +237,23 @@ where
                     size: msg_len,
                     max: ctx.max_message_size,
                 });
+            }
+
+            if let Some(meta_len) = stream_meta_len(control.kind) {
+                if msg_len < meta_len {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "truncated V5 stream metadata",
+                    )));
+                }
+                *state = ReadState::ReadStreamMeta {
+                    kind: control.kind,
+                    body_len: msg_len,
+                    meta: [0; crate::framing::STREAM_REQUEST_START_HEADER_LEN],
+                    meta_len,
+                    read: 0,
+                };
+                return Ok(None);
             }
 
             let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
@@ -160,6 +297,47 @@ where
             let result = crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?;
             Ok(Some(result))
         }
+        ReadState::ReadStreamMeta { kind, body_len, meta, meta_len, read } => {
+            let n = stream.read(&mut meta[*read..*meta_len]).await?;
+            if n == 0 {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed during V5 stream metadata",
+                )));
+            }
+            *read += n;
+            if *read < *meta_len {
+                return Ok(None);
+            }
+            let reservation = reserve_v5_stream_payload(
+                *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
+            )?;
+            *state = if reservation.is_empty() {
+                ReadState::new()
+            } else {
+                ReadState::ReadStreamPayload { reservation, read: 0 }
+            };
+            Ok(None)
+        }
+        ReadState::ReadStreamPayload { reservation, read } => {
+            let target = streaming_state.v5_chunk_target(*reservation, *read)?;
+            let n = stream.read(target).await?;
+            if n == 0 {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed during V5 stream payload",
+                )));
+            }
+            *read += n;
+            if *read < reservation.len() {
+                return Ok(None);
+            }
+            let reservation = match std::mem::replace(state, ReadState::new()) {
+                ReadState::ReadStreamPayload { reservation, .. } => reservation,
+                _ => unreachable!("read state must be V5 stream payload"),
+            };
+            Ok(streaming_state.commit_v5_chunk(reservation)?.map(completed_v5_stream_result))
+        }
     }
 }
 
@@ -188,7 +366,8 @@ enum FastReadOutcome {
     Unhandled(crate::PooledAlignedBuffer),
 }
 
-fn try_handle_read_fast_from_pooled(
+#[cfg(any())]
+fn try_handle_read_fast_from_pooled_v4(
     buffer: crate::PooledAlignedBuffer,
     msg_len: usize,
     ctx: &ReadContext,
@@ -351,6 +530,17 @@ fn try_handle_read_fast_from_pooled(
     unreachable!("actor tell path checked handler presence before payload extraction")
 }
 
+fn try_handle_read_fast_from_pooled(
+    buffer: crate::PooledAlignedBuffer,
+    _msg_len: usize,
+    _ctx: &ReadContext,
+) -> Result<FastReadOutcome> {
+    // V5's shared parser owns the packed-control dispatch. Keeping this seam
+    // intentionally boring until the specialized direct-read stream state lands
+    // avoids duplicating V5 frame decoding in the I/O hot path.
+    Ok(FastReadOutcome::Unhandled(buffer))
+}
+
 fn poll_read_once<S>(stream: &mut S, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize>>
 where
     S: AsyncRead + Unpin,
@@ -367,6 +557,7 @@ async fn read_message_step_poll<S>(
     stream: &mut S,
     state: &mut ReadState,
     ctx: &ReadContext,
+    streaming_state: &mut crate::protocol::StreamingState,
     block_on_pending: bool,
 ) -> Result<ReadPollResult>
 where
@@ -405,7 +596,12 @@ where
                         }));
                     }
 
-                    let msg_len = u32::from_be_bytes(*buf) as usize;
+                    let control = crate::framing::decode_control(*buf)
+                        .ok_or_else(|| crate::GossipError::Network(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unknown V5 wire kind",
+                        )))?;
+                    let msg_len = control.body_len;
                     if msg_len == 0 {
                         return Poll::Ready(Err(reject_zero_length_frame()));
                     }
@@ -416,6 +612,22 @@ where
                         }));
                     }
 
+                    if let Some(meta_len) = stream_meta_len(control.kind) {
+                        if msg_len < meta_len {
+                            return Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "truncated V5 stream metadata",
+                            ))));
+                        }
+                        *state = ReadState::ReadStreamMeta {
+                            kind: control.kind,
+                            body_len: msg_len,
+                            meta: [0; crate::framing::STREAM_REQUEST_START_HEADER_LEN],
+                            meta_len,
+                            read: 0,
+                        };
+                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
                     let mut buffer = unsafe {
                         crate::PooledAlignedBuffer::with_len_uninit(
@@ -503,6 +715,56 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
+        ReadState::ReadStreamMeta { kind, body_len, meta, meta_len, read } => {
+            match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
+                Poll::Pending if block_on_pending => Poll::Pending,
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream metadata",
+                )))),
+                Poll::Ready(Ok(n)) => {
+                    *read += n;
+                    if *read < *meta_len {
+                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    }
+                    let reservation = reserve_v5_stream_payload(
+                        *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
+                    )?;
+                    *state = if reservation.is_empty() {
+                        ReadState::new()
+                    } else {
+                        ReadState::ReadStreamPayload { reservation, read: 0 }
+                    };
+                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            }
+        }
+        ReadState::ReadStreamPayload { reservation, read } => {
+            let target = streaming_state.v5_chunk_target(*reservation, *read)?;
+            match poll_read_once(stream, cx, target) {
+                Poll::Pending if block_on_pending => Poll::Pending,
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream payload",
+                )))),
+                Poll::Ready(Ok(n)) => {
+                    *read += n;
+                    if *read < reservation.len() {
+                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    }
+                    let reservation = match std::mem::replace(state, ReadState::new()) {
+                        ReadState::ReadStreamPayload { reservation, .. } => reservation,
+                        _ => unreachable!(),
+                    };
+                    let result = streaming_state.commit_v5_chunk(reservation)?
+                        .map(completed_v5_stream_result)
+                        .map(ReadIoResult::Generic);
+                    Poll::Ready(Ok(ReadPollResult { result, progressed: true }))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            }
+        }
     })
     .await
 }
@@ -518,6 +780,7 @@ async fn read_message_step_nonblocking<S>(
     stream: &mut S,
     state: &mut ReadState,
     ctx: &ReadContext,
+    streaming_state: &mut crate::protocol::StreamingState,
 ) -> Result<ReadPollResult>
 where
     S: AsyncRead + Unpin,
@@ -549,7 +812,12 @@ where
                         }));
                     }
 
-                    let msg_len = u32::from_be_bytes(*buf) as usize;
+                    let control = crate::framing::decode_control(*buf)
+                        .ok_or_else(|| crate::GossipError::Network(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unknown V5 wire kind",
+                        )))?;
+                    let msg_len = control.body_len;
                     if msg_len == 0 {
                         return Poll::Ready(Err(reject_zero_length_frame()));
                     }
@@ -560,6 +828,22 @@ where
                         }));
                     }
 
+                    if let Some(meta_len) = stream_meta_len(control.kind) {
+                        if msg_len < meta_len {
+                            return Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "truncated V5 stream metadata",
+                            ))));
+                        }
+                        *state = ReadState::ReadStreamMeta {
+                            kind: control.kind,
+                            body_len: msg_len,
+                            meta: [0; crate::framing::STREAM_REQUEST_START_HEADER_LEN],
+                            meta_len,
+                            read: 0,
+                        };
+                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
                     let mut buffer = unsafe {
                         crate::PooledAlignedBuffer::with_len_uninit(
@@ -637,6 +921,54 @@ where
                         result: Some(result),
                         progressed: true,
                     }))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            }
+        }
+        ReadState::ReadStreamMeta { kind, body_len, meta, meta_len, read } => {
+            match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream metadata",
+                )))),
+                Poll::Ready(Ok(n)) => {
+                    *read += n;
+                    if *read < *meta_len {
+                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    }
+                    let reservation = reserve_v5_stream_payload(
+                        *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
+                    )?;
+                    *state = if reservation.is_empty() {
+                        ReadState::new()
+                    } else {
+                        ReadState::ReadStreamPayload { reservation, read: 0 }
+                    };
+                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            }
+        }
+        ReadState::ReadStreamPayload { reservation, read } => {
+            let target = streaming_state.v5_chunk_target(*reservation, *read)?;
+            match poll_read_once(stream, cx, target) {
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream payload",
+                )))),
+                Poll::Ready(Ok(n)) => {
+                    *read += n;
+                    if *read < reservation.len() {
+                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    }
+                    let reservation = match std::mem::replace(state, ReadState::new()) {
+                        ReadState::ReadStreamPayload { reservation, .. } => reservation,
+                        _ => unreachable!(),
+                    };
+                    let result = streaming_state.commit_v5_chunk(reservation)?
+                        .map(completed_v5_stream_result)
+                        .map(ReadIoResult::Generic);
+                    Poll::Ready(Ok(ReadPollResult { result, progressed: true }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
@@ -1051,129 +1383,61 @@ async fn write_streaming_response_direct<S>(
     correlation_id: u32,
     payload: bytes::Bytes,
     max_message_size: usize,
-    schema_hash: Option<u64>,
+    _schema_hash: Option<u64>,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    use bytes::BufMut;
-
-    // Streaming frame wire format excludes the 4-byte length prefix from `msg_len`.
-    // `msg_len` for stream data frames is the V4 prefix plus header and chunk.
-    const STREAM_FRAME_OVERHEAD: usize =
-        crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE;
-    let max_chunk = max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
+    // A V5 data frame is [control:4][stream_id:4][chunk_index:4][payload].
+    let max_chunk = max_message_size.saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
     if max_chunk == 0 {
         return Err(GossipError::InvalidConfig(format!(
             "max_message_size={} too small for streaming (overhead={})",
-            max_message_size, STREAM_FRAME_OVERHEAD
+            max_message_size, crate::framing::STREAM_RESPONSE_START_HEADER_LEN
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-
-    // Generate unique stream ID for this response stream.
-    let stream_id = crate::current_timestamp_nanos();
-
-    fn build_stream_response_header(
-        msg_type: crate::MessageType,
-        header: &crate::StreamHeader,
-        correlation_id: u32,
-        chunk_len: usize,
-        schema_hash: Option<u64>,
-    ) -> bytes::Bytes {
-        // V4 message format: [length:4][type:1][correlation_id:4][schema_hash:8][header:36]
-        let inner_size =
-            crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE + chunk_len;
-        let mut message = bytes::BytesMut::with_capacity(
-            4 + crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE,
-        );
-
-        message.put_u32(inner_size as u32);
-        message.put_u8(msg_type as u8);
-        message.put_u32(correlation_id);
-
-        let mut reserved = [0u8; 8];
-        crate::framing::write_schema_hash(&mut reserved, schema_hash);
-        message.put_slice(&reserved);
-        message.put_slice(&header.to_bytes());
-
-        message.freeze()
-    }
-
-    let total_len = payload.len();
-    let start_header = crate::StreamHeader {
+    let stream_id = allocate_direct_response_stream_id()?;
+    let total_len = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
+        size: payload.len(),
+        max: u32::MAX as usize,
+    })?;
+    let first_len = payload.len().min(chunk_size);
+    let start_header = crate::framing::write_stream_response_start_header(
         stream_id,
-        total_size: total_len as u64,
-        chunk_size: 0,
-        chunk_index: 0,
-        type_hash: 0,
-        actor_id: 0,
-    };
-
-    // StreamResponseStart
-    let start_msg = build_stream_response_header(
-        crate::MessageType::StreamResponseStart,
-        &start_header,
         correlation_id,
-        0,
-        schema_hash,
+        total_len,
+        first_len,
     );
-    stream
-        .write_all(&start_msg)
-        .await
-        .map_err(GossipError::Network)?;
-    bytes_written_counter.fetch_add(start_msg.len(), Ordering::Relaxed);
-    *bytes_since_flush += start_msg.len();
+    write_header_payload_vectored(
+        stream,
+        bytes_written_counter,
+        bytes_since_flush,
+        &start_header,
+        &payload[..first_len],
+    )
+    .await?;
 
-    // StreamResponseData
-    let num_chunks = total_len.div_ceil(chunk_size);
-    for idx in 0..num_chunks {
-        let start = idx * chunk_size;
-        let end = std::cmp::min(start + chunk_size, total_len);
-        let chunk_len = end - start;
-        let chunk_data = payload.slice(start..end);
-
-        let data_header = crate::StreamHeader {
+    for (idx, chunk_data) in payload[first_len..].chunks(chunk_size).enumerate() {
+        let chunk_index = u32::try_from(idx).map_err(|_| GossipError::MessageTooLarge {
+            size: idx + 1,
+            max: u32::MAX as usize,
+        })? + 1;
+        let header = crate::framing::write_stream_data_header(
+            true,
             stream_id,
-            total_size: total_len as u64,
-            chunk_size: chunk_len as u32,
-            chunk_index: idx as u32,
-            type_hash: 0,
-            actor_id: 0,
-        };
-
-        let header_bytes = build_stream_response_header(
-            crate::MessageType::StreamResponseData,
-            &data_header,
-            correlation_id,
-            chunk_len,
-            schema_hash,
+            chunk_index,
+            chunk_data.len(),
         );
-
         write_header_payload_vectored(
             stream,
             bytes_written_counter,
             bytes_since_flush,
-            &header_bytes,
-            chunk_data.as_ref(),
+            &header,
+            chunk_data,
         )
         .await?;
     }
-
-    // StreamResponseEnd
-    let end_msg = build_stream_response_header(
-        crate::MessageType::StreamResponseEnd,
-        &start_header,
-        correlation_id,
-        0,
-        schema_hash,
-    );
-    stream
-        .write_all(&end_msg)
-        .await
-        .map_err(GossipError::Network)?;
-    bytes_written_counter.fetch_add(end_msg.len(), Ordering::Relaxed);
-    *bytes_since_flush += end_msg.len();
 
     stream.flush().await.map_err(GossipError::Network)?;
     *bytes_since_flush = 0;
@@ -1190,22 +1454,16 @@ async fn write_streaming_response_direct_pooled<S>(
     prefix: Option<[u8; 16]>,
     payload_len: usize,
     max_message_size: usize,
-    schema_hash: Option<u64>,
+    _schema_hash: Option<u64>,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    use bytes::BufMut;
-
-    // Streaming frame wire format excludes the 4-byte length prefix from `msg_len`.
-    // `msg_len` for stream data frames is the V4 prefix plus header and chunk.
-    const STREAM_FRAME_OVERHEAD: usize =
-        crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE;
-    let max_chunk = max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
+    let max_chunk = max_message_size.saturating_sub(crate::framing::STREAM_DATA_HEADER_LEN);
     if max_chunk == 0 {
         return Err(GossipError::InvalidConfig(format!(
             "max_message_size={} too small for streaming (overhead={})",
-            max_message_size, STREAM_FRAME_OVERHEAD
+            max_message_size, crate::framing::STREAM_DATA_HEADER_LEN
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
@@ -1225,92 +1483,47 @@ where
         )));
     }
 
-    // Generate unique stream ID for this response stream.
-    let stream_id = crate::current_timestamp_nanos();
-
-    fn build_stream_response_header(
-        msg_type: crate::MessageType,
-        header: &crate::StreamHeader,
-        correlation_id: u32,
-        chunk_len: usize,
-        schema_hash: Option<u64>,
-    ) -> bytes::Bytes {
-        // V4 message format: [length:4][type:1][correlation_id:4][schema_hash:8][header:36]
-        let inner_size =
-            crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE + chunk_len;
-        let mut message = bytes::BytesMut::with_capacity(
-            4 + crate::framing::STREAM_HEADER_PREFIX_LEN + crate::StreamHeader::SERIALIZED_SIZE,
-        );
-
-        message.put_u32(inner_size as u32);
-        message.put_u8(msg_type as u8);
-        message.put_u32(correlation_id);
-
-        let mut reserved = [0u8; 8];
-        crate::framing::write_schema_hash(&mut reserved, schema_hash);
-        message.put_slice(&reserved);
-        message.put_slice(&header.to_bytes());
-
-        message.freeze()
-    }
-
-    let total_len = payload_len;
-    let start_header = crate::StreamHeader {
-        stream_id,
-        total_size: total_len as u64,
-        chunk_size: 0,
-        chunk_index: 0,
-        type_hash: 0,
-        actor_id: 0,
-    };
-
-    // StreamResponseStart
-    let start_msg = build_stream_response_header(
-        crate::MessageType::StreamResponseStart,
-        &start_header,
-        correlation_id,
-        0,
-        schema_hash,
-    );
-    stream
-        .write_all(&start_msg)
-        .await
-        .map_err(GossipError::Network)?;
-    bytes_written_counter.fetch_add(start_msg.len(), Ordering::Relaxed);
-    *bytes_since_flush += start_msg.len();
-
-    // StreamResponseData
+    let stream_id = allocate_direct_response_stream_id()?;
+    let total_len = u32::try_from(payload_len).map_err(|_| GossipError::MessageTooLarge {
+        size: payload_len,
+        max: u32::MAX as usize,
+    })?;
+    // StartData carries chunk zero; later frames carry only stream/index.
     let mut prefix_pos = 0usize;
     let prefix_bytes: Option<&[u8]> = prefix.as_ref().map(|p| p.as_slice());
 
-    let mut remaining_total = total_len;
+    let mut remaining_total = payload_len;
     let mut idx = 0usize;
     while remaining_total > 0 {
         let this_chunk = std::cmp::min(chunk_size, remaining_total);
 
-        let data_header = crate::StreamHeader {
-            stream_id,
-            total_size: total_len as u64,
-            chunk_size: this_chunk as u32,
-            chunk_index: idx as u32,
-            type_hash: 0,
-            actor_id: 0,
+        let mut header_bytes = [0u8; 16];
+        let header_len = if idx == 0 {
+            let header = crate::framing::write_stream_response_start_header(
+                stream_id,
+                correlation_id,
+                total_len,
+                this_chunk,
+            );
+            header_bytes.copy_from_slice(&header);
+            header.len()
+        } else {
+            let header = crate::framing::write_stream_data_header(
+                true,
+                stream_id,
+                u32::try_from(idx).map_err(|_| GossipError::MessageTooLarge { size: idx, max: u32::MAX as usize })?,
+                this_chunk,
+            );
+            header_bytes[..header.len()].copy_from_slice(&header);
+            header.len()
         };
 
-        let header_bytes = build_stream_response_header(
-            crate::MessageType::StreamResponseData,
-            &data_header,
-            correlation_id,
-            this_chunk,
-            schema_hash,
-        );
-
         stream
-            .write_all(&header_bytes)
+            .write_all(&header_bytes[..header_len])
             .await
             .map_err(GossipError::Network)?;
-        bytes_written_counter.fetch_add(header_bytes.len(), Ordering::Relaxed);
-        *bytes_since_flush += header_bytes.len();
+        bytes_written_counter.fetch_add(header_len, Ordering::Relaxed);
+        *bytes_since_flush += header_len;
 
         // Write chunk bytes from: prefix (if any) then pooled payload Buf.
         let mut remaining_in_chunk = this_chunk;
@@ -1351,21 +1564,6 @@ where
         idx += 1;
     }
 
-    // StreamResponseEnd
-    let end_msg = build_stream_response_header(
-        crate::MessageType::StreamResponseEnd,
-        &start_header,
-        correlation_id,
-        0,
-        schema_hash,
-    );
-    stream
-        .write_all(&end_msg)
-        .await
-        .map_err(GossipError::Network)?;
-    bytes_written_counter.fetch_add(end_msg.len(), Ordering::Relaxed);
-    *bytes_since_flush += end_msg.len();
-
     stream.flush().await.map_err(GossipError::Network)?;
     *bytes_since_flush = 0;
 
@@ -1399,14 +1597,14 @@ where
             schema_hash,
             payload,
         } => {
-            if let Some(expected) = registry.config.schema_hash {
-                if schema_hash != Some(expected) {
+            if let (Some(expected), Some(received)) = (registry.config.schema_hash, schema_hash) {
+                // V5 authenticates the schema during Hello, so normal V5
+                // actor frames intentionally carry no repeated schema hash.
+                if received != expected {
                     warn!(
                         peer = %peer_addr,
                         expected = format_args!("{:016x}", expected),
-                        received = schema_hash
-                            .map(|hash| format!("{hash:016x}"))
-                            .unwrap_or_else(|| "none".to_string()),
+                        received = format_args!("{received:016x}"),
                         "Rejected actor payload due to schema hash mismatch"
                     );
                     return Ok(());
@@ -1790,8 +1988,8 @@ where
                 }));
             }
 
-            if let Some(expected) = ctx.expected_schema_hash
-                && schema_hash != Some(expected)
+            if let (Some(expected), Some(received)) = (ctx.expected_schema_hash, schema_hash)
+                && received != expected
             {
                 return Ok(None);
             }

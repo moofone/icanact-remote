@@ -28,6 +28,38 @@ pub struct StreamingState {
     max_concurrent_streams: usize,
 }
 
+/// A validated, not-yet-committed V5 chunk destination. The IO task receives
+/// plaintext directly into this range and commits it only after every byte was
+/// read, so a torn frame can never advance the integrity bitmap.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamChunkReservation {
+    stream_id: u64,
+    chunk_index: usize,
+    offset: usize,
+    len: usize,
+}
+
+impl StreamChunkReservation {
+    pub(crate) fn len(self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Completed direct-read V5 stream. Its payload owns the same pooled aligned
+/// allocation that was reserved at StreamStart.
+#[derive(Debug)]
+pub(crate) struct CompletedV5Stream {
+    pub actor_id: u64,
+    pub type_hash: u32,
+    pub correlation_id: u32,
+    pub is_response: bool,
+    pub payload: crate::AlignedBytes,
+}
+
 /// A stream that is currently being assembled
 #[derive(Debug)]
 struct InProgressStream {
@@ -36,6 +68,7 @@ struct InProgressStream {
     type_hash: u32,
     actor_id: u64,
     correlation_id: u32,
+    is_response: bool,
     schema_hash: Option<u64>,
     received_size: usize,
     /// Pre-allocated aligned buffer for final message assembly.
@@ -116,6 +149,17 @@ impl StreamingState {
         pool: Arc<crate::AlignedBytesPool>,
         schema_hash: Option<u64>,
     ) -> Result<()> {
+        self.start_stream_with_correlation_and_kind(header, correlation_id, pool, schema_hash, false)
+    }
+
+    pub fn start_stream_with_correlation_and_kind(
+        &mut self,
+        header: crate::StreamHeader,
+        correlation_id: u32,
+        pool: Arc<crate::AlignedBytesPool>,
+        schema_hash: Option<u64>,
+        is_response: bool,
+    ) -> Result<()> {
         if self.active_streams.len() >= self.max_concurrent_streams {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::ResourceBusy,
@@ -171,6 +215,7 @@ impl StreamingState {
                 type_hash: header.type_hash,
                 actor_id: header.actor_id,
                 correlation_id,
+                is_response,
                 schema_hash,
                 received_size: 0,
                 buffer,
@@ -186,11 +231,147 @@ impl StreamingState {
         Ok(())
     }
 
+    /// Starts a V5 stream and reserves its first data-bearing Start frame.
+    pub(crate) fn begin_v5_stream(
+        &mut self,
+        header: crate::StreamHeader,
+        correlation_id: u32,
+        pool: Arc<crate::AlignedBytesPool>,
+        is_response: bool,
+        first_chunk_len: usize,
+    ) -> Result<StreamChunkReservation> {
+        if first_chunk_len > header.total_size as usize {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "V5 StreamStartData has invalid first chunk length",
+            )));
+        }
+        self.start_stream_with_correlation_and_kind(header, correlation_id, pool, None, is_response)?;
+        self.reserve_v5_chunk(header.stream_id, 0, first_chunk_len)
+    }
+
+    /// Validates a V5 chunk before the reader receives it. This does not mark
+    /// the bitmap; callers must call `commit_v5_chunk` after a complete read.
+    pub(crate) fn reserve_v5_chunk(
+        &mut self,
+        stream_id: u64,
+        chunk_index: u32,
+        chunk_len: usize,
+    ) -> Result<StreamChunkReservation> {
+        let stream = self.active_streams.get_mut(&stream_id).ok_or_else(|| {
+            GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Received chunk for unknown stream_id={stream_id}"),
+            ))
+        })?;
+        if chunk_len == 0 {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "V5 stream chunk is empty",
+            )));
+        }
+        let chunk_index = chunk_index as usize;
+        let stride = match stream.chunk_stride {
+            Some(stride) => stride,
+            None => {
+                stream.chunk_stride = Some(chunk_len);
+                let expected = (stream.total_size as usize).div_ceil(chunk_len);
+                stream.expected_chunks = Some(expected);
+                stream.received_chunks = vec![0u64; expected.div_ceil(64)];
+                chunk_len
+            }
+        };
+        let expected = stream.expected_chunks.expect("stride sets expected chunks");
+        if chunk_index >= expected {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "V5 stream chunk index out of range",
+            )));
+        }
+        let offset = chunk_index.checked_mul(stride).ok_or_else(|| {
+            GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "V5 stream chunk offset overflow",
+            ))
+        })?;
+        let remaining = stream.total_size as usize - offset;
+        let expected_len = remaining.min(stride);
+        if chunk_len != expected_len {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "V5 stream chunk length does not match its index",
+            )));
+        }
+        let word = chunk_index / 64;
+        let bit = 1u64 << (chunk_index % 64);
+        if stream.received_chunks[word] & bit != 0 {
+            stream.duplicate_chunks = stream.duplicate_chunks.saturating_add(1);
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duplicate V5 stream chunk",
+            )));
+        }
+        Ok(StreamChunkReservation { stream_id, chunk_index, offset, len: chunk_len })
+    }
+
+    pub(crate) fn v5_chunk_target(
+        &mut self,
+        reservation: StreamChunkReservation,
+        read: usize,
+    ) -> Result<&mut [u8]> {
+        let stream = self.active_streams.get_mut(&reservation.stream_id).ok_or_else(|| {
+            GossipError::Network(std::io::Error::new(std::io::ErrorKind::InvalidData, "stream vanished"))
+        })?;
+        if read > reservation.len {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "V5 stream read exceeds reserved chunk",
+            )));
+        }
+        let start = reservation.offset + read;
+        let end = reservation.offset + reservation.len;
+        Ok(&mut stream.buffer.as_mut_slice()[start..end])
+    }
+
+    pub(crate) fn commit_v5_chunk(
+        &mut self,
+        reservation: StreamChunkReservation,
+    ) -> Result<Option<CompletedV5Stream>> {
+        let completed = {
+            let stream = self.active_streams.get_mut(&reservation.stream_id).ok_or_else(|| {
+                GossipError::Network(std::io::Error::new(std::io::ErrorKind::InvalidData, "stream vanished"))
+            })?;
+            let word = reservation.chunk_index / 64;
+            let bit = 1u64 << (reservation.chunk_index % 64);
+            if stream.received_chunks[word] & bit != 0 {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "duplicate V5 stream chunk commit",
+                )));
+            }
+            stream.received_chunks[word] |= bit;
+            stream.received_size += reservation.len;
+            stream.last_activity = std::time::Instant::now();
+            stream.all_chunks_received()
+        };
+        if !completed {
+            return Ok(None);
+        }
+        let stream = self.active_streams.remove(&reservation.stream_id).expect("completed stream exists");
+        Ok(Some(CompletedV5Stream {
+            actor_id: stream.actor_id,
+            type_hash: stream.type_hash,
+            correlation_id: stream.correlation_id,
+            is_response: stream.is_response,
+            payload: stream.buffer.into_aligned_bytes(),
+        }))
+    }
+
     pub fn add_chunk_with_correlation(
         &mut self,
         header: crate::StreamHeader,
         chunk_data: Bytes,
-        schema_hash: Option<u64>,
+        _schema_hash: Option<u64>,
     ) -> Result<Option<(Bytes, u32, Option<u64>)>> {
         // If stream doesn't exist, we might have missed the start frame or it was cleaned up
         if !self.active_streams.contains_key(&header.stream_id) {
@@ -210,17 +391,10 @@ impl StreamingState {
                 ))
             })?;
 
-        if header.total_size != stream.total_size {
+        if header.total_size != 0 && header.total_size != stream.total_size {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "stream total_size mismatch",
-            )));
-        }
-
-        if stream.schema_hash != schema_hash {
-            return Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream schema hash mismatch",
             )));
         }
 
@@ -331,6 +505,26 @@ impl StreamingState {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn metadata_for(
+        &self,
+        stream_id: u64,
+    ) -> Option<(u64, u32, u32, bool)> {
+        self.active_streams.get(&stream_id).map(|stream| {
+            (
+                stream.actor_id,
+                stream.type_hash,
+                stream.correlation_id,
+                stream.is_response,
+            )
+        })
+    }
+
+    /// Drop a partial stream on the V5 cold-path abort signal. Its final
+    /// allocation is returned to the pool and no partial data is delivered.
+    pub fn abort_stream(&mut self, stream_id: u64) -> bool {
+        self.active_streams.remove(&stream_id).is_some()
     }
 
     pub fn finalize_stream_with_correlation(
@@ -631,34 +825,68 @@ pub(crate) async fn process_read_result(
                         || msg_type == crate::MessageType::StreamResponseStart as u8 =>
                 {
                     let pool = registry.connection_pool.aligned_bytes_pool();
-                    if let Err(e) = streaming_state.start_stream_with_correlation(
+                    let is_response = msg_type == crate::MessageType::StreamResponseStart as u8;
+                    if let Err(e) = streaming_state.start_stream_with_correlation_and_kind(
                         stream_header,
                         correlation_id,
                         pool,
                         schema_hash,
+                        is_response,
                     ) {
                         warn!(error = %e, "Failed to start streaming for stream_id={}", stream_header.stream_id);
+                        return Ok(());
+                    }
+                    if chunk_data.is_empty() {
+                        return Ok(());
+                    }
+                    let metadata = streaming_state.metadata_for(stream_header.stream_id);
+                    if let Ok(Some((complete_data, corr_id, schema_hash))) =
+                        streaming_state.add_chunk_with_correlation(stream_header, chunk_data, schema_hash)
+                    {
+                        if metadata.map(|(_, _, _, response)| response).unwrap_or(is_response) {
+                            handle_response_message(
+                                registry,
+                                peer_addr,
+                                corr_id,
+                                crate::AlignedBytes::from_bytes(complete_data)
+                                    .expect("stream buffer must be aligned"),
+                                response_correlation,
+                            )
+                            .await;
+                        } else if let Some((actor_id, type_hash, _, _)) = metadata {
+                            handle_assembled_message(
+                                registry,
+                                peer_addr,
+                                authenticated_peer_id.or_else(|| {
+                                    response_connection.and_then(|conn| conn.embedded_peer_id.as_ref())
+                                }),
+                                actor_id,
+                                type_hash,
+                                crate::AlignedBytes::from_bytes(complete_data)
+                                    .expect("stream buffer must be aligned"),
+                                corr_id,
+                                schema_hash,
+                                response_connection,
+                                ResponseMode::AutoStream,
+                            )
+                            .await;
+                        }
                     }
                 }
                 msg_type
                     if msg_type == crate::MessageType::StreamData as u8
                         || msg_type == crate::MessageType::StreamResponseData as u8 =>
                 {
-                    // Ensure stream is started (auto-start)
-                    let pool = registry.connection_pool.aligned_bytes_pool();
-                    if let Err(e) = streaming_state.start_stream_with_correlation(
-                        stream_header,
-                        correlation_id,
-                        pool,
-                        schema_hash,
-                    ) {
-                        let _ = e;
-                    }
-
+                    let Some((actor_id, type_hash, _, is_response)) =
+                        streaming_state.metadata_for(stream_header.stream_id)
+                    else {
+                        warn!(stream_id = stream_header.stream_id, "Dropping stream chunk without start");
+                        return Ok(());
+                    };
                     if let Ok(Some((complete_data, corr_id, schema_hash))) = streaming_state
                         .add_chunk_with_correlation(stream_header, chunk_data, schema_hash)
                     {
-                        if msg_type == crate::MessageType::StreamResponseData as u8 {
+                        if is_response {
                             handle_response_message(
                                 registry,
                                 peer_addr,
@@ -676,8 +904,8 @@ pub(crate) async fn process_read_result(
                                     response_connection
                                         .and_then(|conn| conn.embedded_peer_id.as_ref())
                                 }),
-                                stream_header.actor_id,
-                                stream_header.type_hash,
+                                actor_id,
+                                type_hash,
                                 crate::AlignedBytes::from_bytes(complete_data)
                                     .expect("stream buffer must be aligned"),
                                 corr_id,
@@ -735,6 +963,11 @@ pub(crate) async fn process_read_result(
                 _ => {
                     warn!("Unknown streaming message type: 0x{:02x}", msg_type);
                 }
+            }
+        }
+        MessageReadResult::StreamAbort { stream_id, reason } => {
+            if !streaming_state.abort_stream(stream_id) {
+                warn!(stream_id, reason, "Ignoring V5 stream abort for unknown stream");
             }
         }
         MessageReadResult::Raw(_payload) => {
@@ -840,13 +1073,15 @@ async fn handle_assembled_message(
     // Complete message assembled - route to actor
     // corr_id == 0 means tell (fire-and-forget), non-zero means ask (expects response)
     let correlation_opt = if corr_id == 0 { None } else { Some(corr_id) };
-    if let Some(expected) = registry.config.schema_hash {
-        // CRITICAL_PATH: schema/version hash validation gate.
-        if schema_hash != Some(expected) {
+    if let (Some(expected), Some(received)) = (registry.config.schema_hash, schema_hash) {
+        // V5 authenticates the schema once during Hello. A value here is only
+        // present on a legacy frame, which remains useful as a defensive
+        // consistency check while old peers are retired.
+        if received != expected {
             warn!(
                 peer = %peer_addr,
                 expected = format_args!("{:016x}", expected),
-                received = schema_hash.map(|hash| format!("{hash:016x}")).unwrap_or_else(|| "none".to_string()),
+                received = format_args!("{received:016x}"),
                 "Rejected actor payload due to schema hash mismatch"
             );
             return;
@@ -1529,5 +1764,104 @@ mod tests {
             .expect("empty stream finalizes")
             .expect("empty stream yields a message");
         assert_eq!(completed.0.len(), 0);
+    }
+
+    #[test]
+    fn v5_direct_read_commits_the_final_allocation_without_a_chunk_copy() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::new(1));
+        let start = crate::StreamHeader {
+            stream_id: 77,
+            total_size: 5,
+            chunk_size: 3,
+            chunk_index: 0,
+            type_hash: 9,
+            actor_id: 11,
+        };
+        let first = state
+            .begin_v5_stream(start, 13, pool, false, 3)
+            .expect("reserve start chunk");
+        let first_ptr = {
+            let target = state.v5_chunk_target(first, 0).expect("first target");
+            target.copy_from_slice(b"abc");
+            target.as_ptr()
+        };
+        assert!(state.commit_v5_chunk(first).unwrap().is_none());
+
+        let second = state.reserve_v5_chunk(77, 1, 2).expect("reserve tail");
+        {
+            let target = state.v5_chunk_target(second, 0).expect("tail target");
+            target.copy_from_slice(b"de");
+        }
+        let complete = state
+            .commit_v5_chunk(second)
+            .unwrap()
+            .expect("complete stream");
+        assert_eq!(complete.payload.as_ref(), b"abcde");
+        assert_eq!(complete.payload.as_ref().as_ptr(), first_ptr);
+        assert_eq!((complete.payload.as_ref().as_ptr() as usize) % crate::PAYLOAD_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn v5_abort_discards_partial_assembly_without_delivery() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::new(1));
+        let reservation = state
+            .begin_v5_stream(
+                crate::StreamHeader {
+                    stream_id: 88,
+                    total_size: 4,
+                    chunk_size: 2,
+                    chunk_index: 0,
+                    type_hash: 1,
+                    actor_id: 2,
+                },
+                3,
+                pool,
+                false,
+                2,
+            )
+            .unwrap();
+        state.v5_chunk_target(reservation, 0).unwrap().copy_from_slice(b"ab");
+        assert!(state.abort_stream(88));
+        assert!(!state.abort_stream(88));
+        assert!(state.commit_v5_chunk(reservation).is_err());
+    }
+
+    #[test]
+    fn v5_direct_read_keeps_alternating_streams_byte_exact() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::new(2));
+        let reserve_start = |state: &mut StreamingState, id, pool: Arc<crate::AlignedBytesPool>| {
+            state.begin_v5_stream(
+                crate::StreamHeader {
+                    stream_id: id,
+                    total_size: 4,
+                    chunk_size: 2,
+                    chunk_index: 0,
+                    type_hash: id as u32,
+                    actor_id: id,
+                },
+                id as u32,
+                pool,
+                false,
+                2,
+            )
+        };
+        let a0 = reserve_start(&mut state, 100, pool.clone()).unwrap();
+        state.v5_chunk_target(a0, 0).unwrap().copy_from_slice(b"ab");
+        let b0 = reserve_start(&mut state, 200, pool).unwrap();
+        state.v5_chunk_target(b0, 0).unwrap().copy_from_slice(b"12");
+        assert!(state.commit_v5_chunk(b0).unwrap().is_none());
+        assert!(state.commit_v5_chunk(a0).unwrap().is_none());
+
+        let a1 = state.reserve_v5_chunk(100, 1, 2).unwrap();
+        state.v5_chunk_target(a1, 0).unwrap().copy_from_slice(b"cd");
+        let b1 = state.reserve_v5_chunk(200, 1, 2).unwrap();
+        state.v5_chunk_target(b1, 0).unwrap().copy_from_slice(b"34");
+        let b = state.commit_v5_chunk(b1).unwrap().unwrap();
+        let a = state.commit_v5_chunk(a1).unwrap().unwrap();
+        assert_eq!(a.payload.as_ref(), b"abcd");
+        assert_eq!(b.payload.as_ref(), b"1234");
     }
 }

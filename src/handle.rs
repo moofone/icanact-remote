@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use crate::aligned::{AlignedBuffer, AlignedBytes};
+use crate::aligned::AlignedBytes;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
@@ -9,7 +9,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time::{Instant, interval},
 };
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
@@ -2764,6 +2764,7 @@ async fn handle_connection(
                     &mut tls_stream,
                     negotiated_alpn.as_deref(),
                     registry.config.enable_peer_discovery,
+                    registry.config.schema_hash,
                 ),
             )
             .await
@@ -2996,6 +2997,14 @@ where
                     peer_addr = %peer_addr,
                     "Streaming frame arrived before peer GossipNodeId is known"
                 );
+                return ConnectionCloseOutcome::Normal { node_id: None };
+            }
+        }
+        Ok(MessageReadResult::StreamAbort { .. }) => {
+            if let Some(node_id) = known_node_id {
+                (node_id.to_peer_id().to_hex(), None, None)
+            } else {
+                warn!(peer_addr = %peer_addr, "StreamAbort arrived before peer GossipNodeId is known");
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
         }
@@ -3572,6 +3581,11 @@ pub(crate) enum MessageReadResult {
         stream_header: crate::StreamHeader,
         chunk_data: bytes::Bytes,
     },
+    /// Cold-path V5 stream cancellation. It carries no application payload.
+    StreamAbort {
+        stream_id: u64,
+        reason: u32,
+    },
     /// Fast-path direct ask (bypasses actor message handler)
     DirectAsk {
         correlation_id: u32,
@@ -3800,7 +3814,8 @@ pub(crate) async fn handle_response_message(
 }
 
 /// Parse a fully buffered TLS message from a pooled aligned buffer.
-pub(crate) fn parse_message_from_pooled_buffer(
+#[cfg(any())]
+pub(crate) fn parse_message_from_pooled_buffer_v4(
     buffer: crate::PooledAlignedBuffer,
     msg_len: usize,
 ) -> Result<MessageReadResult> {
@@ -4072,7 +4087,234 @@ pub(crate) fn parse_message_from_pooled_buffer(
 
 /// Read a message from a TLS reader
 #[allow(dead_code)]
-pub(crate) async fn read_message_from_tls_reader<R>(
+/// Parse a complete V5 frame. The control word owns kind and body length, so
+/// every inline payload offset is fixed by its kind rather than a type byte.
+pub(crate) fn parse_message_from_pooled_buffer(
+    buffer: crate::PooledAlignedBuffer,
+    msg_len: usize,
+) -> Result<MessageReadResult> {
+    let control = crate::framing::decode_control(
+        buffer.as_ref()[..crate::framing::LENGTH_PREFIX_LEN]
+            .try_into()
+            .expect("frame contains control word"),
+    )
+    .ok_or_else(|| invalid_v5_frame("unknown wire kind"))?;
+    if control.body_len != msg_len {
+        return Err(invalid_v5_frame("control/body length mismatch"));
+    }
+    let body = &buffer.as_ref()[crate::framing::LENGTH_PREFIX_LEN..];
+    let body_len = msg_len;
+    let raw = |buffer| {
+        MessageReadResult::Raw(Bytes::from_owner(buffer).slice(crate::framing::LENGTH_PREFIX_LEN..))
+    };
+    let aligned = |buffer, offset, len| AlignedBytes::from_pooled_buffer_range(buffer, offset, len);
+
+    match control.kind {
+        crate::framing::WireKind::ActorTell => {
+            if body.len() < crate::framing::ACTOR_TELL_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated actor tell"));
+            }
+            let actor_id = u64::from_be_bytes(body[..8].try_into().unwrap());
+            let type_hash = u32::from_be_bytes(body[8..12].try_into().unwrap());
+            Ok(MessageReadResult::Actor {
+                msg_type: crate::MessageType::ActorTell as u8,
+                correlation_id: 0,
+                actor_id,
+                type_hash,
+                schema_hash: None,
+                payload: aligned(
+                    buffer,
+                    crate::framing::ACTOR_TELL_FRAME_HEADER_LEN,
+                    body_len - crate::framing::ACTOR_TELL_HEADER_LEN,
+                )?,
+            })
+        }
+        crate::framing::WireKind::ActorAsk => {
+            if body.len() < crate::framing::ACTOR_ASK_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated actor ask"));
+            }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            if correlation_id == 0 {
+                return Err(invalid_v5_frame("actor ask has zero correlation id"));
+            }
+            let actor_id = u64::from_be_bytes(body[4..12].try_into().unwrap());
+            let type_hash = u32::from_be_bytes(body[12..16].try_into().unwrap());
+            Ok(MessageReadResult::Actor {
+                msg_type: crate::MessageType::ActorAsk as u8,
+                correlation_id,
+                actor_id,
+                type_hash,
+                schema_hash: None,
+                payload: aligned(
+                    buffer,
+                    crate::framing::ACTOR_ASK_FRAME_HEADER_LEN,
+                    body_len - crate::framing::ACTOR_ASK_HEADER_LEN,
+                )?,
+            })
+        }
+        crate::framing::WireKind::Ask => {
+            if body.len() < crate::framing::ASK_RESPONSE_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated ask"));
+            }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            let offset = crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN;
+            match decode_registry_message(&buffer.as_ref()[offset..]) {
+                Ok(message) => Ok(MessageReadResult::Gossip(message, Some(correlation_id))),
+                Err(_) => Ok(MessageReadResult::AskRaw {
+                    correlation_id,
+                    payload: aligned(
+                        buffer,
+                        offset,
+                        body_len - crate::framing::ASK_RESPONSE_HEADER_LEN,
+                    )?,
+                }),
+            }
+        }
+        crate::framing::WireKind::Response => {
+            if body.len() < crate::framing::ASK_RESPONSE_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated response"));
+            }
+            Ok(MessageReadResult::Response {
+                correlation_id: u32::from_be_bytes(body[..4].try_into().unwrap()),
+                payload: aligned(
+                    buffer,
+                    crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN,
+                    body_len - crate::framing::ASK_RESPONSE_HEADER_LEN,
+                )?,
+            })
+        }
+        crate::framing::WireKind::DirectAsk | crate::framing::WireKind::DirectResponse => {
+            if body.len() < crate::framing::DIRECT_ASK_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated direct frame"));
+            }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            let payload = aligned(
+                buffer,
+                crate::framing::DIRECT_ASK_FRAME_HEADER_LEN,
+                body_len - crate::framing::DIRECT_ASK_HEADER_LEN,
+            )?;
+            if control.kind == crate::framing::WireKind::DirectAsk {
+                Ok(MessageReadResult::DirectAsk { correlation_id, payload })
+            } else {
+                Ok(MessageReadResult::DirectResponse { correlation_id, payload })
+            }
+        }
+        crate::framing::WireKind::PubSub => {
+            if body.len() < crate::framing::PUBSUB_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated pubsub"));
+            }
+            Ok(MessageReadResult::PubSub {
+                payload: aligned(
+                    buffer,
+                    crate::framing::PUBSUB_FRAME_HEADER_LEN,
+                    body_len - crate::framing::PUBSUB_HEADER_LEN,
+                )?,
+            })
+        }
+        crate::framing::WireKind::Gossip => {
+            if body.len() < crate::framing::GOSSIP_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated gossip"));
+            }
+            match decode_registry_message(&buffer.as_ref()[crate::framing::GOSSIP_FRAME_HEADER_LEN..]) {
+                Ok(message) => Ok(MessageReadResult::Gossip(message, None)),
+                Err(_) => Ok(raw(buffer)),
+            }
+        }
+        crate::framing::WireKind::StreamStart => {
+            if body.len() < crate::framing::STREAM_REQUEST_START_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated stream start"));
+            }
+            let stream_id = u32::from_be_bytes(body[..4].try_into().unwrap()) as u64;
+            let correlation_id = u32::from_be_bytes(body[4..8].try_into().unwrap());
+            let total_size = u32::from_be_bytes(body[8..12].try_into().unwrap()) as u64;
+            let actor_id = u64::from_be_bytes(body[12..20].try_into().unwrap());
+            let type_hash = u32::from_be_bytes(body[20..24].try_into().unwrap());
+            let chunk_start = crate::framing::STREAM_REQUEST_START_FRAME_HEADER_LEN;
+            let chunk_data = Bytes::from_owner(buffer).slice(chunk_start..);
+            Ok(MessageReadResult::Streaming {
+                msg_type: crate::MessageType::StreamStart as u8,
+                correlation_id,
+                schema_hash: None,
+                stream_header: crate::StreamHeader {
+                    stream_id,
+                    total_size,
+                    chunk_size: chunk_data.len() as u32,
+                    chunk_index: 0,
+                    type_hash,
+                    actor_id,
+                },
+                chunk_data,
+            })
+        }
+        crate::framing::WireKind::StreamResponseStart => {
+            if body.len() < crate::framing::STREAM_RESPONSE_START_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated stream response start"));
+            }
+            let stream_id = u32::from_be_bytes(body[..4].try_into().unwrap()) as u64;
+            let correlation_id = u32::from_be_bytes(body[4..8].try_into().unwrap());
+            let total_size = u32::from_be_bytes(body[8..12].try_into().unwrap()) as u64;
+            let chunk_start = crate::framing::STREAM_RESPONSE_START_FRAME_HEADER_LEN;
+            let chunk_data = Bytes::from_owner(buffer).slice(chunk_start..);
+            Ok(MessageReadResult::Streaming {
+                msg_type: crate::MessageType::StreamResponseStart as u8,
+                correlation_id,
+                schema_hash: None,
+                stream_header: crate::StreamHeader {
+                    stream_id,
+                    total_size,
+                    chunk_size: chunk_data.len() as u32,
+                    chunk_index: 0,
+                    type_hash: 0,
+                    actor_id: 0,
+                },
+                chunk_data,
+            })
+        }
+        crate::framing::WireKind::StreamData | crate::framing::WireKind::StreamResponseData => {
+            if body.len() < crate::framing::STREAM_DATA_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated stream data"));
+            }
+            let stream_id = u32::from_be_bytes(body[..4].try_into().unwrap()) as u64;
+            let chunk_index = u32::from_be_bytes(body[4..8].try_into().unwrap());
+            let chunk_start = crate::framing::STREAM_DATA_FRAME_HEADER_LEN;
+            let chunk_data = Bytes::from_owner(buffer).slice(chunk_start..);
+            Ok(MessageReadResult::Streaming {
+                msg_type: if control.kind == crate::framing::WireKind::StreamData {
+                    crate::MessageType::StreamData as u8
+                } else {
+                    crate::MessageType::StreamResponseData as u8
+                },
+                correlation_id: 0,
+                schema_hash: None,
+                stream_header: crate::StreamHeader {
+                    stream_id,
+                    total_size: 0,
+                    chunk_size: chunk_data.len() as u32,
+                    chunk_index,
+                    type_hash: 0,
+                    actor_id: 0,
+                },
+                chunk_data,
+            })
+        }
+        crate::framing::WireKind::StreamAbort => {
+            if body.len() != crate::framing::STREAM_DATA_HEADER_LEN {
+                return Err(invalid_v5_frame("invalid stream abort length"));
+            }
+            Ok(MessageReadResult::StreamAbort {
+                stream_id: u32::from_be_bytes(body[..4].try_into().unwrap()) as u64,
+                reason: u32::from_be_bytes(body[4..8].try_into().unwrap()),
+            })
+        }
+    }
+}
+
+fn invalid_v5_frame(message: &str) -> GossipError {
+    GossipError::Network(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+}
+
+#[cfg(any())]
+pub(crate) async fn read_message_from_tls_reader_v4<R>(
     reader: &mut R,
     max_message_size: usize,
     aligned_pool: Option<&Arc<crate::AlignedBytesPool>>,
@@ -4375,6 +4617,41 @@ where
     }
 }
 
+/// Read one complete V5 frame for the synchronous TLS connection path.
+pub(crate) async fn read_message_from_tls_reader<R>(
+    reader: &mut R,
+    max_message_size: usize,
+    aligned_pool: Option<&Arc<crate::AlignedBytesPool>>,
+) -> Result<MessageReadResult>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut control = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+    reader.read_exact(&mut control).await?;
+    let decoded = crate::framing::decode_control(control)
+        .ok_or_else(|| invalid_v5_frame("unknown wire kind"))?;
+    if decoded.body_len == 0 || decoded.body_len > max_message_size {
+        return Err(GossipError::MessageTooLarge {
+            size: decoded.body_len,
+            max: max_message_size,
+        });
+    }
+    let pool = aligned_pool
+        .cloned()
+        .unwrap_or_else(|| Arc::new(crate::AlignedBytesPool::default()));
+    let mut buffer = unsafe {
+        crate::PooledAlignedBuffer::with_len_uninit(
+            crate::framing::LENGTH_PREFIX_LEN + decoded.body_len,
+            pool,
+        )
+    };
+    buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&control);
+    reader
+        .read_exact(&mut buffer.as_mut_slice()[crate::framing::LENGTH_PREFIX_LEN..])
+        .await?;
+    parse_message_from_pooled_buffer(buffer, decoded.body_len)
+}
+
 #[cfg(test)]
 mod framing_tests {
     use super::{MessageReadResult, read_message_from_tls_reader};
@@ -4555,21 +4832,27 @@ mod framing_tests {
     }
 
     #[tokio::test]
+    async fn stream_abort_parses_as_control_not_raw_payload() {
+        let header = framing::write_stream_abort_header(17, 23);
+        match read_frame(header.to_vec()).await {
+            MessageReadResult::StreamAbort { stream_id, reason } => {
+                assert_eq!(stream_id, 17);
+                assert_eq!(reason, 23);
+            }
+            _ => panic!("unexpected result"),
+        }
+    }
+
+    #[tokio::test]
     async fn actor_tell_parses_with_reordered_header() {
         let payload_bytes = b"actor_payload";
         let actor_id = 0x0102030405060708u64;
         let type_hash = 0x11223344u32;
 
-        // Wire format: [len:4][type:1][correlation_id:4][schema/reserved:11][actor_id:8][type_hash:4][payload:N]
-        let total_len = framing::ACTOR_HEADER_LEN + payload_bytes.len();
-        let mut frame = Vec::with_capacity(framing::LENGTH_PREFIX_LEN + total_len);
-        frame.extend_from_slice(&(total_len as u32).to_be_bytes()); // 4 bytes: length prefix
-        frame.push(MessageType::ActorTell as u8); // 1 byte: message type
-        frame.extend_from_slice(&0u32.to_be_bytes()); // 4 bytes: correlation_id
-        frame.extend_from_slice(&[0u8; 11]); // schema hash + reserved alignment bytes
-        frame.extend_from_slice(&actor_id.to_be_bytes()); // 8 bytes: actor_id
-        frame.extend_from_slice(&type_hash.to_be_bytes()); // 4 bytes: type_hash
-        frame.extend_from_slice(payload_bytes); // N bytes: payload
+        let header = framing::write_actor_tell_header(actor_id, type_hash, payload_bytes.len());
+        let mut frame = Vec::with_capacity(header.len() + payload_bytes.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(payload_bytes);
 
         match read_frame(frame).await {
             MessageReadResult::Actor {
