@@ -25,6 +25,7 @@ pub struct ReadContext {
 #[cfg(test)]
 mod read_pipeline_tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use tokio::io::AsyncWriteExt;
 
@@ -59,6 +60,14 @@ mod read_pipeline_tests {
             .expect_err("zero-length frames must be rejected before entering ReadBody");
         assert!(matches!(error, crate::GossipError::Network(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
     }
+
+    #[test]
+    fn direct_response_stream_ids_restart_after_wrap() {
+        let previous = super::NEXT_DIRECT_RESPONSE_STREAM_ID.swap(u32::MAX, Ordering::SeqCst);
+        assert_eq!(super::allocate_direct_response_stream_id().unwrap(), u32::MAX);
+        assert_eq!(super::allocate_direct_response_stream_id().unwrap(), 1);
+        super::NEXT_DIRECT_RESPONSE_STREAM_ID.store(previous, Ordering::SeqCst);
+    }
 }
 
 enum ReadState {
@@ -90,16 +99,22 @@ enum ReadState {
 }
 
 // Direct responses are emitted by the IO owner rather than a public
-// `LockFreeStreamHandle` method. Keep their IDs monotonic as well; global
-// uniqueness is stronger than the required per-direction uniqueness.
+// `LockFreeStreamHandle` method. The wire requires uniqueness only for live
+// streams in one direction, so reserve zero and deliberately restart at one
+// after the u32 namespace wraps instead of poisoning every connection.
 static NEXT_DIRECT_RESPONSE_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 
 fn allocate_direct_response_stream_id() -> Result<u32> {
-    let id = NEXT_DIRECT_RESPONSE_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-    if id == 0 || id == u32::MAX {
-        return Err(GossipError::Shutdown);
+    loop {
+        let id = NEXT_DIRECT_RESPONSE_STREAM_ID.load(Ordering::Relaxed);
+        let next = if id == u32::MAX || id == 0 { 1 } else { id + 1 };
+        if NEXT_DIRECT_RESPONSE_STREAM_ID
+            .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(if id == 0 { 1 } else { id });
+        }
     }
-    Ok(id)
 }
 
 fn stream_meta_len(kind: crate::framing::WireKind) -> Option<usize> {
