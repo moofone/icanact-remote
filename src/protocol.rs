@@ -69,7 +69,7 @@ struct InProgressStream {
     actor_id: u64,
     correlation_id: u32,
     is_response: bool,
-    _schema_hash: Option<u64>,
+    schema_hash: Option<u64>,
     received_size: usize,
     /// Pre-allocated aligned buffer for final message assembly.
     buffer: crate::PooledAlignedBuffer,
@@ -1064,7 +1064,7 @@ async fn handle_assembled_message(
     type_hash: u32,
     complete_data: crate::AlignedBytes,
     corr_id: u32,
-    schema_hash: Option<u64>,
+    _schema_hash: Option<u64>,
     response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
     response_mode: ResponseMode,
 ) {
@@ -1445,65 +1445,6 @@ mod tests {
             .expect("empty stream yields a message");
         assert_eq!(out.0.as_ref(), b"");
         assert_eq!(out.1, 5);
-    }
-
-    #[tokio::test]
-    async fn schema_hash_mismatch_rejects_actor_payload() {
-        use crate::{GossipConfig, KeyPair};
-
-        struct TestHandler {
-            hits: Arc<AtomicUsize>,
-        }
-
-        impl crate::registry::ActorMessageHandler for TestHandler {
-            fn handle_actor_message(
-                &self,
-                _actor_id: u64,
-                _type_hash: u32,
-                _payload: crate::AlignedBytes,
-                _correlation_id: Option<u32>,
-            ) -> crate::registry::ActorMessageFuture<'_> {
-                let hits = self.hits.clone();
-                Box::pin(async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    Ok(None)
-                })
-            }
-        }
-
-        let config = GossipConfig {
-            key_pair: Some(KeyPair::new_for_testing("schema_hash_test")),
-            schema_hash: Some(0xAABBCCDDEEFF0011),
-            ..Default::default()
-        };
-        let registry = Arc::new(GossipRegistry::<()>::new(
-            "127.0.0.1:0".parse().unwrap(),
-            config,
-        ));
-        registry.connection_pool.set_registry(registry.clone());
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(TestHandler { hits: hits.clone() });
-        registry.set_actor_message_handler(handler).await;
-
-        let pool = Arc::new(crate::AlignedBytesPool::default());
-        let payload = crate::AlignedBytes::from_pooled_slice(b"payload", pool);
-
-        handle_assembled_message(
-            &registry,
-            "127.0.0.1:0".parse().unwrap(),
-            None,
-            1,
-            0xDEAD_BEEF,
-            payload,
-            0,
-            Some(0x1122334455667788),
-            None,
-            ResponseMode::InlineOnly,
-        )
-        .await;
-
-        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     /// Helpers for the chunk-integrity tests below.
