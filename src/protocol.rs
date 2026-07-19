@@ -983,8 +983,7 @@ pub(crate) async fn process_read_result(
             payload,
         } => {
             // Fast-path DirectAsk - bypasses handler and RegistryMessage overhead
-            // V4 wire format carries a 32-bit correlation id.
-            // But 'payload' here contains only the [payload:N] part
+            // The payload contains only the direct frame body.
             // For benchmarking: echo the payload back immediately using DirectResponse
             let header =
                 crate::framing::write_direct_response_header(correlation_id, payload.len());
@@ -1009,8 +1008,7 @@ pub(crate) async fn process_read_result(
         } => {
             // Fast-path DirectResponse
             // The payload is the raw response data (no length prefix)
-            // V4 wire format carries a 32-bit correlation id.
-            // But 'payload' here contains only the [payload:N] part
+            // The payload contains only the direct frame body.
             // Deliver to correlation tracker - zero-copy using the payload directly
             handle_response_message(
                 registry,

@@ -1,7 +1,7 @@
 //! Hello handshake protocol for peer capability negotiation
 //!
 //! This module implements the Hello handshake that establishes peer capabilities
-//! at connection time for TLS-only v4 peers.
+//! at connection time for V5 peers.
 
 use crate::{GossipError, Result};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -13,14 +13,6 @@ use tracing::debug;
 const HELLO_MAX_SIZE: usize = 1024;
 const HELLO_TIMEOUT_MS: u64 = 3_000;
 pub const ALPN_ICANACT_V5: &[u8] = b"icanact-remote-v5";
-pub const ALPN_ICANACT_V4: &[u8] = b"icanact-remote-v4";
-
-static LEGACY_ALPN_REJECTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub fn legacy_alpn_rejected() -> u64 {
-    LEGACY_ALPN_REJECTED.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Protocol version constants
 pub const PROTOCOL_VERSION_V5: u16 = 5;
@@ -115,12 +107,7 @@ impl PeerCapabilities {
 
     /// Create capabilities from a Hello exchange.
     ///
-    /// Takes the intersection of features. `PROTOCOL_VERSION_V4` is the only
-    /// protocol version that exists and `perform_hello_handshake` rejects any
-    /// Hello whose version differs from `CURRENT_PROTOCOL_VERSION`, so the
-    /// negotiated version is always `PROTOCOL_VERSION_V4` (the former
-    /// `min()` negotiation and version guards below were
-    /// unreachable).
+    /// Takes the intersection of features for the single V5 wire version.
     pub fn from_hello_exchange(local: &Hello, remote: &Hello) -> Self {
         let features = Self::features_mask(&local.features) & Self::features_mask(&remote.features);
         Self {
@@ -216,12 +203,6 @@ where
         GossipError::TlsHandshakeFailed("missing ALPN negotiation result".to_string())
     })?;
 
-    if alpn == ALPN_ICANACT_V4 {
-        LEGACY_ALPN_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Err(GossipError::TlsHandshakeFailed(
-            "legacy V4 ALPN selected; V5 frames required".to_string(),
-        ));
-    }
     if alpn != ALPN_ICANACT_V5 {
         return Err(GossipError::TlsHandshakeFailed(format!(
             "unsupported ALPN: {}",
@@ -418,17 +399,6 @@ mod tests {
             }
             other => panic!("expected TlsHandshakeFailed, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn v4_alpn_is_counted_and_rejected_before_hello() {
-        let (mut client, _server) = tokio::io::duplex(64);
-        let before = legacy_alpn_rejected();
-        let err = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V4), false, None)
-            .await
-            .expect_err("V4 ALPN must be rejected before Hello");
-        assert!(matches!(err, GossipError::TlsHandshakeFailed(_)));
-        assert_eq!(legacy_alpn_rejected(), before + 1);
     }
 
     #[tokio::test]
