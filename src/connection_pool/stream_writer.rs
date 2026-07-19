@@ -2843,23 +2843,11 @@ impl LockFreeStreamHandle {
             payload,
         };
 
-        // Prefer the streaming queue for vectored operations; if it's full, fall back
-        // to the normal payload queue (still zero-copy: header + payload remain `Bytes`).
-        match self
-            .streaming_queue
-            .try_push(StreamingCommand::VectoredWrite(command))
-        {
-            Ok(()) => Ok(()),
-            Err(StreamingTryPushError::Full(StreamingCommand::VectoredWrite(vectored_cmd))) => {
-                self.enqueue_write(WritePayload::HeaderPayload {
-                    header: vectored_cmd.header.into_bytes(),
-                    payload: vectored_cmd.payload,
-                })
-                .await
-            }
-            Err(StreamingTryPushError::Closed(addr)) => Err(GossipError::ConnectionClosed(addr)),
-            Err(StreamingTryPushError::Full(_)) => Err(GossipError::Shutdown),
-        }
+        // A stream's StartData and Data frames must share one FIFO queue.
+        // Waiting for capacity preserves frame order under backpressure.
+        self.streaming_queue
+            .push(StreamingCommand::VectoredWrite(command))
+            .await
     }
 
     /// Send owned chunks without copying - optimal for streaming large messages
