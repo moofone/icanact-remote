@@ -2527,38 +2527,36 @@ impl LockFreeStreamHandle {
             max: u32::MAX as usize,
         })?;
         let first_len = payload.len().min(chunk_size);
-        self.write_bytes_vectored(
-            crate::framing::write_stream_request_start_header(
+        self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
+            header: InlineFrameHeader::from_array(crate::framing::write_stream_request_start_header(
                 stream_id,
                 0,
                 total_size,
                 actor_id,
                 type_hash,
                 first_len,
-            ),
-            payload.slice(..first_len),
-        )
-        .await?;
+            )),
+            payload: payload.slice(..first_len),
+        })).await?;
         let mut offset = first_len;
         let mut index = 1u32;
         while offset < payload.len() {
             let end = (offset + chunk_size).min(payload.len());
-            self.write_bytes_vectored(
-                crate::framing::write_stream_data_header(
+            self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
+                header: InlineFrameHeader::from_array(crate::framing::write_stream_data_header(
                     false,
                     stream_id,
                     index,
                     end - offset,
-                ),
-                payload.slice(offset..end),
-            )
-            .await?;
+                )),
+                payload: payload.slice(offset..end),
+            })).await?;
             offset = end;
             index = index.checked_add(1).ok_or_else(|| GossipError::Network(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "stream chunk index exhausted"),
             ))?;
         }
-        Ok(())
+        self.streaming_queue.push(StreamingCommand::Flush).await
     }
 
     /// Copying convenience wrapper for callers that only own a slice.

@@ -1333,11 +1333,12 @@ async fn write_streaming_response_direct_pooled<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let max_chunk = max_message_size.saturating_sub(crate::framing::STREAM_DATA_HEADER_LEN);
+    let max_chunk = max_message_size
+        .saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
     if max_chunk == 0 {
         return Err(GossipError::InvalidConfig(format!(
             "max_message_size={} too small for streaming (overhead={})",
-            max_message_size, crate::framing::STREAM_DATA_HEADER_LEN
+            max_message_size, crate::framing::STREAM_RESPONSE_START_HEADER_LEN
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
