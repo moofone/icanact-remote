@@ -2359,8 +2359,9 @@ impl LockFreeStreamHandle {
     }
 
     fn max_stream_chunk_size(&self) -> Result<usize> {
-        // V5 data frames carry only stream_id and chunk_index before bytes.
-        const STREAM_FRAME_OVERHEAD: usize = crate::framing::STREAM_DATA_HEADER_LEN;
+        // The first request frame has the largest V5 stream metadata header;
+        // every chunk must fit even when it is carried by StreamStartData.
+        const STREAM_FRAME_OVERHEAD: usize = crate::framing::STREAM_REQUEST_START_HEADER_LEN;
 
         let max_chunk = self.max_message_size.saturating_sub(STREAM_FRAME_OVERHEAD);
         if max_chunk == 0 {
