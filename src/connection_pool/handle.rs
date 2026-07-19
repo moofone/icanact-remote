@@ -1280,14 +1280,27 @@ impl<T> ConnectionHandle<T> {
                 index,
                 end - offset,
             );
-            stream_handle.write_bytes_vectored(
+            if let Err(error) = stream_handle.write_bytes_vectored(
                 header,
                 payload.slice(offset..end),
-            ).await?;
+            ).await {
+                // The StartData frame has already made the peer reserve the
+                // final assembly buffer. Best-effort abort releases it now
+                // instead of waiting for the idle reaper.
+                let _ = stream_handle.abort_stream(stream_id, 1).await;
+                return Err(error);
+            }
             offset = end;
-            index = index.checked_add(1).ok_or_else(|| GossipError::Network(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "stream chunk index exhausted"),
-            ))?;
+            index = match index.checked_add(1) {
+                Some(index) => index,
+                None => {
+                    let _ = stream_handle.abort_stream(stream_id, 2).await;
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stream chunk index exhausted",
+                    )));
+                }
+            };
         }
         drop(gate_guard);
         let response = self.correlation.wait_for_response(correlation_id, timeout).await?;
