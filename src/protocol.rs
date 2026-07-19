@@ -12,6 +12,15 @@ use crate::{
     registry::{ActorResponse, GossipRegistry, RegistryMessage},
 };
 
+/// How long an in-progress stream may go without receiving a chunk before it is
+/// reaped. Measured from the last chunk, not from the start, so a legitimately
+/// slow or large transfer is not evicted mid-flight.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Absolute ceiling on a single stream's lifetime, so a peer cannot hold a slot
+/// open forever by trickling one chunk just inside the idle timeout.
+const MAX_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Per-connection streaming state for managing partial streams
 #[derive(Debug)]
 pub struct StreamingState {
@@ -44,8 +53,10 @@ struct InProgressStream {
     expected_chunks: Option<usize>,
     /// Count of chunk indices seen more than once, for diagnostics.
     duplicate_chunks: u32,
-    /// Timestamp when stream started (for stale cleanup)
+    /// Timestamp when stream started (bounds total lifetime).
     started_at: std::time::Instant,
+    /// Timestamp of the most recent chunk (drives idle reaping).
+    last_activity: std::time::Instant,
 }
 
 impl InProgressStream {
@@ -168,6 +179,7 @@ impl StreamingState {
                 expected_chunks: None,
                 duplicate_chunks: 0,
                 started_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
             };
             self.active_streams.insert(header.stream_id, stream);
         }
@@ -311,6 +323,8 @@ impl StreamingState {
         // CRITICAL_PATH: write chunk directly into final buffer.
         stream.buffer.as_mut_slice()[offset..end].copy_from_slice(&chunk_data);
         stream.received_size += chunk_data.len();
+        // Progress, so the idle reaper must not treat this stream as stalled.
+        stream.last_activity = std::time::Instant::now();
 
         if stream.all_chunks_received() {
             self.assemble_complete_message_with_correlation(header.stream_id)
@@ -391,27 +405,60 @@ impl StreamingState {
         Ok(Some((complete_data, correlation_id, schema_hash)))
     }
 
-    /// Clean up stale streams that have been incomplete for too long.
-    pub fn cleanup_stale(&mut self) {
-        use std::time::Duration;
-        const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Number of streams currently in progress.
+    pub fn active_stream_count(&self) -> usize {
+        self.active_streams.len()
+    }
 
+    /// Clean up in-progress streams that have stopped making progress.
+    ///
+    /// Reaping is keyed on *idle* time, not age since the stream started. A
+    /// large or slow-but-healthy transfer legitimately runs longer than the
+    /// timeout, and evicting it mid-flight fails the sender's ask with no
+    /// server-side diagnostic. `MAX_STREAM_LIFETIME` remains as a backstop so a
+    /// peer cannot hold a slot open indefinitely by trickling one chunk forever.
+    pub fn cleanup_stale(&mut self) {
+        self.cleanup_stale_with(STREAM_IDLE_TIMEOUT, MAX_STREAM_LIFETIME);
+    }
+
+    /// `cleanup_stale` with explicit bounds, so tests do not have to wait out
+    /// the production timeouts.
+    pub(crate) fn cleanup_stale_with(
+        &mut self,
+        idle_timeout: std::time::Duration,
+        max_lifetime: std::time::Duration,
+    ) {
         let before_count = self.active_streams.len();
 
         self.active_streams.retain(|stream_id, stream| {
+            let idle = stream.last_activity.elapsed();
             let age = stream.started_at.elapsed();
-            if age > STREAM_TIMEOUT {
+
+            if idle > idle_timeout {
                 warn!(
                     stream_id = stream_id,
+                    idle_secs = idle.as_secs(),
                     age_secs = age.as_secs(),
                     received_size = stream.received_size,
                     expected_size = stream.total_size,
-                    "Cleaning up stale stream - StreamEnd never arrived"
+                    "Cleaning up idle stream - no chunk arrived within the idle timeout"
                 );
-                false // Remove this entry
-            } else {
-                true // Keep this entry
+                return false;
             }
+
+            if age > max_lifetime {
+                warn!(
+                    stream_id = stream_id,
+                    idle_secs = idle.as_secs(),
+                    age_secs = age.as_secs(),
+                    received_size = stream.received_size,
+                    expected_size = stream.total_size,
+                    "Cleaning up stream that exceeded its maximum lifetime"
+                );
+                return false;
+            }
+
+            true
         });
 
         let removed = before_count - self.active_streams.len();
@@ -1387,6 +1434,85 @@ mod tests {
         assert!(
             chunk(&mut state, 4, total, 7, &payload).is_err(),
             "chunk_index 7 of a two-chunk stream must be rejected"
+        );
+    }
+
+    /// A stream that keeps receiving chunks must not be reaped just because it
+    /// has been running a long time. Reaping keyed on age-since-start killed
+    /// legitimately slow or large transfers mid-flight, failing the sender's
+    /// ask with no server-side diagnostic.
+    #[test]
+    fn actively_progressing_stream_survives_past_the_idle_timeout() {
+        use chunk_integrity::{STRIDE, chunk, start};
+        use std::time::Duration;
+
+        let idle_timeout = Duration::from_millis(40);
+        let max_lifetime = Duration::from_secs(60);
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 4) as u64;
+        start(&mut state, 10, total);
+
+        // Trickle chunks, each comfortably inside the idle window, but let the
+        // stream's total age pass the idle timeout several times over.
+        for idx in 0..4u32 {
+            std::thread::sleep(Duration::from_millis(15));
+            let payload = [0x5Au8; STRIDE];
+            let _ = chunk(&mut state, 10, total, idx, &payload);
+            state.cleanup_stale_with(idle_timeout, max_lifetime);
+            if idx < 3 {
+                assert_eq!(
+                    state.active_stream_count(),
+                    1,
+                    "a stream that received a chunk {}ms ago was reaped while still progressing",
+                    15
+                );
+            }
+        }
+    }
+
+    /// The reaper must still collect a stream that genuinely stalls.
+    #[test]
+    fn idle_stream_is_still_reaped() {
+        use chunk_integrity::{STRIDE, start};
+        use std::time::Duration;
+
+        let mut state = StreamingState::new();
+        start(&mut state, 11, (STRIDE * 2) as u64);
+        assert_eq!(state.active_stream_count(), 1);
+
+        std::thread::sleep(Duration::from_millis(30));
+        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(60));
+
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "a stream with no activity past the idle timeout must be reaped"
+        );
+    }
+
+    /// A peer must not be able to hold a slot open forever by trickling chunks
+    /// just inside the idle window.
+    #[test]
+    fn stream_exceeding_max_lifetime_is_reaped_even_while_progressing() {
+        use chunk_integrity::{STRIDE, chunk, start};
+        use std::time::Duration;
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 4) as u64;
+        start(&mut state, 12, total);
+
+        std::thread::sleep(Duration::from_millis(20));
+        let payload = [0x5Au8; STRIDE];
+        let _ = chunk(&mut state, 12, total, 0, &payload);
+
+        // Chunk just arrived, so it is not idle -- but its lifetime is spent.
+        state.cleanup_stale_with(Duration::from_secs(60), Duration::from_millis(10));
+
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "the absolute lifetime backstop must still reap a trickling stream"
         );
     }
 
