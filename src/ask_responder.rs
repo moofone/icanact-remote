@@ -71,6 +71,24 @@ impl AskResponseSink {
         }
     }
 
+    fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
+        match self {
+            Self::StreamHandle(stream_handle) => {
+                let header = framing::write_ask_response_header(
+                    crate::MessageType::Response,
+                    correlation_id,
+                    payload.len(),
+                );
+                stream_handle.write_header_and_payload_control_inline_immediate_nonblocking(
+                    header, 16, payload,
+                )
+            }
+            Self::DeferredWriter(writer) => {
+                writer.try_send_response_bytes_immediate(correlation_id, payload)
+            }
+        }
+    }
+
     async fn send_response_pooled(
         &self,
         correlation_id: u32,
@@ -223,6 +241,18 @@ impl AskResponder {
             .try_send_response_bytes(self.correlation_id, response)
     }
 
+    /// Try to reply through the connection's immediate nonblocking queue.
+    ///
+    /// This is intended for small control-plane responses whose delivery must
+    /// not be starved by ordinary gossip/control traffic. It still never
+    /// awaits or creates a detached task, and it retains the single-reply
+    /// guard shared by cloned responders.
+    pub fn try_reply_bytes_immediate(self, response: Bytes) -> Result<()> {
+        claim_reply(&self.used)?;
+        self.sink
+            .try_send_response_bytes_immediate(self.correlation_id, response)
+    }
+
     pub async fn reply_typed<M>(self, value: &M) -> Result<()>
     where
         M: crate::typed::WireEncode,
@@ -241,6 +271,20 @@ impl std::fmt::Debug for AskResponder {
         f.debug_struct("AskResponder")
             .field("correlation_id", &self.correlation_id)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::AskResponder;
+    use bytes::Bytes;
+
+    // Authority-voter replies must have an explicit immediate, nonblocking
+    // response path so a saturated ordinary control queue cannot starve the
+    // quorum round-trip.
+    #[allow(dead_code)]
+    fn immediate_reply_api_is_available(responder: AskResponder) {
+        let _ = responder.try_reply_bytes_immediate(Bytes::new());
     }
 }
 
@@ -284,6 +328,16 @@ impl ResponseWriter {
         );
         self.stream_handle()?
             .write_header_and_payload_control_inline_nonblocking(header, 16, payload)
+    }
+
+    fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
+        let header = framing::write_ask_response_header(
+            crate::MessageType::Response,
+            correlation_id,
+            payload.len(),
+        );
+        self.stream_handle()?
+            .write_header_and_payload_control_inline_immediate_nonblocking(header, 16, payload)
     }
 
     async fn send_response_pooled(
