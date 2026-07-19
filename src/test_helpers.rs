@@ -71,6 +71,69 @@ pub fn fire_pubsub_subscriber_rmw_hook() {
     }
 }
 
+/// Hook type fired around every `RoutedPubSub::note_interest` background
+/// registry dispatch (register/unregister), keyed by `(topic_key,
+/// present)`. Tests install this to pause a dispatch mid-flight — right
+/// before the registry call it is about to make — so they can force a
+/// specific interleaving between two temporally-overlapping interest
+/// transitions deterministically instead of relying on incidental
+/// scheduler timing.
+///
+/// Unconditionally compiled (mirrors `set_transport_lifecycle_recorder` in
+/// `lifecycle.rs`): the fast, uninstalled path is a single relaxed atomic
+/// load, so both unit tests (`cfg(test)`) and integration tests (which link
+/// the crate without `cfg(test)`) can install it under a plain
+/// `cargo test`, with no `test-helpers` feature required.
+pub type InterestDispatchHook = std::sync::Arc<
+    dyn Fn(u64, bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+static PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+static PUBSUB_INTEREST_DISPATCH_HOOK: OnceLock<Mutex<Option<InterestDispatchHook>>> =
+    OnceLock::new();
+
+fn interest_dispatch_hook_slot() -> &'static Mutex<Option<InterestDispatchHook>> {
+    PUBSUB_INTEREST_DISPATCH_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Installs (replacing any previous) process-wide interest-dispatch hook.
+/// Unlike the subscriber RMW hook this is re-installable, since tests that
+/// exercise this path run serially against a fresh, per-test topic key.
+pub fn install_pubsub_interest_dispatch_hook(hook: InterestDispatchHook) {
+    *interest_dispatch_hook_slot()
+        .lock()
+        .expect("interest dispatch hook mutex poisoned") = Some(hook);
+    PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn clear_pubsub_interest_dispatch_hook() {
+    *interest_dispatch_hook_slot()
+        .lock()
+        .expect("interest dispatch hook mutex poisoned") = None;
+    PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Fires the installed interest-dispatch hook, if any, awaiting the future
+/// it returns. Called by `RoutedPubSub`'s interest-dispatch loop
+/// immediately before issuing the register/unregister registry call.
+#[inline]
+pub async fn fire_pubsub_interest_dispatch_hook(topic_key: u64, present: bool) {
+    if !PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let hook = interest_dispatch_hook_slot()
+        .lock()
+        .expect("interest dispatch hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(topic_key, present).await;
+    }
+}
+
 pub async fn wait_for_raw_payload(timeout: Duration) -> Option<Bytes> {
     let capture = raw_capture();
     {

@@ -412,7 +412,24 @@ impl Drop for PubSubSubscription {
 #[derive(Default)]
 struct InterestState {
     local_counts: HashMap<TopicKey, usize>,
+    /// Desired-state generation per topic: bumped on every 0->1 / 1->0
+    /// local-subscriber-count transition. Shares its lifecycle with
+    /// `local_counts` — an entry is only removed once the dispatch loop in
+    /// `drive_interest_dispatch` has converged on the "absent" state for
+    /// that topic, so a topic that churns to zero subscribers does not
+    /// leak an entry here forever (contrast the pre-fix version of this
+    /// map, which only ever inserted).
     generations: HashMap<TopicKey, u64>,
+    /// Topics with a `note_interest` register/unregister dispatch loop
+    /// currently running. Single-flights dispatch per topic: while a loop
+    /// is in flight, further transitions only bump `generations` (observed
+    /// by the in-flight loop's post-await revalidation) instead of
+    /// spawning a second, independently-racing task. This is what
+    /// eliminates the TOCTOU between two temporally-overlapping
+    /// register/unregister calls for the same topic — there is only ever
+    /// one registry call for a topic in flight at a time, and the last one
+    /// dispatched is always for the most recent generation.
+    dispatch_in_flight: HashSet<TopicKey>,
 }
 
 pub struct RoutedPubSub {
@@ -460,6 +477,15 @@ pub struct RoutedPubSub {
 fn subscriber_rmw_window_hook() {
     #[cfg(any(test, feature = "test-helpers"))]
     crate::test_helpers::fire_pubsub_subscriber_rmw_hook();
+}
+
+/// Fires the test-only interest-dispatch hook (see
+/// `test_helpers::fire_pubsub_interest_dispatch_hook`) immediately before
+/// a `note_interest` background task issues its register/unregister
+/// registry call. Compiles to a no-op in production builds.
+#[inline]
+async fn interest_dispatch_hook(topic_key: u64, present: bool) {
+    crate::test_helpers::fire_pubsub_interest_dispatch_hook(topic_key, present).await;
 }
 
 impl RoutedPubSub {
@@ -1299,7 +1325,7 @@ impl RoutedPubSub {
     }
 
     fn note_interest(&self, topic_key: u64, present: bool) {
-        let (prev, _next, generation) = {
+        let should_spawn = {
             let mut state = match self.interest_state.lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
@@ -1316,7 +1342,8 @@ impl RoutedPubSub {
                 state.local_counts.insert(topic_key, next);
             }
 
-            let generation = if (present && prev == 0) || (!present && prev == 1) {
+            let is_transition = (present && prev == 0) || (!present && prev == 1);
+            if is_transition {
                 let next_generation = state
                     .generations
                     .get(&topic_key)
@@ -1324,76 +1351,129 @@ impl RoutedPubSub {
                     .unwrap_or(0)
                     .saturating_add(1);
                 state.generations.insert(topic_key, next_generation);
-                next_generation
-            } else {
-                state.generations.get(&topic_key).copied().unwrap_or(0)
-            };
-            (prev, next, generation)
+            }
+
+            // Single-flight per topic: if a dispatch loop is already
+            // running for this topic, do not spawn a second, independent
+            // task that would race the first on the registry call. The
+            // generation bump above is enough — the in-flight loop
+            // re-reads `local_counts`/`generations` after every registry
+            // `.await` and keeps dispatching until it observes no change,
+            // so it will pick up this transition itself. This is what
+            // makes the last dispatched registry call always correspond
+            // to the most recent desired state (R6a fix).
+            is_transition && state.dispatch_in_flight.insert(topic_key)
         };
 
-        if (present && prev == 0) || (!present && prev == 1) {
+        if should_spawn {
             let registry = Arc::clone(&self.registry);
             let peer = self.local_peer_id.clone();
             let interest_state = Arc::clone(&self.interest_state);
             let runtime = tokio::runtime::Handle::try_current().ok();
             spawn_pubsub_background(runtime.as_ref(), async move {
-                let (current_present, current_generation) = {
-                    let state = match interest_state.lock() {
-                        Ok(g) => g,
-                        Err(e) => e.into_inner(),
-                    };
-                    (
-                        state.local_counts.get(&topic_key).copied().unwrap_or(0) > 0,
-                        state.generations.get(&topic_key).copied().unwrap_or(0),
-                    )
-                };
-                if current_present != present || current_generation != generation {
-                    return;
-                }
-
-                let name = interest_name(topic_key, &peer);
-                let result = if present {
-                    // Advertise through `advertised_addr()`, never the raw
-                    // `bind_addr` — a node bound to a wildcard address
-                    // (`0.0.0.0:<port>`, a normal deployment pattern) would
-                    // otherwise gossip an undialable interest-actor
-                    // location, starving peers of a route to it (the
-                    // wildcard-advertise reconnect-storm class of bug; see
-                    // `tests/wildcard_advertise_interest_storm.rs`). When
-                    // no `GossipConfig::advertise_address` override is
-                    // configured this can still resolve to an unspecified
-                    // IP; that is deliberately not rejected here.
-                    // Registration proceeds and the receiving side's
-                    // `validate_remote_actor_addr` (`registry.rs`) rewrites
-                    // an unspecified advertised IP using the gossiping
-                    // peer's own verified address — the same trust anchor
-                    // `resolve_peer_addr_checked` already uses for peer
-                    // bind-address resolution — so wildcard-bound nodes
-                    // work correctly with zero required configuration,
-                    // exactly like peer addresses already do.
-                    let advertised = registry.advertised_addr();
-                    let mut location = RemoteActorLocation::new_with_peer(advertised, peer);
-                    location.priority = RegistrationPriority::Immediate;
-                    registry
-                        .register_actor_with_priority(
-                            name,
-                            location,
-                            RegistrationPriority::Immediate,
-                        )
-                        .await
-                } else {
-                    registry.unregister_actor(&name).await.map(|_| ())
-                };
-                if let Err(err) = result {
-                    warn!(
-                        topic_key,
-                        present,
-                        generation,
-                        error = %err,
-                        "failed to update pubsub interest actor"
-                    );
-                }
+                Self::drive_interest_dispatch(interest_state, registry, peer, topic_key).await;
             });
+        }
+    }
+
+    /// Single-flight interest-dispatch loop for `topic_key`. Only one of
+    /// these ever runs per topic at a time (enforced by
+    /// `InterestState::dispatch_in_flight` in `note_interest`). Each
+    /// iteration reads the *current* desired state under the lock,
+    /// releases the lock, performs the (slow) registry call, then
+    /// re-locks and compares generations: if the generation is unchanged
+    /// the desired state did not move during the `.await` and the loop
+    /// converged; if it changed, another `note_interest` transition raced
+    /// in while we were awaiting and we loop again to dispatch the latest
+    /// state. This removes the TOCTOU entirely — the registry is never
+    /// called from two concurrently in-flight tasks for the same topic —
+    /// and it is last-write-wins by construction rather than by
+    /// whichever `.await` happens to resolve first (R6a).
+    ///
+    /// `generations` and `local_counts` share one lifecycle: the
+    /// `generations` entry for a topic is only removed once this loop
+    /// converges on the "absent" state, which prevents it from growing
+    /// without bound under topic churn (R6b).
+    async fn drive_interest_dispatch(
+        interest_state: Arc<Mutex<InterestState>>,
+        registry: Arc<crate::registry::GossipRegistry>,
+        peer: PeerId,
+        topic_key: u64,
+    ) {
+        loop {
+            let (want_present, generation) = {
+                let state = match interest_state.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                (
+                    state.local_counts.get(&topic_key).copied().unwrap_or(0) > 0,
+                    state.generations.get(&topic_key).copied().unwrap_or(0),
+                )
+            };
+
+            interest_dispatch_hook(topic_key, want_present).await;
+
+            let name = interest_name(topic_key, &peer);
+            let result = if want_present {
+                // Advertise through `advertised_addr()`, never the raw
+                // `bind_addr` — a node bound to a wildcard address
+                // (`0.0.0.0:<port>`, a normal deployment pattern) would
+                // otherwise gossip an undialable interest-actor
+                // location, starving peers of a route to it (the
+                // wildcard-advertise reconnect-storm class of bug; see
+                // `tests/wildcard_advertise_interest_storm.rs`). When
+                // no `GossipConfig::advertise_address` override is
+                // configured this can still resolve to an unspecified
+                // IP; that is deliberately not rejected here.
+                // Registration proceeds and the receiving side's
+                // `validate_remote_actor_addr` (`registry.rs`) rewrites
+                // an unspecified advertised IP using the gossiping
+                // peer's own verified address — the same trust anchor
+                // `resolve_peer_addr_checked` already uses for peer
+                // bind-address resolution — so wildcard-bound nodes
+                // work correctly with zero required configuration,
+                // exactly like peer addresses already do.
+                let advertised = registry.advertised_addr();
+                let mut location = RemoteActorLocation::new_with_peer(advertised, peer.clone());
+                location.priority = RegistrationPriority::Immediate;
+                registry
+                    .register_actor_with_priority(name, location, RegistrationPriority::Immediate)
+                    .await
+            } else {
+                registry.unregister_actor(&name).await.map(|_| ())
+            };
+            if let Err(err) = result {
+                warn!(
+                    topic_key,
+                    present = want_present,
+                    generation,
+                    error = %err,
+                    "failed to update pubsub interest actor"
+                );
+            }
+
+            let mut state = match interest_state.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let current_generation = state.generations.get(&topic_key).copied().unwrap_or(0);
+            if current_generation == generation {
+                // Converged: nothing changed while we were awaiting the
+                // registry call. Release single-flight ownership.
+                state.dispatch_in_flight.remove(&topic_key);
+                if !want_present {
+                    // The last dispatched (and now converged) state is
+                    // "absent" — fold the generation bookkeeping's
+                    // lifecycle into `local_counts`'s so this map does not
+                    // grow without bound under topic churn (R6b).
+                    state.generations.remove(&topic_key);
+                }
+                break;
+            }
+            // The desired state moved during the `.await` above (another
+            // `note_interest` call bumped the generation). Loop again and
+            // dispatch the latest state instead of returning.
         }
     }
 
@@ -2615,5 +2695,162 @@ mod tests {
         assert_eq!(stats.decode_drops, 1);
         assert_eq!(stats.accepted, 0);
         assert_eq!(stats.delivered_local, 0);
+    }
+
+    /// Polls `cond` until it returns `true` or `timeout` elapses. Returns the
+    /// last observed value.
+    async fn poll_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond().await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    // --- R6(a): TOCTOU in interest advertisement ---------------------------
+    //
+    // `note_interest` snapshots `(present, generation)` once before the
+    // `.await` on the registry register/unregister call and never
+    // re-validates afterward. Two independent background tasks — one
+    // finishing an unregister for a topic's last-subscriber-leaves
+    // transition, one finishing a register for the very next
+    // new-subscriber-arrives transition — can both pass their pre-await
+    // gate and then race unsynchronized on the registry itself. Whichever
+    // registry call *completes* last wins, regardless of which transition
+    // was chronologically (or logically) correct.
+    //
+    // This test forces exactly that interleaving deterministically using
+    // `test_helpers::install_pubsub_interest_dispatch_hook`: the hook
+    // pauses the unregister dispatch immediately before its registry call,
+    // lets a subsequent resubscribe's register dispatch run to completion
+    // first, and only then releases the unregister so it completes last.
+    // At baseline this reliably reproduces the bug every run (not just
+    // "intermittently") because the interleaving is forced rather than
+    // left to scheduler luck.
+    #[tokio::test]
+    async fn final_advertised_state_matches_final_subscriber_state_under_churn() {
+        let pubsub = test_pubsub("pubsub-interest-convergence");
+        let topic = topic_key("interest-convergence-churn");
+        let name = interest_name(topic, &pubsub.local_peer_id);
+
+        crate::test_helpers::clear_pubsub_interest_dispatch_hook();
+
+        // Establish one live local subscriber so the topic starts "present"
+        // and let the initial registration land (present=true dispatches
+        // are never delayed by the hook installed below). `note_interest`
+        // is the subscribe/unsubscribe side effect under test here and is
+        // independent of the `subscribers` delivery map, so driving it
+        // directly is a faithful, minimal reproduction.
+        pubsub.note_interest(topic, true);
+        assert!(
+            poll_until(
+                || async { pubsub.registry.lookup_actor(&name).await.is_some() },
+                Duration::from_millis(500),
+            )
+            .await,
+            "initial registration must land before the churn phase starts"
+        );
+
+        // Gate the *unregister* dispatch right before its registry call.
+        let reached_unregister = Arc::new(tokio::sync::Notify::new());
+        let release_unregister = Arc::new(tokio::sync::Notify::new());
+        {
+            let reached = Arc::clone(&reached_unregister);
+            let release = Arc::clone(&release_unregister);
+            crate::test_helpers::install_pubsub_interest_dispatch_hook(Arc::new(
+                move |_topic_key, present| {
+                    let reached = Arc::clone(&reached);
+                    let release = Arc::clone(&release);
+                    Box::pin(async move {
+                        if !present {
+                            reached.notify_one();
+                            release.notified().await;
+                        }
+                    }) as std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+                },
+            ));
+        }
+
+        // Last subscriber leaves: spawns/coalesces the unregister dispatch
+        // (generation g+1). It will park just before calling the registry.
+        pubsub.note_interest(topic, false);
+        reached_unregister.notified().await;
+
+        // A new subscriber arrives immediately after: spawns/coalesces the
+        // register dispatch (generation g+2). `present=true` is never
+        // delayed by the hook, so this runs to completion right away,
+        // *before* the stale unregister is released.
+        pubsub.note_interest(topic, true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now let the stale unregister complete last.
+        release_unregister.notify_one();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        crate::test_helpers::clear_pubsub_interest_dispatch_hook();
+
+        assert!(
+            pubsub.registry.lookup_actor(&name).await.is_some(),
+            "topic has a live local subscriber; advertised interest must be \
+             registered even though a stale unregister completed after the \
+             resubscribe's register"
+        );
+    }
+
+    // --- R6(b): unbounded `InterestState.generations` leak ------------------
+    //
+    // `generations.insert(topic_key, ...)` is the only mutation to that map;
+    // nothing ever removes an entry (contrast `local_counts`, which *is*
+    // correctly removed once a topic's subscriber count returns to 0). Under
+    // ephemeral/per-session topic churn the map grows for the life of the
+    // process.
+    #[tokio::test]
+    async fn generations_map_returns_to_baseline_after_topic_churn() {
+        let pubsub = test_pubsub("pubsub-interest-generations-leak");
+        crate::test_helpers::clear_pubsub_interest_dispatch_hook();
+
+        let baseline_len = {
+            let state = pubsub.interest_state.lock().unwrap();
+            state.generations.len()
+        };
+
+        const CHURN_TOPICS: u64 = 64;
+        for i in 0..CHURN_TOPICS {
+            let topic = topic_key(&format!("ephemeral-generations-churn-{i}"));
+            pubsub.note_interest(topic, true);
+            pubsub.note_interest(topic, false);
+        }
+
+        // Let any spawned register/unregister dispatch tasks settle.
+        assert!(
+            poll_until(
+                || async {
+                    let state = pubsub.interest_state.lock().unwrap();
+                    state.local_counts.is_empty()
+                },
+                Duration::from_millis(500),
+            )
+            .await,
+            "local_counts must return to empty once every churned topic has 0 subscribers"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let final_len = {
+            let state = pubsub.interest_state.lock().unwrap();
+            state.generations.len()
+        };
+        assert_eq!(
+            final_len, baseline_len,
+            "generations map must return to its baseline size once every churned \
+             topic has 0 local subscribers again, not grow by {CHURN_TOPICS} entries"
+        );
     }
 }
