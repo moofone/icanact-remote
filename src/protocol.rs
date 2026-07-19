@@ -33,8 +33,61 @@ struct InProgressStream {
     buffer: crate::PooledAlignedBuffer,
     /// Chunk stride used to calculate offsets.
     chunk_stride: Option<usize>,
+    /// Bitmap of chunk indices already written, one bit per chunk.
+    ///
+    /// Sized once the stride is known (from the first chunk). Without it,
+    /// completion was decided purely on the sum of received bytes, so a
+    /// duplicated chunk could stand in for one that never arrived and the
+    /// stream would assemble with an unwritten (zero-filled) hole.
+    received_chunks: Vec<u64>,
+    /// Number of chunks this stream expects, known once the stride is.
+    expected_chunks: Option<usize>,
+    /// Count of chunk indices seen more than once, for diagnostics.
+    duplicate_chunks: u32,
     /// Timestamp when stream started (for stale cleanup)
     started_at: std::time::Instant,
+}
+
+impl InProgressStream {
+    /// Records `chunk_index` as received. Returns `false` if it was already
+    /// recorded (a duplicate), in which case the caller must not write the
+    /// payload or advance `received_size` again.
+    fn mark_chunk_received(&mut self, chunk_index: usize) -> bool {
+        let word = chunk_index / 64;
+        let bit = 1u64 << (chunk_index % 64);
+        if word >= self.received_chunks.len() {
+            return false;
+        }
+        if self.received_chunks[word] & bit != 0 {
+            self.duplicate_chunks = self.duplicate_chunks.saturating_add(1);
+            return false;
+        }
+        self.received_chunks[word] |= bit;
+        true
+    }
+
+    /// True once every expected chunk index has been written.
+    ///
+    /// A stream whose stride is not yet known has received no chunks, so it is
+    /// complete only if it declared no payload at all.
+    fn all_chunks_received(&self) -> bool {
+        let Some(expected) = self.expected_chunks else {
+            return self.total_size == 0;
+        };
+        if expected == 0 {
+            return true;
+        }
+        let full_words = expected / 64;
+        if self.received_chunks[..full_words].iter().any(|w| *w != u64::MAX) {
+            return false;
+        }
+        let remainder = expected % 64;
+        if remainder == 0 {
+            return true;
+        }
+        let mask = (1u64 << remainder) - 1;
+        self.received_chunks[full_words] & mask == mask
+    }
 }
 
 impl StreamingState {
@@ -111,6 +164,9 @@ impl StreamingState {
                 received_size: 0,
                 buffer,
                 chunk_stride: None,
+                received_chunks: Vec::new(),
+                expected_chunks: None,
+                duplicate_chunks: 0,
                 started_at: std::time::Instant::now(),
             };
             self.active_streams.insert(header.stream_id, stream);
@@ -171,7 +227,13 @@ impl StreamingState {
         }
 
         if stream.chunk_stride.is_none() && header.chunk_size > 0 {
-            stream.chunk_stride = Some(header.chunk_size as usize);
+            let stride = header.chunk_size as usize;
+            stream.chunk_stride = Some(stride);
+            // The stride fixes how many chunks this stream consists of, which
+            // in turn sizes the received-chunk bitmap.
+            let expected = (stream.total_size as usize).div_ceil(stride);
+            stream.expected_chunks = Some(expected);
+            stream.received_chunks = vec![0u64; expected.div_ceil(64)];
         }
 
         let stride = stream.chunk_stride.unwrap_or(header.chunk_size as usize);
@@ -182,7 +244,15 @@ impl StreamingState {
             )));
         }
 
-        let offset = header.chunk_index as usize * stride;
+        let chunk_index = header.chunk_index as usize;
+        let offset = chunk_index
+            .checked_mul(stride)
+            .ok_or_else(|| {
+                GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("chunk offset overflow for stream_id={}", header.stream_id),
+                ))
+            })?;
         let end = offset + chunk_data.len();
         if end > stream.total_size as usize {
             return Err(GossipError::Network(std::io::Error::new(
@@ -191,12 +261,58 @@ impl StreamingState {
             )));
         }
 
+        if let Some(expected) = stream.expected_chunks {
+            if chunk_index >= expected {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "chunk_index={} is past the {} chunks declared by stream_id={}",
+                        chunk_index, expected, header.stream_id
+                    ),
+                )));
+            }
+
+            // Senders chunk with a fixed stride, so every chunk but the last is
+            // exactly one stride and the last is the remainder. Pinning this
+            // keeps the stride (and therefore the chunk count the completion
+            // check relies on) consistent with what actually arrives.
+            let want = if chunk_index + 1 == expected {
+                stream.total_size as usize - offset
+            } else {
+                stride
+            };
+            if chunk_data.len() != want {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "chunk_index={} of stream_id={} has {} bytes, expected {}",
+                        chunk_index,
+                        header.stream_id,
+                        chunk_data.len(),
+                        want
+                    ),
+                )));
+            }
+        }
+
+        // A repeated chunk index must not advance `received_size`: completion is
+        // decided per chunk, and double-counting bytes is exactly what let a
+        // retransmit stand in for a chunk that never arrived.
+        if !stream.mark_chunk_received(chunk_index) {
+            warn!(
+                stream_id = header.stream_id,
+                chunk_index = chunk_index,
+                duplicates = stream.duplicate_chunks,
+                "Ignoring duplicate stream chunk"
+            );
+            return Ok(None);
+        }
+
         // CRITICAL_PATH: write chunk directly into final buffer.
         stream.buffer.as_mut_slice()[offset..end].copy_from_slice(&chunk_data);
         stream.received_size += chunk_data.len();
 
-        // Check if we have all chunks (when total matches expected size)
-        if stream.received_size >= stream.total_size as usize {
+        if stream.all_chunks_received() {
             self.assemble_complete_message_with_correlation(header.stream_id)
         } else {
             Ok(None)
@@ -243,6 +359,18 @@ impl StreamingState {
                 format!(
                     "stream_id={} finalized incomplete: {} of {} bytes received",
                     stream_id, stream.received_size, stream.total_size
+                ),
+            )));
+        }
+
+        // The byte count alone cannot prove the buffer is fully written -- that
+        // was the gap a duplicated chunk exploited. Require every chunk index.
+        if !stream.all_chunks_received() {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "stream_id={} finalized with missing chunks ({} duplicates seen)",
+                    stream_id, stream.duplicate_chunks
                 ),
             )));
         }
@@ -1110,5 +1238,170 @@ mod tests {
         .await;
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Helpers for the chunk-integrity tests below.
+    mod chunk_integrity {
+        use super::*;
+
+        pub(super) const STRIDE: usize = 8;
+
+        pub(super) fn start(state: &mut StreamingState, stream_id: u64, total_size: u64) {
+            let pool = Arc::new(crate::AlignedBytesPool::default());
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size,
+                chunk_size: 0,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .start_stream_with_correlation(header, 7, pool, None)
+                .expect("stream start is accepted");
+        }
+
+        pub(super) fn chunk(
+            state: &mut StreamingState,
+            stream_id: u64,
+            total_size: u64,
+            chunk_index: u32,
+            payload: &[u8],
+        ) -> Result<Option<(Bytes, u32, Option<u64>)>> {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size,
+                chunk_size: payload.len() as u32,
+                chunk_index,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state.add_chunk_with_correlation(header, Bytes::copy_from_slice(payload), None)
+        }
+    }
+
+    /// A duplicated chunk must not be able to stand in for a chunk that never
+    /// arrived. Counting only received *bytes* let `received_size` reach
+    /// `total_size` while a hole in the pre-allocated (zero-filled) buffer was
+    /// never written, so a corrupt, zero-padded payload was delivered to the
+    /// actor as a complete message.
+    #[test]
+    fn duplicate_chunk_never_substitutes_for_a_missing_chunk() {
+        use chunk_integrity::{STRIDE, chunk, start};
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 2) as u64;
+        start(&mut state, 1, total);
+
+        let first = [0xAAu8; STRIDE];
+        assert!(
+            chunk(&mut state, 1, total, 0, &first)
+                .expect("first chunk is accepted")
+                .is_none(),
+            "a single chunk of a two-chunk stream must not complete it"
+        );
+
+        // Chunk 0 again -- a retransmit. Chunk 1 never arrives.
+        let completed = chunk(&mut state, 1, total, 0, &first);
+
+        match completed {
+            Err(_) => {}
+            Ok(None) => {}
+            Ok(Some((data, _, _))) => panic!(
+                "stream completed on a duplicated chunk while chunk 1 was never \
+                 received; delivered {} bytes with tail {:?}",
+                data.len(),
+                &data[STRIDE..]
+            ),
+        }
+    }
+
+    /// A duplicate that arrives alongside the full set must not corrupt the
+    /// payload or the accounting: the assembled message is still byte-exact.
+    #[test]
+    fn duplicate_chunk_does_not_corrupt_a_complete_stream() {
+        use chunk_integrity::{STRIDE, chunk, start};
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 2) as u64;
+        start(&mut state, 2, total);
+
+        let first = [0xAAu8; STRIDE];
+        let second = [0xBBu8; STRIDE];
+
+        assert!(chunk(&mut state, 2, total, 0, &first).unwrap().is_none());
+        // Retransmit of chunk 0 before chunk 1 lands.
+        let _ = chunk(&mut state, 2, total, 0, &first);
+        let completed = chunk(&mut state, 2, total, 1, &second)
+            .expect("final chunk is accepted")
+            .expect("stream completes once every chunk has arrived");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&second);
+        assert_eq!(
+            completed.0.as_ref(),
+            expected.as_slice(),
+            "assembled payload must be byte-exact despite the duplicate"
+        );
+    }
+
+    /// Chunks may legitimately arrive out of order; completion must still be
+    /// exact and the payload correctly placed.
+    #[test]
+    fn out_of_order_chunks_still_assemble_byte_exactly() {
+        use chunk_integrity::{STRIDE, chunk, start};
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 3) as u64;
+        start(&mut state, 3, total);
+
+        let c0 = [0x11u8; STRIDE];
+        let c1 = [0x22u8; STRIDE];
+        let c2 = [0x33u8; STRIDE];
+
+        assert!(chunk(&mut state, 3, total, 2, &c2).unwrap().is_none());
+        assert!(chunk(&mut state, 3, total, 0, &c0).unwrap().is_none());
+        let completed = chunk(&mut state, 3, total, 1, &c1)
+            .expect("final chunk is accepted")
+            .expect("stream completes once every chunk has arrived");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&c0);
+        expected.extend_from_slice(&c1);
+        expected.extend_from_slice(&c2);
+        assert_eq!(completed.0.as_ref(), expected.as_slice());
+    }
+
+    /// A chunk index past the declared end of the stream must be rejected
+    /// rather than silently ignored or written out of range.
+    #[test]
+    fn chunk_index_beyond_declared_length_is_rejected() {
+        use chunk_integrity::{STRIDE, chunk, start};
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 2) as u64;
+        start(&mut state, 4, total);
+
+        let payload = [0xCCu8; STRIDE];
+        assert!(
+            chunk(&mut state, 4, total, 7, &payload).is_err(),
+            "chunk_index 7 of a two-chunk stream must be rejected"
+        );
+    }
+
+    /// The existing zero-length stream contract must keep working.
+    #[test]
+    fn empty_stream_finalizes_without_chunks() {
+        use chunk_integrity::start;
+
+        let mut state = StreamingState::new();
+        start(&mut state, 5, 0);
+
+        let completed = state
+            .finalize_stream_with_correlation(5, None)
+            .expect("empty stream finalizes")
+            .expect("empty stream yields a message");
+        assert_eq!(completed.0.len(), 0);
     }
 }
