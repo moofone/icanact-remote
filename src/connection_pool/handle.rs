@@ -1246,6 +1246,9 @@ impl<T> ConnectionHandle<T> {
             return self.ask_actor_frame(actor_id, type_hash, payload, timeout).await;
         }
         let chunk_size = stream_handle.max_stream_chunk_size()?;
+        // `SlotGuard` cancels this exact correlation slot on every `?` or
+        // cancellation path below. Only a successful terminal response calls
+        // `disarm`, after `wait_for_response` has removed the waiter.
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
         let gate_guard = stream_handle.acquire_streaming_mode().await?;
