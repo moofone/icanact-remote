@@ -298,7 +298,7 @@ impl RemoteConnection {
 ///
 /// `RemoteActorRef` uses weak references to prevent memory leaks:
 /// - `registry: Weak<GossipRegistry>` - doesn't prevent registry cleanup
-/// - `connection: Option<Arc<Mutex<ConnectionHandle>>>` - optional strong ref
+/// - `connection: Arc<ArcSwapOption<RemoteConnection>>` - live shared slot
 ///
 /// When the registry shuts down, `tell()`/`ask()` will fail on the next use.
 /// Cached connections may observe `ConnectionClosed` before weak-registry shutdown is noticed.
@@ -353,13 +353,6 @@ impl RemoteConnection {
 pub struct RemoteActorRef<T = ()> {
     /// The actor location information
     pub location: RemoteActorLocation,
-    /// Initial cached connection, retained for debug/test compatibility with
-    /// the previously public field. Use [`Self::connection_ref`] to observe
-    /// the current self-healing connection.
-    #[cfg(any(test, feature = "test-helpers", debug_assertions))]
-    pub connection: Option<RemoteConnection>,
-    #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
-    connection: Option<RemoteConnection>,
     /// Cached connection handle - set during `lookup()`, used for direct
     /// zero-lookup sending. Lock-free swappable slot: a transport-level
     /// failure or actor-ask timeout can atomically replace the contents
@@ -368,7 +361,7 @@ pub struct RemoteActorRef<T = ()> {
     /// same `Arc<ArcSwapOption<..>>` slot so the heal is visible everywhere.
     /// `None` for actors that aren't listening yet (established lazily on
     /// first use).
-    connection_slot: Arc<ArcSwapOption<RemoteConnection>>,
+    pub connection: Arc<ArcSwapOption<RemoteConnection>>,
     /// Registry weak reference - doesn't prevent registry shutdown/cleanup
     /// Used for reconnection after DNS changes
     registry: Weak<crate::registry::GossipRegistry>,
@@ -451,7 +444,7 @@ impl<T> RemoteActorRef<T> {
 
     #[inline]
     fn current_connection_or_not_listening(&self) -> crate::Result<Arc<RemoteConnection>> {
-        self.connection_slot.load_full().ok_or_else(|| {
+        self.connection.load_full().ok_or_else(|| {
             crate::GossipError::ActorNotFound(format!(
                 "'{}' - not listening yet",
                 self.location.address
@@ -497,7 +490,7 @@ impl<T> RemoteActorRef<T> {
         new: Arc<RemoteConnection>,
     ) -> std::result::Result<(), Option<Arc<RemoteConnection>>> {
         let expected_owned: Option<Arc<RemoteConnection>> = expected.cloned();
-        let previous = self.connection_slot.compare_and_swap(&expected_owned, Some(new));
+        let previous = self.connection.compare_and_swap(&expected_owned, Some(new));
         let matched = match (&expected_owned, &*previous) {
             (None, None) => true,
             (Some(exp), Some(prev)) => Arc::ptr_eq(exp, prev),
@@ -538,7 +531,7 @@ impl<T> RemoteActorRef<T> {
         // Somebody else may have already repaired this ref concurrently -
         // if the live slot no longer points at the instance that just
         // failed, reuse it instead of dialing again.
-        if let Some(current) = self.connection_slot.load_full() {
+        if let Some(current) = self.connection.load_full() {
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(current);
             }
@@ -558,7 +551,7 @@ impl<T> RemoteActorRef<T> {
                 Err(None) => {
                     // Slot had already been cleared out from under us; nothing
                     // better than our own fresh dial is available.
-                    self.connection_slot.store(Some(fresh.clone()));
+                    self.connection.store(Some(fresh.clone()));
                     fresh
                 }
             },
@@ -590,8 +583,7 @@ impl<T> RemoteActorRef<T> {
         let connection = connection.map(RemoteConnection::from_handle);
         Self {
             location,
-            connection_slot: Arc::new(ArcSwapOption::from_pointee(connection.clone())),
-            connection,
+            connection: Arc::new(ArcSwapOption::from_pointee(connection)),
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
             _marker: PhantomData,
         }
@@ -614,7 +606,7 @@ impl<T> RemoteActorRef<T> {
     ///
     /// Returns None if no connection is established yet.
     pub fn connection_ref(&self) -> Option<RemoteConnection> {
-        self.connection_slot.load_full().map(|arc| (*arc).clone())
+        self.connection.load_full().map(|arc| (*arc).clone())
     }
 
     fn actor_ask_cancellation_guard(
@@ -696,7 +688,7 @@ impl<T> RemoteActorRef<T> {
             Ok(()) => fresh,
             Err(Some(other)) => other,
             Err(None) => {
-                self.connection_slot.store(Some(fresh.clone()));
+                self.connection.store(Some(fresh.clone()));
                 fresh
             }
         };
