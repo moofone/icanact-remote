@@ -2896,6 +2896,10 @@ where
     };
 
     let (sender_node_id, _initial_correlation_id, sender_bind_addr_opt) = match &msg_result {
+        Ok(MessageReadResult::RouteBound) => {
+            warn!(peer_addr = %peer_addr, "RouteBind arrived before connection setup");
+            return ConnectionCloseOutcome::Normal { node_id: None };
+        }
         Ok(MessageReadResult::Gossip(msg, correlation_id)) => {
             let (node_id, bind_addr) = match msg {
                 RegistryMessage::DeltaGossip { delta, .. } => (delta.sender_peer_id.to_hex(), None),
@@ -3152,6 +3156,7 @@ where
             max_message_size,
             expected_schema_hash: registry.config.schema_hash,
             aligned_pool: aligned_pool.clone(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
             response_correlation: Some(correlation_tracker.clone()),
             response_writer: Some(response_writer.clone()),
             tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
@@ -3553,6 +3558,9 @@ where
 /// Result type for message reading that can handle gossip, actor, and streaming messages
 #[derive(Debug)]
 pub(crate) enum MessageReadResult {
+    /// A connection-local route binding was accepted. It carries no application
+    /// message and is deliberately invisible to actor dispatch.
+    RouteBound,
     Gossip(RegistryMessage, Option<u32>),
     AskRaw {
         correlation_id: u32,
@@ -3819,6 +3827,17 @@ pub(crate) fn parse_message_from_pooled_buffer(
     buffer: crate::PooledAlignedBuffer,
     msg_len: usize,
 ) -> Result<MessageReadResult> {
+    parse_message_from_pooled_buffer_with_routes(buffer, msg_len, None)
+}
+
+/// Parse a V5 frame with the route bindings owned by its transport connection.
+/// Passing no table is only valid for the pre-connection TLS identification
+/// read, where route frames are forbidden.
+pub(crate) fn parse_message_from_pooled_buffer_with_routes(
+    buffer: crate::PooledAlignedBuffer,
+    msg_len: usize,
+    routes: Option<&crate::route_interning::RouteTable>,
+) -> Result<MessageReadResult> {
     let control = crate::framing::decode_control(
         buffer.as_ref()[..crate::framing::LENGTH_PREFIX_LEN]
             .try_into()
@@ -3875,6 +3894,51 @@ pub(crate) fn parse_message_from_pooled_buffer(
                     buffer,
                     crate::framing::ACTOR_ASK_FRAME_HEADER_LEN,
                     body_len - crate::framing::ACTOR_ASK_HEADER_LEN,
+                )?,
+            })
+        }
+        crate::framing::WireKind::RouteBind => {
+            if body.len() != crate::framing::ROUTE_BIND_HEADER_LEN {
+                return Err(invalid_v5_frame("invalid route bind length"));
+            }
+            let route_slot = u32::from_be_bytes(body[..4].try_into().unwrap());
+            let actor_id = u64::from_be_bytes(body[4..12].try_into().unwrap());
+            let type_hash = u32::from_be_bytes(body[12..16].try_into().unwrap());
+            if body[16..20].iter().any(|byte| *byte != 0) {
+                return Err(invalid_v5_frame("noncanonical route bind padding"));
+            }
+            let routes = routes.ok_or_else(|| invalid_v5_frame("route bind before connection setup"))?;
+            if !routes.bind(route_slot, crate::route_interning::RouteKey { actor_id, type_hash }) {
+                return Err(invalid_v5_frame("conflicting route bind"));
+            }
+            Ok(MessageReadResult::RouteBound)
+        }
+        crate::framing::WireKind::RoutedActorAsk => {
+            if body.len() < crate::framing::ROUTED_ACTOR_ASK_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated routed actor ask"));
+            }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            if correlation_id == 0 {
+                return Err(invalid_v5_frame("routed actor ask has zero correlation id"));
+            }
+            let route_slot = u32::from_be_bytes(body[4..8].try_into().unwrap());
+            if body[8..12].iter().any(|byte| *byte != 0) {
+                return Err(invalid_v5_frame("noncanonical routed ask padding"));
+            }
+            let routes = routes.ok_or_else(|| invalid_v5_frame("routed ask before connection setup"))?;
+            let route = routes
+                .resolve(route_slot)
+                .ok_or_else(|| invalid_v5_frame("unknown route slot"))?;
+            Ok(MessageReadResult::Actor {
+                msg_type: crate::MessageType::ActorAsk as u8,
+                correlation_id,
+                actor_id: route.actor_id,
+                type_hash: route.type_hash,
+                schema_hash: None,
+                payload: aligned(
+                    buffer,
+                    crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN,
+                    body_len - crate::framing::ROUTED_ACTOR_ASK_HEADER_LEN,
                 )?,
             })
         }
@@ -4076,7 +4140,7 @@ where
 
 #[cfg(test)]
 mod framing_tests {
-    use super::{MessageReadResult, read_message_from_tls_reader};
+    use super::{MessageReadResult, parse_message_from_pooled_buffer_with_routes, read_message_from_tls_reader};
     use crate::{MessageType, framing, registry::RegistryMessage};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
@@ -4089,6 +4153,24 @@ mod framing_tests {
         read_message_from_tls_reader(&mut reader, 1024 * 1024, None)
             .await
             .unwrap()
+    }
+
+    fn parse_with_routes(
+        frame: &[u8],
+        routes: &crate::route_interning::RouteTable,
+    ) -> crate::Result<MessageReadResult> {
+        let mut buffer = unsafe {
+            crate::PooledAlignedBuffer::with_len_uninit(
+                frame.len(),
+                std::sync::Arc::new(crate::AlignedBytesPool::default()),
+            )
+        };
+        buffer.as_mut_slice().copy_from_slice(frame);
+        parse_message_from_pooled_buffer_with_routes(
+            buffer,
+            frame.len() - crate::framing::LENGTH_PREFIX_LEN,
+            Some(routes),
+        )
     }
 
     /// R6: the initial inbound read is wrapped in a connection-timeout. A peer
@@ -4263,6 +4345,70 @@ mod framing_tests {
             }
             _ => panic!("unexpected result"),
         }
+    }
+
+    #[test]
+    fn routed_actor_ask_requires_a_bound_connection_local_route() {
+        let routes = crate::route_interning::RouteTable::new();
+        let actor_id = 0x0102_0304_0506_0708;
+        let type_hash = 0x1122_3344;
+        let route_slot = 9;
+        let bind = framing::write_route_bind_header(route_slot, actor_id, type_hash);
+        assert!(matches!(
+            parse_with_routes(&bind, &routes).unwrap(),
+            MessageReadResult::RouteBound
+        ));
+
+        let payload = b"routed payload";
+        let header = framing::write_routed_actor_ask_header(7, route_slot, payload.len());
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(payload);
+        match parse_with_routes(&frame, &routes).unwrap() {
+            MessageReadResult::Actor {
+                msg_type,
+                correlation_id,
+                actor_id: actual_actor_id,
+                type_hash: actual_type_hash,
+                payload: actual_payload,
+                ..
+            } => {
+                assert_eq!(msg_type, MessageType::ActorAsk as u8);
+                assert_eq!(correlation_id, 7);
+                assert_eq!(actual_actor_id, actor_id);
+                assert_eq!(actual_type_hash, type_hash);
+                assert_eq!(actual_payload.as_ref(), payload);
+            }
+            other => panic!("expected routed actor ask, got {other:?}"),
+        }
+
+        let fresh_connection = crate::route_interning::RouteTable::new();
+        assert!(parse_with_routes(&frame, &fresh_connection).is_err());
+    }
+
+    #[test]
+    fn route_bind_conflicts_are_rejected() {
+        let routes = crate::route_interning::RouteTable::new();
+        let first = framing::write_route_bind_header(3, 7, 9);
+        let conflicting = framing::write_route_bind_header(3, 8, 9);
+        assert!(parse_with_routes(&first, &routes).is_ok());
+        assert!(parse_with_routes(&conflicting, &routes).is_err());
+    }
+
+    #[test]
+    fn route_bind_requires_zero_padding() {
+        let routes = crate::route_interning::RouteTable::new();
+        let mut bind = framing::write_route_bind_header(3, 7, 9);
+        bind[20] = 1;
+        assert!(parse_with_routes(&bind, &routes).is_err());
+    }
+
+    #[test]
+    fn routed_actor_ask_requires_zero_padding() {
+        let routes = crate::route_interning::RouteTable::new();
+        assert!(routes.bind(3, crate::route_interning::RouteKey { actor_id: 7, type_hash: 9 }));
+        let mut ask = framing::write_routed_actor_ask_header(5, 3, 0);
+        ask[12] = 1;
+        assert!(parse_with_routes(&ask, &routes).is_err());
     }
 
     #[tokio::test]

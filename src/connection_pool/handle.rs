@@ -216,6 +216,18 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    async fn write_routed_actor_ask(
+        &self,
+        correlation_id: u32,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> Result<()> {
+        self.stream_handle()?
+            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
+            .await
+    }
+
     async fn write_direct_ask_inline(&self, header: [u8; 16], payload: bytes::Bytes) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_direct_ask_inline(header, payload).await
@@ -567,10 +579,8 @@ impl<T> ConnectionHandle<T> {
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let header =
-            crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
         if let Err(e) = self
-            .write_header_and_payload_ask_inline32(header, payload)
+            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
             .await
         {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
@@ -653,11 +663,8 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<crate::AlignedBytes> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let header =
-            crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
-
         if let Err(e) = self
-            .write_header_and_payload_ask_inline32(header, payload)
+            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
             .await
         {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
@@ -684,11 +691,8 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<PendingAsk> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let header =
-            crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
-
         if let Err(e) = self
-            .write_header_and_payload_ask_inline32(header, payload)
+            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
             .await
         {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.

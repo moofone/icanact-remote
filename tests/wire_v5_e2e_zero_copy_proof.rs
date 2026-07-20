@@ -1,7 +1,7 @@
 //! End-to-end V5 transport proof over real TCP/TLS sockets.
 //!
 //! This intentionally exercises the public owned-`Bytes` APIs: 16-byte tell,
-//! 32-byte ask/response, and a request/response stream that is larger than the
+//! compact routed asks (including a non-small payload), and a request/response stream that is larger than the
 //! inline threshold.  It complements the lower-level allocation provenance
 //! tests in `protocol.rs` and `read_pipeline.rs`.
 
@@ -76,9 +76,18 @@ async fn wire_v5_e2e_zero_copy_proof() {
     let ask = Bytes::from_static(b"ask");
     assert_eq!(connection.ask_actor_frame(7, 9, ask.clone(), Duration::from_secs(5)).await.unwrap(), ask);
 
+    let non_small_ask = payload(256 * 1024);
+    assert_eq!(
+        connection
+            .ask_actor_frame(7, 9, non_small_ask.clone(), Duration::from_secs(5))
+            .await
+            .unwrap(),
+        non_small_ask
+    );
+
     let stream = payload(2 * 1024 * 1024);
     assert_eq!(connection.ask_streaming_bytes(stream.clone(), 9, 7, Duration::from_secs(30)).await.unwrap(), stream);
-    assert_eq!(echo.asks.load(Ordering::SeqCst), 2);
+    assert_eq!(echo.asks.load(Ordering::SeqCst), 3);
     assert_eq!(echo.last_len.load(Ordering::SeqCst), 2 * 1024 * 1024);
 
     a.shutdown().await;
