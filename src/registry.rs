@@ -5218,6 +5218,8 @@ impl<T: 'static> GossipRegistry<T> {
                 .collect()
         };
 
+        let mut should_trigger_immediate = false;
+
         if !peers_to_cleanup.is_empty() {
             // IMPORTANT: Always acquire locks in consistent order to prevent deadlocks
             // Order: actor_state before gossip_state
@@ -5234,26 +5236,65 @@ impl<T: 'static> GossipRegistry<T> {
                     let peer_info = gossip_state.peers.get(peer_addr).cloned();
                     let mut actors_removed = 0usize;
                     for actor_name in &actor_names {
-                        let should_remove = self.actor_state.known_actors.read_sync(
-                            actor_name.as_str(),
-                            |_, location| {
+                        // Capture the current location (not just a bool) so a
+                        // confirmed removal can be tombstoned and gossiped with
+                        // the same causal-removal shape every other removal
+                        // path uses (unregister_actor / apply_delta_from).
+                        let removal_location = self
+                            .actor_state
+                            .known_actors
+                            .read_sync(actor_name.as_str(), |_, location| {
                                 actor_location_belongs_to_peer(
                                     location,
                                     *peer_addr,
                                     peer_info.as_ref(),
                                 )
-                            },
-                        );
+                                .then(|| location.clone())
+                            })
+                            .flatten();
 
-                        if should_remove.unwrap_or(false)
-                            && self
+                        if let Some(location) = removal_location {
+                            if self
                                 .actor_state
                                 .known_actors
                                 .remove_sync(actor_name.as_str())
                                 .is_some()
-                        {
-                            gossip_state.release_actor_admission(actor_name);
-                            actors_removed += 1;
+                            {
+                                gossip_state.release_actor_admission(actor_name);
+                                actors_removed += 1;
+
+                                // Record a peer-death tombstone causally after the
+                                // reaped location, and propagate the removal via
+                                // gossip — otherwise a peer holding a stale cached
+                                // copy of this actor can re-admit it (see R2:
+                                // `current_actor_upsert_plan` only rejects an
+                                // incoming ActorAdded when a dominating tombstone
+                                // exists or a causally-newer entry is present, and
+                                // without this the fast dead-peer reap silently
+                                // degrades to the 24h actor_ttl backstop).
+                                let removal_clock = location.vector_clock.clone();
+                                removal_clock.increment(self.peer_id.to_node_id());
+                                let _ = self.actor_state.removed_actors.upsert_sync(
+                                    actor_name.clone(),
+                                    RemovedActorTombstone::new(removal_clock.clone()),
+                                );
+
+                                let change = RegistryChange::ActorRemoved {
+                                    name: actor_name.clone(),
+                                    vector_clock: removal_clock,
+                                    removing_node_id: self.peer_id.to_node_id(),
+                                    priority: location.priority,
+                                };
+                                if location.priority.should_trigger_immediate_gossip() {
+                                    gossip_state.urgent_changes.push(change.clone());
+                                    gossip_state
+                                        .pending_changes
+                                        .push(Self::as_regular_gossip_change(&change));
+                                    should_trigger_immediate = true;
+                                } else {
+                                    gossip_state.pending_changes.push(change);
+                                }
+                            }
                         }
                     }
                     gossip_state.peer_to_actors.remove(peer_addr);
@@ -5285,6 +5326,15 @@ impl<T: 'static> GossipRegistry<T> {
             for peer_addr in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
                 self.remove_clock_state_for_addr(peer_addr);
+            }
+
+            // Trigger immediate gossip (outside the gossip_state lock —
+            // trigger_immediate_gossip re-acquires it) if any reaped actor
+            // had a priority requiring urgent propagation.
+            if should_trigger_immediate {
+                if let Err(err) = self.trigger_immediate_gossip().await {
+                    warn!(error = %err, "failed to trigger immediate gossip for dead-peer actor removal");
+                }
             }
         }
     }
@@ -11983,6 +12033,95 @@ mod tests {
         ); // Actors are cleaned up
     }
 
+    /// R2 regression: `cleanup_dead_peers` is the only removal path that did
+    /// NOT write a `RemovedActorTombstone` or enqueue a `RegistryChange::
+    /// ActorRemoved`, unlike `unregister_actor` and the removal branch of
+    /// `apply_delta_from`. Without a dominating tombstone, a stale cached
+    /// copy from a third peer can re-admit the actor via
+    /// `current_actor_upsert_plan`, undoing the fast dead-peer reap and
+    /// silently degrading it to the 24h `actor_ttl` backstop.
+    #[tokio::test]
+    async fn cleanup_dead_peers_writes_tombstone_and_enqueues_removal_change() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(7170), config);
+        let peer_addr = test_addr(7171);
+        let peer_id = test_peer_id("r2-dead-peer-tombstone");
+        let actor_name = "svc-x";
+
+        let location = RemoteActorLocation::new_with_peer(peer_addr, peer_id.clone());
+        let pre_removal_clock = location.vector_clock.clone();
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+            let mut actors = HashSet::new();
+            actors.insert(actor_name.to_string());
+            gossip_state.peer_to_actors.insert(peer_addr, actors);
+        }
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), location);
+
+        registry.cleanup_dead_peers().await;
+
+        assert!(
+            !registry.actor_state.known_actors.contains_sync(actor_name),
+            "sanity: actor must actually be reaped"
+        );
+
+        let tombstone_clock = registry
+            .actor_state
+            .removed_actors
+            .read_sync(actor_name, |_, tombstone| tombstone.vector_clock.clone());
+        let tombstone_clock = tombstone_clock.expect(
+            "cleanup_dead_peers must record a RemovedActorTombstone, like every other \
+             removal path (unregister_actor / apply_delta_from), or stale peer copies \
+             can resurrect the actor",
+        );
+        assert!(
+            matches!(
+                pre_removal_clock.compare(&tombstone_clock),
+                crate::ClockOrdering::Before
+            ),
+            "tombstone must be causally after the reaped actor's vector clock so it \
+             dominates any stale copy still holding the original clock"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let enqueued = gossip_state
+            .pending_changes
+            .iter()
+            .chain(gossip_state.urgent_changes.iter())
+            .any(|change| matches!(change, RegistryChange::ActorRemoved { name, .. } if name == actor_name));
+        assert!(
+            enqueued,
+            "cleanup_dead_peers must enqueue a RegistryChange::ActorRemoved so the \
+             removal propagates via gossip to peers holding a stale cached copy"
+        );
+    }
+
     /// Companion regression test that demonstrates the underlying
     /// race-window pattern is exploitable. Mirrors the pre-fix
     /// apply_delta ordering: a lockless `known_actors.upsert_sync`
@@ -12528,6 +12667,91 @@ mod tests {
         assert!(
             !state.peer_to_actors.contains_key(&dead_addr),
             "timeout cleanup should still clear the stale peer_to_actors side table"
+        );
+    }
+
+    /// R2 end-to-end regression: node B reaps `svc-x` (owned by dead peer A)
+    /// via `cleanup_dead_peers`. Peer C then delivers a delta still
+    /// containing the ORIGINAL, un-restamped `svc-x` -> A entry (as if C's
+    /// cache had not yet observed the removal). Without a dominating
+    /// tombstone from the reap, B re-admits the actor and `lookup_actor`
+    /// starts routing to the confirmed-dead node A again.
+    #[tokio::test]
+    async fn cleanup_dead_peers_tombstone_survives_stale_replay_from_third_peer() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let node_b = Arc::new(GossipRegistry::<()>::new(test_addr(7180), config));
+        let actor_name = "svc-x";
+        let peer_a = test_peer_id("r2-e2e-peer-a-dead");
+        let peer_c = test_peer_id("r2-e2e-peer-c-replay");
+        let addr_a = test_addr(7181);
+
+        // B currently knows about svc-x hosted on A.
+        let location_from_a = RemoteActorLocation::new_with_peer(addr_a, peer_a.clone());
+        let _ = node_b
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), location_from_a.clone());
+
+        // A is registered as a peer of B and is failed/dead long enough to
+        // cross dead_peer_timeout.
+        {
+            let mut gossip_state = node_b.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                addr_a,
+                PeerInfo {
+                    address: addr_a,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_a.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+            let mut actors = HashSet::new();
+            actors.insert(actor_name.to_string());
+            gossip_state.peer_to_actors.insert(addr_a, actors);
+        }
+
+        // B reaps svc-x from dead peer A.
+        node_b.cleanup_dead_peers().await;
+        assert!(
+            node_b.lookup_actor(actor_name).await.is_none(),
+            "sanity: svc-x must be gone from B immediately after the reap"
+        );
+
+        // Peer C now replays a delta with the stale, original (un-restamped)
+        // svc-x -> A entry, as if its own cache had not caught up yet.
+        let delta = RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor_name.to_string(),
+                location: location_from_a,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: peer_c,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        };
+        let _ = node_b.apply_delta(delta).await;
+
+        assert!(
+            node_b.lookup_actor(actor_name).await.is_none(),
+            "B must not re-admit svc-x from a stale third-party replay after \
+             cleanup_dead_peers reaped it — the reap must have left a dominating \
+             tombstone behind, or the fast dead-peer reclaim silently degrades to \
+             the 24h actor_ttl backstop"
         );
     }
 
