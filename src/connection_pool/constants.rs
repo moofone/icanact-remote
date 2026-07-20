@@ -684,6 +684,14 @@ impl WriteQueue {
         }
     }
 
+    /// Wake a writer parked on `data_notify` so it can re-check external
+    /// state (e.g. `shutdown_signal`). `data_notify` is consumer-only —
+    /// producers wake on `space_notify` — so this permit is never stolen by a
+    /// producer. Used by graceful shutdown, not the message fast path.
+    fn wake_consumer(&self) {
+        self.data_notify.notify_one();
+    }
+
     /// Consumer-side pre-park drain: clear `data_pending`, then re-check the
     /// queue. Must be called by the writer task immediately before parking on
     /// `data_notify`:
@@ -840,6 +848,13 @@ impl StreamingQueue {
         if !self.data_pending.swap(true, Ordering::AcqRel) {
             self.data_notify.notify_one();
         }
+    }
+
+    /// See `WriteQueue::wake_consumer`: wake a writer parked on `data_notify`
+    /// (consumer-only permit, never stolen by a producer) so it can re-check
+    /// external state such as `shutdown_signal`.
+    fn wake_consumer(&self) {
+        self.data_notify.notify_one();
     }
 
     /// See `WriteQueue::prepare_park`: consumer-side pre-park drain.
