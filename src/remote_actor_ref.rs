@@ -318,11 +318,12 @@ impl RemoteConnection {
 /// `ask()` (connection reset, broken pipe, or an already-closed handle) —
 /// or an actor-ask times out, subject to `ConnectionRecoveryPolicy` — the
 /// ref re-resolves the peer through the registry's connection pool
-/// (`peer_id` → address, refreshing DNS as needed), retries the operation
-/// once against the fresh connection, and **persists** the healed
-/// connection back into the slot so every subsequent call on this ref (and
-/// on any of its clones, which share the same slot) uses it directly with
-/// zero additional lookups.
+/// (`peer_id` → address, refreshing DNS as needed), and **persists** the
+/// healed connection back into the slot so every subsequent call on this ref
+/// (and on any of its clones, which share the same slot) uses it directly
+/// with zero additional lookups. The failed operation is not replayed because
+/// a transport error is ambiguous; an actor ask is retried only when the
+/// caller explicitly enables the timeout-retry policy.
 ///
 /// This provides **self-healing** behavior - no manual re-lookup needed!
 /// A failed re-resolution (e.g. the peer is genuinely unreachable, or the
@@ -718,12 +719,9 @@ impl<T> RemoteActorRef<T> {
 
         // Direct call - ZERO LOCKS
         // ConnectionHandle.tell_bytes() avoids an extra payload clone.
-        match conn.tell_bytes(message.clone()).await {
+        match conn.tell_bytes(message).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                self.reheal_connection(&conn)
-                    .await?
-                    .tell_bytes(message)
-                    .await
+                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
             }
             other => other,
         }
@@ -749,15 +747,9 @@ impl<T> RemoteActorRef<T> {
         payload: bytes::Bytes,
     ) -> crate::Result<()> {
         let conn = self.current_connection_or_not_listening()?;
-        match conn
-            .tell_actor_frame(actor_id, type_hash, payload.clone())
-            .await
-        {
+        match conn.tell_actor_frame(actor_id, type_hash, payload).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                self.reheal_connection(&conn)
-                    .await?
-                    .tell_actor_frame(actor_id, type_hash, payload)
-                    .await
+                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
             }
             other => other,
         }
@@ -954,10 +946,7 @@ impl<T> RemoteActorRef<T> {
         let conn = self.current_connection_or_not_listening()?;
         match conn.tell_typed(message).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                self.reheal_connection(&conn)
-                    .await?
-                    .tell_typed(message)
-                    .await
+                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
             }
             other => other,
         }
