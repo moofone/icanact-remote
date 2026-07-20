@@ -40,6 +40,7 @@ pub mod pubsub;
 pub mod registry;
 pub mod remote_actor_location;
 pub mod remote_actor_ref;
+mod route_interning;
 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
 pub mod test_helpers;
 pub mod tls;
