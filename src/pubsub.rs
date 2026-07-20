@@ -484,9 +484,14 @@ fn subscriber_rmw_window_hook() {
 /// a `note_interest` background task issues its register/unregister
 /// registry call. Compiles to a no-op in production builds.
 #[inline]
+#[cfg(any(test, feature = "test-helpers"))]
 async fn interest_dispatch_hook(topic_key: u64, present: bool) {
     crate::test_helpers::fire_pubsub_interest_dispatch_hook(topic_key, present).await;
 }
+
+#[inline]
+#[cfg(not(any(test, feature = "test-helpers")))]
+async fn interest_dispatch_hook(_topic_key: u64, _present: bool) {}
 
 impl RoutedPubSub {
     pub async fn install(registry: Arc<crate::registry::GossipRegistry>) -> Arc<Self> {

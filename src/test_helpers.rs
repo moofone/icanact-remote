@@ -79,23 +79,22 @@ pub fn fire_pubsub_subscriber_rmw_hook() {
 /// transitions deterministically instead of relying on incidental
 /// scheduler timing.
 ///
-/// Unconditionally compiled (mirrors `set_transport_lifecycle_recorder` in
-/// `lifecycle.rs`): the fast, uninstalled path is a single relaxed atomic
-/// load, so both unit tests (`cfg(test)`) and integration tests (which link
-/// the crate without `cfg(test)`) can install it under a plain
-/// `cargo test`, with no `test-helpers` feature required.
+#[cfg(any(test, feature = "test-helpers"))]
 pub type InterestDispatchHook = std::sync::Arc<
     dyn Fn(u64, bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
 
+#[cfg(any(test, feature = "test-helpers"))]
 static PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(any(test, feature = "test-helpers"))]
 static PUBSUB_INTEREST_DISPATCH_HOOK: OnceLock<Mutex<Option<InterestDispatchHook>>> =
     OnceLock::new();
 
+#[cfg(any(test, feature = "test-helpers"))]
 fn interest_dispatch_hook_slot() -> &'static Mutex<Option<InterestDispatchHook>> {
     PUBSUB_INTEREST_DISPATCH_HOOK.get_or_init(|| Mutex::new(None))
 }
@@ -103,6 +102,7 @@ fn interest_dispatch_hook_slot() -> &'static Mutex<Option<InterestDispatchHook>>
 /// Installs (replacing any previous) process-wide interest-dispatch hook.
 /// Unlike the subscriber RMW hook this is re-installable, since tests that
 /// exercise this path run serially against a fresh, per-test topic key.
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn install_pubsub_interest_dispatch_hook(hook: InterestDispatchHook) {
     *interest_dispatch_hook_slot()
         .lock()
@@ -110,6 +110,7 @@ pub fn install_pubsub_interest_dispatch_hook(hook: InterestDispatchHook) {
     PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn clear_pubsub_interest_dispatch_hook() {
     *interest_dispatch_hook_slot()
         .lock()
@@ -121,6 +122,7 @@ pub fn clear_pubsub_interest_dispatch_hook() {
 /// it returns. Called by `RoutedPubSub`'s interest-dispatch loop
 /// immediately before issuing the register/unregister registry call.
 #[inline]
+#[cfg(any(test, feature = "test-helpers"))]
 pub async fn fire_pubsub_interest_dispatch_hook(topic_key: u64, present: bool) {
     if !PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
