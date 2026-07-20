@@ -448,6 +448,18 @@ where
             .write_vectored(slices)
             .await
             .map_err(GossipError::Network)?;
+        // R-7: a zero-length vectored write means the stream is no longer
+        // writable (peer closed the write side). Without this guard the advance
+        // loop below no-ops (remaining == 0) and `while cur_slice < total_slices`
+        // re-issues the identical write forever, spinning a runtime worker at
+        // 100% with the connection wedged. Tear down instead — the guarded twin
+        // `write_response_batch` does the same.
+        if n == 0 {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write_vectored returned 0",
+            )));
+        }
         bytes_written_counter.fetch_add(n, Ordering::Relaxed);
         *bytes_since_flush += n;
 
@@ -1239,5 +1251,85 @@ mod queue_notify_tests {
             .expect("consumer parked forever: wakeup lost while frames were queued");
         assert_eq!(received, FRAMES);
         producer.join().expect("producer thread panicked");
+    }
+
+    /// `AsyncWrite` that reports `Ok(0)` (WriteZero) on vectored writes, but
+    /// caps re-issued writes: a correct caller surfaces WriteZero on the first
+    /// `Ok(0)` and never re-issues, while a missing guard would spin forever —
+    /// the cap turns that into a bounded, distinct error so the test fails
+    /// cleanly instead of hanging the process at 100% CPU (R-7).
+    struct WriteZeroVectored {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl tokio::io::AsyncWrite for WriteZeroVectored {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+        fn poll_write_vectored(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= 4096 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "vectored write re-issued 4096 times without progress (R-7 spin)",
+                )));
+            }
+            Poll::Ready(Ok(0))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// R-7: `write_direct_response_batch` must surface a vectored `Ok(0)` as a
+    /// `WriteZero` error on the first such write. Pre-fix the advance loop
+    /// no-ops (remaining == 0) and `while cur_slice < total_slices` re-issues
+    /// the identical write at 100% CPU with the connection wedged; the mock's
+    /// 4096-call cap bounds that into a distinct `Other` error so the WriteZero
+    /// assertion fails cleanly rather than hanging.
+    #[tokio::test]
+    async fn qa_r7_direct_response_batch_ok0_errors_not_spins() {
+        let mut stream =
+            WriteZeroVectored { calls: std::sync::atomic::AtomicUsize::new(0) };
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut bytes_since_flush = 0usize;
+        let mut batch = DirectResponseBatch::new(8);
+        // Two payloads force the vectored path (skips the `len() == 1` fast path).
+        batch.push_bytes(1, bytes::Bytes::from_static(b"resp-one"));
+        batch.push_bytes(2, bytes::Bytes::from_static(b"resp-two"));
+        let result =
+            write_direct_response_batch(&mut stream, &counter, &mut bytes_since_flush, &mut batch)
+                .await;
+        match result {
+            Err(crate::GossipError::Network(e))
+                if e.kind() == std::io::ErrorKind::WriteZero =>
+            {
+                assert!(
+                    stream.calls.load(std::sync::atomic::Ordering::SeqCst) <= 1,
+                    "WriteZero must surface on the first Ok(0), not after a spin"
+                );
+            }
+            Err(crate::GossipError::Network(e)) => {
+                panic!("expected Network(WriteZero), got kind {:?}: {e}", e.kind())
+            }
+            other => panic!("expected Network(WriteZero), got {other:?}"),
+        }
     }
 }

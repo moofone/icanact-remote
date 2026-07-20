@@ -1148,7 +1148,7 @@ impl LockFreeStreamHandle {
 
                                 while payload.has_remaining() {
                                     match stream.write_buf(&mut payload).await {
-                                        Ok(0) => break,
+                                        Ok(0) => return, // R-7: WriteZero mid-frame -> teardown (break would drop the remaining payload and desync the wire)
                                         Ok(n) => {
                                             bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                             total_bytes_written += n;
@@ -1277,7 +1277,7 @@ impl LockFreeStreamHandle {
 
                                 while payload.has_remaining() {
                                     match stream.write_buf(&mut payload).await {
-                                        Ok(0) => break,
+                                        Ok(0) => return, // R-7: WriteZero mid-frame -> teardown (break would drop the remaining payload and desync the wire)
                                         Ok(n) => {
                                             bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                             total_bytes_written += n;
@@ -1335,7 +1335,7 @@ impl LockFreeStreamHandle {
 
                                 while buf.has_remaining() {
                                     match stream.write_buf(&mut buf).await {
-                                        Ok(0) => break,
+                                        Ok(0) => return, // R-7: WriteZero mid-frame -> teardown (break would drop the remaining payload and desync the wire)
                                         Ok(n) => {
                                             bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                             total_bytes_written += n;
