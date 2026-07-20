@@ -1448,6 +1448,35 @@ mod tests {
         assert_eq!(out.1, 5);
     }
 
+    #[test]
+    fn finalize_empty_stream_survives_exhausted_pool() {
+        let pool = Arc::new(crate::AlignedBytesPool::new(2));
+        let _checked_out: Vec<_> = std::iter::from_fn(|| {
+            (pool.available_count() > 0).then(|| pool.get_buffer(64))
+        })
+        .collect();
+        assert_eq!(pool.available_count(), 0, "pool must be fully checked out");
+
+        let mut state = StreamingState::new();
+        let start = crate::StreamHeader {
+            stream_id: 99,
+            total_size: 0,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 1,
+            actor_id: 2,
+        };
+        state
+            .start_stream_with_correlation(start, 11, pool, None)
+            .expect("zero-length stream must start with an exhausted pool");
+        let out = state
+            .finalize_stream_with_correlation(99, None)
+            .expect("zero-length stream must finalize")
+            .expect("empty stream yields a message");
+        assert_eq!(out.0.as_ref(), b"");
+        assert_eq!(out.1, 11);
+    }
+
     /// Helpers for the chunk-integrity tests below.
     mod chunk_integrity {
         use super::*;
