@@ -154,6 +154,16 @@ impl<T> GossipRegistryHandle<T> {
         }
         transport_stack.prepare_config(&secret_key, &mut config)?;
 
+        // Flips a cancel flag when dropped. Living across the `spawn_blocking`
+        // await below, it lets a dropped outer future abort the blocking bind
+        // task instead of leaking it (and the bound port).
+        struct BindCancelGuard(Arc<AtomicBool>);
+        impl Drop for BindCancelGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
         let (listener, actual_bind_addr) = match transport_stack.wire_kind() {
             TransportWireKind::TcpStream => {
                 // Create the TCP listener first to get the actual bound address.
@@ -166,13 +176,28 @@ impl<T> GossipRegistryHandle<T> {
                 // ~10 s). Run it on the blocking pool so an EPERM burst at
                 // startup cannot stall this async worker (which would freeze the
                 // whole executor on a single-thread runtime).
-                let listener = tokio::task::spawn_blocking(move || bind_with_reuseaddr(bind_addr))
-                    .await
-                    .map_err(|err| {
-                        GossipError::Network(std::io::Error::other(format!(
-                            "bind task failed to join: {err}"
-                        )))
-                    })??;
+                //
+                // If this future is dropped (outer timeout/select) mid-bind, the
+                // JoinHandle drops but the blocking task keeps running and could
+                // hold the port for the full EPERM window. `BindCancelGuard`
+                // flips `bind_cancel` on drop so the task abandons the loop and
+                // releases any listener it just bound, freeing the port for a
+                // same-addr retry.
+                let bind_cancel = Arc::new(AtomicBool::new(false));
+                let cancel_guard = BindCancelGuard(bind_cancel.clone());
+                let task_cancel = bind_cancel;
+                let listener = tokio::task::spawn_blocking(move || {
+                    bind_with_reuseaddr(bind_addr, task_cancel)
+                })
+                .await
+                .map_err(|err| {
+                    GossipError::Network(std::io::Error::other(format!(
+                        "bind task failed to join: {err}"
+                    )))
+                })??;
+                // Bind completed; disarm the guard so the normal path does not
+                // flip the (now unobserved) cancel flag.
+                drop(cancel_guard);
                 let actual_bind_addr = listener.local_addr()?;
                 (listener, actual_bind_addr)
             }
@@ -2187,94 +2212,183 @@ mod tests {
         handle.shutdown_and_wait().await;
         Ok(())
     }
-}
 
-pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> {
-    use socket2::{Domain, Socket, Type};
+    #[test]
+    fn bind_with_backoff_impl_honors_cancellation() {
+        use std::sync::mpsc;
 
-    fn is_sandbox_eperm(err: &std::io::Error) -> bool {
-        // In some sandbox profiles on macOS, networking syscalls can fail with EPERM but
-        // the `ErrorKind` is not consistently `PermissionDenied`. Treat raw OS EPERM as
-        // a soft failure and fall back to std's listener.
-        err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(1)
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Flip the cancel flag shortly after the blocking loop starts.
+        let flip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip.store(true, Ordering::Relaxed);
+        });
+
+        // Run the blocking bind on its own thread with a bind_fn that always
+        // reports sandbox EPERM (raw OS error 1), so the backoff loop never
+        // terminates on its own within the test window.
+        let (tx, rx) = mpsc::channel();
+        let bind_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let res =
+                bind_with_backoff_impl(&bind_cancel, || Err(std::io::Error::from_raw_os_error(1)));
+            let _ = tx.send(res);
+        });
+
+        // A cancelled bind must abandon the backoff loop promptly. Without the
+        // cancel check the loop runs to the multi-second EPERM deadline and this
+        // recv times out (the seam-only stage).
+        let res = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("bind_with_backoff_impl must return within 500ms of cancellation");
+        assert!(
+            matches!(res, Err(GossipError::Shutdown)),
+            "cancelled bind must return GossipError::Shutdown, got {res:?}"
+        );
     }
 
-    fn bind_fallback_std(bind_addr: SocketAddr) -> Result<TcpListener> {
-        // macOS sandboxed runs can return transient EPERM for otherwise-valid `bind()` calls.
-        // Retrying here is cheap (only on startup) and makes socket-heavy integration tests
-        // deterministic.
-        // Some sandbox profiles exhibit long EPERM bursts under load, so allow a longer retry
-        // window. This only impacts startup when EPERM is actually occurring.
-        //
-        // IMPORTANT: use backoff, not a tight loop. Hammering bind() every ~10ms can prolong the
-        // sandbox burst and makes `cargo test --all` retries converge poorly.
-        let max_wait_ms: u64 = std::env::var("ICANACT_EPERM_BIND_MAX_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000);
-        let backoff_start_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_START_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
-        let backoff_max_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_MAX_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1_000);
+    #[tokio::test]
+    async fn bind_with_backoff_impl_releases_port_when_cancelled_after_bind() {
+        // Reserve a currently-free port, then release it so the bind below can
+        // claim (and must then release) it.
+        let addr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            let addr = probe.local_addr().expect("probe addr");
+            drop(probe);
+            addr
+        };
 
-        let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
-        let mut backoff = Duration::from_millis(backoff_start_ms);
+        // bind_fn succeeds and flips cancel immediately after a successful bind;
+        // the post-bind cancel check must drop the listener and return Shutdown.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let after_bind = cancel.clone();
+        let res = bind_with_backoff_impl(&cancel, move || {
+            let std_listener = std::net::TcpListener::bind(addr)?;
+            std_listener.set_nonblocking(true)?;
+            let listener = TcpListener::from_std(std_listener)?;
+            after_bind.store(true, Ordering::Relaxed);
+            Ok(listener)
+        });
+        assert!(
+            matches!(res, Err(GossipError::Shutdown)),
+            "cancelled-after-bind must return Shutdown, got {res:?}"
+        );
 
-        loop {
-            match std::net::TcpListener::bind(bind_addr) {
-                Ok(std_listener) => {
-                    if let Err(e) = std_listener.set_nonblocking(true) {
-                        if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
-                            std::thread::sleep(backoff);
-                            backoff = std::cmp::min(
-                                backoff.saturating_mul(2),
-                                Duration::from_millis(backoff_max_ms),
-                            );
-                            continue;
-                        }
-                        return Err(GossipError::Network(e));
-                    }
+        // The port must be free again immediately: the cancelled bind dropped it.
+        std::net::TcpListener::bind(addr).expect("port must be released after cancelled bind");
+    }
+}
 
-                    match TcpListener::from_std(std_listener) {
-                        Ok(listener) => return Ok(listener),
-                        Err(e) => {
-                            // Treat tokio's conversion failure the same way as bind flakiness
-                            // in sandboxed environments.
-                            if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
-                                std::thread::sleep(backoff);
-                                backoff = std::cmp::min(
-                                    backoff.saturating_mul(2),
-                                    Duration::from_millis(backoff_max_ms),
-                                );
-                                continue;
-                            }
-                            return Err(GossipError::Network(e));
-                        }
-                    }
+fn is_sandbox_eperm(err: &std::io::Error) -> bool {
+    // In some sandbox profiles on macOS, networking syscalls can fail with EPERM but
+    // the `ErrorKind` is not consistently `PermissionDenied`. Treat raw OS EPERM as
+    // a soft failure and fall back to std's listener.
+    err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(1)
+}
+
+/// Sleep in small blocking slices so a dropped startup future does not wait
+/// for a full exponential-backoff interval before its bind task exits.
+fn sleep_backoff_or_cancel(cancel: &AtomicBool, delay: Duration) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+/// Retry a blocking bind with exponential backoff until it succeeds, hits a
+/// non-EPERM error, or the retry deadline elapses.
+///
+/// macOS sandboxed runs can return transient EPERM for otherwise-valid `bind()`
+/// calls; retrying here is cheap (only on startup) and makes socket-heavy
+/// integration tests deterministic. Some sandbox profiles exhibit long EPERM
+/// bursts under load, so the window is generous. Backoff (not a tight loop) is
+/// important: hammering bind() every ~10ms can prolong the sandbox burst.
+///
+/// Extracted as a seam so cancellation can be injected: `cancel` lets a caller
+/// whose future was dropped abort this otherwise multi-second blocking loop
+/// (honored by the T5 cancellation fix).
+fn bind_with_backoff_impl(
+    cancel: &Arc<AtomicBool>,
+    mut bind_fn: impl FnMut() -> std::io::Result<TcpListener>,
+) -> Result<TcpListener> {
+    let max_wait_ms: u64 = std::env::var("ICANACT_EPERM_BIND_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let backoff_start_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_START_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let backoff_max_ms: u64 = std::env::var("ICANACT_EPERM_BIND_BACKOFF_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000);
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
+    let mut backoff = Duration::from_millis(backoff_start_ms);
+
+    loop {
+        // A caller whose future was dropped flips `cancel`; abandon the backoff
+        // loop rather than block for the multi-second EPERM window.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(GossipError::Shutdown);
+        }
+        match bind_fn() {
+            Ok(listener) => {
+                // If cancellation raced a successful bind, drop the listener so
+                // the port is released immediately for a same-addr retry.
+                if cancel.load(Ordering::Relaxed) {
+                    drop(listener);
+                    return Err(GossipError::Shutdown);
                 }
-                Err(e) => {
-                    if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
-                        std::thread::sleep(backoff);
-                        backoff = std::cmp::min(
-                            backoff.saturating_mul(2),
-                            Duration::from_millis(backoff_max_ms),
-                        );
-                        continue;
+                return Ok(listener);
+            }
+            Err(e) => {
+                if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
+                    if sleep_backoff_or_cancel(cancel, backoff) {
+                        return Err(GossipError::Shutdown);
                     }
-                    return Err(GossipError::Network(e));
+                    backoff = std::cmp::min(
+                        backoff.saturating_mul(2),
+                        Duration::from_millis(backoff_max_ms),
+                    );
+                    continue;
                 }
+                return Err(GossipError::Network(e));
             }
         }
+    }
+}
+
+pub(crate) fn bind_with_reuseaddr(
+    bind_addr: SocketAddr,
+    cancel: Arc<AtomicBool>,
+) -> Result<TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    fn bind_fallback_std(bind_addr: SocketAddr, cancel: &Arc<AtomicBool>) -> Result<TcpListener> {
+        // One bind attempt (bind + set_nonblocking + tokio conversion); the
+        // backoff/retry loop lives in `bind_with_backoff_impl`.
+        bind_with_backoff_impl(cancel, move || {
+            let std_listener = std::net::TcpListener::bind(bind_addr)?;
+            std_listener.set_nonblocking(true)?;
+            TcpListener::from_std(std_listener)
+        })
     }
 
     // For ephemeral ports, std's bind path is already fast and reliable, and avoids
     // sandbox-sensitive socket option syscalls (EPERM flakiness in some environments).
     if bind_addr.port() == 0 {
-        return bind_fallback_std(bind_addr);
+        return bind_fallback_std(bind_addr, &cancel);
     }
 
     #[cfg(any(
@@ -2319,7 +2433,7 @@ pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> 
         Ok(s) => s,
         Err(e) if is_sandbox_eperm(&e) => {
             // Some sandbox profiles disallow raw socket creation/config; fall back.
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         Err(e) => return Err(GossipError::Network(e)),
     };
@@ -2344,20 +2458,20 @@ pub(crate) fn bind_with_reuseaddr(bind_addr: SocketAddr) -> Result<TcpListener> 
 
     if let Err(e) = socket.bind(&bind_addr.into()) {
         if is_sandbox_eperm(&e) {
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         return Err(GossipError::Network(e));
     }
     if let Err(e) = socket.listen(1024) {
         if is_sandbox_eperm(&e) {
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         return Err(GossipError::Network(e));
     }
 
     if let Err(e) = socket.set_nonblocking(true) {
         if is_sandbox_eperm(&e) {
-            return bind_fallback_std(bind_addr);
+            return bind_fallback_std(bind_addr, &cancel);
         }
         return Err(GossipError::Network(e));
     }
