@@ -57,7 +57,7 @@ impl LockFreeStreamHandle {
     fn allocate_stream_id(&self) -> Result<u32> {
         let id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         if id == 0 || id == u32::MAX {
-            self.shutdown_signal.store(true, Ordering::Release);
+            self.signal_shutdown();
             return Err(GossipError::Shutdown);
         }
         Ok(id)
@@ -544,7 +544,7 @@ impl LockFreeStreamHandle {
             .map(|_| crate::protocol::StreamingState::new());
         let mut last_cleanup = std::time::Instant::now();
 
-        while !shutdown_signal.load(Ordering::Relaxed) {
+        while !shutdown_signal.load(Ordering::Acquire) {
             let mut total_bytes_written = 0;
             let mut did_work = false;
             let mut wrote_ask_payload = false;
@@ -2381,9 +2381,21 @@ impl LockFreeStreamHandle {
         self.addr
     }
 
+    /// Mark this connection shut down and wake any writer parked in the idle
+    /// select so it observes the flag at the next loop iteration. Without the
+    /// wake, an idle connection's writer never re-checks `shutdown_signal` and
+    /// `wait_for_exit` / `task.await` hangs forever (R-2). The queue data
+    /// notifiers are consumer-only, so these permits are never stolen by a
+    /// producer (producers wait on `space_notify`).
+    fn signal_shutdown(&self) {
+        self.shutdown_signal.store(true, Ordering::Release);
+        self.write_queue.wake_consumer();
+        self.streaming_queue.wake_consumer();
+    }
+
     /// Shutdown the background writer task
     pub fn shutdown(&self) {
-        self.shutdown_signal.store(true, Ordering::Relaxed);
+        self.signal_shutdown();
     }
 
     /// Wait until the IO task exits.
@@ -2718,8 +2730,7 @@ mod route_interning_tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
-    #[tokio::test]
-    async fn first_routed_ask_binds_before_compact_frame_and_reuses_the_route() {
+    async fn run_routed_ask_route_reuse_body() {
         let (client, mut peer) = tokio::io::duplex(1024);
         let (writer, task, _) = LockFreeStreamHandle::new(
             client,
@@ -2763,6 +2774,68 @@ mod route_interning_tests {
 
         writer.shutdown();
         task.await.unwrap();
+    }
+
+    // R-2 (#144 regression): this test hung forever on remote main — every
+    // routed ask and its bind drained fine, but `writer.shutdown()` only stored
+    // the flag without waking the writer parked in the idle select, so
+    // `task.await` never returned (plain `cargo test` never terminated). The
+    // timeout converts any future regression from a suite-wide hang into a
+    // clean test failure and STAYS after the fix.
+    #[tokio::test]
+    async fn first_routed_ask_binds_before_compact_frame_and_reuses_the_route() {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_routed_ask_route_reuse_body(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "routed-ask route-reuse flow must not hang (R-2): shutdown must wake the parked writer"
+        );
+    }
+
+    /// R-2: same route-reuse invariant on the multi-thread flavor, so the
+    /// contract is pinned independently of the runtime flavor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qa_r2_route_reuse_multithread() {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_routed_ask_route_reuse_body(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "routed-ask route-reuse flow must not hang on the multi-thread runtime (R-2)"
+        );
+    }
+
+    /// R-2: the exact lost-wakeup point — `shutdown()` must wake a writer parked
+    /// in the idle select. Before the fix it only stored the flag, so a parked
+    /// writer never re-checked it and `task` (the writer's JoinHandle) hung
+    /// forever. Two `yield_now`s let the current-thread runtime run the spawned
+    /// writer to its idle park point (no frames queued, no read context) before
+    /// shutdown is called, making the regression deterministic rather than
+    /// timing-dependent.
+    #[tokio::test]
+    async fn qa_r2_shutdown_wakes_parked_writer() {
+        let (client, _peer) = tokio::io::duplex(128);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9903".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        writer.shutdown();
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+        assert!(
+            exited.is_ok(),
+            "shutdown() must wake a writer parked in the idle select (R-2)"
+        );
     }
 
     #[tokio::test]
