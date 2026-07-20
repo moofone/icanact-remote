@@ -1029,7 +1029,15 @@ async fn dropped_transport_during_actor_ask_self_heals_and_reconnects() -> icana
     .await;
     connect_preferred_direction(&local, &remote, &remote_to_local).await?;
     wait_until_connected(&local, &remote.registry.peer_id).await?;
-    wait_for_successful_ask(&local, &remote.registry.peer_id, b"after", b"remote:after").await?;
+    let healed = remote_ref
+        .ask_actor_frame(
+            TEST_ACTOR_ID,
+            TEST_TYPE_HASH,
+            Bytes::from_static(b"after"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    assert_eq!(healed.as_ref(), b"remote:after");
 
     with_events(&events, |events| {
         assert!(
