@@ -6916,3 +6916,189 @@ async fn connect_via_stream_rejects_self_after_cert_identity_discovery_on_addres
          took {elapsed:?}"
     );
 }
+
+/// R4: a mock transport whose `poll_write` legally returns `Ok(0)` on a
+/// non-empty buffer once `threshold` bytes have been accepted — modelling a
+/// half-closed write side. Distinct from `Pending`: per the `AsyncWrite`
+/// contract this must be treated as no-more-forward-progress-possible, not
+/// as "nothing written yet, poll again".
+struct ZeroWriteAfterThreshold {
+    written: AtomicUsize,
+    threshold: usize,
+    zero_write_calls: Arc<AtomicUsize>,
+}
+
+impl AsyncRead for ZeroWriteAfterThreshold {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Never exercised: `read_context` is `None` in this test, so the
+        // writer task's io_task loop never polls the read side.
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for ZeroWriteAfterThreshold {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let cur = self.written.load(Ordering::SeqCst);
+        if cur >= self.threshold {
+            self.zero_write_calls.fetch_add(1, Ordering::SeqCst);
+            return Poll::Ready(Ok(0));
+        }
+        let n = buf.len();
+        self.written.fetch_add(n, Ordering::SeqCst);
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// R4 (RED -> GREEN): `StreamingCommand::OwnedChunks` batches more chunks
+/// than fit in the `MAX_IOV` (64) vectored-write slice array. The vectored
+/// write completes only the first 64 chunks; the remaining chunk(s) are
+/// drained via a raw, un-wrapped `AsyncWriteExt::write()` call (the only one
+/// in this crate — every other write site goes through `write_all` /
+/// `write_vectored_all`, which both already fold `Ok(0)` into `WriteZero`).
+///
+/// Pre-fix, an `Ok(0)` reply from `poll_write` on that raw call leaves
+/// `remaining`/`offset_in_chunk` unchanged, so the loop condition never
+/// changes and the writer task spins on `.write().await` forever: no
+/// progress, no `Pending`, no crash, no log, no timeout — 100% CPU on that
+/// task with the connection's queues permanently undrained.
+///
+/// Post-fix, `Ok(0)` on a non-empty remaining buffer must be treated as
+/// `ErrorKind::WriteZero` (matching `write_all`) and routed into the
+/// existing write-error teardown, so the writer task exits promptly instead
+/// of livelocking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_chunks_zero_write_past_max_iov_exits_instead_of_livelocking() {
+    const CHUNK_LEN: usize = 4;
+    const MAX_IOV: usize = 64; // must match stream_writer.rs's OwnedChunks MAX_IOV
+    const TOTAL_CHUNKS: usize = MAX_IOV + 1; // forces the tail chunk past the vectored batch
+
+    let threshold = MAX_IOV * CHUNK_LEN;
+    let zero_write_calls = Arc::new(AtomicUsize::new(0));
+
+    let stream = ZeroWriteAfterThreshold {
+        written: AtomicUsize::new(0),
+        threshold,
+        zero_write_calls: zero_write_calls.clone(),
+    };
+
+    let addr: SocketAddr = "127.0.0.1:40999".parse().unwrap();
+    let (stream_handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        stream,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+
+    let chunks: Vec<bytes::Bytes> = (0..TOTAL_CHUNKS)
+        .map(|_| bytes::Bytes::from_static(b"AAAA"))
+        .collect();
+    stream_handle
+        .write_owned_chunks(chunks)
+        .expect("queue has room for a single batch");
+
+    // Pre-fix this task never completes (no progress, no `Pending`); bound
+    // the wait so the defect fails the test instead of hanging the suite.
+    let joined = tokio::time::timeout(Duration::from_secs(5), writer_task).await;
+
+    assert!(
+        joined.is_ok(),
+        "writer task did not exit within 5s: livelocked on a legal Ok(0) short write \
+         past MAX_IOV (observed zero-write polls = {})",
+        zero_write_calls.load(Ordering::SeqCst)
+    );
+    joined.unwrap().expect("writer task must not panic");
+
+    assert_eq!(
+        zero_write_calls.load(Ordering::SeqCst),
+        1,
+        "expected the writer to treat the first Ok(0) as WriteZero and stop, not spin on it"
+    );
+}
+
+/// R4 regression guard: `write_all` / `write_vectored_all` already fold a
+/// legal `Ok(0)` `poll_write` reply into `ErrorKind::WriteZero`. A bare
+/// `AsyncWriteExt::write()` call bypasses that and can livelock (this is
+/// exactly what R4 fixed in `stream_writer.rs`'s `OwnedChunks` short-write
+/// tail). Scan the `connection_pool` source files for any *new* raw
+/// `.write(` call site so a future edit can't reintroduce the bug silently.
+///
+/// This is a coarse text scan, not a type-aware lint, so it allowlists the
+/// other legitimate uses of a zero-arg-ish `.write(` that are NOT
+/// `AsyncWriteExt::write`:
+///   - `MaybeUninit<IoSlice>` slot initialization (always has `IoSlice::new(`
+///     in the same call)
+///   - raw-pointer/`UnsafeCell` slot writes (`(*hdr_slot).write(header)`,
+///     `(*slot.get()).write(response)`)
+///   - `std::sync::RwLock::write()` lock acquisition (always a bare
+///     `.write()` on its own line in this codebase's chaining style)
+///
+/// Anything else containing `.write(` is treated as a potential raw
+/// `AsyncWriteExt::write()` call and fails the test.
+#[test]
+fn connection_pool_has_no_unwrapped_raw_async_write_calls() {
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/connection_pool"));
+
+    let is_allowed = |trimmed: &str| -> bool {
+        trimmed.contains("IoSlice::new(")
+            || trimmed == "(*hdr_slot).write(header);"
+            || trimmed == "(*slot_ref.response.get()).write(response);"
+            || trimmed == ".write()"
+    };
+
+    let mut violations = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read connection_pool dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        // Only the flat `include!`d source files; the `tests/` submodule
+        // (this file) and `transport_stream.rs` (a real submodule, not part
+        // of the io_task write path) are out of scope for this guard.
+        if path.is_dir() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&path).expect("read source file");
+        for (idx, line) in contents.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.contains(".write(") {
+                continue;
+            }
+            // `.write_all(` / `.write_vectored(` / `.write_vectored_all(` are
+            // the sanctioned wrappers and never match the literal `.write(`
+            // substring check (the char after `write` is `_`, not `(`), so
+            // no separate exclusion is needed for them here.
+            if !is_allowed(trimmed) {
+                violations.push(format!(
+                    "{}:{}: {}",
+                    path.display(),
+                    idx + 1,
+                    trimmed
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "found raw `.write(` call site(s) outside the write_all/write_vectored_all wrappers \
+         (R4 livelock class — Ok(0) on a non-empty buffer must be treated as WriteZero, not \
+         retried in a loop):\n{}",
+        violations.join("\n")
+    );
+}

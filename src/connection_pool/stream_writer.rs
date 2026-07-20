@@ -658,26 +658,33 @@ impl LockFreeStreamHandle {
                                     offset_in_chunk -= chunks[chunk_idx].len();
                                     chunk_idx += 1;
                                 }
-                                // Continue writing from current position
+                                // Continue writing from current position. Use `write_all`
+                                // (not a raw `write()`) so a legal `Ok(0)` reply from
+                                // `poll_write` — distinct from `Pending`, meaning the
+                                // transport is no longer accepting bytes (e.g. a
+                                // half-closed write side) — is folded into
+                                // `ErrorKind::WriteZero` exactly like every other write
+                                // path in this file (`write_all`/`write_vectored_all`).
+                                // A raw `write()` here previously left `remaining`/
+                                // `offset_in_chunk` unchanged on `Ok(0)`, spinning the
+                                // writer task forever with no progress and no yield
+                                // point (R4 livelock).
                                 while chunk_idx < chunks.len() && remaining > 0 {
-                                    match stream.write(&chunks[chunk_idx][offset_in_chunk..]).await
+                                    let chunk_remaining =
+                                        chunks[chunk_idx].len() - offset_in_chunk;
+                                    if let Err(e) = stream
+                                        .write_all(&chunks[chunk_idx][offset_in_chunk..])
+                                        .await
                                     {
-                                        Ok(written) => {
-                                            bytes_written_counter
-                                                .fetch_add(written, Ordering::Relaxed);
-                                            total_bytes_written += written;
-                                            remaining -= written;
-                                            offset_in_chunk += written;
-                                            if offset_in_chunk >= chunks[chunk_idx].len() {
-                                                chunk_idx += 1;
-                                                offset_in_chunk = 0;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Chunk batch write completion error: {}", e);
-                                            return;
-                                        }
+                                        error!("Chunk batch write completion error: {}", e);
+                                        return;
                                     }
+                                    bytes_written_counter
+                                        .fetch_add(chunk_remaining, Ordering::Relaxed);
+                                    total_bytes_written += chunk_remaining;
+                                    remaining -= chunk_remaining;
+                                    chunk_idx += 1;
+                                    offset_in_chunk = 0;
                                 }
                             }
                             Err(e) => {
