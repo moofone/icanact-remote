@@ -101,6 +101,50 @@ impl RouteTable {
     }
 }
 
+/// RAII rollback for a freshly-allocated outbound route whose `RouteBind`
+/// frame has not yet been enqueued. `Drop` calls [`RouteTable::remove_unbound`]
+/// unless the caller [`disarm`](Self::disarm)s the guard after the bind frame is
+/// successfully queued — making the allocation cancel-safe at every await
+/// point (R-3).
+///
+/// Without this, dropping the `write_routed_actor_ask` future while its bind
+/// enqueue is parked on a full write queue leaves the route marked bound, so
+/// the next ask emits a `RoutedActorAsk` for a slot the peer never learned
+/// (`unknown route slot` -> connection teardown).
+pub(crate) struct UnboundRouteGuard<'a> {
+    table: &'a RouteTable,
+    slot: u32,
+    key: RouteKey,
+    armed: bool,
+}
+
+impl<'a> UnboundRouteGuard<'a> {
+    /// Arm a rollback for `key` freshly allocated at `slot`.
+    pub(crate) fn new(table: &'a RouteTable, slot: u32, key: RouteKey) -> Self {
+        Self {
+            table,
+            slot,
+            key,
+            armed: true,
+        }
+    }
+
+    /// Cancel the rollback. Call only once the `RouteBind` frame is
+    /// successfully enqueued — the writer task owns retry/teardown from there,
+    /// so the route must stay bound.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnboundRouteGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.table.remove_unbound(self.slot, self.key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +193,49 @@ mod tests {
         assert_eq!(table.slot_for(second), None);
         assert!(!table.bind(2, second));
         assert!(table.bind(1, first), "existing binding remains idempotent");
+    }
+
+    /// R-3: a dropped-while-armed `UnboundRouteGuard` rolls back the fresh
+    /// allocation; a disarmed guard leaves the binding intact. This is the
+    /// cancel-safety primitive for `write_routed_actor_ask`'s bind enqueue.
+    #[test]
+    fn qa_r3_unbound_route_guard_rolls_back_only_while_armed() {
+        let table = RouteTable::new();
+        let key = RouteKey { actor_id: 7, type_hash: 9 };
+
+        // Armed drop -> rolled back.
+        let (slot, fresh) = table.slot_for(key).unwrap();
+        assert!(fresh);
+        {
+            let guard = UnboundRouteGuard::new(&table, slot, key);
+            assert_eq!(
+                table.resolve(slot),
+                Some(key),
+                "guard construction must not remove the binding"
+            );
+            drop(guard); // armed
+        }
+        assert_eq!(
+            table.resolve(slot),
+            None,
+            "armed guard drop must roll back the fresh allocation"
+        );
+        let (retry_slot, retry_fresh) = table.slot_for(key).unwrap();
+        assert!(retry_fresh, "rolled-back route re-binds fresh");
+        assert_ne!(retry_slot, slot);
+
+        // Disarmed drop -> binding stays.
+        let (slot2, _) = table.slot_for(key).unwrap();
+        assert_eq!(slot2, retry_slot);
+        {
+            let mut guard = UnboundRouteGuard::new(&table, slot2, key);
+            guard.disarm();
+            drop(guard); // disarmed
+        }
+        assert_eq!(
+            table.resolve(slot2),
+            Some(key),
+            "disarmed guard must leave the binding intact"
+        );
     }
 }
