@@ -1998,7 +1998,10 @@ impl LockFreeStreamHandle {
             .ok_or(GossipError::Shutdown)?;
         if needs_bind {
             let bind = crate::framing::write_route_bind_header(route_slot, actor_id, type_hash);
-            self.write_bytes_control(bytes::Bytes::copy_from_slice(&bind)).await?;
+            if let Err(error) = self.write_bytes_control(bytes::Bytes::copy_from_slice(&bind)).await {
+                self.outbound_routes.remove_unbound(route_slot, route);
+                return Err(error);
+            }
         }
         let header = crate::framing::write_routed_actor_ask_header(
             correlation_id,
@@ -2753,5 +2756,28 @@ mod route_interning_tests {
 
         writer.shutdown();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_first_bind_does_not_publish_a_route_for_retry() {
+        let (client, _peer) = tokio::io::duplex(128);
+        let (writer, _task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9902".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        writer.shutdown();
+        assert!(writer
+            .write_routed_actor_ask(17, 7, 9, bytes::Bytes::from_static(b"one"))
+            .await
+            .is_err());
+        let (_, retry_is_fresh) = writer
+            .outbound_routes
+            .slot_for(crate::route_interning::RouteKey { actor_id: 7, type_hash: 9 })
+            .unwrap();
+        assert!(retry_is_fresh, "failed bind must not publish its route");
     }
 }

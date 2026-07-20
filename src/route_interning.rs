@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
 
+/// A peer cannot grow route state beyond this per-connection limit.
+pub(crate) const MAX_ROUTES_PER_CONNECTION: usize = 65_536;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RouteKey {
     pub(crate) actor_id: u64,
@@ -17,6 +20,7 @@ pub(crate) struct RouteKey {
 #[derive(Debug, Default)]
 pub(crate) struct RouteTable {
     next_slot: AtomicU32,
+    max_routes: usize,
     maps: RwLock<RouteMaps>,
 }
 
@@ -28,7 +32,15 @@ struct RouteMaps {
 
 impl RouteTable {
     pub(crate) fn new() -> Self {
-        Self { next_slot: AtomicU32::new(1), ..Self::default() }
+        Self::with_limit(MAX_ROUTES_PER_CONNECTION)
+    }
+
+    fn with_limit(max_routes: usize) -> Self {
+        Self {
+            next_slot: AtomicU32::new(1),
+            max_routes,
+            ..Self::default()
+        }
     }
 
     /// Allocates once per route for this connection. Zero is never a route.
@@ -39,6 +51,9 @@ impl RouteTable {
         let mut maps = self.maps.write().ok()?;
         if let Some(slot) = maps.by_key.get(&key).copied() {
             return Some((slot, false));
+        }
+        if maps.by_key.len() >= self.max_routes {
+            return None;
         }
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
         if slot == 0 || slot == u32::MAX { return None; }
@@ -55,6 +70,9 @@ impl RouteTable {
             Some(existing) if *existing != key => false,
             Some(_) => true,
             None => {
+                if maps.by_key.len() >= self.max_routes {
+                    return false;
+                }
                 if maps.by_key.get(&key).is_some_and(|existing| *existing != slot) {
                     return false;
                 }
@@ -67,6 +85,19 @@ impl RouteTable {
 
     pub(crate) fn resolve(&self, slot: u32) -> Option<RouteKey> {
         self.maps.read().ok()?.by_slot.get(&slot).copied()
+    }
+
+    /// Undo an outbound allocation whose bind frame was not enqueued. The
+    /// caller serializes first-use attempts, so removing only this exact pair
+    /// cannot discard a route that has since become usable on the wire.
+    pub(crate) fn remove_unbound(&self, slot: u32, key: RouteKey) {
+        let Ok(mut maps) = self.maps.write() else {
+            return;
+        };
+        if maps.by_slot.get(&slot) == Some(&key) && maps.by_key.get(&key) == Some(&slot) {
+            maps.by_slot.remove(&slot);
+            maps.by_key.remove(&key);
+        }
     }
 }
 
@@ -94,5 +125,29 @@ mod tests {
         let (slot, _) = old.slot_for(RouteKey { actor_id: 7, type_hash: 9 }).unwrap();
         let new_connection = RouteTable::new();
         assert_eq!(new_connection.resolve(slot), None);
+    }
+
+    #[test]
+    fn failed_first_bind_can_be_rolled_back_for_a_safe_retry() {
+        let table = RouteTable::new();
+        let key = RouteKey { actor_id: 7, type_hash: 9 };
+        let (slot, fresh) = table.slot_for(key).unwrap();
+        assert!(fresh);
+        table.remove_unbound(slot, key);
+        assert_eq!(table.resolve(slot), None);
+        let (retry_slot, retry_is_fresh) = table.slot_for(key).unwrap();
+        assert!(retry_is_fresh);
+        assert_ne!(retry_slot, slot);
+    }
+
+    #[test]
+    fn route_table_has_a_hard_per_connection_limit() {
+        let table = RouteTable::with_limit(1);
+        let first = RouteKey { actor_id: 7, type_hash: 9 };
+        let second = RouteKey { actor_id: 8, type_hash: 9 };
+        assert!(table.slot_for(first).is_some());
+        assert_eq!(table.slot_for(second), None);
+        assert!(!table.bind(2, second));
+        assert!(table.bind(1, first), "existing binding remains idempotent");
     }
 }
