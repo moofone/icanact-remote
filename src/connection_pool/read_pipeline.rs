@@ -31,6 +31,16 @@ mod read_pipeline_tests {
 
     use tokio::io::AsyncWriteExt;
 
+    /// The direct-response stream-id allocator is process-global; serialize the
+    /// tests that swap/observe it so they cannot race each other under parallel
+    /// test execution.
+    fn allocator_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[tokio::test]
     async fn zero_length_frame_is_rejected_before_body_read() {
         let (mut writer, mut reader) = tokio::io::duplex(crate::framing::LENGTH_PREFIX_LEN);
@@ -90,9 +100,32 @@ mod read_pipeline_tests {
 
     #[test]
     fn direct_response_stream_ids_restart_after_wrap() {
-        let previous = super::NEXT_DIRECT_RESPONSE_STREAM_ID.swap(u32::MAX, Ordering::SeqCst);
-        assert_eq!(super::allocate_direct_response_stream_id().unwrap(), u32::MAX);
-        assert_eq!(super::allocate_direct_response_stream_id().unwrap(), 1);
+        let _g = allocator_test_lock();
+        // R-5: even partition — the max even id (u32::MAX - 1) wraps back to 2,
+        // never colliding with the per-handle allocator's odd ids.
+        let previous =
+            super::NEXT_DIRECT_RESPONSE_STREAM_ID.swap(u32::MAX - 1, Ordering::SeqCst);
+        assert_eq!(super::allocate_direct_response_stream_id().unwrap(), u32::MAX - 1);
+        assert_eq!(super::allocate_direct_response_stream_id().unwrap(), 2);
+        super::NEXT_DIRECT_RESPONSE_STREAM_ID.store(previous, Ordering::SeqCst);
+    }
+
+    /// R-5: direct-response stream ids occupy the even partition (disjoint from
+    /// the per-handle stream allocator's odd ids), so they can never collide on
+    /// `stream_id` with a handle-initiated stream on the same connection.
+    #[test]
+    fn qa_r5_direct_response_stream_ids_are_even() {
+        let _g = allocator_test_lock();
+        let previous = super::NEXT_DIRECT_RESPONSE_STREAM_ID.swap(2, Ordering::SeqCst);
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let id = super::allocate_direct_response_stream_id().unwrap();
+            assert!(
+                id != 0 && id % 2 == 0,
+                "direct-response stream id must be even and nonzero, got {id}"
+            );
+            assert!(ids.insert(id), "direct-response stream id reused: {id}");
+        }
         super::NEXT_DIRECT_RESPONSE_STREAM_ID.store(previous, Ordering::SeqCst);
     }
 }
@@ -126,20 +159,28 @@ enum ReadState {
 }
 
 // Direct responses are emitted by the IO owner rather than a public
-// `LockFreeStreamHandle` method. The wire requires uniqueness only for live
-// streams in one direction, so reserve zero and deliberately restart at one
-// after the u32 namespace wraps instead of poisoning every connection.
-static NEXT_DIRECT_RESPONSE_STREAM_ID: AtomicU32 = AtomicU32::new(1);
+// `LockFreeStreamHandle` method. R-5: request and response streams share one
+// reassembly map keyed by `stream_id` alone (no direction bit), so this
+// counter takes the EVEN partition (2, 4, 6, ...) — disjoint from each
+// per-handle `LockFreeStreamHandle` allocator's ODD ids — and a direct
+// streaming response can never collide with a handle-initiated stream on the
+// same connection (a collision keys two live streams to one id and tears the
+// connection down as a duplicate start). Reserve zero; wrap the max even id
+// back to 2 instead of poisoning every connection.
+static NEXT_DIRECT_RESPONSE_STREAM_ID: AtomicU32 = AtomicU32::new(2);
 
 fn allocate_direct_response_stream_id() -> Result<u32> {
     loop {
         let id = NEXT_DIRECT_RESPONSE_STREAM_ID.load(Ordering::Relaxed);
-        let next = if id == u32::MAX || id == 0 { 1 } else { id + 1 };
+        // Even partition (R-5): step 2, wrapping the max even id (u32::MAX - 1)
+        // back to 2. `id` is always even and nonzero, so the odd half stays free
+        // for the per-handle stream allocator.
+        let next = if id >= u32::MAX - 1 { 2 } else { id + 2 };
         if NEXT_DIRECT_RESPONSE_STREAM_ID
             .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            return Ok(if id == 0 { 1 } else { id });
+            return Ok(id);
         }
     }
 }

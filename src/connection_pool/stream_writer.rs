@@ -55,7 +55,13 @@ impl LockFreeStreamHandle {
     }
 
     fn allocate_stream_id(&self) -> Result<u32> {
-        let id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        // R-5: per-handle stream ids take the ODD partition (1, 3, 5, ...) so they
+        // can never collide with the process-global direct-response allocator's
+        // EVEN ids on the same connection — a collision keys two live streams
+        // to one `stream_id` and tears the connection down as a duplicate start.
+        // Init 1 (see `new`); step 2. u32::MAX is odd, so the exhaustion guard
+        // below still fires before any wrap into the even space.
+        let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         if id == 0 || id == u32::MAX {
             self.signal_shutdown();
             return Err(GossipError::Shutdown);
@@ -2951,5 +2957,30 @@ mod route_interning_tests {
         // task.await.
         drop(peer);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// R-5: per-handle stream ids occupy the odd partition (disjoint from the
+    /// direct-response allocator's even ids), so they can never collide on
+    /// `stream_id` with a direct streaming response on the same connection.
+    #[tokio::test]
+    async fn qa_r5_handle_stream_ids_are_odd() {
+        let (client, _peer) = tokio::io::duplex(64);
+        let (writer, _task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9905".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let id = writer.allocate_stream_id().unwrap();
+            assert!(
+                id != 0 && id % 2 == 1,
+                "handle stream id must be odd and nonzero, got {id}"
+            );
+            assert!(ids.insert(id), "handle stream id reused: {id}");
+        }
     }
 }
