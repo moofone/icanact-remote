@@ -557,9 +557,9 @@ async fn cached_ref_self_heals_after_disconnect_bare_connection_fails_closed()
         "stale cached RemoteConnection must fail closed, got {stale_conn_result:?}"
     );
 
-    // (R3) `RemoteActorRef` self-heals: a transport failure on the cached
-    // connection re-resolves the peer through the registry and retries once,
-    // with no manual re-lookup required.
+    // (R3) `RemoteActorRef` repairs its cached connection after an ambiguous
+    // failure, but must not replay this request: the remote may already have
+    // processed it before the local transport reported failure.
     let stale_ref_result = cached_ref
         .ask_actor_frame(
             TEST_ACTOR_ID,
@@ -568,10 +568,23 @@ async fn cached_ref_self_heals_after_disconnect_bare_connection_fails_closed()
             ASK_TIMEOUT,
         )
         .await;
+    assert!(
+        stale_ref_result.is_err(),
+        "ambiguous cached RemoteActorRef ask must not be replayed, got {stale_ref_result:?}"
+    );
+
+    let healed_ref_result = cached_ref
+        .ask_actor_frame(
+            TEST_ACTOR_ID,
+            TEST_TYPE_HASH,
+            Bytes::from_static(b"healed-ref"),
+            ASK_TIMEOUT,
+        )
+        .await;
     assert_eq!(
-        stale_ref_result.as_deref().ok(),
-        Some(b"b:stale-ref".as_slice()),
-        "cached RemoteActorRef should self-heal after disconnect with no manual re-lookup, got {stale_ref_result:?}"
+        healed_ref_result.as_deref().ok(),
+        Some(b"b:healed-ref".as_slice()),
+        "the next cached RemoteActorRef ask should use the healed connection, got {healed_ref_result:?}"
     );
 
     let (a_to_b, b_to_a) = tokio::join!(
