@@ -802,17 +802,37 @@ impl<T> RemoteActorRef<T> {
         match result {
             Err(crate::GossipError::Timeout) => {
                 // The remote may have received the request before the local
-                // timeout fired. Repair the cached connection for the next
-                // operation, but never replay this potentially non-idempotent
-                // ask.
+                // timeout fired. By default, repair the cached connection for
+                // the next operation but do not replay this potentially
+                // non-idempotent ask. The timeout-retry policy is the explicit
+                // caller opt-in to one replay after recovery.
                 let recovery_deadline = tokio::time::Instant::now() + timeout;
-                if let Err(repair_err) = self
+                match self
                     .recover_connection_after_actor_ask_timeout(recovery_deadline, &conn)
                     .await
                 {
-                    tracing::debug!(error = ?repair_err, "failed to repair cached connection after timed-out ask");
+                    Ok(Some(reconnected)) => {
+                        let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
+                        let remaining = Self::remaining_until(recovery_deadline)?;
+                        let retry_result = Self::ask_actor_frame_with_deadline(
+                            &reconnected,
+                            actor_id,
+                            type_hash,
+                            payload,
+                            remaining,
+                        )
+                        .await;
+                        if let Some(guard) = retry_guard.as_mut() {
+                            guard.disarm();
+                        }
+                        retry_result
+                    }
+                    Ok(None) => Err(crate::GossipError::Timeout),
+                    Err(repair_err) => {
+                        tracing::debug!(error = ?repair_err, "failed to repair cached connection after timed-out ask");
+                        Err(crate::GossipError::Timeout)
+                    }
                 }
-                Err(crate::GossipError::Timeout)
             }
             Err(err) if Self::is_transport_failure(&err) => {
                 Err(self.preserve_ambiguous_ask_error(&conn, err).await)
