@@ -1375,7 +1375,6 @@ pub struct GossipRegistry<T = ()> {
     pending_clock_probes: Arc<SccHashMap<u64, PendingClockProbe>>,
     pending_clock_echoes: Arc<SccHashMap<SocketAddr, PendingClockEcho>>,
     peer_clock_snapshots: Arc<SccHashMap<SocketAddr, PeerClockSnapshot>>,
-    next_clock_sample_id: Arc<AtomicU64>,
     /// PEER_ID_REFACTOR runtime observability: owner-sent unusable
     /// advertised IPs repaired from the verified source IP
     /// (`resolve_remote_actor_addr`).
@@ -1637,7 +1636,6 @@ impl<T: 'static> GossipRegistry<T> {
             pending_clock_probes: Arc::new(SccHashMap::default()),
             pending_clock_echoes: Arc::new(SccHashMap::default()),
             peer_clock_snapshots: Arc::new(SccHashMap::default()),
-            next_clock_sample_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             addr_substitutions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             relayed_unusable_addr_kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tie_break_evictions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1871,7 +1869,13 @@ impl<T: 'static> GossipRegistry<T> {
             && (interval_elapsed || (had_expired_probe && !has_snapshot));
 
         if should_probe {
-            let sample_id = self.next_clock_sample_id.fetch_add(1, Ordering::Relaxed);
+            // Unpredictable sample ids: a sequential counter lets an
+            // authenticated peer guess in-flight ids and forge echoes. Draw a
+            // random id, regenerating on the vanishing chance of a collision.
+            let mut sample_id = rand::random::<u64>();
+            while self.pending_clock_probes.contains_sync(&sample_id) {
+                sample_id = rand::random::<u64>();
+            }
             let _ = self.clock_probe_state.upsert_sync(
                 peer_addr,
                 PeerClockProbeState {
@@ -1964,12 +1968,21 @@ impl<T: 'static> GossipRegistry<T> {
         echo: ClockEchoV1,
         origin_recv_wall_ns: u64,
     ) {
-        let Some((_, pending)) = self.pending_clock_probes.remove_sync(&echo.sample_id) else {
+        // Validate-then-remove atomically: only consume the pending probe when
+        // the echo's origin address and wall clock match the probe we sent.
+        // Otherwise an authenticated peer replaying/guessing a sample_id could
+        // void another peer's in-flight calibration probe. `remove_if_sync`
+        // holds the bucket lock across the predicate, so a mismatch leaves the
+        // probe intact.
+        let Some((_, pending)) =
+            self.pending_clock_probes
+                .remove_if_sync(&echo.sample_id, |pending| {
+                    pending.peer_addr == peer_addr
+                        && pending.sender_wall_ns == echo.origin_sender_wall_ns
+                })
+        else {
             return;
         };
-        if pending.peer_addr != peer_addr || pending.sender_wall_ns != echo.origin_sender_wall_ns {
-            return;
-        }
 
         let Some((offset_ns, rtt_ns, error_bound_ns)) = compute_clock_sample(
             pending.sender_wall_ns,
@@ -8690,6 +8703,47 @@ mod tests {
         assert!(
             snapshot
                 .is_stale_at(snapshot.sampled_at_wall_ns + CLOCK_CALIBRATION_STALE_AFTER_NS + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_clock_echo_cannot_void_another_peers_pending_probe() {
+        let origin = GossipRegistry::<()>::new(test_addr(8080), test_config());
+        let responder = GossipRegistry::<()>::new(test_addr(8081), test_config());
+        let peer_a = test_addr(8081);
+        let peer_b = test_addr(8082);
+        origin.set_peer_capabilities(peer_a, clock_caps());
+        responder.set_peer_capabilities(peer_a, clock_caps());
+
+        // Origin probes peer A: pending_clock_probes now holds A's probe.
+        let probe_ext = origin
+            .gossip_extensions_for_outbound(peer_a, 1_000)
+            .await
+            .expect("origin attaches probe for A");
+        let sample_id = probe_ext.clock_probe.expect("probe").sample_id;
+        assert!(origin.pending_clock_probes.contains_sync(&sample_id));
+
+        // A genuine responder builds the echo peer A would return.
+        responder.record_inbound_gossip_extensions(peer_a, Some(probe_ext), 2_550);
+        let echo_ext = responder
+            .gossip_extensions_for_outbound(peer_a, 2_570)
+            .await
+            .expect("responder attaches echo");
+
+        // An authenticated peer B replays/guesses A's sample_id and delivers the
+        // echo from its own address. This forgery must NOT destroy A's probe.
+        origin.record_inbound_gossip_extensions(peer_b, Some(echo_ext), 1_120);
+        assert!(
+            origin.pending_clock_probes.contains_sync(&sample_id),
+            "forged echo from peer B must not void peer A's in-flight probe"
+        );
+        assert!(origin.peer_clock_snapshot(&peer_b).is_none());
+
+        // The genuine echo from A still lands.
+        origin.record_inbound_gossip_extensions(peer_a, Some(echo_ext), 1_120);
+        assert!(
+            origin.peer_clock_snapshot(&peer_a).is_some(),
+            "genuine echo from A must record the calibration snapshot"
         );
     }
 
