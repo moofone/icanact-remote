@@ -1997,6 +1997,15 @@ impl LockFreeStreamHandle {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
+        // `route_bind_gate` serializes all routed asks, and `outbound_routes`
+        // has no other mutator (the IO/parse path uses the separate inbound
+        // table) — this is the serialization of bind publication with routed
+        // asks. A second `write_routed_actor_ask` therefore cannot observe a
+        // route until this holder drops the gate. On cancellation, locals drop
+        // in reverse declaration order: the R-3 bind guard (declared below)
+        // runs `remove_unbound` BEFORE `_route_guard` releases the gate, so the
+        // next ask sees the route gone and re-binds rather than reusing a
+        // stale `needs_bind == false` slot.
         let _route_guard = self.route_bind_gate.lock().await;
         let route = crate::route_interning::RouteKey { actor_id, type_hash };
         let (route_slot, needs_bind) = self
@@ -2005,10 +2014,24 @@ impl LockFreeStreamHandle {
             .ok_or(GossipError::Shutdown)?;
         if needs_bind {
             let bind = crate::framing::write_route_bind_header(route_slot, actor_id, type_hash);
+            // R-3: arm an RAII rollback for the fresh allocation. If this future
+            // is dropped while the bind enqueue below is parked on a full write
+            // queue (routine under load — every ask is timeout-wrapped), the
+            // guard's Drop removes the route so the next ask re-emits RouteBind
+            // instead of sending RoutedActorAsk for a slot the peer never
+            // learned ("unknown route slot" -> connection teardown). Disarmed
+            // only after the enqueue returns Ok — that is the commit point; the
+            // writer task owns retry/teardown beyond it.
+            let mut bind_guard = crate::route_interning::UnboundRouteGuard::new(
+                self.outbound_routes.as_ref(),
+                route_slot,
+                route,
+            );
             if let Err(error) = self.write_bytes_control(bytes::Bytes::copy_from_slice(&bind)).await {
-                self.outbound_routes.remove_unbound(route_slot, route);
+                // guard drops armed -> remove_unbound(route_slot, route)
                 return Err(error);
             }
+            bind_guard.disarm();
         }
         let header = crate::framing::write_routed_actor_ask_header(
             correlation_id,
@@ -2859,5 +2882,74 @@ mod route_interning_tests {
             .slot_for(crate::route_interning::RouteKey { actor_id: 7, type_hash: 9 })
             .unwrap();
         assert!(retry_is_fresh, "failed bind must not publish its route");
+    }
+
+    /// R-3: cancelling `write_routed_actor_ask` while its RouteBind enqueue is
+    /// parked on a full write queue must roll back the freshly-allocated route.
+    /// Without the RAII guard the route stays marked bound, so the next ask
+    /// sends a RoutedActorAsk for a slot the peer never learned -> the peer
+    /// returns "unknown route slot" and tears the whole connection down.
+    ///
+    /// Current-thread flavor is deliberate: the spawned writer must NOT drain
+    /// the queue during the test (otherwise it keeps a frame in-flight and
+    /// leaves queue space, so the bind's `try_push` would succeed). None of the
+    /// awaits below yield until the final `task.await`, so the writer never runs
+    /// until cleanup and the queue stays genuinely full.
+    #[tokio::test]
+    async fn qa_r3_cancelled_bind_enqueue_unbinds_route() {
+        let (client, peer) = tokio::io::duplex(8);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9904".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default().with_write_queue_capacity(128),
+            None,
+            None,
+        );
+
+        // Saturate the write queue. Each push completes without yielding while
+        // there is space; a zero-duration timeout turns the parked (129th) push
+        // into a clean "queue is full" signal — no sleep-based synchronization.
+        let pad = bytes::Bytes::from_static(b"padpadpadpad");
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(0),
+                writer.write_bytes_control(pad.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                _ => break, // push parked -> queue is full
+            }
+        }
+
+        // A routed ask for a fresh route: slot_for marks it bound, then the
+        // RouteBind enqueue parks on the full queue and is cancelled at once.
+        let route = crate::route_interning::RouteKey { actor_id: 42, type_hash: 7 };
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(0),
+            writer.write_routed_actor_ask(1, 42, 7, bytes::Bytes::from_static(b"ask")),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the RouteBind enqueue should park on the full write queue"
+        );
+
+        // R-3: the cancelled fresh allocation must roll back, so the next
+        // slot_for still needs a bind. Before the fix the route stayed bound
+        // (needs_bind == false) and the next ask sent RoutedActorAsk for a slot
+        // the peer never learned.
+        let (_, needs_bind) = writer.outbound_routes.slot_for(route).unwrap();
+        assert!(
+            needs_bind,
+            "cancelled bind enqueue must roll back the route (R-3)"
+        );
+
+        // Cleanup: drop the unread peer half so the writer's blocked write
+        // errors and the task exits; the current-thread runtime drains it at
+        // task.await.
+        drop(peer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 }
