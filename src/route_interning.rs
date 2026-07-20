@@ -17,8 +17,13 @@ pub(crate) struct RouteKey {
 #[derive(Debug, Default)]
 pub(crate) struct RouteTable {
     next_slot: AtomicU32,
-    by_key: RwLock<HashMap<RouteKey, u32>>,
-    by_slot: RwLock<HashMap<u32, RouteKey>>,
+    maps: RwLock<RouteMaps>,
+}
+
+#[derive(Debug, Default)]
+struct RouteMaps {
+    by_key: HashMap<RouteKey, u32>,
+    by_slot: HashMap<u32, RouteKey>,
 }
 
 impl RouteTable {
@@ -28,36 +33,40 @@ impl RouteTable {
 
     /// Allocates once per route for this connection. Zero is never a route.
     pub(crate) fn slot_for(&self, key: RouteKey) -> Option<(u32, bool)> {
-        if let Some(slot) = self.by_key.read().ok()?.get(&key).copied() {
+        if let Some(slot) = self.maps.read().ok()?.by_key.get(&key).copied() {
             return Some((slot, false));
         }
-        let mut by_key = self.by_key.write().ok()?;
-        if let Some(slot) = by_key.get(&key).copied() {
+        let mut maps = self.maps.write().ok()?;
+        if let Some(slot) = maps.by_key.get(&key).copied() {
             return Some((slot, false));
         }
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
         if slot == 0 || slot == u32::MAX { return None; }
-        self.by_slot.write().ok()?.insert(slot, key);
-        by_key.insert(key, slot);
+        maps.by_slot.insert(slot, key);
+        maps.by_key.insert(key, slot);
         Some((slot, true))
     }
 
     /// Receiver-side bind. Conflicting rebinding is rejected fail-closed.
     pub(crate) fn bind(&self, slot: u32, key: RouteKey) -> bool {
         if slot == 0 { return false; }
-        let mut by_slot = match self.by_slot.write() { Ok(value) => value, Err(_) => return false };
-        match by_slot.get(&slot) {
+        let mut maps = match self.maps.write() { Ok(value) => value, Err(_) => return false };
+        match maps.by_slot.get(&slot) {
             Some(existing) if *existing != key => false,
             Some(_) => true,
             None => {
-                by_slot.insert(slot, key);
-                self.by_key.write().map(|mut map| { map.insert(key, slot); }).is_ok()
+                if maps.by_key.get(&key).is_some_and(|existing| *existing != slot) {
+                    return false;
+                }
+                maps.by_slot.insert(slot, key);
+                maps.by_key.insert(key, slot);
+                true
             }
         }
     }
 
     pub(crate) fn resolve(&self, slot: u32) -> Option<RouteKey> {
-        self.by_slot.read().ok()?.get(&slot).copied()
+        self.maps.read().ok()?.by_slot.get(&slot).copied()
     }
 }
 
@@ -75,6 +84,7 @@ mod tests {
         assert_eq!(table.slot_for(first), Some((slot, false)));
         assert!(table.bind(slot, first));
         assert!(!table.bind(slot, second));
+        assert!(!table.bind(slot + 1, first));
         assert_eq!(table.resolve(slot), Some(first));
     }
 

@@ -11,6 +11,8 @@ pub struct ReadContext {
     pub(crate) max_message_size: usize,
     pub(crate) expected_schema_hash: Option<u64>,
     pub(crate) aligned_pool: Arc<crate::AlignedBytesPool>,
+    /// Route bindings are scoped to this exact transport connection.
+    pub(crate) inbound_routes: Arc<crate::route_interning::RouteTable>,
     pub(crate) response_correlation: Option<Arc<CorrelationTracker>>,
     pub(crate) response_writer: Option<Arc<crate::ask_responder::ResponseWriter>>,
     pub(crate) tell_handler_sync: Option<Arc<crate::registry::ActorTellHandlerSyncCell>>,
@@ -41,6 +43,7 @@ mod read_pipeline_tests {
             max_message_size: 1024,
             expected_schema_hash: None,
             aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
             response_correlation: None,
             response_writer: None,
             tell_handler_sync: None,
@@ -69,7 +72,8 @@ mod read_pipeline_tests {
         let ctx = super::ReadContext {
             registry_weak: std::sync::Weak::new(), peer_addr: "127.0.0.1:9001".parse().unwrap(),
             peer_id: None, max_message_size: 1024, expected_schema_hash: None,
-            aligned_pool: Arc::new(crate::AlignedBytesPool::default()), response_correlation: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()), response_correlation: None,
             response_writer: None, tell_handler_sync: None, tell_handler_sync_context: None,
             ask_immediate_handler_sync: None, ask_handler_sync: None, sync_actor_handler: None,
         };
@@ -332,7 +336,11 @@ where
                 _ => unreachable!("read state must be ReadBody when complete"),
             };
 
-            let result = crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?;
+            let result = crate::handle::parse_message_from_pooled_buffer_with_routes(
+                buffer,
+                msg_len,
+                Some(&ctx.inbound_routes),
+            )?;
             Ok(Some(result))
         }
         ReadState::ReadStreamMeta { kind, body_len, meta, meta_len, read } => {
@@ -578,7 +586,11 @@ where
                         }
                         FastReadOutcome::Parsed(result) => result,
                         FastReadOutcome::Unhandled(buffer) => ReadIoResult::Generic(
-                            crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
+                            crate::handle::parse_message_from_pooled_buffer_with_routes(
+                                buffer,
+                                msg_len,
+                                Some(&ctx.inbound_routes),
+                            )?,
                         ),
                     };
                     Poll::Ready(Ok(ReadPollResult {
@@ -788,7 +800,11 @@ where
                         }
                         FastReadOutcome::Parsed(result) => result,
                         FastReadOutcome::Unhandled(buffer) => ReadIoResult::Generic(
-                            crate::handle::parse_message_from_pooled_buffer(buffer, msg_len)?,
+                            crate::handle::parse_message_from_pooled_buffer_with_routes(
+                                buffer,
+                                msg_len,
+                                Some(&ctx.inbound_routes),
+                            )?,
                         ),
                     };
                     Poll::Ready(Ok(ReadPollResult {
@@ -1545,6 +1561,7 @@ where
                     max_message_size: registry.config.max_message_size,
                     expected_schema_hash: registry.config.schema_hash,
                     aligned_pool: registry.connection_pool.aligned_bytes_pool(),
+                    inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
                     response_correlation: None,
                     response_writer: None,
                     tell_handler_sync: None,

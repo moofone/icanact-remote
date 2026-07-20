@@ -703,6 +703,7 @@ pub(crate) async fn process_read_result(
     authenticated_peer_id: Option<&PeerId>,
 ) -> Result<()> {
     match result {
+        MessageReadResult::RouteBound => {}
         MessageReadResult::Gossip(msg, _correlation_id) => {
             let authenticated_peer_id = authenticated_peer_id
                 .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));

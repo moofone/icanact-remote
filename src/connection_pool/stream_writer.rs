@@ -25,6 +25,10 @@ pub struct LockFreeStreamHandle {
     /// busy-spinning a failed CAS + `yield_now` for the winner's entire stream
     /// duration (which starved the loser and burned a scheduler slot per poll).
     stream_gate: Arc<tokio::sync::Semaphore>,
+    /// Outbound route bindings for this exact transport instance.  The gate
+    /// keeps a newly enqueued RouteBind immediately ahead of its first ask.
+    outbound_routes: Arc<crate::route_interning::RouteTable>,
+    route_bind_gate: Arc<tokio::sync::Mutex<()>>,
     /// Lock-free write queue for payload writes
     write_queue: Arc<WriteQueue>,
     /// Bounded streaming command queue for background task.
@@ -77,6 +81,8 @@ impl LockFreeStreamHandle {
         let shutdown_signal = Arc::new(AtomicBool::new(false));
         let streaming_active = Arc::new(AtomicBool::new(false));
         let stream_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let outbound_routes = Arc::new(crate::route_interning::RouteTable::new());
+        let route_bind_gate = Arc::new(tokio::sync::Mutex::new(()));
         let flush_pending = Arc::new(AtomicBool::new(false));
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_notify = Arc::new(Notify::new());
@@ -148,6 +154,8 @@ impl LockFreeStreamHandle {
                 exit_notify,
                 streaming_active,
                 stream_gate,
+                outbound_routes,
+                route_bind_gate,
                 write_queue,
                 streaming_queue,
                 buffer_config,
@@ -1972,6 +1980,35 @@ impl LockFreeStreamHandle {
         self.enqueue_ask_write(WritePayload::Single(data)).await
     }
 
+    /// Queue a compact ActorAsk, installing its connection-local route first.
+    /// Both frames use the one ordered writer queue; the small gate only spans
+    /// enqueueing, so no response wait or network I/O is serialized here.
+    pub async fn write_routed_actor_ask(
+        &self,
+        correlation_id: u32,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> Result<()> {
+        let _route_guard = self.route_bind_gate.lock().await;
+        let route = crate::route_interning::RouteKey { actor_id, type_hash };
+        let (route_slot, needs_bind) = self
+            .outbound_routes
+            .slot_for(route)
+            .ok_or(GossipError::Shutdown)?;
+        if needs_bind {
+            let bind = crate::framing::write_route_bind_header(route_slot, actor_id, type_hash);
+            self.write_bytes_control(bytes::Bytes::copy_from_slice(&bind)).await?;
+        }
+        let header = crate::framing::write_routed_actor_ask_header(
+            correlation_id,
+            route_slot,
+            payload.len(),
+        );
+        self.write_header_and_payload_ask_inline(header, 16, payload)
+            .await
+    }
+
     pub async fn write_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
         self.enqueue_write(WritePayload::Single(data)).await
     }
@@ -2664,4 +2701,57 @@ fn parse_direct_message_payload<'a>(
     }
 
     Ok(&msg_data[payload_start..payload_end])
+}
+
+#[cfg(test)]
+mod route_interning_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn first_routed_ask_binds_before_compact_frame_and_reuses_the_route() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9901".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+
+        writer
+            .write_routed_actor_ask(17, 7, 9, bytes::Bytes::from_static(b"one"))
+            .await
+            .unwrap();
+        let mut bind = [0u8; crate::framing::ROUTE_BIND_FRAME_HEADER_LEN];
+        peer.read_exact(&mut bind).await.unwrap();
+        assert_eq!(
+            crate::framing::decode_control(bind[..4].try_into().unwrap()).unwrap().kind,
+            crate::framing::WireKind::RouteBind
+        );
+
+        let mut first = [0u8; crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN + 3];
+        peer.read_exact(&mut first).await.unwrap();
+        assert_eq!(
+            crate::framing::decode_control(first[..4].try_into().unwrap()).unwrap().kind,
+            crate::framing::WireKind::RoutedActorAsk
+        );
+        assert_eq!(&first[crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN..], b"one");
+
+        writer
+            .write_routed_actor_ask(18, 7, 9, bytes::Bytes::from_static(b"two"))
+            .await
+            .unwrap();
+        let mut second = [0u8; crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN + 3];
+        peer.read_exact(&mut second).await.unwrap();
+        assert_eq!(
+            crate::framing::decode_control(second[..4].try_into().unwrap()).unwrap().kind,
+            crate::framing::WireKind::RoutedActorAsk
+        );
+        assert_eq!(&second[crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN..], b"two");
+
+        writer.shutdown();
+        task.await.unwrap();
+    }
 }

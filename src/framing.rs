@@ -12,6 +12,8 @@ pub const ASK_RESPONSE_HEADER_LEN: usize = 12;
 pub const GOSSIP_HEADER_LEN: usize = 12;
 pub const ACTOR_TELL_HEADER_LEN: usize = 12;
 pub const ACTOR_ASK_HEADER_LEN: usize = 28;
+pub const ROUTED_ACTOR_ASK_HEADER_LEN: usize = 12;
+pub const ROUTE_BIND_HEADER_LEN: usize = 20;
 pub const DIRECT_ASK_HEADER_LEN: usize = 12;
 pub const DIRECT_RESPONSE_HEADER_LEN: usize = 12;
 pub const PUBSUB_HEADER_LEN: usize = 12;
@@ -28,12 +30,15 @@ pub const ASK_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ASK_RESPONS
 pub const GOSSIP_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + GOSSIP_HEADER_LEN;
 pub const ACTOR_TELL_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ACTOR_TELL_HEADER_LEN;
 pub const ACTOR_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ACTOR_ASK_HEADER_LEN;
+pub const ROUTED_ACTOR_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ROUTED_ACTOR_ASK_HEADER_LEN;
+pub const ROUTE_BIND_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ROUTE_BIND_HEADER_LEN;
 pub const DIRECT_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_ASK_HEADER_LEN;
 pub const DIRECT_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_RESPONSE_HEADER_LEN;
 pub const PUBSUB_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + PUBSUB_HEADER_LEN;
 
 const _: () = assert!(ACTOR_TELL_FRAME_HEADER_LEN % 16 == 0);
 const _: () = assert!(ACTOR_ASK_FRAME_HEADER_LEN % 16 == 0);
+const _: () = assert!(ROUTED_ACTOR_ASK_FRAME_HEADER_LEN % 16 == 0);
 const _: () = assert!(ASK_RESPONSE_FRAME_HEADER_LEN % 16 == 0);
 const _: () = assert!(GOSSIP_FRAME_HEADER_LEN % 16 == 0);
 const _: () = assert!(DIRECT_ASK_FRAME_HEADER_LEN % 16 == 0);
@@ -57,6 +62,8 @@ pub enum WireKind {
     DirectResponse = 10,
     PubSub = 11,
     StreamAbort = 12,
+    RouteBind = 13,
+    RoutedActorAsk = 14,
 }
 
 impl WireKind {
@@ -93,6 +100,7 @@ impl WireKind {
             Self::DirectResponse => MessageType::DirectResponse,
             Self::PubSub => MessageType::PubSub,
             Self::StreamAbort => MessageType::StreamEnd,
+            Self::RouteBind | Self::RoutedActorAsk => MessageType::ActorAsk,
         }
     }
 
@@ -111,6 +119,8 @@ impl WireKind {
             10 => Some(Self::DirectResponse),
             11 => Some(Self::PubSub),
             12 => Some(Self::StreamAbort),
+            13 => Some(Self::RouteBind),
+            14 => Some(Self::RoutedActorAsk),
             _ => None,
         }
     }
@@ -180,6 +190,30 @@ pub fn write_actor_ask_header(
     let body_len = checked_body_len(ACTOR_ASK_HEADER_LEN, payload_len);
     let mut header = init_header(WireKind::ActorAsk, body_len);
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    header[8..16].copy_from_slice(&actor_id.to_be_bytes());
+    header[16..20].copy_from_slice(&type_hash.to_be_bytes());
+    header
+}
+
+/// V5 compact ask after its route was bound on this connection.
+pub fn write_routed_actor_ask_header(
+    correlation_id: u32,
+    route_slot: u32,
+    payload_len: usize,
+) -> [u8; ROUTED_ACTOR_ASK_FRAME_HEADER_LEN] {
+    let mut header = init_header(
+        WireKind::RoutedActorAsk,
+        checked_body_len(ROUTED_ACTOR_ASK_HEADER_LEN, payload_len),
+    );
+    header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    header[8..12].copy_from_slice(&route_slot.to_be_bytes());
+    header
+}
+
+/// Establishes a connection-scoped slot before a routed ask uses it.
+pub fn write_route_bind_header(route_slot: u32, actor_id: u64, type_hash: u32) -> [u8; ROUTE_BIND_FRAME_HEADER_LEN] {
+    let mut header = init_header(WireKind::RouteBind, ROUTE_BIND_HEADER_LEN);
+    header[4..8].copy_from_slice(&route_slot.to_be_bytes());
     header[8..16].copy_from_slice(&actor_id.to_be_bytes());
     header[16..20].copy_from_slice(&type_hash.to_be_bytes());
     header
@@ -325,6 +359,8 @@ mod tests {
             WireKind::DirectResponse,
             WireKind::PubSub,
             WireKind::StreamAbort,
+            WireKind::RouteBind,
+            WireKind::RoutedActorAsk,
         ];
         for (expected_value, kind) in kinds.into_iter().enumerate() {
             let bytes = encode_control(kind, 17);
@@ -401,6 +437,19 @@ mod tests {
             0x1234_5678
         );
         assert_eq!(&header[8..], &[0; 8]);
+    }
+
+    #[test]
+    fn routed_ask_is_sixteen_bytes_and_route_bind_is_exact() {
+        let ask = write_routed_actor_ask_header(7, 11, 99);
+        assert_eq!(ask.len(), 16);
+        assert_eq!(decode_control(ask[..4].try_into().unwrap()).unwrap().kind, WireKind::RoutedActorAsk);
+        assert_eq!(u32::from_be_bytes(ask[4..8].try_into().unwrap()), 7);
+        assert_eq!(u32::from_be_bytes(ask[8..12].try_into().unwrap()), 11);
+        let bind = write_route_bind_header(11, 0x0102_0304_0506_0708, 0x1122_3344);
+        assert_eq!(bind.len(), 24);
+        assert_eq!(decode_control(bind[..4].try_into().unwrap()).unwrap().kind, WireKind::RouteBind);
+        assert_eq!(u32::from_be_bytes(bind[4..8].try_into().unwrap()), 11);
     }
 
     #[test]

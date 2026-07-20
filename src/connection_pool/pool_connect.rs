@@ -3230,6 +3230,7 @@ impl<T> ConnectionPool<T> {
                     max_message_size: registry.config.max_message_size,
                     expected_schema_hash: registry.config.schema_hash,
                     aligned_pool: registry.connection_pool.aligned_bytes_pool(),
+                    inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
                     response_correlation: Some(correlation_tracker.clone()),
                     response_writer: Some(response_writer.clone()),
                     tell_handler_sync: registry.actor_tell_handler_sync.load_full(),
