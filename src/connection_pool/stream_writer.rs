@@ -1997,6 +1997,15 @@ impl LockFreeStreamHandle {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
+        // `route_bind_gate` serializes all routed asks, and `outbound_routes`
+        // has no other mutator (the IO/parse path uses the separate inbound
+        // table) — this is the serialization of bind publication with routed
+        // asks. A second `write_routed_actor_ask` therefore cannot observe a
+        // route until this holder drops the gate. On cancellation, locals drop
+        // in reverse declaration order: the R-3 bind guard (declared below)
+        // runs `remove_unbound` BEFORE `_route_guard` releases the gate, so the
+        // next ask sees the route gone and re-binds rather than reusing a
+        // stale `needs_bind == false` slot.
         let _route_guard = self.route_bind_gate.lock().await;
         let route = crate::route_interning::RouteKey { actor_id, type_hash };
         let (route_slot, needs_bind) = self
