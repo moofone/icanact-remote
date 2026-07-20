@@ -2288,6 +2288,22 @@ fn is_sandbox_eperm(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(1)
 }
 
+/// Sleep in small blocking slices so a dropped startup future does not wait
+/// for a full exponential-backoff interval before its bind task exits.
+fn sleep_backoff_or_cancel(cancel: &AtomicBool, delay: Duration) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 /// Retry a blocking bind with exponential backoff until it succeeds, hits a
 /// non-EPERM error, or the retry deadline elapses.
 ///
@@ -2338,7 +2354,9 @@ fn bind_with_backoff_impl(
             }
             Err(e) => {
                 if is_sandbox_eperm(&e) && std::time::Instant::now() < deadline {
-                    std::thread::sleep(backoff);
+                    if sleep_backoff_or_cancel(cancel, backoff) {
+                        return Err(GossipError::Shutdown);
+                    }
                     backoff = std::cmp::min(
                         backoff.saturating_mul(2),
                         Duration::from_millis(backoff_max_ms),
