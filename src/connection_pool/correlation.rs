@@ -29,6 +29,11 @@ struct PendingResponseSlot {
     id: AtomicU32,
     response: UnsafeCell<MaybeUninit<crate::AlignedBytes>>,
     waker: AtomicWaker,
+    /// R-10: gates waker registration against allocation/recycle so a stale
+    /// waiter cannot register (and overwrite the current owner's waker) once
+    /// its id has been recycled. Held only for brief, await-free critical
+    /// sections.
+    register_lock: std::sync::Mutex<()>,
 }
 
 // Safety: access is synchronized via atomics and the correlation protocol.
@@ -111,6 +116,25 @@ impl CorrelationTracker {
         ReadyTake::NotReady
     }
 
+    /// R-10: atomically (verify ownership + register waker) under the per-slot
+    /// gate. Returns true if registered (we still own the slot), false if the
+    /// slot was recycled to a different id (the caller must stop waiting). The
+    /// gate serializes this with `allocate()`'s id install, so a stale waiter
+    /// whose id was recycled cannot overwrite the current owner's waker.
+    #[inline]
+    fn register_if_owner(
+        slot_ref: &PendingResponseSlot,
+        waker: &std::task::Waker,
+        correlation_id: u32,
+    ) -> bool {
+        let _gate = slot_ref.register_lock.lock().expect("register_lock poisoned");
+        if slot_ref.id.load(Ordering::Acquire) != correlation_id {
+            return false;
+        }
+        slot_ref.waker.register(waker);
+        true
+    }
+
     fn new() -> Arc<Self> {
         debug_assert!(
             PENDING_RESPONSES_SIZE.is_power_of_two(),
@@ -122,6 +146,7 @@ impl CorrelationTracker {
             id: AtomicU32::new(0),
             response: UnsafeCell::new(MaybeUninit::uninit()),
             waker: AtomicWaker::new(),
+            register_lock: std::sync::Mutex::new(()),
         });
         Arc::new(Self {
             next_id: AtomicU32::new(1),
@@ -174,7 +199,18 @@ impl CorrelationTracker {
                 )
                 .is_ok()
             {
-                slot_ref.id.store(id, Ordering::Relaxed);
+                {
+                    // R-10: under the registration gate, wake any waker a stale
+                    // waiter left on this slot and install the new id before
+                    // publishing WAITING. A concurrent waiter's
+                    // register_if_owner takes the same gate, so it cannot observe
+                    // a half-installed id or overwrite a waker for the previous
+                    // generation.
+                    let _gate =
+                        slot_ref.register_lock.lock().expect("register_lock poisoned");
+                    slot_ref.waker.wake();
+                    slot_ref.id.store(id, Ordering::Release);
+                }
                 slot_ref.state.store(SLOT_WAITING, Ordering::Release);
                 #[cfg(feature = "trace-correlation")]
                 trace!(
@@ -383,13 +419,13 @@ impl CorrelationTracker {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
 
-            // R-10: a stale (recycled) waiter must not overwrite the genuine
-            // owner's waker -- if the slot no longer holds our id, terminate
-            // instead of parking on the shared AtomicWaker.
-            if slot_ref.id.load(Ordering::Acquire) != correlation_id {
+            // R-10: register only while we still own the slot. register_if_owner
+            // atomically (id-check + register) under the per-slot gate, so a
+            // stale waiter whose id was recycled cannot overwrite the current
+            // owner's waker. If recycled, terminate instead of parking.
+            if !Self::register_if_owner(slot_ref, cx.waker(), correlation_id) {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
-            slot_ref.waker.register(cx.waker());
 
             match Self::try_take_ready(slot_ref, correlation_id) {
                 ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
@@ -464,13 +500,13 @@ impl CorrelationTracker {
             if state == SLOT_EMPTY {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
-            // R-10: a stale (recycled) waiter must not overwrite the genuine
-            // owner's waker -- if the slot no longer holds our id, terminate
-            // instead of parking on the shared AtomicWaker.
-            if slot_ref.id.load(Ordering::Acquire) != correlation_id {
+            // R-10: register only while we still own the slot. register_if_owner
+            // atomically (id-check + register) under the per-slot gate, so a
+            // stale waiter whose id was recycled cannot overwrite the current
+            // owner's waker. If recycled, terminate instead of parking.
+            if !Self::register_if_owner(slot_ref, cx.waker(), correlation_id) {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
-            slot_ref.waker.register(cx.waker());
             match Self::try_take_ready(slot_ref, correlation_id) {
                 ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
                 ReadyTake::ForeignReady => {
@@ -753,5 +789,127 @@ mod correlation_tests {
             "the slot must still belong to id, not the stale waiter"
         );
         guard.disarm();
+    }
+
+    /// A `Waker` that counts wake() calls, so a test can observe *which*
+    /// registered waker `complete()` actually woke.
+    struct CountWaker(Arc<std::sync::atomic::AtomicUsize>);
+    impl std::task::Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn count_waker() -> (std::task::Waker, Arc<std::sync::atomic::AtomicUsize>) {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waker: std::task::Waker = Arc::new(CountWaker(counter.clone())).into();
+        (waker, counter)
+    }
+
+    /// R-10 (waker-ownership race, fail-first): after a slot is recycled from
+    /// X to Y and Y registers its waker, a stale X attempting to register MUST
+    /// NOT overwrite Y's waker. `complete(Y)` must wake Y (not X), so Y
+    /// receives its reply. Pre-fix (bare `register` with no id gate) X overwrote
+    /// Y's waker and `complete(Y)` woke X while Y hung -- proven RED by reverting
+    /// `register_if_owner` to a bare register (X's counter fires, Y's does not).
+    #[test]
+    fn qa_r10_stale_waiter_cannot_overwrite_the_owners_waker() {
+        let tracker = CorrelationTracker::new();
+        // 1. Allocate X in slot S, then recycle S to Y (cancel X, force the
+        //    next allocation to alias to S, allocate Y).
+        let guard_x = tracker.allocate().expect("slot should allocate");
+        let id_x = guard_x.id();
+        let slot = CorrelationTracker::slot_index(id_x);
+        drop(guard_x); // cancel(X): S -> EMPTY
+        tracker
+            .next_id
+            .store(id_x + PENDING_RESPONSES_SIZE as u32, Ordering::Release);
+        let guard_y = tracker.allocate().expect("Y should re-claim slot S");
+        let id_y = guard_y.id();
+        assert_eq!(CorrelationTracker::slot_index(id_y), slot, "Y must alias to S");
+        assert_ne!(id_x, id_y);
+
+        let slot_ref = &tracker.pending[slot];
+        // 2. Y registers its waker.
+        let (waker_y, y_wakes) = count_waker();
+        assert!(
+            CorrelationTracker::register_if_owner(slot_ref, &waker_y, id_y),
+            "Y (the current owner) must register"
+        );
+        // 3. Stale X attempts to register on the same slot.
+        let (waker_x, x_wakes) = count_waker();
+        assert!(
+            !CorrelationTracker::register_if_owner(slot_ref, &waker_x, id_x),
+            "stale X must be refused registration after recycle (R-10)"
+        );
+        // 4. complete(Y) must wake Y, never X.
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"for-Y", pool));
+        assert!(tracker.complete(id_y, &mut response));
+        assert_eq!(y_wakes.load(Ordering::SeqCst), 1, "complete(Y) must wake Y's waker");
+        assert_eq!(
+            x_wakes.load(Ordering::SeqCst),
+            0,
+            "X's waker must not have been registered (no overwrite)"
+        );
+        // 5. Y receives its reply.
+        assert_eq!(
+            expect_taken(
+                CorrelationTracker::try_take_ready(slot_ref, id_y),
+                "Y's reply"
+            )
+            .as_ref(),
+            b"for-Y"
+        );
+        guard_y.disarm();
+    }
+
+    /// R-10 (liveness, no-timeout path): the genuine owner on the no-timeout
+    /// path (`handle.rs::ask_direct_no_timeout`) must still receive its reply
+    /// promptly after a recycle -- it must not hang because a stale waiter
+    /// overwrote its waker. Watchdog-bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qa_r10_owner_receives_reply_on_no_timeout_path_after_recycle() {
+        let tracker = Arc::new(CorrelationTracker::new());
+        let guard_x = tracker.allocate().expect("slot should allocate");
+        let id_x = guard_x.id();
+        let slot = CorrelationTracker::slot_index(id_x);
+        drop(guard_x); // recycle: S -> EMPTY
+        tracker
+            .next_id
+            .store(id_x + PENDING_RESPONSES_SIZE as u32, Ordering::Release);
+        let guard_y = tracker.allocate().expect("Y should re-claim slot S");
+        let id_y = guard_y.id();
+        assert_eq!(CorrelationTracker::slot_index(id_y), slot);
+
+        // Y waits with NO timeout.
+        let tracker_for_wait = tracker.clone();
+        let y_wait = tokio::spawn(async move {
+            tracker_for_wait.wait_for_response_no_timeout(id_y).await
+        });
+        // Let Y register its waker.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // A stale X attempts to register on the same slot -- refused by the gate.
+        let (stale_waker, _) = count_waker();
+        assert!(!CorrelationTracker::register_if_owner(
+            &tracker.pending[slot],
+            &stale_waker,
+            id_x
+        ));
+
+        // complete(Y) wakes Y (not the stale X).
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"for-Y", pool));
+        assert!(tracker.complete(id_y, &mut response));
+
+        // Y must receive its reply promptly -- the no-timeout path must not hang.
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), y_wait)
+            .await
+            .expect("Y's no-timeout wait must not hang (R-10)")
+            .expect("Y's task joined");
+        assert_eq!(reply.unwrap().as_ref(), b"for-Y");
+        guard_y.disarm();
     }
 }
