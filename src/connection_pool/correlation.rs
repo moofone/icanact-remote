@@ -383,6 +383,12 @@ impl CorrelationTracker {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
 
+            // R-10: a stale (recycled) waiter must not overwrite the genuine
+            // owner's waker -- if the slot no longer holds our id, terminate
+            // instead of parking on the shared AtomicWaker.
+            if slot_ref.id.load(Ordering::Acquire) != correlation_id {
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+            }
             slot_ref.waker.register(cx.waker());
 
             match Self::try_take_ready(slot_ref, correlation_id) {
@@ -456,6 +462,12 @@ impl CorrelationTracker {
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+            }
+            // R-10: a stale (recycled) waiter must not overwrite the genuine
+            // owner's waker -- if the slot no longer holds our id, terminate
+            // instead of parking on the shared AtomicWaker.
+            if slot_ref.id.load(Ordering::Acquire) != correlation_id {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
             slot_ref.waker.register(cx.waker());
@@ -709,11 +721,13 @@ mod correlation_tests {
         guard.disarm();
     }
 
-    /// R-10: a stale waiter timing out on an aliased slot must NOT evict the
-    /// different request currently WAITING there. Pre-fix the timeout path did
-    /// a bare `WAITING -> EMPTY` CAS with no id check.
+    /// R-10: a stale waiter on an aliased slot must terminate WITHOUT evicting
+    /// the different request currently WAITING there. With the id check before
+    /// waker registration, the stale waiter returns ConnectionDropped as soon as
+    /// it observes the slot no longer holds its id (previously the timeout path
+    /// did a bare WAITING -> EMPTY CAS with no id check).
     #[tokio::test]
-    async fn qa_r10_timeout_does_not_evict_an_aliased_waiter() {
+    async fn qa_r10_stale_waiter_does_not_evict_an_aliased_waiter() {
         let tracker = CorrelationTracker::new();
         let guard = tracker.allocate().expect("slot should allocate");
         let id = guard.id();
@@ -724,17 +738,17 @@ mod correlation_tests {
             .wait_for_response(stale_id, std::time::Duration::from_millis(1))
             .await;
         assert!(
-            matches!(outcome, Err(crate::GossipError::Timeout)),
-            "stale waiter should time out, got {outcome:?}"
+            matches!(outcome, Err(crate::GossipError::ConnectionDropped)),
+            "stale waiter must terminate with ConnectionDropped, got {outcome:?}"
         );
         let slot_ref = &tracker.pending[slot];
         assert_eq!(
             slot_ref.state.load(Ordering::Acquire),
             SLOT_WAITING,
-            "aliased WAITING entry must survive a stale timeout (R-10)"
+            "aliased WAITING entry must survive a stale waiter (R-10)"
         );
         assert_eq!(
-            slot_ref.id.load(Ordering::Relaxed),
+            slot_ref.id.load(Ordering::Acquire),
             id,
             "the slot must still belong to id, not the stale waiter"
         );
