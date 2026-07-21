@@ -6464,15 +6464,23 @@ impl<T: 'static> GossipRegistry<T> {
     /// A peer can be keyed in `peers` under an address that differs from the
     /// one the connection is pooled under (inbound-only peers key on the
     /// ephemeral TCP source, NAT'd peers on `peer_address`, DNS-refreshed peers
-    /// on a re-resolved `address`). All three are checked, otherwise an
-    /// inbound-only peer looks idle -- its `last_success` lives under an alias
-    /// and never advances on the key we sorted by.
+    /// on a re-resolved `address`), and the pool may index the live connection
+    /// by peer ID under none of those addresses at all. Liveness therefore
+    /// defers to `peer_has_live_connection`, which already handles the
+    /// address-alias and peer-ID-index cases; checking addresses alone would
+    /// treat a peer with a live peer-ID-indexed connection as evictable.
+    ///
+    /// The map key is checked separately for both liveness and configuration,
+    /// since `peer_has_live_connection` only sees the `PeerInfo` fields.
     fn peer_is_eviction_exempt(
         &self,
         addr: &SocketAddr,
         peer: &PeerInfo,
         configured: &std::collections::HashSet<SocketAddr>,
     ) -> bool {
+        if self.peer_has_live_connection(peer) {
+            return true;
+        }
         let candidates = [Some(*addr), peer.peer_address, Some(peer.address)];
         candidates.iter().flatten().any(|candidate| {
             configured.contains(candidate)
