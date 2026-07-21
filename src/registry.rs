@@ -1073,6 +1073,23 @@ pub struct PeerInfo {
     /// stale verdict until either we get one or the configured grace
     /// expires from `last_attempt`).
     pub last_response_received_ms: u64,
+    /// R-11: one-shot "accept the next FullSync even if its sequence is lower
+    /// than `last_sequence`".
+    ///
+    /// `last_sequence` only ever advances (`max()`), and the `handle_peer_death`
+    /// reset the comments still reference no longer exists. A peer that crashes
+    /// and restarts at the same address resumes from sequence ~0, so every node
+    /// that saw its pre-restart sequence drops all of its FullSyncs forever.
+    /// The omission-prune never runs, and actors the peer no longer hosts sit in
+    /// `known_actors` until the 24h TTL — asks error, tells are silently
+    /// dropped — because the peer is healthy so the dead-peer reap never fires.
+    ///
+    /// Armed only when a NEW TLS-authenticated session is established for the
+    /// peer's identity (see `arm_sequence_reset_for_new_session`), which is
+    /// actual restart evidence and cannot be forged mid-session or by a
+    /// third party's gossip. Cleared on the first FullSync it admits, so the
+    /// stale gate is restored immediately and still blocks in-session replays.
+    pub accept_lower_sequence: bool,
 }
 
 impl PeerInfo {
@@ -1096,6 +1113,7 @@ impl PeerInfo {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         }
     }
 
@@ -1127,6 +1145,7 @@ impl PeerInfo {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         }
     }
 
@@ -1179,6 +1198,7 @@ impl PeerInfo {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         })
     }
 }
@@ -2045,6 +2065,7 @@ impl<T: 'static> GossipRegistry<T> {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -2319,6 +2340,40 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Add a new peer with GossipNodeId for TLS verification
+    /// R-11: arm the one-shot lower-sequence acceptance for a peer whose
+    /// identity has just completed a NEW TLS-authenticated session.
+    ///
+    /// A fresh authenticated session is the only evidence we accept for
+    /// "this peer may have restarted". Keying on it means:
+    /// - a mid-session replay cannot trigger it (no new session occurs), so
+    ///   the stale gate still blocks the in-session replays it exists for;
+    /// - a third party cannot trigger it via gossip, and a peer cannot trigger
+    ///   it for a *victim* identity, because `node_id` here is the TLS client
+    ///   certificate identity, not a wire-claimed field (see B-5).
+    ///
+    /// Only arms when the recorded `node_id` matches the authenticated one, so
+    /// an address whose identity has changed is not silently granted a reset.
+    pub async fn arm_sequence_reset_for_new_session(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: crate::GossipNodeId,
+    ) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr)
+            && peer_info.node_id == Some(node_id)
+        {
+            // Nothing to do for a peer that never got past sequence 0.
+            if peer_info.last_sequence > 0 {
+                debug!(
+                    peer = %peer_addr,
+                    last_sequence = peer_info.last_sequence,
+                    "R-11: new authenticated session; accepting one lower-sequence FullSync"
+                );
+            }
+            peer_info.accept_lower_sequence = true;
+        }
+    }
+
     pub async fn add_peer_with_node_id(
         &self,
         peer_addr: SocketAddr,
@@ -2384,6 +2439,7 @@ impl<T: 'static> GossipRegistry<T> {
                             last_failure_time: None,
                             last_dns_refresh_attempt: None,
                             last_response_received_ms: current_time_ms,
+                            accept_lower_sequence: false,
                         },
                     );
 
@@ -4360,6 +4416,7 @@ impl<T: 'static> GossipRegistry<T> {
                         last_failure_time: None,
                         last_dns_refresh_attempt: None,
                         last_response_received_ms: crate::current_timestamp_millis(),
+                        accept_lower_sequence: false,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -4856,26 +4913,49 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Record comprehensive node activity
 
-        // Check if we've already processed this or a newer sequence from this peer
-        {
-            let gossip_state = self.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get(&sender_addr) {
-                if sequence < peer_info.last_sequence {
-                    debug!(
-                        last_sequence = peer_info.last_sequence,
-                        received_sequence = sequence,
-                        "ignoring old gossip message"
-                    );
-                    return;
-                }
-            }
-        }
-
-        // Update peer sequence and vector clock
+        // Check if we've already processed this or a newer sequence from this
+        // peer, and take the sequence update in the SAME critical section.
+        //
+        // R-11: a restarted peer resumes from sequence ~0, so this gate would
+        // otherwise drop all of its FullSyncs forever (`last_sequence` only
+        // advances and is never reset — the `handle_peer_death` reset the
+        // comments elsewhere reference no longer exists). The omission-prune
+        // then never runs and actors the peer no longer hosts linger until the
+        // 24h TTL. `accept_lower_sequence` is a one-shot exemption armed only
+        // by a new TLS-authenticated session; it is consumed here so the gate
+        // is restored immediately.
+        //
+        // Gate and update are one critical section because the exemption is
+        // one-shot: releasing the lock between them would let two concurrent
+        // restarted-peer FullSyncs both observe the armed flag.
         {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
-                peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
+                if sequence < peer_info.last_sequence {
+                    if !peer_info.accept_lower_sequence {
+                        debug!(
+                            last_sequence = peer_info.last_sequence,
+                            received_sequence = sequence,
+                            "ignoring old gossip message"
+                        );
+                        return;
+                    }
+                    info!(
+                        peer = %sender_addr,
+                        last_sequence = peer_info.last_sequence,
+                        received_sequence = sequence,
+                        "R-11: accepting lower-sequence FullSync after peer restart"
+                    );
+                    // Consume the one-shot and adopt the restarted peer's
+                    // sequence line wholesale — `max()` would pin us to the
+                    // pre-restart high-water mark and re-close the gate against
+                    // every subsequent sync from the restarted peer.
+                    peer_info.accept_lower_sequence = false;
+                    peer_info.last_sequence = sequence;
+                } else {
+                    peer_info.accept_lower_sequence = false;
+                    peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
+                }
             }
         }
 
@@ -7597,6 +7677,7 @@ impl<T: 'static> GossipRegistry<T> {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: now_ms,
+            accept_lower_sequence: false,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -8663,6 +8744,139 @@ mod tests {
         );
     }
 
+    /// R-11 helper: a FullSync from `owner` advertising exactly `actors`.
+    async fn qa_r11_full_sync(
+        reg: &GossipRegistry<()>,
+        owner: &crate::PeerId,
+        peer_addr: SocketAddr,
+        sequence: u64,
+        actors: &[&str],
+    ) {
+        let mut local_actors = HashMap::new();
+        for name in actors {
+            local_actors.insert(
+                (*name).to_string(),
+                RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+            );
+        }
+        reg.merge_full_sync_from(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(peer_addr),
+            sequence,
+            current_timestamp(),
+        )
+        .await;
+    }
+
+    /// R-11: a peer that crashes and restarts resumes from sequence ~0. The
+    /// stale gate (`sequence < last_sequence`) dropped every one of its
+    /// FullSyncs forever, because `last_sequence` only ever advances and the
+    /// `handle_peer_death` reset the comments reference no longer exists.
+    /// The omission-prune therefore never ran, so an actor the peer no longer
+    /// hosts stayed in `known_actors` until the 24h TTL — and because the peer
+    /// is healthy, the dead-peer reap never fired either.
+    #[tokio::test]
+    async fn qa_r11_restart_omission_prune_within_one_round() {
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7801), test_config_with_seed("qa-r11-restart"));
+        let owner_kp = KeyPair::new_for_testing("qa-r11-owner");
+        let owner = owner_kp.peer_id();
+        let node_id = owner.to_node_id();
+        let peer_addr = test_addr(9401);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+
+        // Pre-restart: B is at sequence 40 hosting X and Y.
+        qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11/X", "qa_r11/Y"]).await;
+        assert!(reg.lookup_actor("qa_r11/X").await.is_some());
+        assert!(reg.lookup_actor("qa_r11/Y").await.is_some());
+
+        // B restarts: new authenticated session, sequence back to 1, and it no
+        // longer hosts Y.
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id)
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11/X"]).await;
+
+        assert!(
+            reg.lookup_actor("qa_r11/X").await.is_some(),
+            "R-11: the restarted peer's surviving actor must remain"
+        );
+        assert!(
+            reg.lookup_actor("qa_r11/Y").await.is_none(),
+            "R-11: the omission-prune must drop an actor the restarted peer no \
+             longer advertises, within one sync round"
+        );
+    }
+
+    /// R-11: the one-shot must be exactly one-shot. After the restart sync is
+    /// admitted the gate is restored, so an in-session replay of an older
+    /// sequence is still dropped — that is what the gate exists for.
+    #[tokio::test]
+    async fn qa_r11_stale_gate_still_blocks_mid_session_replays() {
+        let reg = GossipRegistry::<()>::new(test_addr(7802), test_config_with_seed("qa-r11-replay"));
+        let owner_kp = KeyPair::new_for_testing("qa-r11-replay-owner");
+        let owner = owner_kp.peer_id();
+        let node_id = owner.to_node_id();
+        let peer_addr = test_addr(9402);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11r/X", "qa_r11r/Y"]).await;
+
+        // No new session — a replayed old FullSync omitting Y must NOT prune Y.
+        qa_r11_full_sync(&reg, &owner, peer_addr, 5, &["qa_r11r/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11r/Y").await.is_some(),
+            "R-11: the stale gate must still drop in-session lower-sequence replays"
+        );
+
+        // One new session admits exactly one lower-sequence sync...
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id)
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 3, &["qa_r11r/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11r/Y").await.is_none(),
+            "R-11: the armed one-shot must admit the restart sync"
+        );
+
+        // ...and is consumed: a second, still-lower replay is dropped again.
+        qa_r11_full_sync(&reg, &owner, peer_addr, 2, &["qa_r11r/X", "qa_r11r/Z"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11r/Z").await.is_none(),
+            "R-11: the one-shot must be consumed by the sync it admits"
+        );
+    }
+
+    /// R-11 (security boundary, cf. B-5): the reset is keyed to the
+    /// TLS-authenticated identity. Arming for an address whose recorded
+    /// `node_id` is a DIFFERENT identity must be a no-op, so a peer cannot
+    /// weaponise the reset against a victim's bookkeeping.
+    #[tokio::test]
+    async fn qa_r11_arming_requires_matching_authenticated_identity() {
+        let reg = GossipRegistry::<()>::new(test_addr(7803), test_config_with_seed("qa-r11-ident"));
+        let owner = KeyPair::new_for_testing("qa-r11-ident-owner").peer_id();
+        let attacker_node_id = KeyPair::new_for_testing("qa-r11-ident-attacker")
+            .peer_id()
+            .to_node_id();
+        let peer_addr = test_addr(9403);
+
+        reg.add_peer_with_node_id(peer_addr, Some(owner.to_node_id()))
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11i/X", "qa_r11i/Y"]).await;
+
+        // A different identity must not be able to arm the victim's reset.
+        reg.arm_sequence_reset_for_new_session(peer_addr, attacker_node_id)
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11i/X"]).await;
+
+        assert!(
+            reg.lookup_actor("qa_r11i/Y").await.is_some(),
+            "R-11: arming under a non-matching identity must not open the stale gate"
+        );
+    }
+
     /// PEER_ID_REFACTOR §5 runtime observability: substitutions,
     /// relayed-kept events, and tie-break evictions are counted and exposed
     /// via `get_stats` so the storm signature is visible in prod telemetry.
@@ -9090,6 +9304,7 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -9368,6 +9583,7 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: now_ms,
+            accept_lower_sequence: false,
         }
     }
 
@@ -10278,6 +10494,7 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -10298,6 +10515,7 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -12294,6 +12512,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp() - 100),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -12478,6 +12697,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -12568,6 +12788,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: 0,
+                    accept_lower_sequence: false,
                 },
             );
             let mut seeded = HashSet::new();
@@ -12687,6 +12908,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: 0,
+                    accept_lower_sequence: false,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -12871,6 +13093,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -12958,6 +13181,7 @@ mod tests {
                         last_failure_time: None,
                         last_dns_refresh_attempt: None,
                         last_response_received_ms: crate::current_timestamp_millis(),
+                        accept_lower_sequence: false,
                     },
                 );
             }
@@ -13045,6 +13269,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -13124,6 +13349,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -14008,6 +14234,7 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -14065,6 +14292,7 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -14112,6 +14340,7 @@ mod tests {
             last_failure_time: Some(950),
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         };
 
         // Convert to gossip format
@@ -14501,6 +14730,7 @@ mod tests {
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis()
                         .saturating_sub(10_000),
+                        accept_lower_sequence: false,
                 },
             );
         }
@@ -14958,6 +15188,7 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15097,6 +15328,7 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15138,6 +15370,7 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15179,6 +15412,7 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15233,6 +15467,7 @@ mod tests {
                     last_failure_time: Some(now),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15294,6 +15529,7 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -15387,6 +15623,7 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence: false,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -15443,6 +15680,7 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15522,6 +15760,7 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15588,6 +15827,7 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }
@@ -15646,6 +15886,7 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence: false,
                 },
             );
         }

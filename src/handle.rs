@@ -3226,6 +3226,17 @@ where
         registry
             .add_peer_with_node_id(peer_state_addr, Some(node_id))
             .await;
+        // R-11: this is a new TLS-authenticated session for `node_id`, which is
+        // the only evidence we accept that the peer may have restarted. Allow
+        // exactly one lower-sequence FullSync through the stale gate, otherwise
+        // a peer that restarted at the same address has every FullSync dropped
+        // forever and its stale actors survive until the 24h TTL.
+        //
+        // `node_id` here comes from the TLS client certificate, not from the
+        // wire-claimed hello fields, so a peer cannot arm this for a victim.
+        registry
+            .arm_sequence_reset_for_new_session(peer_state_addr, node_id)
+            .await;
         // Associate capabilities captured during the Hello handshake (stored under peer_addr).
         registry
             .associate_peer_capabilities_with_node(peer_addr, node_id)
