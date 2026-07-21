@@ -6455,6 +6455,92 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Enforce bounds on gossip state data structures to prevent unbounded growth
+    /// R-12: is this peer entry exempt from `enforce_bounds` LRU eviction?
+    ///
+    /// Exempt when the peer is genuinely in use:
+    /// - it has a live pooled connection, under any of its known addresses; or
+    /// - it is an operator-configured / required peer.
+    ///
+    /// A peer can be keyed in `peers` under an address that differs from the
+    /// one the connection is pooled under (inbound-only peers key on the
+    /// ephemeral TCP source, NAT'd peers on `peer_address`, DNS-refreshed peers
+    /// on a re-resolved `address`), and the pool may index the live connection
+    /// by peer ID under none of those addresses at all. Liveness therefore
+    /// defers to `peer_has_live_connection`, which already handles the
+    /// address-alias and peer-ID-index cases; checking addresses alone would
+    /// treat a peer with a live peer-ID-indexed connection as evictable.
+    ///
+    /// The map key is checked separately for liveness, since
+    /// `peer_has_live_connection` only sees the `PeerInfo` fields.
+    ///
+    /// SECURITY: the configured-peer check deliberately does NOT consult
+    /// `peer.address` / `peer.peer_address`. Those are peer-influenced (see
+    /// B-5), so trusting them would let an untrusted inbound peer advertise a
+    /// configured address to make itself eviction-exempt — and repeat that
+    /// across many entries to bypass `max_peers` entirely and drive unbounded
+    /// memory growth. Configuration is matched on trusted identity only: the
+    /// TLS-authenticated `node_id`, or the `peers` map key, which is our own
+    /// bookkeeping key rather than a field the peer fills in.
+    ///
+    /// Liveness is safe to check via aliases because it consults the actual
+    /// connection pool — a peer cannot fabricate a live pooled connection.
+    fn peer_is_eviction_exempt(
+        &self,
+        addr: &SocketAddr,
+        peer: &PeerInfo,
+        configured_addrs: &std::collections::HashSet<SocketAddr>,
+        configured_peer_ids: &std::collections::HashSet<crate::PeerId>,
+    ) -> bool {
+        if self.peer_has_live_connection(peer) {
+            return true;
+        }
+
+        // Trusted-identity configuration match.
+        if let Some(node_id) = peer.node_id
+            && configured_peer_ids.contains(&node_id.to_peer_id())
+        {
+            return true;
+        }
+        if configured_addrs.contains(addr) {
+            return true;
+        }
+
+        // Alias sweep for LIVENESS only (pool-backed, not peer-claimed).
+        let candidates = [Some(*addr), peer.peer_address, Some(peer.address)];
+        candidates.iter().flatten().any(|candidate| {
+            self.connection_pool
+                .get_existing_connection(*candidate)
+                .is_some()
+        })
+    }
+
+    /// R-12: choose up to `to_remove` peers to evict, oldest-contact-first,
+    /// considering only peers the caller reports as evictable.
+    ///
+    /// Split out from `enforce_bounds` so the policy is testable without
+    /// standing up real pooled connections. Returns fewer than `to_remove`
+    /// addresses when the excess is all exempt -- the caller logs that case
+    /// rather than forcing an eviction.
+    fn select_peers_to_evict(
+        peers: &HashMap<SocketAddr, PeerInfo>,
+        to_remove: usize,
+        is_exempt: impl Fn(&SocketAddr, &PeerInfo) -> bool,
+    ) -> Vec<SocketAddr> {
+        let mut evictable: Vec<(SocketAddr, u64)> = peers
+            .iter()
+            .filter(|(addr, peer)| !is_exempt(addr, peer))
+            .map(|(addr, peer)| (*addr, peer.last_success))
+            .collect();
+        // Oldest successful contact first; address breaks ties so eviction is
+        // deterministic rather than dependent on HashMap iteration order.
+        evictable.sort_by_key(|(addr, last_success)| (*last_success, *addr));
+        evictable
+            .into_iter()
+            .take(to_remove)
+            .map(|(addr, _)| addr)
+            .collect()
+    }
+
     async fn enforce_bounds(&self) {
         let mut gossip_state = self.gossip_state.lock().await;
 
@@ -6511,26 +6597,35 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // Bound pending changes
+        // Bound pending changes.
+        //
+        // R-12(b): drop the OLDEST entries, not the newest. `truncate` kept the
+        // head and discarded the tail, which is exactly backwards: the tail is
+        // the most recent changes. `ActorRemoved` is not carried by FullSync
+        // (only live entries are), so a burst that overflowed this bound lost
+        // removal propagation outright and the stale actor survived until TTL.
         let max_pending = 1000;
         if gossip_state.pending_changes.len() > max_pending {
-            debug!(
-                "Trimming pending changes from {} to {}",
-                gossip_state.pending_changes.len(),
-                max_pending
+            let overflow = gossip_state.pending_changes.len() - max_pending;
+            warn!(
+                dropped = overflow,
+                retained = max_pending,
+                "pending changes overflowed the bound; dropping the oldest entries"
             );
-            gossip_state.pending_changes.truncate(max_pending);
+            gossip_state.pending_changes.drain(..overflow);
         }
 
-        // Bound urgent changes (smaller limit since these are high priority)
+        // Bound urgent changes (smaller limit since these are high priority).
+        // Same oldest-first policy as above, for the same reason.
         let max_urgent = 100;
         if gossip_state.urgent_changes.len() > max_urgent {
-            debug!(
-                "Trimming urgent changes from {} to {}",
-                gossip_state.urgent_changes.len(),
-                max_urgent
+            let overflow = gossip_state.urgent_changes.len() - max_urgent;
+            warn!(
+                dropped = overflow,
+                retained = max_urgent,
+                "urgent changes overflowed the bound; dropping the oldest entries"
             );
-            gossip_state.urgent_changes.truncate(max_urgent);
+            gossip_state.urgent_changes.drain(..overflow);
         }
 
         // Bound delta history
@@ -6540,29 +6635,44 @@ impl<T: 'static> GossipRegistry<T> {
             gossip_state.delta_history.drain(0..excess);
         }
 
-        // Bound peers list
-        let max_peers = 1000;
+        // Bound peers list.
+        //
+        // R-12(a): honour `config.max_peers` (this was hardcoded to 1000, so
+        // the operator's cap was silently ignored), and never evict a peer that
+        // is still in use. Eviction is destructive well beyond the `peers` map
+        // -- it drops `peer_to_actors` (breaking every future dead-peer reap
+        // for that peer), fires `on_peer_disconnected`, and destroys `node_id`
+        // and `last_sequence`. Doing that to a live peer is a fault, not a
+        // trim.
+        let max_peers = self.config.max_peers.max(1);
         let mut evicted_addrs: Vec<SocketAddr> = Vec::new();
         if gossip_state.peers.len() > max_peers {
-            debug!(
-                "Trimming peers from {} to {}",
-                gossip_state.peers.len(),
-                max_peers
-            );
-            let _current_time = current_timestamp();
-            let mut peers_by_age: Vec<_> = gossip_state
-                .peers
-                .iter()
-                .map(|(addr, peer)| (*addr, peer.last_success))
-                .collect();
-            peers_by_age.sort_by_key(|(_, last_success)| *last_success);
+            let configured = self.connection_pool.list_configured_peers();
+            let configured_peer_ids: std::collections::HashSet<crate::PeerId> =
+                configured.iter().map(|(peer_id, _)| peer_id.clone()).collect();
+            let configured_addrs: std::collections::HashSet<SocketAddr> =
+                configured.into_iter().map(|(_, addr)| addr).collect();
 
             let to_remove = gossip_state.peers.len() - max_peers;
-            evicted_addrs = peers_by_age
-                .iter()
-                .take(to_remove)
-                .map(|(addr, _)| *addr)
-                .collect();
+            evicted_addrs =
+                Self::select_peers_to_evict(&gossip_state.peers, to_remove, |addr, peer| {
+                    self.peer_is_eviction_exempt(
+                        addr,
+                        peer,
+                        &configured_addrs,
+                        &configured_peer_ids,
+                    )
+                });
+
+            if evicted_addrs.len() < to_remove {
+                warn!(
+                    over_cap = to_remove,
+                    evictable = evicted_addrs.len(),
+                    max_peers,
+                    "peer table is over its bound but the excess is all in-use \
+                     (live/configured/alias-linked) peers; leaving them in place"
+                );
+            }
             for addr in &evicted_addrs {
                 gossip_state.peers.remove(addr);
                 gossip_state.peer_to_actors.remove(addr);
@@ -13080,6 +13190,188 @@ mod tests {
         // Verify bounds were enforced
         let gossip_state = registry.gossip_state.lock().await;
         assert!(gossip_state.pending_changes.len() <= 1000);
+    }
+
+    /// R-12(a): `enforce_bounds` hardcoded `let max_peers = 1000;`, ignoring
+    /// `config.max_peers` entirely. An operator capping the peer table at 10
+    /// got no bound at all until the table passed 1000.
+    #[tokio::test]
+    async fn qa_r12_enforce_bounds_honours_configured_max_peers() {
+        let config = GossipConfig {
+            max_peers: 10,
+            ..test_config()
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            for i in 0..25u16 {
+                let addr = test_addr(9000 + i);
+                let mut peer = PeerInfo::local(addr);
+                peer.last_success = 1_000 + u64::from(i);
+                gossip_state.peers.insert(addr, peer);
+            }
+        }
+
+        registry.enforce_bounds().await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(
+            gossip_state.peers.len(),
+            10,
+            "R-12: enforce_bounds must honour config.max_peers, not a hardcoded 1000"
+        );
+    }
+
+    /// R-12(a): eviction sorted by `last_success` alone with no exemption, so
+    /// the peers most likely to be evicted -- inbound-only peers, whose
+    /// `last_success` never advances on the key they are stored under -- were
+    /// exactly the live ones. Eviction drops `peer_to_actors`, fires
+    /// `on_peer_disconnected`, and destroys `node_id`/`last_sequence`.
+    ///
+    /// Tests the policy function directly: standing up 15 real pooled
+    /// connections is not needed to pin the selection rule.
+    #[test]
+    fn qa_r12_live_peers_never_evicted() {
+        let mut peers = HashMap::new();
+        for i in 0..15u16 {
+            let addr = test_addr(9000 + i);
+            let mut peer = PeerInfo::local(addr);
+            // The five OLDEST-contact peers are the live ones -- precisely the
+            // set the old oldest-first policy would have evicted.
+            peer.last_success = 1_000 + u64::from(i);
+            peers.insert(addr, peer);
+        }
+        let live: std::collections::HashSet<SocketAddr> =
+            (0..5u16).map(|i| test_addr(9000 + i)).collect();
+
+        let evicted =
+            GossipRegistry::<()>::select_peers_to_evict(&peers, 5, |addr, _| live.contains(addr));
+
+        assert_eq!(evicted.len(), 5, "should still evict the requested count");
+        for addr in &evicted {
+            assert!(
+                !live.contains(addr),
+                "R-12: live peer {addr} must never be evicted"
+            );
+        }
+        // The oldest *evictable* peers go first.
+        let mut sorted = evicted.clone();
+        sorted.sort();
+        let expected: Vec<SocketAddr> = (5..10u16).map(|i| test_addr(9000 + i)).collect();
+        assert_eq!(sorted, expected, "R-12: evict oldest evictable peers first");
+    }
+
+    /// R-12(a): when the entire excess is exempt, evict nothing rather than
+    /// forcing a live peer out to satisfy the bound.
+    #[test]
+    fn qa_r12_all_exempt_evicts_nothing() {
+        let mut peers = HashMap::new();
+        for i in 0..12u16 {
+            let addr = test_addr(9000 + i);
+            peers.insert(addr, PeerInfo::local(addr));
+        }
+
+        let evicted = GossipRegistry::<()>::select_peers_to_evict(&peers, 2, |_, _| true);
+
+        assert!(
+            evicted.is_empty(),
+            "R-12: an all-exempt peer table must not be force-evicted"
+        );
+    }
+
+    /// R-12 (review P1, codex): an untrusted peer must not be able to buy
+    /// eviction exemption by ADVERTISING a configured address.
+    ///
+    /// `peer.address` / `peer.peer_address` are peer-influenced (B-5). If the
+    /// configured-peer check trusted them, any inbound peer could claim a
+    /// configured address to become exempt, and repeat that across many
+    /// entries to bypass `max_peers` entirely -> unbounded memory growth.
+    /// Configuration is therefore matched on trusted identity only.
+    #[tokio::test]
+    async fn qa_r12_advertised_alias_does_not_grant_configured_exemption() {
+        let config = GossipConfig {
+            max_peers: 2,
+            ..test_config()
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+        let configured_addr = test_addr(9999);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            for i in 0..6u16 {
+                let key = test_addr(9500 + i);
+                let mut peer = PeerInfo::local(key);
+                // Every peer LIES, claiming the configured address as its own
+                // advertised aliases.
+                peer.address = configured_addr;
+                peer.peer_address = Some(configured_addr);
+                peer.last_success = 1_000 + u64::from(i);
+                gossip_state.peers.insert(key, peer);
+            }
+        }
+
+        registry.enforce_bounds().await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(
+            gossip_state.peers.len(),
+            2,
+            "R-12: peers must not become eviction-exempt by advertising a \
+             configured address; the bound must still be enforced"
+        );
+    }
+
+    /// R-12(b): the bound used `truncate`, which keeps the head and drops the
+    /// TAIL -- the most recent changes. `ActorRemoved` is not carried by
+    /// FullSync, so a burst that overflowed the bound lost removal propagation
+    /// entirely and the stale actor survived until the 24h TTL.
+    #[tokio::test]
+    async fn qa_r12_removed_burst_still_propagates() {
+        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            // 1000 older additions...
+            for i in 0..1000 {
+                gossip_state
+                    .pending_changes
+                    .push(RegistryChange::ActorAdded {
+                        name: format!("actor{i}"),
+                        location: test_location(test_addr(9000)),
+                        priority: RegistrationPriority::Normal,
+                    });
+            }
+            // ...then the 100 most recent changes, all removals.
+            for i in 0..100 {
+                gossip_state
+                    .pending_changes
+                    .push(RegistryChange::ActorRemoved {
+                        name: format!("removed{i}"),
+                        vector_clock: crate::VectorClock::new(),
+                        removing_node_id: crate::KeyPair::new_for_testing("qa_r12_remover")
+                            .peer_id()
+                            .to_node_id(),
+                        priority: RegistrationPriority::Normal,
+                    });
+            }
+        }
+
+        registry.enforce_bounds().await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(gossip_state.pending_changes.len() <= 1000);
+
+        let surviving_removals = gossip_state
+            .pending_changes
+            .iter()
+            .filter(|c| matches!(c, RegistryChange::ActorRemoved { .. }))
+            .count();
+        assert_eq!(
+            surviving_removals, 100,
+            "R-12: the newest ActorRemoved entries must survive the bound; \
+             dropping them loses removal propagation permanently"
+        );
     }
 
     #[tokio::test]

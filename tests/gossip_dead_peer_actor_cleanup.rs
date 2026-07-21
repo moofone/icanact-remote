@@ -929,6 +929,27 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
             gossip_interval: Duration::from_secs(3600),
             peer_gossip_interval: Some(Duration::from_millis(250)),
             peer_retry_interval: Duration::from_secs(3600),
+            // FLAKE FIX: the peer supervisor must be quiesced too, not just
+            // gossip and retry.
+            //
+            // This test back-dates `last_response_received_ms` to synthesize
+            // peer silence. It left `peer_supervisor_interval` at its default
+            // of 1s (DEFAULT_PEER_SUPERVISOR_SECONDS), so
+            // `supervise_configured_peers` re-dialled the (required, and
+            // genuinely alive) peer roughly every second and
+            // `connect_to_peer`'s success path reset both `failures` and
+            // `last_response_received_ms` — wiping the synthetic silence
+            // within the same millisecond. Under concurrent test-binary load
+            // that tick lands inside the assertion window: reproduced 16/80,
+            // never in 15 isolated runs.
+            //
+            // This is not a timing workaround: the test's own doc comment
+            // already states the intent to quiet all background activity, and
+            // this knob is the single configuration asymmetry between this
+            // test and its non-flaky sibling
+            // (`required_peer_drops_after_two_liveness_failures_and_recovers_on_reconnect`,
+            // gossip_required_peer_liveness_chaos.rs), which sets it.
+            peer_supervisor_interval: Duration::from_secs(3600),
             peer_liveness_window: Duration::from_millis(500),
             connection_timeout: Duration::from_millis(500),
             max_peer_failures: 3,
