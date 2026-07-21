@@ -631,6 +631,15 @@ impl LockFreeStreamHandle {
                         flush_pending.store(false, Ordering::Release);
                         bytes_since_flush = 0;
                     }
+                    StreamingCommand::Abort { stream_id, reason } => {
+                        let header = crate::framing::write_stream_abort_header(stream_id, reason);
+                        if let Err(error) = stream.write_all(&header).await {
+                            warn!(stream_id, reason, %error, "failed to write stream abort");
+                            return;
+                        }
+                        bytes_written_counter.fetch_add(header.len(), Ordering::Relaxed);
+                        total_bytes_written += header.len();
+                    }
                     StreamingCommand::VectoredWrite(cmd) => {
                         // Handle short writes by falling back to sequential write_all
                         // TCP can return partial writes under backpressure
@@ -2560,6 +2569,7 @@ impl LockFreeStreamHandle {
             )),
             payload: payload.slice(..first_len),
         })).await?;
+        let mut abort_guard = StreamAbortGuard::new(self, stream_id);
         let mut offset = first_len;
         let mut index = 1u32;
         while offset < payload.len() {
@@ -2578,7 +2588,9 @@ impl LockFreeStreamHandle {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "stream chunk index exhausted"),
             ))?;
         }
-        self.streaming_queue.push(StreamingCommand::Flush).await
+        self.streaming_queue.push(StreamingCommand::Flush).await?;
+        abort_guard.disarm();
+        Ok(())
     }
 
     /// Copying convenience wrapper for callers that only own a slice.
@@ -2638,6 +2650,7 @@ impl LockFreeStreamHandle {
                 payload: payload.slice(..first_len),
             }))
             .await?;
+        let mut abort_guard = StreamAbortGuard::new(self, stream_id);
         let mut offset = first_len;
         let mut index = 1u32;
         while offset < payload.len() {
@@ -2663,6 +2676,7 @@ impl LockFreeStreamHandle {
             })?;
         }
         self.streaming_queue.push(StreamingCommand::Flush).await?;
+        abort_guard.disarm();
         Ok(())
     }
 
@@ -2711,6 +2725,23 @@ impl LockFreeStreamHandle {
         .await
     }
 
+    /// Drop-safe cancellation for a partially queued V5 stream.
+    ///
+    /// The abort uses the same FIFO as stream chunks, so it is ordered after
+    /// every chunk accepted before cancellation. If that FIFO cannot accept an
+    /// abort, shut the transport down: a closed socket releases the peer's
+    /// reassembly immediately, whereas silently losing the abort leaks it for
+    /// the idle timeout.
+    fn try_abort_stream(&self, stream_id: u32, reason: u32) {
+        if self
+            .streaming_queue
+            .try_push(StreamingCommand::Abort { stream_id, reason })
+            .is_err()
+        {
+            self.signal_shutdown();
+        }
+    }
+
     /// Zero-copy vectored write for header + payload in single operation
     /// This eliminates copying payload data into frame buffer - optimal for streaming
     pub async fn write_bytes_vectored<const N: usize>(
@@ -2744,6 +2775,34 @@ impl LockFreeStreamHandle {
             .map_err(|_| GossipError::WriteQueueFull)?;
 
         Ok(())
+    }
+}
+
+/// Arms after `StreamStart` has entered the streaming FIFO. Dropping an async
+/// sender while it is backpressured must release the peer's pre-allocation,
+/// but `Drop` may not await. The guard therefore publishes an ordered abort on
+/// the same queue and fails closed if the queue is no longer usable.
+struct StreamAbortGuard<'a> {
+    handle: &'a LockFreeStreamHandle,
+    stream_id: u32,
+    armed: bool,
+}
+
+impl<'a> StreamAbortGuard<'a> {
+    fn new(handle: &'a LockFreeStreamHandle, stream_id: u32) -> Self {
+        Self { handle, stream_id, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamAbortGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.try_abort_stream(self.stream_id, 1);
+        }
     }
 }
 
@@ -2915,6 +2974,50 @@ mod route_interning_tests {
             exited.is_ok(),
             "shutdown() must wake a writer parked in the idle select (R-2)"
         );
+    }
+
+    /// R-8: cancellation must be ordered after the accepted StreamStart. The
+    /// abort used to go through the normal queue, which is serviced between
+    /// streaming turns and could overtake queued stream data.
+    #[tokio::test]
+    async fn qa_r8_cancelled_stream_abort_follows_stream_start() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9905".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream_id = 7;
+        let start = crate::framing::write_stream_request_start_header(
+            stream_id, 1, 1, 2, 3, 1,
+        );
+        writer
+            .streaming_queue
+            .push(StreamingCommand::VectoredWrite(VectoredSendItem {
+                header: InlineFrameHeader::from_array(start),
+                payload: bytes::Bytes::from_static(b"x"),
+            }))
+            .await
+            .unwrap();
+        drop(StreamAbortGuard::new(&writer, stream_id));
+
+        let mut received_start = vec![0u8; start.len() + 1];
+        peer.read_exact(&mut received_start).await.unwrap();
+        assert_eq!(&received_start[..start.len()], &start);
+        assert_eq!(&received_start[start.len()..], b"x");
+
+        let expected_abort = crate::framing::write_stream_abort_header(stream_id, 1);
+        let mut abort = [0u8; crate::framing::STREAM_DATA_HEADER_LEN + crate::framing::LENGTH_PREFIX_LEN];
+        peer.read_exact(&mut abort).await.unwrap();
+        assert_eq!(abort, expected_abort);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .expect("writer exits after R-8 cancellation test");
     }
 
     #[tokio::test]

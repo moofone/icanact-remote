@@ -174,6 +174,12 @@ enum ReadState {
         reservation: crate::protocol::StreamChunkReservation,
         read: usize,
     },
+    /// Payload of a stream rejected for bounded resource pressure. Consume it
+    /// into a fixed scratch buffer to keep framing aligned without allocating.
+    DiscardStreamPayload {
+        remaining: usize,
+        scratch: Box<[u8; 8192]>,
+    },
 }
 
 // Direct responses are emitted by the IO owner rather than a public
@@ -242,7 +248,7 @@ fn reserve_v5_stream_payload(
     meta: &[u8],
     streaming_state: &mut crate::protocol::StreamingState,
     pool: Arc<crate::AlignedBytesPool>,
-) -> Result<crate::protocol::StreamChunkReservation> {
+) -> Result<Option<crate::protocol::StreamChunkReservation>> {
     let meta_len = stream_meta_len(kind).expect("stream kind has metadata");
     let payload_len = body_len.checked_sub(meta_len).ok_or_else(|| GossipError::Network(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated V5 stream metadata"),
@@ -254,7 +260,7 @@ fn reserve_v5_stream_payload(
             let total_size = u32::from_be_bytes(meta[8..12].try_into().unwrap()) as u64;
             let actor_id = u64::from_be_bytes(meta[12..20].try_into().unwrap());
             let type_hash = u32::from_be_bytes(meta[20..24].try_into().unwrap());
-            streaming_state.begin_v5_stream(
+            streaming_state.begin_v5_stream_or_discard(
                 crate::StreamHeader { stream_id, total_size, chunk_size: payload_len as u32, chunk_index: 0, type_hash, actor_id },
                 correlation_id,
                 pool,
@@ -266,7 +272,7 @@ fn reserve_v5_stream_payload(
             let stream_id = u32::from_be_bytes(meta[..4].try_into().unwrap()) as u64;
             let correlation_id = u32::from_be_bytes(meta[4..8].try_into().unwrap());
             let total_size = u32::from_be_bytes(meta[8..12].try_into().unwrap()) as u64;
-            streaming_state.begin_v5_stream(
+            streaming_state.begin_v5_stream_or_discard(
                 crate::StreamHeader { stream_id, total_size, chunk_size: payload_len as u32, chunk_index: 0, type_hash: 0, actor_id: 0 },
                 correlation_id,
                 pool,
@@ -277,9 +283,24 @@ fn reserve_v5_stream_payload(
         crate::framing::WireKind::StreamData | crate::framing::WireKind::StreamResponseData => {
             let stream_id = u32::from_be_bytes(meta[..4].try_into().unwrap()) as u64;
             let chunk_index = u32::from_be_bytes(meta[4..8].try_into().unwrap());
-            streaming_state.reserve_v5_chunk(stream_id, chunk_index, payload_len)
+            streaming_state.reserve_v5_chunk_or_discard(stream_id, chunk_index, payload_len)
         }
         _ => unreachable!("non-stream kind passed to direct stream reservation"),
+    }
+}
+
+fn stream_payload_state(
+    reservation: Option<crate::protocol::StreamChunkReservation>,
+    body_len: usize,
+    meta_len: usize,
+) -> ReadState {
+    match reservation {
+        Some(reservation) if reservation.is_empty() => ReadState::new(),
+        Some(reservation) => ReadState::ReadStreamPayload { reservation, read: 0 },
+        None => ReadState::DiscardStreamPayload {
+            remaining: body_len - meta_len,
+            scratch: Box::new([0; 8192]),
+        },
     }
 }
 
@@ -417,11 +438,7 @@ where
             let reservation = reserve_v5_stream_payload(
                 *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
             )?;
-            *state = if reservation.is_empty() {
-                ReadState::new()
-            } else {
-                ReadState::ReadStreamPayload { reservation, read: 0 }
-            };
+            *state = stream_payload_state(reservation, *body_len, *meta_len);
             Ok(None)
         }
         ReadState::ReadStreamPayload { reservation, read } => {
@@ -442,6 +459,25 @@ where
                 _ => unreachable!("read state must be V5 stream payload"),
             };
             Ok(streaming_state.commit_v5_chunk(reservation)?.map(completed_v5_stream_result))
+        }
+        ReadState::DiscardStreamPayload { remaining, scratch } => {
+            let read_len = (*remaining).min(scratch.len());
+            if read_len == 0 {
+                *state = ReadState::new();
+                return Ok(None);
+            }
+            let n = stream.read(&mut scratch[..read_len]).await?;
+            if n == 0 {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed while discarding rejected stream payload",
+                )));
+            }
+            *remaining -= n;
+            if *remaining == 0 {
+                *state = ReadState::new();
+            }
+            Ok(None)
         }
     }
 }
@@ -675,11 +711,7 @@ where
                     let reservation = reserve_v5_stream_payload(
                         *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
                     )?;
-                    *state = if reservation.is_empty() {
-                        ReadState::new()
-                    } else {
-                        ReadState::ReadStreamPayload { reservation, read: 0 }
-                    };
+                    *state = stream_payload_state(reservation, *body_len, *meta_len);
                     Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -706,6 +738,29 @@ where
                         .map(completed_v5_stream_result)
                         .map(ReadIoResult::Generic);
                     Poll::Ready(Ok(ReadPollResult { result, progressed: true }))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            }
+        }
+        ReadState::DiscardStreamPayload { remaining, scratch } => {
+            let read_len = (*remaining).min(scratch.len());
+            if read_len == 0 {
+                *state = ReadState::new();
+                return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+            }
+            match poll_read_once(stream, cx, &mut scratch[..read_len]) {
+                Poll::Pending if block_on_pending => Poll::Pending,
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed while discarding rejected stream payload",
+                )))),
+                Poll::Ready(Ok(n)) => {
+                    *remaining -= n;
+                    if *remaining == 0 {
+                        *state = ReadState::new();
+                    }
+                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
@@ -888,11 +943,7 @@ where
                     let reservation = reserve_v5_stream_payload(
                         *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
                     )?;
-                    *state = if reservation.is_empty() {
-                        ReadState::new()
-                    } else {
-                        ReadState::ReadStreamPayload { reservation, read: 0 }
-                    };
+                    *state = stream_payload_state(reservation, *body_len, *meta_len);
                     Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -918,6 +969,28 @@ where
                         .map(completed_v5_stream_result)
                         .map(ReadIoResult::Generic);
                     Poll::Ready(Ok(ReadPollResult { result, progressed: true }))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            }
+        }
+        ReadState::DiscardStreamPayload { remaining, scratch } => {
+            let read_len = (*remaining).min(scratch.len());
+            if read_len == 0 {
+                *state = ReadState::new();
+                return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+            }
+            match poll_read_once(stream, cx, &mut scratch[..read_len]) {
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed while discarding rejected stream payload",
+                )))),
+                Poll::Ready(Ok(n)) => {
+                    *remaining -= n;
+                    if *remaining == 0 {
+                        *state = ReadState::new();
+                    }
+                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }

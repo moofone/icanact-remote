@@ -1054,6 +1054,9 @@ impl<T> ConnectionHandle<T> {
             first_header,
             payload.slice(..first_len),
         ).await?;
+        // Armed only after StreamStart was accepted by the FIFO. From here on,
+        // every cancellation path must release the peer-side reassembly.
+        let mut abort_guard = StreamAbortGuard::new(stream_handle, stream_id);
         let mut offset = first_len;
         let mut index = 1u32;
         while offset < payload.len() {
@@ -1068,17 +1071,12 @@ impl<T> ConnectionHandle<T> {
                 header,
                 payload.slice(offset..end),
             ).await {
-                // The StartData frame has already made the peer reserve the
-                // final assembly buffer. Best-effort abort releases it now
-                // instead of waiting for the idle reaper.
-                let _ = stream_handle.abort_stream(stream_id, 1).await;
                 return Err(error);
             }
             offset = end;
             index = match index.checked_add(1) {
                 Some(index) => index,
                 None => {
-                    let _ = stream_handle.abort_stream(stream_id, 2).await;
                     return Err(GossipError::Network(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "stream chunk index exhausted",
@@ -1086,6 +1084,9 @@ impl<T> ConnectionHandle<T> {
                 }
             };
         }
+        // All stream frames are now queued in FIFO order. A caller cancelling
+        // while it waits for the response cannot leave a partial reassembly.
+        abort_guard.disarm();
         drop(gate_guard);
         let response = self.correlation.wait_for_response(correlation_id, timeout).await?;
         let _ = slot.disarm();
