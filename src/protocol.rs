@@ -25,8 +25,13 @@ const MAX_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(
 #[derive(Debug)]
 pub struct StreamingState {
     active_streams: HashMap<u64, InProgressStream>,
+    /// Rejected stream ids are quarantined so their trailing frames can be
+    /// consumed without allocating or tearing down unrelated traffic.
+    rejected_streams: HashMap<u64, std::time::Instant>,
     max_concurrent_streams: usize,
 }
+
+const MAX_REJECTED_STREAMS: usize = 32;
 
 /// A validated, not-yet-committed V5 chunk destination. The IO task receives
 /// plaintext directly into this range and commits it only after every byte was
@@ -138,6 +143,7 @@ impl StreamingState {
     pub fn new() -> Self {
         Self {
             active_streams: HashMap::new(),
+            rejected_streams: HashMap::new(),
             max_concurrent_streams: 16, // Reasonable limit
         }
     }
@@ -160,6 +166,12 @@ impl StreamingState {
         schema_hash: Option<u64>,
         is_response: bool,
     ) -> Result<()> {
+        // A repeated StreamStart must never be reclassified as resource
+        // pressure merely because the connection is already at capacity. The
+        // subsequent duplicate chunk remains a fatal protocol error.
+        if self.active_streams.contains_key(&header.stream_id) {
+            return Ok(());
+        }
         if self.active_streams.len() >= self.max_concurrent_streams {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::ResourceBusy,
@@ -185,31 +197,29 @@ impl StreamingState {
             )));
         }
 
-        // Only insert if not already exists to avoid resetting progress on duplicate start frames
-        if !self.active_streams.contains_key(&header.stream_id) {
-            // Bound aggregate eager allocation across all in-flight streams on
-            // this connection. A StreamStart pre-allocates its full declared
-            // size, so cap the sum to keep a peer from opening many max-size
-            // streams and forcing ~1 GiB of eager allocation (DoS). Summed on
-            // demand over the (<= max_concurrent_streams) active entries.
-            let inflight_bytes: usize = self
-                .active_streams
-                .values()
-                .map(|s| s.total_size as usize)
-                .sum();
-            if inflight_bytes.saturating_add(total_size) > crate::MAX_INFLIGHT_STREAM_BYTES {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::ResourceBusy,
-                    format!(
-                        "per-connection in-flight stream budget exceeded: {} in flight + {} requested > {}",
-                        inflight_bytes,
-                        total_size,
-                        crate::MAX_INFLIGHT_STREAM_BYTES
-                    ),
-                )));
-            }
-            let buffer = crate::PooledAlignedBuffer::with_len(total_size, pool);
-            let stream = InProgressStream {
+        // Bound aggregate eager allocation across all in-flight streams on
+        // this connection. A StreamStart pre-allocates its full declared
+        // size, so cap the sum to keep a peer from opening many max-size
+        // streams and forcing ~1 GiB of eager allocation (DoS). Summed on
+        // demand over the (<= max_concurrent_streams) active entries.
+        let inflight_bytes: usize = self
+            .active_streams
+            .values()
+            .map(|s| s.total_size as usize)
+            .sum();
+        if inflight_bytes.saturating_add(total_size) > crate::MAX_INFLIGHT_STREAM_BYTES {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                format!(
+                    "per-connection in-flight stream budget exceeded: {} in flight + {} requested > {}",
+                    inflight_bytes,
+                    total_size,
+                    crate::MAX_INFLIGHT_STREAM_BYTES
+                ),
+            )));
+        }
+        let buffer = crate::PooledAlignedBuffer::with_len(total_size, pool);
+        let stream = InProgressStream {
                 stream_id: header.stream_id,
                 total_size: header.total_size,
                 type_hash: header.type_hash,
@@ -225,9 +235,8 @@ impl StreamingState {
                 duplicate_chunks: 0,
                 started_at: std::time::Instant::now(),
                 last_activity: std::time::Instant::now(),
-            };
-            self.active_streams.insert(header.stream_id, stream);
-        }
+        };
+        self.active_streams.insert(header.stream_id, stream);
         Ok(())
     }
 
@@ -248,6 +257,31 @@ impl StreamingState {
         }
         self.start_stream_with_correlation_and_kind(header, correlation_id, pool, None, is_response)?;
         self.reserve_v5_chunk(header.stream_id, 0, first_chunk_len)
+    }
+
+    /// Convert only bounded resource-pressure rejections into a stream-local
+    /// discard. Malformed frames stay fatal protocol errors.
+    pub(crate) fn begin_v5_stream_or_discard(
+        &mut self,
+        header: crate::StreamHeader,
+        correlation_id: u32,
+        pool: Arc<crate::AlignedBytesPool>,
+        is_response: bool,
+        first_chunk_len: usize,
+    ) -> Result<Option<StreamChunkReservation>> {
+        // TCP preserves frame order: every trailing frame for the rejected
+        // generation arrives before a later StreamStart. A new start is
+        // therefore an unambiguous generation boundary, not a reason to
+        // suppress a legitimate retry until the tombstone expires.
+        self.rejected_streams.remove(&header.stream_id);
+        match self.begin_v5_stream(header, correlation_id, pool, is_response, first_chunk_len) {
+            Ok(reservation) => Ok(Some(reservation)),
+            Err(error) if is_resource_busy(&error) => {
+                self.reject_stream(header.stream_id)?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Validates a V5 chunk before the reader receives it. This does not mark
@@ -312,6 +346,32 @@ impl StreamingState {
             )));
         }
         Ok(StreamChunkReservation { stream_id, chunk_index, offset, len: chunk_len })
+    }
+
+    pub(crate) fn reserve_v5_chunk_or_discard(
+        &mut self,
+        stream_id: u64,
+        chunk_index: u32,
+        chunk_len: usize,
+    ) -> Result<Option<StreamChunkReservation>> {
+        if self.rejected_streams.contains_key(&stream_id) {
+            return Ok(None);
+        }
+        self.reserve_v5_chunk(stream_id, chunk_index, chunk_len).map(Some)
+    }
+
+    fn reject_stream(&mut self, stream_id: u64) -> Result<()> {
+        self.rejected_streams.retain(|_, at| at.elapsed() <= STREAM_IDLE_TIMEOUT);
+        if !self.rejected_streams.contains_key(&stream_id)
+            && self.rejected_streams.len() >= MAX_REJECTED_STREAMS
+        {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "too many rejected streams",
+            )));
+        }
+        self.rejected_streams.insert(stream_id, std::time::Instant::now());
+        Ok(())
     }
 
     pub(crate) fn v5_chunk_target(
@@ -623,6 +683,8 @@ impl StreamingState {
         max_lifetime: std::time::Duration,
     ) {
         let before_count = self.active_streams.len();
+        self.rejected_streams
+            .retain(|_, at| at.elapsed() <= idle_timeout);
 
         self.active_streams.retain(|stream_id, stream| {
             let idle = stream.last_activity.elapsed();
@@ -670,6 +732,10 @@ impl Default for StreamingState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn is_resource_busy(error: &GossipError) -> bool {
+    matches!(error, GossipError::Network(io) if io.kind() == std::io::ErrorKind::ResourceBusy)
 }
 
 fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
@@ -1270,7 +1336,6 @@ async fn handle_assembled_message(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn streaming_rejects_oversize() {
@@ -1781,6 +1846,78 @@ mod tests {
         assert!(state.abort_stream(88));
         assert!(!state.abort_stream(88));
         assert!(state.commit_v5_chunk(reservation).is_err());
+    }
+
+    #[test]
+    fn qa_r8_resource_rejection_tombstones_trailing_chunks() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::new(1));
+
+        for stream_id in 1..=16 {
+            let reservation = state
+                .begin_v5_stream(
+                    crate::StreamHeader {
+                        stream_id,
+                        total_size: 1,
+                        chunk_size: 1,
+                        chunk_index: 0,
+                        type_hash: 0,
+                        actor_id: 0,
+                    },
+                    0,
+                    pool.clone(),
+                    false,
+                    1,
+                )
+                .expect("fill the active-stream budget");
+            let target = state.v5_chunk_target(reservation, 0).unwrap();
+            target[0] = 1;
+        }
+
+        let rejected = state
+            .begin_v5_stream_or_discard(
+                crate::StreamHeader {
+                    stream_id: 17,
+                    total_size: 2,
+                    chunk_size: 1,
+                    chunk_index: 0,
+                    type_hash: 0,
+                    actor_id: 0,
+                },
+                0,
+                pool,
+                false,
+                1,
+            )
+            .expect("resource pressure is a stream-local rejection");
+        assert!(rejected.is_none());
+        assert!(state
+            .reserve_v5_chunk_or_discard(17, 1, 1)
+            .expect("trailing chunk is discarded")
+            .is_none());
+        assert_eq!(state.active_stream_count(), 16);
+
+        // Once pressure clears, a later StreamStart is a new generation on
+        // the ordered transport and must not be silently discarded because
+        // its old generation was tombstoned.
+        assert!(state.abort_stream(1));
+        assert!(state
+            .begin_v5_stream_or_discard(
+                crate::StreamHeader {
+                    stream_id: 17,
+                    total_size: 1,
+                    chunk_size: 1,
+                    chunk_index: 0,
+                    type_hash: 0,
+                    actor_id: 0,
+                },
+                0,
+                Arc::new(crate::AlignedBytesPool::new(1)),
+                false,
+                1,
+            )
+            .expect("a retry start is valid after pressure clears")
+            .is_some());
     }
 
     #[test]

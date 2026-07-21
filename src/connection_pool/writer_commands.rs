@@ -19,6 +19,9 @@ enum StreamingCommand {
     VectoredWrite(VectoredSendItem),
     /// Batch of owned chunks for streaming (zero-copy).
     OwnedChunks(Vec<bytes::Bytes>),
+    /// Abort a partially transmitted stream. This stays on the streaming FIFO
+    /// so it cannot overtake data chunks that were already accepted.
+    Abort { stream_id: u32, reason: u32 },
 }
 
 impl std::fmt::Debug for StreamingCommand {
@@ -37,6 +40,11 @@ impl std::fmt::Debug for StreamingCommand {
                 .debug_struct("OwnedChunks")
                 .field("chunk_count", &chunks.len())
                 .field("total_len", &chunks.iter().map(|c| c.len()).sum::<usize>())
+                .finish(),
+            StreamingCommand::Abort { stream_id, reason } => f
+                .debug_struct("Abort")
+                .field("stream_id", stream_id)
+                .field("reason", reason)
                 .finish(),
         }
     }
