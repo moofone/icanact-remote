@@ -248,6 +248,12 @@ const OUTBOUND_DIAL_FAILED: u8 = 2;
 struct OutboundDialGate {
     state: AtomicU8,
     notify: Notify,
+    /// R-15 test hook. Fired inside [`OutboundDialGate::wait`] at the exact
+    /// vulnerable point — after the state observation, before the await — so a
+    /// test can drive `finish()` into the `Notified` registration gap
+    /// deterministically instead of racing for it.
+    #[cfg(test)]
+    race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl OutboundDialGate {
@@ -255,6 +261,27 @@ impl OutboundDialGate {
         Self {
             state: AtomicU8::new(OUTBOUND_DIAL_PENDING),
             notify: Notify::new(),
+            #[cfg(test)]
+            race_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.race_hook.lock().expect("race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    /// Fires the R-15 hook at most once, without holding the lock across the
+    /// callback (the callback re-enters `finish()` on this same gate).
+    #[cfg(test)]
+    fn fire_race_hook(&self) {
+        let hook = self
+            .race_hook
+            .lock()
+            .expect("race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -272,10 +299,32 @@ impl OutboundDialGate {
 
     async fn wait(&self) {
         loop {
-            let notified = self.notify.notified();
+            // R-15. The QA finding claimed a permanent lost wakeup here. That
+            // specific claim was WRONG: `Notified` captures `Notify`'s
+            // `notify_waiters_calls` generation counter at *construction* time
+            // (tokio notify.rs `notified()`), and `finish()` broadcasts with
+            // `notify_waiters()`, which bumps that counter — so constructing
+            // `notified` before the state load was already sufficient to
+            // observe a `finish()` landing in the load -> await window.
+            //
+            // But that correctness depended entirely on an undocumented
+            // statement ordering: move the construction below the load and the
+            // wakeup IS lost permanently, and the follower branch of
+            // `get_connection*` has no timeout, so the dial hangs forever.
+            //
+            // `enable()` registers the waiter up front, which makes the wakeup
+            // safe regardless of where the state load sits — the same
+            // enable()-before-recheck discipline the write queues use in
+            // `constants.rs`. Those queues genuinely need it, because they wake
+            // with permit-based `notify_one()`, which has no generation
+            // counter to fall back on.
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
             if self.state.load(Ordering::Acquire) != OUTBOUND_DIAL_PENDING {
                 return;
             }
+            #[cfg(test)]
+            self.fire_race_hook();
             notified.await;
         }
     }
