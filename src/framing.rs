@@ -30,7 +30,8 @@ pub const ASK_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ASK_RESPONS
 pub const GOSSIP_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + GOSSIP_HEADER_LEN;
 pub const ACTOR_TELL_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ACTOR_TELL_HEADER_LEN;
 pub const ACTOR_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ACTOR_ASK_HEADER_LEN;
-pub const ROUTED_ACTOR_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ROUTED_ACTOR_ASK_HEADER_LEN;
+pub const ROUTED_ACTOR_ASK_FRAME_HEADER_LEN: usize =
+    LENGTH_PREFIX_LEN + ROUTED_ACTOR_ASK_HEADER_LEN;
 pub const ROUTE_BIND_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + ROUTE_BIND_HEADER_LEN;
 pub const DIRECT_ASK_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_ASK_HEADER_LEN;
 pub const DIRECT_RESPONSE_FRAME_HEADER_LEN: usize = LENGTH_PREFIX_LEN + DIRECT_RESPONSE_HEADER_LEN;
@@ -211,7 +212,11 @@ pub fn write_routed_actor_ask_header(
 }
 
 /// Establishes a connection-scoped slot before a routed ask uses it.
-pub fn write_route_bind_header(route_slot: u32, actor_id: u64, type_hash: u32) -> [u8; ROUTE_BIND_FRAME_HEADER_LEN] {
+pub fn write_route_bind_header(
+    route_slot: u32,
+    actor_id: u64,
+    type_hash: u32,
+) -> [u8; ROUTE_BIND_FRAME_HEADER_LEN] {
     let mut header = init_header(WireKind::RouteBind, ROUTE_BIND_HEADER_LEN);
     header[4..8].copy_from_slice(&route_slot.to_be_bytes());
     header[8..16].copy_from_slice(&actor_id.to_be_bytes());
@@ -236,11 +241,17 @@ pub fn write_ask_response_header(
 }
 
 pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER_LEN] {
-    init_header(WireKind::Gossip, checked_body_len(GOSSIP_HEADER_LEN, payload_len))
+    init_header(
+        WireKind::Gossip,
+        checked_body_len(GOSSIP_HEADER_LEN, payload_len),
+    )
 }
 
 pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER_LEN] {
-    init_header(WireKind::PubSub, checked_body_len(PUBSUB_HEADER_LEN, payload_len))
+    init_header(
+        WireKind::PubSub,
+        checked_body_len(PUBSUB_HEADER_LEN, payload_len),
+    )
 }
 
 pub fn write_direct_ask_header(
@@ -310,16 +321,16 @@ pub fn write_stream_data_header(
     } else {
         WireKind::StreamData
     };
-    let mut header = init_header(
-        kind,
-        checked_body_len(STREAM_DATA_HEADER_LEN, payload_len),
-    );
+    let mut header = init_header(kind, checked_body_len(STREAM_DATA_HEADER_LEN, payload_len));
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&chunk_index.to_be_bytes());
     header
 }
 
-pub fn write_stream_abort_header(stream_id: u32, reason: u32) -> [u8; STREAM_DATA_FRAME_HEADER_LEN] {
+pub fn write_stream_abort_header(
+    stream_id: u32,
+    reason: u32,
+) -> [u8; STREAM_DATA_FRAME_HEADER_LEN] {
     let mut header = init_header(WireKind::StreamAbort, STREAM_DATA_HEADER_LEN);
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&reason.to_be_bytes());
@@ -364,7 +375,10 @@ mod tests {
         ];
         for (expected_value, kind) in kinds.into_iter().enumerate() {
             let bytes = encode_control(kind, 17);
-            assert_eq!(u32::from_be_bytes(bytes) >> CONTROL_BODY_LEN_BITS, expected_value as u32);
+            assert_eq!(
+                u32::from_be_bytes(bytes) >> CONTROL_BODY_LEN_BITS,
+                expected_value as u32
+            );
             assert_eq!(decode_control(bytes), Some(Control { kind, body_len: 17 }));
         }
     }
@@ -391,8 +405,7 @@ mod tests {
             10 * 1024 * 1024,
             CONTROL_BODY_LEN_MASK as usize - ACTOR_TELL_HEADER_LEN,
         ] {
-            let header =
-                write_actor_tell_header(0x0102_0304_0506_0708, 0x1122_3344, payload_len);
+            let header = write_actor_tell_header(0x0102_0304_0506_0708, 0x1122_3344, payload_len);
             assert_eq!(header.len(), 16);
             assert_eq!(
                 u64::from_be_bytes(header[4..12].try_into().unwrap()),
@@ -443,31 +456,42 @@ mod tests {
     fn routed_ask_is_sixteen_bytes_and_route_bind_is_exact() {
         let ask = write_routed_actor_ask_header(7, 11, 99);
         assert_eq!(ask.len(), 16);
-        assert_eq!(decode_control(ask[..4].try_into().unwrap()).unwrap().kind, WireKind::RoutedActorAsk);
+        assert_eq!(
+            decode_control(ask[..4].try_into().unwrap()).unwrap().kind,
+            WireKind::RoutedActorAsk
+        );
         assert_eq!(u32::from_be_bytes(ask[4..8].try_into().unwrap()), 7);
         assert_eq!(u32::from_be_bytes(ask[8..12].try_into().unwrap()), 11);
         let bind = write_route_bind_header(11, 0x0102_0304_0506_0708, 0x1122_3344);
         assert_eq!(bind.len(), 24);
-        assert_eq!(decode_control(bind[..4].try_into().unwrap()).unwrap().kind, WireKind::RouteBind);
+        assert_eq!(
+            decode_control(bind[..4].try_into().unwrap()).unwrap().kind,
+            WireKind::RouteBind
+        );
         assert_eq!(u32::from_be_bytes(bind[4..8].try_into().unwrap()), 11);
     }
 
     #[test]
     fn oversize_body_panics() {
-        assert!(std::panic::catch_unwind(|| {
-            write_actor_tell_header(0, 0, CONTROL_BODY_LEN_MASK as usize)
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                write_actor_tell_header(0, 0, CONTROL_BODY_LEN_MASK as usize)
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn stream_abort_is_a_fixed_twelve_byte_frame() {
         let header = write_stream_abort_header(7, 9);
         assert_eq!(header.len(), STREAM_DATA_FRAME_HEADER_LEN);
-        assert_eq!(decode_control(header[..4].try_into().unwrap()), Some(Control {
-            kind: WireKind::StreamAbort,
-            body_len: STREAM_DATA_HEADER_LEN,
-        }));
+        assert_eq!(
+            decode_control(header[..4].try_into().unwrap()),
+            Some(Control {
+                kind: WireKind::StreamAbort,
+                body_len: STREAM_DATA_HEADER_LEN,
+            })
+        );
         assert_eq!(u32::from_be_bytes(header[4..8].try_into().unwrap()), 7);
         assert_eq!(u32::from_be_bytes(header[8..12].try_into().unwrap()), 9);
     }

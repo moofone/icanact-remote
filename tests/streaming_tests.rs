@@ -201,7 +201,10 @@ fn wire_v5_e2e_zero_copy_proof() {
         // Default handler echoes back with "PROCESSED:" prefix
         info!("Received response of {} bytes", response.len());
 
-        assert_eq!(response, payload, "the streamed response must preserve bytes");
+        assert_eq!(
+            response, payload,
+            "the streamed response must preserve bytes"
+        );
         assert!(handler.message_received.load(Ordering::SeqCst));
         assert_eq!(
             handler.payload_size.load(Ordering::SeqCst) as usize,
@@ -229,8 +232,7 @@ fn bench_ask_latency_and_throughput_under_large_stream() {
 
         let addr_a: SocketAddr = "127.0.0.1:7971".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:7972".parse().unwrap();
-        let (key_pair_a, key_pair_b) =
-            key_pair_ordered_for_outbound_a("r8_bench_a", "r8_bench_b");
+        let (key_pair_a, key_pair_b) = key_pair_ordered_for_outbound_a("r8_bench_a", "r8_bench_b");
         let peer_id_b = key_pair_b.peer_id();
         let config = GossipConfig {
             gossip_interval: Duration::from_secs(300),

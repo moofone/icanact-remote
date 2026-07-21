@@ -5,11 +5,20 @@
 //! inline threshold.  It complements the lower-level allocation provenance
 //! tests in `protocol.rs` and `read_pipeline.rs`.
 
-use std::{net::SocketAddr, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
-use icanact_remote::{AlignedBytes, BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair};
 use icanact_remote::registry::{ActorMessageFuture, ActorMessageHandler};
+use icanact_remote::{
+    AlignedBytes, BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair,
+};
 use tokio::time::sleep;
 
 struct Echo {
@@ -47,7 +56,11 @@ fn ordered_keys() -> (KeyPair, KeyPair) {
 }
 
 fn payload(size: usize) -> Bytes {
-    Bytes::from((0..size).map(|index| (index % 251) as u8).collect::<Vec<_>>())
+    Bytes::from(
+        (0..size)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -55,26 +68,56 @@ async fn wire_v5_e2e_zero_copy_proof() {
     let addr_a: SocketAddr = "127.0.0.1:7931".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:7932".parse().unwrap();
     let (key_a, key_b) = ordered_keys();
-    let config = GossipConfig { gossip_interval: Duration::from_secs(300), ..Default::default() };
+    let config = GossipConfig {
+        gossip_interval: Duration::from_secs(300),
+        ..Default::default()
+    };
     let a = GossipRegistryHandle::new_with_transport_stack(
-        addr_a, key_a.to_secret_key(), Some(config.clone()), BuilderTlsBootstrap,
-    ).await.unwrap();
+        addr_a,
+        key_a.to_secret_key(),
+        Some(config.clone()),
+        BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
     let b = GossipRegistryHandle::new_with_transport_stack(
-        addr_b, key_b.to_secret_key(), Some(config), BuilderTlsBootstrap,
-    ).await.unwrap();
-    let echo = Arc::new(Echo { tells: AtomicUsize::new(0), asks: AtomicUsize::new(0), last_len: AtomicUsize::new(0) });
+        addr_b,
+        key_b.to_secret_key(),
+        Some(config),
+        BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
+    let echo = Arc::new(Echo {
+        tells: AtomicUsize::new(0),
+        asks: AtomicUsize::new(0),
+        last_len: AtomicUsize::new(0),
+    });
     b.registry.set_actor_message_handler(echo.clone()).await;
 
-    a.add_peer(&key_b.peer_id()).await.connect(&addr_b).await.unwrap();
+    a.add_peer(&key_b.peer_id())
+        .await
+        .connect(&addr_b)
+        .await
+        .unwrap();
     sleep(Duration::from_millis(100)).await;
     let connection = a.lookup_address(addr_b).await.unwrap();
 
-    connection.tell_actor_frame(7, 9, Bytes::from_static(b"tell")).await.unwrap();
+    connection
+        .tell_actor_frame(7, 9, Bytes::from_static(b"tell"))
+        .await
+        .unwrap();
     sleep(Duration::from_millis(30)).await;
     assert_eq!(echo.tells.load(Ordering::SeqCst), 1);
 
     let ask = Bytes::from_static(b"ask");
-    assert_eq!(connection.ask_actor_frame(7, 9, ask.clone(), Duration::from_secs(5)).await.unwrap(), ask);
+    assert_eq!(
+        connection
+            .ask_actor_frame(7, 9, ask.clone(), Duration::from_secs(5))
+            .await
+            .unwrap(),
+        ask
+    );
 
     let non_small_ask = payload(256 * 1024);
     assert_eq!(
@@ -86,7 +129,13 @@ async fn wire_v5_e2e_zero_copy_proof() {
     );
 
     let stream = payload(2 * 1024 * 1024);
-    assert_eq!(connection.ask_streaming_bytes(stream.clone(), 9, 7, Duration::from_secs(30)).await.unwrap(), stream);
+    assert_eq!(
+        connection
+            .ask_streaming_bytes(stream.clone(), 9, 7, Duration::from_secs(30))
+            .await
+            .unwrap(),
+        stream
+    );
     assert_eq!(echo.asks.load(Ordering::SeqCst), 3);
     assert_eq!(echo.last_len.load(Ordering::SeqCst), 2 * 1024 * 1024);
 

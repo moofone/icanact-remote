@@ -195,6 +195,46 @@ pub struct AskResponder {
     used: Arc<AtomicBool>,
 }
 
+/// Exclusive fallback ownership after an immediate reply was rejected before
+/// it entered the writer. The original responder's shared single-reply claim
+/// remains held, so sibling responders cannot race the selected fallback.
+pub struct ImmediateReplyFallback {
+    responder: AskResponder,
+    error: GossipError,
+}
+
+impl ImmediateReplyFallback {
+    /// The immediate-enqueue error that selected this fallback path.
+    pub fn error(&self) -> &GossipError {
+        &self.error
+    }
+
+    /// Retry through the ordinary nonblocking response queue while retaining
+    /// exclusive ownership of the ask correlation.
+    pub fn try_reply_bytes(self, response: Bytes) -> Result<()> {
+        self.responder
+            .sink
+            .try_send_response_bytes(self.responder.correlation_id, response)
+    }
+
+    /// Retry through the reserved immediate queue while retaining exclusive
+    /// ownership of the ask correlation.
+    pub fn try_reply_bytes_immediate(self, response: Bytes) -> Result<()> {
+        self.responder
+            .sink
+            .try_send_response_bytes_immediate(self.responder.correlation_id, response)
+    }
+
+    /// Fall back to the asynchronous response path while retaining exclusive
+    /// ownership of the ask correlation.
+    pub async fn reply_bytes(self, response: Bytes) -> Result<()> {
+        self.responder
+            .sink
+            .send_response_bytes(self.responder.correlation_id, response)
+            .await
+    }
+}
+
 impl AskResponder {
     pub(crate) fn from_stream_handle(
         correlation_id: u32,
@@ -245,12 +285,39 @@ impl AskResponder {
     ///
     /// This is intended for small control-plane responses whose delivery must
     /// not be starved by ordinary gossip/control traffic. It still never
-    /// awaits or creates a detached task, and it retains the single-reply
-    /// guard shared by cloned responders.
+    /// awaits or creates a detached task. A rejected enqueue still consumes
+    /// the reply claim, preserving at-most-once ownership across sibling
+    /// responders. Use [`Self::try_reply_bytes_immediate_with_fallback`] when
+    /// the caller needs an exclusive retry or fallback path.
     pub fn try_reply_bytes_immediate(self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
         self.sink
             .try_send_response_bytes_immediate(self.correlation_id, response)
+    }
+
+    /// Try the reserved immediate queue and retain exclusive reply ownership
+    /// on rejection. The returned fallback can retry or select another reply
+    /// path without permitting a sibling responder to enqueue a duplicate.
+    pub fn try_reply_bytes_immediate_with_fallback(
+        self,
+        response: Bytes,
+    ) -> std::result::Result<(), ImmediateReplyFallback> {
+        if let Err(error) = claim_reply(&self.used) {
+            return Err(ImmediateReplyFallback {
+                responder: self,
+                error,
+            });
+        }
+        match self
+            .sink
+            .try_send_response_bytes_immediate(self.correlation_id, response)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(ImmediateReplyFallback {
+                responder: self,
+                error,
+            }),
+        }
     }
 
     pub async fn reply_typed<M>(self, value: &M) -> Result<()>
@@ -425,6 +492,43 @@ mod tests {
         assert!(
             is_duplicate(&clone_result),
             "a clone must not send a second reply: {clone_result:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_immediate_reply_retains_exclusive_fallback_ownership() {
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12347".parse().unwrap()));
+        let context = AskContext::from_writer(11, &writer, None);
+
+        let immediate = context.responder();
+        let sibling = context.responder();
+        let immediate_result = immediate.try_reply_bytes_immediate(Bytes::from_static(b"fast"));
+        assert!(
+            !is_duplicate(&immediate_result),
+            "the owner sees the underlying enqueue failure, not a duplicate"
+        );
+        assert!(
+            is_duplicate(&sibling.try_reply_bytes(Bytes::from_static(b"sibling"))),
+            "a rejected immediate enqueue must not release ownership to a sibling"
+        );
+
+        let retry_context = AskContext::from_writer(12, &writer, None);
+        let retry_sibling = retry_context.responder();
+        let fallback = match retry_context
+            .responder()
+            .try_reply_bytes_immediate_with_fallback(Bytes::from_static(b"fast"))
+        {
+            Ok(()) => panic!("unbound writer must reject immediate enqueue"),
+            Err(fallback) => fallback,
+        };
+        assert!(
+            is_duplicate(&retry_sibling.try_reply_bytes(Bytes::from_static(b"sibling"))),
+            "fallback ownership must remain exclusive to the original responder"
+        );
+        let retry_result = fallback.try_reply_bytes(Bytes::from_static(b"fallback"));
+        assert!(
+            !is_duplicate(&retry_result),
+            "the original owner may choose a nonblocking fallback path"
         );
     }
 }

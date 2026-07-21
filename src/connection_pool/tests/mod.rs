@@ -6927,7 +6927,7 @@ async fn connect_via_stream_rejects_self_after_cert_identity_discovery_on_addres
             false,
             None,
         )
-            .await;
+        .await;
     });
 
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
@@ -7134,12 +7134,7 @@ fn connection_pool_has_no_unwrapped_raw_async_write_calls() {
             // substring check (the char after `write` is `_`, not `(`), so
             // no separate exclusion is needed for them here.
             if !is_allowed(trimmed) {
-                violations.push(format!(
-                    "{}:{}: {}",
-                    path.display(),
-                    idx + 1,
-                    trimmed
-                ));
+                violations.push(format!("{}:{}: {}", path.display(), idx + 1, trimmed));
             }
         }
     }

@@ -3260,11 +3260,10 @@ where
     // once it has processed the first frame, and the IO task awaits `ready` and
     // inherits the state (a fresh state would split a multi-chunk StreamStart
     // that began as the first frame and tear the connection down on chunk 2).
-    let streaming_state_handoff =
-        Arc::new(crate::connection_pool::StreamingStateHandoff {
-            cell: std::sync::Mutex::new(None),
-            ready: tokio::sync::Notify::new(),
-        });
+    let streaming_state_handoff = Arc::new(crate::connection_pool::StreamingStateHandoff {
+        cell: std::sync::Mutex::new(None),
+        ready: tokio::sync::Notify::new(),
+    });
 
     // Register the TLS stream with the connection pool before handling the first message so responses work
     let (response_correlation, response_connection) = {
@@ -4049,8 +4048,15 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
             if body[16..20].iter().any(|byte| *byte != 0) {
                 return Err(invalid_v5_frame("noncanonical route bind padding"));
             }
-            let routes = routes.ok_or_else(|| invalid_v5_frame("route bind before connection setup"))?;
-            if !routes.bind(route_slot, crate::route_interning::RouteKey { actor_id, type_hash }) {
+            let routes =
+                routes.ok_or_else(|| invalid_v5_frame("route bind before connection setup"))?;
+            if !routes.bind(
+                route_slot,
+                crate::route_interning::RouteKey {
+                    actor_id,
+                    type_hash,
+                },
+            ) {
                 return Err(invalid_v5_frame("conflicting route bind"));
             }
             Ok(MessageReadResult::RouteBound)
@@ -4067,7 +4073,8 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
             if body[8..12].iter().any(|byte| *byte != 0) {
                 return Err(invalid_v5_frame("noncanonical routed ask padding"));
             }
-            let routes = routes.ok_or_else(|| invalid_v5_frame("routed ask before connection setup"))?;
+            let routes =
+                routes.ok_or_else(|| invalid_v5_frame("routed ask before connection setup"))?;
             let route = routes
                 .resolve(route_slot)
                 .ok_or_else(|| invalid_v5_frame("unknown route slot"))?;
@@ -4126,9 +4133,15 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
                 body_len - crate::framing::DIRECT_ASK_HEADER_LEN,
             )?;
             if control.kind == crate::framing::WireKind::DirectAsk {
-                Ok(MessageReadResult::DirectAsk { correlation_id, payload })
+                Ok(MessageReadResult::DirectAsk {
+                    correlation_id,
+                    payload,
+                })
             } else {
-                Ok(MessageReadResult::DirectResponse { correlation_id, payload })
+                Ok(MessageReadResult::DirectResponse {
+                    correlation_id,
+                    payload,
+                })
             }
         }
         crate::framing::WireKind::PubSub => {
@@ -4147,7 +4160,9 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
             if body.len() < crate::framing::GOSSIP_HEADER_LEN {
                 return Err(invalid_v5_frame("truncated gossip"));
             }
-            match decode_registry_message(&buffer.as_ref()[crate::framing::GOSSIP_FRAME_HEADER_LEN..]) {
+            match decode_registry_message(
+                &buffer.as_ref()[crate::framing::GOSSIP_FRAME_HEADER_LEN..],
+            ) {
                 Ok(message) => Ok(MessageReadResult::Gossip(message, None)),
                 Err(_) => Ok(raw(buffer)),
             }
@@ -4242,7 +4257,10 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
 }
 
 fn invalid_v5_frame(message: &str) -> GossipError {
-    GossipError::Network(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+    GossipError::Network(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
 }
 
 /// Read one complete V5 frame for the synchronous TLS connection path.
@@ -4282,7 +4300,10 @@ where
 
 #[cfg(test)]
 mod framing_tests {
-    use super::{MessageReadResult, parse_message_from_pooled_buffer_with_routes, read_message_from_tls_reader};
+    use super::{
+        MessageReadResult, parse_message_from_pooled_buffer_with_routes,
+        read_message_from_tls_reader,
+    };
     use crate::{MessageType, framing, registry::RegistryMessage};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
@@ -4547,7 +4568,13 @@ mod framing_tests {
     #[test]
     fn routed_actor_ask_requires_zero_padding() {
         let routes = crate::route_interning::RouteTable::new();
-        assert!(routes.bind(3, crate::route_interning::RouteKey { actor_id: 7, type_hash: 9 }));
+        assert!(routes.bind(
+            3,
+            crate::route_interning::RouteKey {
+                actor_id: 7,
+                type_hash: 9
+            }
+        ));
         let mut ask = framing::write_routed_actor_ask_header(5, 3, 0);
         ask[12] = 1;
         assert!(parse_with_routes(&ask, &routes).is_err());

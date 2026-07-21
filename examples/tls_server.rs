@@ -51,7 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_id = secret_key.public();
 
     println!("   GossipNodeId: {}", node_id.fmt_short());
-    println!("   Full GossipNodeId: {:?}", hex::encode(node_id.as_bytes()));
+    println!(
+        "   Full GossipNodeId: {:?}",
+        hex::encode(node_id.as_bytes())
+    );
     println!("   Key file: {}", key_path);
     println!("   Port: {}", port);
     println!();

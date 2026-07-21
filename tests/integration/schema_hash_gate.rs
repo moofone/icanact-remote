@@ -1,8 +1,8 @@
 use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::time::{sleep, timeout, Duration};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::time::{Duration, sleep, timeout};
 
 struct TestHandler {
     hits: Arc<AtomicUsize>,
@@ -48,12 +48,22 @@ async fn schema_hash_allows_matching_headers() {
         ..Default::default()
     };
 
-    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
-    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        addr_a,
+        key_a.to_secret_key(),
+        Some(config_a),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        addr_b,
+        key_b.to_secret_key(),
+        Some(config_b),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
 
     let hits = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -108,12 +118,22 @@ async fn schema_hash_rejects_mismatched_hello_before_a_session_is_published() {
         ..Default::default()
     };
 
-    let handle_a = GossipRegistryHandle::new_with_transport_stack(addr_a, key_a.to_secret_key(), Some(config_a), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
-    let handle_b = GossipRegistryHandle::new_with_transport_stack(addr_b, key_b.to_secret_key(), Some(config_b), icanact_remote::BuilderTlsBootstrap)
-        .await
-        .unwrap();
+    let handle_a = GossipRegistryHandle::new_with_transport_stack(
+        addr_a,
+        key_a.to_secret_key(),
+        Some(config_a),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
+    let handle_b = GossipRegistryHandle::new_with_transport_stack(
+        addr_b,
+        key_b.to_secret_key(),
+        Some(config_b),
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .unwrap();
 
     let hits = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(tokio::sync::Notify::new());

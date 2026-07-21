@@ -487,6 +487,10 @@ struct ReadPollResult {
     progressed: bool,
 }
 
+#[expect(
+    dead_code,
+    reason = "the direct ask fast-path shares these result variants with the IO owner and remains intentionally pre-wired"
+)]
 enum ReadIoResult {
     Generic(crate::handle::MessageReadResult),
     DirectAsk {
@@ -501,6 +505,10 @@ enum ReadIoResult {
     },
 }
 
+#[expect(
+    dead_code,
+    reason = "the direct ask fast-path result variants are retained for the zero-copy parser seam"
+)]
 enum FastReadOutcome {
     Handled,
     Parsed(ReadIoResult),

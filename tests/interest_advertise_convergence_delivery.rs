@@ -145,7 +145,7 @@ async fn remote_publisher_reaches_topic_that_churned_zero_to_one_under_registry_
     let pubsub_b = RoutedPubSub::install(Arc::clone(&b.registry)).await;
 
     let topic = topic_key("icanact/interest-convergence/delivery-under-churn");
-    let type_hash: u64 = 0x00D3_1_1_09;
+    let type_hash: u64 = 0x00D3_1109;
     let interest_name = interest_actor_name(topic, &b_peer_id);
 
     let received = Arc::new(AtomicUsize::new(0));

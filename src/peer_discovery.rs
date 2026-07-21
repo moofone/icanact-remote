@@ -924,7 +924,10 @@ mod tests {
         // ACTOR_REM_2 R3 sub-finding: 2001:db8::/32 documentation prefix.
         let local = public_addr(8080);
         let discovery = PeerDiscovery::with_defaults(local);
-        let doc = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 8080);
+        let doc = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            8080,
+        );
         assert!(!discovery.is_safe_to_dial(&doc));
     }
 

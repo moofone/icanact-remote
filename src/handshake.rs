@@ -371,10 +371,10 @@ mod tests {
             server.read_exact(&mut buf).await.unwrap();
 
             // Send an older-version Hello to trigger rejection.
-        let legacy_hello = Hello {
-            protocol_version: 0,
-            features: vec![],
-            schema_hash: None,
+            let legacy_hello = Hello {
+                protocol_version: 0,
+                features: vec![],
+                schema_hash: None,
             };
             let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy_hello).unwrap();
             server
@@ -417,7 +417,10 @@ mod tests {
                 schema_hash: Some(2),
             };
             let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&remote).unwrap();
-            server.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+            server
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
             server.write_all(&bytes).await.unwrap();
         });
 

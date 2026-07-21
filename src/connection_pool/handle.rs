@@ -149,38 +149,6 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
-    async fn write_header_and_payload_control_inline32(
-        &self,
-        header: [u8; 32],
-        payload: bytes::Bytes,
-    ) -> Result<()> {
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle
-                .write_header_and_payload_control_inline32(header, payload)
-                .await
-        } else {
-            Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("connection {} has no writer path", self.addr),
-            )))
-        }
-    }
-
-    fn write_header_and_payload_control_inline32_nonblocking(
-        &self,
-        header: [u8; 32],
-        payload: bytes::Bytes,
-    ) -> Result<()> {
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle.write_header_and_payload_control_inline32_nonblocking(header, payload)
-        } else {
-            Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("connection {} has no writer path", self.addr),
-            )))
-        }
-    }
-
     async fn write_header_and_payload_ask_inline(
         &self,
         header: [u8; 16],
@@ -190,23 +158,6 @@ impl<T> ConnectionHandle<T> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle
                 .write_header_and_payload_ask_inline(header, header_len, payload)
-                .await
-        } else {
-            Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("connection {} has no writer path", self.addr),
-            )))
-        }
-    }
-
-    async fn write_header_and_payload_ask_inline32(
-        &self,
-        header: [u8; 32],
-        payload: bytes::Bytes,
-    ) -> Result<()> {
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle
-                .write_header_and_payload_ask_inline32(header, payload)
                 .await
         } else {
             Err(GossipError::Network(std::io::Error::new(
@@ -236,14 +187,6 @@ impl<T> ConnectionHandle<T> {
                 std::io::ErrorKind::NotConnected,
                 format!("connection {} has no writer path", self.addr),
             )))
-        }
-    }
-
-    fn schema_hash(&self) -> Option<u64> {
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle.schema_hash()
-        } else {
-            self.schema_hash
         }
     }
 

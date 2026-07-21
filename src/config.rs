@@ -365,7 +365,7 @@ impl Default for GossipConfig {
             max_pooled_connections: 20, // Allow up to 20 pooled connections
             vector_clock_gc_frequency: Duration::from_secs(300), // 5 minutes
             vector_clock_retention_period: Duration::from_secs(7200), // 2 hours (was 1 hour)
-            max_vector_clock_size: 1000,                         // Compact after 1000 entries
+            max_vector_clock_size: 1000, // Compact after 1000 entries
             small_cluster_threshold: DEFAULT_SMALL_CLUSTER_THRESHOLD,
             immediate_propagation_enabled: true,
             urgent_gossip_fanout: 5,
@@ -510,7 +510,6 @@ within one supervisor tick (avoids the Dead-verdict reconnect stall)"
             );
             self.preferred_inbound_wait = wait_cap;
         }
-
     }
 }
 

@@ -31,6 +31,10 @@ pub struct LockFreeStreamHandle {
     route_bind_gate: Arc<tokio::sync::Mutex<()>>,
     /// Lock-free write queue for payload writes
     write_queue: Arc<WriteQueue>,
+    /// Reserved lock-free queue for latency-critical control replies. This is
+    /// intentionally independent from `write_queue`: ordinary traffic must
+    /// not consume the admission capacity needed for a control-plane reply.
+    immediate_write_queue: Arc<WriteQueue>,
     /// Bounded streaming command queue for background task.
     streaming_queue: Arc<StreamingQueue>,
     /// Buffer configuration that determines sizes and thresholds
@@ -112,8 +116,10 @@ impl LockFreeStreamHandle {
         // Create shared counter for actual TCP bytes written
         let bytes_written = Arc::new(AtomicUsize::new(0));
 
-        // Create lock-free queue for payload writes and channel for streaming commands
+        // Keep immediate control replies in a separate bounded queue. Normal
+        // traffic can saturate its own queue without rejecting a critical reply.
         let write_queue = WriteQueue::new(buffer_config.write_queue_capacity(), addr);
+        let immediate_write_queue = WriteQueue::new(128, addr);
         let streaming_queue = StreamingQueue::new(buffer_config.write_queue_capacity(), addr);
 
         let max_message_size = read_context
@@ -131,6 +137,7 @@ impl LockFreeStreamHandle {
             let writer_addr = addr;
             let writer_channel_id = channel_id;
             let write_queue = write_queue.clone();
+            let immediate_write_queue = immediate_write_queue.clone();
             let streaming_queue = streaming_queue.clone();
 
             tokio::spawn(async move {
@@ -146,6 +153,7 @@ impl LockFreeStreamHandle {
                     flush_pending_for_task,
                     streaming_active_for_task,
                     write_queue,
+                    immediate_write_queue,
                     streaming_queue,
                     read_context,
                     instance_id,
@@ -179,6 +187,7 @@ impl LockFreeStreamHandle {
                 outbound_routes,
                 route_bind_gate,
                 write_queue,
+                immediate_write_queue,
                 streaming_queue,
                 buffer_config,
                 max_message_size,
@@ -199,6 +208,7 @@ impl LockFreeStreamHandle {
         flush_pending: Arc<AtomicBool>,
         streaming_active: Arc<AtomicBool>,
         write_queue: Arc<WriteQueue>,
+        immediate_write_queue: Arc<WriteQueue>,
         streaming_queue: Arc<StreamingQueue>,
         read_context: Option<ReadContext>,
         instance_id: u64,
@@ -352,6 +362,7 @@ impl LockFreeStreamHandle {
             // `push()` on a full queue, otherwise it hangs forever (the queue's
             // space notifier is only fired by `pop()`, which has stopped).
             write_queue: Arc<WriteQueue>,
+            immediate_write_queue: Arc<WriteQueue>,
             streaming_queue: Arc<StreamingQueue>,
             response_correlation: Option<Arc<CorrelationTracker>>,
             registry_weak: Option<std::sync::Weak<GossipRegistry>>,
@@ -367,6 +378,7 @@ impl LockFreeStreamHandle {
                 // Wake parked `push()` callers so they observe `closed` and
                 // return `ConnectionClosed` rather than hanging on a full queue.
                 self.write_queue.mark_closed_and_wake();
+                self.immediate_write_queue.mark_closed_and_wake();
                 self.streaming_queue.mark_closed_and_wake();
                 let mut should_cancel_pending = true;
                 if let (Some(registry_weak), Some(peer_addr)) =
@@ -505,6 +517,7 @@ impl LockFreeStreamHandle {
             flag: exit_flag,
             notify: exit_notify,
             write_queue: write_queue.clone(),
+            immediate_write_queue: immediate_write_queue.clone(),
             streaming_queue: streaming_queue.clone(),
             response_correlation: read_context
                 .as_ref()
@@ -546,6 +559,10 @@ impl LockFreeStreamHandle {
         // stream throughput stays dominant.
         const STREAM_INTERLEAVE_BYTES: usize = 256 * 1024;
         const STREAM_ACTIVE_WRITE_BATCH: usize = 16;
+        // Drain a bounded priority burst before regular traffic. Admission is
+        // reserved by `immediate_write_queue`; this budget preserves regular
+        // traffic progress if control replies arrive continuously.
+        const IMMEDIATE_WRITE_BATCH: usize = 8;
 
         let mut bytes_since_flush = 0;
 
@@ -559,6 +576,7 @@ impl LockFreeStreamHandle {
         let mut response_batch = ResponseBatch::new(READ_BATCH_LIMIT);
         let mut direct_response_batch = DirectResponseBatch::new(READ_BATCH_LIMIT);
         let mut pending_cmd: Option<WriteCommand> = None;
+        let mut pending_immediate_cmd: Option<WriteCommand> = None;
         let mut pending_stream_cmd: Option<StreamingCommand> = None;
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
         let mut streaming_state = match read_context
@@ -777,7 +795,7 @@ impl LockFreeStreamHandle {
             // when the queue is empty (the common case mid-stream) this is a
             // cheap no-op.
             {
-                let write_batch_limit = if streaming_active.load(Ordering::Acquire) {
+                let normal_batch_limit = if streaming_active.load(Ordering::Acquire) {
                     STREAM_ACTIVE_WRITE_BATCH
                 } else {
                     OWNER_BATCH_SIZE
@@ -788,11 +806,26 @@ impl LockFreeStreamHandle {
                 inline32_headers.clear();
                 inline32_payloads.clear();
 
+                // A priority command that raced the idle select still leads
+                // the next batch. Drain only a bounded burst so the normal
+                // queue cannot be starved by a sustained control flood.
+                if let Some(cmd) = pending_immediate_cmd.take() {
+                    owner_batch.push(cmd);
+                }
+
+                while owner_batch.len() < IMMEDIATE_WRITE_BATCH {
+                    match immediate_write_queue.pop() {
+                        Some(command) => owner_batch.push(command),
+                        None => break,
+                    }
+                }
+
                 if let Some(cmd) = pending_cmd.take() {
                     owner_batch.push(cmd);
                 }
 
-                while owner_batch.len() < write_batch_limit {
+                let regular_batch_end = owner_batch.len() + normal_batch_limit;
+                while owner_batch.len() < regular_batch_end {
                     match write_queue.pop() {
                         Some(command) => owner_batch.push(command),
                         None => break,
@@ -802,10 +835,14 @@ impl LockFreeStreamHandle {
                 if !owner_batch.is_empty() {
                     did_work = true;
                     for command in owner_batch.drain(..) {
-                        write_queue.notify_space();
                         let is_ask_payload = matches!(&command, WriteCommand::AskPayload(_));
                         let is_immediate_payload =
                             matches!(&command, WriteCommand::ImmediatePayload(_));
+                        if is_immediate_payload {
+                            immediate_write_queue.notify_space();
+                        } else {
+                            write_queue.notify_space();
+                        }
                         let payload = match command {
                             WriteCommand::Payload(payload)
                             | WriteCommand::ImmediatePayload(payload) => payload,
@@ -1677,6 +1714,10 @@ impl LockFreeStreamHandle {
                     // re-check for a command that raced the last drain. A push
                     // landing after the clear stores a wakeup permit, so the
                     // select below cannot park forever with frames queued.
+                    if let Some(cmd) = immediate_write_queue.prepare_park() {
+                        pending_immediate_cmd = Some(cmd);
+                        continue;
+                    }
                     if let Some(cmd) = write_queue.prepare_park() {
                         pending_cmd = Some(cmd);
                         continue;
@@ -1904,8 +1945,14 @@ impl LockFreeStreamHandle {
                         // Wake on new outbound writes even if the socket is currently idle for reads.
                         // Without this, a mostly-write workload (e.g., initial gossip propagation)
                         // can stall until an unrelated read event occurs.
+                        _ = immediate_write_queue.data_notify.notified() => {
+                            pending_immediate_cmd = immediate_write_queue.pop();
+                        }
                         _ = write_queue.data_notify.notified() => {
                             pending_cmd = write_queue.pop();
+                        }
+                        _ = immediate_write_queue.space_notify.notified() => {
+                            // Producer wakeup only; no action needed.
                         }
                         _ = write_queue.space_notify.notified() => {
                             // Producer wakeup only; no action needed.
@@ -1916,6 +1963,10 @@ impl LockFreeStreamHandle {
                     }
                 } else {
                     // Pre-park drain; see the read-armed variant above.
+                    if let Some(cmd) = immediate_write_queue.prepare_park() {
+                        pending_immediate_cmd = Some(cmd);
+                        continue;
+                    }
                     if let Some(cmd) = write_queue.prepare_park() {
                         pending_cmd = Some(cmd);
                         continue;
@@ -1928,8 +1979,14 @@ impl LockFreeStreamHandle {
                         _ = streaming_queue.data_notify.notified() => {
                             // Wake on streaming commands; drained at the top of the loop.
                         }
+                        _ = immediate_write_queue.data_notify.notified() => {
+                            pending_immediate_cmd = immediate_write_queue.pop();
+                        }
                         _ = write_queue.data_notify.notified() => {
                             pending_cmd = write_queue.pop();
+                        }
+                        _ = immediate_write_queue.space_notify.notified() => {
+                            // Producer wakeup only; no action needed.
                         }
                         _ = write_queue.space_notify.notified() => {
                             // Producer wakeup only; no action needed.
@@ -2037,11 +2094,11 @@ impl LockFreeStreamHandle {
         }
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         match self
-            .write_queue
+            .immediate_write_queue
             .try_push(WriteCommand::ImmediatePayload(payload))
         {
             Ok(()) => {
-                self.write_queue.notify_data();
+                self.immediate_write_queue.notify_data();
                 Ok(())
             }
             Err(_) => Err(GossipError::WriteQueueFull),
@@ -3107,17 +3164,12 @@ mod route_interning_tests {
         // there is space; a zero-duration timeout turns the parked (129th) push
         // into a clean "queue is full" signal — no sleep-based synchronization.
         let pad = bytes::Bytes::from_static(b"padpadpadpad");
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(0),
-                writer.write_bytes_control(pad.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                _ => break, // push parked -> queue is full
-            }
-        }
+        while let Ok(Ok(())) = tokio::time::timeout(
+            std::time::Duration::from_millis(0),
+            writer.write_bytes_control(pad.clone()),
+        )
+        .await
+        {}
 
         // A routed ask for a fresh route: slot_for marks it bound, then the
         // RouteBind enqueue parks on the full queue and is cancelled at once.

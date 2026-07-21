@@ -1,6 +1,5 @@
 use crate::{
-    GossipNodeId, RegistrationPriority, VectorClock, current_timestamp,
-    current_timestamp_nanos,
+    GossipNodeId, RegistrationPriority, VectorClock, current_timestamp, current_timestamp_nanos,
 };
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::net::SocketAddr;
@@ -11,7 +10,7 @@ use std::net::SocketAddr;
 pub struct RemoteActorLocation {
     pub address: String,                // Use String for rkyv serialization
     pub peer_id: crate::PeerId,         // Which peer is hosting this actor
-    pub node_id: GossipNodeId,                // Node ID for vector clock operations
+    pub node_id: GossipNodeId,          // Node ID for vector clock operations
     pub vector_clock: VectorClock,      // Vector clock for causal ordering
     pub wall_clock_time: u64,           // Still needed for TTL calculations
     pub priority: RegistrationPriority, // Registration priority for propagation
