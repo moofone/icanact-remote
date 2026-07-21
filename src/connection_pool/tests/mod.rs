@@ -1140,15 +1140,22 @@ async fn test_connection_pool_new() {
     assert_eq!(pool.connection_timeout, Duration::from_secs(5));
 }
 
-/// R-15: `OutboundDialGate::wait()` built a `Notified` but never registered it
-/// before re-checking the state. `Notified` only registers on first poll and
-/// `finish()` uses `notify_waiters()`, which stores no permit for unregistered
-/// waiters — so a `finish()` landing between the state load and the first poll
-/// was lost forever. The follower branch of `get_connection*` has no timeout,
-/// so that lost wakeup hangs the dial permanently.
+/// R-15: pins that a `finish()` landing between `wait()`'s state load and its
+/// await still wakes the waiter.
 ///
-/// The race hook fires at exactly that point, making the interleaving
-/// deterministic rather than probabilistic.
+/// The original finding claimed this was a live lost-wakeup bug. It was not —
+/// `Notified` captures `Notify`'s `notify_waiters_calls` generation counter at
+/// *construction*, and `finish()` bumps it via `notify_waiters()`, so the
+/// pre-existing construct-before-load ordering already covered this window.
+/// But that made correctness depend on an undocumented statement order, and
+/// getting it wrong hangs the dial forever (the follower branch of
+/// `get_connection*` has no timeout). `wait()` now registers the waiter with
+/// `enable()` up front so the ordering no longer matters.
+///
+/// The race hook fires at exactly the vulnerable point, making the
+/// interleaving deterministic rather than probabilistic. Verified to
+/// discriminate: moving the construction+enable below the state load makes
+/// this test fail in 1s.
 #[tokio::test]
 async fn qa_r15_finish_between_check_and_await_wakes_waiter() {
     let gate = Arc::new(OutboundDialGate::new());
