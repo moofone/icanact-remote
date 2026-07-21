@@ -299,23 +299,27 @@ impl OutboundDialGate {
 
     async fn wait(&self) {
         loop {
-            // ORDER IS LOAD-BEARING (R-15): `notified()` must be constructed
-            // BEFORE the state load below. `Notified` captures `Notify`'s
-            // `notify_waiters_calls` generation counter at *construction* time,
-            // not at first-poll registration time. `finish()` broadcasts with
-            // `notify_waiters()`, which bumps that counter, so a `finish()`
-            // landing in the load -> await window is still observed by the
-            // first poll (tokio notify.rs `State::Init`) and `wait()` returns.
+            // R-15. The QA finding claimed a permanent lost wakeup here. That
+            // specific claim was WRONG: `Notified` captures `Notify`'s
+            // `notify_waiters_calls` generation counter at *construction* time
+            // (tokio notify.rs `notified()`), and `finish()` broadcasts with
+            // `notify_waiters()`, which bumps that counter — so constructing
+            // `notified` before the state load was already sufficient to
+            // observe a `finish()` landing in the load -> await window.
             //
-            // Moving this line below the load would reintroduce a permanent
-            // lost wakeup: the follower branch of `get_connection*` has no
-            // timeout, so the dial would hang forever. Pinned by
-            // `qa_r15_finish_between_check_and_await_wakes_waiter`.
+            // But that correctness depended entirely on an undocumented
+            // statement ordering: move the construction below the load and the
+            // wakeup IS lost permanently, and the follower branch of
+            // `get_connection*` has no timeout, so the dial hangs forever.
             //
-            // NOTE: this is why no `enable()`-before-recheck is needed here,
-            // unlike the write queues in `constants.rs` — those wake with
-            // permit-based `notify_one()`, which has no generation counter.
-            let notified = self.notify.notified();
+            // `enable()` registers the waiter up front, which makes the wakeup
+            // safe regardless of where the state load sits — the same
+            // enable()-before-recheck discipline the write queues use in
+            // `constants.rs`. Those queues genuinely need it, because they wake
+            // with permit-based `notify_one()`, which has no generation
+            // counter to fall back on.
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
             if self.state.load(Ordering::Acquire) != OUTBOUND_DIAL_PENDING {
                 return;
             }
