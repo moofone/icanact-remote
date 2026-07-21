@@ -1140,6 +1140,32 @@ async fn test_connection_pool_new() {
     assert_eq!(pool.connection_timeout, Duration::from_secs(5));
 }
 
+/// R-15: `OutboundDialGate::wait()` built a `Notified` but never registered it
+/// before re-checking the state. `Notified` only registers on first poll and
+/// `finish()` uses `notify_waiters()`, which stores no permit for unregistered
+/// waiters — so a `finish()` landing between the state load and the first poll
+/// was lost forever. The follower branch of `get_connection*` has no timeout,
+/// so that lost wakeup hangs the dial permanently.
+///
+/// The race hook fires at exactly that point, making the interleaving
+/// deterministic rather than probabilistic.
+#[tokio::test]
+async fn qa_r15_finish_between_check_and_await_wakes_waiter() {
+    let gate = Arc::new(OutboundDialGate::new());
+
+    // Weak, so the hook does not keep the gate alive through a reference cycle.
+    let hook_gate = Arc::downgrade(&gate);
+    gate.set_race_hook(move || {
+        if let Some(gate) = hook_gate.upgrade() {
+            gate.finish(true);
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), gate.wait())
+        .await
+        .expect("R-15: finish() landing in the notified() registration gap must still wake wait()");
+}
+
 #[tokio::test]
 async fn test_outbound_dial_gate_is_released_when_leader_is_cancelled() {
     let pool = ConnectionPool::<()>::new(10, Duration::from_secs(5));

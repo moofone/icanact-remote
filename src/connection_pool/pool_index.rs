@@ -248,6 +248,12 @@ const OUTBOUND_DIAL_FAILED: u8 = 2;
 struct OutboundDialGate {
     state: AtomicU8,
     notify: Notify,
+    /// R-15 test hook. Fired inside [`OutboundDialGate::wait`] at the exact
+    /// vulnerable point — after the state observation, before the await — so a
+    /// test can drive `finish()` into the `Notified` registration gap
+    /// deterministically instead of racing for it.
+    #[cfg(test)]
+    race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl OutboundDialGate {
@@ -255,6 +261,27 @@ impl OutboundDialGate {
         Self {
             state: AtomicU8::new(OUTBOUND_DIAL_PENDING),
             notify: Notify::new(),
+            #[cfg(test)]
+            race_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.race_hook.lock().expect("race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    /// Fires the R-15 hook at most once, without holding the lock across the
+    /// callback (the callback re-enters `finish()` on this same gate).
+    #[cfg(test)]
+    fn fire_race_hook(&self) {
+        let hook = self
+            .race_hook
+            .lock()
+            .expect("race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -272,10 +299,28 @@ impl OutboundDialGate {
 
     async fn wait(&self) {
         loop {
+            // ORDER IS LOAD-BEARING (R-15): `notified()` must be constructed
+            // BEFORE the state load below. `Notified` captures `Notify`'s
+            // `notify_waiters_calls` generation counter at *construction* time,
+            // not at first-poll registration time. `finish()` broadcasts with
+            // `notify_waiters()`, which bumps that counter, so a `finish()`
+            // landing in the load -> await window is still observed by the
+            // first poll (tokio notify.rs `State::Init`) and `wait()` returns.
+            //
+            // Moving this line below the load would reintroduce a permanent
+            // lost wakeup: the follower branch of `get_connection*` has no
+            // timeout, so the dial would hang forever. Pinned by
+            // `qa_r15_finish_between_check_and_await_wakes_waiter`.
+            //
+            // NOTE: this is why no `enable()`-before-recheck is needed here,
+            // unlike the write queues in `constants.rs` — those wake with
+            // permit-based `notify_one()`, which has no generation counter.
             let notified = self.notify.notified();
             if self.state.load(Ordering::Acquire) != OUTBOUND_DIAL_PENDING {
                 return;
             }
+            #[cfg(test)]
+            self.fire_race_hook();
             notified.await;
         }
     }
