@@ -506,6 +506,24 @@ impl<T> ConnectionPool<T> {
                             .associate_peer_capabilities_with_node(addr, node_id)
                             .await;
                         registry_arc.mark_peer_connected(addr).await;
+                        // R-11: arm the one-shot lower-sequence exemption for
+                        // OUTBOUND sessions too, not just inbound. When we
+                        // redial a peer that has restarted, its
+                        // FullSyncResponse carries a lower sequence; without
+                        // arming here the stale gate rejects every one of them
+                        // and the omission-prune never runs, so its stale
+                        // actors persist until the 24h TTL — the same outage
+                        // this fix exists to close, just on the dialling side.
+                        //
+                        // `node_id` here is extracted from the peer's TLS
+                        // certificate, so it is authenticated. The session
+                        // source is the dial target: for an outbound
+                        // connection that is the connection's remote address,
+                        // which is what the receive path reports as
+                        // `verified_sender_addr`.
+                        registry_arc
+                            .arm_sequence_reset_for_new_session(addr, node_id, addr)
+                            .await;
                     }
 
                     let finalize_started = Instant::now();
