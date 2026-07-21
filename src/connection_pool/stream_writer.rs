@@ -2544,9 +2544,17 @@ impl LockFreeStreamHandle {
         let chunk_size = self.max_stream_chunk_size()?;
         let _guard = self.acquire_streaming_mode().await?;
         let stream_id = self.allocate_stream_id()?;
+        // R-9: reject locally at MAX_STREAM_SIZE — receivers hard-reject a larger
+        // stream as a FATAL error, so sending it would tear the connection down.
+        if payload.len() > crate::MAX_STREAM_SIZE {
+            return Err(GossipError::MessageTooLarge {
+                size: payload.len(),
+                max: crate::MAX_STREAM_SIZE,
+            });
+        }
         let total_size = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
             size: payload.len(),
-            max: u32::MAX as usize,
+            max: crate::MAX_STREAM_SIZE,
         })?;
         let first_len = payload.len().min(chunk_size);
         self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
@@ -2614,15 +2622,23 @@ impl LockFreeStreamHandle {
         correlation_id: u32,
     ) -> Result<()> {
         if payload.is_empty() {
-            return self.send_response_auto(payload, correlation_id).await;
+            return self.write_response_inline(payload, correlation_id).await;
         }
         let chunk_size = self.max_stream_chunk_size()?;
         let _guard = self.acquire_streaming_mode().await?;
         let stream_id = self.allocate_stream_id()?;
+        // R-9: reject locally at MAX_STREAM_SIZE — receivers hard-reject a larger
+        // stream as a FATAL error, so sending it would tear the connection down.
+        if payload.len() > crate::MAX_STREAM_SIZE {
+            return Err(GossipError::MessageTooLarge {
+                size: payload.len(),
+                max: crate::MAX_STREAM_SIZE,
+            });
+        }
         let total_size = u32::try_from(payload.len()).map_err(|_| {
             GossipError::MessageTooLarge {
                 size: payload.len(),
-                max: u32::MAX as usize,
+                max: crate::MAX_STREAM_SIZE,
             }
         })?;
         let first_len = payload.len().min(chunk_size);
@@ -2667,7 +2683,11 @@ impl LockFreeStreamHandle {
     }
 
     /// Send a response using the inline write queue (never streaming).
-    pub async fn send_response_auto(
+    /// Write a response as a single inline Response frame (the <= streaming
+    /// threshold path). Shared by `send_response_auto(_bytes)` and the empty
+    /// branch of `stream_response_bytes` so the auto-stream decision does not
+    /// recurse between them (R-9).
+    async fn write_response_inline(
         &self,
         payload: bytes::Bytes,
         correlation_id: u32,
@@ -2679,6 +2699,22 @@ impl LockFreeStreamHandle {
         );
         self.write_header_and_payload_control_inline(header, 16, payload)
             .await
+    }
+
+    pub async fn send_response_auto(
+        &self,
+        payload: bytes::Bytes,
+        correlation_id: u32,
+    ) -> Result<()> {
+        // R-9: route large deferred replies through streaming, mirroring the
+        // immediate-response path. A single inline Response frame above the
+        // peer's max_message_size is rejected as MessageTooLarge (teardown),
+        // and at >= 2^27 bytes the frame header length check would panic the
+        // responding task.
+        if payload.len() > self.streaming_threshold() {
+            return self.stream_response_bytes(payload, correlation_id).await;
+        }
+        self.write_response_inline(payload, correlation_id).await
     }
 
     /// Send a response with owned Bytes using the inline write queue (never streaming).
@@ -2694,13 +2730,12 @@ impl LockFreeStreamHandle {
         correlation_id: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
-        let header = framing::write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            payload.len(),
-        );
-        self.write_header_and_payload_control_inline(header, 16, payload)
-            .await
+        // R-9: route large deferred replies through streaming, mirroring the
+        // immediate-response path (see `send_response_auto`).
+        if payload.len() > self.streaming_threshold() {
+            return self.stream_response_bytes(payload, correlation_id).await;
+        }
+        self.write_response_inline(payload, correlation_id).await
     }
 
     /// Cold-path cancellation for a partially queued V5 stream.
@@ -3063,5 +3098,67 @@ mod route_interning_tests {
             u32::MAX,
             "counter must rest on the sentinel, not wrap to 1"
         );
+    }
+
+    /// R-9: a streaming payload larger than MAX_STREAM_SIZE must fail locally
+    /// (MessageTooLarge) before any frame is emitted -- every receiver hard-
+    /// rejects such a stream as a FATAL error, so sending it would tear the
+    /// connection down with collateral loss.
+    #[tokio::test]
+    async fn qa_r9_oversized_stream_fails_locally() {
+        let (client, _peer) = tokio::io::duplex(64);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9907".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let oversized = bytes::BytesMut::zeroed(crate::MAX_STREAM_SIZE + 1).freeze();
+        let err = writer
+            .stream_large_message_bytes(oversized, 1, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// R-9: a deferred reply above the streaming threshold is streamed (a
+    /// StreamResponseStart frame), not written as one inline Response frame
+    /// (which the peer would reject as MessageTooLarge, and which would panic
+    /// the frame header length check at >= 2^27 bytes).
+    #[tokio::test]
+    async fn qa_r9_large_deferred_reply_streams_not_inlines() {
+        let (client, peer) = tokio::io::duplex(8 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9908".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        // Above the default ~1MB streaming threshold.
+        let payload = bytes::BytesMut::zeroed(2 * 1024 * 1024).freeze();
+        writer.send_response_auto_bytes(42, payload).await.unwrap();
+        // The first frame on the wire must be a StreamResponseStart, not an
+        // inline Response.
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        let mut peer = peer;
+        peer.read_exact(&mut ctrl).await.unwrap();
+        let kind = crate::framing::decode_control(ctrl).unwrap().kind;
+        assert_eq!(
+            kind,
+            crate::framing::WireKind::StreamResponseStart,
+            "large deferred reply must stream (R-9)"
+        );
+        writer.shutdown();
+        drop(peer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 }
