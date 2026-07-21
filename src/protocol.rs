@@ -269,9 +269,11 @@ impl StreamingState {
         is_response: bool,
         first_chunk_len: usize,
     ) -> Result<Option<StreamChunkReservation>> {
-        if self.rejected_streams.contains_key(&header.stream_id) {
-            return Ok(None);
-        }
+        // TCP preserves frame order: every trailing frame for the rejected
+        // generation arrives before a later StreamStart. A new start is
+        // therefore an unambiguous generation boundary, not a reason to
+        // suppress a legitimate retry until the tombstone expires.
+        self.rejected_streams.remove(&header.stream_id);
         match self.begin_v5_stream(header, correlation_id, pool, is_response, first_chunk_len) {
             Ok(reservation) => Ok(Some(reservation)),
             Err(error) if is_resource_busy(&error) => {
@@ -1894,6 +1896,28 @@ mod tests {
             .expect("trailing chunk is discarded")
             .is_none());
         assert_eq!(state.active_stream_count(), 16);
+
+        // Once pressure clears, a later StreamStart is a new generation on
+        // the ordered transport and must not be silently discarded because
+        // its old generation was tombstoned.
+        assert!(state.abort_stream(1));
+        assert!(state
+            .begin_v5_stream_or_discard(
+                crate::StreamHeader {
+                    stream_id: 17,
+                    total_size: 1,
+                    chunk_size: 1,
+                    chunk_index: 0,
+                    type_hash: 0,
+                    actor_id: 0,
+                },
+                0,
+                Arc::new(crate::AlignedBytesPool::new(1)),
+                false,
+                1,
+            )
+            .expect("a retry start is valid after pressure clears")
+            .is_some());
     }
 
     #[test]
