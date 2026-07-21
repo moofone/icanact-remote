@@ -2682,7 +2682,8 @@ impl LockFreeStreamHandle {
         Ok(())
     }
 
-    /// Send a response using the inline write queue (never streaming).
+    /// Send a response, streaming it when it exceeds the streaming threshold
+    /// (R-9) and otherwise using the inline write queue.
     /// Write a response as a single inline Response frame (the <= streaming
     /// threshold path). Shared by `send_response_auto(_bytes)` and the empty
     /// branch of `stream_response_bytes` so the auto-stream decision does not
@@ -2717,7 +2718,8 @@ impl LockFreeStreamHandle {
         self.write_response_inline(payload, correlation_id).await
     }
 
-    /// Send a response with owned Bytes using the inline write queue (never streaming).
+    /// Send a response with owned Bytes, streaming it when it exceeds the
+    /// streaming threshold (R-9) and otherwise using the inline write queue.
     ///
     /// # Arguments
     /// * `correlation_id` - The correlation ID from the original request
