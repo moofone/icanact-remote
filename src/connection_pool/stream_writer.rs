@@ -568,11 +568,23 @@ impl LockFreeStreamHandle {
             // R-6: inherit the accept path's first-frame StreamingState so a
             // multi-chunk StreamStart that began as the connection's first
             // frame is continued here, not rejected as "unknown stream_id"
-            // against a fresh state. Await the accept path's handoff (it
-            // notifies once it has processed the first frame), then take the
-            // populated state.
+            // against a fresh state. Race the handoff against a shutdown check
+            // so a cancelled/errored accept path (or connection shutdown during
+            // the wait) cannot hang the IO task forever; the accept path
+            // notifies on success AND on its error path, and this loop is the
+            // defensive backstop. On shutdown/no-handoff fall back to a fresh
+            // state and let the main loop's shutdown check / read error exit.
             Some(handoff) => {
-                handoff.ready.notified().await;
+                loop {
+                    tokio::select! {
+                        _ = handoff.ready.notified() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                            if shutdown_signal.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Some(
                     handoff
                         .cell

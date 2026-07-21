@@ -3666,6 +3666,10 @@ where
     .await
     {
         warn!(error = %e, "Failed to process initial TLS message - connection will be closed");
+        // R-6: release the IO task from the handoff wait even on this error
+        // path (no first-frame state to hand; it falls back to a fresh state
+        // and exits via the connection close).
+        streaming_state_handoff.ready.notify_one();
         return ConnectionCloseOutcome::Normal { node_id: None };
     }
 
