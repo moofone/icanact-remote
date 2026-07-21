@@ -79,6 +79,11 @@ impl CorrelationTracker {
             // READY and leave the response for the genuine owner.
             if slot_ref.id.load(Ordering::Relaxed) != correlation_id {
                 slot_ref.state.store(SLOT_READY, Ordering::Release);
+                // R-10 (review): the READY response belongs to a different
+                // (recycled) request whose waiter may be parked on this slot.
+                // Wake it so the genuine owner observes the READY state we just
+                // restored instead of waiting until its own timeout.
+                slot_ref.waker.wake();
                 return None;
             }
             // SAFETY: READY -> WRITING gives this reader exclusive ownership;
