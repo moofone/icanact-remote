@@ -3224,6 +3224,7 @@ impl<T> ConnectionPool<T> {
             .map(|registry| {
                 let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(addr));
                 let read_context = ReadContext {
+                    streaming_state_handoff: None,
                     registry_weak: Arc::downgrade(&registry),
                     peer_addr: addr,
                     peer_id: peer_id_opt.clone(),
