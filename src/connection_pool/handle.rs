@@ -1037,9 +1037,18 @@ impl<T> ConnectionHandle<T> {
         let correlation_id = slot.id();
         let gate_guard = stream_handle.acquire_streaming_mode().await?;
         let stream_id = stream_handle.allocate_stream_id()?;
+        // R-9: reject locally at MAX_STREAM_SIZE — every receiver hard-rejects a
+        // larger stream as a FATAL error, so sending it would tear the
+        // connection down with collateral loss. Cap before emitting any frame.
+        if payload.len() > crate::MAX_STREAM_SIZE {
+            return Err(GossipError::MessageTooLarge {
+                size: payload.len(),
+                max: crate::MAX_STREAM_SIZE,
+            });
+        }
         let total_size = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
             size: payload.len(),
-            max: u32::MAX as usize,
+            max: crate::MAX_STREAM_SIZE,
         })?;
         let first_len = payload.len().min(chunk_size);
         let first_header = crate::framing::write_stream_request_start_header(
