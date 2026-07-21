@@ -561,9 +561,31 @@ impl LockFreeStreamHandle {
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_stream_cmd: Option<StreamingCommand> = None;
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
-        let mut streaming_state = read_context
+        let mut streaming_state = match read_context
             .as_ref()
-            .map(|_| crate::protocol::StreamingState::new());
+            .and_then(|ctx| ctx.streaming_state_handoff.as_ref())
+        {
+            // R-6: inherit the accept path's first-frame StreamingState so a
+            // multi-chunk StreamStart that began as the connection's first
+            // frame is continued here, not rejected as "unknown stream_id"
+            // against a fresh state. Await the accept path's handoff (it
+            // notifies once it has processed the first frame), then take the
+            // populated state.
+            Some(handoff) => {
+                handoff.ready.notified().await;
+                Some(
+                    handoff
+                        .cell
+                        .lock()
+                        .ok()
+                        .and_then(|mut g| g.take())
+                        .unwrap_or_else(crate::protocol::StreamingState::new),
+                )
+            }
+            None => read_context
+                .as_ref()
+                .map(|_| crate::protocol::StreamingState::new()),
+        };
         let mut last_cleanup = std::time::Instant::now();
 
         while !shutdown_signal.load(Ordering::Acquire) {

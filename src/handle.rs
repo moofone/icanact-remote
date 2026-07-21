@@ -3255,6 +3255,17 @@ where
         );
     }
 
+    // R-6: handoff for the first-frame StreamingState (see io_task). Created
+    // before the IO task is spawned; the accept path fills `cell` and notifies
+    // once it has processed the first frame, and the IO task awaits `ready` and
+    // inherits the state (a fresh state would split a multi-chunk StreamStart
+    // that began as the first frame and tear the connection down on chunk 2).
+    let streaming_state_handoff =
+        Arc::new(crate::connection_pool::StreamingStateHandoff {
+            cell: std::sync::Mutex::new(None),
+            ready: tokio::sync::Notify::new(),
+        });
+
     // Register the TLS stream with the connection pool before handling the first message so responses work
     let (response_correlation, response_connection) = {
         let buffer_config = crate::connection_pool::BufferConfig::default()
@@ -3264,6 +3275,7 @@ where
             .get_or_create_correlation_tracker(&peer_id);
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(peer_addr));
         let read_context = crate::connection_pool::ReadContext {
+            streaming_state_handoff: Some(streaming_state_handoff.clone()),
             registry_weak: Arc::downgrade(&registry),
             peer_addr,
             peer_id: Some(peer_id.clone()),
@@ -3656,6 +3668,18 @@ where
         warn!(error = %e, "Failed to process initial TLS message - connection will be closed");
         return ConnectionCloseOutcome::Normal { node_id: None };
     }
+
+    // R-6: hand the first-frame StreamingState to the IO task so a multi-chunk
+    // StreamStart that began as the connection's first frame is continued by
+    // the IO task (not rejected as "unknown stream_id" against a fresh state).
+    {
+        let mut cell = streaming_state_handoff
+            .cell
+            .lock()
+            .expect("streaming state handoff cell poisoned");
+        *cell = Some(streaming_state);
+    }
+    streaming_state_handoff.ready.notify_one();
 
     // Continue processing via the IO task; wait for it to exit.
     if let Some(handle) = response_connection.stream_handle.as_ref() {

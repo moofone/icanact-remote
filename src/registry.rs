@@ -10857,6 +10857,7 @@ mod tests {
         // exactly as a real accepted/dialed connection would.
         let (old_io, old_peer_io) = tokio::io::duplex(1024);
         let old_read_ctx = ReadContext {
+            streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry),
             peer_addr: old_addr,
             peer_id: Some(peer_id.clone()),
@@ -11198,6 +11199,7 @@ mod tests {
         // production `ReplaceExisting` loser being evicted.
         let (old_io, old_peer_io) = tokio::io::duplex(1024);
         let old_read_ctx = ReadContext {
+            streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry),
             peer_addr: old_addr,
             peer_id: Some(peer_id.clone()),

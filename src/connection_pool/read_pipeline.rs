@@ -1,3 +1,10 @@
+/// R-6: one-shot handoff of the accept path's first-frame `StreamingState` to
+/// this connection's IO task. See `ReadContext::streaming_state_handoff`.
+pub(crate) struct StreamingStateHandoff {
+    pub(crate) cell: std::sync::Mutex<Option<crate::protocol::StreamingState>>,
+    pub(crate) ready: tokio::sync::Notify,
+}
+
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct ReadContext {
@@ -22,6 +29,15 @@ pub struct ReadContext {
         Option<Arc<crate::registry::ActorAskImmediateHandlerSyncCell>>,
     pub(crate) ask_handler_sync: Option<Arc<crate::registry::ActorAskHandlerSyncCell>>,
     pub(crate) sync_actor_handler: Option<Arc<crate::registry::ActorMessageHandlerSyncCell>>,
+    /// R-6: one-shot handoff of the accept path's first-frame `StreamingState`
+    /// to this connection's IO task, so a multi-chunk `StreamStart` arriving as
+    /// the connection's first frame is not split across two separate states
+    /// (which would tear the connection down on the follow-up chunk). The IO
+    /// task awaits `ready` and takes the state before its read loop; the accept
+    /// path fills `cell` and notifies once it has processed the first frame.
+    /// `None` on outbound connections and in tests (no separate first-frame
+    /// read).
+    pub(crate) streaming_state_handoff: Option<Arc<StreamingStateHandoff>>,
 }
 
 #[cfg(test)]
@@ -47,6 +63,7 @@ mod read_pipeline_tests {
         writer.write_all(&0u32.to_be_bytes()).await.unwrap();
 
         let ctx = super::ReadContext {
+            streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: "127.0.0.1:9000".parse().unwrap(),
             peer_id: None,
@@ -80,6 +97,7 @@ mod read_pipeline_tests {
         let (mut writer, mut reader) = tokio::io::duplex(frame.len());
         writer.write_all(&frame).await.unwrap();
         let ctx = super::ReadContext {
+            streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(), peer_addr: "127.0.0.1:9001".parse().unwrap(),
             peer_id: None, max_message_size: 1024, expected_schema_hash: None,
             aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
@@ -1596,6 +1614,7 @@ where
                 && corr_id != 0
             {
                 let temp_ctx = ReadContext {
+                    streaming_state_handoff: None,
                     registry_weak: Arc::downgrade(registry),
                     peer_addr,
                     peer_id: None,
