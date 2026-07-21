@@ -3234,8 +3234,11 @@ where
         //
         // `node_id` here comes from the TLS client certificate, not from the
         // wire-claimed hello fields, so a peer cannot arm this for a victim.
+        // Scoped to THIS connection's verified TCP source (ephemeral port
+        // included), so an old connection still draining through the reconnect
+        // cannot consume the exemption meant for the new session.
         registry
-            .arm_sequence_reset_for_new_session(peer_state_addr, node_id)
+            .arm_sequence_reset_for_new_session(peer_state_addr, node_id, peer_addr)
             .await;
         // Associate capabilities captured during the Hello handshake (stored under peer_addr).
         registry

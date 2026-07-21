@@ -3122,7 +3122,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         last_failure_time: None,
         last_dns_refresh_attempt: None,
         last_response_received_ms: stale_time,
-        accept_lower_sequence: false,
+        accept_lower_sequence_from: None,
     }
 }
 
