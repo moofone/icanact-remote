@@ -55,18 +55,34 @@ impl LockFreeStreamHandle {
     }
 
     fn allocate_stream_id(&self) -> Result<u32> {
-        // R-5: per-handle stream ids take the ODD partition (1, 3, 5, ...) so they
-        // can never collide with the process-global direct-response allocator's
-        // EVEN ids on the same connection — a collision keys two live streams
-        // to one `stream_id` and tears the connection down as a duplicate start.
-        // Init 1 (see `new`); step 2. u32::MAX is odd, so the exhaustion guard
-        // below still fires before any wrap into the even space.
-        let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        if id == 0 || id == u32::MAX {
-            self.signal_shutdown();
-            return Err(GossipError::Shutdown);
+        // R-5: per-handle stream ids take the ODD partition (1, 3, 5, ...) —
+        // disjoint from the process-global direct-response allocator's EVEN
+        // ids — so a direct streaming response and a handle-initiated stream on
+        // the same connection can never collide on `stream_id` (a collision
+        // keys two live streams to one id and tears the connection down as a
+        // duplicate start).
+        //
+        // A CAS loop (not fetch_add) so exhaustion shuts the connection down at
+        // the u32::MAX sentinel WITHOUT wrapping the counter back to 1 — a wrap
+        // would hand out id 1 again on a still-live connection (stream-id
+        // reuse). u32::MAX is the odd sentinel (never handed out); the last id
+        // returned is u32::MAX - 2. Each odd id is handed out at most once.
+        loop {
+            let current = self.next_stream_id.load(Ordering::Acquire);
+            if current == u32::MAX {
+                self.signal_shutdown();
+                return Err(GossipError::Shutdown);
+            }
+            // current is odd and in [1, u32::MAX - 2]; +2 stays odd and <= u32::MAX.
+            let next = current + 2;
+            if self
+                .next_stream_id
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(current);
+            }
         }
-        Ok(id)
     }
 
     /// Create a new lock-free streaming handle with background writer task
@@ -2982,5 +2998,36 @@ mod route_interning_tests {
             );
             assert!(ids.insert(id), "handle stream id reused: {id}");
         }
+    }
+
+    /// R-5 (review follow-up): the per-handle allocator must exhaust at the
+    /// u32::MAX sentinel WITHOUT wrapping back to 1 (which would reuse id 1 on
+    /// a still-live connection). u32::MAX - 2 is the last id handed out;
+    /// u32::MAX is the sentinel that shuts the connection down.
+    #[tokio::test]
+    async fn qa_r5_handle_allocator_exhausts_without_wrapping_to_one() {
+        let (client, _peer) = tokio::io::duplex(64);
+        let (writer, _task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9906".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        // Park the allocator one id before the sentinel.
+        writer
+            .next_stream_id
+            .store(u32::MAX - 2, Ordering::Release);
+        assert_eq!(writer.allocate_stream_id().unwrap(), u32::MAX - 2);
+        // u32::MAX is the sentinel: exhaustion -> Shutdown, no wrap to 1.
+        assert!(writer.allocate_stream_id().is_err());
+        // Subsequent allocations stay shut down (never hand out id 1 again).
+        assert!(writer.allocate_stream_id().is_err());
+        assert_eq!(
+            writer.next_stream_id.load(Ordering::Acquire),
+            u32::MAX,
+            "counter must rest on the sentinel, not wrap to 1"
+        );
     }
 }
