@@ -604,12 +604,33 @@ fn test_failure_recovery_backoff() -> Result<(), DynError> {
             wait_for_pair_lookup(&node_a, &node_c, Duration::from_secs(10)).await,
             "A/C should be mutually reachable before failure simulation"
         );
+        // FLAKE FIX: wait on the exact precondition the assertion below
+        // depends on, not on an unrelated counter.
+        //
+        // This used to wait for `discovered_peers >= 2`, which is
+        // `known_peers.len()` — peers A has merely HEARD ABOUT via gossip. The
+        // assertion below reads `mesh_formation_time_ms`, a write-once latch
+        // that fires only when discovery reaches `connected_peer_count() >=
+        // mesh_formation_target` (2 here). Gossip hearsay outruns the second
+        // TLS connection, so under machine-wide CPU contention the snapshot
+        // was taken with `active_peers == 1` and the latch still `None`; the
+        // latch then fired during the following `wait_for_pair_lookup`, and
+        // the assertion compared `Some(8)` against `None`.
+        //
+        // Reproduced 3/20 under 48 spinners on 16 cores; every failing run had
+        // `active_peers == 1` at the snapshot, every passing run had 2.
+        //
+        // Waiting on the latch itself is condition-based synchronization, not
+        // a timing hack: the `is_none()` guard at registry.rs makes the value
+        // provably immutable once set, so this cannot mask a product race. It
+        // is also the established idiom in this file — see
+        // `test_mesh_formation_3_nodes`, which the failing test simply omitted.
         assert!(
             common::wait_for_condition(Duration::from_secs(10), || async {
-                node_a.stats().await.discovered_peers >= 2
+                node_a.stats().await.mesh_formation_time_ms.is_some()
             })
             .await,
-            "A should know both peers before failure simulation"
+            "A should record mesh formation before failure simulation"
         );
 
         // Verify stats for subsequent logic

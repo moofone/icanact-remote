@@ -6470,24 +6470,47 @@ impl<T: 'static> GossipRegistry<T> {
     /// address-alias and peer-ID-index cases; checking addresses alone would
     /// treat a peer with a live peer-ID-indexed connection as evictable.
     ///
-    /// The map key is checked separately for both liveness and configuration,
-    /// since `peer_has_live_connection` only sees the `PeerInfo` fields.
+    /// The map key is checked separately for liveness, since
+    /// `peer_has_live_connection` only sees the `PeerInfo` fields.
+    ///
+    /// SECURITY: the configured-peer check deliberately does NOT consult
+    /// `peer.address` / `peer.peer_address`. Those are peer-influenced (see
+    /// B-5), so trusting them would let an untrusted inbound peer advertise a
+    /// configured address to make itself eviction-exempt — and repeat that
+    /// across many entries to bypass `max_peers` entirely and drive unbounded
+    /// memory growth. Configuration is matched on trusted identity only: the
+    /// TLS-authenticated `node_id`, or the `peers` map key, which is our own
+    /// bookkeeping key rather than a field the peer fills in.
+    ///
+    /// Liveness is safe to check via aliases because it consults the actual
+    /// connection pool — a peer cannot fabricate a live pooled connection.
     fn peer_is_eviction_exempt(
         &self,
         addr: &SocketAddr,
         peer: &PeerInfo,
-        configured: &std::collections::HashSet<SocketAddr>,
+        configured_addrs: &std::collections::HashSet<SocketAddr>,
+        configured_peer_ids: &std::collections::HashSet<crate::PeerId>,
     ) -> bool {
         if self.peer_has_live_connection(peer) {
             return true;
         }
+
+        // Trusted-identity configuration match.
+        if let Some(node_id) = peer.node_id
+            && configured_peer_ids.contains(&node_id.to_peer_id())
+        {
+            return true;
+        }
+        if configured_addrs.contains(addr) {
+            return true;
+        }
+
+        // Alias sweep for LIVENESS only (pool-backed, not peer-claimed).
         let candidates = [Some(*addr), peer.peer_address, Some(peer.address)];
         candidates.iter().flatten().any(|candidate| {
-            configured.contains(candidate)
-                || self
-                    .connection_pool
-                    .get_existing_connection(*candidate)
-                    .is_some()
+            self.connection_pool
+                .get_existing_connection(*candidate)
+                .is_some()
         })
     }
 
@@ -6624,19 +6647,22 @@ impl<T: 'static> GossipRegistry<T> {
         let max_peers = self.config.max_peers.max(1);
         let mut evicted_addrs: Vec<SocketAddr> = Vec::new();
         if gossip_state.peers.len() > max_peers {
-            let configured: std::collections::HashSet<SocketAddr> = self
-                .connection_pool
-                .list_configured_peers()
-                .into_iter()
-                .map(|(_, addr)| addr)
-                .collect();
+            let configured = self.connection_pool.list_configured_peers();
+            let configured_peer_ids: std::collections::HashSet<crate::PeerId> =
+                configured.iter().map(|(peer_id, _)| peer_id.clone()).collect();
+            let configured_addrs: std::collections::HashSet<SocketAddr> =
+                configured.into_iter().map(|(_, addr)| addr).collect();
 
             let to_remove = gossip_state.peers.len() - max_peers;
-            evicted_addrs = Self::select_peers_to_evict(
-                &gossip_state.peers,
-                to_remove,
-                |addr, peer| self.peer_is_eviction_exempt(addr, peer, &configured),
-            );
+            evicted_addrs =
+                Self::select_peers_to_evict(&gossip_state.peers, to_remove, |addr, peer| {
+                    self.peer_is_eviction_exempt(
+                        addr,
+                        peer,
+                        &configured_addrs,
+                        &configured_peer_ids,
+                    )
+                });
 
             if evicted_addrs.len() < to_remove {
                 warn!(
@@ -13251,6 +13277,48 @@ mod tests {
         assert!(
             evicted.is_empty(),
             "R-12: an all-exempt peer table must not be force-evicted"
+        );
+    }
+
+    /// R-12 (review P1, codex): an untrusted peer must not be able to buy
+    /// eviction exemption by ADVERTISING a configured address.
+    ///
+    /// `peer.address` / `peer.peer_address` are peer-influenced (B-5). If the
+    /// configured-peer check trusted them, any inbound peer could claim a
+    /// configured address to become exempt, and repeat that across many
+    /// entries to bypass `max_peers` entirely -> unbounded memory growth.
+    /// Configuration is therefore matched on trusted identity only.
+    #[tokio::test]
+    async fn qa_r12_advertised_alias_does_not_grant_configured_exemption() {
+        let config = GossipConfig {
+            max_peers: 2,
+            ..test_config()
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
+        let configured_addr = test_addr(9999);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            for i in 0..6u16 {
+                let key = test_addr(9500 + i);
+                let mut peer = PeerInfo::local(key);
+                // Every peer LIES, claiming the configured address as its own
+                // advertised aliases.
+                peer.address = configured_addr;
+                peer.peer_address = Some(configured_addr);
+                peer.last_success = 1_000 + u64::from(i);
+                gossip_state.peers.insert(key, peer);
+            }
+        }
+
+        registry.enforce_bounds().await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(
+            gossip_state.peers.len(),
+            2,
+            "R-12: peers must not become eviction-exempt by advertising a \
+             configured address; the bound must still be enforced"
         );
     }
 
