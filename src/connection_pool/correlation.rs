@@ -6,6 +6,17 @@ const SLOT_WAITING: u8 = 1;
 const SLOT_WRITING: u8 = 2;
 const SLOT_READY: u8 = 3;
 
+/// Outcome of attempting to take a slot's ready response.
+enum ReadyTake {
+    /// Slot was not READY.
+    NotReady,
+    /// Took this waiter's own response.
+    Taken(crate::AlignedBytes),
+    /// Slot is READY but belongs to a different correlation id: this waiter's
+    /// request was recycled (R-10). The caller must stop waiting.
+    ForeignReady,
+}
+
 /// Pending response slot
 struct PendingResponseSlot {
     state: AtomicU8,
@@ -18,6 +29,11 @@ struct PendingResponseSlot {
     id: AtomicU32,
     response: UnsafeCell<MaybeUninit<crate::AlignedBytes>>,
     waker: AtomicWaker,
+    /// R-10: gates waker registration against allocation/recycle so a stale
+    /// waiter cannot register (and overwrite the current owner's waker) once
+    /// its id has been recycled. Held only for brief, await-free critical
+    /// sections.
+    register_lock: std::sync::Mutex<()>,
 }
 
 // Safety: access is synchronized via atomics and the correlation protocol.
@@ -47,15 +63,19 @@ impl CorrelationTracker {
     }
 
     #[inline]
-    fn try_take_ready(slot_ref: &PendingResponseSlot) -> Option<crate::AlignedBytes> {
-        Self::try_take_ready_before_release(slot_ref, || {})
+    fn try_take_ready(
+        slot_ref: &PendingResponseSlot,
+        correlation_id: u32,
+    ) -> ReadyTake {
+        Self::try_take_ready_before_release(slot_ref, correlation_id, || {})
     }
 
     #[inline]
     fn try_take_ready_before_release(
         slot_ref: &PendingResponseSlot,
+        correlation_id: u32,
         before_slot_release: impl FnOnce(),
-    ) -> Option<crate::AlignedBytes> {
+    ) -> ReadyTake {
         if slot_ref
             .state
             .compare_exchange(
@@ -66,14 +86,53 @@ impl CorrelationTracker {
             )
             .is_ok()
         {
+            // R-10: verify the full correlation id under exclusive WRITING
+            // ownership. `id` and `id + 8192*k` alias to the same slot index, so
+            // after cancel_all + ~8192 further allocations a stale, woken
+            // waiter's slot can be READY with a *different* request's response;
+            // without this check the waiter steals that response (and the
+            // rightful owner later gets ConnectionDropped). Load `id` with
+            // Acquire so the value observed is the one whose store
+            // happened-before the READY publication (a Relaxed load could read a
+            // stale id and treat the genuine owner as foreign).
+            if slot_ref.id.load(Ordering::Acquire) != correlation_id {
+                // Restore READY for the genuine owner, nudge the slot waker once
+                // (the owner may be parked), and tell this stale waiter to stop
+                // waiting. Returning ForeignReady (-> ConnectionDropped)
+                // terminates the stale wait, so it does not re-poll/self-wake on
+                // the shared AtomicWaker (which would busy-loop and starve the
+                // genuine owner).
+                slot_ref.state.store(SLOT_READY, Ordering::Release);
+                slot_ref.waker.wake();
+                return ReadyTake::ForeignReady;
+            }
             // SAFETY: READY -> WRITING gives this reader exclusive ownership;
             // allocation requires EMPTY and cancellation spins on WRITING.
             let response = unsafe { (*slot_ref.response.get()).assume_init_read() };
             before_slot_release();
             slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
-            return Some(response);
+            return ReadyTake::Taken(response);
         }
-        None
+        ReadyTake::NotReady
+    }
+
+    /// R-10: atomically (verify ownership + register waker) under the per-slot
+    /// gate. Returns true if registered (we still own the slot), false if the
+    /// slot was recycled to a different id (the caller must stop waiting). The
+    /// gate serializes this with `allocate()`'s id install, so a stale waiter
+    /// whose id was recycled cannot overwrite the current owner's waker.
+    #[inline]
+    fn register_if_owner(
+        slot_ref: &PendingResponseSlot,
+        waker: &std::task::Waker,
+        correlation_id: u32,
+    ) -> bool {
+        let _gate = slot_ref.register_lock.lock().expect("register_lock poisoned");
+        if slot_ref.id.load(Ordering::Acquire) != correlation_id {
+            return false;
+        }
+        slot_ref.waker.register(waker);
+        true
     }
 
     fn new() -> Arc<Self> {
@@ -87,6 +146,7 @@ impl CorrelationTracker {
             id: AtomicU32::new(0),
             response: UnsafeCell::new(MaybeUninit::uninit()),
             waker: AtomicWaker::new(),
+            register_lock: std::sync::Mutex::new(()),
         });
         Arc::new(Self {
             next_id: AtomicU32::new(1),
@@ -139,7 +199,18 @@ impl CorrelationTracker {
                 )
                 .is_ok()
             {
-                slot_ref.id.store(id, Ordering::Relaxed);
+                {
+                    // R-10: under the registration gate, wake any waker a stale
+                    // waiter left on this slot and install the new id before
+                    // publishing WAITING. A concurrent waiter's
+                    // register_if_owner takes the same gate, so it cannot observe
+                    // a half-installed id or overwrite a waker for the previous
+                    // generation.
+                    let _gate =
+                        slot_ref.register_lock.lock().expect("register_lock poisoned");
+                    slot_ref.waker.wake();
+                    slot_ref.id.store(id, Ordering::Release);
+                }
                 slot_ref.state.store(SLOT_WAITING, Ordering::Release);
                 #[cfg(feature = "trace-correlation")]
                 trace!(
@@ -336,18 +407,32 @@ impl CorrelationTracker {
         let wait_fut = futures::future::poll_fn(|cx| {
             // If the slot was cancelled (e.g. connection dropped and cancel_all() ran),
             // return a concrete error instead of waiting forever.
-            if let Some(response) = Self::try_take_ready(slot_ref) {
-                return std::task::Poll::Ready(Ok(response));
+            match Self::try_take_ready(slot_ref, correlation_id) {
+                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::ForeignReady => {
+                    return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+                }
+                ReadyTake::NotReady => {}
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
 
-            slot_ref.waker.register(cx.waker());
+            // R-10: register only while we still own the slot. register_if_owner
+            // atomically (id-check + register) under the per-slot gate, so a
+            // stale waiter whose id was recycled cannot overwrite the current
+            // owner's waker. If recycled, terminate instead of parking.
+            if !Self::register_if_owner(slot_ref, cx.waker(), correlation_id) {
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+            }
 
-            if let Some(response) = Self::try_take_ready(slot_ref) {
-                return std::task::Poll::Ready(Ok(response));
+            match Self::try_take_ready(slot_ref, correlation_id) {
+                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::ForeignReady => {
+                    return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+                }
+                ReadyTake::NotReady => {}
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
@@ -360,20 +445,32 @@ impl CorrelationTracker {
         match tokio::time::timeout(timeout, wait_fut).await {
             Ok(result) => result,
             Err(_) => {
+                // R-10: enter WRITING and verify the full id before evicting, so a
+                // timeout cannot evict an innocent aliased WAITING request that
+                // recycled this slot after cancel_all. On id mismatch restore
+                // WAITING and fall through (the slot belongs to a different
+                // request now).
                 if slot_ref
                     .state
                     .compare_exchange(
                         SLOT_WAITING,
-                        SLOT_EMPTY,
+                        SLOT_WRITING,
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
                     .is_ok()
                 {
-                    return Err(crate::GossipError::Timeout);
+                    if slot_ref.id.load(Ordering::Acquire) != correlation_id {
+                        slot_ref.state.store(SLOT_WAITING, Ordering::Release);
+                    } else {
+                        slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
+                        return Err(crate::GossipError::Timeout);
+                    }
                 }
-                if let Some(response) = Self::try_take_ready(slot_ref) {
-                    return Ok(response);
+                match Self::try_take_ready(slot_ref, correlation_id) {
+                    ReadyTake::Taken(response) => return Ok(response),
+                    ReadyTake::ForeignReady => return Err(crate::GossipError::ConnectionDropped),
+                    ReadyTake::NotReady => {}
                 }
                 match slot_ref.state.load(Ordering::Acquire) {
                     SLOT_WRITING => self.wait_for_response_no_timeout(correlation_id).await,
@@ -392,16 +489,30 @@ impl CorrelationTracker {
         let slot_ref = &self.pending[slot];
 
         futures::future::poll_fn(|cx| {
-            if let Some(response) = Self::try_take_ready(slot_ref) {
-                return std::task::Poll::Ready(Ok(response));
+            match Self::try_take_ready(slot_ref, correlation_id) {
+                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::ForeignReady => {
+                    return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+                }
+                ReadyTake::NotReady => {}
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
-            slot_ref.waker.register(cx.waker());
-            if let Some(response) = Self::try_take_ready(slot_ref) {
-                return std::task::Poll::Ready(Ok(response));
+            // R-10: register only while we still own the slot. register_if_owner
+            // atomically (id-check + register) under the per-slot gate, so a
+            // stale waiter whose id was recycled cannot overwrite the current
+            // owner's waker. If recycled, terminate instead of parking.
+            if !Self::register_if_owner(slot_ref, cx.waker(), correlation_id) {
+                return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+            }
+            match Self::try_take_ready(slot_ref, correlation_id) {
+                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::ForeignReady => {
+                    return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
+                }
+                ReadyTake::NotReady => {}
             }
             let state = slot_ref.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY {
@@ -489,6 +600,15 @@ mod correlation_tests {
 
     use super::*;
 
+    /// Unwrap a `ReadyTake::Taken`, panicking otherwise (test helper).
+    fn expect_taken(take: ReadyTake, msg: &str) -> crate::AlignedBytes {
+        match take {
+            ReadyTake::Taken(response) => response,
+            ReadyTake::NotReady => panic!("{msg}: slot was not READY (NotReady)"),
+            ReadyTake::ForeignReady => panic!("{msg}: slot held a foreign id (ForeignReady)"),
+        }
+    }
+
     #[test]
     fn dropping_guard_after_a_raced_response_releases_the_slot() {
         let tracker = CorrelationTracker::new();
@@ -546,8 +666,8 @@ mod correlation_tests {
 
         // Drain the ready response so drop(guard) sees a clean slot.
         let slot_ref = &tracker.pending[CorrelationTracker::slot_index(id)];
-        let taken = CorrelationTracker::try_take_ready(slot_ref);
-        assert_eq!(taken.expect("ready response").as_ref(), b"reply");
+        let taken = CorrelationTracker::try_take_ready(slot_ref, id);
+        assert_eq!(expect_taken(taken, "ready response").as_ref(), b"reply");
         guard.disarm();
     }
 
@@ -565,11 +685,13 @@ mod correlation_tests {
         tracker.cancel(id + PENDING_RESPONSES_SIZE as u32);
 
         let slot_ref = &tracker.pending[CorrelationTracker::slot_index(id)];
-        let taken = CorrelationTracker::try_take_ready(slot_ref);
+        let taken = CorrelationTracker::try_take_ready(slot_ref, id);
         assert_eq!(
-            taken
-                .expect("a stale cancel for an aliased correlation id dropped a ready response")
-                .as_ref(),
+            expect_taken(
+                taken,
+                "a stale cancel for an aliased correlation id dropped a ready response"
+            )
+            .as_ref(),
             b"reply"
         );
         guard.disarm();
@@ -586,7 +708,7 @@ mod correlation_tests {
         let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
         assert!(tracker.complete(id, &mut response));
 
-        let taken = CorrelationTracker::try_take_ready_before_release(slot_ref, || {
+        let taken = CorrelationTracker::try_take_ready_before_release(slot_ref, id, || {
             assert_eq!(
                 slot_ref.state.load(Ordering::Acquire),
                 SLOT_WRITING,
@@ -594,8 +716,200 @@ mod correlation_tests {
             );
         });
 
-        assert_eq!(taken.expect("ready response").as_ref(), b"reply");
+        assert_eq!(expect_taken(taken, "ready response").as_ref(), b"reply");
         assert_eq!(slot_ref.state.load(Ordering::Acquire), SLOT_EMPTY);
         guard.disarm();
+    }
+
+    /// R-10: a stale waiter whose aliased id maps to a slot READY with a
+    /// *different* request's response must NOT steal it (the #130 fix covered
+    /// `complete`/`cancel`; the waiter-side `try_take_ready` did not verify the
+    /// id). `id` and `id + 8192` share a slot index.
+    #[test]
+    fn qa_r10_stale_waiter_cannot_steal_a_recycled_slot_response() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+        let slot = CorrelationTracker::slot_index(id);
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"reply", pool));
+        assert!(tracker.complete(id, &mut response));
+
+        let stale_id = id + PENDING_RESPONSES_SIZE as u32;
+        assert_eq!(CorrelationTracker::slot_index(stale_id), slot);
+        let slot_ref = &tracker.pending[slot];
+        assert!(
+            matches!(
+                CorrelationTracker::try_take_ready(slot_ref, stale_id),
+                ReadyTake::ForeignReady
+            ),
+            "stale waiter must not steal a recycled slot's response (R-10)"
+        );
+        // The genuine owner still receives it.
+        assert_eq!(
+            expect_taken(
+                CorrelationTracker::try_take_ready(slot_ref, id),
+                "genuine owner's response"
+            )
+            .as_ref(),
+            b"reply"
+        );
+        guard.disarm();
+    }
+
+    /// R-10: a stale waiter on an aliased slot must terminate WITHOUT evicting
+    /// the different request currently WAITING there. With the id check before
+    /// waker registration, the stale waiter returns ConnectionDropped as soon as
+    /// it observes the slot no longer holds its id (previously the timeout path
+    /// did a bare WAITING -> EMPTY CAS with no id check).
+    #[tokio::test]
+    async fn qa_r10_stale_waiter_does_not_evict_an_aliased_waiter() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+        let slot = CorrelationTracker::slot_index(id);
+        // Slot is WAITING for `id`; `id + 8192` aliases to the same slot.
+        let stale_id = id + PENDING_RESPONSES_SIZE as u32;
+        let outcome = tracker
+            .wait_for_response(stale_id, std::time::Duration::from_millis(1))
+            .await;
+        assert!(
+            matches!(outcome, Err(crate::GossipError::ConnectionDropped)),
+            "stale waiter must terminate with ConnectionDropped, got {outcome:?}"
+        );
+        let slot_ref = &tracker.pending[slot];
+        assert_eq!(
+            slot_ref.state.load(Ordering::Acquire),
+            SLOT_WAITING,
+            "aliased WAITING entry must survive a stale waiter (R-10)"
+        );
+        assert_eq!(
+            slot_ref.id.load(Ordering::Acquire),
+            id,
+            "the slot must still belong to id, not the stale waiter"
+        );
+        guard.disarm();
+    }
+
+    /// A `Waker` that counts wake() calls, so a test can observe *which*
+    /// registered waker `complete()` actually woke.
+    struct CountWaker(Arc<std::sync::atomic::AtomicUsize>);
+    impl std::task::Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn count_waker() -> (std::task::Waker, Arc<std::sync::atomic::AtomicUsize>) {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waker: std::task::Waker = Arc::new(CountWaker(counter.clone())).into();
+        (waker, counter)
+    }
+
+    /// R-10 (waker-ownership race, fail-first): after a slot is recycled from
+    /// X to Y and Y registers its waker, a stale X attempting to register MUST
+    /// NOT overwrite Y's waker. `complete(Y)` must wake Y (not X), so Y
+    /// receives its reply. Pre-fix (bare `register` with no id gate) X overwrote
+    /// Y's waker and `complete(Y)` woke X while Y hung -- proven RED by reverting
+    /// `register_if_owner` to a bare register (X's counter fires, Y's does not).
+    #[test]
+    fn qa_r10_stale_waiter_cannot_overwrite_the_owners_waker() {
+        let tracker = CorrelationTracker::new();
+        // 1. Allocate X in slot S, then recycle S to Y (cancel X, force the
+        //    next allocation to alias to S, allocate Y).
+        let guard_x = tracker.allocate().expect("slot should allocate");
+        let id_x = guard_x.id();
+        let slot = CorrelationTracker::slot_index(id_x);
+        drop(guard_x); // cancel(X): S -> EMPTY
+        tracker
+            .next_id
+            .store(id_x + PENDING_RESPONSES_SIZE as u32, Ordering::Release);
+        let guard_y = tracker.allocate().expect("Y should re-claim slot S");
+        let id_y = guard_y.id();
+        assert_eq!(CorrelationTracker::slot_index(id_y), slot, "Y must alias to S");
+        assert_ne!(id_x, id_y);
+
+        let slot_ref = &tracker.pending[slot];
+        // 2. Y registers its waker.
+        let (waker_y, y_wakes) = count_waker();
+        assert!(
+            CorrelationTracker::register_if_owner(slot_ref, &waker_y, id_y),
+            "Y (the current owner) must register"
+        );
+        // 3. Stale X attempts to register on the same slot.
+        let (waker_x, x_wakes) = count_waker();
+        assert!(
+            !CorrelationTracker::register_if_owner(slot_ref, &waker_x, id_x),
+            "stale X must be refused registration after recycle (R-10)"
+        );
+        // 4. complete(Y) must wake Y, never X.
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"for-Y", pool));
+        assert!(tracker.complete(id_y, &mut response));
+        assert_eq!(y_wakes.load(Ordering::SeqCst), 1, "complete(Y) must wake Y's waker");
+        assert_eq!(
+            x_wakes.load(Ordering::SeqCst),
+            0,
+            "X's waker must not have been registered (no overwrite)"
+        );
+        // 5. Y receives its reply.
+        assert_eq!(
+            expect_taken(
+                CorrelationTracker::try_take_ready(slot_ref, id_y),
+                "Y's reply"
+            )
+            .as_ref(),
+            b"for-Y"
+        );
+        guard_y.disarm();
+    }
+
+    /// R-10 (liveness, no-timeout path): the genuine owner on the no-timeout
+    /// path (`handle.rs::ask_direct_no_timeout`) must still receive its reply
+    /// promptly after a recycle -- it must not hang because a stale waiter
+    /// overwrote its waker. Watchdog-bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qa_r10_owner_receives_reply_on_no_timeout_path_after_recycle() {
+        let tracker = Arc::new(CorrelationTracker::new());
+        let guard_x = tracker.allocate().expect("slot should allocate");
+        let id_x = guard_x.id();
+        let slot = CorrelationTracker::slot_index(id_x);
+        drop(guard_x); // recycle: S -> EMPTY
+        tracker
+            .next_id
+            .store(id_x + PENDING_RESPONSES_SIZE as u32, Ordering::Release);
+        let guard_y = tracker.allocate().expect("Y should re-claim slot S");
+        let id_y = guard_y.id();
+        assert_eq!(CorrelationTracker::slot_index(id_y), slot);
+
+        // Y waits with NO timeout.
+        let tracker_for_wait = tracker.clone();
+        let y_wait = tokio::spawn(async move {
+            tracker_for_wait.wait_for_response_no_timeout(id_y).await
+        });
+        // Let Y register its waker.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // A stale X attempts to register on the same slot -- refused by the gate.
+        let (stale_waker, _) = count_waker();
+        assert!(!CorrelationTracker::register_if_owner(
+            &tracker.pending[slot],
+            &stale_waker,
+            id_x
+        ));
+
+        // complete(Y) wakes Y (not the stale X).
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"for-Y", pool));
+        assert!(tracker.complete(id_y, &mut response));
+
+        // Y must receive its reply promptly -- the no-timeout path must not hang.
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), y_wait)
+            .await
+            .expect("Y's no-timeout wait must not hang (R-10)")
+            .expect("Y's task joined");
+        assert_eq!(reply.unwrap().as_ref(), b"for-Y");
+        guard_y.disarm();
     }
 }
