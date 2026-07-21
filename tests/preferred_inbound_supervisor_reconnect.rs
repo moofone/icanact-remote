@@ -111,7 +111,10 @@ async fn higher_id_supervisor_reconnect_completes_within_debounce_window() {
     // the lower-id side never dials — the higher-id supervisor is the only
     // path to a connection.
     high.registry
-        .add_peer_with_node_id(low.registry.bind_addr, Some(low.registry.peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            low.registry.bind_addr,
+            Some(low.registry.peer_id.to_node_id()),
+        )
         .await;
     high.registry
         .configure_peer(low.registry.peer_id.clone(), low.registry.bind_addr)

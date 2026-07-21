@@ -3078,9 +3078,8 @@ impl<T: 'static> GossipRegistry<T> {
 
         if priority.should_trigger_immediate_gossip() {
             let gossip_trigger_time = crate::current_timestamp_nanos();
-            let registration_duration_ms = gossip_trigger_time
-                .saturating_sub(register_start_time) as f64
-                / 1_000_000.0;
+            let registration_duration_ms =
+                gossip_trigger_time.saturating_sub(register_start_time) as f64 / 1_000_000.0;
 
             info!(
                 actor_name = %name,
@@ -3443,10 +3442,9 @@ impl<T: 'static> GossipRegistry<T> {
                         ) else {
                             continue;
                         };
-                        let transfers_admission = gossip_state
-                            .actor_admission_peer_by_name
-                            .get(&name)
-                            != Some(&sender_peer_id);
+                        let transfers_admission =
+                            gossip_state.actor_admission_peer_by_name.get(&name)
+                                != Some(&sender_peer_id);
                         if transfers_admission
                             && gossip_state.actor_admission_count(&sender_peer_id)
                                 >= self.config.max_known_actors_per_peer
@@ -4955,14 +4953,10 @@ impl<T: 'static> GossipRegistry<T> {
             let mut rejected_by_global_cap = 0usize;
 
             for (name, location, addr) in &updates_to_apply {
-                let known_exists = self
-                    .actor_state
-                    .known_actors
-                    .contains_sync(name.as_str());
-                let transfers_admission = gossip_state
-                    .actor_admission_peer_by_name
-                    .get(name.as_str())
-                    != Some(&sender_peer_id);
+                let known_exists = self.actor_state.known_actors.contains_sync(name.as_str());
+                let transfers_admission =
+                    gossip_state.actor_admission_peer_by_name.get(name.as_str())
+                        != Some(&sender_peer_id);
                 if transfers_admission
                     && gossip_state.actor_admission_count(&sender_peer_id)
                         >= self.config.max_known_actors_per_peer
@@ -4990,8 +4984,7 @@ impl<T: 'static> GossipRegistry<T> {
                     continue;
                 }
                 peer_actors.insert(name.clone());
-                let (clear_tombstone, is_update) =
-                    upsert_plan.expect("upsert plan checked above");
+                let (clear_tombstone, is_update) = upsert_plan.expect("upsert plan checked above");
                 if clear_tombstone {
                     let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                 }
@@ -6648,8 +6641,10 @@ impl<T: 'static> GossipRegistry<T> {
         let mut evicted_addrs: Vec<SocketAddr> = Vec::new();
         if gossip_state.peers.len() > max_peers {
             let configured = self.connection_pool.list_configured_peers();
-            let configured_peer_ids: std::collections::HashSet<crate::PeerId> =
-                configured.iter().map(|(peer_id, _)| peer_id.clone()).collect();
+            let configured_peer_ids: std::collections::HashSet<crate::PeerId> = configured
+                .iter()
+                .map(|(peer_id, _)| peer_id.clone())
+                .collect();
             let configured_addrs: std::collections::HashSet<SocketAddr> =
                 configured.into_iter().map(|(_, addr)| addr).collect();
 
@@ -6901,9 +6896,8 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         let serialization_end = crate::current_timestamp_nanos();
-        let serialization_duration_ms = serialization_end
-            .saturating_sub(serialization_start) as f64
-            / 1_000_000.0;
+        let serialization_duration_ms =
+            serialization_end.saturating_sub(serialization_start) as f64 / 1_000_000.0;
 
         if serialized_messages.len() > 1 {
             warn!(
@@ -9907,10 +9901,7 @@ mod tests {
             let changes = (0..2)
                 .map(|actor_index| RegistryChange::ActorAdded {
                     name: format!("batch-{batch}-actor-{actor_index}"),
-                    location: RemoteActorLocation::new_with_peer(
-                        test_addr(8300),
-                        sender.clone(),
-                    ),
+                    location: RemoteActorLocation::new_with_peer(test_addr(8300), sender.clone()),
                     priority: RegistrationPriority::Normal,
                 })
                 .collect();
@@ -10093,7 +10084,12 @@ mod tests {
 
         let gossip_state = registry.gossip_state.lock().await;
         assert!(gossip_state.peer_to_actors[&sender_addr].is_empty());
-        assert!(!registry.actor_state.known_actors.contains_sync("local-wins"));
+        assert!(
+            !registry
+                .actor_state
+                .known_actors
+                .contains_sync("local-wins")
+        );
     }
 
     /// Duplicate immediate deltas must be observably idempotent.
@@ -12660,9 +12656,12 @@ mod tests {
         }
 
         // Seed all three addr-keyed clock tables for the dead peer.
-        let _ = registry
-            .clock_probe_state
-            .upsert_sync(dead_addr, PeerClockProbeState { last_probe_sent_wall_ns: 1 });
+        let _ = registry.clock_probe_state.upsert_sync(
+            dead_addr,
+            PeerClockProbeState {
+                last_probe_sent_wall_ns: 1,
+            },
+        );
         let _ = registry.pending_clock_echoes.upsert_sync(
             dead_addr,
             PendingClockEcho {

@@ -51,8 +51,8 @@ async fn connect_tls(
         false,
         schema_hash,
     )
-        .await
-        .expect("hello handshake");
+    .await
+    .expect("hello handshake");
 
     (tls, client_peer_id)
 }

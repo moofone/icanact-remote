@@ -801,6 +801,10 @@ const STREAMING_QUEUE_CLOSED: usize = 1usize << (usize::BITS - 1);
 const STREAMING_QUEUE_PUSHERS: usize = !STREAMING_QUEUE_CLOSED;
 
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "the error retains the rejected command for callers that need an explicit retry policy"
+)]
 enum StreamingTryPushError {
     Closed(SocketAddr),
     Full(StreamingCommand),
@@ -1100,6 +1104,66 @@ mod queue_notify_tests {
         WriteCommand::Payload(WritePayload::Single(bytes::Bytes::from_static(b"frame")))
     }
 
+    fn immediate_frame() -> WriteCommand {
+        WriteCommand::ImmediatePayload(WritePayload::Single(bytes::Bytes::from_static(
+            b"immediate",
+        )))
+    }
+
+    /// Immediate control replies have independent bounded admission and lead a
+    /// regular writer turn. A saturated normal queue must therefore neither
+    /// reject the reply nor place it behind the existing backlog.
+    #[test]
+    fn immediate_queue_reserves_admission_and_leads_saturated_normal_backlog() {
+        let normal = WriteQueue::new(128, test_addr());
+        let immediate = WriteQueue::new(128, test_addr());
+
+        for _ in 0..128 {
+            normal.try_push(frame()).expect("normal queue has capacity");
+        }
+        assert!(normal.try_push(frame()).is_err(), "normal queue is saturated");
+
+        immediate
+            .try_push(immediate_frame())
+            .expect("reserved immediate queue admits critical reply");
+
+        let first = immediate
+            .pop()
+            .expect("writer drains priority queue before normal backlog");
+        assert!(matches!(first, WriteCommand::ImmediatePayload(_)));
+        assert_eq!(normal.queue.len(), 128, "normal backlog was not consumed first");
+    }
+
+    /// The priority lane is bounded per writer turn. After a control burst,
+    /// normal traffic still receives its regular service budget.
+    #[test]
+    fn immediate_priority_budget_preserves_regular_queue_progress() {
+        const IMMEDIATE_WRITE_BATCH: usize = 8;
+        let normal = WriteQueue::new(128, test_addr());
+        let immediate = WriteQueue::new(128, test_addr());
+        normal.try_push(frame()).expect("normal queue has capacity");
+        for _ in 0..(IMMEDIATE_WRITE_BATCH + 1) {
+            immediate
+                .try_push(immediate_frame())
+                .expect("immediate queue has capacity");
+        }
+
+        let mut turn = Vec::new();
+        for _ in 0..IMMEDIATE_WRITE_BATCH {
+            turn.push(immediate.pop().expect("priority frame available"));
+        }
+        turn.push(normal.pop().expect("regular frame receives a fair turn"));
+
+        assert!(turn[..IMMEDIATE_WRITE_BATCH]
+            .iter()
+            .all(|command| matches!(command, WriteCommand::ImmediatePayload(_))));
+        assert!(matches!(
+            turn[IMMEDIATE_WRITE_BATCH],
+            WriteCommand::Payload(_)
+        ));
+        assert_eq!(immediate.queue.len(), 1, "priority traffic remains bounded");
+    }
+
     /// Two producers pushing concurrently into an EMPTY queue must publish a
     /// writer wakeup. With the `len() == 1` empty->non-empty heuristic, the
     /// interleaving pushA, pushB, lenA == 2, lenB == 2 notifies nobody and the
@@ -1277,8 +1341,7 @@ mod queue_notify_tests {
         ) -> Poll<std::io::Result<usize>> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n >= 4096 {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Poll::Ready(Err(std::io::Error::other(
                     "vectored write re-issued 4096 times without progress (R-7 spin)",
                 )));
             }

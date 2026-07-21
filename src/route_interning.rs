@@ -5,8 +5,8 @@
 //! valid after reconnect.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A peer cannot grow route state beyond this per-connection limit.
 pub(crate) const MAX_ROUTES_PER_CONNECTION: usize = 65_536;
@@ -56,7 +56,9 @@ impl RouteTable {
             return None;
         }
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
-        if slot == 0 || slot == u32::MAX { return None; }
+        if slot == 0 || slot == u32::MAX {
+            return None;
+        }
         maps.by_slot.insert(slot, key);
         maps.by_key.insert(key, slot);
         Some((slot, true))
@@ -64,8 +66,13 @@ impl RouteTable {
 
     /// Receiver-side bind. Conflicting rebinding is rejected fail-closed.
     pub(crate) fn bind(&self, slot: u32, key: RouteKey) -> bool {
-        if slot == 0 { return false; }
-        let mut maps = match self.maps.write() { Ok(value) => value, Err(_) => return false };
+        if slot == 0 {
+            return false;
+        }
+        let mut maps = match self.maps.write() {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
         match maps.by_slot.get(&slot) {
             Some(existing) if *existing != key => false,
             Some(_) => true,
@@ -73,7 +80,11 @@ impl RouteTable {
                 if maps.by_key.len() >= self.max_routes {
                     return false;
                 }
-                if maps.by_key.get(&key).is_some_and(|existing| *existing != slot) {
+                if maps
+                    .by_key
+                    .get(&key)
+                    .is_some_and(|existing| *existing != slot)
+                {
                     return false;
                 }
                 maps.by_slot.insert(slot, key);
@@ -152,8 +163,14 @@ mod tests {
     #[test]
     fn route_slots_bind_once_and_reject_conflicts() {
         let table = RouteTable::new();
-        let first = RouteKey { actor_id: 7, type_hash: 9 };
-        let second = RouteKey { actor_id: 8, type_hash: 9 };
+        let first = RouteKey {
+            actor_id: 7,
+            type_hash: 9,
+        };
+        let second = RouteKey {
+            actor_id: 8,
+            type_hash: 9,
+        };
         let (slot, fresh) = table.slot_for(first).unwrap();
         assert!(fresh);
         assert_eq!(table.slot_for(first), Some((slot, false)));
@@ -166,7 +183,12 @@ mod tests {
     #[test]
     fn reconnect_starts_with_no_stale_slots() {
         let old = RouteTable::new();
-        let (slot, _) = old.slot_for(RouteKey { actor_id: 7, type_hash: 9 }).unwrap();
+        let (slot, _) = old
+            .slot_for(RouteKey {
+                actor_id: 7,
+                type_hash: 9,
+            })
+            .unwrap();
         let new_connection = RouteTable::new();
         assert_eq!(new_connection.resolve(slot), None);
     }
@@ -174,7 +196,10 @@ mod tests {
     #[test]
     fn failed_first_bind_can_be_rolled_back_for_a_safe_retry() {
         let table = RouteTable::new();
-        let key = RouteKey { actor_id: 7, type_hash: 9 };
+        let key = RouteKey {
+            actor_id: 7,
+            type_hash: 9,
+        };
         let (slot, fresh) = table.slot_for(key).unwrap();
         assert!(fresh);
         table.remove_unbound(slot, key);
@@ -187,8 +212,14 @@ mod tests {
     #[test]
     fn route_table_has_a_hard_per_connection_limit() {
         let table = RouteTable::with_limit(1);
-        let first = RouteKey { actor_id: 7, type_hash: 9 };
-        let second = RouteKey { actor_id: 8, type_hash: 9 };
+        let first = RouteKey {
+            actor_id: 7,
+            type_hash: 9,
+        };
+        let second = RouteKey {
+            actor_id: 8,
+            type_hash: 9,
+        };
         assert!(table.slot_for(first).is_some());
         assert_eq!(table.slot_for(second), None);
         assert!(!table.bind(2, second));
@@ -201,7 +232,10 @@ mod tests {
     #[test]
     fn qa_r3_unbound_route_guard_rolls_back_only_while_armed() {
         let table = RouteTable::new();
-        let key = RouteKey { actor_id: 7, type_hash: 9 };
+        let key = RouteKey {
+            actor_id: 7,
+            type_hash: 9,
+        };
 
         // Armed drop -> rolled back.
         let (slot, fresh) = table.slot_for(key).unwrap();

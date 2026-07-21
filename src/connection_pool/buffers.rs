@@ -22,9 +22,6 @@ impl InlineFrameHeader {
         self.len as usize
     }
 
-    pub fn into_bytes(self) -> bytes::Bytes {
-        bytes::Bytes::copy_from_slice(self.as_slice())
-    }
 }
 
 /// Vectored write command for zero-copy header + payload operations.

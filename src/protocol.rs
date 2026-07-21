@@ -127,7 +127,10 @@ impl InProgressStream {
             return true;
         }
         let full_words = expected / 64;
-        if self.received_chunks[..full_words].iter().any(|w| *w != u64::MAX) {
+        if self.received_chunks[..full_words]
+            .iter()
+            .any(|w| *w != u64::MAX)
+        {
             return false;
         }
         let remainder = expected % 64;
@@ -155,7 +158,13 @@ impl StreamingState {
         pool: Arc<crate::AlignedBytesPool>,
         schema_hash: Option<u64>,
     ) -> Result<()> {
-        self.start_stream_with_correlation_and_kind(header, correlation_id, pool, schema_hash, false)
+        self.start_stream_with_correlation_and_kind(
+            header,
+            correlation_id,
+            pool,
+            schema_hash,
+            false,
+        )
     }
 
     pub fn start_stream_with_correlation_and_kind(
@@ -220,21 +229,21 @@ impl StreamingState {
         }
         let buffer = crate::PooledAlignedBuffer::with_len(total_size, pool);
         let stream = InProgressStream {
-                stream_id: header.stream_id,
-                total_size: header.total_size,
-                type_hash: header.type_hash,
-                actor_id: header.actor_id,
-                correlation_id,
-                is_response,
-                schema_hash,
-                received_size: 0,
-                buffer,
-                chunk_stride: None,
-                received_chunks: Vec::new(),
-                expected_chunks: None,
-                duplicate_chunks: 0,
-                started_at: std::time::Instant::now(),
-                last_activity: std::time::Instant::now(),
+            stream_id: header.stream_id,
+            total_size: header.total_size,
+            type_hash: header.type_hash,
+            actor_id: header.actor_id,
+            correlation_id,
+            is_response,
+            schema_hash,
+            received_size: 0,
+            buffer,
+            chunk_stride: None,
+            received_chunks: Vec::new(),
+            expected_chunks: None,
+            duplicate_chunks: 0,
+            started_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
         };
         self.active_streams.insert(header.stream_id, stream);
         Ok(())
@@ -255,7 +264,13 @@ impl StreamingState {
                 "V5 StreamStartData has invalid first chunk length",
             )));
         }
-        self.start_stream_with_correlation_and_kind(header, correlation_id, pool, None, is_response)?;
+        self.start_stream_with_correlation_and_kind(
+            header,
+            correlation_id,
+            pool,
+            None,
+            is_response,
+        )?;
         self.reserve_v5_chunk(header.stream_id, 0, first_chunk_len)
     }
 
@@ -345,7 +360,12 @@ impl StreamingState {
                 "duplicate V5 stream chunk",
             )));
         }
-        Ok(StreamChunkReservation { stream_id, chunk_index, offset, len: chunk_len })
+        Ok(StreamChunkReservation {
+            stream_id,
+            chunk_index,
+            offset,
+            len: chunk_len,
+        })
     }
 
     pub(crate) fn reserve_v5_chunk_or_discard(
@@ -357,11 +377,13 @@ impl StreamingState {
         if self.rejected_streams.contains_key(&stream_id) {
             return Ok(None);
         }
-        self.reserve_v5_chunk(stream_id, chunk_index, chunk_len).map(Some)
+        self.reserve_v5_chunk(stream_id, chunk_index, chunk_len)
+            .map(Some)
     }
 
     fn reject_stream(&mut self, stream_id: u64) -> Result<()> {
-        self.rejected_streams.retain(|_, at| at.elapsed() <= STREAM_IDLE_TIMEOUT);
+        self.rejected_streams
+            .retain(|_, at| at.elapsed() <= STREAM_IDLE_TIMEOUT);
         if !self.rejected_streams.contains_key(&stream_id)
             && self.rejected_streams.len() >= MAX_REJECTED_STREAMS
         {
@@ -370,7 +392,8 @@ impl StreamingState {
                 "too many rejected streams",
             )));
         }
-        self.rejected_streams.insert(stream_id, std::time::Instant::now());
+        self.rejected_streams
+            .insert(stream_id, std::time::Instant::now());
         Ok(())
     }
 
@@ -379,9 +402,15 @@ impl StreamingState {
         reservation: StreamChunkReservation,
         read: usize,
     ) -> Result<&mut [u8]> {
-        let stream = self.active_streams.get_mut(&reservation.stream_id).ok_or_else(|| {
-            GossipError::Network(std::io::Error::new(std::io::ErrorKind::InvalidData, "stream vanished"))
-        })?;
+        let stream = self
+            .active_streams
+            .get_mut(&reservation.stream_id)
+            .ok_or_else(|| {
+                GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream vanished",
+                ))
+            })?;
         if read > reservation.len {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -398,9 +427,15 @@ impl StreamingState {
         reservation: StreamChunkReservation,
     ) -> Result<Option<CompletedV5Stream>> {
         let completed = {
-            let stream = self.active_streams.get_mut(&reservation.stream_id).ok_or_else(|| {
-                GossipError::Network(std::io::Error::new(std::io::ErrorKind::InvalidData, "stream vanished"))
-            })?;
+            let stream = self
+                .active_streams
+                .get_mut(&reservation.stream_id)
+                .ok_or_else(|| {
+                    GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stream vanished",
+                    ))
+                })?;
             let word = reservation.chunk_index / 64;
             let bit = 1u64 << (reservation.chunk_index % 64);
             if stream.received_chunks[word] & bit != 0 {
@@ -417,7 +452,10 @@ impl StreamingState {
         if !completed {
             return Ok(None);
         }
-        let stream = self.active_streams.remove(&reservation.stream_id).expect("completed stream exists");
+        let stream = self
+            .active_streams
+            .remove(&reservation.stream_id)
+            .expect("completed stream exists");
         Ok(Some(CompletedV5Stream {
             actor_id: stream.actor_id,
             type_hash: stream.type_hash,
@@ -491,14 +529,12 @@ impl StreamingState {
         }
 
         let chunk_index = header.chunk_index as usize;
-        let offset = chunk_index
-            .checked_mul(stride)
-            .ok_or_else(|| {
-                GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("chunk offset overflow for stream_id={}", header.stream_id),
-                ))
-            })?;
+        let offset = chunk_index.checked_mul(stride).ok_or_else(|| {
+            GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("chunk offset overflow for stream_id={}", header.stream_id),
+            ))
+        })?;
         let end = offset + chunk_data.len();
         if end > stream.total_size as usize {
             return Err(GossipError::Network(std::io::Error::new(
@@ -567,10 +603,7 @@ impl StreamingState {
         }
     }
 
-    pub fn metadata_for(
-        &self,
-        stream_id: u64,
-    ) -> Option<(u64, u32, u32, bool)> {
+    pub fn metadata_for(&self, stream_id: u64) -> Option<(u64, u32, u32, bool)> {
         self.active_streams.get(&stream_id).map(|stream| {
             (
                 stream.actor_id,
@@ -907,10 +940,13 @@ pub(crate) async fn process_read_result(
                         return Ok(());
                     }
                     let metadata = streaming_state.metadata_for(stream_header.stream_id);
-                    if let Ok(Some((complete_data, corr_id, schema_hash))) =
-                        streaming_state.add_chunk_with_correlation(stream_header, chunk_data, schema_hash)
+                    if let Ok(Some((complete_data, corr_id, schema_hash))) = streaming_state
+                        .add_chunk_with_correlation(stream_header, chunk_data, schema_hash)
                     {
-                        if metadata.map(|(_, _, _, response)| response).unwrap_or(is_response) {
+                        if metadata
+                            .map(|(_, _, _, response)| response)
+                            .unwrap_or(is_response)
+                        {
                             handle_response_message(
                                 registry,
                                 peer_addr,
@@ -925,7 +961,8 @@ pub(crate) async fn process_read_result(
                                 registry,
                                 peer_addr,
                                 authenticated_peer_id.or_else(|| {
-                                    response_connection.and_then(|conn| conn.embedded_peer_id.as_ref())
+                                    response_connection
+                                        .and_then(|conn| conn.embedded_peer_id.as_ref())
                                 }),
                                 actor_id,
                                 type_hash,
@@ -947,7 +984,10 @@ pub(crate) async fn process_read_result(
                     let Some((actor_id, type_hash, _, is_response)) =
                         streaming_state.metadata_for(stream_header.stream_id)
                     else {
-                        warn!(stream_id = stream_header.stream_id, "Dropping stream chunk without start");
+                        warn!(
+                            stream_id = stream_header.stream_id,
+                            "Dropping stream chunk without start"
+                        );
                         return Ok(());
                     };
                     if let Ok(Some((complete_data, corr_id, schema_hash))) = streaming_state
@@ -1034,7 +1074,10 @@ pub(crate) async fn process_read_result(
         }
         MessageReadResult::StreamAbort { stream_id, reason } => {
             if !streaming_state.abort_stream(stream_id) {
-                warn!(stream_id, reason, "Ignoring V5 stream abort for unknown stream");
+                warn!(
+                    stream_id,
+                    reason, "Ignoring V5 stream abort for unknown stream"
+                );
             }
         }
         MessageReadResult::Raw(_payload) => {
@@ -1516,10 +1559,9 @@ mod tests {
     #[test]
     fn finalize_empty_stream_survives_exhausted_pool() {
         let pool = Arc::new(crate::AlignedBytesPool::new(2));
-        let _checked_out: Vec<_> = std::iter::from_fn(|| {
-            (pool.available_count() > 0).then(|| pool.get_buffer(64))
-        })
-        .collect();
+        let _checked_out: Vec<_> =
+            std::iter::from_fn(|| (pool.available_count() > 0).then(|| pool.get_buffer(64)))
+                .collect();
         assert_eq!(pool.available_count(), 0, "pool must be fully checked out");
 
         let mut state = StreamingState::new();
@@ -1819,7 +1861,10 @@ mod tests {
             .expect("complete stream");
         assert_eq!(complete.payload.as_ref(), b"abcde");
         assert_eq!(complete.payload.as_ref().as_ptr(), first_ptr);
-        assert_eq!((complete.payload.as_ref().as_ptr() as usize) % crate::PAYLOAD_ALIGNMENT, 0);
+        assert_eq!(
+            (complete.payload.as_ref().as_ptr() as usize) % crate::PAYLOAD_ALIGNMENT,
+            0
+        );
     }
 
     #[test]
@@ -1842,7 +1887,10 @@ mod tests {
                 2,
             )
             .unwrap();
-        state.v5_chunk_target(reservation, 0).unwrap().copy_from_slice(b"ab");
+        state
+            .v5_chunk_target(reservation, 0)
+            .unwrap()
+            .copy_from_slice(b"ab");
         assert!(state.abort_stream(88));
         assert!(!state.abort_stream(88));
         assert!(state.commit_v5_chunk(reservation).is_err());
@@ -1891,33 +1939,37 @@ mod tests {
             )
             .expect("resource pressure is a stream-local rejection");
         assert!(rejected.is_none());
-        assert!(state
-            .reserve_v5_chunk_or_discard(17, 1, 1)
-            .expect("trailing chunk is discarded")
-            .is_none());
+        assert!(
+            state
+                .reserve_v5_chunk_or_discard(17, 1, 1)
+                .expect("trailing chunk is discarded")
+                .is_none()
+        );
         assert_eq!(state.active_stream_count(), 16);
 
         // Once pressure clears, a later StreamStart is a new generation on
         // the ordered transport and must not be silently discarded because
         // its old generation was tombstoned.
         assert!(state.abort_stream(1));
-        assert!(state
-            .begin_v5_stream_or_discard(
-                crate::StreamHeader {
-                    stream_id: 17,
-                    total_size: 1,
-                    chunk_size: 1,
-                    chunk_index: 0,
-                    type_hash: 0,
-                    actor_id: 0,
-                },
-                0,
-                Arc::new(crate::AlignedBytesPool::new(1)),
-                false,
-                1,
-            )
-            .expect("a retry start is valid after pressure clears")
-            .is_some());
+        assert!(
+            state
+                .begin_v5_stream_or_discard(
+                    crate::StreamHeader {
+                        stream_id: 17,
+                        total_size: 1,
+                        chunk_size: 1,
+                        chunk_index: 0,
+                        type_hash: 0,
+                        actor_id: 0,
+                    },
+                    0,
+                    Arc::new(crate::AlignedBytesPool::new(1)),
+                    false,
+                    1,
+                )
+                .expect("a retry start is valid after pressure clears")
+                .is_some()
+        );
     }
 
     #[test]

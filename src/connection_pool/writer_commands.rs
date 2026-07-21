@@ -10,6 +10,10 @@ enum WriteCommand {
 }
 
 /// Commands for streaming operations.
+#[expect(
+    dead_code,
+    reason = "the direct write command remains part of the writer-owned transport command set"
+)]
 enum StreamingCommand {
     /// Direct write bytes for streaming.
     WriteBytes(bytes::Bytes),

@@ -10,7 +10,6 @@
     clippy::manual_is_multiple_of,
     clippy::needless_borrow,
     clippy::needless_lifetimes,
-    clippy::needless_return,
     clippy::option_as_ref_deref,
     clippy::question_mark,
     clippy::redundant_pattern_matching,
