@@ -3211,7 +3211,11 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let now = current_timestamp();
             let age_secs = now.saturating_sub(location.wall_clock_time);
-            if age_secs < self.config.actor_ttl.as_secs() {
+            if age_secs < self.config.actor_ttl.as_secs()
+                // R-1: a connected owner's actor is reachable regardless of
+                // wall-clock age; TTL only gates actors of unreachable peers.
+                || self.owner_peer_is_connected(&location)
+            {
                 debug!(
                     actor_name = %name,
                     location = "remote",
@@ -5106,6 +5110,20 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Clean up stale actor entries (using wall clock for TTL)
+    /// R-1: whether the owning peer of `location` currently has a live
+    /// (Connected) connection. Used to exempt connected owners from actor-TTL
+    /// reaping and the lookup age gate, so TTL only governs actors of
+    /// unreachable peers (its actual purpose). Best-effort: parses the owner's
+    /// advertised address and asks the pool for a live connection.
+    fn owner_peer_is_connected(&self, location: &RemoteActorLocation) -> bool {
+        location
+            .address
+            .parse::<SocketAddr>()
+            .ok()
+            .and_then(|addr| self.connection_pool.get_existing_connection(addr))
+            .is_some()
+    }
+
     pub async fn cleanup_stale_actors(&self) {
         let now = current_timestamp();
         let ttl_secs = self.config.actor_ttl.as_secs();
@@ -5116,7 +5134,12 @@ impl<T: 'static> GossipRegistry<T> {
 
             let mut to_remove = Vec::new();
             self.actor_state.known_actors.iter_sync(|k, location| {
-                if now.saturating_sub(location.wall_clock_time) >= ttl_secs {
+                if now.saturating_sub(location.wall_clock_time) >= ttl_secs
+                    // R-1: do not TTL-reap an actor whose owning peer is
+                    // currently connected -- TTL then only governs actors of
+                    // unreachable peers.
+                    && !self.owner_peer_is_connected(location)
+                {
                     to_remove.push(k.clone());
                 }
                 true

@@ -891,6 +891,15 @@ impl RoutedPubSub {
 
                 let groups = self.route_groups.load();
                 let Some(groups) = groups.get(&topic_key) else {
+                    // R-1: no route for this topic (e.g. the owning
+                    // subscriber's interest actor was TTL-reaped). Surface it
+                    // via the route-miss stat instead of a silent Ok with zero
+                    // sends.
+                    stats.remote_route_miss = stats.remote_route_miss.saturating_add(1);
+                    warn!(
+                        topic = ?topic_key,
+                        "publish to topic with no remote route (remote_route_miss)"
+                    );
                     return Ok(());
                 };
                 for (next_hop, destinations) in groups.iter() {
