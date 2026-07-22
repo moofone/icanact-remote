@@ -106,6 +106,37 @@ impl LockFreeConnection {
     /// Abort all tracked background tasks (writer, reader).
     /// Call this when tearing down the connection to prevent resource leaks.
     pub fn abort_tasks(&self) {
+        self.abort_tasks_inner(true);
+    }
+
+    /// Same as [`Self::abort_tasks`], but never calls `cancel_all()` on
+    /// `correlation`.
+    ///
+    /// `correlation` is a SESSION-level `Arc<CorrelationTracker>`, shared by
+    /// pointer across every reconnect instance for a peer (installed via
+    /// `ConnectionPool::get_or_create_correlation_tracker` /
+    /// `add_connection_by_peer_id`). Callers that are tearing down a
+    /// DISPLACED/losing connection instance while a DIFFERENT, still-live
+    /// sibling instance for the same peer keeps using that identical tracker
+    /// Arc (e.g. `retire_displaced_expected` retiring `expected` after
+    /// `winner` is already published, or
+    /// `unpublish_rejected_outbound_candidate` discarding a candidate while
+    /// restoring a still-live `existing_before`) must use this instead of
+    /// `abort_tasks()`: an unconditional `cancel_all()` there would cancel
+    /// the SURVIVING sibling's in-flight ask slots, not just the instance
+    /// actually being torn down.
+    ///
+    /// Callers must first confirm the tracker is actually shared with a
+    /// still-live sibling (see [`shares_correlation_tracker`]) — this only
+    /// skips the cancellation, it does not itself decide whether skipping is
+    /// correct. A genuinely final teardown (no surviving sibling) must keep
+    /// using `abort_tasks()` so its own in-flight callers still observe
+    /// `ConnectionDropped` instead of hanging until timeout.
+    pub(crate) fn abort_tasks_keep_correlation(&self) {
+        self.abort_tasks_inner(false);
+    }
+
+    fn abort_tasks_inner(&self, cancel_correlation: bool) {
         // NOTE: `JoinHandle::abort()` does not run destructors inside the task. Our IO task
         // sets `exit_flag` and cancels all pending correlation slots via an `ExitGuard` in Drop.
         // If we abort without also flipping these flags, callers can observe a "zombie handle"
@@ -115,7 +146,7 @@ impl LockFreeConnection {
             handle.exit_flag.store(true, Ordering::Release);
             handle.exit_notify.notify_waiters();
         }
-        if let Some(correlation) = self.correlation.as_ref() {
+        if cancel_correlation && let Some(correlation) = self.correlation.as_ref() {
             correlation.cancel_all();
         }
         self.task_tracker.abort_all();
@@ -160,6 +191,19 @@ impl LockFreeConnection {
 
     pub fn is_connected(&self) -> bool {
         self.get_state() == ConnectionState::Connected
+    }
+
+    /// True when `self` and `other` hold the exact same `Arc<CorrelationTracker>`
+    /// pointer (a shared, SESSION-level tracker) rather than merely
+    /// `==`-equal/independent trackers. See
+    /// [`Self::abort_tasks_keep_correlation`] for why callers retiring one of
+    /// two sibling instances for the same peer must check this before
+    /// deciding whether `cancel_all()` is safe to run.
+    pub(crate) fn shares_correlation_tracker(&self, other: &Self) -> bool {
+        matches!(
+            (self.correlation.as_ref(), other.correlation.as_ref()),
+            (Some(a), Some(b)) if Arc::ptr_eq(a, b)
+        )
     }
 
     pub(crate) fn has_live_stream(&self) -> bool {
