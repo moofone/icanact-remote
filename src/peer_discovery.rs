@@ -357,7 +357,17 @@ impl PeerDiscovery {
             }
         }
 
-        // Atomically mark candidates as pending using peer_states
+        // Atomically mark candidates as pending using peer_states.
+        //
+        // A candidate here may be a brand-new peer OR a previously-Failed
+        // peer whose backoff window has just elapsed (see the `Failed`
+        // arm above): it is legitimately dial-eligible again, so it still
+        // needs to move out of `Failed` to be returned as a fresh dial
+        // candidate. Overwriting with `Pending` here does NOT lose its
+        // failure history: the legacy `failed_peers` ledger is intentionally
+        // left untouched (unlike `on_peer_connected`, which clears it on
+        // genuine recovery), so `on_peer_failure` can recover `attempts` /
+        // `retry_delay_seconds` from it if this dial fails again (R-P).
         for addr in &candidates {
             self.peer_states
                 .insert(*addr, PeerState::Pending { since: now });
@@ -430,14 +440,31 @@ impl PeerDiscovery {
     pub fn on_peer_failure(&mut self, addr: SocketAddr) -> bool {
         let now = current_timestamp();
 
-        // Get current attempts from unified state
+        // Get current attempts from unified state, falling back to the
+        // legacy failure ledger (`failed_peers`) when the unified state is
+        // no longer `Failed`. This handles a peer that is still in backoff
+        // but whose `PeerState` was transitioned to `Pending` by an
+        // intervening `on_peer_list_gossip` re-observation (see that
+        // method): the peer has NOT actually recovered, so its accumulated
+        // `attempts`/`retry_delay_seconds` must survive the transition.
+        // Without this fallback, backoff never escalates past the first
+        // window and a permanently-dead gossiped peer is redialed forever
+        // instead of eventually hitting MAX_PEER_FAILURES (R-P).
+        //
+        // `failed_peers` is only cleared on genuine recovery
+        // (`on_peer_connected`), on TTL expiry (`cleanup_expired`), or on
+        // removal (the `should_remove` branch below), so a brand-new peer
+        // correctly falls through to `(0, MIN_BACKOFF_SECONDS)`.
         let (current_attempts, previous_delay) = match self.peer_states.get(&addr) {
             Some(PeerState::Failed {
                 attempts,
                 retry_delay_seconds,
                 ..
             }) => (*attempts, *retry_delay_seconds),
-            _ => (0, MIN_BACKOFF_SECONDS), // Any other state or no state means first failure
+            _ => match self.failed_peers.get(&addr) {
+                Some(legacy) => (legacy.consecutive_failures, legacy.retry_delay_seconds),
+                None => (0, MIN_BACKOFF_SECONDS), // Truly new peer: first failure
+            },
         };
 
         let new_attempts = current_attempts.saturating_add(1);
@@ -1410,6 +1437,92 @@ mod tests {
             discovery.failed_peer_count()
         );
         assert_eq!(discovery.failed_count_unified(), 1);
+    }
+
+    /// R-P (P1): a PeerListGossip re-observation of a peer that is currently
+    /// in Failed backoff must NOT clobber its accumulated `attempts` /
+    /// `retry_delay_seconds`. Before the fix, `on_peer_list_gossip`
+    /// unconditionally overwrote the Failed state with a fresh
+    /// `Pending { since }` once the backoff window elapsed, so the very next
+    /// `on_peer_failure` fell into the `_ => (0, MIN_BACKOFF_SECONDS)` arm
+    /// and treated the peer as failing for the first time again. That
+    /// destroys backoff escalation (stuck at the first 2-6s window forever)
+    /// and means `attempts` can never reach MAX_PEER_FAILURES, so a
+    /// permanently-dead gossiped peer is redialed forever and never removed.
+    #[test]
+    fn gossip_reobservation_of_failed_peer_preserves_backoff_escalation() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::with_defaults(local);
+        let peer = test_addr(9500);
+
+        let gossip_for_peer = || vec![create_peer_gossip(&peer.to_string())];
+
+        // Bring the peer into discovery the way real gossip does: first
+        // observation admits it as a brand-new Pending candidate.
+        let candidates = discovery.on_peer_list_gossip(&gossip_for_peer());
+        assert_eq!(
+            candidates,
+            vec![peer],
+            "peer should be admitted as a new pending candidate"
+        );
+
+        let mut previous_attempts = 0u8;
+        for i in 1..=MAX_PEER_FAILURES {
+            // Simulated dial attempt fails.
+            let removed = discovery.on_peer_failure(peer);
+
+            if i < MAX_PEER_FAILURES {
+                assert!(!removed, "peer removed too early on iteration {i}");
+                let state = discovery.get_peer_state(&peer).expect("must still be tracked");
+                let (_, attempts) = state.failure_info().expect("must be in Failed state");
+                assert_eq!(
+                    attempts, i,
+                    "attempts must escalate monotonically across interleaved gossip \
+                     re-observations (iteration {i}); a clobber resets it back to 1"
+                );
+                assert!(
+                    attempts > previous_attempts,
+                    "attempts regressed/reset on iteration {i}: {attempts} <= {previous_attempts}"
+                );
+                previous_attempts = attempts;
+
+                // Force this Failed peer's backoff window to look elapsed
+                // (avoids sleeping in the test) and let gossip re-observe it,
+                // exactly as happens once its real backoff naturally expires.
+                if let PeerState::Failed {
+                    attempts,
+                    retry_delay_seconds,
+                    ..
+                } = *discovery.get_peer_state(&peer).unwrap()
+                {
+                    discovery.peer_states.insert(
+                        peer,
+                        PeerState::Failed {
+                            since: 0,
+                            attempts,
+                            retry_delay_seconds,
+                        },
+                    );
+                }
+                let regossip = discovery.on_peer_list_gossip(&gossip_for_peer());
+                assert_eq!(
+                    regossip,
+                    vec![peer],
+                    "a backoff-expired Failed peer must still be dial-eligible via \
+                     gossip re-observation (iteration {i})"
+                );
+            } else {
+                assert!(
+                    removed,
+                    "peer must be removed once MAX_PEER_FAILURES consecutive failures \
+                     are reached, not redialed forever"
+                );
+                assert!(
+                    discovery.get_peer_state(&peer).is_none(),
+                    "removed peer must not remain tracked in discovery"
+                );
+            }
+        }
     }
 
     /// Test cleanup_expired works with unified peer_states
