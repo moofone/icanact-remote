@@ -271,10 +271,19 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// Try to send a routed PubSub payload without awaiting on the write queue.
+    ///
+    /// R-D: this MUST use the normal (non-immediate) write queue. The
+    /// `immediate_write_queue` is a small, fixed-size lane reserved
+    /// exclusively for latency-critical control-plane replies (see the
+    /// invariant documented on `LockFreeStreamHandle::immediate_write_queue`
+    /// in `stream_writer.rs`); routing pubsub DATA-plane traffic through it
+    /// both shrinks pubsub burst admission (128 slots vs. the normal queue's
+    /// `DEFAULT_ASK_WINDOW * 8` = 1024) and lets a pubsub burst consume the
+    /// capacity a control-plane reply needs, defeating the reservation.
     pub fn try_send_pubsub_payload(&self, payload: bytes::Bytes) -> Result<()> {
         let header = framing::write_pubsub_frame_prefix(payload.len());
         if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle.write_header_and_payload_control_inline_immediate_nonblocking(
+            stream_handle.write_header_and_payload_control_inline_nonblocking(
                 header,
                 crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
                 payload,
@@ -288,6 +297,9 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// Try to send a routed PubSub payload from a pooled buffer without allocating.
+    ///
+    /// R-D: see `try_send_pubsub_payload` — must stay on the normal write
+    /// queue, never the reserved immediate control-reply lane.
     pub fn try_send_pubsub_payload_pooled(
         &self,
         payload: crate::typed::PooledPayload,
@@ -297,7 +309,7 @@ impl<T> ConnectionHandle<T> {
         let header = framing::write_pubsub_frame_prefix(payload_len);
         let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
         if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle.write_pooled_control_inline_immediate_nonblocking(
+            stream_handle.write_pooled_control_inline_nonblocking(
                 header,
                 crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
                 prefix,
@@ -1182,5 +1194,103 @@ impl<T> ConnectionHandle<T> {
                 format!("connection {} has no writer path", self.addr),
             )))
         }
+    }
+}
+
+/// R-D (P1): routed-pubsub DATA-plane frames must never share admission
+/// capacity with the `immediate_write_queue` that PR #157 reserved exclusively
+/// for latency-critical control-plane replies (see the invariant documented
+/// at `stream_writer.rs` on `LockFreeStreamHandle::immediate_write_queue`).
+/// Before the fix, `try_send_pubsub_payload{,_pooled}` enqueued onto that same
+/// 128-slot lane, which both (a) shrank pubsub burst admission from the
+/// normal write queue's 1024 slots down to 128, and (b) let a pubsub burst
+/// fill the lane so a genuine `AskResponder::try_reply_bytes_immediate` call
+/// gets `WriteQueueFull` even though its capacity was supposed to be reserved.
+#[cfg(test)]
+mod pubsub_lane_tests {
+    use super::*;
+    use crate::ask_responder::AskResponder;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:19999".parse().expect("valid test addr")
+    }
+
+    /// Builds a `ConnectionHandle` (the exact production entry point routed
+    /// pubsub sends through) plus the underlying stream handle so the test can
+    /// also mint an `AskResponder` for the reserved control-reply path.
+    ///
+    /// The duplex's peer end is intentionally never read from, and the test
+    /// bodies never `.await` before their assertions, so the background writer
+    /// task (spawned but not yet polled) never drains either queue — both
+    /// stay genuinely full for the duration of the check.
+    fn make_handle() -> (ConnectionHandle, Arc<LockFreeStreamHandle>, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64);
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            test_addr(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream_handle = Arc::new(stream_handle);
+        let correlation = CorrelationTracker::new();
+        let conn = ConnectionHandle::new_stream(test_addr(), stream_handle.clone(), correlation);
+        (conn, stream_handle, task)
+    }
+
+    /// RED (starvation): fill the immediate lane with routed-pubsub frames via
+    /// the production `try_send_pubsub_payload` path, then assert a
+    /// control-plane immediate reply is STILL admitted. Fails today because
+    /// pubsub and control replies share the same 128-slot
+    /// `immediate_write_queue`.
+    #[tokio::test]
+    async fn pubsub_burst_must_not_starve_reserved_control_reply_capacity() {
+        let (conn, stream_handle, _task) = make_handle();
+
+        let mut filled = 0usize;
+        for _ in 0..256 {
+            match conn.try_send_pubsub_payload(bytes::Bytes::from_static(b"pubsub-burst")) {
+                Ok(()) => filled += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            filled >= 128,
+            "expected the pubsub burst to saturate at least the historical \
+             128-slot immediate lane; only {filled} frames were admitted"
+        );
+
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(1, stream_handle.clone(), used);
+        let result = responder.try_reply_bytes_immediate(bytes::Bytes::from_static(b"reply"));
+        assert!(
+            result.is_ok(),
+            "control-plane reply must not be starved by a pubsub burst sharing \
+             the reserved immediate lane (R-D): {result:?}"
+        );
+    }
+
+    /// RED (capacity regression): pre-#157, routed pubsub shared the normal
+    /// write queue (`DEFAULT_ASK_WINDOW * 8` = 1024 slots). Routing it through
+    /// the 128-slot immediate lane instead silently drops burst frames 129+
+    /// that the old queue would have absorbed.
+    #[tokio::test]
+    async fn pubsub_burst_capacity_must_not_regress_below_normal_write_queue() {
+        let (conn, _stream_handle, _task) = make_handle();
+
+        let mut filled = 0usize;
+        for _ in 0..2000 {
+            match conn.try_send_pubsub_payload(bytes::Bytes::from_static(b"x")) {
+                Ok(()) => filled += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            filled >= 1024,
+            "pubsub burst capacity regressed: only {filled} frames were \
+             admitted before WriteQueueFull (expected >= 1024, matching the \
+             normal write queue restored by the R-D fix)"
+        );
     }
 }
