@@ -2219,6 +2219,8 @@ impl LockFreeStreamHandle {
     /// Queue a compact ActorAsk, installing its connection-local route first.
     /// Both frames use the one ordered writer queue; the small gate only spans
     /// enqueueing, so no response wait or network I/O is serialized here.
+    /// Falls back to the uncompact `ActorAsk` frame when the route table has
+    /// no slot available for a new (actor_id, type_hash) pair.
     pub async fn write_routed_actor_ask(
         &self,
         correlation_id: u32,
@@ -2237,10 +2239,25 @@ impl LockFreeStreamHandle {
         // stale `needs_bind == false` slot.
         let _route_guard = self.route_bind_gate.lock().await;
         let route = crate::route_interning::RouteKey { actor_id, type_hash };
-        let (route_slot, needs_bind) = self
-            .outbound_routes
-            .slot_for(route)
-            .ok_or(GossipError::Shutdown)?;
+        let Some((route_slot, needs_bind)) = self.outbound_routes.slot_for(route) else {
+            // The connection-local slot space is exhausted (either the
+            // MAX_ROUTES_PER_CONNECTION cap, or, vanishingly rarely, the
+            // slot-id counter itself). Slots are never unilaterally recycled:
+            // the peer only learns a slot is free via an explicit unbind it
+            // acknowledges, and no such handshake exists today, so evicting
+            // one here could hand a still-referenced id to a new
+            // (actor_id, type_hash) and let the peer misroute a compact
+            // frame to the wrong actor. Falling back to the uncompact
+            // `ActorAsk` frame is always safe instead: it carries actor_id
+            // and type_hash directly and needs no connection-local slot at
+            // all, so this ask (and every later one on this connection) still
+            // succeeds rather than the connection being torn down.
+            let header =
+                crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
+            return self
+                .write_header_and_payload_ask_inline32(header, payload)
+                .await;
+        };
         if needs_bind {
             let bind = crate::framing::write_route_bind_header(route_slot, actor_id, type_hash);
             // R-3: arm an RAII rollback for the fresh allocation. If this future
@@ -3242,6 +3259,145 @@ mod route_interning_tests {
             .slot_for(crate::route_interning::RouteKey { actor_id: 7, type_hash: 9 })
             .unwrap();
         assert!(retry_is_fresh, "failed bind must not publish its route");
+    }
+
+    /// P1: a full route table must fall back to the uncompact `ActorAsk`
+    /// frame (which carries `actor_id`/`type_hash` directly and needs no
+    /// connection-local slot) instead of permanently failing every new ask
+    /// on the connection with a misleading `GossipError::Shutdown`.
+    #[tokio::test]
+    async fn route_table_full_falls_back_to_uncompact_actor_ask_instead_of_failing() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9910".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+
+        for i in 0..crate::route_interning::MAX_ROUTES_PER_CONNECTION as u64 {
+            writer
+                .outbound_routes
+                .slot_for(crate::route_interning::RouteKey {
+                    actor_id: i,
+                    type_hash: 1,
+                })
+                .expect("table has room until MAX_ROUTES_PER_CONNECTION");
+        }
+
+        let result = writer
+            .write_routed_actor_ask(1, 999_999, 42, bytes::Bytes::from_static(b"payload"))
+            .await;
+        assert!(
+            result.is_ok(),
+            "a full route table must fall back to an uncompact ask, not fail the send: {result:?}"
+        );
+
+        let mut header = [0u8; crate::framing::ACTOR_ASK_FRAME_HEADER_LEN];
+        peer.read_exact(&mut header).await.unwrap();
+        let control =
+            crate::framing::decode_control(header[..4].try_into().unwrap()).unwrap();
+        assert_eq!(
+            control.kind,
+            crate::framing::WireKind::ActorAsk,
+            "fallback must use the uncompact ActorAsk frame, which needs no connection-local slot"
+        );
+        let correlation_id = u32::from_be_bytes(header[4..8].try_into().unwrap());
+        let actor_id = u64::from_be_bytes(header[8..16].try_into().unwrap());
+        let type_hash = u32::from_be_bytes(header[16..20].try_into().unwrap());
+        assert_eq!(correlation_id, 1);
+        assert_eq!(actor_id, 999_999);
+        assert_eq!(type_hash, 42);
+
+        let mut payload = [0u8; 7];
+        peer.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"payload");
+
+        writer.shutdown();
+        task.await.unwrap();
+    }
+
+    /// P1: the fallback must be sustained, not a one-shot escape hatch — every
+    /// subsequent new route on a full table must also succeed via fallback,
+    /// existing (already-interned) routes must keep using the compact frame,
+    /// and the connection must stay open throughout (no teardown).
+    #[tokio::test]
+    async fn route_table_full_keeps_connection_open_for_known_and_new_routes() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9911".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+
+        for i in 0..crate::route_interning::MAX_ROUTES_PER_CONNECTION as u64 {
+            writer
+                .outbound_routes
+                .slot_for(crate::route_interning::RouteKey {
+                    actor_id: i,
+                    type_hash: 1,
+                })
+                .expect("table has room until MAX_ROUTES_PER_CONNECTION");
+        }
+
+        // A known (already-interned) route still uses the compact frame.
+        writer
+            .write_routed_actor_ask(10, 0, 1, bytes::Bytes::from_static(b"known"))
+            .await
+            .expect("an already-interned route must not be affected by a full table");
+        let mut known_header = [0u8; crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN];
+        peer.read_exact(&mut known_header).await.unwrap();
+        assert_eq!(
+            crate::framing::decode_control(known_header[..4].try_into().unwrap())
+                .unwrap()
+                .kind,
+            crate::framing::WireKind::RoutedActorAsk,
+            "an already-known route is unaffected by the table being full"
+        );
+        let mut known_payload = [0u8; 5];
+        peer.read_exact(&mut known_payload).await.unwrap();
+        assert_eq!(&known_payload, b"known");
+
+        // Two distinct brand-new routes both fall back cleanly; the
+        // connection must not be torn down after the first one.
+        for (correlation_id, actor_id) in [(20u32, 1_000_000u64), (21u32, 1_000_001u64)] {
+            let result = writer
+                .write_routed_actor_ask(
+                    correlation_id,
+                    actor_id,
+                    7,
+                    bytes::Bytes::from_static(b"new"),
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "sustained fallback must keep succeeding for new routes: {result:?}"
+            );
+            let mut header = [0u8; crate::framing::ACTOR_ASK_FRAME_HEADER_LEN];
+            peer.read_exact(&mut header).await.unwrap();
+            assert_eq!(
+                crate::framing::decode_control(header[..4].try_into().unwrap())
+                    .unwrap()
+                    .kind,
+                crate::framing::WireKind::ActorAsk
+            );
+            let mut payload = [0u8; 3];
+            peer.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"new");
+        }
+
+        assert!(
+            !writer.shutdown_signal.load(std::sync::atomic::Ordering::Relaxed),
+            "a full route table must never trigger connection shutdown"
+        );
+
+        writer.shutdown();
+        task.await.unwrap();
     }
 
     /// R-3: cancelling `write_routed_actor_ask` while its RouteBind enqueue is
