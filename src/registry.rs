@@ -4900,6 +4900,25 @@ impl<T: 'static> GossipRegistry<T> {
                 // Peer bookkeeping keys on the peer's BIND address; address
                 // REPAIR anchors on the verified TCP source (§1.6) — the
                 // peer-controlled sender_bind_addr is never a trust anchor.
+                //
+                // `session_source: None` (falls back to `verified_sender_addr`,
+                // the peer's dial-target/bind address) is only correct
+                // because this call is unreachable for real wire traffic:
+                // `handle_gossip_response` is invoked from
+                // `apply_gossip_results`, whose `GossipResult::outcome` is
+                // always built from `send_gossip_message_zero_copy`'s
+                // `Result<()>` (see `gossip_send_outcome_to_result` in
+                // handle.rs) -- a fire-and-forget send that never carries a
+                // reply. Every FullSyncResponse actually received over the
+                // wire arrives asynchronously on its own connection's read
+                // task and is processed by `handle_incoming_message`
+                // instead, which threads that connection's real
+                // `session_source` (the dialling socket's own local
+                // ephemeral port for outbound connections). If this call
+                // path is ever wired to a genuine response, `None` here
+                // would silently drop legitimate current-session outbound
+                // FullSyncResponses under the `from_current_session` gate --
+                // thread the real per-connection session source instead.
                 self.merge_full_sync_from(
                     local_actors.into_iter().collect(),
                     known_actors.into_iter().collect(),

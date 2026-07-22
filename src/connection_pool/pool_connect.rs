@@ -3207,6 +3207,15 @@ impl<T> ConnectionPool<T> {
         // into this connection's `ReadContext` so the receive path can tell
         // a redial's new connection apart from an old one still draining.
         local_session_addr: SocketAddr,
+        // R-11: the identity this exact TLS handshake cryptographically
+        // proved (derived from the live connection's own peer certificate
+        // by the caller, before the stream was moved in here). `None` if
+        // the handshake didn't yield one. Used to arm the sequence-reset
+        // exemption, but ONLY once this candidate is confirmed below to be
+        // the peer's live connection -- never for a candidate that loses
+        // the tie-break, which would strand the exemption on a socket that
+        // never becomes live.
+        fresh_session_node_id: Option<crate::GossipNodeId>,
     ) -> Result<ConnectionHandle<T>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3571,6 +3580,22 @@ impl<T> ConnectionPool<T> {
         // Another task can observe and tear down the connection immediately after publication,
         // so publication must not assume the address entry remains present beyond this point.
         debug!("CONNECTION POOL: Published connection for {}", addr);
+
+        // R-11: arm the one-shot lower-sequence exemption for OUTBOUND
+        // sessions too, not just inbound. Every early return above (a rival
+        // won the tie-break, or a publish race) happens before this point,
+        // so reaching here is the confirmation that THIS candidate is the
+        // peer's live connection -- arming any earlier could strand the
+        // exemption on a socket that never becomes live while leaving the
+        // surviving connection's subsequent gossip rejected (its source no
+        // longer matches this failed candidate).
+        if let (Some(registry_arc), Some(node_id)) =
+            (registry_weak.upgrade(), fresh_session_node_id)
+        {
+            registry_arc
+                .arm_sequence_reset_for_new_session(addr, node_id, local_session_addr)
+                .await;
+        }
 
         // Send initial FullSync message to identify ourselves
         if let Some(registry_arc) = registry_weak.upgrade() {

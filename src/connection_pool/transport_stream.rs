@@ -596,23 +596,30 @@ impl<T> ConnectionPool<T> {
                         registry_arc.mark_peer_connected(addr).await;
                     }
 
-                    // R-11: arm the one-shot lower-sequence exemption for
-                    // OUTBOUND sessions too, not just inbound. When we
-                    // redial a peer that has restarted, its
-                    // FullSyncResponse carries a lower sequence; without
-                    // arming here the stale gate rejects every one of them
-                    // and the omission-prune never runs, so its stale
-                    // actors persist until the 24h TTL — the same outage
-                    // this fix exists to close, just on the dialling side.
+                    // R-11: precompute what OUTBOUND sessions need to arm
+                    // the one-shot lower-sequence exemption, but do NOT arm
+                    // it here. `finalize_new_outbound_connection` can still
+                    // reject this exact candidate (a concurrent/preferred
+                    // rival wins the tie-break, or a publish race) without
+                    // erroring the connect attempt overall; arming before
+                    // that decision is known would strand the exemption on
+                    // a socket that never becomes live while the surviving
+                    // connection's subsequent gossip is rejected (its source
+                    // no longer matches this failed candidate). Arming is
+                    // therefore done inside `finalize_new_outbound_connection`
+                    // itself, only once this candidate is confirmed to be
+                    // the peer's live connection.
                     //
-                    // Deliberately independent of `associated_node_id` above:
-                    // that value can fall back to a cached `lookup_node_id`
-                    // lookup when this handshake itself didn't yield a
-                    // cert-derived identity, which is not evidence tied to
-                    // this session. Arming must only ever be backed by an
-                    // identity this exact TLS handshake cryptographically
-                    // proved, so it is re-derived here straight from the
-                    // live connection's own peer certificate.
+                    // The node_id is deliberately independent of
+                    // `associated_node_id` above: that value can fall back
+                    // to a cached `lookup_node_id` lookup when this
+                    // handshake itself didn't yield a cert-derived identity,
+                    // which is not evidence tied to this session. Arming
+                    // must only ever be backed by an identity this exact TLS
+                    // handshake cryptographically proved, so it is derived
+                    // here straight from the live connection's own peer
+                    // certificate -- before `tls_stream` is moved into
+                    // `finalize_new_outbound_connection`.
                     //
                     // The session discriminator is this outbound socket's
                     // OWN local ephemeral port, not the dial target `addr`.
@@ -627,14 +634,7 @@ impl<T> ConnectionPool<T> {
                     // arriving on THIS socket can consume or extend the
                     // exemption.
                     let local_session_addr = tls_stream.get_ref().0.local_addr().ok();
-                    if let (Some(node_id), Some(local_session_addr)) = (
-                        outbound_session_authenticated_node_id(&tls_stream),
-                        local_session_addr,
-                    ) {
-                        registry_arc
-                            .arm_sequence_reset_for_new_session(addr, node_id, local_session_addr)
-                            .await;
-                    }
+                    let fresh_session_node_id = outbound_session_authenticated_node_id(&tls_stream);
 
                     let finalize_started = Instant::now();
                     let result = self
@@ -647,6 +647,7 @@ impl<T> ConnectionPool<T> {
                             // GossipNodeId was pinned (bootstrap/placeholder-SNI dials).
                             discovered_node_id,
                             local_session_addr.unwrap_or(addr),
+                            fresh_session_node_id,
                         )
                         .await;
                     match &result {

@@ -469,7 +469,7 @@ async fn finalize_binds_cert_identity_over_stale_addr_map_on_rekey() {
 
     let (io, _peer_io) = tokio::io::duplex(1024);
     let _handle = pool
-        .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), Some(new_a_node_id), addr)
+        .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), Some(new_a_node_id), addr, None)
         .await
         .expect("finalize outbound connection");
 
@@ -3610,7 +3610,7 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
         // the peer id, giving us a real stream instance to pin.
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr)
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr, None)
             .await
             .expect("finalize outbound");
 
@@ -3663,7 +3663,7 @@ fn hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide() {
 
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr)
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr, None)
             .await
             .expect("finalize outbound");
 
@@ -3796,7 +3796,7 @@ fn outbound_finalize_balances_connection_counter() {
         let (io, _peer) = tokio::io::duplex(1024);
 
         let _handle = pool
-            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr)
+            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr, None)
             .await
             .expect("outbound finalize should succeed");
 
@@ -3888,7 +3888,7 @@ async fn outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter() 
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await;
 
     assert!(
@@ -3918,6 +3918,121 @@ async fn outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter() 
         pool.connection_counter.load(Ordering::SeqCst),
         counter_before,
         "a rejected outbound candidate must never bump the live connection counter"
+    );
+}
+
+/// R-11: a candidate that loses the outbound-finalize tie-break must not
+/// strand the sequence-reset exemption on a socket that never becomes live,
+/// and must not disturb the surviving live connection's own gossip.
+///
+/// Arming used to happen in the caller BEFORE `finalize_new_outbound_connection`
+/// decided whether this candidate would actually become the peer's live
+/// connection. A losing candidate (this exact scenario: a live,
+/// tie-break-preferred INBOUND session already exists) would still arm
+/// `current_session_source`/`accept_lower_sequence_from` to the LOSING
+/// candidate's own local ephemeral port -- a value the surviving inbound
+/// session's traffic can never present, since its own session source is
+/// different. Every subsequent FullSync on the surviving connection would
+/// then be gated against a session that never went live, silently breaking
+/// its gossip.
+#[tokio::test]
+async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("finalize-reject-exemption-hi", "finalize-reject-exemption-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let registry_weak = Arc::downgrade(&registry);
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // The existing, live, preferred INBOUND session, published as this
+    // peer's CURRENT connection. Its own session source (what its actual
+    // traffic will present as `verified_sender_addr`) is `existing_addr`.
+    let existing_addr: SocketAddr = "127.0.0.1:7450".parse().unwrap();
+    let (existing_io, _existing_keep) = tokio::io::duplex(1024);
+    let (existing_sh, _existing_w, _existing_r) = LockFreeStreamHandle::new(
+        existing_io,
+        existing_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut existing_conn = LockFreeConnection::new(existing_addr, ConnectionDirection::Inbound);
+    existing_conn.stream_handle = Some(Arc::new(existing_sh));
+    existing_conn.set_state(ConnectionState::Connected);
+    let existing = Arc::new(existing_conn);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        existing_addr,
+        existing.clone()
+    ));
+
+    // The peer is already known to the registry under its dial address, with
+    // a session already armed for the EXISTING (surviving) connection --
+    // exactly what a real prior inbound accept would have done.
+    let dial_addr: SocketAddr = "127.0.0.1:7451".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    registry
+        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .await;
+    registry
+        .arm_sequence_reset_for_new_session(dial_addr, remote_node_id, existing_addr)
+        .await;
+
+    // A fresh, non-preferred OUTBOUND dial to the same peer loses the
+    // tie-break (`RejectIncoming`), simulating a redial racing the peer's
+    // already-live preferred inbound session.
+    let losing_candidate_local_port: SocketAddr = "127.0.0.1:57999".parse().unwrap();
+    let (io, _keep) = tokio::io::duplex(1024);
+    let result = pool
+        .finalize_new_outbound_connection(
+            dial_addr,
+            io,
+            registry_weak,
+            None,
+            losing_candidate_local_port,
+            Some(remote_node_id),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(crate::GossipError::ConnectionExists)),
+        "sanity: this must be the same reject outcome as the sibling test: got {result:?}"
+    );
+
+    // The exemption must still point at the EXISTING (surviving) session's
+    // source, never at the losing candidate's local ephemeral port.
+    let gossip_state = registry.gossip_state.lock().await;
+    let peer_info = gossip_state
+        .peers
+        .get(&dial_addr)
+        .expect("peer must still be tracked");
+    assert_ne!(
+        peer_info.current_session_source,
+        Some(losing_candidate_local_port),
+        "R-11: a losing candidate must not arm current_session_source to its \
+         own (never-live) local ephemeral port"
+    );
+    assert_eq!(
+        peer_info.current_session_source,
+        Some(existing_addr),
+        "R-11: the surviving session's own source must remain the armed \
+         session, untouched by the losing candidate"
+    );
+    assert_ne!(
+        peer_info.accept_lower_sequence_from,
+        Some(losing_candidate_local_port),
+        "R-11: a losing candidate must not strand the one-shot exemption on \
+         a socket that never becomes live"
     );
 }
 
@@ -3985,7 +4100,7 @@ async fn outbound_finalize_reject_restores_displaced_live_session_address_index(
     // address the live inbound already owns.
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(shared_addr, io, registry_weak, None, shared_addr)
+        .finalize_new_outbound_connection(shared_addr, io, registry_weak, None, shared_addr, None)
         .await;
 
     assert!(
@@ -4143,7 +4258,7 @@ async fn outbound_finalize_accept_incoming_compare_and_publishes_against_snapsho
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await;
 
     // The candidate lost the compare-and-publish re-resolve to a
@@ -4273,7 +4388,7 @@ async fn outbound_finalize_evict_stale_reject_incoming_cas_lost_fully_unpublishe
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await;
 
     assert!(
@@ -4464,7 +4579,7 @@ async fn outbound_finalize_clear_race_retry_loss_to_second_rival_fully_unpublish
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await;
 
     assert!(
@@ -4670,7 +4785,7 @@ async fn outbound_finalize_evict_replace_retry_loss_to_new_rival_fully_unpublish
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await;
 
     assert!(
@@ -4846,7 +4961,7 @@ async fn outbound_finalize_nested_replace_existing_retry_loss_to_new_rival_fully
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await;
 
     assert!(
@@ -4998,7 +5113,7 @@ async fn outbound_finalize_replace_existing_compare_and_publishes_against_snapsh
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await;
 
     assert!(
@@ -5120,7 +5235,7 @@ async fn outbound_finalize_stale_rival_lookup_is_pure_and_excludes_the_new_candi
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
 
     let (io, _keep) = tokio::io::duplex(1024);
-    pool.finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
+    pool.finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
         .await
         .expect("outbound finalize should succeed");
 
@@ -5245,7 +5360,7 @@ async fn outbound_finalize_decision_snapshot_does_not_clear_fresh_session() {
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None, dial_addr, None)
         .await;
 
     assert!(
@@ -5388,7 +5503,7 @@ async fn outbound_finalize_does_not_abort_its_own_out_of_band_published_candidat
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None, dial_addr)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None, dial_addr, None)
         .await;
     drop(_guard);
 

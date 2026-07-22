@@ -2671,7 +2671,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
-                                outcome: outcome.map(|_| None),
+                                outcome: gossip_send_outcome_to_result(outcome),
                             }
                         });
                         futures.push(future);
@@ -4682,6 +4682,59 @@ mod keepalive_apply_tests {
         .await
         .unwrap();
         handle.shutdown_and_wait().await;
+    }
+}
+
+/// The periodic gossip loop's send is fire-and-forget (`tell()`): it writes
+/// the request and returns as soon as the local write completes, without
+/// waiting for or reading any reply. Whatever the peer sends back arrives
+/// later, asynchronously, on that same persistent connection's own read
+/// task, and is dispatched there via `process_read_result` ->
+/// `handle_incoming_message` -- which threads that connection's real,
+/// per-socket `session_source` correctly (see `ReadContext::session_source`).
+///
+/// `send_gossip_message_zero_copy`'s `Result<()>` return type makes this the
+/// ONLY possible mapping to `GossipResult::outcome`: there is no response to
+/// carry. `apply_gossip_results`' `handle_gossip_response` call for a
+/// `FullSyncResponse` is therefore unreachable for real wire traffic --
+/// `response_opt` is always `None` here. If `send_gossip_message_zero_copy`
+/// is ever changed to synchronously return a genuine response, this mapping
+/// must change too, and `handle_gossip_response`'s call into
+/// `merge_full_sync_from` must be updated to thread the actual connection's
+/// session source (not `None`), or a legitimate current-session
+/// FullSyncResponse for an outbound peer will be silently dropped by the
+/// R-11 `from_current_session` gate (its fallback to
+/// `verified_sender_addr` -- the peer's fixed dial-target address -- will
+/// not match `current_session_source`, which for an outbound session is the
+/// dialling socket's own local ephemeral port).
+fn gossip_send_outcome_to_result(outcome: Result<()>) -> Result<Option<crate::registry::RegistryMessage>> {
+    outcome.map(|_| None)
+}
+
+#[cfg(test)]
+mod gossip_send_outcome_tests {
+    use super::gossip_send_outcome_to_result;
+
+    /// Pins the invariant `handle_gossip_response`'s `FullSyncResponse` arm
+    /// relies on: the periodic gossip loop can never observe a real
+    /// response through `GossipResult::outcome`, because the only thing it
+    /// ever sends is a fire-and-forget write outcome. If this ever starts
+    /// returning `Ok(Some(_))`, `send_gossip_message_zero_copy`'s return
+    /// type had to change to carry a response too -- see this function's
+    /// doc comment for what must be fixed alongside that (`session_source`
+    /// threading).
+    #[test]
+    fn gossip_send_outcome_never_carries_a_response_on_success() {
+        assert!(gossip_send_outcome_to_result(Ok(())).unwrap().is_none());
+    }
+
+    #[test]
+    fn gossip_send_outcome_still_propagates_send_errors() {
+        let err = crate::GossipError::Shutdown;
+        assert!(matches!(
+            gossip_send_outcome_to_result(Err(err)),
+            Err(crate::GossipError::Shutdown)
+        ));
     }
 }
 
