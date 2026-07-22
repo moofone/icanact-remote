@@ -1135,24 +1135,37 @@ pub(crate) async fn process_read_result(
             correlation_id,
             payload,
         } => {
-            // Fast-path DirectAsk - bypasses handler and RegistryMessage overhead
-            // The payload contains only the direct frame body.
-            // For benchmarking: echo the payload back immediately using DirectResponse
-            let header =
-                crate::framing::write_direct_response_header(correlation_id, payload.len());
+            // Fast-path DirectAsk - bypasses handler and RegistryMessage overhead.
+            // The payload contains only the direct frame body. There is no
+            // registered application handler for DirectAsk, so in production
+            // builds we must not fabricate a response from the request bytes.
+            #[cfg(any(test, feature = "test-helpers", debug_assertions))]
+            {
+                let header =
+                    crate::framing::write_direct_response_header(correlation_id, payload.len());
 
-            // Send DirectResponse using connection pool
-            let pool = &registry.connection_pool;
-            if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
-                if let Some(ref stream_handle) = conn.stream_handle {
-                    let payload_bytes: bytes::Bytes = payload.into();
-                    if let Err(e) = stream_handle
-                        .write_direct_response_inline(header, payload_bytes)
-                        .await
-                    {
-                        warn!(peer = %peer_addr, error = %e, correlation_id, "Failed to send DirectResponse");
+                // Send DirectResponse using connection pool
+                let pool = &registry.connection_pool;
+                if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
+                    if let Some(ref stream_handle) = conn.stream_handle {
+                        let payload_bytes: bytes::Bytes = payload.into();
+                        if let Err(e) = stream_handle
+                            .write_direct_response_inline(header, payload_bytes)
+                            .await
+                        {
+                            warn!(peer = %peer_addr, error = %e, correlation_id, "Failed to send DirectResponse");
+                        }
                     }
                 }
+            }
+            #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
+            {
+                let _ = payload;
+                warn!(
+                    peer = %peer_addr,
+                    correlation_id,
+                    "Received DirectAsk request - no handler registered, dropping"
+                );
             }
         }
         MessageReadResult::DirectResponse {

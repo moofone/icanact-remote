@@ -1731,12 +1731,27 @@ where
             correlation_id,
             payload,
         } => {
-            let write_start = perf.map(|_| Instant::now());
-            direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
-            if let (Some(perf), Some(start)) = (perf, write_start) {
-                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                perf.response_write_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // DirectAsk has no registered application handler; production
+            // builds must not fabricate a response from the request bytes.
+            #[cfg(any(test, feature = "test-helpers", debug_assertions))]
+            {
+                let write_start = perf.map(|_| Instant::now());
+                direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
+                if let (Some(perf), Some(start)) = (perf, write_start) {
+                    perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.response_write_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+            #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
+            {
+                let _ = payload;
+                let _ = &direct_response_batch;
+                warn!(
+                    peer = %peer_addr,
+                    correlation_id,
+                    "Received DirectAsk request - no handler registered, dropping"
+                );
             }
             Ok(())
         }
@@ -1948,13 +1963,28 @@ where
             correlation_id,
             payload,
         } => {
-            let write_start = perf.map(|_| Instant::now());
-            direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
-            *wrote_response_bytes = true;
-            if let (Some(perf), Some(start)) = (perf, write_start) {
-                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                perf.response_write_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // DirectAsk has no registered application handler; production
+            // builds must not fabricate a response from the request bytes.
+            #[cfg(any(test, feature = "test-helpers", debug_assertions))]
+            {
+                let write_start = perf.map(|_| Instant::now());
+                direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
+                *wrote_response_bytes = true;
+                if let (Some(perf), Some(start)) = (perf, write_start) {
+                    perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.response_write_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+            #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
+            {
+                let _ = payload;
+                let _ = &direct_response_batch;
+                warn!(
+                    peer = %ctx.peer_addr,
+                    correlation_id,
+                    "Received DirectAsk request - no handler registered, dropping"
+                );
             }
             Ok(None)
         }
@@ -2047,13 +2077,28 @@ where
             correlation_id,
             payload,
         }) => {
-            let write_start = perf.map(|_| Instant::now());
-            direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
-            *wrote_response_bytes = true;
-            if let (Some(perf), Some(start)) = (perf, write_start) {
-                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                perf.response_write_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // DirectAsk has no registered application handler; production
+            // builds must not fabricate a response from the request bytes.
+            #[cfg(any(test, feature = "test-helpers", debug_assertions))]
+            {
+                let write_start = perf.map(|_| Instant::now());
+                direct_response_batch.push_bytes(correlation_id, payload.into_bytes());
+                *wrote_response_bytes = true;
+                if let (Some(perf), Some(start)) = (perf, write_start) {
+                    perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
+                    perf.response_write_ns
+                        .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+            #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
+            {
+                let _ = payload;
+                let _ = &direct_response_batch;
+                warn!(
+                    peer = %ctx.peer_addr,
+                    correlation_id,
+                    "Received DirectAsk request - no handler registered, dropping"
+                );
             }
             Ok(None)
         }
