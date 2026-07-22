@@ -417,6 +417,12 @@ impl StreamingState {
                 "V5 stream read exceeds reserved chunk",
             )));
         }
+        // R-L(a): a single chunk can be larger than one idle window (e.g. a
+        // 1 MiB chunk trickling in at <17 KB/s). Forward byte progress on a
+        // partial read is real activity even though the chunk has not fully
+        // committed yet, so the idle reaper must not treat the stream as
+        // stalled while the reader still holds this live reservation.
+        stream.last_activity = std::time::Instant::now();
         let start = reservation.offset + read;
         let end = reservation.offset + reservation.len;
         Ok(&mut stream.buffer.as_mut_slice()[start..end])
@@ -719,6 +725,14 @@ impl StreamingState {
         self.rejected_streams
             .retain(|_, at| at.elapsed() <= idle_timeout);
 
+        // R-L(b): a stream the reaper drops is not necessarily done as far as
+        // the sender is concerned -- its next in-flight chunk (or, for the
+        // absolute lifetime cap, a chunk for a still-progressing transfer) is
+        // already on the wire. Collect the reaped ids so they can be
+        // tombstoned into `rejected_streams` below: without that, the late
+        // chunk hits "unknown stream_id", which is a fatal protocol error
+        // that tears down the whole connection instead of just this stream.
+        let mut reaped_ids = Vec::new();
         self.active_streams.retain(|stream_id, stream| {
             let idle = stream.last_activity.elapsed();
             let age = stream.started_at.elapsed();
@@ -732,6 +746,7 @@ impl StreamingState {
                     expected_size = stream.total_size,
                     "Cleaning up idle stream - no chunk arrived within the idle timeout"
                 );
+                reaped_ids.push(*stream_id);
                 return false;
             }
 
@@ -744,11 +759,16 @@ impl StreamingState {
                     expected_size = stream.total_size,
                     "Cleaning up stream that exceeded its maximum lifetime"
                 );
+                reaped_ids.push(*stream_id);
                 return false;
             }
 
             true
         });
+
+        for stream_id in &reaped_ids {
+            self.tombstone_reaped_stream(*stream_id);
+        }
 
         let removed = before_count - self.active_streams.len();
         if removed > 0 {
@@ -758,6 +778,29 @@ impl StreamingState {
                 "Cleaned up stale in-progress streams"
             );
         }
+    }
+
+    /// Quarantines a reaped stream id the same way `reject_stream` quarantines
+    /// a resource-pressure rejection, but the reaper itself must never fail:
+    /// if the quarantine table is already full, evict the oldest tombstone to
+    /// make room rather than dropping the new one. A recently reaped id is
+    /// exactly the one a sender is about to retry against, so it is the
+    /// tombstone most worth keeping.
+    fn tombstone_reaped_stream(&mut self, stream_id: u64) {
+        if !self.rejected_streams.contains_key(&stream_id)
+            && self.rejected_streams.len() >= MAX_REJECTED_STREAMS
+        {
+            if let Some(oldest) = self
+                .rejected_streams
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(id, _)| *id)
+            {
+                self.rejected_streams.remove(&oldest);
+            }
+        }
+        self.rejected_streams
+            .insert(stream_id, std::time::Instant::now());
     }
 }
 
@@ -1969,6 +2012,97 @@ mod tests {
                 )
                 .expect("a retry start is valid after pressure clears")
                 .is_some()
+        );
+    }
+
+    /// R-L(a): a single large chunk that trickles in slowly must not be
+    /// reaped mid-read while the reader holds a live reservation. Before the
+    /// fix, `last_activity` was only advanced on a full chunk *commit*, so a
+    /// chunk larger than one idle window (e.g. a 1 MiB chunk at <17 KB/s)
+    /// looked idle even while bytes were actively arriving.
+    #[test]
+    fn partial_v5_chunk_progress_keeps_stream_alive_past_idle_timeout() {
+        use std::time::Duration;
+
+        let idle_timeout = Duration::from_millis(40);
+        let max_lifetime = Duration::from_secs(60);
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 200,
+            total_size: 64,
+            chunk_size: 64,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let reservation = state
+            .begin_v5_stream(header, 1, pool, false, 64)
+            .expect("reserve the single large chunk");
+
+        // Trickle the one large chunk in small pieces, each comfortably
+        // inside the idle window, but let total elapsed time cross the idle
+        // window several times over before the chunk ever fully commits.
+        let mut read = 0usize;
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(15));
+            let target = state
+                .v5_chunk_target(reservation, read)
+                .expect("reservation is still live");
+            target[..8].copy_from_slice(&[0xAB; 8]);
+            read += 8;
+            state.cleanup_stale_with(idle_timeout, max_lifetime);
+            assert_eq!(
+                state.active_stream_count(),
+                1,
+                "a stream receiving partial-chunk byte progress must not be reaped mid-read"
+            );
+        }
+    }
+
+    /// R-L(b): once the reaper removes a stream (idle or over the absolute
+    /// lifetime cap), the sender's next in-flight chunk for that id must be a
+    /// clean per-stream rejection, not a fatal "unknown stream_id" that tears
+    /// down the whole connection. This requires the reaped id to be
+    /// tombstoned into `rejected_streams`, mirroring the existing resource-
+    /// pressure rejection path.
+    #[test]
+    fn reaped_stream_tombstones_so_late_chunk_is_a_clean_rejection_not_a_fatal_teardown() {
+        use std::time::Duration;
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 201,
+            total_size: 16,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let _ = state
+            .begin_v5_stream(header, 1, pool, false, 8)
+            .expect("start stream and reserve its first chunk");
+
+        // Idle out with nothing further arriving for this stream, then reap.
+        std::thread::sleep(Duration::from_millis(20));
+        state.cleanup_stale_with(Duration::from_millis(5), Duration::from_secs(60));
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "the stream must have been reaped for the test to be meaningful"
+        );
+
+        // The sender, unaware the stream was reaped, sends its next chunk.
+        let result = state.reserve_v5_chunk_or_discard(201, 1, 8);
+        assert!(
+            result.is_ok(),
+            "a late chunk for a reaped stream must not be a fatal protocol error: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "a late chunk for a reaped stream must be discarded, not accepted as a fresh reservation"
         );
     }
 
