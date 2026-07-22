@@ -3,9 +3,91 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwapOption;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 
 use crate::{GossipError, Result, connection_pool::LockFreeStreamHandle, framing};
+
+/// R-E (P1): nonblocking/"immediate" reply lanes (`try_reply_bytes`,
+/// `try_reply_bytes_immediate`) cannot enter the async auto-streaming path
+/// (`stream_response_bytes`) without either blocking or duplicating its
+/// queue/permit machinery in a sync context. Above the streaming threshold
+/// they therefore reject the reply outright instead of ever building an
+/// oversize inline frame (peer teardown, see `send_response_auto_bytes`/R-9)
+/// or, at >= 2^27 bytes, panicking `framing::checked_body_len`'s `.expect`.
+/// Callers with a payload this large must use the async `reply`/`reply_typed`
+/// path, which auto-streams (mirrors `send_response_auto_bytes`).
+#[inline]
+fn reject_oversize_for_nonblocking_lane(
+    stream_handle: &LockFreeStreamHandle,
+    payload_len: usize,
+) -> Result<()> {
+    let threshold = stream_handle.streaming_threshold();
+    if payload_len > threshold {
+        return Err(GossipError::MessageTooLarge {
+            size: payload_len,
+            max: threshold,
+        });
+    }
+    Ok(())
+}
+
+/// R-E (P1): shared gate for the typed/pooled deferred-reply path
+/// (`AskResponder::reply_typed` -> `send_response_pooled`), mirroring
+/// `send_response_auto_bytes`'s size gate (R-9) instead of duplicating it.
+/// A payload above `MAX_STREAM_SIZE` is rejected locally (every receiver
+/// hard-rejects a larger stream as FATAL); a payload above the streaming
+/// threshold is auto-streamed via `stream_response_bytes` — the same
+/// machinery the `Bytes` reply path uses, reached here via one copy of the
+/// (rare, already-oversized) payload into `Bytes`.
+async fn send_pooled_via_stream_handle(
+    stream_handle: &LockFreeStreamHandle,
+    correlation_id: u32,
+    payload: crate::typed::PooledPayload,
+    prefix: Option<[u8; 16]>,
+    payload_len: usize,
+) -> Result<()> {
+    if payload_len > crate::MAX_STREAM_SIZE {
+        return Err(GossipError::MessageTooLarge {
+            size: payload_len,
+            max: crate::MAX_STREAM_SIZE,
+        });
+    }
+    if payload_len > stream_handle.streaming_threshold() {
+        let bytes = pooled_payload_into_bytes(prefix, payload);
+        return stream_handle.stream_response_bytes(bytes, correlation_id).await;
+    }
+    let header = framing::write_ask_response_header(
+        crate::MessageType::Response,
+        correlation_id,
+        payload_len,
+    );
+    let prefix_len = prefix.as_ref().map(|bytes| bytes.len()).unwrap_or(0) as u8;
+    stream_handle
+        .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
+        .await
+}
+
+/// Copy an (already above-threshold, so rare) pooled typed payload plus its
+/// optional debug type-hash prefix into one contiguous `Bytes` for
+/// `stream_response_bytes`, which needs owned, slice-able `Bytes` to chunk
+/// without an extra copy per chunk.
+fn pooled_payload_into_bytes(
+    prefix: Option<[u8; 16]>,
+    mut payload: crate::typed::PooledPayload,
+) -> Bytes {
+    let prefix_len = prefix.map(|p| p.len()).unwrap_or(0);
+    let mut buf = bytes::BytesMut::with_capacity(payload.remaining() + prefix_len);
+    if let Some(prefix) = prefix {
+        buf.extend_from_slice(&prefix);
+    }
+    while payload.has_remaining() {
+        let chunk = payload.chunk();
+        let n = chunk.len();
+        buf.extend_from_slice(chunk);
+        payload.advance(n);
+    }
+    buf.freeze()
+}
 
 /// ACTOR_REM_2 R15: reject a second reply for one ask. Returns `true` if this
 /// call is the first to claim the shared single-use guard (i.e. it may send).
@@ -59,6 +141,7 @@ impl AskResponseSink {
     fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         match self {
             Self::StreamHandle(stream_handle) => {
+                reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
                 let header = framing::write_ask_response_header(
                     crate::MessageType::Response,
                     correlation_id,
@@ -74,6 +157,7 @@ impl AskResponseSink {
     fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         match self {
             Self::StreamHandle(stream_handle) => {
+                reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
                 let header = framing::write_ask_response_header(
                     crate::MessageType::Response,
                     correlation_id,
@@ -98,15 +182,14 @@ impl AskResponseSink {
     ) -> Result<()> {
         match self {
             Self::StreamHandle(stream_handle) => {
-                let header = framing::write_ask_response_header(
-                    crate::MessageType::Response,
+                send_pooled_via_stream_handle(
+                    stream_handle,
                     correlation_id,
+                    payload,
+                    prefix,
                     payload_len,
-                );
-                let prefix_len = prefix.as_ref().map(|bytes| bytes.len()).unwrap_or(0) as u8;
-                stream_handle
-                    .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
-                    .await
+                )
+                .await
             }
             Self::DeferredWriter(writer) => {
                 writer
@@ -388,22 +471,25 @@ impl ResponseWriter {
     }
 
     fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
+        let stream_handle = self.stream_handle()?;
+        reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
         let header = framing::write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
         );
-        self.stream_handle()?
-            .write_header_and_payload_control_inline_nonblocking(header, 16, payload)
+        stream_handle.write_header_and_payload_control_inline_nonblocking(header, 16, payload)
     }
 
     fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
+        let stream_handle = self.stream_handle()?;
+        reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
         let header = framing::write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
         );
-        self.stream_handle()?
+        stream_handle
             .write_header_and_payload_control_inline_immediate_nonblocking(header, 16, payload)
     }
 
@@ -415,14 +501,7 @@ impl ResponseWriter {
         payload_len: usize,
     ) -> Result<()> {
         let stream_handle = self.stream_handle()?;
-        let header = framing::write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            payload_len,
-        );
-        let prefix_len = prefix.as_ref().map(|bytes| bytes.len()).unwrap_or(0) as u8;
-        stream_handle
-            .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
+        send_pooled_via_stream_handle(&stream_handle, correlation_id, payload, prefix, payload_len)
             .await
     }
 }
@@ -530,5 +609,95 @@ mod tests {
             !is_duplicate(&retry_result),
             "the original owner may choose a nonblocking fallback path"
         );
+    }
+}
+
+/// R-E (P1): PR #152 (R-9) gated only the `Bytes` deferred-reply paths
+/// (`send_response_auto`/`send_response_auto_bytes`) with a streaming
+/// threshold + MAX_STREAM_SIZE check. The typed/pooled deferred-reply path
+/// (`AskResponder::reply_typed` -> `send_response_pooled`) still wrote one
+/// inline Response frame unconditionally, so a typed reply above the peer's
+/// `max_message_size` tore the connection down, and a typed reply >= 2^27
+/// bytes panicked `checked_body_len`'s `.expect` in the replying task.
+#[cfg(test)]
+mod size_gate_tests {
+    use super::*;
+    use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
+    use tokio::io::AsyncReadExt;
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, PartialEq)]
+    struct BigReply {
+        data: Vec<u8>,
+    }
+    crate::wire_type!(BigReply, "ask_responder::size_gate_tests::BigReply");
+
+    /// A typed deferred reply above the streaming threshold must be
+    /// auto-streamed (StreamResponseStart), not written as one inline
+    /// Response frame — mirroring `send_response_auto_bytes` (R-9).
+    #[tokio::test]
+    async fn qa_re_large_typed_reply_streams_not_inlines() {
+        let (client, mut peer) = tokio::io::duplex(8 * 1024);
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9990".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream_handle = Arc::new(stream_handle);
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(42, stream_handle.clone(), used);
+
+        // Above the default ~1MB streaming threshold, well under MAX_STREAM_SIZE.
+        let big = BigReply {
+            data: vec![0u8; 2 * 1024 * 1024],
+        };
+        responder.reply_typed(&big).await.unwrap();
+
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        peer.read_exact(&mut ctrl).await.unwrap();
+        let kind = crate::framing::decode_control(ctrl).unwrap().kind;
+        assert_eq!(
+            kind,
+            crate::framing::WireKind::StreamResponseStart,
+            "large typed reply must stream (R-E), not emit an inline Response frame"
+        );
+
+        stream_handle.shutdown();
+        drop(peer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A typed deferred reply at/above 2^27 bytes (the V5 27-bit frame body
+    /// length limit) must return `MessageTooLarge`, never panic
+    /// `checked_body_len`'s `.expect` in the replying task.
+    #[tokio::test]
+    async fn qa_re_typed_reply_at_2_27_bytes_errors_not_panics() {
+        let (client, _peer) = tokio::io::duplex(8 * 1024);
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9991".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream_handle = Arc::new(stream_handle);
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(43, stream_handle.clone(), used);
+
+        // >= 2^27 bytes (also > MAX_STREAM_SIZE).
+        let huge = BigReply {
+            data: vec![0u8; (1usize << 27) + 4096],
+        };
+        let err = responder.reply_typed(&huge).await.unwrap_err();
+        assert!(
+            matches!(err, crate::GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        stream_handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 }
