@@ -281,6 +281,10 @@ pub struct AskResponder {
 /// Exclusive fallback ownership after an immediate reply was rejected before
 /// it entered the writer. The original responder's shared single-reply claim
 /// remains held, so sibling responders cannot race the selected fallback.
+///
+/// Constructed only when the caller itself claimed the single-use reply
+/// guard and a subsequent enqueue attempt was rejected — never when the
+/// claim was already taken by a sibling responder (see [`TryReplyError`]).
 pub struct ImmediateReplyFallback {
     responder: AskResponder,
     error: GossipError,
@@ -315,6 +319,32 @@ impl ImmediateReplyFallback {
             .sink
             .send_response_bytes(self.responder.correlation_id, response)
             .await
+    }
+}
+
+/// Outcome of a `*_with_fallback` reply attempt that failed to send inline.
+///
+/// The two failure modes are not interchangeable: a claim that was already
+/// taken by a sibling responder means a reply for this ask is already sent
+/// or in flight, and retrying would send a duplicate on the same correlation
+/// id. A rejected enqueue means this call owns the sole claim and the bytes
+/// were never sent, so it is safe — and necessary — to retry.
+pub enum TryReplyError {
+    /// The single-use reply guard was already claimed by another responder
+    /// for this ask. There is nothing to retry; the reply must be dropped.
+    ClaimUnavailable(GossipError),
+    /// This call claimed the guard, but the nonblocking enqueue was
+    /// rejected. The fallback retains exclusive ownership and may retry.
+    Enqueue(ImmediateReplyFallback),
+}
+
+impl TryReplyError {
+    /// The underlying error, regardless of which case produced it.
+    pub fn error(&self) -> &GossipError {
+        match self {
+            Self::ClaimUnavailable(error) => error,
+            Self::Enqueue(fallback) => fallback.error(),
+        }
     }
 }
 
@@ -358,10 +388,56 @@ impl AskResponder {
         self.reply(response).await
     }
 
+    /// A rejected enqueue still consumes the reply claim, so the response is
+    /// lost if the caller does not retry from the returned error. Use
+    /// [`Self::try_reply_bytes_with_fallback`] when the caller needs an
+    /// exclusive retry or fallback path.
     pub fn try_reply_bytes(self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
         self.sink
             .try_send_response_bytes(self.correlation_id, response)
+    }
+
+    /// Try the ordinary nonblocking queue, distinguishing a claim already
+    /// held by a sibling responder (nothing to retry — drop it) from a
+    /// rejected enqueue while this call owns the claim (retryable via the
+    /// returned fallback, which cannot be raced by a sibling).
+    pub fn try_reply_bytes_with_fallback(
+        self,
+        response: Bytes,
+    ) -> std::result::Result<(), TryReplyError> {
+        if let Err(error) = claim_reply(&self.used) {
+            return Err(TryReplyError::ClaimUnavailable(error));
+        }
+        match self
+            .sink
+            .try_send_response_bytes(self.correlation_id, response)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(TryReplyError::Enqueue(ImmediateReplyFallback {
+                responder: self,
+                error,
+            })),
+        }
+    }
+
+    /// Reply through the ordinary queue with a hard delivery guarantee: if
+    /// this call wins the single-use claim, the reply is either sent
+    /// inline or, on a rejected enqueue, retried through the awaitable,
+    /// backpressured response path before this call returns. There is no
+    /// state in which this call holds the claim but the reply is neither
+    /// sent nor retried.
+    ///
+    /// Returns `Err` only when a sibling responder already held the claim
+    /// (nothing for this call to do — delivery is that sibling's
+    /// responsibility under the same guarantee) or when the connection is
+    /// gone.
+    pub async fn reply_bytes_guaranteed(self, response: Bytes) -> Result<()> {
+        match self.try_reply_bytes_with_fallback(response.clone()) {
+            Ok(()) => Ok(()),
+            Err(TryReplyError::ClaimUnavailable(error)) => Err(error),
+            Err(TryReplyError::Enqueue(fallback)) => fallback.reply_bytes(response).await,
+        }
     }
 
     /// Try to reply through the connection's immediate nonblocking queue.
@@ -378,28 +454,26 @@ impl AskResponder {
             .try_send_response_bytes_immediate(self.correlation_id, response)
     }
 
-    /// Try the reserved immediate queue and retain exclusive reply ownership
-    /// on rejection. The returned fallback can retry or select another reply
-    /// path without permitting a sibling responder to enqueue a duplicate.
+    /// Try the reserved immediate queue, distinguishing a claim already held
+    /// by a sibling responder (nothing to retry — drop it) from a rejected
+    /// enqueue while this call owns the claim (retryable via the returned
+    /// fallback, which cannot be raced by a sibling).
     pub fn try_reply_bytes_immediate_with_fallback(
         self,
         response: Bytes,
-    ) -> std::result::Result<(), ImmediateReplyFallback> {
+    ) -> std::result::Result<(), TryReplyError> {
         if let Err(error) = claim_reply(&self.used) {
-            return Err(ImmediateReplyFallback {
-                responder: self,
-                error,
-            });
+            return Err(TryReplyError::ClaimUnavailable(error));
         }
         match self
             .sink
             .try_send_response_bytes_immediate(self.correlation_id, response)
         {
             Ok(()) => Ok(()),
-            Err(error) => Err(ImmediateReplyFallback {
+            Err(error) => Err(TryReplyError::Enqueue(ImmediateReplyFallback {
                 responder: self,
                 error,
-            }),
+            })),
         }
     }
 
@@ -598,7 +672,10 @@ mod tests {
             .try_reply_bytes_immediate_with_fallback(Bytes::from_static(b"fast"))
         {
             Ok(()) => panic!("unbound writer must reject immediate enqueue"),
-            Err(fallback) => fallback,
+            Err(TryReplyError::ClaimUnavailable(error)) => {
+                panic!("this call owns the claim, not a stale sibling: {error:?}")
+            }
+            Err(TryReplyError::Enqueue(fallback)) => fallback,
         };
         assert!(
             is_duplicate(&retry_sibling.try_reply_bytes(Bytes::from_static(b"sibling"))),
@@ -609,6 +686,38 @@ mod tests {
             !is_duplicate(&retry_result),
             "the original owner may choose a nonblocking fallback path"
         );
+    }
+
+    /// A sibling responder whose reply arrives after another sibling already
+    /// claimed the shared guard must see `ClaimUnavailable`, never `Enqueue` —
+    /// otherwise a caller that retries every `Err` through the fallback path
+    /// would send a duplicate response for an ask that was already answered.
+    #[test]
+    fn claim_already_taken_by_sibling_is_not_an_enqueue_fallback() {
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12348".parse().unwrap()));
+        let context = AskContext::from_writer(13, &writer, None);
+
+        let first = context.responder();
+        let second = context.responder();
+
+        // First reply claims the shared guard (its send fails only because no
+        // stream handle is bound in this unit test).
+        let _ = first.try_reply_bytes_with_fallback(Bytes::from_static(b"first"));
+
+        match second.try_reply_bytes_with_fallback(Bytes::from_static(b"second")) {
+            Ok(()) => panic!("a claim already held by a sibling must not succeed"),
+            Err(TryReplyError::Enqueue(_)) => panic!(
+                "a claim already held by a sibling must not be reported as a \
+                 retryable enqueue rejection — that would let a caller resend \
+                 a duplicate reply"
+            ),
+            Err(TryReplyError::ClaimUnavailable(error)) => {
+                assert!(
+                    is_duplicate(&Err(error)),
+                    "expected the duplicate-claim error"
+                );
+            }
+        }
     }
 }
 
