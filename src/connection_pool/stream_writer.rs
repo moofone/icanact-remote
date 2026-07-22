@@ -1572,6 +1572,44 @@ impl LockFreeStreamHandle {
                     let mut reads = 0usize;
                     let mut read_batch_limit = READ_BATCH_LIMIT;
                     while reads < read_batch_limit {
+                        // R-I: cap per-turn byte accumulation independent of
+                        // the frame-count cap above. Checked every iteration
+                        // (covering both the normal and the fast-io `continue`
+                        // paths below) so a peer packing its ask window with
+                        // max-size response frames cannot force unbounded
+                        // memory growth before `read_batch_limit` frames are
+                        // seen. See `flush_response_batch_if_over_byte_cap`.
+                        if let Err(e) = flush_response_batch_if_over_byte_cap(
+                            &mut stream,
+                            &bytes_written_counter,
+                            &mut bytes_since_flush,
+                            &mut response_batch,
+                        )
+                        .await
+                        {
+                            warn!(
+                                peer = %ctx.peer_addr,
+                                error = %e,
+                                "Failed to write response batch (byte cap)"
+                            );
+                            return;
+                        }
+                        if let Err(e) = flush_direct_response_batch_if_over_byte_cap(
+                            &mut stream,
+                            &bytes_written_counter,
+                            &mut bytes_since_flush,
+                            &mut direct_response_batch,
+                        )
+                        .await
+                        {
+                            warn!(
+                                peer = %ctx.peer_addr,
+                                error = %e,
+                                "Failed to write direct response batch (byte cap)"
+                            );
+                            return;
+                        }
+
                         let read_start = perf.map(|_| Instant::now());
                         let read_result =
                             match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
@@ -1815,6 +1853,40 @@ impl LockFreeStreamHandle {
                             let mut drained = 0usize;
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
                             while drained < drain_batch_limit {
+                                // R-I: same per-turn byte cap as the primary
+                                // drain loop above; see
+                                // `flush_response_batch_if_over_byte_cap`.
+                                if let Err(e) = flush_response_batch_if_over_byte_cap(
+                                    &mut stream,
+                                    &bytes_written_counter,
+                                    &mut bytes_since_flush,
+                                    &mut response_batch,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to write response batch (byte cap)"
+                                    );
+                                    return;
+                                }
+                                if let Err(e) = flush_direct_response_batch_if_over_byte_cap(
+                                    &mut stream,
+                                    &bytes_written_counter,
+                                    &mut bytes_since_flush,
+                                    &mut direct_response_batch,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to write direct response batch (byte cap)"
+                                    );
+                                    return;
+                                }
+
                                 let read_start = perf.map(|_| Instant::now());
                                 let next = match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
                                     Ok(r) => r,
