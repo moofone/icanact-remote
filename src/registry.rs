@@ -1209,7 +1209,10 @@ pub struct PeerInfoGossip {
 pub struct HistoricalDelta {
     pub sequence: u64,
     pub changes: Vec<RegistryChange>,
-    pub wall_clock_time: u64,
+    /// Monotonic push time, used only for local retention (`cleanup_stale_actors`).
+    /// Never leaves this process, so it uses `Instant` rather than wall-clock
+    /// time and is immune to NTP steps / VM pauses.
+    pub recorded_at: Instant,
 }
 
 /// Data needed to perform gossip with a single peer
@@ -4197,7 +4200,7 @@ impl<T: 'static> GossipRegistry<T> {
                 let delta = HistoricalDelta {
                     sequence: gossip_state.gossip_sequence,
                     changes: combined,
-                    wall_clock_time: current_timestamp(),
+                    recorded_at: Instant::now(),
                 };
                 gossip_state.delta_history.push(delta);
                 if gossip_state.delta_history.len() > self.config.max_delta_history {
@@ -4317,9 +4320,10 @@ impl<T: 'static> GossipRegistry<T> {
                     if peer_info.failures >= self.config.max_peer_failures {
                         let time_since_failure = peer_info
                             .last_failure_time
-                            .map(|t| current_time - t)
+                            .map(|t| current_time.saturating_sub(t))
                             .unwrap_or(0);
-                        let time_since_last_attempt = current_time - peer_info.last_attempt;
+                        let time_since_last_attempt =
+                            current_time.saturating_sub(peer_info.last_attempt);
                         info!(
                             peer = %peer,
                             failures = peer_info.failures,
@@ -5186,13 +5190,18 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // Clean up old delta history (using wall clock)
+        // Clean up old delta history. Retention is a pure elapsed-time check
+        // against a value that never leaves this process, so it uses the
+        // monotonic clock rather than wall-clock arithmetic: a backward or
+        // forward wall-clock step can neither panic this nor purge (or
+        // preserve) the entire history in one step.
         {
             let mut gossip_state = self.gossip_state.lock().await;
-            let history_ttl = self.config.actor_ttl.as_secs() * 2;
-            gossip_state
-                .delta_history
-                .retain(|delta| now - delta.wall_clock_time < history_ttl);
+            let history_ttl = self.config.actor_ttl.saturating_mul(2);
+            let now_instant = Instant::now();
+            gossip_state.delta_history.retain(|delta| {
+                now_instant.saturating_duration_since(delta.recorded_at) < history_ttl
+            });
         }
 
         // Enforce bounds on data structures
@@ -5240,7 +5249,7 @@ impl<T: 'static> GossipRegistry<T> {
                     // Check if peer has been disconnected for too long
                     info.failures >= self.config.max_peer_failures
                         && info.last_failure_time.is_some_and(|failure_time| {
-                            (current_time - failure_time) > dead_peer_timeout_secs
+                            current_time.saturating_sub(failure_time) > dead_peer_timeout_secs
                         })
                 })
                 .map(|(addr, _)| *addr)
@@ -5388,7 +5397,7 @@ impl<T: 'static> GossipRegistry<T> {
                         active.insert(*node_id);
                     } else if let Some(failure_time) = peer_info.last_failure_time {
                         // Peer is failed - check how long it's been dead
-                        let time_since_failure = current_time - failure_time;
+                        let time_since_failure = current_time.saturating_sub(failure_time);
                         let retention_secs = self.config.vector_clock_retention_period.as_secs();
 
                         if time_since_failure > retention_secs {
@@ -9415,6 +9424,54 @@ mod tests {
         );
     }
 
+    /// A peer can be genuinely retry-eligible (its `last_attempt` really is
+    /// more than `peer_retry_interval` in the past) while its independently
+    /// recorded `last_failure_time` sits ahead of the current wall-clock read
+    /// — e.g. a backward NTP step landed between the two writes. The
+    /// gossip-retry log path must not panic computing `time_since_failure`
+    /// for such a peer.
+    #[tokio::test]
+    async fn prepare_gossip_round_survives_backward_last_failure_time_step() {
+        let mut config = test_config();
+        config.small_cluster_threshold = 0;
+        config.max_peer_failures = 3;
+        config.peer_retry_interval = Duration::from_millis(1);
+        let registry = GossipRegistry::<()>::new(test_addr(8094), config);
+        let peer_addr = test_addr(8095);
+        let peer_id = test_peer_id("backward-clock-retry-log");
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: true,
+                    outbound_dial_success: true,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    // Genuinely in the past, so the (safe, saturating) retry
+                    // window gate lets this peer through.
+                    last_attempt: current_timestamp().saturating_sub(60),
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    // Recorded "in the future" relative to the wall clock read
+                    // inside `prepare_gossip_round` — simulates a backward step.
+                    last_failure_time: Some(current_timestamp() + 10_000),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+        }
+
+        // Must not panic (RED: raw subtraction underflows in debug builds).
+        let _ = registry.prepare_gossip_round().await;
+    }
+
     /// Mirror of the above for the urgent fan-out path
     /// (`trigger_immediate_gossip`): a single immediate-priority registration
     /// must produce at most one DeltaGossip per physical peer, regardless of
@@ -12155,6 +12212,58 @@ mod tests {
         );
     }
 
+    /// The delta-history retention check must not panic or misbehave when one
+    /// entry's `recorded_at` sits ahead of the current read (e.g. two threads
+    /// raced pushing entries around a scheduler pause). Using the monotonic
+    /// clock with a saturating duration means this can never underflow or
+    /// wrap the way a raw wall-clock subtraction would, and a backward step
+    /// can never purge the *entire* history the way release-mode wraparound
+    /// on wall-clock arithmetic would.
+    #[tokio::test]
+    async fn delta_history_retention_survives_wall_clock_backward_step() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_secs(60); // history_ttl = 120s
+        let registry = GossipRegistry::<()>::new(test_addr(8082), config);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.delta_history = vec![
+                // Genuinely expired (> 120s old): should be purged.
+                HistoricalDelta {
+                    sequence: 1,
+                    changes: Vec::new(),
+                    recorded_at: Instant::now() - Duration::from_secs(200),
+                },
+                // Fresh: should be retained.
+                HistoricalDelta {
+                    sequence: 2,
+                    changes: Vec::new(),
+                    recorded_at: Instant::now(),
+                },
+                // Ahead of "now" by the time `cleanup_stale_actors` reads the
+                // clock. Must not panic and must not be (mis)treated as
+                // expired.
+                HistoricalDelta {
+                    sequence: 3,
+                    changes: Vec::new(),
+                    recorded_at: Instant::now() + Duration::from_secs(10_000),
+                },
+            ];
+        }
+
+        // Must not panic.
+        registry.cleanup_stale_actors().await;
+
+        let state = registry.gossip_state.lock().await;
+        let sequences: Vec<u64> = state.delta_history.iter().map(|d| d.sequence).collect();
+        assert_eq!(
+            sequences,
+            vec![2, 3],
+            "expected only the genuinely expired delta (seq 1) purged, \
+             got {sequences:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_cleanup_dead_peers() {
         let mut config = test_config();
@@ -12216,6 +12325,117 @@ mod tests {
                 .known_actors
                 .contains_sync("peer_actor")
         ); // Actors are cleaned up
+    }
+
+    /// A backward wall-clock step (NTP correction, VM pause/resume) can leave
+    /// `last_failure_time` recorded *ahead* of a subsequent `current_timestamp()`
+    /// read. The raw `current_time - failure_time` subtraction must not panic,
+    /// and must not treat the peer as dead-for-longer-than-timeout (which would
+    /// mass-reap every recently-failed peer's actors on the next tick).
+    #[tokio::test]
+    async fn cleanup_dead_peers_survives_backward_clock_step() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(8090), config);
+        let peer_addr = test_addr(8091);
+        let peer_id = test_peer_id("backward-clock-dead-peer");
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    // Recorded "in the future" relative to the wall clock read
+                    // inside `cleanup_dead_peers` — simulates the clock having
+                    // stepped backward since this failure was recorded.
+                    last_failure_time: Some(current_timestamp() + 10_000),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+        }
+
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            "peer_actor".to_string(),
+            RemoteActorLocation::new_with_peer(peer_addr, peer_id),
+        );
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut actors = HashSet::new();
+            actors.insert("peer_actor".to_string());
+            gossip_state.peer_to_actors.insert(peer_addr, actors);
+        }
+
+        // Must not panic (RED: raw subtraction underflows in debug builds).
+        registry.cleanup_dead_peers().await;
+
+        // Must not treat the peer as dead-for-longer-than-timeout: the
+        // clamped elapsed time is ~0, which is not > dead_peer_timeout, so
+        // the peer's actors must survive.
+        assert!(
+            registry
+                .actor_state
+                .known_actors
+                .contains_sync("peer_actor"),
+            "backward clock step must not spuriously reap actors as dead-peer timeout"
+        );
+    }
+
+    /// Same backward-clock hazard as `cleanup_dead_peers_survives_backward_clock_step`,
+    /// but for the vector-clock GC path: a future `last_failure_time` must not
+    /// panic the raw `current_time - failure_time` subtraction, and must not be
+    /// treated as "dead longer than retention" (which would prematurely GC the
+    /// node's vector-clock entries).
+    #[tokio::test]
+    async fn run_vector_clock_gc_survives_backward_clock_step() {
+        let mut config = test_config();
+        config.vector_clock_retention_period = Duration::from_secs(3600);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(8092), config);
+        let peer_addr = test_addr(8093);
+        let peer_id = test_peer_id("backward-clock-vector-gc");
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    // Recorded "in the future" relative to the wall clock read
+                    // inside `run_vector_clock_gc` — simulates a backward step.
+                    last_failure_time: Some(current_timestamp() + 10_000),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                },
+            );
+        }
+
+        // Must not panic (RED: raw subtraction underflows in debug builds).
+        registry.run_vector_clock_gc().await;
     }
 
     /// R2 regression: `cleanup_dead_peers` is the only removal path that did
@@ -13094,15 +13314,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_historical_delta() {
+        let recorded_at = Instant::now();
         let delta = HistoricalDelta {
             sequence: 10,
             changes: vec![],
-            wall_clock_time: 1000,
+            recorded_at,
         };
 
         assert_eq!(delta.sequence, 10);
         assert!(delta.changes.is_empty());
-        assert_eq!(delta.wall_clock_time, 1000);
+        assert_eq!(delta.recorded_at, recorded_at);
     }
 
     #[tokio::test]
@@ -14850,12 +15071,12 @@ mod tests {
                 HistoricalDelta {
                     sequence: 8,
                     changes: Vec::new(),
-                    wall_clock_time: 0,
+                    recorded_at: Instant::now(),
                 },
                 HistoricalDelta {
                     sequence: 9,
                     changes: Vec::new(),
-                    wall_clock_time: 0,
+                    recorded_at: Instant::now(),
                 },
             ];
             state.peers.insert(
