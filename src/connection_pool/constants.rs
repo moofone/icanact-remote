@@ -122,6 +122,9 @@ impl DirectResponseBatch {
         self.payloads.is_empty()
     }
 
+    // Only called from the production echo/bench affordance, which is compiled
+    // out entirely when `test`, `test-helpers`, and `debug_assertions` are all off.
+    #[allow(dead_code)]
     fn push_bytes(&mut self, correlation_id: u32, payload: bytes::Bytes) {
         self.total_bytes += payload.len();
         self.correlation_ids.push(correlation_id);

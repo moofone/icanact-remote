@@ -4165,6 +4165,54 @@ async fn test_ask_direct_throughput() {
     receiver.shutdown().await;
 }
 
+/// In a production build (no `debug_assertions`, no `test-helpers`), an
+/// inbound `DirectAsk` with no registered handler must never fabricate a
+/// response from the caller's own request bytes. Only runs in release test
+/// binaries, since `debug_assertions` is what keeps the bench/test echo path
+/// alive during ordinary `cargo test` (dev profile) runs.
+#[cfg(not(debug_assertions))]
+#[tokio::test]
+async fn direct_ask_production_build_does_not_echo_request_payload() {
+    let config = GossipConfig {
+        gossip_interval: Duration::from_millis(100),
+        ask_window: 65_536,
+        ..Default::default()
+    };
+
+    let receiver = create_registry("direct_ask_no_echo_receiver", config.clone()).await;
+    let sender = create_registry("direct_ask_no_echo_sender", config).await;
+
+    connect_bidirectional(&sender, &receiver).await;
+    sleep(Duration::from_millis(200)).await;
+
+    let remote = sender
+        .lookup_peer(&receiver.registry.peer_id)
+        .await
+        .unwrap();
+
+    let payload = Bytes::from_static(b"do-not-echo-me-back");
+    let result = remote
+        .ask_direct(payload.clone(), Duration::from_millis(500))
+        .await;
+
+    match result {
+        Ok(reply) => {
+            assert_ne!(
+                reply, payload,
+                "production DirectAsk path must not echo the request payload back as a response"
+            );
+        }
+        Err(icanact_remote::GossipError::Timeout) => {
+            // Expected: no handler is registered, so the request goes
+            // unanswered and the caller times out.
+        }
+        Err(other) => panic!("unexpected error from ask_direct: {other:?}"),
+    }
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "benchmark-only; run explicitly when profiling"]
 async fn test_ask_actor_frame_no_timeout_throughput() {
