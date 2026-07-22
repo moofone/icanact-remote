@@ -469,7 +469,7 @@ async fn finalize_binds_cert_identity_over_stale_addr_map_on_rekey() {
 
     let (io, _peer_io) = tokio::io::duplex(1024);
     let _handle = pool
-        .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), Some(new_a_node_id))
+        .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), Some(new_a_node_id), addr)
         .await
         .expect("finalize outbound connection");
 
@@ -565,6 +565,7 @@ fn deferred_actor_ask_sync_replies_via_responder() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -598,6 +599,7 @@ fn deferred_actor_ask_sync_replies_via_responder() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -670,6 +672,7 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -703,6 +706,7 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -786,6 +790,7 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -819,6 +824,7 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -902,6 +908,7 @@ fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: Some(peer_id.clone()),
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -941,6 +948,7 @@ fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: Some(client_registry.peer_id.clone()),
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -1607,6 +1615,7 @@ fn stream_direct_ask_throughput_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2064,6 +2073,7 @@ fn stream_protocol_ask_throughput_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2099,6 +2109,7 @@ fn stream_protocol_ask_throughput_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2393,6 +2404,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2428,6 +2440,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2543,6 +2556,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2578,6 +2592,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2704,6 +2719,7 @@ fn stream_protocol_tell_throughput_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
+            session_source: server_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -2739,6 +2755,7 @@ fn stream_protocol_tell_throughput_bench() {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
+            session_source: client_addr,
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -3123,6 +3140,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         last_dns_refresh_attempt: None,
         last_response_received_ms: stale_time,
         accept_lower_sequence_from: None,
+        current_session_source: None,
     }
 }
 
@@ -3158,7 +3176,7 @@ async fn full_sync_with_remote_loopback_bind_does_not_poison_peer_state() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), tcp_source, msg)
+    super::handle_incoming_message(registry.clone(), tcp_source, tcp_source, msg)
         .await
         .expect("non-dialable FullSync should be ignored without crashing");
 
@@ -3219,7 +3237,7 @@ async fn full_sync_response_with_remote_loopback_bind_does_not_reindex_connectio
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), tcp_source, msg)
+    super::handle_incoming_message(registry.clone(), tcp_source, tcp_source, msg)
         .await
         .expect("non-dialable FullSyncResponse should be ignored without crashing");
 
@@ -3300,7 +3318,7 @@ async fn full_sync_response_updates_last_response_received_ms() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+    super::handle_incoming_message(registry.clone(), peer_addr, peer_addr, msg)
         .await
         .expect("handle_incoming_message should succeed");
 
@@ -3355,7 +3373,7 @@ async fn full_sync_updates_last_response_received_ms() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+    super::handle_incoming_message(registry.clone(), peer_addr, peer_addr, msg)
         .await
         .expect("handle_incoming_message should succeed");
 
@@ -3414,7 +3432,7 @@ async fn delta_gossip_updates_last_response_received_ms() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+    super::handle_incoming_message(registry.clone(), peer_addr, peer_addr, msg)
         .await
         .expect("handle_incoming_message should succeed");
 
@@ -3592,7 +3610,7 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
         // the peer id, giving us a real stream instance to pin.
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr)
             .await
             .expect("finalize outbound");
 
@@ -3645,7 +3663,7 @@ fn hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide() {
 
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
+        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr)
             .await
             .expect("finalize outbound");
 
@@ -3778,7 +3796,7 @@ fn outbound_finalize_balances_connection_counter() {
         let (io, _peer) = tokio::io::duplex(1024);
 
         let _handle = pool
-            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
+            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr)
             .await
             .expect("outbound finalize should succeed");
 
@@ -3870,7 +3888,7 @@ async fn outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter() 
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await;
 
     assert!(
@@ -3967,7 +3985,7 @@ async fn outbound_finalize_reject_restores_displaced_live_session_address_index(
     // address the live inbound already owns.
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(shared_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(shared_addr, io, registry_weak, None, shared_addr)
         .await;
 
     assert!(
@@ -4125,7 +4143,7 @@ async fn outbound_finalize_accept_incoming_compare_and_publishes_against_snapsho
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await;
 
     // The candidate lost the compare-and-publish re-resolve to a
@@ -4255,7 +4273,7 @@ async fn outbound_finalize_evict_stale_reject_incoming_cas_lost_fully_unpublishe
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await;
 
     assert!(
@@ -4446,7 +4464,7 @@ async fn outbound_finalize_clear_race_retry_loss_to_second_rival_fully_unpublish
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await;
 
     assert!(
@@ -4652,7 +4670,7 @@ async fn outbound_finalize_evict_replace_retry_loss_to_new_rival_fully_unpublish
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await;
 
     assert!(
@@ -4828,7 +4846,7 @@ async fn outbound_finalize_nested_replace_existing_retry_loss_to_new_rival_fully
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await;
 
     assert!(
@@ -4980,7 +4998,7 @@ async fn outbound_finalize_replace_existing_compare_and_publishes_against_snapsh
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await;
 
     assert!(
@@ -5102,7 +5120,7 @@ async fn outbound_finalize_stale_rival_lookup_is_pure_and_excludes_the_new_candi
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
 
     let (io, _keep) = tokio::io::duplex(1024);
-    pool.finalize_new_outbound_connection(dial_addr, io, registry_weak, None)
+    pool.finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr)
         .await
         .expect("outbound finalize should succeed");
 
@@ -5227,7 +5245,7 @@ async fn outbound_finalize_decision_snapshot_does_not_clear_fresh_session() {
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None, dial_addr)
         .await;
 
     assert!(
@@ -5370,7 +5388,7 @@ async fn outbound_finalize_does_not_abort_its_own_out_of_band_published_candidat
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
-        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None)
+        .finalize_new_outbound_connection(dial_addr, io, registry_weak.clone(), None, dial_addr)
         .await;
     drop(_guard);
 
@@ -7357,6 +7375,7 @@ async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_whe
         streaming_state_handoff: None,
         registry_weak: Arc::downgrade(&registry),
         peer_addr: addr,
+        session_source: addr,
         peer_id: None,
         max_message_size: MASTER_BUFFER_SIZE,
         expected_schema_hash: None,

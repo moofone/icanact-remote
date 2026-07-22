@@ -3201,6 +3201,12 @@ impl<T> ConnectionPool<T> {
         stream: S,
         registry_weak: std::sync::Weak<GossipRegistry>,
         tofu_node_id: Option<crate::GossipNodeId>,
+        // R-11: this specific outbound socket's own local ephemeral port --
+        // unique per connection, unlike `addr` (the peer's fixed listening
+        // port, shared by every connection we ever make to it). Threaded
+        // into this connection's `ReadContext` so the receive path can tell
+        // a redial's new connection apart from an old one still draining.
+        local_session_addr: SocketAddr,
     ) -> Result<ConnectionHandle<T>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3254,6 +3260,7 @@ impl<T> ConnectionPool<T> {
                     streaming_state_handoff: None,
                     registry_weak: Arc::downgrade(&registry),
                     peer_addr: addr,
+                    session_source: local_session_addr,
                     peer_id: peer_id_opt.clone(),
                     max_message_size: registry.config.max_message_size,
                     expected_schema_hash: registry.config.schema_hash,
@@ -3907,6 +3914,13 @@ async fn answer_inbound_clock_probe(
 pub(crate) fn handle_incoming_message(
     registry: Arc<GossipRegistry>,
     _peer_addr: SocketAddr,
+    // R-11: this connection's own session discriminator -- see
+    // `ReadContext::session_source`. For inbound connections this equals
+    // `_peer_addr`; for outbound connections it is this specific socket's
+    // own local ephemeral port, not the (shared, non-unique) dial target.
+    // Passed to `merge_full_sync_from` so the restart-sequence exemption is
+    // scoped to the exact connection that armed it.
+    session_source: SocketAddr,
     msg: RegistryMessage,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
@@ -3956,6 +3970,7 @@ pub(crate) fn handle_incoming_message(
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
+                                current_session_source: None,
                             });
                         }
                     }
@@ -4142,6 +4157,7 @@ pub(crate) fn handle_incoming_message(
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
+                                current_session_source: None,
                             });
                         }
                     }
@@ -4233,6 +4249,7 @@ pub(crate) fn handle_incoming_message(
                         sender_peer_id.clone(),
                         sender_socket_addr,
                         Some(_peer_addr),
+                        Some(session_source),
                         sequence,
                         wall_clock_time,
                     )
@@ -4486,6 +4503,7 @@ pub(crate) fn handle_incoming_message(
                         sender_peer_id.clone(),
                         sender_socket_addr,
                         Some(_peer_addr),
+                        Some(session_source),
                         sequence,
                         wall_clock_time,
                     )

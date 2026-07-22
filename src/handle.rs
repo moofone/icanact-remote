@@ -3291,6 +3291,10 @@ where
             streaming_state_handoff: Some(streaming_state_handoff.clone()),
             registry_weak: Arc::downgrade(&registry),
             peer_addr,
+            // Inbound: the remote client's actual TCP source (ephemeral
+            // port included) is already unique per connection, so it
+            // doubles as the R-11 session discriminator directly.
+            session_source: peer_addr,
             peer_id: Some(peer_id.clone()),
             max_message_size,
             expected_schema_hash: registry.config.schema_hash,
@@ -3671,6 +3675,9 @@ where
         msg_result.unwrap(),
         &mut streaming_state,
         &registry,
+        peer_addr,
+        // Inbound: the remote client's own TCP source is already unique per
+        // connection, so it doubles as the R-11 session discriminator.
         peer_addr,
         response_correlation.as_ref().map(|c| c.as_ref()),
         Some(&response_connection),

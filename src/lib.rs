@@ -907,6 +907,7 @@ impl<T: 'static> Peer<T> {
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: current_time_ms,
                     accept_lower_sequence_from: None,
+                    current_session_source: None,
                 },
             );
             let peers_after = gossip_state.peers.len();

@@ -612,13 +612,27 @@ impl<T> ConnectionPool<T> {
                     // this session. Arming must only ever be backed by an
                     // identity this exact TLS handshake cryptographically
                     // proved, so it is re-derived here straight from the
-                    // live connection's own peer certificate. The session
-                    // source is the dial target: for an outbound connection
-                    // that is the connection's remote address, which is what
-                    // the receive path reports as `verified_sender_addr`.
-                    if let Some(node_id) = outbound_session_authenticated_node_id(&tls_stream) {
+                    // live connection's own peer certificate.
+                    //
+                    // The session discriminator is this outbound socket's
+                    // OWN local ephemeral port, not the dial target `addr`.
+                    // `addr` is the peer's fixed listening port, identical
+                    // for every connection we ever make to it, so it cannot
+                    // tell a redial's new connection apart from an old one
+                    // still draining -- unlike the inbound side, where the
+                    // remote's ephemeral port is naturally unique per
+                    // connection. `local_session_addr` is threaded through
+                    // this connection's own `ReadContext` and is what the
+                    // receive path compares against, so only a FullSync
+                    // arriving on THIS socket can consume or extend the
+                    // exemption.
+                    let local_session_addr = tls_stream.get_ref().0.local_addr().ok();
+                    if let (Some(node_id), Some(local_session_addr)) = (
+                        outbound_session_authenticated_node_id(&tls_stream),
+                        local_session_addr,
+                    ) {
                         registry_arc
-                            .arm_sequence_reset_for_new_session(addr, node_id, addr)
+                            .arm_sequence_reset_for_new_session(addr, node_id, local_session_addr)
                             .await;
                     }
 
@@ -632,6 +646,7 @@ impl<T> ConnectionPool<T> {
                             // extracted from the peer's verified TLS cert when no
                             // GossipNodeId was pinned (bootstrap/placeholder-SNI dials).
                             discovered_node_id,
+                            local_session_addr.unwrap_or(addr),
                         )
                         .await;
                     match &result {

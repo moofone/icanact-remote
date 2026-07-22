@@ -840,6 +840,11 @@ pub(crate) async fn process_read_result(
     streaming_state: &mut StreamingState,
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
+    // R-11: this connection's own session discriminator -- see
+    // `ReadContext::session_source`. Threaded to
+    // `handle_incoming_message` so the restart-sequence exemption is
+    // scoped to the exact connection that armed it.
+    session_source: SocketAddr,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
     response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
     authenticated_peer_id: Option<&PeerId>,
@@ -880,9 +885,13 @@ pub(crate) async fn process_read_result(
                 }
             }
 
-            if let Err(e) =
-                crate::connection_pool::handle_incoming_message(registry.clone(), peer_addr, msg)
-                    .await
+            if let Err(e) = crate::connection_pool::handle_incoming_message(
+                registry.clone(),
+                peer_addr,
+                session_source,
+                msg,
+            )
+            .await
             {
                 warn!(error = %e, "Failed to process gossip message");
             }
