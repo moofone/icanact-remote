@@ -4167,10 +4167,14 @@ async fn test_ask_direct_throughput() {
 
 /// In a production build (no `debug_assertions`, no `test-helpers`), an
 /// inbound `DirectAsk` with no registered handler must never fabricate a
-/// response from the caller's own request bytes. Only runs in release test
-/// binaries, since `debug_assertions` is what keeps the bench/test echo path
-/// alive during ordinary `cargo test` (dev profile) runs.
-#[cfg(not(debug_assertions))]
+/// response from the caller's own request bytes. Integration test binaries
+/// link the library with `test = false`, so the library's echo gate
+/// (`cfg(any(test, feature = "test-helpers", debug_assertions))`) reduces to
+/// `any(feature = "test-helpers", debug_assertions)` here. This test must
+/// only compile in the complementary (echo-off) configuration, or it would
+/// spuriously fail whenever `--features test-helpers` is set alongside
+/// `--release`.
+#[cfg(not(any(feature = "test-helpers", debug_assertions)))]
 #[tokio::test]
 async fn direct_ask_production_build_does_not_echo_request_payload() {
     let config = GossipConfig {
