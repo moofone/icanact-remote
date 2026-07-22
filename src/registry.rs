@@ -9808,6 +9808,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp() + 10_000),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
                 },
             );
         }
@@ -12711,6 +12712,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp() + 10_000),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
                 },
             );
         }
@@ -12777,6 +12779,7 @@ mod tests {
                     last_failure_time: Some(current_timestamp() + 10_000),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
                 },
             );
         }
