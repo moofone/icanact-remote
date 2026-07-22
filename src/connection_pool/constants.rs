@@ -7,6 +7,27 @@ pub const MASTER_BUFFER_SIZE: usize = 1024 * 1024; // 1MB - THE source of truth
 pub const STREAM_CHUNK_SIZE: usize = MASTER_BUFFER_SIZE; // Streaming chunk size
 pub const STREAMING_THRESHOLD: usize = MASTER_BUFFER_SIZE.saturating_sub(1024); // Just under buffer limit
 
+// R-I (P1): the per-turn response batch drain loops in `stream_writer.rs`
+// (`ResponseBatch` / `DirectResponseBatch`) were bounded only by FRAME COUNT
+// (`READ_BATCH_LIMIT` = 2048, `ASK_READ_BATCH_LIMIT` = 8192), not by bytes.
+// Each buffered payload can be up to `STREAMING_THRESHOLD` (~1 MiB) before it
+// would instead take the streaming path, so a peer that packs its ask window
+// (`DEFAULT_ASK_WINDOW`, sender-side politeness only — never enforced by the
+// receiver) with max-size response frames could force up to
+// `ASK_READ_BATCH_LIMIT * STREAMING_THRESHOLD` (~8 GiB) of live `Bytes` to
+// accumulate in one turn before the frame-count cap ever fired. This is a
+// memory-blowup DoS vector and it also inflates RTT, since nothing flushes
+// while still accumulating.
+//
+// `RESPONSE_BATCH_BYTE_CAP` bounds accumulated bytes per batch independent of
+// frame count: once a batch's running total reaches this cap, the drain loop
+// flushes it immediately and continues draining into a fresh batch. Sized at
+// 8x `STREAMING_THRESHOLD` (~8 MiB): generous enough to keep the common case
+// (small ask/response payloads) batching exactly as before, while capping the
+// worst case (all-maximum-size payloads) at a small, fixed multiple of a
+// single streaming chunk instead of thousands of them.
+pub const RESPONSE_BATCH_BYTE_CAP: usize = STREAMING_THRESHOLD.saturating_mul(8);
+
 struct IoPerfCounters {
     read_calls: AtomicU64,
     read_ns: AtomicU64,
@@ -35,6 +56,10 @@ fn flush_each_actor_response() -> bool {
 struct ResponseBatch {
     correlation_ids: Vec<u32>,
     payloads: Vec<bytes::Bytes>,
+    /// Running sum of `payloads` lengths, kept in lock-step with
+    /// push/clear so the drain loop can enforce `RESPONSE_BATCH_BYTE_CAP`
+    /// without re-summing the batch on every check (R-I).
+    total_bytes: usize,
 }
 
 impl ResponseBatch {
@@ -42,12 +67,14 @@ impl ResponseBatch {
         Self {
             correlation_ids: Vec::with_capacity(capacity),
             payloads: Vec::with_capacity(capacity),
+            total_bytes: 0,
         }
     }
 
     fn clear(&mut self) {
         self.correlation_ids.clear();
         self.payloads.clear();
+        self.total_bytes = 0;
     }
 
     fn is_empty(&self) -> bool {
@@ -55,8 +82,15 @@ impl ResponseBatch {
     }
 
     fn push_bytes(&mut self, correlation_id: u32, payload: bytes::Bytes) {
+        self.total_bytes += payload.len();
         self.correlation_ids.push(correlation_id);
         self.payloads.push(payload);
+    }
+
+    /// Bytes accumulated in this batch since the last `clear()`. Used by the
+    /// drain loop to enforce `RESPONSE_BATCH_BYTE_CAP` (R-I).
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 }
 
@@ -65,6 +99,8 @@ impl ResponseBatch {
 struct DirectResponseBatch {
     correlation_ids: Vec<u32>,
     payloads: Vec<bytes::Bytes>,
+    /// Running sum of `payloads` lengths; see `ResponseBatch::total_bytes` (R-I).
+    total_bytes: usize,
 }
 
 impl DirectResponseBatch {
@@ -72,12 +108,14 @@ impl DirectResponseBatch {
         Self {
             correlation_ids: Vec::with_capacity(capacity),
             payloads: Vec::with_capacity(capacity),
+            total_bytes: 0,
         }
     }
 
     fn clear(&mut self) {
         self.correlation_ids.clear();
         self.payloads.clear();
+        self.total_bytes = 0;
     }
 
     fn is_empty(&self) -> bool {
@@ -85,8 +123,15 @@ impl DirectResponseBatch {
     }
 
     fn push_bytes(&mut self, correlation_id: u32, payload: bytes::Bytes) {
+        self.total_bytes += payload.len();
         self.correlation_ids.push(correlation_id);
         self.payloads.push(payload);
+    }
+
+    /// Bytes accumulated in this batch since the last `clear()`. Used by the
+    /// drain loop to enforce `RESPONSE_BATCH_BYTE_CAP` (R-I).
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 }
 
@@ -354,6 +399,46 @@ where
 
     batch.clear();
     Ok(())
+}
+
+/// Flush `batch` immediately if it has accumulated at least
+/// `RESPONSE_BATCH_BYTE_CAP` bytes since the last flush (R-I). This bounds
+/// per-turn memory independent of the frame-count caps (`READ_BATCH_LIMIT`,
+/// `ASK_READ_BATCH_LIMIT` in `stream_writer.rs`): those only stop accumulating
+/// after thousands of frames, so a peer packing its ask window with max-size
+/// (~1 MiB, i.e. up to `STREAMING_THRESHOLD`) response payloads could
+/// otherwise force gigabytes of live `Bytes` into one batch before either cap
+/// fired. `write_response_batch` drains `batch` strictly in push order before
+/// clearing it, so an early flush here never reorders or drops frames.
+async fn flush_response_batch_if_over_byte_cap<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    batch: &mut ResponseBatch,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP {
+        return Ok(());
+    }
+    write_response_batch(stream, bytes_written_counter, bytes_since_flush, batch).await
+}
+
+/// See `flush_response_batch_if_over_byte_cap`; the `DirectResponseBatch` twin.
+async fn flush_direct_response_batch_if_over_byte_cap<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    batch: &mut DirectResponseBatch,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP {
+        return Ok(());
+    }
+    write_direct_response_batch(stream, bytes_written_counter, bytes_since_flush, batch).await
 }
 
 async fn write_direct_response_batch<S>(
@@ -1394,5 +1479,187 @@ mod queue_notify_tests {
             }
             other => panic!("expected Network(WriteZero), got {other:?}"),
         }
+    }
+}
+
+// R-I (P1): the response batch drain loops in `stream_writer.rs` accumulated
+// frames up to a FRAME-COUNT cap only (`READ_BATCH_LIMIT` / 2048,
+// `ASK_READ_BATCH_LIMIT` / 8192) with no byte-level bound, so a peer sending
+// many max-size (~1 MiB) response payloads could force gigabytes of live
+// `Bytes` into a single in-memory batch before anything flushed. These tests
+// drive the real `ResponseBatch`/`DirectResponseBatch` types and the real
+// `write_response_batch`/`write_direct_response_batch` writers against a
+// recording mock stream, simulating exactly what the drain loop does each
+// iteration: push one frame, then give the loop a chance to flush early.
+#[cfg(test)]
+mod response_batch_byte_cap_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    /// Records every byte written via `write_vectored`/`write_all` in order,
+    /// so tests can assert both total volume and exact frame ordering across
+    /// however many flushes occur.
+    #[derive(Default)]
+    struct RecordingStream {
+        written: Vec<u8>,
+        write_vectored_calls: usize,
+    }
+
+    impl tokio::io::AsyncWrite for RecordingStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.write_vectored_calls += 1;
+            let mut n = 0;
+            for buf in bufs {
+                self.written.extend_from_slice(buf);
+                n += buf.len();
+            }
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A payload just under `STREAMING_THRESHOLD`, matching the largest
+    /// payload the batch paths (as opposed to the streaming path) ever carry.
+    fn near_streaming_threshold_payload(fill: u8) -> bytes::Bytes {
+        bytes::Bytes::from(vec![fill; STREAMING_THRESHOLD])
+    }
+
+    /// Drives `ResponseBatch` + `write_response_batch` the way the
+    /// `stream_writer.rs` drain loop does: push one frame per simulated read,
+    /// then call the byte-cap guard so it can flush early. Returns the number
+    /// of `write_vectored` calls observed and the fully reassembled written
+    /// bytes for ordering checks.
+    async fn drain_simulated_turn(
+        frame_count: usize,
+    ) -> (usize, Vec<u8>, /* max batch bytes observed */ usize) {
+        let mut stream = RecordingStream::default();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut bytes_since_flush = 0usize;
+        let mut batch = ResponseBatch::new(frame_count);
+        let mut max_batch_bytes = 0usize;
+
+        for i in 0..frame_count {
+            let payload = near_streaming_threshold_payload((i % 256) as u8);
+            batch.push_bytes(i as u32, payload);
+            max_batch_bytes = max_batch_bytes.max(batch.total_bytes());
+
+            // This is the fix under test: the drain loop must flush a batch
+            // immediately once it reaches RESPONSE_BATCH_BYTE_CAP, rather than
+            // only checking frame count. Pre-fix, no such guard exists.
+            flush_response_batch_if_over_byte_cap(
+                &mut stream,
+                &counter,
+                &mut bytes_since_flush,
+                &mut batch,
+            )
+            .await
+            .expect("flush must not fail against a healthy mock stream");
+        }
+
+        if !batch.is_empty() {
+            write_response_batch(&mut stream, &counter, &mut bytes_since_flush, &mut batch)
+                .await
+                .expect("final flush must not fail against a healthy mock stream");
+        }
+
+        (stream.write_vectored_calls, stream.written, max_batch_bytes)
+    }
+
+    /// RED: with `STREAM_ACTIVE`-sized (~1 MiB) payloads, 32 frames is ~32 MiB
+    /// — comfortably below both `READ_BATCH_LIMIT` (2048) and
+    /// `ASK_READ_BATCH_LIMIT` (8192), so the old frame-count-only cap would
+    /// never trigger and the whole 32 MiB would sit in one `ResponseBatch`
+    /// until the single end-of-turn flush. This asserts the batch is never
+    /// allowed to hold more than a small, fixed multiple of a single
+    /// streaming-sized payload (`RESPONSE_BATCH_BYTE_CAP`) at once, proving a
+    /// real byte-level cap is enforced independent of frame count.
+    #[tokio::test]
+    async fn response_batch_never_exceeds_byte_cap_regardless_of_frame_count() {
+        const FRAMES: usize = 32;
+        let (write_vectored_calls, written, max_batch_bytes) =
+            drain_simulated_turn(FRAMES).await;
+
+        assert!(
+            max_batch_bytes <= RESPONSE_BATCH_BYTE_CAP,
+            "batch accumulated {max_batch_bytes} bytes, exceeding the \
+             RESPONSE_BATCH_BYTE_CAP of {RESPONSE_BATCH_BYTE_CAP} bytes; a \
+             peer packing its ask window with max-size frames can force \
+             unbounded per-turn memory growth"
+        );
+
+        // Bytes-capped batching must still have flushed more than once across
+        // 32 MiB of payload (each write_vectored call carries at most the
+        // byte cap's worth of frames), proving early flush actually fired
+        // rather than accumulating everything into one end-of-turn write.
+        assert!(
+            write_vectored_calls > 1,
+            "expected multiple early flushes once the byte cap was reached, \
+             got only {write_vectored_calls} write_vectored call(s)"
+        );
+
+        // Frame ordering must be preserved across the early flushes: replay
+        // the recorded bytes as a sequence of [header, payload] frames and
+        // confirm correlation ids and payload fill bytes arrive 0..FRAMES in
+        // order, with no frame dropped or duplicated.
+        let mut offset = 0usize;
+        for expected_id in 0..FRAMES {
+            const HDR_LEN: usize = crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN;
+            const ASK_RESPONSE_HEADER_LEN: usize = crate::framing::ASK_RESPONSE_HEADER_LEN;
+            assert!(
+                offset + HDR_LEN <= written.len(),
+                "missing frame header for correlation id {expected_id}"
+            );
+            let header = &written[offset..offset + HDR_LEN];
+            let mut control_word = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+            control_word.copy_from_slice(&header[..crate::framing::LENGTH_PREFIX_LEN]);
+            let control = crate::framing::decode_control(control_word)
+                .expect("recorded bytes must contain a valid control word");
+            assert_eq!(control.kind, crate::framing::WireKind::Response);
+            let payload_len = control.body_len - ASK_RESPONSE_HEADER_LEN;
+            let correlation_id = u32::from_be_bytes(header[4..8].try_into().unwrap());
+            assert_eq!(
+                correlation_id, expected_id as u32,
+                "frame order was not preserved across an early byte-cap flush"
+            );
+            assert_eq!(payload_len, STREAMING_THRESHOLD);
+            offset += HDR_LEN;
+
+            let expected_fill = (expected_id % 256) as u8;
+            let payload = &written[offset..offset + payload_len];
+            assert!(
+                payload.iter().all(|&b| b == expected_fill),
+                "payload bytes for correlation id {expected_id} were corrupted \
+                 or misaligned across an early byte-cap flush"
+            );
+            offset += payload_len;
+        }
+        assert_eq!(offset, written.len(), "no extra or missing trailing bytes");
     }
 }
