@@ -109,8 +109,9 @@ impl LockFreeConnection {
         self.abort_tasks_inner(true);
     }
 
-    /// Same as [`Self::abort_tasks`], but never calls `cancel_all()` on
-    /// `correlation`.
+    /// Same as [`Self::abort_tasks`], but never cancels `correlation` — not
+    /// the direct call here, and not indirectly through the IO task's own
+    /// `ExitGuard` either.
     ///
     /// `correlation` is a SESSION-level `Arc<CorrelationTracker>`, shared by
     /// pointer across every reconnect instance for a peer (installed via
@@ -126,6 +127,15 @@ impl LockFreeConnection {
     /// the SURVIVING sibling's in-flight ask slots, not just the instance
     /// actually being torn down.
     ///
+    /// Skipping the direct `cancel_all()` call below is not by itself
+    /// enough: the IO task's own `ExitGuard` also cancels `correlation` on
+    /// drop unless it independently infers this exact instance is
+    /// superseded, and that inference reads pool state which can lag this
+    /// call (the peer/addr lookup it uses may not yet reflect the surviving
+    /// sibling). So before signalling exit, this also marks the stream
+    /// handle's `known_superseded` flag, which the `ExitGuard` checks ahead
+    /// of — and authoritatively overriding — its own inference.
+    ///
     /// Callers must first confirm the tracker is actually shared with a
     /// still-live sibling (see [`shares_correlation_tracker`]) — this only
     /// skips the cancellation, it does not itself decide whether skipping is
@@ -133,6 +143,9 @@ impl LockFreeConnection {
     /// using `abort_tasks()` so its own in-flight callers still observe
     /// `ConnectionDropped` instead of hanging until timeout.
     pub(crate) fn abort_tasks_keep_correlation(&self) {
+        if let Some(handle) = self.stream_handle.as_ref() {
+            handle.known_superseded.store(true, Ordering::Release);
+        }
         self.abort_tasks_inner(false);
     }
 

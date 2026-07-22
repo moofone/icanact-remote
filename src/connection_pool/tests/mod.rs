@@ -7308,3 +7308,133 @@ async fn disconnect_connection_by_peer_id_still_cancels_correlation_on_final_tea
 
     guard.disarm();
 }
+
+/// RED-first: skipping the DIRECT `correlation.cancel_all()` call in
+/// `abort_tasks_keep_correlation` is not sufficient on its own. The
+/// connection's real IO task carries its own `ExitGuard`, which cancels the
+/// same tracker on Drop unless it independently infers this instance is
+/// superseded — and that inference can miss:
+///
+/// - the exiting instance's `ExitGuard` captured `peer_id: None` in its
+///   `ReadContext` (the realistic shape for an outbound dial made before the
+///   peer's identity was learned, even though the connection is later
+///   associated with a peer via `add_connection_by_peer_id`), so it falls
+///   back to an ADDRESS-keyed lookup instead of a peer-keyed one;
+/// - `retire_displaced_expected`'s own address-alias sweep removes the
+///   exiting instance's `connections_by_addr` entry, and the higher-level
+///   caller that would re-index the WINNER at that same address (e.g.
+///   `finalize_new_outbound_connection`) has not run yet — exactly the
+///   window between `compare_and_publish_peer_connection` returning and that
+///   caller's own follow-up indexing step.
+///
+/// In that window the address-keyed fallback resolves to nothing, the
+/// `ExitGuard` concludes "not superseded", and unconditionally cancels the
+/// shared tracker via the task-abort path — even though
+/// `abort_tasks_keep_correlation` correctly skipped its own direct call.
+#[tokio::test]
+async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_when_peer_id_unresolved()
+ {
+    let peer_id =
+        crate::KeyPair::new_for_testing("shared-correlation-exit-guard-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7498".parse().unwrap();
+
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("exit-guard-race-registry")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let pool = &registry.connection_pool;
+
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // `expected`: the losing/displaced instance, with a REAL IO task whose
+    // `ExitGuard` captured NO peer_id at spawn time.
+    let (io, _keep) = tokio::io::duplex(1024);
+    let read_ctx = ReadContext {
+        streaming_state_handoff: None,
+        registry_weak: Arc::downgrade(&registry),
+        peer_addr: addr,
+        peer_id: None,
+        max_message_size: MASTER_BUFFER_SIZE,
+        expected_schema_hash: None,
+        aligned_pool: pool.aligned_bytes_pool(),
+        inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+        response_correlation: Some(tracker.clone()),
+        response_writer: None,
+        tell_handler_sync: None,
+        tell_handler_sync_context: None,
+        ask_immediate_handler_sync: None,
+        ask_handler_sync: None,
+        sync_actor_handler: None,
+    };
+    let (sh, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        Some(read_ctx),
+    );
+    let mut expected_conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+    expected_conn.stream_handle = Some(Arc::new(sh));
+    expected_conn.set_state(ConnectionState::Connected);
+    expected_conn.correlation = Some(tracker.clone());
+    expected_conn.task_tracker.set_writer(writer_task.abort_handle());
+    let expected = Arc::new(expected_conn);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, expected.clone()));
+
+    // Let the writer task actually start running (construct its `ExitGuard`
+    // and park on its first real await point) before we retire `expected` —
+    // otherwise `.abort()` can cancel the task before it is ever polled even
+    // once, which drops the future without ever constructing `_exit_guard`
+    // and trivially (uninterestingly) "wins" this test.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    // `winner`: the fresh instance the tie-break selects, sharing the
+    // IDENTICAL tracker Arc. Published in `connections_by_peer` by the
+    // compare-and-publish below but — exactly like the real
+    // `AcceptIncoming` call sites, which index it by address SEPARATELY,
+    // outside `compare_and_publish_peer_connection` — never installed in
+    // `connections_by_addr` here.
+    let winner =
+        make_live_connection_with_correlation(addr, ConnectionDirection::Inbound, tracker.clone())
+            .await;
+
+    // An in-flight ask slot on the WINNER's (shared) tracker.
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+
+    let result =
+        pool.compare_and_publish_peer_connection(&peer_id, Some(&expected), winner.clone());
+    assert!(
+        result.is_ok(),
+        "compare-and-publish against the still-installed `expected` must succeed: {result:?}"
+    );
+
+    // Give the aborted writer task's `ExitGuard` a bounded chance to run.
+    for _ in 0..200 {
+        if tracker.pending[slot].state.load(Ordering::Acquire) != SLOT_WAITING {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    debug_assert!(writer_task.is_finished(), "test setup: the writer task must actually exit");
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "the exiting loser's OWN IO-task ExitGuard cancelled the shared correlation tracker's \
+         in-flight slot via the task-abort path (peer_id unresolved + winner not yet \
+         addr-indexed) — this kills the WINNER's in-flight asks even though the direct \
+         cancel_all() call was skipped"
+    );
+
+    guard.disarm();
+}
