@@ -461,7 +461,21 @@ impl<T> ConnectionPool<T> {
             }
         }
         self.release_counted_connection(expected);
-        expected.abort_tasks();
+        // `expected.correlation` is a SESSION-level
+        // tracker shared BY POINTER across reconnect instances for this
+        // peer. `winner` is already published as the peer's current session
+        // at this point, so if it shares that exact tracker Arc with
+        // `expected` (the common case — both went through
+        // `get_or_create_correlation_tracker`/`add_connection_by_peer_id`
+        // for the same peer), an unconditional `expected.abort_tasks()`
+        // would `cancel_all()` the tracker `winner` is actively using,
+        // spuriously failing the winner's in-flight asks. Only cancel the
+        // shared tracker when `winner` does NOT depend on it.
+        if expected.shares_correlation_tracker(winner) {
+            expected.abort_tasks_keep_correlation();
+        } else {
+            expected.abort_tasks();
+        }
     }
 
     /// Evict `rival` for a `ReplaceExisting` decision, and return the
@@ -2262,11 +2276,20 @@ impl<T> ConnectionPool<T> {
             .connections_by_addr
             .remove_if_sync(&addr, |v| Arc::ptr_eq(v, candidate))
             .is_some();
+        // `candidate` and a still-live `existing_before`
+        // for the SAME peer share their `correlation` tracker BY POINTER
+        // (both resolve through `get_or_create_correlation_tracker(peer_id)`
+        // for this peer session) — restoring `existing` below does not stop
+        // `candidate.abort_tasks()` from also cancelling every in-flight ask
+        // on that live, restored connection. Only cancel the shared tracker
+        // when `existing` does not depend on it.
+        let mut keep_correlation = false;
         if removed {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
                     let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
                     let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+                    keep_correlation = candidate.shares_correlation_tracker(existing);
                 }
                 _ => {
                     let _ = self.addr_to_peer_id.remove_sync(&addr);
@@ -2278,7 +2301,11 @@ impl<T> ConnectionPool<T> {
         // removal above found this exact instance still indexed — the
         // candidate is being discarded either way and its tasks must not be
         // left running unaccounted for.
-        candidate.abort_tasks();
+        if keep_correlation {
+            candidate.abort_tasks_keep_correlation();
+        } else {
+            candidate.abort_tasks();
+        }
     }
 
     /// Disconnect a specific connection instance for `peer_id`, but only if

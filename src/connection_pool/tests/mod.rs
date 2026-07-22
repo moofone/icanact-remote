@@ -7147,3 +7147,294 @@ fn connection_pool_has_no_unwrapped_raw_async_write_calls() {
         violations.join("\n")
     );
 }
+
+/// Test helper: like `make_live_connection`, but installs a caller-supplied
+/// (typically shared) correlation tracker instead of getting a fresh one
+/// from `LockFreeConnection::new`. Mirrors how a real peer-session tracker
+/// (`ConnectionPool::get_or_create_correlation_tracker`) ends up installed on
+/// more than one connection instance for the same peer.
+async fn make_live_connection_with_correlation(
+    addr: SocketAddr,
+    direction: ConnectionDirection,
+    correlation: Arc<CorrelationTracker>,
+) -> Arc<LockFreeConnection> {
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (sh, _w, _r) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut conn = LockFreeConnection::new(addr, direction);
+    conn.stream_handle = Some(Arc::new(sh));
+    conn.set_state(ConnectionState::Connected);
+    conn.correlation = Some(correlation);
+    Arc::new(conn)
+}
+
+/// RED-first (QA finding R-C, P1, `abort_tasks`/`retire_displaced_expected`,
+/// `types.rs` ~108-122 / `pool_connect.rs` ~436-465): `conn.correlation` is a
+/// SESSION-level `Arc<CorrelationTracker>`, shared BY POINTER across
+/// reconnect instances for a peer (installed via
+/// `get_or_create_correlation_tracker`/`add_connection_by_peer_id`). When a
+/// displaced/losing connection instance is retired via
+/// `retire_displaced_expected` — which runs AFTER the winner is already
+/// published as the peer's current session — `expected.abort_tasks()`
+/// unconditionally called `correlation.cancel_all()` on that SAME shared
+/// tracker, cancelling the WINNER's in-flight ask slots too. This fires on
+/// every `AcceptIncoming`-shaped displacement (routine single-node-restart
+/// reconnect churn), producing spurious ask failures on a perfectly healthy
+/// replacement connection.
+///
+/// RED (pre-fix): the winner's in-flight slot is cancelled back to
+/// `SLOT_EMPTY` by retiring a loser it merely shares a tracker with. GREEN
+/// (post-fix): the slot survives, still `SLOT_WAITING`.
+#[tokio::test]
+async fn retire_displaced_expected_must_not_cancel_winners_shared_correlation() {
+    let peer_id = crate::KeyPair::new_for_testing("shared-correlation-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7496".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+
+    // The peer session's shared, SESSION-level tracker — created up front,
+    // exactly like the real outbound/inbound connect paths do via
+    // `get_or_create_correlation_tracker` BEFORE installing it onto a raw
+    // `conn.correlation` (production `LockFreeConnection::new` always seeds
+    // a fresh PRIVATE tracker; only this explicit overwrite makes it
+    // session-shared — see `pool_connect.rs` outbound ~3216-3219 / inbound
+    // ~3634).
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // `expected`: the losing/displaced instance, indexed+counted exactly
+    // like a real, previously accepted/finalized connection for this peer,
+    // using the shared tracker.
+    let expected =
+        make_live_connection_with_correlation(addr, ConnectionDirection::Outbound, tracker.clone())
+            .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, expected.clone()));
+    assert!(
+        expected
+            .correlation
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &tracker)),
+        "test precondition: `expected` must use the peer session's shared tracker"
+    );
+
+    // `winner`: the fresh instance the tie-break selects, installed with the
+    // IDENTICAL shared tracker Arc — exactly what a real reconnect for this
+    // peer gets from `handle_correlation`/`add_connection_by_peer_id`.
+    let winner =
+        make_live_connection_with_correlation(addr, ConnectionDirection::Inbound, tracker.clone())
+            .await;
+
+    // An in-flight ask slot on the WINNER's tracker, exactly as if a real ask
+    // were awaiting a reply on the connection that is about to become
+    // current.
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    // The exact primitive every `AcceptIncoming` call site uses, which on
+    // success retires `expected` via `retire_displaced_expected` — AFTER
+    // `winner` is already published as the peer's current connection.
+    let result =
+        pool.compare_and_publish_peer_connection(&peer_id, Some(&expected), winner.clone());
+    assert!(
+        result.is_ok(),
+        "compare-and-publish against the still-installed `expected` must succeed: {result:?}"
+    );
+
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &winner)),
+        "the winner must be published as the peer's current session (got {current:?})"
+    );
+
+    // The core assertion: retiring the displaced `expected` instance must
+    // NOT cancel the shared tracker's in-flight slots — those belong to the
+    // still-live `winner`.
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "retiring the displaced/losing instance cancelled the shared correlation tracker's \
+         in-flight slot — this kills the WINNER's in-flight asks (QA finding R-C)"
+    );
+
+    guard.disarm();
+}
+
+/// Control for the fix above: a GENUINELY FINAL teardown (no surviving
+/// sibling instance for the peer) must still cancel every in-flight slot on
+/// the connection's correlation tracker, exactly as before this change —
+/// callers awaiting those asks must observe `ConnectionDropped` instead of
+/// hanging until timeout.
+#[tokio::test]
+async fn disconnect_connection_by_peer_id_still_cancels_correlation_on_final_teardown() {
+    let peer_id = crate::KeyPair::new_for_testing("final-teardown-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7497".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let conn =
+        make_live_connection_with_correlation(addr, ConnectionDirection::Outbound, tracker.clone())
+            .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, conn.clone()));
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    // No rival/winner is ever published for this peer: this is a genuinely
+    // final teardown, not a displacement.
+    let removed = pool.disconnect_connection_by_peer_id(&peer_id);
+    assert!(removed.is_some_and(|c| Arc::ptr_eq(&c, &conn)));
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_EMPTY,
+        "a genuinely final teardown (no surviving sibling instance) must still cancel the \
+         connection's correlation tracker"
+    );
+
+    guard.disarm();
+}
+
+/// RED-first: skipping the DIRECT `correlation.cancel_all()` call in
+/// `abort_tasks_keep_correlation` is not sufficient on its own. The
+/// connection's real IO task carries its own `ExitGuard`, which cancels the
+/// same tracker on Drop unless it independently infers this instance is
+/// superseded — and that inference can miss:
+///
+/// - the exiting instance's `ExitGuard` captured `peer_id: None` in its
+///   `ReadContext` (the realistic shape for an outbound dial made before the
+///   peer's identity was learned, even though the connection is later
+///   associated with a peer via `add_connection_by_peer_id`), so it falls
+///   back to an ADDRESS-keyed lookup instead of a peer-keyed one;
+/// - `retire_displaced_expected`'s own address-alias sweep removes the
+///   exiting instance's `connections_by_addr` entry, and the higher-level
+///   caller that would re-index the WINNER at that same address (e.g.
+///   `finalize_new_outbound_connection`) has not run yet — exactly the
+///   window between `compare_and_publish_peer_connection` returning and that
+///   caller's own follow-up indexing step.
+///
+/// In that window the address-keyed fallback resolves to nothing, the
+/// `ExitGuard` concludes "not superseded", and unconditionally cancels the
+/// shared tracker via the task-abort path — even though
+/// `abort_tasks_keep_correlation` correctly skipped its own direct call.
+#[tokio::test]
+async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_when_peer_id_unresolved()
+ {
+    let peer_id =
+        crate::KeyPair::new_for_testing("shared-correlation-exit-guard-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7498".parse().unwrap();
+
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("exit-guard-race-registry")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let pool = &registry.connection_pool;
+
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // `expected`: the losing/displaced instance, with a REAL IO task whose
+    // `ExitGuard` captured NO peer_id at spawn time.
+    let (io, _keep) = tokio::io::duplex(1024);
+    let read_ctx = ReadContext {
+        streaming_state_handoff: None,
+        registry_weak: Arc::downgrade(&registry),
+        peer_addr: addr,
+        peer_id: None,
+        max_message_size: MASTER_BUFFER_SIZE,
+        expected_schema_hash: None,
+        aligned_pool: pool.aligned_bytes_pool(),
+        inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+        response_correlation: Some(tracker.clone()),
+        response_writer: None,
+        tell_handler_sync: None,
+        tell_handler_sync_context: None,
+        ask_immediate_handler_sync: None,
+        ask_handler_sync: None,
+        sync_actor_handler: None,
+    };
+    let (sh, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        Some(read_ctx),
+    );
+    let mut expected_conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+    expected_conn.stream_handle = Some(Arc::new(sh));
+    expected_conn.set_state(ConnectionState::Connected);
+    expected_conn.correlation = Some(tracker.clone());
+    expected_conn.task_tracker.set_writer(writer_task.abort_handle());
+    let expected = Arc::new(expected_conn);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, expected.clone()));
+
+    // Let the writer task actually start running (construct its `ExitGuard`
+    // and park on its first real await point) before we retire `expected` —
+    // otherwise `.abort()` can cancel the task before it is ever polled even
+    // once, which drops the future without ever constructing `_exit_guard`
+    // and trivially (uninterestingly) "wins" this test.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    // `winner`: the fresh instance the tie-break selects, sharing the
+    // IDENTICAL tracker Arc. Published in `connections_by_peer` by the
+    // compare-and-publish below but — exactly like the real
+    // `AcceptIncoming` call sites, which index it by address SEPARATELY,
+    // outside `compare_and_publish_peer_connection` — never installed in
+    // `connections_by_addr` here.
+    let winner =
+        make_live_connection_with_correlation(addr, ConnectionDirection::Inbound, tracker.clone())
+            .await;
+
+    // An in-flight ask slot on the WINNER's (shared) tracker.
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+
+    let result =
+        pool.compare_and_publish_peer_connection(&peer_id, Some(&expected), winner.clone());
+    assert!(
+        result.is_ok(),
+        "compare-and-publish against the still-installed `expected` must succeed: {result:?}"
+    );
+
+    // Give the aborted writer task's `ExitGuard` a bounded chance to run.
+    for _ in 0..200 {
+        if tracker.pending[slot].state.load(Ordering::Acquire) != SLOT_WAITING {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    debug_assert!(writer_task.is_finished(), "test setup: the writer task must actually exit");
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "the exiting loser's OWN IO-task ExitGuard cancelled the shared correlation tracker's \
+         in-flight slot via the task-abort path (peer_id unresolved + winner not yet \
+         addr-indexed) — this kills the WINNER's in-flight asks even though the direct \
+         cancel_all() call was skipped"
+    );
+
+    guard.disarm();
+}

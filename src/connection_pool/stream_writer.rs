@@ -12,6 +12,14 @@ pub struct LockFreeStreamHandle {
     shutdown_signal: Arc<AtomicBool>,
     exit_flag: Arc<AtomicBool>,
     exit_notify: Arc<Notify>,
+    /// Set by a caller that is authoritatively retiring THIS instance while
+    /// its `correlation` tracker is still shared with a live sibling
+    /// instance for the same peer (see
+    /// `LockFreeConnection::abort_tasks_keep_correlation`). The IO task's
+    /// `ExitGuard` checks this before its own peer/addr-based supersession
+    /// inference, which can otherwise lag the caller's already-published
+    /// decision by a check-then-act window.
+    known_superseded: Arc<AtomicBool>,
     flush_pending: Arc<AtomicBool>,
     /// Atomic flag for coordinating streaming mode. Read by the IO task and
     /// `is_streaming_active` as a cheap observability signal; the actual mutual
@@ -112,6 +120,7 @@ impl LockFreeStreamHandle {
         let flush_pending = Arc::new(AtomicBool::new(false));
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_notify = Arc::new(Notify::new());
+        let known_superseded = Arc::new(AtomicBool::new(false));
 
         // Create shared counter for actual TCP bytes written
         let bytes_written = Arc::new(AtomicUsize::new(0));
@@ -134,6 +143,7 @@ impl LockFreeStreamHandle {
             let flush_pending_for_task = flush_pending.clone();
             let exit_flag_for_task = exit_flag.clone();
             let exit_notify_for_task = exit_notify.clone();
+            let known_superseded_for_task = known_superseded.clone();
             let writer_addr = addr;
             let writer_channel_id = channel_id;
             let write_queue = write_queue.clone();
@@ -159,6 +169,7 @@ impl LockFreeStreamHandle {
                     instance_id,
                     exit_flag_for_task,
                     exit_notify_for_task,
+                    known_superseded_for_task,
                 )
                 .await;
                 // CRITICAL: Log when writer exits - this helps diagnose silent writer deaths
@@ -182,6 +193,7 @@ impl LockFreeStreamHandle {
                 flush_pending,
                 exit_flag,
                 exit_notify,
+                known_superseded,
                 streaming_active,
                 stream_gate,
                 outbound_routes,
@@ -214,6 +226,7 @@ impl LockFreeStreamHandle {
         instance_id: u64,
         exit_flag: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
+        known_superseded: Arc<AtomicBool>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -369,6 +382,7 @@ impl LockFreeStreamHandle {
             peer_addr: Option<SocketAddr>,
             peer_id: Option<crate::PeerId>,
             instance_id: u64,
+            known_superseded: Arc<AtomicBool>,
         }
 
         impl Drop for ExitGuard {
@@ -380,7 +394,16 @@ impl LockFreeStreamHandle {
                 self.write_queue.mark_closed_and_wake();
                 self.immediate_write_queue.mark_closed_and_wake();
                 self.streaming_queue.mark_closed_and_wake();
-                let mut should_cancel_pending = true;
+                // Authoritative signal from a caller that is deliberately
+                // retiring this exact instance while its correlation tracker
+                // is still shared with a live sibling (e.g.
+                // `retire_displaced_expected`/`unpublish_rejected_outbound_candidate`
+                // via `abort_tasks_keep_correlation`). Trust it ahead of the
+                // peer/addr-based inference below, which reads pool state
+                // this same caller may have already mutated (or not yet
+                // re-published) by the time this Drop runs.
+                let mut superseded = self.known_superseded.load(Ordering::Acquire);
+                let mut should_cancel_pending = !superseded;
                 if let (Some(registry_weak), Some(peer_addr)) =
                     (self.registry_weak.as_ref(), self.peer_addr)
                     && let Some(registry) = registry_weak.upgrade()
@@ -393,8 +416,15 @@ impl LockFreeStreamHandle {
                     let pool = &registry.connection_pool;
                     let peer_id = peer_id_hint.or_else(|| pool.get_peer_id_by_addr(&peer_addr));
 
-                    let mut superseded = false;
-                    if let Some(peer_id) = peer_id.as_ref()
+                    // Skip re-deriving supersession when `known_superseded`
+                    // already settled it above: this inference reads pool
+                    // state the SAME caller that set that flag may have
+                    // already mutated (its own address-alias sweep) or not
+                    // yet re-published (a sibling's own indexing step can
+                    // still be pending), so it must never downgrade an
+                    // authoritative "yes" back to "no".
+                    if !superseded
+                        && let Some(peer_id) = peer_id.as_ref()
                         && let Some(current) = pool.get_connection_by_peer_id(peer_id)
                         && let Some(handle) = current.stream_handle.as_ref()
                         && handle.instance_id() != expected_instance
@@ -407,7 +437,8 @@ impl LockFreeStreamHandle {
                             current_instance = handle.instance_id(),
                             "IO task exited for stale connection; skipping pending cancel/failure handling"
                         );
-                    } else if peer_id.is_none()
+                    } else if !superseded
+                        && peer_id.is_none()
                         && let Some(current) = pool.get_lock_free_connection(peer_addr)
                         && let Some(handle) = current.stream_handle.as_ref()
                         && handle.instance_id() != expected_instance
@@ -501,6 +532,9 @@ impl LockFreeStreamHandle {
                     return;
                 }
 
+                if superseded {
+                    return;
+                }
                 warn!(
                     peer = ?self.peer_addr,
                     peer_id = ?self.peer_id,
@@ -526,6 +560,7 @@ impl LockFreeStreamHandle {
             peer_addr: read_context.as_ref().map(|ctx| ctx.peer_addr),
             peer_id: read_context.as_ref().and_then(|ctx| ctx.peer_id.clone()),
             instance_id,
+            known_superseded,
         };
 
         let perf = if IoPerfCounters::enabled() {
