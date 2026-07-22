@@ -43,6 +43,30 @@ impl RouteTable {
         }
     }
 
+    /// Hands out the next slot id, or `None` once the id space is exhausted.
+    ///
+    /// A CAS loop (not `fetch_add`) so exhaustion at `u32::MAX` is terminal:
+    /// `fetch_add` wraps silently on overflow, which would eventually hand
+    /// out slot `0`, then `1`, `2`, ... again — colliding with whatever
+    /// (actor_id, type_hash) is still bound at those low ids and letting the
+    /// peer misroute a compact frame to the wrong actor. Once exhausted this
+    /// always returns `None`; callers fall back to the uncompact ask path.
+    fn allocate_slot(&self) -> Option<u32> {
+        loop {
+            let current = self.next_slot.load(Ordering::Acquire);
+            if current == 0 || current == u32::MAX {
+                return None;
+            }
+            if self
+                .next_slot
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(current);
+            }
+        }
+    }
+
     /// Allocates once per route for this connection. Zero is never a route.
     pub(crate) fn slot_for(&self, key: RouteKey) -> Option<(u32, bool)> {
         if let Some(slot) = self.maps.read().ok()?.by_key.get(&key).copied() {
@@ -55,10 +79,7 @@ impl RouteTable {
         if maps.by_key.len() >= self.max_routes {
             return None;
         }
-        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
-        if slot == 0 || slot == u32::MAX {
-            return None;
-        }
+        let slot = self.allocate_slot()?;
         maps.by_slot.insert(slot, key);
         maps.by_key.insert(key, slot);
         Some((slot, true))
@@ -224,6 +245,47 @@ mod tests {
         assert_eq!(table.slot_for(second), None);
         assert!(!table.bind(2, second));
         assert!(table.bind(1, first), "existing binding remains idempotent");
+    }
+
+    /// Slot-id exhaustion must be a terminal, safe dead end: once the
+    /// allocator hits `u32::MAX` it must return `None` forever, never wrap
+    /// back around to a low id that a still-live route already owns. A
+    /// `fetch_add`-based allocator wraps silently past `u32::MAX`, which
+    /// would eventually reissue slot `1` (still bound to `early` here) to a
+    /// brand-new, unrelated key — letting the peer misroute a compact frame.
+    #[test]
+    fn next_slot_exhaustion_is_permanent_and_never_wraps_to_a_reusable_slot() {
+        let table = RouteTable::new();
+        let early = RouteKey {
+            actor_id: 1,
+            type_hash: 1,
+        };
+        let (early_slot, _) = table.slot_for(early).unwrap();
+        assert_eq!(early_slot, 1);
+
+        // Simulate years of cancel/rollback churn driving the allocator to
+        // the brink of exhaustion without needing 4B real routes.
+        table.next_slot.store(u32::MAX - 1, Ordering::Relaxed);
+
+        let last_valid = RouteKey {
+            actor_id: 2,
+            type_hash: 2,
+        };
+        let (slot, fresh) = table.slot_for(last_valid).unwrap();
+        assert!(fresh);
+        assert_eq!(slot, u32::MAX - 1);
+
+        let probe = RouteKey {
+            actor_id: 99,
+            type_hash: 99,
+        };
+        for _ in 0..8 {
+            assert_eq!(
+                table.slot_for(probe),
+                None,
+                "exhausted allocator must not wrap back to a low, still-live slot"
+            );
+        }
     }
 
     /// R-3: a dropped-while-armed `UnboundRouteGuard` rolls back the fresh
