@@ -465,7 +465,18 @@ async fn finalize_binds_cert_identity_over_stale_addr_map_on_rekey() {
     // finalized connection must bind A — the cert-verified identity — not the
     // stale cached B, otherwise the per-message identity guard black-holes every
     // frame A sends.
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    use crate::{GossipConfig, registry::GossipRegistry};
+    // A real (if otherwise unused) registry: finalize must actually be able
+    // to send its identifying FullSync, or it now fails the connect outright
+    // rather than silently publishing an unidentified candidate.
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("rekey-test-local")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
     let addr: SocketAddr = "127.0.0.1:40611".parse().unwrap();
 
     let stale_b = crate::KeyPair::new_for_testing("rekey_stale_peer_b").peer_id();
@@ -476,7 +487,14 @@ async fn finalize_binds_cert_identity_over_stale_addr_map_on_rekey() {
 
     let (io, _peer_io) = tokio::io::duplex(1024);
     let _handle = pool
-        .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), Some(new_a_node_id), addr, None)
+        .finalize_new_outbound_connection(
+            addr,
+            io,
+            Arc::downgrade(&registry),
+            Some(new_a_node_id),
+            addr,
+            None,
+        )
         .await
         .expect("finalize outbound connection");
 
@@ -3611,7 +3629,19 @@ fn streak_threshold_zero_never_evicts() {
 #[test]
 fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
     run_multi_thread_test(async {
-        let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+        use crate::{GossipConfig, registry::GossipRegistry};
+        // A real (if otherwise unused) registry: finalize must actually be
+        // able to send its identifying FullSync, or it now fails the
+        // connect outright rather than silently publishing an unidentified
+        // candidate.
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("streak-guard-local")),
+                ..Default::default()
+            },
+        ));
+        let pool = registry.connection_pool.clone();
         let peer = crate::KeyPair::new_for_testing("streak_instance_guard").peer_id();
         let addr: SocketAddr = "127.0.0.1:7313".parse().unwrap();
 
@@ -3619,9 +3649,16 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
         // the peer id, giving us a real stream instance to pin.
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr, None)
-            .await
-            .expect("finalize outbound");
+        pool.finalize_new_outbound_connection(
+            addr,
+            io,
+            Arc::downgrade(&registry),
+            None,
+            addr,
+            None,
+        )
+        .await
+        .expect("finalize outbound");
 
         let live_instance = pool
             .current_peer_connection_instance(&peer)
@@ -3666,15 +3703,34 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
 #[test]
 fn hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide() {
     run_multi_thread_test(async {
-        let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+        use crate::{GossipConfig, registry::GossipRegistry};
+        // A real (if otherwise unused) registry: finalize must actually be
+        // able to send its identifying FullSync, or it now fails the
+        // connect outright rather than silently publishing an unidentified
+        // candidate.
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("hard-fault-scoped-local")),
+                ..Default::default()
+            },
+        ));
+        let pool = registry.connection_pool.clone();
         let peer = crate::KeyPair::new_for_testing("hard_fault_instance_scoped").peer_id();
         let addr: SocketAddr = "127.0.0.1:7314".parse().unwrap();
 
         pool.add_addr_to_peer_id(addr, peer.clone());
         let (io, _keep) = tokio::io::duplex(1024);
-        pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr, None)
-            .await
-            .expect("finalize outbound");
+        pool.finalize_new_outbound_connection(
+            addr,
+            io,
+            Arc::downgrade(&registry),
+            None,
+            addr,
+            None,
+        )
+        .await
+        .expect("finalize outbound");
 
         let live_instance = pool
             .current_peer_connection_instance(&peer)
@@ -3800,12 +3856,31 @@ fn learned_peer_route_is_not_a_required_configured_peer() {
 #[test]
 fn outbound_finalize_balances_connection_counter() {
     run_multi_thread_test(async {
-        let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+        use crate::{GossipConfig, registry::GossipRegistry};
+        // A real (if otherwise unused) registry: finalize must actually be
+        // able to send its identifying FullSync, or it now fails the
+        // connect outright rather than silently publishing an unidentified
+        // candidate.
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("counter-balance-local")),
+                ..Default::default()
+            },
+        ));
+        let pool = registry.connection_pool.clone();
         let addr: SocketAddr = "127.0.0.1:7100".parse().unwrap();
         let (io, _peer) = tokio::io::duplex(1024);
 
         let _handle = pool
-            .finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None, addr, None)
+            .finalize_new_outbound_connection(
+                addr,
+                io,
+                Arc::downgrade(&registry),
+                None,
+                addr,
+                None,
+            )
             .await
             .expect("outbound finalize should succeed");
 
@@ -9453,4 +9528,512 @@ async fn peer_health_report_rejects_fabricated_subject_addresses() {
         "a report about a real, known peer must still be recorded so \
          consensus can use it"
     );
+}
+
+// RED: a fresh outbound connect publishes the connection (making it
+// resolvable via `get_connection_by_addr`) before the identifying FullSync
+// is built and enqueued -- `finalize_new_outbound_connection` awaits a
+// `gossip_state` lock and an actor-pairs snapshot between those two steps.
+// A routed ask that discovers the freshly published connection in that
+// window enqueues its RouteBind onto the SAME per-connection write queue,
+// so the acceptor can see RouteBind arrive before the identifying FullSync
+// and drop the connection ("RouteBind arrived before connection setup").
+//
+// This test holds `gossip_state`'s lock from the test task so a task
+// finalizing a fresh outbound connect parks exactly at that await, publishes
+// a racing routed ask's RouteBind while it is parked, then releases the
+// lock and asserts what actually lands on the wire first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_outbound_connect_sends_identifying_fullsync_before_racing_routed_ask() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+    use tokio::io::AsyncReadExt;
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "fullsync-race-local",
+            )),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+    let addr: SocketAddr = "127.0.0.1:41777".parse().unwrap();
+
+    let (io, mut peer_io) = tokio::io::duplex(4096);
+
+    // Hold `gossip_state` from the test task. In the unfixed code the
+    // connection is published (discoverable via `get_connection_by_addr`)
+    // long before the identify build ever touches this lock, so a racing
+    // task spun up below can find and exploit that window while the lock is
+    // still held. In the fixed code the identify build -- which now runs
+    // BEFORE publish -- itself needs this same lock, so publish cannot
+    // happen at all until this test task releases it; the racing task
+    // then only ever discovers the connection after the identify has
+    // already been enqueued.
+    let guard = registry.gossip_state.lock().await;
+
+    let finalize_registry = Arc::downgrade(&registry);
+    let finalize_task = tokio::spawn(async move {
+        pool.finalize_new_outbound_connection(addr, io, finalize_registry, None, addr, None)
+            .await
+            .expect("finalize outbound connection")
+    });
+
+    // Race a routed ask against the connect on a separate task: spin trying
+    // to discover the connection and, the instant it is, enqueue a
+    // RouteBind onto its write queue exactly as a real routed ask would.
+    let racer_pool = registry.connection_pool.clone();
+    let racer_task = tokio::spawn(async move {
+        loop {
+            if let Some(conn) = racer_pool.get_connection_by_addr(&addr) {
+                let stream = conn
+                    .stream_handle
+                    .clone()
+                    .expect("finalized connection must have a stream handle");
+                stream
+                    .write_routed_actor_ask(1, 42, 99, bytes::Bytes::from_static(b"race"))
+                    .await
+                    .expect("racing routed ask must be able to enqueue");
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Hold the lock long enough that, on the multi-thread runtime, the
+    // racer task -- spinning freely on another worker thread this entire
+    // time -- has effectively unbounded opportunity to win the unfixed
+    // code's (synchronous, lock-independent) publish-then-later-identify
+    // window if it exists at all. Only then release it, letting a
+    // fixed-code finalize proceed to build and enqueue its identify.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(guard);
+
+    let handle = finalize_task.await.expect("finalize task must not panic");
+    racer_task.await.expect("racer task must not panic");
+    drop(handle);
+
+    let mut control = [0u8; 4];
+    peer_io
+        .read_exact(&mut control)
+        .await
+        .expect("a first frame must have been written to the wire");
+    let kind = crate::framing::decode_control(control).unwrap().kind;
+    assert_eq!(
+        kind,
+        crate::framing::WireKind::Gossip,
+        "the identifying FullSync must be the first frame on a fresh \
+         outbound connection, even when a routed ask races the connect and \
+         discovers the connection while the identify is still being built \
+         -- got {kind:?} first instead, which is exactly what makes the \
+         acceptor drop the connection (\"RouteBind arrived before \
+         connection setup\")"
+    );
+}
+
+// RED: the reader/writer IO tasks for a fresh outbound connection are
+// already running by the time its identify build reaches the `gossip_state`
+// await (identify is built and sent before this candidate is published
+// anywhere). If the peer disconnects while that await is contended, the IO
+// tasks notice and exit -- but nothing is indexed for this candidate yet,
+// so no other cleanup path can reach it. The identify send that follows
+// then fails on the now-dead stream. A finalize that merely logs that
+// failure and continues would go on to publish and count this dead
+// candidate as the peer's live "current" connection: it can never actually
+// identify itself, nothing will ever reap it, and it permanently suppresses
+// a redial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_outbound_connect_aborts_when_identify_send_fails_instead_of_publishing_dead_candidate()
+ {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("identify-fail-local")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+    let addr: SocketAddr = "127.0.0.1:41778".parse().unwrap();
+
+    let (io, peer_io) = tokio::io::duplex(4096);
+
+    // Hold `gossip_state` so the finalize task's identify build parks here,
+    // exactly as in the identify-first race test above.
+    let guard = registry.gossip_state.lock().await;
+
+    let finalize_registry = Arc::downgrade(&registry);
+    let pool_for_finalize = pool.clone();
+    let finalize_task = tokio::spawn(async move {
+        pool_for_finalize
+            .finalize_new_outbound_connection(addr, io, finalize_registry, None, addr, None)
+            .await
+    });
+
+    // Simulate the peer disconnecting while the candidate is parked here --
+    // before anything is indexed for it, so the IO tasks' own dead-stream
+    // cleanup has nothing to reach.
+    drop(peer_io);
+
+    // Give the reader/writer IO tasks, already running against the now-
+    // closed stream, real time to notice and mark themselves exited before
+    // the finalize task is allowed to proceed past the lock.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(guard);
+
+    let result = finalize_task.await.expect("finalize task must not panic");
+
+    assert!(
+        result.is_err(),
+        "finalize must fail when the identifying FullSync could not be \
+         sent to a dead stream, not silently succeed with a dead candidate"
+    );
+    assert!(
+        pool.get_connection_by_addr(&addr).is_none(),
+        "a candidate whose identify send failed must never be published -- \
+         it can never actually identify itself to the acceptor and nothing \
+         can later reap it, which would otherwise suppress a redial forever"
+    );
+    assert_eq!(
+        pool.connection_count(),
+        0,
+        "a candidate whose identify send failed must not leak a counted \
+         connection-instance"
+    );
+}
+
+// R-11 regression coverage for `finalize_new_outbound_connection`'s own
+// arm-then-identify sequencing (as opposed to `arm_sequence_reset_for_new_session`'s
+// own internal race-safety, already covered by the `qa_r11_*` tests in
+// `registry.rs`): a fresh outbound connect to a peer that has already been
+// seen at a HIGH gossip sequence over an old session must still accept that
+// peer's post-restart sync at a LOW sequence over the NEW session finalize
+// just established. This is only possible if finalize armed the exemption
+// for the new session before anything could act on it -- exactly what
+// restoring the original arm-before-identify ordering guarantees, since the
+// two run strictly sequentially within `finalize_new_outbound_connection`
+// with no interleaving possible.
+#[tokio::test]
+async fn fresh_outbound_connect_arms_restart_exemption_so_post_restart_sync_is_accepted() {
+    use crate::{GossipConfig, RemoteActorLocation, registry::GossipRegistry};
+    use std::collections::HashMap;
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("r11-wiring-local")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let owner = crate::KeyPair::new_for_testing("r11-wiring-owner").peer_id();
+    let node_id = owner.to_node_id();
+    let peer_addr: SocketAddr = "127.0.0.1:41780".parse().unwrap();
+    let old_session_addr: SocketAddr = "127.0.0.1:57201".parse().unwrap();
+    let new_session_addr: SocketAddr = "127.0.0.1:57202".parse().unwrap();
+
+    registry.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+
+    // Pre-restart: peer is at a high sequence over an old session.
+    let mut pre_restart_actors = HashMap::new();
+    pre_restart_actors.insert(
+        "r11-wiring/x".to_string(),
+        RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            pre_restart_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(old_session_addr),
+            None,
+            40,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    // The peer restarts and we dial it fresh, threading `fresh_session_node_id`
+    // through exactly as the real dial path does -- this is what arms the
+    // one-shot lower-sequence exemption for `new_session_addr`.
+    let (io, _peer_io) = tokio::io::duplex(4096);
+    let handle = pool
+        .finalize_new_outbound_connection(
+            peer_addr,
+            io,
+            Arc::downgrade(&registry),
+            Some(node_id),
+            new_session_addr,
+            Some(node_id),
+        )
+        .await
+        .expect("finalize outbound connection");
+    drop(handle);
+
+    // The restarted peer's first sync after reconnecting resets to a LOW
+    // sequence over the NEW session. Accepted only if the exemption armed
+    // above actually took effect -- proven by a brand-new actor replacing
+    // the pre-restart set.
+    let mut restart_actors = HashMap::new();
+    restart_actors.insert(
+        "r11-wiring/y".to_string(),
+        RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            restart_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(new_session_addr),
+            None,
+            1,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    assert!(
+        registry.lookup_actor("r11-wiring/y").await.is_some(),
+        "R-11: the restarted peer's post-reconnect sync (low sequence, new \
+         session) must be accepted -- finalize_new_outbound_connection must \
+         actually arm the lower-sequence exemption for the session it just \
+         established"
+    );
+    assert!(
+        registry.lookup_actor("r11-wiring/x").await.is_none(),
+        "the restart sync must have pruned the pre-restart actor"
+    );
+}
+
+// RED: if the registry is already gone (e.g. shutdown) by the time
+// `finalize_new_outbound_connection` reaches its identify step,
+// `registry_weak.upgrade()` fails there. That must be treated exactly like
+// a failed identify send -- abort finalization and tear the candidate back
+// down -- not silently fall through to publishing it. Silently continuing
+// would leave the connection published and counted but permanently
+// un-identified (the identify gate armed by `begin_identify_gate` never
+// gets resolved), so any `write_routed_actor_ask` racing the connect and
+// parked in `wait_until_identified` would hang forever instead of being
+// released with an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_outbound_connect_releases_racing_waiter_when_registry_is_gone_during_identify() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let addr: SocketAddr = "127.0.0.1:41781".parse().unwrap();
+
+    let (registry_weak, pool) = {
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("gate-stuck-registry-gone")),
+                ..Default::default()
+            },
+        ));
+        (Arc::downgrade(&registry), registry.connection_pool.clone())
+        // `registry` (the only strong reference) drops here; `pool` is an
+        // independent `Arc` clone that survives, exactly like a real
+        // connection pool outliving a registry mid-shutdown.
+    };
+    assert!(
+        registry_weak.upgrade().is_none(),
+        "sanity: the registry must actually be gone before finalize runs"
+    );
+
+    let (io, _peer_io) = tokio::io::duplex(4096);
+
+    // Race a routed ask against the connect on a separate task, exactly as
+    // in the identify-first race test above: spin trying to discover the
+    // connection and, the instant it is, enqueue onto its write queue --
+    // which must park in `wait_until_identified` until the gate resolves
+    // one way or the other.
+    let racer_pool = pool.clone();
+    let racer_task = tokio::spawn(async move {
+        // Bounded discovery poll: if this candidate is torn down (correctly)
+        // before ever being observed, there was nothing to race against --
+        // `None` here is a fine, unproblematic outcome, distinct from
+        // actually racing and getting back a success (`Some(Ok(()))`, the
+        // real bug this guards against) or an expected failure
+        // (`Some(Err(_))`).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(conn) = racer_pool.get_connection_by_addr(&addr)
+                && let Some(stream) = conn.stream_handle.clone()
+            {
+                return Some(
+                    stream
+                        .write_routed_actor_ask(1, 42, 99, bytes::Bytes::from_static(b"race"))
+                        .await,
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let finalize_result = pool
+        .finalize_new_outbound_connection(addr, io, registry_weak, None, addr, None)
+        .await;
+
+    assert!(
+        finalize_result.is_err(),
+        "finalize must fail when the registry is gone during identify, not \
+         silently publish an unidentified candidate"
+    );
+    assert!(
+        pool.get_connection_by_addr(&addr).is_none(),
+        "a candidate that could never identify itself must not be left \
+         published"
+    );
+    assert_eq!(
+        pool.connection_count(),
+        0,
+        "a candidate that could never identify itself must not leak a \
+         counted connection-instance"
+    );
+
+    // The racer must have been released -- with an error, since the
+    // connection was torn down before ever identifying -- rather than
+    // hanging forever waiting for a gate that would otherwise never
+    // resolve. Bounded so a real regression (a hang) fails the test instead
+    // of blocking the suite.
+    let racer_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), racer_task).await;
+    match racer_outcome {
+        Ok(join_result) => match join_result.expect("racer task must not panic") {
+            Some(write_result) => {
+                assert!(
+                    write_result.is_err(),
+                    "a routed ask racing a connect whose identify never \
+                     resolves must fail, not silently succeed"
+                );
+            }
+            None => {
+                // Never discovered the candidate before it was torn down --
+                // nothing raced, so nothing more to assert here; the
+                // finalize-side assertions above already cover correctness.
+            }
+        },
+        Err(_elapsed) => {
+            panic!(
+                "a routed ask racing a connect whose registry disappeared \
+                 during identify hung instead of being released with an \
+                 error -- the identify gate was left stuck"
+            );
+        }
+    }
+}
+
+// RED (without `IdentifyGateGuard`): `finalize_new_outbound_connection`'s
+// only real caller awaits it inside a `tokio::time::timeout`, so the whole
+// call can be cancelled out from under it at any await point -- including
+// while parked building/sending its own identify. A candidate that was
+// already published and counted by the time that happens must still be
+// fully retired (and its identify gate resolved with an error for any
+// racing waiter), not left behind as a published-but-unidentified zombie
+// with no task left to ever finish it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_outbound_connect_cancelled_mid_identify_does_not_strand_a_published_candidate() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "gate-stuck-cancel-mid-identify",
+            )),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+    let addr: SocketAddr = "127.0.0.1:41782".parse().unwrap();
+
+    let (io, _peer_io) = tokio::io::duplex(4096);
+
+    // Hold `gossip_state` so the finalize task parks building its identify
+    // (the same chokepoint the earlier race tests use), then cancel the
+    // whole finalize call from the outside while it is parked there --
+    // mirroring the real caller's connect-attempt timeout elapsing at
+    // exactly this point.
+    let guard = registry.gossip_state.lock().await;
+
+    let finalize_registry = Arc::downgrade(&registry);
+    let pool_for_finalize = pool.clone();
+    let finalize_task = tokio::spawn(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            pool_for_finalize.finalize_new_outbound_connection(
+                addr,
+                io,
+                finalize_registry,
+                None,
+                addr,
+                None,
+            ),
+        )
+        .await
+    });
+
+    // A routed ask racing the connect, parked in `wait_until_identified`
+    // once it discovers the (published, but not yet identified) candidate.
+    let racer_pool = pool.clone();
+    let racer_task = tokio::spawn(async move {
+        loop {
+            if let Some(conn) = racer_pool.get_connection_by_addr(&addr)
+                && let Some(stream) = conn.stream_handle.clone()
+            {
+                return stream
+                    .write_routed_actor_ask(1, 42, 99, bytes::Bytes::from_static(b"race"))
+                    .await;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Hold the lock well past the 50ms timeout above so the cancellation
+    // actually fires while finalize is genuinely parked, then release it --
+    // finalize's own future is already gone by then; releasing just lets
+    // anything else contending for the lock proceed.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(guard);
+
+    let finalize_outcome = finalize_task.await.expect("finalize task must not panic");
+    assert!(
+        finalize_outcome.is_err(),
+        "sanity: the outer timeout must actually have elapsed while finalize \
+         was parked, cancelling it"
+    );
+
+    assert!(
+        pool.get_connection_by_addr(&addr).is_none(),
+        "a candidate cancelled mid-identify must not be left published"
+    );
+    assert_eq!(
+        pool.connection_count(),
+        0,
+        "a candidate cancelled mid-identify must not leak a counted \
+         connection-instance"
+    );
+
+    let racer_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), racer_task).await;
+    match racer_outcome {
+        Ok(join_result) => {
+            let write_result = join_result.expect("racer task must not panic");
+            assert!(
+                write_result.is_err(),
+                "a routed ask racing a connect that gets cancelled mid-identify \
+                 must fail, not silently succeed"
+            );
+        }
+        Err(_elapsed) => {
+            panic!(
+                "a routed ask racing a connect cancelled mid-identify hung \
+                 instead of being released with an error -- the identify \
+                 gate was left stuck"
+            );
+        }
+    }
 }
