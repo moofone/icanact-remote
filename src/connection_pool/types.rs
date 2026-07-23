@@ -63,6 +63,27 @@ pub struct LockFreeConnection {
     pub(crate) embedded_peer_id: Option<crate::PeerId>,
     /// Task tracker for background tasks (writer and reader)
     pub task_tracker: TaskTracker,
+    /// R-11: this connection's own session discriminator, mirroring
+    /// `ReadContext::session_source` and set once at construction (never
+    /// mutated afterwards) -- unique per physical connection. For inbound
+    /// connections this is the remote's TCP source (ephemeral port
+    /// included), same as `addr`; for outbound connections it is this
+    /// socket's own local ephemeral port, not the dial target (`addr`,
+    /// which is the peer's fixed listening port and identical across every
+    /// connection ever made to it).
+    ///
+    /// This is what lets `peer_info_is_from_current_session` confirm that
+    /// an inbound message actually arrived on the pool's currently
+    /// published connection for a peer, by comparing the message's
+    /// `session_source` against this field on the `Arc<LockFreeConnection>`
+    /// `peer_current_connection_snapshot` returns -- the same
+    /// non-spoofable per-connection identity `Arc::ptr_eq` gives when the
+    /// receiving connection's own `Arc` is directly in hand (as it is at
+    /// arming time), used here as a value comparison instead because the
+    /// receiving connection's `Arc` does not exist yet at the point its
+    /// `ReadContext` is constructed (the stream handle -- and this struct
+    /// wrapping it -- is built from that same `ReadContext`).
+    pub(crate) session_source: SocketAddr,
 }
 
 impl Clone for LockFreeConnection {
@@ -82,6 +103,7 @@ impl Clone for LockFreeConnection {
             // This is intentional: clones are typically used for metadata snapshots,
             // not to transfer task ownership
             task_tracker: TaskTracker::new(),
+            session_source: self.session_source,
         }
     }
 }
@@ -100,6 +122,11 @@ impl LockFreeConnection {
             direction,
             embedded_peer_id: None,
             task_tracker: TaskTracker::new(),
+            // Default matches the inbound case (session_source == addr).
+            // The one outbound construction site overrides this to the
+            // dialling socket's own local ephemeral port immediately after
+            // construction, before the connection is published.
+            session_source: addr,
         }
     }
 

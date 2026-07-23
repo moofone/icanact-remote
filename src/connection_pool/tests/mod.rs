@@ -5198,6 +5198,168 @@ async fn late_message_from_superseded_armed_source_is_rejected_not_self_healed()
     );
 }
 
+/// R-11: self-heal must confirm the RECEIVING connection instance is the
+/// pool's actual CURRENT PUBLISHED connection for the peer, not merely
+/// that the message's `session_source` differs from the armed source.
+/// During rapid reconnects a THIRD connection -- neither the armed one nor
+/// the genuine live successor -- can also present a `session_source`
+/// different from the armed one (e.g. a stale in-flight candidate, or one
+/// that lost a tie-break and never itself got published). Before this fix,
+/// any such traffic satisfied the case-3 self-heal condition, clearing the
+/// session guards and getting accepted -- restoring a stale snapshot and
+/// leaving the real successor's own subsequent traffic rejected because
+/// the guards it should have inherited were clobbered by an impostor.
+#[tokio::test]
+async fn stale_third_connection_cannot_self_heal_while_a_different_successor_is_published() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("third-conn-hi", "third-conn-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let peer_addr: SocketAddr = "127.0.0.1:7486".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    registry
+        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .await;
+
+    // Baseline, before any session is armed.
+    let mut baseline_actors = std::collections::HashMap::new();
+    baseline_actors.insert(
+        "third-conn/SURVIVOR".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            baseline_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            None,
+            None,
+            40,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    // Connection A arms the session; its restart exemption is live.
+    let a_addr: SocketAddr = "127.0.0.1:59601".parse().unwrap();
+    let a_conn = qa_r11_generation_race_connection(a_addr);
+    assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), a_addr, a_conn.clone()));
+    registry
+        .arm_sequence_reset_for_new_session(
+            peer_addr,
+            remote_node_id,
+            a_addr,
+            &remote_peer_id,
+            &a_conn,
+        )
+        .await;
+
+    // Connection B is published as the pool's current connection for the
+    // peer -- the genuine live successor -- but never arms itself (e.g. a
+    // cert-type migration or node_id mismatch on its own accept).
+    let b_addr: SocketAddr = "127.0.0.1:59602".parse().unwrap();
+    let b_conn = qa_r11_generation_race_connection(b_addr);
+    assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), b_addr, b_conn.clone()));
+
+    // Connection C is a THIRD connection: its own `session_source` differs
+    // from both A (armed) and B (published current), and it was never
+    // itself published into the pool (simulating a stale in-flight
+    // candidate or a tie-break loser). Its traffic must be rejected, not
+    // self-healed.
+    let c_addr: SocketAddr = "127.0.0.1:59603".parse().unwrap();
+    let mut c_actors = std::collections::HashMap::new();
+    c_actors.insert(
+        "third-conn/FROM_C".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            c_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            Some(c_addr),
+            Some(c_addr),
+            1,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    assert!(
+        registry.lookup_actor("third-conn/FROM_C").await.is_none(),
+        "R-11: a third connection that is neither the armed connection nor \
+         the pool's actual current published connection must not be \
+         accepted, even though its session_source differs from the armed \
+         source"
+    );
+    assert!(
+        registry.lookup_actor("third-conn/SURVIVOR").await.is_some(),
+        "R-11: the rejected third-connection message must not omission-prune \
+         actors either"
+    );
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get(&peer_addr)
+            .expect("peer must still be tracked");
+        assert_eq!(
+            peer_info.current_session_source,
+            Some(a_addr),
+            "R-11: a rejected third-connection message must not trigger the \
+             self-heal clear -- current_session_source stays exactly as it \
+             was until the ACTUAL published successor's own traffic heals it"
+        );
+        assert_eq!(
+            peer_info.last_sequence, 40,
+            "R-11: the rejected third-connection message must not have \
+             advanced/restored the high-water mark"
+        );
+        assert_eq!(
+            peer_info.accept_lower_sequence_from,
+            Some(a_addr),
+            "R-11: the rejected third-connection message must not have \
+             consumed A's still-unspent exemption"
+        );
+    }
+
+    // The ACTUAL published successor's (B's) own traffic still self-heals
+    // and is accepted normally.
+    let mut b_actors = std::collections::HashMap::new();
+    b_actors.insert(
+        "third-conn/FROM_B".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            b_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            Some(b_addr),
+            Some(b_addr),
+            42,
+            crate::current_timestamp(),
+        )
+        .await;
+    assert!(
+        registry.lookup_actor("third-conn/FROM_B").await.is_some(),
+        "R-11: the genuinely published successor's own traffic must still \
+         self-heal and be accepted"
+    );
+}
+
 /// R-11: a stale `FullSync`/`FullSyncResponse` arriving on an old,
 /// no-longer-current connection must not reset the peer's failure/health
 /// bookkeeping (`failures`, `last_failure_time`, `last_success`,

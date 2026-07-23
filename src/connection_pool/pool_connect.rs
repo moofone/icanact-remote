@@ -3307,6 +3307,12 @@ impl<T> ConnectionPool<T> {
         }
 
         let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+        // R-11: outbound session_source is this socket's own local
+        // ephemeral port (unique per connection), not the dial target
+        // `addr` this instance was constructed with (the peer's fixed
+        // listening port, shared by every connection ever made to it) --
+        // see `ReadContext::session_source` and `LockFreeConnection::session_source`.
+        conn.session_source = local_session_addr;
         conn.stream_handle = Some(stream_handle.clone());
         conn.set_state(ConnectionState::Connected);
         conn.update_last_used();

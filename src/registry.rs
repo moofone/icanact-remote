@@ -5238,16 +5238,14 @@ impl<T: 'static> GossipRegistry<T> {
         // Independent of whether THIS message came from the armed source:
         // is `connection_pool` currently showing a DIFFERENT connection as
         // the peer's current one than the one that armed the session?
-        let pool_shows_different_connection = self
-            .connection_pool
-            .peer_current_connection_snapshot(peer_id)
-            .is_some_and(|current| {
-                !peer_info
-                    .current_session_connection
-                    .as_ref()
-                    .and_then(|weak| weak.upgrade())
-                    .is_some_and(|armed| std::sync::Arc::ptr_eq(&armed, &current))
-            });
+        let current_connection = self.connection_pool.peer_current_connection_snapshot(peer_id);
+        let pool_shows_different_connection = current_connection.as_ref().is_some_and(|current| {
+            !peer_info
+                .current_session_connection
+                .as_ref()
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|armed| std::sync::Arc::ptr_eq(&armed, current))
+        });
 
         let from_armed_source = session_source == Some(armed_source);
 
@@ -5262,7 +5260,30 @@ impl<T: 'static> GossipRegistry<T> {
             return false;
         }
 
-        // Case 3: a live successor's own traffic. Self-heal.
+        // Case 3 candidate: the pool shows a different connection is
+        // current, and this message isn't from the armed source. That
+        // alone is not proof it arrived on the PUBLISHED successor,
+        // though -- during rapid reconnects a THIRD connection (a
+        // stale/tie-break-losing candidate that never itself became
+        // current) also has a `session_source` different from the armed
+        // one. Self-heal must only fire for traffic that actually arrived
+        // on the connection instance `connection_pool` is publishing as
+        // current, confirmed here via `LockFreeConnection::session_source`
+        // -- the same non-spoofable per-connection identity `Arc::ptr_eq`
+        // checks above, applied to the receiving side instead of the
+        // armed side.
+        let from_current_published_successor = current_connection
+            .as_ref()
+            .is_some_and(|current| Some(current.session_source) == session_source);
+
+        if !from_current_published_successor {
+            // A stale or tie-break-losing third connection. Reject without
+            // self-healing or touching any session state -- only the
+            // actually-current published successor may do that.
+            return false;
+        }
+
+        // Case 3: the live successor's own traffic, confirmed. Self-heal.
         peer_info.current_session_source = None;
         peer_info.accept_lower_sequence_from = None;
         peer_info.current_session_connection = None;
