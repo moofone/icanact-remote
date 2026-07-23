@@ -235,6 +235,29 @@ pub struct PeerDiscovery {
     pending_peers: HashMap<SocketAddr, u64>,
     /// Failed peers with backoff state (legacy)
     failed_peers: HashMap<SocketAddr, FailureState>,
+    /// Generation stamped on `addr` every time `on_peer_connected` records a
+    /// NEW `Connected` transition for it. See `connect_generation`'s doc for
+    /// why this exists independently of the gossip registry's own
+    /// session-epoch machinery.
+    connect_generations: HashMap<SocketAddr, u64>,
+}
+
+/// Process-wide, never-reset counter allocating discovery connect
+/// generations. Mirrors `registry::SESSION_EPOCH_COUNTER`'s rationale: a
+/// per-peer counter starting from a locally-reset value would let a removed
+/// and recreated entry (or a different peer reusing the same address)
+/// reproduce a generation a still-in-flight, already-superseded discovery
+/// clear captured before the removal. A single global, monotonic counter
+/// never repeats for the life of the process, so a stale captured
+/// generation can never accidentally match again.
+static DISCOVERY_CONNECT_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate a fresh, process-wide-unique discovery connect generation. `0`
+/// is never returned, reserved as "no `Connected` transition has ever been
+/// recorded for this address" (mirrors the session-epoch sentinel).
+fn next_discovery_connect_generation() -> u64 {
+    DISCOVERY_CONNECT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl PeerDiscovery {
@@ -248,6 +271,7 @@ impl PeerDiscovery {
             connected_peers: HashSet::new(),
             pending_peers: HashMap::new(),
             failed_peers: HashMap::new(),
+            connect_generations: HashMap::new(),
         }
     }
 
@@ -525,6 +549,15 @@ impl PeerDiscovery {
         self.pending_peers.remove(&addr);
         self.failed_peers.remove(&addr);
         self.connected_peers.insert(addr);
+
+        // A NEW connect generation every time, whether or not `addr` was
+        // already `Connected` -- this call is the authoritative signal that
+        // SOME connection just (re)confirmed itself as this address's
+        // current live one, independent of whatever the gossip registry's
+        // own session-epoch machinery did or didn't do for it. See
+        // `connect_generation`.
+        self.connect_generations
+            .insert(addr, next_discovery_connect_generation());
     }
 
     /// Record a peer disconnection
@@ -536,6 +569,26 @@ impl PeerDiscovery {
 
         // Also update legacy field for backward compatibility
         self.connected_peers.remove(&addr);
+        self.connect_generations.remove(&addr);
+    }
+
+    /// The generation stamped on `addr`'s most recent `Connected` transition
+    /// (see `on_peer_connected`), or `None` if discovery does not currently
+    /// show `addr` as `Connected` at all.
+    ///
+    /// This is the guard a connection-teardown/failure path must use before
+    /// clearing `addr`'s `Connected` state: a plain session-epoch comparison
+    /// (`PeerInfo::current_session_epoch`) is not enough, because
+    /// `on_peer_connected` can be invoked WITHOUT any session-epoch change
+    /// at all (e.g. a discovery-driven connect-on-demand success whose
+    /// identity isn't yet known, so no TLS session was ever armed for it;
+    /// or simply a second `mark_peer_connected` call for an address that
+    /// was already `Connected`), and can even fire when `gossip_state.peers`
+    /// has no entry for `addr` whatsoever. Comparing THIS generation instead
+    /// catches every such transition, regardless of session-epoch or
+    /// `peers`-entry state.
+    pub fn connect_generation(&self, addr: &SocketAddr) -> Option<u64> {
+        self.connect_generations.get(addr).copied()
     }
 
     /// Get the current number of connected peers
