@@ -542,6 +542,12 @@ impl PeerDiscovery {
     /// Atomically transitions peer to Connected state.
     /// This is a single operation that replaces any previous state.
     pub fn on_peer_connected(&mut self, addr: SocketAddr) {
+        // Captured BEFORE the state transition below: whether this call is
+        // a genuine Pending/Failed/Disconnected/absent -> Connected
+        // transition, or a redundant re-confirmation of an address that was
+        // ALREADY `Connected`.
+        let was_already_connected = matches!(self.peer_states.get(&addr), Some(PeerState::Connected));
+
         // Atomically transition to Connected state (single operation)
         self.peer_states.insert(addr, PeerState::Connected);
 
@@ -550,14 +556,23 @@ impl PeerDiscovery {
         self.failed_peers.remove(&addr);
         self.connected_peers.insert(addr);
 
-        // A NEW connect generation every time, whether or not `addr` was
-        // already `Connected` -- this call is the authoritative signal that
-        // SOME connection just (re)confirmed itself as this address's
-        // current live one, independent of whatever the gossip registry's
-        // own session-epoch machinery did or didn't do for it. See
-        // `connect_generation`.
-        self.connect_generations
-            .insert(addr, next_discovery_connect_generation());
+        // Advance the connect generation ONLY on a genuine transition INTO
+        // `Connected`, never on a redundant `Connected` -> `Connected`
+        // re-mark. This call carries no connection-instance identity --
+        // just an address -- so a duplicate notification for the SAME
+        // still-live socket must not look like a brand-new connection. If
+        // it did, a teardown reported for that exact socket in the gap
+        // between a failure's generation capture and its discovery clear
+        // would bump the generation out from under the capture even though
+        // nothing new actually connected, making the clear wrongly decline
+        // and permanently strand the slot as `Connected` with no live
+        // connection behind it at all -- the exact exhaustion this
+        // generation mechanism exists to prevent, reintroduced via a new
+        // path. See `connect_generation`.
+        if !was_already_connected {
+            self.connect_generations
+                .insert(addr, next_discovery_connect_generation());
+        }
     }
 
     /// Record a peer disconnection

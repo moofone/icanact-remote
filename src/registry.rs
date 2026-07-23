@@ -8403,31 +8403,33 @@ impl<T: 'static> GossipRegistry<T> {
             .and_then(|discovery| discovery.connect_generation(&addr))
     }
 
-    /// Whether `addr`'s discovery connect-generation snapshot is unchanged
-    /// from `expected_generation` (captured earlier by
+    /// Whether `addr`'s discovery connect-generation snapshot is still
+    /// exactly `expected_generation` (captured earlier by
     /// `capture_pre_failure_discovery_generation`), for the specific purpose
     /// of deciding whether it is safe to clear peer-discovery state.
     ///
-    /// The comparison is symmetric: `None` at capture and still
-    /// `None`/not-`Connected` now is ALSO "unchanged" (nothing ever
-    /// transitioned this address to `Connected`, so there is nothing a
-    /// clear could collaterally destroy) and must be treated as
-    /// safe-to-clear, or a peer that was only ever discovery-`Connected`
-    /// without a `gossip_state.peers` entry could never have its discovery
-    /// state cleared on a genuine disconnect, permanently exhausting its
-    /// slot. Any OTHER change -- `None` to `Some(_)`, or `Some(g)` to a
-    /// different `Some(g')` -- means SOME `on_peer_connected` call happened
-    /// in between and must decline.
+    /// Only an EXACT `Some(g)` == `Some(g)` match is "unchanged" and
+    /// safe-to-clear. `expected_generation` being `None` is handled by the
+    /// caller as a no-op before this is ever called -- it is never treated
+    /// as "unchanged" here, because a `Connected` address always has
+    /// `Some(generation)` (see `PeerDiscovery::on_peer_connected`); `None`
+    /// can only mean the address is Pending, Failed, or entirely untracked,
+    /// none of which this clear (which only ever calls
+    /// `on_peer_disconnected`, an unconditional removal regardless of
+    /// variant) may touch. Any change -- a different `Some(g')`, or the
+    /// address no longer showing `Some` at all -- means some
+    /// `on_peer_connected`/`on_peer_disconnected` transition happened in
+    /// between and must decline.
     fn discovery_connect_generation_unchanged(
         gossip_state: &GossipState,
         addr: SocketAddr,
-        expected_generation: Option<u64>,
+        expected_generation: u64,
     ) -> bool {
         gossip_state
             .peer_discovery
             .as_ref()
             .and_then(|discovery| discovery.connect_generation(&addr))
-            == expected_generation
+            == Some(expected_generation)
     }
 
     /// Clears `addr`'s peer-discovery `Connected` state only if no
@@ -8436,6 +8438,16 @@ impl<T: 'static> GossipRegistry<T> {
     /// `capture_pre_failure_discovery_generation` and
     /// `discovery_connect_generation_unchanged`) -- i.e. only for a
     /// teardown that is still genuinely current.
+    ///
+    /// `expected_generation` of `None` (discovery did not show `addr` as
+    /// `Connected` at the moment the failure was detected -- it was
+    /// Pending, Failed, or entirely untracked) is a NO-OP: there is no
+    /// `Connected` state to reclaim, and `on_peer_disconnected` removes
+    /// whatever unified state DOES exist unconditionally, regardless of
+    /// variant -- calling it here would discard a `Failed` peer's backoff
+    /// state or a `Pending` reservation, letting an immediate retry bypass
+    /// backoff or corrupting capacity accounting, for a peer this specific
+    /// report was never about.
     ///
     /// A replacement connection can call `mark_peer_connected` for the same
     /// address in the gap between a failure being detected and this call
@@ -8451,6 +8463,15 @@ impl<T: 'static> GossipRegistry<T> {
         addr: SocketAddr,
         expected_generation: Option<u64>,
     ) {
+        let Some(expected_generation) = expected_generation else {
+            debug!(
+                addr = %addr,
+                "no discovery Connected generation was captured for this address at \
+                 failure-detection time (Pending/Failed/untracked); nothing to clear"
+            );
+            return;
+        };
+
         let mut gossip_state = self.gossip_state.lock().await;
         if Self::discovery_connect_generation_unchanged(&gossip_state, addr, expected_generation) {
             if let Some(ref mut discovery) = gossip_state.peer_discovery {
@@ -11817,6 +11838,13 @@ mod tests {
             .capture_pre_failure_discovery_generation(peer_addr)
             .await;
 
+        // The old connection's own death is independently observed (e.g. a
+        // liveness/heartbeat check, distinct from -- and faster than -- the
+        // slow teardown path whose capture is above) before the replacement
+        // connects: a genuine Connected -> not-Connected -> Connected
+        // transition, not a redundant re-mark of the same still-live socket.
+        registry.mark_peer_disconnected(peer_addr).await;
+
         // A replacement connection arrives and arms a fresh session for the
         // SAME identity -- in the gap between that capture and the
         // eventual discovery clear.
@@ -11892,6 +11920,12 @@ mod tests {
             .capture_pre_failure_discovery_generation(peer_addr)
             .await;
 
+        // The old connection's own death is independently observed before
+        // the replacement connects: a genuine Connected -> not-Connected ->
+        // Connected transition, not a redundant re-mark of the same
+        // still-live socket.
+        registry.mark_peer_disconnected(peer_addr).await;
+
         // A replacement connect succeeds for the SAME address -- no TLS
         // session is ever armed for it (no `arm_sequence_reset_for_new_session`
         // call at all), so the session epoch does not change.
@@ -11923,15 +11957,117 @@ mod tests {
         );
     }
 
+    /// `on_peer_connected` carries no connection-instance identity -- just an
+    /// address -- so a REDUNDANT re-confirmation of an address that is
+    /// already `Connected` must NOT advance the connect generation. If it
+    /// did, a teardown reported for that exact still-live socket, landing in
+    /// the gap between a failure's generation capture and the discovery
+    /// clear, would see a bumped generation it never actually raced against
+    /// and wrongly decline -- permanently stranding the slot as `Connected`
+    /// with no live connection behind it at all. A genuine disconnect after
+    /// a redundant re-confirmation must still clear normally.
+    #[tokio::test]
+    async fn redundant_connect_does_not_bump_generation_and_genuine_disconnect_still_clears() {
+        let mut config = test_config_with_seed("discovery-redundant-connect");
+        config.enable_peer_discovery = true;
+        config.max_peers = 1;
+        let registry = GossipRegistry::<()>::new(test_addr(7908), config);
+        let peer_addr = test_addr(9918);
+
+        registry.add_peer(peer_addr).await;
+        registry.mark_peer_connected(peer_addr).await;
+
+        let generation_after_first_connect = registry
+            .capture_pre_failure_discovery_generation(peer_addr)
+            .await;
+        assert!(generation_after_first_connect.is_some());
+
+        // A REDUNDANT re-confirmation of the SAME still-Connected address --
+        // e.g. a second status notification for the identical live socket,
+        // not a new connection.
+        registry.mark_peer_connected(peer_addr).await;
+
+        let generation_after_redundant_connect = registry
+            .capture_pre_failure_discovery_generation(peer_addr)
+            .await;
+        assert_eq!(
+            generation_after_first_connect, generation_after_redundant_connect,
+            "a redundant Connected -> Connected re-mark must not advance the connect generation"
+        );
+
+        // The genuine teardown of that exact socket, using the generation
+        // captured back at the FIRST connect (exactly what a real failure
+        // handler would have captured before this redundant re-mark ever
+        // happened).
+        registry
+            .clear_discovery_state_if_generation_unchanged(peer_addr, generation_after_first_connect)
+            .await;
+
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.connected_count_unified(),
+            0,
+            "a genuine disconnect must still clear the slot even though a redundant connect \
+             notification was recorded for the same address in between"
+        );
+        assert_eq!(discovery.remaining_slots(), 1);
+    }
+
+    /// The discovery clear must be a NO-OP -- not a clear -- when the
+    /// captured generation was `None` (the address was `Pending`/`Failed`/
+    /// untracked, never `Connected`, at failure-detection time).
+    /// `on_peer_disconnected` removes whatever unified state DOES exist
+    /// unconditionally, regardless of variant; calling it here for a
+    /// `Failed` peer would discard its backoff state, letting an immediate
+    /// retry bypass the backoff the peer legitimately earned, for a report
+    /// that was never about a `Connected` state at all.
+    #[tokio::test]
+    async fn discovery_clear_does_not_disturb_a_failed_peers_backoff_state() {
+        let mut config = test_config_with_seed("discovery-none-noop-failed");
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(7909), config);
+        let peer_addr = test_addr(9919);
+
+        registry.mark_peer_failed(peer_addr).await;
+
+        let failed_state_before = {
+            let state = registry.gossip_state.lock().await;
+            let discovery = state.peer_discovery.as_ref().unwrap();
+            let captured = discovery.connect_generation(&peer_addr);
+            assert_eq!(
+                captured, None,
+                "sanity: a Failed peer must have no discovery connect generation"
+            );
+            discovery.get_peer_state(&peer_addr).cloned()
+        };
+        assert!(
+            matches!(failed_state_before, Some(crate::peer_discovery::PeerState::Failed { .. })),
+            "sanity: the peer must be in the Failed state before the clear"
+        );
+
+        // `None` captured -- exactly what a failure report for a peer that
+        // was never `Connected` would produce.
+        registry
+            .clear_discovery_state_if_generation_unchanged(peer_addr, None)
+            .await;
+
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.get_peer_state(&peer_addr),
+            failed_state_before.as_ref(),
+            "a None-captured clear must not disturb a Failed peer's backoff state at all"
+        );
+    }
+
     /// Edge case: `mark_peer_connected` notifies discovery unconditionally,
     /// even when `gossip_state.peers` has no entry for the address at all
     /// (and an entry can also disappear concurrently, e.g. peer-table
-    /// eviction). `capture_pre_failure_discovery_generation` must capture `None`
-    /// for this case, and the clear decision must treat "no entry at
-    /// capture, still no entry now" as an UNCHANGED snapshot -- there was
-    /// never a session to protect -- rather than declining forever. A
-    /// genuine disconnect (no replacement) for such a peer must still
-    /// reclaim the discovery slot.
+    /// eviction). Discovery itself still shows the address `Connected` (with
+    /// its own `Some(generation)`) in this case, so the clear must still
+    /// reclaim the slot on a genuine disconnect, entirely independent of
+    /// whether `gossip_state.peers` ever had an entry at all.
     #[tokio::test]
     async fn handle_peer_connection_failure_clears_discovery_state_with_no_peers_entry() {
         let mut config = test_config_with_seed("discovery-disconnect-no-entry");
@@ -12050,6 +12186,12 @@ mod tests {
         let pre_failure_epoch = registry
             .capture_pre_failure_discovery_generation(peer_addr)
             .await;
+
+        // The old connection's own death is independently observed before
+        // the replacement connects: a genuine Connected -> not-Connected ->
+        // Connected transition, not a redundant re-mark of the same
+        // still-live socket.
+        registry.mark_peer_disconnected(peer_addr).await;
 
         // A replacement connection arrives and arms a fresh session for the
         // SAME identity, in the gap between that capture and the eventual
