@@ -651,15 +651,36 @@ impl<T> ConnectionPool<T> {
                         )
                         .await;
                     match &result {
-                        Ok(_) => info!(
-                            target: "icanact_remote_lifecycle",
-                            attempt_id,
-                            requested_addr = %requested_addr,
-                            final_addr = %addr,
-                            finalize_ms = finalize_started.elapsed().as_millis(),
-                            total_ms = attempt_started.elapsed().as_millis(),
-                            "outbound_connect_ready"
-                        ),
+                        Ok(_) => {
+                            // Guaranteed POST-publication discovery mark:
+                            // the earlier `mark_peer_connected` call above
+                            // ran BEFORE `finalize_new_outbound_connection`
+                            // (which is what actually publishes the
+                            // connection into `connection_pool`) even had a
+                            // chance to run, let alone succeed -- and that
+                            // call can still reject this exact candidate (a
+                            // concurrent/preferred rival wins the tie-break,
+                            // or a publish race) without erroring the
+                            // connect attempt overall. A stale teardown
+                            // clear landing in that pre-publish window would
+                            // see no published connection yet and could
+                            // clear discovery's `Connected` state for a
+                            // connection that either isn't live yet or never
+                            // becomes the peer's live session at all.
+                            // Reached only on `Ok`, i.e. this candidate is
+                            // now durably published -- idempotent, same as
+                            // the inbound accept path's equivalent re-mark.
+                            registry_arc.mark_peer_connected(addr).await;
+                            info!(
+                                target: "icanact_remote_lifecycle",
+                                attempt_id,
+                                requested_addr = %requested_addr,
+                                final_addr = %addr,
+                                finalize_ms = finalize_started.elapsed().as_millis(),
+                                total_ms = attempt_started.elapsed().as_millis(),
+                                "outbound_connect_ready"
+                            )
+                        }
                         Err(e) => warn!(
                             target: "icanact_remote_lifecycle",
                             attempt_id,

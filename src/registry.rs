@@ -8263,38 +8263,25 @@ impl<T: 'static> GossipRegistry<T> {
         self.trigger_immediate_peer_gossip();
     }
 
-    /// The connection-instance token (see #156's `LockFreeStreamHandle::instance_id`)
-    /// identifying the connection that is being marked connected for `addr`,
-    /// for `PeerDiscovery::on_peer_connected` to tell a genuine replacement
-    /// connection at the same address (a different token) from a redundant
-    /// re-mark of the same one (an identical token) -- reusing the exact
-    /// per-connection instance identity #156 already established for the
-    /// analogous `arm_sequence_reset_for_new_session`/
-    /// `disconnect_connection_instance` mechanisms, rather than inventing a
-    /// second one.
+    /// Notifies peer discovery that `addr` has a live, established
+    /// connection, transitioning it to `Connected` in `PeerDiscovery`.
     ///
-    /// Always returns a concrete, usable token -- never `None` -- because an
-    /// ambiguous "identity unknown" value is unsafe in EITHER direction for
-    /// the caller (see `PeerDiscovery::on_peer_connected`'s doc): the normal
-    /// case resolves the REAL instance id of whatever connection
-    /// `connection_pool` currently has published for `addr`. On the small
-    /// number of call sites where that connection has not been published
-    /// under `addr` YET at the exact moment the mark fires (e.g. the inbound
-    /// accept path, which marks connected before finalizing/publishing the
-    /// connection object for this exact session), or where no connection is
-    /// published at all (a local/test caller managing connections outside
-    /// `connection_pool`), the real id cannot be resolved. Rather than
-    /// silently treating that as "no identity" (ambiguous, unsafe either
-    /// way), this draws a FRESH, always-unique synthetic token instead: a
-    /// mark whose identity cannot be resolved is always treated as a
-    /// (possibly new) instance, so the discovery clear declines rather than
-    /// risking wiping out a replacement it cannot actually distinguish from
-    /// the failing connection. A spurious "looks new" verdict here only
-    /// ever costs a discovery clear that should have proceeded -- and that
-    /// slot still self-heals on the very next disconnect/failure event for
-    /// whatever connection is actually there -- whereas the reverse (wiping
-    /// a live replacement's state) directly corrupts capacity accounting
-    /// while the peer is up.
+    /// Discovery tracks only address + state here -- no per-connection
+    /// identity or generation. What guards a later teardown from wiping out
+    /// a replacement's `Connected` state is direct and simple: the clear
+    /// (`GossipRegistry::clear_discovery_state_if_no_live_connection`) asks
+    /// `connection_pool.has_connection(addr)` at the moment it runs, under
+    /// the same `gossip_state` lock as the mutation it authorizes. As long
+    /// as every path that can ever mark `addr` `Connected` here also
+    /// guarantees a call AFTER the corresponding connection is actually
+    /// published into `connection_pool` (the inbound accept path and the
+    /// outbound dial path each add a second, idempotent call right after
+    /// their own publish step succeeds, precisely because their FIRST mark
+    /// -- driven by earlier handshake bookkeeping -- necessarily runs before
+    /// publication is even possible), that invariant holds: discovery
+    /// `Connected` for `addr` implies `connection_pool` has a live
+    /// connection for it, so the liveness clear can never race a real,
+    /// already-published replacement out of existence.
     fn record_peer_discovery_connected(&self, gossip_state: &mut GossipState, addr: SocketAddr) {
         let should_track_mesh_time =
             self.config.mesh_formation_target > 0 && gossip_state.mesh_formation_time_ms.is_none();
@@ -11954,6 +11941,82 @@ mod tests {
             Some(&crate::peer_discovery::PeerState::Connected),
             "the live connection's Connected state must survive the clear attempt"
         );
+    }
+
+    /// The mark/publish ordering fix: the inbound accept path (and the
+    /// outbound dial path) each call `mark_peer_connected` once EARLY --
+    /// before the connection they are establishing is published into
+    /// `connection_pool` at all, since publication itself depends on
+    /// finishing that exact connection object first -- and then again,
+    /// unconditionally, right after their own publish step succeeds. This
+    /// reproduces that exact two-mark sequence at the registry level and
+    /// confirms the property it exists for: a clear landing in the
+    /// pre-publish gap may legitimately clear (the address genuinely has no
+    /// live connection yet -- benign, since the guaranteed re-mark below
+    /// still restores it), but ONCE the guaranteed post-publish re-mark has
+    /// run, discovery `Connected` is backed by an actually-published live
+    /// connection and survives a clear from then on.
+    #[tokio::test]
+    async fn discovery_connected_mark_before_publish_self_corrects_after_guaranteed_remark() {
+        let mut config = test_config_with_seed("discovery-mark-before-publish");
+        config.enable_peer_discovery = true;
+        config.max_peers = 1;
+        let registry = GossipRegistry::<()>::new(test_addr(7916), config);
+        let peer_addr = test_addr(9926);
+        let peer_id = test_peer_id("discovery-mark-before-publish-peer");
+
+        // The EARLY mark: fires before the connection object for this
+        // session has been constructed, let alone published -- exactly
+        // like the inbound accept path's first `mark_peer_connected` call,
+        // which runs right after the first frame identifies the peer, well
+        // before the tie-break/compare-and-publish step that actually
+        // indexes the connection into `connection_pool`.
+        registry.mark_peer_connected(peer_addr).await;
+        assert!(
+            !registry.connection_pool.has_connection(&peer_addr),
+            "sanity: nothing is published yet at this point"
+        );
+
+        // A stale teardown's clear landing in exactly this pre-publish
+        // window sees no live connection and clears -- acceptable and
+        // self-correcting, not the permanent stranding the old
+        // generation-based guard produced.
+        registry
+            .clear_discovery_state_if_no_live_connection(peer_addr)
+            .await;
+        {
+            let state = registry.gossip_state.lock().await;
+            let discovery = state.peer_discovery.as_ref().unwrap();
+            assert_eq!(
+                discovery.connected_count_unified(),
+                0,
+                "sanity: the pre-publish window can be legitimately cleared"
+            );
+        }
+
+        // The connection is NOW published (the tie-break/compare-and-publish
+        // step succeeded), and the accept path's GUARANTEED post-publish
+        // re-mark fires.
+        let _conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
+        registry.mark_peer_connected(peer_addr).await;
+
+        // A later stale clear now correctly sees the live, published
+        // connection and declines -- the invariant the ordering fix
+        // restores: discovery Connected implies a published pool
+        // connection exists.
+        registry
+            .clear_discovery_state_if_no_live_connection(peer_addr)
+            .await;
+
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.connected_count_unified(),
+            1,
+            "the guaranteed post-publish re-mark must make discovery's Connected state \
+             reflect the now-published live connection, surviving a later clear"
+        );
+        assert_eq!(discovery.remaining_slots(), 0);
     }
 
     /// The discovery clear must be a NO-OP -- not a clear -- for a `Failed`

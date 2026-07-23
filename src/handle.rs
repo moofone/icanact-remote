@@ -4011,6 +4011,31 @@ where
             return ConnectionCloseOutcome::DroppedByTieBreaker;
         }
 
+        // Guaranteed POST-publication discovery mark. The earlier
+        // `mark_peer_connected`/`mark_inbound_connection_observed` call
+        // above (right after the first frame identifies `node_id`) runs
+        // BEFORE `connection_arc` is even constructed, let alone published
+        // into `connection_pool` -- necessarily, since publication itself
+        // depends on the tie-break resolution just above, which needs
+        // `connection_arc` to exist first. The discovery-clear guard
+        // (`GossipRegistry::clear_discovery_state_if_no_live_connection`)
+        // checks `connection_pool.has_connection` directly, so a stale
+        // teardown clear landing in that pre-publish window would see no
+        // published connection yet, clear discovery's `Connected` state,
+        // and leave this connection permanently uncounted even though it
+        // is about to become (or already is) the peer's live session.
+        //
+        // Reached only when `keep_connection` is true, i.e. `connection_arc`
+        // has already been durably published (`finish_indexing_accepted_connection`
+        // succeeded above) -- so this re-mark is exactly what closes that
+        // window: after it, discovery `Connected` for this address is
+        // guaranteed to correspond to a connection `connection_pool` can
+        // actually see. `mark_peer_connected` is idempotent (a second call
+        // for an address already `Connected` only resets softer bookkeeping
+        // -- failure counters, gossip triggers -- never anything that would
+        // misbehave from being applied twice).
+        registry.mark_peer_connected(peer_state_addr).await;
+
         // R-11: this is a new TLS-authenticated session for `node_id`, which is
         // the only evidence we accept that the peer may have restarted. Allow
         // exactly one lower-sequence FullSync through the stale gate, otherwise
