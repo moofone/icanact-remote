@@ -157,6 +157,34 @@ fn actor_location_belongs_to_peer(
 ///
 /// # Returns
 /// A valid routable SocketAddr, or None when the sender advertised a non-dialable bind address.
+/// Atomically re-validates, under an already-held `gossip_state` lock,
+/// that `expected_generation` (captured earlier, at session-validation
+/// time, from `PeerInfo::current_session_generation`) still matches this
+/// peer's current session epoch.
+///
+/// A session-gated decision (this FullSync/delta is from the peer's
+/// current session) and the state mutation it authorizes are frequently
+/// not performed under one continuous lock hold -- candidate updates are
+/// collected, addresses resolved, or the delta handed off to
+/// `apply_delta_from` across released-and-reacquired locks or `.await`
+/// points. A mismatch here means a newer session has been armed, or the
+/// previously-validated one has self-expired, since that original
+/// validation: the caller's pending write must be dropped rather than
+/// applied, or it could silently overwrite a newer (possibly
+/// lower-sequence, restart) session's state with a stale, pre-restart
+/// snapshot. A peer no longer tracked at all is treated the same way
+/// (not current) rather than as vacuously valid.
+pub(crate) fn session_generation_still_current(
+    gossip_state: &GossipState,
+    peer_addr: SocketAddr,
+    expected_generation: u64,
+) -> bool {
+    gossip_state
+        .peers
+        .get(&peer_addr)
+        .is_some_and(|peer_info| peer_info.current_session_generation == expected_generation)
+}
+
 pub fn resolve_peer_addr_checked(
     sender_bind_addr: Option<&str>,
     tcp_source_addr: SocketAddr,
@@ -1147,6 +1175,31 @@ pub struct PeerInfo {
     /// `accept_lower_sequence_from` are cleared, falling back to the
     /// unarmed (accept-from-any-source) behavior.
     pub current_session_connection: Option<std::sync::Weak<crate::connection_pool::LockFreeConnection>>,
+    /// Monotonic counter bumped every time `current_session_source` /
+    /// `current_session_connection` change -- armed by
+    /// `arm_sequence_reset_for_new_session`, or cleared by
+    /// `peer_info_is_from_current_session`'s self-healing expiry.
+    ///
+    /// A session-gated decision (accept this FullSync/delta, it is from
+    /// the current session) and the actual state mutation it authorizes
+    /// (known_actors/peer_to_actors upserts, omission pruning, the delta
+    /// apply) are not always performed under the same lock acquisition --
+    /// collecting candidate updates, resolving addresses, or handing off
+    /// to `apply_delta_from` can all involve released-and-reacquired locks
+    /// or `.await` points. Without this counter, a connection whose
+    /// traffic was validated as "current" at the START of that pipeline
+    /// could have its write actually land AFTER a newer session has
+    /// armed and completed its own (possibly lower-sequence, restart)
+    /// write, silently overwriting the newer session's state with the
+    /// old one's pre-restart snapshot.
+    ///
+    /// Callers capture this value at validation time and re-compare it
+    /// immediately before the actual mutation, atomically under whatever
+    /// lock guards that mutation (see `merge_full_sync_from`'s STEP 2 and
+    /// `apply_delta_from`'s `session_guard` parameter); a mismatch means a
+    /// newer session has since been armed or the old one has expired, and
+    /// the pending write must be dropped rather than applied.
+    pub current_session_generation: u64,
 }
 
 impl PeerInfo {
@@ -1173,6 +1226,7 @@ impl PeerInfo {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         }
     }
 
@@ -1207,6 +1261,7 @@ impl PeerInfo {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         }
     }
 
@@ -1262,6 +1317,7 @@ impl PeerInfo {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         })
     }
 }
@@ -2131,6 +2187,7 @@ impl<T: 'static> GossipRegistry<T> {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -2503,6 +2560,12 @@ impl<T: 'static> GossipRegistry<T> {
             // self-expires instead of permanently rejecting a live,
             // non-arming successor's traffic.
             peer_info.current_session_connection = Some(std::sync::Arc::downgrade(connection_instance));
+            // A new session epoch begins here: any in-flight apply that
+            // captured a generation before this point must be dropped
+            // rather than allowed to write, even if it validated as
+            // "current session" moments before this arm.
+            peer_info.current_session_generation =
+                peer_info.current_session_generation.wrapping_add(1);
         }
     }
 
@@ -2574,6 +2637,7 @@ impl<T: 'static> GossipRegistry<T> {
                             accept_lower_sequence_from: None,
                             current_session_source: None,
                             current_session_connection: None,
+                            current_session_generation: 0,
                         },
                     );
 
@@ -3517,7 +3581,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// Duplicate deltas whose contents were all suppressed return an empty
     /// list, making delta application observably idempotent.
     pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<Vec<String>> {
-        self.apply_delta_from(delta, None).await
+        self.apply_delta_from(delta, None, None).await
     }
 
     /// Apply a delta, resolving advertised addresses against the
@@ -3526,10 +3590,25 @@ impl<T: 'static> GossipRegistry<T> {
     /// outranks any locally derived route (configured/discovered), which
     /// may be stale. Wire receive paths must pass `verified_sender_addr`;
     /// `None` (local/test callers) falls back to the connection-pool route.
+    ///
+    /// `session_guard`, when the caller already validated this delta
+    /// against `peer_info_is_from_current_session` under its own lock
+    /// acquisition, is `Some((peer_addr, captured_generation))` -- the same
+    /// key and `PeerInfo::current_session_generation` value observed at
+    /// that validation. It is re-checked atomically here, under the same
+    /// `gossip_state` lock this function already takes for its actual
+    /// mutations, immediately before applying any change: a mismatch means
+    /// a newer session was armed (or the validated one self-expired)
+    /// between the caller's validation and this call actually running, and
+    /// the whole delta is dropped rather than partially or fully applied.
+    /// `None` skips the recheck (no session context to validate against,
+    /// e.g. local/test callers), matching the un-gated behavior deltas had
+    /// before session scoping existed.
     pub async fn apply_delta_from(
         &self,
         delta: RegistryDelta,
         verified_sender_addr: Option<SocketAddr>,
+        session_guard: Option<(SocketAddr, u64)>,
     ) -> Result<Vec<String>> {
         let total_changes = delta.changes.len();
         let sender_peer_id = delta.sender_peer_id.clone();
@@ -3579,8 +3658,28 @@ impl<T: 'static> GossipRegistry<T> {
         let mut applied_count = 0usize;
         let mut peer_actor_names_changed = std::collections::HashSet::new();
         let mut applied_immediate: Vec<String> = Vec::new();
+        if let Some((session_peer_addr, _)) = session_guard {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::DeltaApplyPendingMutation {
+                    peer: sender_peer_id.clone(),
+                    addr: session_peer_addr,
+                },
+            );
+        }
         let log_adds: Vec<(String, RemoteActorLocation)> = {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            if let Some((session_peer_addr, expected_generation)) = session_guard
+                && !session_generation_still_current(&gossip_state, session_peer_addr, expected_generation)
+            {
+                debug!(
+                    peer = %session_peer_addr,
+                    "dropping delta apply; a newer session was armed after \
+                     this message's session validation"
+                );
+                return Ok(Vec::new());
+            }
+
             let mut log_adds = Vec::new();
             let mut sender_actors = bookkeeping_addr
                 .and_then(|addr| gossip_state.peer_to_actors.get(&addr).cloned())
@@ -4553,6 +4652,7 @@ impl<T: 'static> GossipRegistry<T> {
                         accept_lower_sequence_from: None,
                         current_session_source: None,
                         current_session_connection: None,
+                        current_session_generation: 0,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -4913,7 +5013,10 @@ impl<T: 'static> GossipRegistry<T> {
 
                 // `addr` is the verified socket address this response
                 // arrived from — the §1.6 trust anchor for address repair.
-                self.apply_delta_from(delta, Some(addr)).await?;
+                // No session_guard: this call path is unreachable for real
+                // wire traffic (see the doc comment on the FullSyncResponse
+                // arm below for the full trace).
+                self.apply_delta_from(delta, Some(addr), None).await?;
                 // Don't add peer here - peers are managed through handle_connection
 
                 let now = crate::current_timestamp_millis();
@@ -5103,6 +5206,12 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_info.current_session_source = None;
                 peer_info.accept_lower_sequence_from = None;
                 peer_info.current_session_connection = None;
+                // The session epoch also ends here, for the same reason as
+                // in `arm_sequence_reset_for_new_session`: a pending apply
+                // that captured the generation while this (now-expired)
+                // session still validated must not be allowed to write.
+                peer_info.current_session_generation =
+                    peer_info.current_session_generation.wrapping_add(1);
             }
         }
 
@@ -5167,7 +5276,16 @@ impl<T: 'static> GossipRegistry<T> {
         // Gate and update are one critical section because the exemption is
         // one-shot: releasing the lock between them would let two concurrent
         // restarted-peer FullSyncs both observe the armed flag.
-        {
+        // `captured_generation` is `PeerInfo::current_session_generation` as
+        // observed at the moment this message was validated as being from
+        // the peer's current session, below. STEP 2 re-checks it
+        // atomically, under its own lock, immediately before mutating
+        // `known_actors`/`peer_to_actors` -- collecting and resolving
+        // `updates_to_apply` between here and there involves no lock at
+        // all, so a newer session can arm (or the validated one can
+        // self-expire) in that gap, and this is what lets STEP 2 detect
+        // and drop the now-stale pending write instead of applying it.
+        let captured_generation: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
                 // Once a session has been armed for this peer, only the
@@ -5244,8 +5362,11 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_info.accept_lower_sequence_from = None;
                     peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
                 }
+                Some(peer_info.current_session_generation)
+            } else {
+                None
             }
-        }
+        };
 
         let mut new_actors = 0;
         let mut updated_actors = 0;
@@ -5319,8 +5440,32 @@ impl<T: 'static> GossipRegistry<T> {
         // plan-then-execute fix on `apply_delta`. See test
         // `test_apply_delta_and_cleanup_dead_peers_preserve_invariant`.
         let mut routes_to_configure: Vec<(String, crate::PeerId, SocketAddr)> = Vec::new();
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::FullSyncApplyPendingMutation {
+                peer: sender_peer_id.clone(),
+                addr: sender_addr,
+            },
+        );
         {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            // Atomic generation recheck, immediately before any write in
+            // this block: if a newer session has been armed (or the
+            // validated one has self-expired) since STEP 1 captured
+            // `captured_generation`, this pending apply is stale and must
+            // be dropped rather than overwrite the newer session's state
+            // with this connection's (possibly pre-restart) snapshot.
+            if let Some(generation) = captured_generation
+                && !session_generation_still_current(&gossip_state, sender_addr, generation)
+            {
+                debug!(
+                    peer = %sender_addr,
+                    "dropping full-sync actor apply; a newer session was armed \
+                     after this message's sequence validation"
+                );
+                return;
+            }
+
             let mut rejected_by_peer_cap = 0usize;
             let mut rejected_by_global_cap = 0usize;
 
@@ -7968,6 +8113,7 @@ impl<T: 'static> GossipRegistry<T> {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -10001,6 +10147,7 @@ mod tests {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -10282,6 +10429,7 @@ mod tests {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         }
     }
 
@@ -10381,6 +10529,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -11198,6 +11347,7 @@ mod tests {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -11221,6 +11371,7 @@ mod tests {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -13222,6 +13373,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -13295,6 +13447,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -13364,6 +13517,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -13415,6 +13569,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
             let mut actors = HashSet::new();
@@ -13508,6 +13663,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
             let mut seeded = HashSet::new();
@@ -13630,6 +13786,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -13817,6 +13974,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -13907,6 +14065,7 @@ mod tests {
                         accept_lower_sequence_from: None,
                         current_session_source: None,
                         current_session_connection: None,
+                        current_session_generation: 0,
                     },
                 );
             }
@@ -13997,6 +14156,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
             let mut actors = HashSet::new();
@@ -14079,6 +14239,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
             let mut actors = HashSet::new();
@@ -14966,6 +15127,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -15026,6 +15188,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -15076,6 +15239,7 @@ mod tests {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         };
 
         // Convert to gossip format
@@ -15468,6 +15632,7 @@ mod tests {
                         accept_lower_sequence_from: None,
                         current_session_source: None,
                         current_session_connection: None,
+                        current_session_generation: 0,
                 },
             );
         }
@@ -15930,6 +16095,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16072,6 +16238,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16116,6 +16283,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16160,6 +16328,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16217,6 +16386,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16281,6 +16451,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -16377,6 +16548,7 @@ mod tests {
             accept_lower_sequence_from: None,
             current_session_source: None,
             current_session_connection: None,
+            current_session_generation: 0,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -16436,6 +16608,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16518,6 +16691,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16587,6 +16761,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }
@@ -16648,6 +16823,7 @@ mod tests {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
         }

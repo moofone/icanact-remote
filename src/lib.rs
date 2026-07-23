@@ -909,6 +909,7 @@ impl<T: 'static> Peer<T> {
                     accept_lower_sequence_from: None,
                     current_session_source: None,
                     current_session_connection: None,
+                    current_session_generation: 0,
                 },
             );
             let peers_after = gossip_state.peers.len();

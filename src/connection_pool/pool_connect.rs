@@ -3981,6 +3981,14 @@ pub(crate) fn handle_incoming_message(
                     crate::current_timestamp_nanos(),
                 );
 
+                // Captured alongside session validation below so
+                // `apply_delta_from` can atomically recheck it under its
+                // own lock, immediately before applying any change --
+                // collecting `delta` for that call (and releasing the lock
+                // acquired just below first) leaves a gap a newer session
+                // can arm in.
+                let mut captured_generation: Option<u64> = None;
+
                 // OPTIMIZATION: Do all peer management in one lock acquisition
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
@@ -4011,6 +4019,7 @@ pub(crate) fn handle_incoming_message(
                                 accept_lower_sequence_from: None,
                                 current_session_source: None,
                                 current_session_connection: None,
+                                current_session_generation: 0,
                             });
                         }
                     }
@@ -4052,6 +4061,7 @@ pub(crate) fn handle_incoming_message(
                                 peer_info,
                                 Some(session_source),
                             );
+                            captured_generation = Some(peer_info.current_session_generation);
                             if !from_current_session {
                                 false
                             } else {
@@ -4114,7 +4124,13 @@ pub(crate) fn handle_incoming_message(
                 // for advertised-address repair (outranks configured/
                 // discovered route state, which may be stale).
                 let sender_peer_id = delta.sender_peer_id.clone();
-                registry.apply_delta_from(delta, Some(_peer_addr)).await?;
+                registry
+                    .apply_delta_from(
+                        delta,
+                        Some(_peer_addr),
+                        captured_generation.map(|generation| (sender_socket_addr, generation)),
+                    )
+                    .await?;
 
                 // R16i: An inbound-only / NAT'd peer we never dial outbound will
                 // never receive a scheduled gossip round from us, so a clock echo
@@ -4228,6 +4244,7 @@ pub(crate) fn handle_incoming_message(
                                 accept_lower_sequence_from: None,
                                 current_session_source: None,
                                 current_session_connection: None,
+                                current_session_generation: 0,
                             });
                         }
                     }
@@ -4522,17 +4539,22 @@ pub(crate) fn handle_incoming_message(
 
                 // Gated the same way the DeltaGossip branch above is: once a
                 // session is armed for this peer, only its own connection's
-                // deltas may be applied.
-                let from_current_session = {
+                // deltas may be applied. The captured generation is
+                // rechecked atomically inside `apply_delta_from`, under its
+                // own lock, immediately before applying any change -- this
+                // lock is released before that call, leaving a gap a newer
+                // session can arm in.
+                let (from_current_session, captured_generation) = {
                     let mut gossip_state = registry.gossip_state.lock().await;
                     if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                        registry.peer_info_is_from_current_session(
+                        let allowed = registry.peer_info_is_from_current_session(
                             &delta.sender_peer_id,
                             peer_info,
                             Some(session_source),
-                        )
+                        );
+                        (allowed, Some(peer_info.current_session_generation))
                     } else {
-                        true
+                        (true, None)
                     }
                 };
                 if !from_current_session {
@@ -4547,7 +4569,14 @@ pub(crate) fn handle_incoming_message(
                 // Same §1.6 trust anchor as the DeltaGossip branch above:
                 // responses also carry actor additions, and repair must use
                 // the verified socket address of this connection.
-                if let Err(err) = registry.apply_delta_from(delta, Some(_peer_addr)).await {
+                if let Err(err) = registry
+                    .apply_delta_from(
+                        delta,
+                        Some(_peer_addr),
+                        captured_generation.map(|generation| (sender_socket_addr, generation)),
+                    )
+                    .await
+                {
                     warn!(error = %err, "failed to apply delta from response");
                 } else {
                     let mut gossip_state = registry.gossip_state.lock().await;
