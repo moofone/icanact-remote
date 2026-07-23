@@ -151,6 +151,90 @@ pub(crate) fn incoming_session_is_newer(
     }
 }
 
+/// RAII guard for the window between a fresh outbound candidate being
+/// published/counted and its identify gate (`LockFreeStreamHandle::mark_identified`)
+/// being resolved one way or the other.
+///
+/// `finalize_new_outbound_connection` is itself awaited inside a
+/// `tokio::time::timeout` at its only call site, so it can be cancelled out
+/// from under it at any await point -- including while parked building or
+/// sending the identify. Without this guard, a cancellation (or any early
+/// return added later between publish/count and a successful identify)
+/// would leave the candidate published and counted but never identified:
+/// any `write_routed_actor_ask` caller parked in `wait_until_identified`
+/// would then hang forever, since nothing would ever call `mark_identified`
+/// or tear the candidate down.
+///
+/// [`Self::disarm`] on a clean, successful identify is the only way to
+/// suppress the `Drop` cleanup; every other path -- an explicit early
+/// return or the whole future being dropped by an external cancellation --
+/// runs it, retiring the candidate exactly like a failed identify send
+/// would.
+struct IdentifyGateGuard<'a, T> {
+    pool: &'a ConnectionPool<T>,
+    addr: SocketAddr,
+    connection: Arc<LockFreeConnection>,
+    peer_id: Option<crate::PeerId>,
+    armed: bool,
+}
+
+impl<'a, T> IdentifyGateGuard<'a, T> {
+    fn new(
+        pool: &'a ConnectionPool<T>,
+        addr: SocketAddr,
+        connection: Arc<LockFreeConnection>,
+        peer_id: Option<crate::PeerId>,
+    ) -> Self {
+        Self {
+            pool,
+            addr,
+            connection,
+            peer_id,
+            armed: true,
+        }
+    }
+
+    /// The candidate identified successfully and is live -- nothing to
+    /// unwind.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<'a, T> Drop for IdentifyGateGuard<'a, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(peer_id) = self.peer_id.as_ref() {
+            // Re-derives whether this candidate is still the peer's current
+            // connection via an atomic compare-and-clear, right now -- not
+            // from any earlier decision-time snapshot, which a sibling
+            // published while this candidate was still mid-flight would
+            // have made stale. If a sibling HAS already superseded this
+            // candidate, that sibling's own publish already retired this
+            // candidate in full (aliases, counted instance, and a
+            // correlation-tracker-aware abort via
+            // `retire_displaced_expected`), so this call correctly declines
+            // rather than duplicating that teardown or cancelling the
+            // sibling's shared correlation tracker.
+            self.pool
+                .disconnect_connection_instance(peer_id, &self.connection);
+        } else {
+            // No `addr_to_peer_id`/peer-session entry was ever created for
+            // an unidentified candidate; only the address index and its own
+            // correlation tracker (never shared, since none was known) need
+            // cleanup.
+            let _ = self
+                .pool
+                .connections_by_addr
+                .remove_if_sync(&self.addr, |v| Arc::ptr_eq(v, &self.connection));
+            self.pool.release_counted_connection(&self.connection);
+            self.connection.abort_tasks();
+        }
+    }
+}
+
 impl<T> ConnectionPool<T> {
     pub fn new(max_connections: usize, connection_timeout: Duration) -> Self {
         Self::new_with_aligned_pool_size(
@@ -3656,6 +3740,13 @@ impl<T> ConnectionPool<T> {
         // so publication must not assume the address entry remains present beyond this point.
         debug!("CONNECTION POOL: Published connection for {}", addr);
 
+        // From here on, this candidate is published and counted. Guard the
+        // window until its identify gate is resolved -- see
+        // `IdentifyGateGuard`'s own doc comment for why this is needed even
+        // beyond the explicit `identify_send_failed` check below.
+        let identify_gate_guard =
+            IdentifyGateGuard::new(self, addr, connection_arc.clone(), peer_id_opt.clone());
+
         // R-11: arm the one-shot lower-sequence exemption for OUTBOUND
         // sessions too, not just inbound. Every early return above (a rival
         // won the tie-break, or a publish race) happens before this point,
@@ -3698,68 +3789,81 @@ impl<T> ConnectionPool<T> {
         // publication above -- it can only enqueue its `RouteBind` once
         // this send has already landed in the write queue.
         let mut identify_send_failed = false;
-        if let Some(registry_arc) = registry_weak.upgrade() {
-            let initial_msg = {
-                let (local_actors, known_actors) = registry_arc.snapshot_actor_pairs();
-                let gossip_state = registry_arc.gossip_state.lock().await;
+        match registry_weak.upgrade() {
+            Some(registry_arc) => {
+                let initial_msg = {
+                    let (local_actors, known_actors) = registry_arc.snapshot_actor_pairs();
+                    let gossip_state = registry_arc.gossip_state.lock().await;
 
-                RegistryMessage::FullSync {
-                    local_actors,
-                    known_actors,
-                    sender_peer_id: registry_arc.peer_id.clone(),
-                    sender_bind_addr: Some(registry_arc.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
-                    sequence: gossip_state.gossip_sequence,
-                    wall_clock_time: crate::current_timestamp(),
-                    extensions: None,
-                }
-            };
+                    RegistryMessage::FullSync {
+                        local_actors,
+                        known_actors,
+                        sender_peer_id: registry_arc.peer_id.clone(),
+                        sender_bind_addr: Some(registry_arc.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
+                        sequence: gossip_state.gossip_sequence,
+                        wall_clock_time: crate::current_timestamp(),
+                        extensions: None,
+                    }
+                };
 
-            // Serialize and send the initial message without flattening header + payload.
-            match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
-                Ok(data) => {
-                    // Create a connection handle to send the message
-                    let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
-                        addr,
-                        stream_handle.clone(),
-                        connection_arc
-                            .correlation
-                            .clone()
-                            .unwrap_or_else(CorrelationTracker::new),
-                    );
-                    match conn_handle
-                        .send_gossip_payload(bytes::Bytes::from_owner(data))
-                        .await
-                    {
-                        Ok(()) => {
-                            // The enqueue can succeed even though the IO
-                            // task backing it had already exited (or exits
-                            // an instant later) -- the frame was accepted
-                            // into the queue, but nothing will ever flush
-                            // it to the peer. Revalidate liveness right
-                            // after the enqueue so that race is caught too,
-                            // not just an outright enqueue failure.
-                            if conn_handle.is_closed() {
-                                warn!(
-                                    peer = %addr,
-                                    "identify FullSync enqueued but this connection's IO task \
-                                     had already exited; treating identify as failed"
-                                );
+                // Serialize and send the initial message without flattening header + payload.
+                match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
+                    Ok(data) => {
+                        // Create a connection handle to send the message
+                        let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
+                            addr,
+                            stream_handle.clone(),
+                            connection_arc
+                                .correlation
+                                .clone()
+                                .unwrap_or_else(CorrelationTracker::new),
+                        );
+                        match conn_handle
+                            .send_gossip_payload(bytes::Bytes::from_owner(data))
+                            .await
+                        {
+                            Ok(()) => {
+                                // The enqueue can succeed even though the IO
+                                // task backing it had already exited (or exits
+                                // an instant later) -- the frame was accepted
+                                // into the queue, but nothing will ever flush
+                                // it to the peer. Revalidate liveness right
+                                // after the enqueue so that race is caught too,
+                                // not just an outright enqueue failure.
+                                if conn_handle.is_closed() {
+                                    warn!(
+                                        peer = %addr,
+                                        "identify FullSync enqueued but this connection's IO task \
+                                         had already exited; treating identify as failed"
+                                    );
+                                    identify_send_failed = true;
+                                } else {
+                                    stream_handle.mark_identified();
+                                    info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
                                 identify_send_failed = true;
-                            } else {
-                                stream_handle.mark_identified();
-                                info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
                             }
                         }
-                        Err(e) => {
-                            warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
-                            identify_send_failed = true;
-                        }
+                    }
+                    Err(e) => {
+                        warn!(peer = %addr, error = %e, "Failed to serialize initial FullSync message");
+                        identify_send_failed = true;
                     }
                 }
-                Err(e) => {
-                    warn!(peer = %addr, error = %e, "Failed to serialize initial FullSync message");
-                    identify_send_failed = true;
-                }
+            }
+            None => {
+                // The registry is gone (shutting down): this candidate can
+                // never be a live session, so treat it exactly like a
+                // failed send rather than silently leaving it published,
+                // counted, and permanently un-identified.
+                warn!(
+                    peer = %addr,
+                    "registry gone while sending identify FullSync; aborting this candidate"
+                );
+                identify_send_failed = true;
             }
         }
 
@@ -3770,37 +3874,17 @@ impl<T> ConnectionPool<T> {
             // `connection_counter` all need unwinding, not just its own IO
             // tasks. It can never actually identify itself, and left alone
             // it would suppress a redial forever with a dead "current"
-            // connection nothing else can reap.
-            if let Some(peer_id) = peer_id_opt.as_ref() {
-                // `disconnect_connection_instance` re-derives whether this
-                // candidate is still the peer's current connection via an
-                // atomic compare-and-clear, right now -- not from the
-                // earlier `existing_before` decision-time snapshot, which a
-                // sibling published during the `gossip_state` wait above
-                // would have made stale. If a sibling HAS already
-                // superseded this candidate, that sibling's own publish
-                // already retired this candidate in full (aliases, counted
-                // instance, and a correlation-tracker-aware abort via
-                // `retire_displaced_expected`), so this call correctly
-                // declines rather than duplicating that teardown or
-                // cancelling the sibling's shared correlation tracker.
-                self.disconnect_connection_instance(peer_id, &connection_arc);
-            } else {
-                // No `addr_to_peer_id`/peer-session entry was ever created
-                // for an unidentified candidate; only the address index and
-                // its own correlation tracker (never shared, since none was
-                // known) need cleanup.
-                let _ = self
-                    .connections_by_addr
-                    .remove_if_sync(&addr, |v| Arc::ptr_eq(v, &connection_arc));
-                self.release_counted_connection(&connection_arc);
-                connection_arc.abort_tasks();
-            }
+            // connection nothing else can reap. `identify_gate_guard`,
+            // still armed here, does exactly that unwinding on drop.
             return Err(crate::GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 format!("failed to send identifying FullSync to {addr}"),
             )));
         }
+
+        // A clean, successful identify: nothing left for the guard to
+        // unwind.
+        identify_gate_guard.disarm();
 
         // Reset failure state for this peer since we successfully connected.
         if let Some(registry) = registry_weak.upgrade() {
