@@ -8164,46 +8164,88 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Mark a peer connection as established (clears failure state)
     pub async fn mark_peer_connected(&self, addr: SocketAddr) {
+        self.mark_peer_connected_inner(addr, false).await;
+    }
+
+    /// Same as `mark_peer_connected`, but a NO-OP -- does not reset failure
+    /// bookkeeping, does not touch `known_peers`, and does not mark
+    /// discovery `Connected` -- unless, under the SAME `gossip_state` lock
+    /// acquisition as those mutations, `connection_pool.has_connection(addr)`
+    /// is true right now (the connection is both published AND live).
+    ///
+    /// This is the liveness-gated counterpart to
+    /// `clear_discovery_state_if_no_live_connection`, symmetric by design:
+    /// that clear only removes `Connected` when no live connection exists;
+    /// this only (re-)establishes it when one does, checked with the exact
+    /// same predicate under the same lock. It exists for the GUARANTEED
+    /// post-publish re-mark on the inbound accept and outbound dial paths
+    /// (see their call sites): the connection's own I/O task can fail and
+    /// run its teardown -- removing the pool entry and clearing discovery
+    /// -- in the gap between publish succeeding and this re-mark's `.await`
+    /// acquiring the lock. An unconditional re-mark there would resurrect
+    /// `Connected` and reset failure bookkeeping for a session that is
+    /// already dead, with the teardown having already run and nothing left
+    /// to clear it again later. Gating on live-connection-under-the-lock
+    /// makes that re-mark a no-op instead.
+    pub(crate) async fn mark_peer_connected_if_live(&self, addr: SocketAddr) {
+        self.mark_peer_connected_inner(addr, true).await;
+    }
+
+    async fn mark_peer_connected_inner(&self, addr: SocketAddr, require_live: bool) {
         let now = current_timestamp();
-        {
+        let did_mark = {
             let mut gossip_state = self.gossip_state.lock().await;
 
-            // A fresh connection was established and verified by the
-            // caller (post-handshake / first framed message received).
-            // Clear the death verdict unconditionally: softer evidence
-            // paths (`record_peer_activity`, `mark_response_received`)
-            // keep their `< max_peer_failures` gate so a stray response
-            // cannot resurrect a peer, but a *real* reconnect must
-            // recover one — otherwise a single death verdict welds the
-            // peer out of the active set until the process restarts.
-            if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
-                peer_info.failures = 0;
-                peer_info.last_failure_time = None;
-                peer_info.last_success = peer_info.last_success.max(now);
-                peer_info.last_response_received_ms = peer_info
-                    .last_response_received_ms
-                    .max(crate::current_timestamp_millis());
-            }
+            if require_live && !self.connection_pool.has_connection(&addr) {
+                debug!(
+                    addr = %addr,
+                    "declining to (re-)mark peer connected; no live pool connection exists \
+                     for this address right now"
+                );
+                false
+            } else {
+                // A fresh connection was established and verified by the
+                // caller (post-handshake / first framed message received).
+                // Clear the death verdict unconditionally: softer evidence
+                // paths (`record_peer_activity`, `mark_response_received`)
+                // keep their `< max_peer_failures` gate so a stray response
+                // cannot resurrect a peer, but a *real* reconnect must
+                // recover one — otherwise a single death verdict welds the
+                // peer out of the active set until the process restarts.
+                if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_success = peer_info.last_success.max(now);
+                    peer_info.last_response_received_ms = peer_info
+                        .last_response_received_ms
+                        .max(crate::current_timestamp_millis());
+                }
 
-            // Update known_peers
-            if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
-                peer_info.failures = 0;
-                peer_info.last_failure_time = None;
-                peer_info.last_success = now;
-                if let Some(node_id) = peer_info.node_id {
-                    let _ = self.peer_capability_addr_to_node.upsert_sync(addr, node_id);
-                    let caps = self
-                        .peer_capabilities_by_node
-                        .read_sync(&node_id, |_, v| *v);
-                    if let Some(caps) = caps {
-                        let _ = self.peer_capabilities.upsert_sync(addr, caps);
+                // Update known_peers
+                if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_success = now;
+                    if let Some(node_id) = peer_info.node_id {
+                        let _ = self.peer_capability_addr_to_node.upsert_sync(addr, node_id);
+                        let caps = self
+                            .peer_capabilities_by_node
+                            .read_sync(&node_id, |_, v| *v);
+                        if let Some(caps) = caps {
+                            let _ = self.peer_capabilities.upsert_sync(addr, caps);
+                        }
                     }
                 }
+
+                self.record_peer_discovery_connected(&mut gossip_state, addr);
+
+                debug!(addr = %addr, "marked peer as connected");
+                true
             }
+        };
 
-            self.record_peer_discovery_connected(&mut gossip_state, addr);
-
-            debug!(addr = %addr, "marked peer as connected");
+        if !did_mark {
+            return;
         }
 
         // Notify peer connect handler (outgoing connections may only hit this path).
@@ -11996,9 +12038,10 @@ mod tests {
 
         // The connection is NOW published (the tie-break/compare-and-publish
         // step succeeded), and the accept path's GUARANTEED post-publish
-        // re-mark fires.
+        // re-mark fires -- liveness-gated, since a live connection now
+        // genuinely exists.
         let _conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
-        registry.mark_peer_connected(peer_addr).await;
+        registry.mark_peer_connected_if_live(peer_addr).await;
 
         // A later stale clear now correctly sees the live, published
         // connection and declines -- the invariant the ordering fix
@@ -12017,6 +12060,121 @@ mod tests {
              reflect the now-published live connection, surviving a later clear"
         );
         assert_eq!(discovery.remaining_slots(), 0);
+    }
+
+    /// The symmetric half of the liveness-gated guard: if the connection's
+    /// own I/O task has ALREADY failed and torn down (removing the pool
+    /// entry -- and, in production, already running its own discovery
+    /// clear) before the guaranteed post-publish re-mark's `.await`
+    /// acquires the `gossip_state` lock, the re-mark must be a NO-OP. It
+    /// must not resurrect discovery `Connected`, and it must not reset the
+    /// peer's failure bookkeeping either -- both would be lies about a
+    /// session that no longer exists, with the teardown having already run
+    /// and nothing left to clear it again later.
+    #[tokio::test]
+    async fn mark_peer_connected_if_live_does_not_resurrect_after_teardown_already_ran() {
+        let mut config = test_config_with_seed("discovery-remark-after-teardown");
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(7917), config);
+        let peer_addr = test_addr(9927);
+        let peer_id = test_peer_id("discovery-remark-after-teardown-peer");
+
+        // Establish failure bookkeeping first, exactly like a peer that
+        // already failed once before this (doomed) connection attempt. Set
+        // it directly under the lock (rather than via `mark_peer_failed`,
+        // which -- for peers not yet gossip-discovered -- only updates
+        // `known_peers`, not `peers`) so the precondition is unambiguous
+        // for whichever bookkeeping map the guard is meant to protect.
+        registry.add_peer(peer_addr).await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let peer_info = state.peers.get_mut(&peer_addr).unwrap();
+            peer_info.failures = 3;
+            peer_info.last_failure_time = Some(current_timestamp());
+        }
+        let failures_before = {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.get_mut(&peer_addr).unwrap().failures
+        };
+        assert!(failures_before > 0, "sanity: failure bookkeeping is non-zero before the re-mark");
+
+        // The connection was published, but its own I/O task has ALREADY
+        // failed and torn itself down (removing the pool entry -- and, in
+        // production, its own discovery clear has already run too) by the
+        // time the guaranteed post-publish re-mark gets a chance to run.
+        let _conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
+        assert!(registry.connection_pool.has_connection(&peer_addr));
+        registry.connection_pool.remove_connection(peer_addr);
+        assert!(
+            !registry.connection_pool.has_connection(&peer_addr),
+            "sanity: the connection is gone before the re-mark runs"
+        );
+
+        registry.mark_peer_connected_if_live(peer_addr).await;
+
+        let state = registry.gossip_state.lock().await;
+        assert_ne!(
+            state
+                .peer_discovery
+                .as_ref()
+                .unwrap()
+                .get_peer_state(&peer_addr),
+            Some(&crate::peer_discovery::PeerState::Connected),
+            "the re-mark must not resurrect discovery Connected for a session that has \
+             already torn down"
+        );
+        assert_eq!(
+            state.peers.get(&peer_addr).unwrap().failures,
+            failures_before,
+            "the re-mark must not reset failure bookkeeping for a session that has \
+             already torn down"
+        );
+    }
+
+    /// The other half: when a live, published connection genuinely exists,
+    /// `mark_peer_connected_if_live` must (re-)establish discovery
+    /// `Connected` exactly like the unconditional `mark_peer_connected`
+    /// would, and it must survive a subsequent liveness-gated clear.
+    #[tokio::test]
+    async fn mark_peer_connected_if_live_marks_and_preserves_a_genuinely_live_connection() {
+        let mut config = test_config_with_seed("discovery-remark-live");
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(7918), config);
+        let peer_addr = test_addr(9928);
+        let peer_id = test_peer_id("discovery-remark-live-peer");
+
+        let _conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
+        assert!(registry.connection_pool.has_connection(&peer_addr));
+
+        registry.mark_peer_connected_if_live(peer_addr).await;
+
+        {
+            let state = registry.gossip_state.lock().await;
+            assert_eq!(
+                state
+                    .peer_discovery
+                    .as_ref()
+                    .unwrap()
+                    .get_peer_state(&peer_addr),
+                Some(&crate::peer_discovery::PeerState::Connected),
+                "a genuinely live, published connection must be (re-)marked Connected"
+            );
+        }
+
+        registry
+            .clear_discovery_state_if_no_live_connection(peer_addr)
+            .await;
+
+        let state = registry.gossip_state.lock().await;
+        assert_eq!(
+            state
+                .peer_discovery
+                .as_ref()
+                .unwrap()
+                .get_peer_state(&peer_addr),
+            Some(&crate::peer_discovery::PeerState::Connected),
+            "the live connection's Connected state must survive a subsequent clear attempt"
+        );
     }
 
     /// The discovery clear must be a NO-OP -- not a clear -- for a `Failed`

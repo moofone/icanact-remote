@@ -4030,11 +4030,16 @@ where
         // succeeded above) -- so this re-mark is exactly what closes that
         // window: after it, discovery `Connected` for this address is
         // guaranteed to correspond to a connection `connection_pool` can
-        // actually see. `mark_peer_connected` is idempotent (a second call
-        // for an address already `Connected` only resets softer bookkeeping
-        // -- failure counters, gossip triggers -- never anything that would
-        // misbehave from being applied twice).
-        registry.mark_peer_connected(peer_state_addr).await;
+        // actually see. Liveness-gated (`mark_peer_connected_if_live`), not
+        // the plain unconditional mark: this connection's own I/O task can
+        // already have failed and torn itself down (removing the pool
+        // entry and clearing discovery) in the time between publish
+        // returning and this `.await` acquiring the lock, and an
+        // unconditional re-mark would resurrect `Connected` for a session
+        // that is already dead, with nothing left to clear it again later.
+        registry
+            .mark_peer_connected_if_live(peer_state_addr)
+            .await;
 
         // R-11: this is a new TLS-authenticated session for `node_id`, which is
         // the only evidence we accept that the peer may have restarted. Allow

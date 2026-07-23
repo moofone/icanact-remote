@@ -668,9 +668,19 @@ impl<T> ConnectionPool<T> {
                             // connection that either isn't live yet or never
                             // becomes the peer's live session at all.
                             // Reached only on `Ok`, i.e. this candidate is
-                            // now durably published -- idempotent, same as
-                            // the inbound accept path's equivalent re-mark.
-                            registry_arc.mark_peer_connected(addr).await;
+                            // now durably published. Liveness-gated
+                            // (`mark_peer_connected_if_live`), not the plain
+                            // unconditional mark: this connection's own I/O
+                            // task can already have failed and torn itself
+                            // down (removing the pool entry and clearing
+                            // discovery) in the time between `Ok` here and
+                            // this `.await` acquiring the lock, and an
+                            // unconditional re-mark would resurrect
+                            // `Connected` for a session that is already
+                            // dead, with nothing left to clear it again
+                            // later. Same guard the inbound accept path's
+                            // equivalent re-mark uses.
+                            registry_arc.mark_peer_connected_if_live(addr).await;
                             info!(
                                 target: "icanact_remote_lifecycle",
                                 attempt_id,
