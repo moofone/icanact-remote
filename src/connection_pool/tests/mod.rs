@@ -3142,7 +3142,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         accept_lower_sequence_from: None,
         current_session_source: None,
         current_session_connection: None,
-        current_session_generation: 0,
+        current_session_epoch: 0,
     }
 }
 
@@ -4805,6 +4805,332 @@ async fn full_sync_stale_apply_paused_between_validation_and_mutation_is_dropped
         "R-11: the stale FullSync's actor-mutation must be dropped once the \
          generation recheck detects it was superseded, not applied on top \
          of the newer session's already-correct state"
+    );
+}
+
+/// R-11: the session epoch must be a globally non-recycled value, not a
+/// per-peer counter reset to 0 on every fresh `PeerInfo`. A per-peer
+/// counter is an ABA hole: if a `current_session_epoch == 1` (that
+/// peer's own first-ever arm) apply pauses between validation and
+/// mutation while the peer entry is removed and recreated at the SAME
+/// address -- e.g. a dead-peer sweep followed by a fresh accept -- the
+/// replacement's own first-ever arm would ALSO produce `1` under a
+/// locally-reset scheme, and the stale apply's captured-epoch recheck
+/// would wrongly pass, applying the pre-removal snapshot on top of the
+/// replacement session's state.
+///
+/// Reuses the `FullSyncApplyPendingMutation` seam: the hook removes the
+/// peer entry outright and recreates it at the same address before
+/// arming the replacement, so the replacement's arm is genuinely that
+/// fresh `PeerInfo`'s first-ever arm (the exact ABA precondition), not
+/// merely a second arm on the same still-live entry (already covered by
+/// the sibling supersession tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_same_addr() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("epoch-aba-hi", "epoch-aba-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let peer_addr: SocketAddr = "127.0.0.1:7483".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+
+    // A brand-new peer entry; this is its FIRST-EVER arm (current_session_epoch
+    // starts at the "never armed" sentinel 0), the precondition an
+    // ABA-vulnerable per-peer counter would collide on after recreation.
+    registry
+        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .await;
+    let old_addr: SocketAddr = "127.0.0.1:59401".parse().unwrap();
+    let old_conn = qa_r11_generation_race_connection(old_addr);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        old_addr,
+        old_conn.clone()
+    ));
+    registry
+        .arm_sequence_reset_for_new_session(
+            peer_addr,
+            remote_node_id,
+            old_addr,
+            &remote_peer_id,
+            &old_conn,
+        )
+        .await;
+
+    let mut baseline_actors = std::collections::HashMap::new();
+    baseline_actors.insert(
+        "epoch-aba/SURVIVOR".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            baseline_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            Some(old_addr),
+            Some(old_addr),
+            40,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    let new_addr: SocketAddr = "127.0.0.1:59402".parse().unwrap();
+
+    let _guard = {
+        let pool = pool.clone();
+        let registry_for_hook = registry.clone();
+        let peer_id = remote_peer_id.clone();
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            let crate::TransportLifecycleEvent::FullSyncApplyPendingMutation {
+                peer: event_peer,
+                ..
+            } = &event
+            else {
+                return;
+            };
+            if *event_peer != peer_id {
+                return;
+            }
+            crate::set_transport_lifecycle_recorder(None);
+
+            let new_conn = qa_r11_generation_race_connection(new_addr);
+            assert!(pool.add_connection_by_peer_id(
+                peer_id.clone(),
+                new_addr,
+                new_conn.clone()
+            ));
+
+            let registry_for_hook = registry_for_hook.clone();
+            let peer_id = peer_id.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    // The peer entry is removed OUTRIGHT and recreated at
+                    // the SAME address -- the ABA precondition, not merely
+                    // a second arm on the same still-live entry.
+                    {
+                        let mut gossip_state = registry_for_hook.gossip_state.lock().await;
+                        gossip_state.peers.remove(&peer_addr);
+                    }
+                    registry_for_hook
+                        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+                        .await;
+
+                    // The replacement's arm is this FRESH PeerInfo's
+                    // first-ever arm -- exactly what would reproduce `1`
+                    // under a locally-reset, per-peer counter.
+                    registry_for_hook
+                        .arm_sequence_reset_for_new_session(
+                            peer_addr,
+                            remote_node_id,
+                            new_addr,
+                            &peer_id,
+                            &new_conn,
+                        )
+                        .await;
+
+                    let mut restart_actors = std::collections::HashMap::new();
+                    restart_actors.insert(
+                        "epoch-aba/NEW".to_string(),
+                        crate::RemoteActorLocation::new_with_peer(peer_addr, peer_id.clone()),
+                    );
+                    registry_for_hook
+                        .merge_full_sync_from(
+                            restart_actors,
+                            std::collections::HashMap::new(),
+                            peer_id.clone(),
+                            peer_addr,
+                            Some(new_addr),
+                            Some(new_addr),
+                            1,
+                            crate::current_timestamp(),
+                        )
+                        .await;
+                })
+            });
+        }))
+    };
+
+    // OLD's own subsequent, advancing-sequence FullSync -- validates fine
+    // (OLD is still current at STEP 1 time, before the removal/recreation
+    // above), but by the time its STEP 2 actually runs, the entry it
+    // validated against has been removed and replaced outright.
+    let mut stale_actors = std::collections::HashMap::new();
+    stale_actors.insert(
+        "epoch-aba/STALE".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            stale_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            Some(old_addr),
+            Some(old_addr),
+            41,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    assert!(
+        registry.lookup_actor("epoch-aba/NEW").await.is_some(),
+        "R-11: the replacement session's restart FullSync must have been applied"
+    );
+    assert!(
+        registry.lookup_actor("epoch-aba/STALE").await.is_none(),
+        "R-11: the stale apply captured against the REMOVED peer entry must \
+         not be accepted just because the recreated entry's first-ever arm \
+         happens to look like the same session generation number -- the \
+         epoch must be a globally non-recycled value that a recreated entry \
+         can never reproduce"
+    );
+}
+
+/// R-11: the self-heal expiry inside `peer_info_is_from_current_session`
+/// must only fire on a message that is ITSELF evidence of a live
+/// successor (its `session_source` differs from the armed
+/// `current_session_source`) -- never on a message arriving on the
+/// ARMED connection's own source, even when `connection_pool` shows some
+/// OTHER (e.g. non-arming duplicate/racing) connection as current for
+/// the peer.
+///
+/// Before this fix, ANY message observed once `connection_pool` shows a
+/// different current connection self-healed the session -- including one
+/// from the armed connection itself. That wipes
+/// `accept_lower_sequence_from` (via the self-heal's own clear) before
+/// the armed connection ever gets a chance to consume its OWN
+/// (still-unspent) restart exemption with a genuine lower-sequence
+/// FullSync, incorrectly rejecting it as if no session had ever been
+/// armed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_message_on_the_armed_connection_itself_does_not_self_heal_or_spend_its_own_exemption()
+ {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("self-heal-own-source-hi", "self-heal-own-source-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let peer_addr: SocketAddr = "127.0.0.1:7484".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    registry
+        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .await;
+
+    // Baseline established BEFORE any session is armed: last_sequence=40,
+    // no exemption in play yet.
+    let mut baseline_actors = std::collections::HashMap::new();
+    baseline_actors.insert(
+        "self-heal-own/SURVIVOR".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            baseline_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            None,
+            None,
+            40,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    // Connection A: authenticates and arms -- its restart exemption is now
+    // live and unconsumed.
+    let a_addr: SocketAddr = "127.0.0.1:59501".parse().unwrap();
+    let a_conn = qa_r11_generation_race_connection(a_addr);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        a_addr,
+        a_conn.clone()
+    ));
+    registry
+        .arm_sequence_reset_for_new_session(
+            peer_addr,
+            remote_node_id,
+            a_addr,
+            &remote_peer_id,
+            &a_conn,
+        )
+        .await;
+
+    // A non-arming duplicate/racing connection B is published, becoming
+    // `connection_pool`'s current entry for the peer WITHOUT itself ever
+    // arming (e.g. a cert-type migration, a non-mTLS client, or simply a
+    // node_id mismatch on B's own accept).
+    let b_addr: SocketAddr = "127.0.0.1:59502".parse().unwrap();
+    let b_conn = qa_r11_generation_race_connection(b_addr);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        b_addr,
+        b_conn.clone()
+    ));
+
+    // A's OWN genuine restart sync now arrives, on A's own armed source.
+    let mut restart_actors = std::collections::HashMap::new();
+    restart_actors.insert(
+        "self-heal-own/NEW".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            restart_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            Some(a_addr),
+            Some(a_addr),
+            1,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    assert!(
+        registry.lookup_actor("self-heal-own/NEW").await.is_some(),
+        "R-11: A's own restart sync, on its own armed connection, must be \
+         accepted"
+    );
+    assert!(
+        registry.lookup_actor("self-heal-own/SURVIVOR").await.is_none(),
+        "R-11: A's restart sync must have consumed its OWN exemption and \
+         omission-pruned the actor it no longer advertises -- proof it was \
+         accepted via the exemption path, not silently dropped"
+    );
+
+    let gossip_state = registry.gossip_state.lock().await;
+    let peer_info = gossip_state
+        .peers
+        .get(&peer_addr)
+        .expect("peer must still be tracked");
+    assert_eq!(
+        peer_info.current_session_source,
+        Some(a_addr),
+        "R-11: a message arriving on the ARMED connection's own source must \
+         never trigger the self-heal clear merely because connection_pool \
+         shows a different (non-arming) connection as current"
     );
 }
 

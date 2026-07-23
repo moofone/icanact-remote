@@ -3987,7 +3987,7 @@ pub(crate) fn handle_incoming_message(
                 // collecting `delta` for that call (and releasing the lock
                 // acquired just below first) leaves a gap a newer session
                 // can arm in.
-                let mut captured_generation: Option<u64> = None;
+                let mut captured_epoch: Option<u64> = None;
 
                 // OPTIMIZATION: Do all peer management in one lock acquisition
                 {
@@ -4019,7 +4019,7 @@ pub(crate) fn handle_incoming_message(
                                 accept_lower_sequence_from: None,
                                 current_session_source: None,
                                 current_session_connection: None,
-                                current_session_generation: 0,
+                                current_session_epoch: 0,
                             });
                         }
                     }
@@ -4061,7 +4061,7 @@ pub(crate) fn handle_incoming_message(
                                 peer_info,
                                 Some(session_source),
                             );
-                            captured_generation = Some(peer_info.current_session_generation);
+                            captured_epoch = Some(peer_info.current_session_epoch);
                             if !from_current_session {
                                 false
                             } else {
@@ -4128,7 +4128,7 @@ pub(crate) fn handle_incoming_message(
                     .apply_delta_from(
                         delta,
                         Some(_peer_addr),
-                        captured_generation.map(|generation| (sender_socket_addr, generation)),
+                        captured_epoch.map(|generation| (sender_socket_addr, generation)),
                     )
                     .await?;
 
@@ -4244,7 +4244,7 @@ pub(crate) fn handle_incoming_message(
                                 accept_lower_sequence_from: None,
                                 current_session_source: None,
                                 current_session_connection: None,
-                                current_session_generation: 0,
+                                current_session_epoch: 0,
                             });
                         }
                     }
@@ -4544,7 +4544,7 @@ pub(crate) fn handle_incoming_message(
                 // own lock, immediately before applying any change -- this
                 // lock is released before that call, leaving a gap a newer
                 // session can arm in.
-                let (from_current_session, captured_generation) = {
+                let (from_current_session, captured_epoch) = {
                     let mut gossip_state = registry.gossip_state.lock().await;
                     if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
                         let allowed = registry.peer_info_is_from_current_session(
@@ -4552,7 +4552,7 @@ pub(crate) fn handle_incoming_message(
                             peer_info,
                             Some(session_source),
                         );
-                        (allowed, Some(peer_info.current_session_generation))
+                        (allowed, Some(peer_info.current_session_epoch))
                     } else {
                         (true, None)
                     }
@@ -4573,7 +4573,7 @@ pub(crate) fn handle_incoming_message(
                     .apply_delta_from(
                         delta,
                         Some(_peer_addr),
-                        captured_generation.map(|generation| (sender_socket_addr, generation)),
+                        captured_epoch.map(|generation| (sender_socket_addr, generation)),
                     )
                     .await
                 {
