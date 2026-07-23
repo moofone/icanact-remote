@@ -5173,34 +5173,49 @@ impl<T: 'static> GossipRegistry<T> {
         sequence: u64,
         wall_clock_time: u64,
     ) {
-        self.merge_full_sync_from(
-            remote_local,
-            remote_known,
-            sender_peer_id,
-            sender_addr,
-            None,
-            None,
-            sequence,
-            wall_clock_time,
-        )
-        .await
+        let _ = self
+            .merge_full_sync_from(
+                remote_local,
+                remote_known,
+                sender_peer_id,
+                sender_addr,
+                None,
+                None,
+                sequence,
+                wall_clock_time,
+            )
+            .await;
     }
 
     /// Whether a gossip message (FullSync or Delta) claiming to arrive on
     /// `session_source` should be treated as coming from `peer_info`'s
     /// current authenticated session.
     ///
-    /// Self-healing: if `peer_info.current_session_source` is set but the
-    /// connection instance that armed it (`current_session_connection`) is
-    /// no longer `connection_pool`'s current published connection for
-    /// `peer_id` -- closed, evicted, or superseded by a connection that
-    /// never itself armed a session (a cert-type migration, a non-mTLS
-    /// client, or a `node_id` mismatch) -- the armed session has expired.
-    /// `current_session_source` and `accept_lower_sequence_from` are
-    /// cleared right here so the gate falls back to accept-from-any-source
-    /// instead of permanently rejecting a live, non-arming successor's
-    /// traffic (the exact failure mode a plain "never clear it" design
-    /// would hit).
+    /// Three explicit cases, in order:
+    ///
+    /// 1. `connection_pool` still shows the ARMED connection as current
+    ///    (nothing supersedes it, including when nothing has ever been
+    ///    recorded at all -- e.g. a registry-level caller that manages
+    ///    sessions without registering into the pool, as most tests do, or
+    ///    a narrow window before the pool has indexed anything): only a
+    ///    message whose `session_source` matches the armed source is
+    ///    current.
+    /// 2. `connection_pool` shows a DIFFERENT connection as current, but
+    ///    this message's `session_source` is the OLD armed source itself:
+    ///    REJECT outright. This is the superseded connection's own
+    ///    traffic -- it must not be treated as current, and critically
+    ///    must NOT trigger the self-heal clear below, which would let it
+    ///    back in via the resulting "no session armed" fallback and spend
+    ///    the exemption (via the ordinary path's unconditional
+    ///    `accept_lower_sequence_from = None`) before the actual live
+    ///    successor ever gets a chance to use it.
+    /// 3. `connection_pool` shows a DIFFERENT connection as current, and
+    ///    this message's `session_source` is neither the armed source nor
+    ///    (by elimination) unaccounted for: genuine evidence of a live
+    ///    successor. Self-heal -- clear the expired session right here so
+    ///    the fallback in case 1 accepts this (and all subsequent, until a
+    ///    new arm) traffic, instead of permanently rejecting a live,
+    ///    non-arming successor forever.
     ///
     /// Must be called with `peer_info` borrowed from an already-locked
     /// `gossip_state`, and the caller must perform any subsequent mutation
@@ -5214,61 +5229,50 @@ impl<T: 'static> GossipRegistry<T> {
         peer_info: &mut PeerInfo,
         session_source: Option<SocketAddr>,
     ) -> bool {
-        if peer_info.current_session_source.is_some() {
-            // Only a POSITIVE observation that a DIFFERENT connection is now
-            // published for this peer counts as supersession. If
-            // `connection_pool` has nothing on record at all (e.g. a
-            // registry-level caller that manages sessions without
-            // registering into the pool, as most tests do, or a narrow
-            // window where the pool hasn't indexed anything yet), that is
-            // not proof the armed session is dead -- fall through and keep
-            // enforcing the recorded `current_session_source` as before.
-            //
-            // Also require the OBSERVED message itself to have arrived on a
-            // source other than the armed one. `connection_pool` can show a
-            // different (live, successor) connection as current while the
-            // message actually being processed right now still came in on
-            // the OLD, already-superseded connection -- e.g. an in-flight
-            // message that was already on the wire before the successor
-            // published. Self-healing on that message would clear the
-            // session, let the OLD connection's stale traffic through via
-            // the resulting "no session armed" fallback, and (via the
-            // ordinary non-stale path's unconditional
-            // `accept_lower_sequence_from = None`) spend an exemption that
-            // was never meant for it -- leaving a later, genuinely live but
-            // non-arming successor's own restart sync with no exemption to
-            // rely on. Self-heal must only fire on a message that is ITSELF
-            // evidence of the new session, i.e. one that did not arrive on
-            // the old armed source.
-            let superseded = session_source != peer_info.current_session_source
-                && self
-                    .connection_pool
-                    .peer_current_connection_snapshot(peer_id)
-                    .is_some_and(|current| {
-                        !peer_info
-                            .current_session_connection
-                            .as_ref()
-                            .and_then(|weak| weak.upgrade())
-                            .is_some_and(|armed| std::sync::Arc::ptr_eq(&armed, &current))
-                    });
-            if superseded {
-                peer_info.current_session_source = None;
-                peer_info.accept_lower_sequence_from = None;
-                peer_info.current_session_connection = None;
-                // The session epoch also ends here, for the same reason as
-                // in `arm_sequence_reset_for_new_session`: a pending apply
-                // that captured the epoch while this (now-expired) session
-                // still validated must not be allowed to write. Drawn fresh
-                // from the process-wide counter -- see `next_session_epoch`.
-                peer_info.current_session_epoch = next_session_epoch();
-            }
+        let Some(armed_source) = peer_info.current_session_source else {
+            // No session has ever been armed for this peer: accept from
+            // any source, preserving prior behavior.
+            return true;
+        };
+
+        // Independent of whether THIS message came from the armed source:
+        // is `connection_pool` currently showing a DIFFERENT connection as
+        // the peer's current one than the one that armed the session?
+        let pool_shows_different_connection = self
+            .connection_pool
+            .peer_current_connection_snapshot(peer_id)
+            .is_some_and(|current| {
+                !peer_info
+                    .current_session_connection
+                    .as_ref()
+                    .and_then(|weak| weak.upgrade())
+                    .is_some_and(|armed| std::sync::Arc::ptr_eq(&armed, &current))
+            });
+
+        let from_armed_source = session_source == Some(armed_source);
+
+        if !pool_shows_different_connection {
+            // Case 1: nothing supersedes the armed connection yet.
+            return from_armed_source;
         }
 
-        peer_info
-            .current_session_source
-            .zip(session_source)
-            .is_some_and(|(current, verified)| current == verified)
-            || peer_info.current_session_source.is_none()
+        if from_armed_source {
+            // Case 2: the OLD, now-superseded connection's own traffic.
+            // Reject without touching any session state.
+            return false;
+        }
+
+        // Case 3: a live successor's own traffic. Self-heal.
+        peer_info.current_session_source = None;
+        peer_info.accept_lower_sequence_from = None;
+        peer_info.current_session_connection = None;
+        // The session epoch also ends here, for the same reason as in
+        // `arm_sequence_reset_for_new_session`: a pending apply that
+        // captured the epoch while this (now-expired) session still
+        // validated must not be allowed to write. Drawn fresh from the
+        // process-wide counter -- see `next_session_epoch`.
+        peer_info.current_session_epoch = next_session_epoch();
+        true
     }
 
     /// Merge a full sync, resolving advertised actor addresses against the
@@ -5293,6 +5297,15 @@ impl<T: 'static> GossipRegistry<T> {
     /// ever make to it, so it cannot tell a redial's new connection apart
     /// from an old one still draining.
     #[allow(clippy::too_many_arguments)]
+    /// Returns whether this message validated as being from the peer's
+    /// current authenticated session (`peer_info_is_from_current_session`'s
+    /// STEP 1 verdict) -- regardless of whether its specific sequence/actor
+    /// content went on to be applied, replay-rejected, or dropped by the
+    /// narrower STEP 2 epoch recheck. Callers use this to gate any of
+    /// THEIR OWN peer-state bookkeeping (failure/health resets,
+    /// `consecutive_deltas`, etc.) that must likewise only be touched by
+    /// the current session -- see `handle_incoming_message`'s FullSync /
+    /// FullSyncResponse arms.
     pub async fn merge_full_sync_from(
         &self,
         remote_local: HashMap<String, RemoteActorLocation>,
@@ -5303,7 +5316,7 @@ impl<T: 'static> GossipRegistry<T> {
         session_source: Option<SocketAddr>,
         sequence: u64,
         _wall_clock_time: u64,
-    ) {
+    ) -> bool {
         let repair_addr = verified_sender_addr.unwrap_or(sender_addr);
         let session_source = session_source.or(verified_sender_addr);
         // Don't add peer here - peers are managed through handle_connection
@@ -5365,7 +5378,7 @@ impl<T: 'static> GossipRegistry<T> {
                         "ignoring gossip from a connection that is not this \
                          peer's current authenticated session"
                     );
-                    return;
+                    return false;
                 }
 
                 if sequence < peer_info.last_sequence {
@@ -5386,7 +5399,13 @@ impl<T: 'static> GossipRegistry<T> {
                             received_sequence = sequence,
                             "ignoring old gossip message"
                         );
-                        return;
+                        // The connection IS the peer's current session (the
+                        // check above already confirmed that); this
+                        // specific sequence just looks like an in-session
+                        // replay. `true` because the caller's own
+                        // peer-health bookkeeping is about session
+                        // authority, not this particular message's content.
+                        return true;
                     }
                     info!(
                         peer = %sender_addr,
@@ -5512,7 +5531,10 @@ impl<T: 'static> GossipRegistry<T> {
                     "dropping full-sync actor apply; a newer session was armed \
                      after this message's sequence validation"
                 );
-                return;
+                // Was current at STEP 1 (that is what got this far); the
+                // narrower epoch race is about this specific pending
+                // write, not session authority, so still `true`.
+                return true;
             }
 
             let mut rejected_by_peer_cap = 0usize;
@@ -5666,6 +5688,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_actor_count = peer_actors.len(),
             "merged gossip data using vector clock conflict resolution"
         );
+        true
     }
 
     /// Clean up stale actor entries (using wall clock for TTL)

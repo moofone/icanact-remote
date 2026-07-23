@@ -4998,28 +4998,29 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
     );
 }
 
-/// R-11: the self-heal expiry inside `peer_info_is_from_current_session`
-/// must only fire on a message that is ITSELF evidence of a live
-/// successor (its `session_source` differs from the armed
-/// `current_session_source`) -- never on a message arriving on the
-/// ARMED connection's own source, even when `connection_pool` shows some
-/// OTHER (e.g. non-arming duplicate/racing) connection as current for
-/// the peer.
+/// R-11: `peer_info_is_from_current_session`'s three explicit cases,
+/// exercised end to end: (1) the armed connection's own traffic is
+/// accepted while nothing supersedes it; (2) once `connection_pool` shows
+/// a DIFFERENT connection as current, a LATE message that still arrives on
+/// the OLD armed source is REJECTED outright -- not merely "not
+/// self-healed but still accepted" (an earlier, incomplete fix), and not
+/// treated as evidence of a live successor; (3) the successor's own
+/// traffic (a different `session_source`) still self-heals and is
+/// accepted normally.
 ///
-/// Before this fix, ANY message observed once `connection_pool` shows a
-/// different current connection self-healed the session -- including one
-/// from the armed connection itself. That wipes
-/// `accept_lower_sequence_from` (via the self-heal's own clear) before
-/// the armed connection ever gets a chance to consume its OWN
-/// (still-unspent) restart exemption with a genuine lower-sequence
-/// FullSync, incorrectly rejecting it as if no session had ever been
-/// armed.
+/// Case 2 is the crux: before this fix, the OLD connection's own traffic
+/// falling through to the ordinary (unhealed) "matches
+/// `current_session_source`" path would still be ACCEPTED -- consuming
+/// the exemption and/or restoring a stale high-water mark -- even though
+/// `connection_pool` already shows it superseded. That let the OLD
+/// connection stay authoritative indefinitely as long as it kept talking,
+/// silently reintroducing the exact stale-write class of bug R-11 exists
+/// to close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stale_message_on_the_armed_connection_itself_does_not_self_heal_or_spend_its_own_exemption()
- {
+async fn late_message_from_superseded_armed_source_is_rejected_not_self_healed() {
     use crate::{GossipConfig, registry::GossipRegistry};
 
-    let (hi_kp, lo_kp) = hi_lo_keypairs("self-heal-own-source-hi", "self-heal-own-source-lo");
+    let (hi_kp, lo_kp) = hi_lo_keypairs("superseded-armed-source-hi", "superseded-armed-source-lo");
     let remote_peer_id = lo_kp.peer_id();
     let remote_node_id = remote_peer_id.to_node_id();
 
@@ -5042,7 +5043,7 @@ async fn stale_message_on_the_armed_connection_itself_does_not_self_heal_or_spen
     // no exemption in play yet.
     let mut baseline_actors = std::collections::HashMap::new();
     baseline_actors.insert(
-        "self-heal-own/SURVIVOR".to_string(),
+        "superseded-armed/SURVIVOR".to_string(),
         crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
     );
     registry
@@ -5077,7 +5078,29 @@ async fn stale_message_on_the_armed_connection_itself_does_not_self_heal_or_spen
         )
         .await;
 
-    // A non-arming duplicate/racing connection B is published, becoming
+    // Case 1 sanity: A's own traffic is accepted while nothing supersedes
+    // it yet -- checked via `current_session_source` rather than another
+    // FullSync, so the still-unconsumed exemption armed above survives
+    // intact into case 2 below.
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get(&peer_addr)
+            .expect("peer must still be tracked");
+        assert_eq!(
+            peer_info.current_session_source,
+            Some(a_addr),
+            "sanity: A is the armed, current session before anything supersedes it"
+        );
+        assert_eq!(
+            peer_info.accept_lower_sequence_from,
+            Some(a_addr),
+            "sanity: A's restart exemption is armed and unconsumed"
+        );
+    }
+
+    // Connection B (a live successor) is published, becoming
     // `connection_pool`'s current entry for the peer WITHOUT itself ever
     // arming (e.g. a cert-type migration, a non-mTLS client, or simply a
     // node_id mismatch on B's own accept).
@@ -5089,15 +5112,17 @@ async fn stale_message_on_the_armed_connection_itself_does_not_self_heal_or_spen
         b_conn.clone()
     ));
 
-    // A's OWN genuine restart sync now arrives, on A's own armed source.
-    let mut restart_actors = std::collections::HashMap::new();
-    restart_actors.insert(
-        "self-heal-own/NEW".to_string(),
+    // Case 2: a LATE message, still on A's own (now-superseded) armed
+    // source, tries to restore a high-water mark and consume the
+    // exemption via a lower-sequence "restart".
+    let mut stale_a_actors = std::collections::HashMap::new();
+    stale_a_actors.insert(
+        "superseded-armed/STALE".to_string(),
         crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
     );
     registry
         .merge_full_sync_from(
-            restart_actors,
+            stale_a_actors,
             std::collections::HashMap::new(),
             remote_peer_id.clone(),
             peer_addr,
@@ -5109,16 +5134,171 @@ async fn stale_message_on_the_armed_connection_itself_does_not_self_heal_or_spen
         .await;
 
     assert!(
-        registry.lookup_actor("self-heal-own/NEW").await.is_some(),
-        "R-11: A's own restart sync, on its own armed connection, must be \
-         accepted"
+        registry.lookup_actor("superseded-armed/STALE").await.is_none(),
+        "R-11: a late message from the superseded armed source must be \
+         rejected outright, never accepted via the exemption or any \
+         fallback"
     );
     assert!(
-        registry.lookup_actor("self-heal-own/SURVIVOR").await.is_none(),
-        "R-11: A's restart sync must have consumed its OWN exemption and \
-         omission-pruned the actor it no longer advertises -- proof it was \
-         accepted via the exemption path, not silently dropped"
+        registry
+            .lookup_actor("superseded-armed/SURVIVOR")
+            .await
+            .is_some(),
+        "R-11: the rejected message must not omission-prune actors either -- \
+         it must have no effect on state at all"
     );
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get(&peer_addr)
+            .expect("peer must still be tracked");
+        assert_eq!(
+            peer_info.current_session_source,
+            Some(a_addr),
+            "R-11: a rejected message from the superseded armed source must \
+             not trigger the self-heal clear either -- current_session_source \
+             stays exactly as it was until the successor's OWN traffic heals it"
+        );
+        assert_eq!(
+            peer_info.last_sequence, 40,
+            "R-11: the rejected message must not have restored/advanced the \
+             high-water mark"
+        );
+        assert_eq!(
+            peer_info.accept_lower_sequence_from,
+            Some(a_addr),
+            "R-11: the rejected message must not have consumed the exemption"
+        );
+    }
+
+    // Case 3: B's OWN traffic (a different session_source) still
+    // self-heals and is accepted normally.
+    let mut b_actors = std::collections::HashMap::new();
+    b_actors.insert(
+        "superseded-armed/FROM_B".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            b_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            peer_addr,
+            Some(b_addr),
+            Some(b_addr),
+            42,
+            crate::current_timestamp(),
+        )
+        .await;
+    assert!(
+        registry.lookup_actor("superseded-armed/FROM_B").await.is_some(),
+        "R-11: the live successor's own traffic must still self-heal and be \
+         accepted"
+    );
+}
+
+/// R-11: a stale `FullSync`/`FullSyncResponse` arriving on an old,
+/// no-longer-current connection must not reset the peer's failure/health
+/// bookkeeping (`failures`, `last_failure_time`, `last_success`,
+/// `last_response_received_ms`) or `consecutive_deltas`. Before this fix
+/// those fields were reset UNCONDITIONALLY, before (FullSync) or
+/// independent of (FullSyncResponse) the session-scoped merge -- so even
+/// though the merge itself correctly dropped the stale content, the
+/// failure-state reset had already applied, masking real peer
+/// unresponsiveness and perturbing `should_use_delta_state`'s strategy
+/// choice via a stale `consecutive_deltas`.
+#[tokio::test]
+async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_bookkeeping() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("health-gate-hi", "health-gate-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let peer_addr: SocketAddr = "127.0.0.1:7485".parse().unwrap();
+    registry
+        .connection_pool
+        .peer_id_to_addr
+        .upsert_sync(remote_peer_id.clone(), peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    registry
+        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .await;
+
+    // Seed failure/health state that a stale message must NOT be able to
+    // touch.
+    let stale_last_failure_time = 123_456;
+    let stale_last_response_ms = 1;
+    {
+        let mut gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get_mut(&peer_addr)
+            .expect("peer must be tracked");
+        peer_info.failures = 3;
+        peer_info.last_failure_time = Some(stale_last_failure_time);
+        peer_info.last_success = 0;
+        peer_info.last_response_received_ms = stale_last_response_ms;
+        peer_info.consecutive_deltas = 7;
+    }
+
+    // A NEW connection arms and becomes current -- everything after this
+    // is superseded.
+    let new_addr: SocketAddr = "127.0.0.1:59601".parse().unwrap();
+    let new_conn = qa_r11_generation_race_connection(new_addr);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        new_addr,
+        new_conn.clone()
+    ));
+    registry
+        .arm_sequence_reset_for_new_session(
+            peer_addr,
+            remote_node_id,
+            new_addr,
+            &remote_peer_id,
+            &new_conn,
+        )
+        .await;
+
+    // An OLD, no-longer-current connection sends a FullSync.
+    let old_addr: SocketAddr = "127.0.0.1:59602".parse().unwrap();
+    let full_sync_msg = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![],
+        known_actors: vec![],
+        sender_peer_id: remote_peer_id.clone(),
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 99,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(registry.clone(), old_addr, old_addr, full_sync_msg)
+        .await
+        .expect("stale FullSync must not error, only be ignored");
+
+    // ...and a FullSyncResponse, also on the OLD connection.
+    let full_sync_response_msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: vec![],
+        known_actors: vec![],
+        sender_peer_id: remote_peer_id.clone(),
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 99,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(registry.clone(), old_addr, old_addr, full_sync_response_msg)
+        .await
+        .expect("stale FullSyncResponse must not error, only be ignored");
 
     let gossip_state = registry.gossip_state.lock().await;
     let peer_info = gossip_state
@@ -5126,11 +5306,27 @@ async fn stale_message_on_the_armed_connection_itself_does_not_self_heal_or_spen
         .get(&peer_addr)
         .expect("peer must still be tracked");
     assert_eq!(
-        peer_info.current_session_source,
-        Some(a_addr),
-        "R-11: a message arriving on the ARMED connection's own source must \
-         never trigger the self-heal clear merely because connection_pool \
-         shows a different (non-arming) connection as current"
+        peer_info.failures, 3,
+        "R-11: a stale FullSync/FullSyncResponse must not reset `failures`"
+    );
+    assert_eq!(
+        peer_info.last_failure_time,
+        Some(stale_last_failure_time),
+        "R-11: a stale FullSync/FullSyncResponse must not clear `last_failure_time`"
+    );
+    assert_eq!(
+        peer_info.last_response_received_ms, stale_last_response_ms,
+        "R-11: a stale FullSync/FullSyncResponse must not advance \
+         `last_response_received_ms` -- it must not be treated as proof \
+         of the current session's liveness"
+    );
+    assert_eq!(
+        peer_info.consecutive_deltas, 7,
+        "R-11: a stale FullSync must not reset `consecutive_deltas`"
+    );
+    assert_eq!(
+        peer_info.last_success, 0,
+        "R-11: a stale FullSync/FullSyncResponse must not advance `last_success`"
     );
 }
 
