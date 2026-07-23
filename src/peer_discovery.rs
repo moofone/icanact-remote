@@ -513,10 +513,10 @@ impl PeerDiscovery {
         should_remove
     }
 
-    /// Record a successful connection to a peer
+    /// Record a successful connection to a peer.
     ///
-    /// Atomically transitions peer to Connected state.
-    /// This is a single operation that replaces any previous state.
+    /// Atomically transitions peer to Connected state. This is a single
+    /// operation that replaces any previous state.
     pub fn on_peer_connected(&mut self, addr: SocketAddr) {
         // Atomically transition to Connected state (single operation)
         self.peer_states.insert(addr, PeerState::Connected);
