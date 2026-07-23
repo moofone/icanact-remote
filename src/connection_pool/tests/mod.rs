@@ -9932,3 +9932,150 @@ async fn fresh_outbound_connect_cancelled_mid_identify_does_not_strand_a_publish
         }
     }
 }
+
+/// A different, TLS-authenticated peer M must not be able to hijack a known
+/// live peer V's address-keyed bookkeeping by simply advertising
+/// `sender_bind_addr == V's address` in a FullSync. `sender_peer_id` being
+/// verified against the TLS identity only proves M is who M claims to be --
+/// it says nothing about who owns `V`'s address. Before the fix, the
+/// FullSync/FullSyncResponse handlers treat any dialable `sender_bind_addr`
+/// as authoritative and unconditionally: (a) migrate the sender's own
+/// ephemeral-address `PeerInfo` onto the claimed address, clobbering V's
+/// entry (and its anti-replay `last_sequence` high-water mark), (b) repoint
+/// `addr_to_peer_id[V_addr]` (and the connection-pool route) to M, and (c)
+/// overwrite `peer_to_actors[V_addr]` with M's actor set via
+/// `merge_full_sync_from`. This mirrors the DNS re-resolution migration
+/// guard (`refresh_peer_dns` collision pre-check) which correctly aborts
+/// when a target address is already owned by a different peer -- the
+/// sender_bind_addr path must fail closed the same way.
+#[tokio::test]
+async fn authenticated_peer_cannot_hijack_victim_bind_addr_via_full_sync() {
+    let bind_addr: SocketAddr = "10.90.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("hijack-guard-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    // Victim V: a known, live peer at a stable bind address.
+    let victim_kp = crate::KeyPair::new_for_testing("hijack-guard-victim");
+    let victim = victim_kp.peer_id();
+    let victim_node_id = victim.to_node_id();
+    let victim_addr: SocketAddr = "10.90.0.2:9000".parse().unwrap();
+
+    // Attacker M: a DIFFERENT, but also validly TLS-authenticated, peer at
+    // its own ephemeral address.
+    let attacker_kp = crate::KeyPair::new_for_testing("hijack-guard-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_node_id = attacker.to_node_id();
+    let attacker_ephemeral: SocketAddr = "10.90.0.3:51000".parse().unwrap();
+
+    // V is tracked (e.g. from an earlier TLS-authenticated identification).
+    registry
+        .add_peer_with_node_id(victim_addr, Some(victim_node_id))
+        .await;
+
+    // V sends a genuine FullSync advancing its own high-water mark and
+    // advertising an actor it hosts.
+    let victim_actor = crate::RemoteActorLocation::new_with_peer(victim_addr, victim.clone());
+    let victim_full_sync = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![("victim/actor".to_string(), victim_actor)],
+        known_actors: vec![],
+        sender_peer_id: victim.clone(),
+        sender_bind_addr: Some(victim_addr.to_string()),
+        sequence: 100,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(registry.clone(), victim_addr, victim_addr, victim_full_sync)
+        .await
+        .expect("victim's genuine FullSync must succeed");
+
+    assert!(
+        registry.lookup_actor("victim/actor").await.is_some(),
+        "sanity: victim's actor must be registered before the attack"
+    );
+
+    // M is independently tracked at its OWN ephemeral address (e.g. from its
+    // own TLS-authenticated first frame).
+    registry
+        .add_peer_with_node_id(attacker_ephemeral, Some(attacker_node_id))
+        .await;
+
+    // M now sends a FullSync claiming `sender_bind_addr == victim_addr` --
+    // an authenticated peer advertising a DIFFERENT, already-owned peer's
+    // address.
+    let attacker_actor =
+        crate::RemoteActorLocation::new_with_peer(victim_addr, attacker.clone());
+    let attacker_full_sync = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![("attacker/actor".to_string(), attacker_actor)],
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(victim_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_ephemeral,
+        attacker_ephemeral,
+        attacker_full_sync,
+    )
+    .await
+    .expect("attacker's FullSync must not error, only be rejected/ignored");
+
+    // (a) V's peers[] entry must still belong to V, and its anti-replay
+    // high-water mark must not have been rolled back.
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get(&victim_addr)
+            .expect("victim's peer entry must still exist");
+        assert_eq!(
+            peer_info.node_id,
+            Some(victim_node_id),
+            "attacker must not be able to clobber victim's peers[addr] entry \
+             via a claimed sender_bind_addr"
+        );
+        assert_eq!(
+            peer_info.last_sequence, 100,
+            "attacker must not be able to roll back victim's anti-replay \
+             high-water mark via a claimed sender_bind_addr"
+        );
+    }
+
+    // (b) addr_to_peer_id[victim_addr] must still route to V, not M.
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&victim_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "attacker must not be able to repoint addr_to_peer_id[victim_addr] \
+         to itself via a claimed sender_bind_addr"
+    );
+
+    // (c) peer_to_actors[victim_addr] must still reflect V's actors, not M's.
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        let actors = gossip_state
+            .peer_to_actors
+            .get(&victim_addr)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            actors.contains("victim/actor"),
+            "victim's actor set must survive the attack"
+        );
+        assert!(
+            !actors.contains("attacker/actor"),
+            "attacker must not be able to replace victim's peer_to_actors[addr] \
+             with its own actor set via a claimed sender_bind_addr"
+        );
+    }
+}

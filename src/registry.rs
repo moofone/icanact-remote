@@ -2554,6 +2554,27 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
+    /// Ownership guard for a peer-controlled address claim (e.g. the wire
+    /// `sender_bind_addr` field). Mirrors the DNS re-resolution migration
+    /// guard's collision pre-check: an address's bookkeeping
+    /// (`peers[addr]`, `addr_to_peer_id[addr]`, `peer_to_actors[addr]`)
+    /// belongs to whichever authenticated node_id most recently legitimately
+    /// owned it. Returns `true` only when `addr` is already tracked AND its
+    /// known owner is a DIFFERENT node_id than `claimed_by` -- a brand-new
+    /// address (no tracked owner) or the same owner re-asserting its own
+    /// address are both legitimate and return `false`.
+    pub(crate) fn addr_owned_by_other_node(
+        gossip_state: &GossipState,
+        addr: SocketAddr,
+        claimed_by: crate::GossipNodeId,
+    ) -> bool {
+        gossip_state
+            .peers
+            .get(&addr)
+            .and_then(|peer_info| peer_info.node_id)
+            .is_some_and(|owner| owner != claimed_by)
+    }
+
     pub async fn add_peer_with_node_id(
         &self,
         peer_addr: SocketAddr,
@@ -2578,12 +2599,28 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         }
         if peer_addr != self.bind_addr {
+            // Ownership guard: `peer_addr` may come straight from the
+            // peer-controlled `sender_bind_addr` wire field (via the
+            // caller's address resolution). If it is already tracked as
+            // belonging to a DIFFERENT authenticated node_id than the one
+            // being asserted here, the connection-pool routing update below
+            // must not repoint `addr_to_peer_id`/the connection route to
+            // the claimant -- fail closed, mirroring the DNS re-resolution
+            // migration guard's collision pre-check.
+            let owner_conflict;
             {
                 let mut gossip_state = self.gossip_state.lock().await;
+
+                owner_conflict = node_id.is_some_and(|claimed| {
+                    Self::addr_owned_by_other_node(&gossip_state, peer_addr, claimed)
+                });
 
                 // Check if we already have this peer
                 if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
                     // Update GossipNodeId if provided and not already set
+                    // (never overwritten once set -- see `owner_conflict`
+                    // above, which uses this same never-overwritten
+                    // invariant to gate the pool-routing update below).
                     if node_id.is_some() && existing_peer.node_id.is_none() {
                         existing_peer.node_id = node_id;
                         debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
@@ -2646,7 +2683,14 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Safely update connection pool if we have a GossipNodeId
             // This is critical for TLS connections to work (get_connection_to_peer needs this mapping)
-            if let Some(id) = node_id {
+            if owner_conflict {
+                warn!(
+                    peer = %peer_addr,
+                    claimed_node_id = ?node_id,
+                    "refusing to repoint addr_to_peer_id/connection routing: address already \
+                     owned by a different authenticated peer"
+                );
+            } else if let Some(id) = node_id {
                 let peer_id = id.to_peer_id();
 
                 // A peer re-announced at a new address (e.g. a restart on a
@@ -5318,6 +5362,27 @@ impl<T: 'static> GossipRegistry<T> {
         // and drop the now-stale pending write instead of applying it.
         let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            // Ownership guard: `sender_addr` may come straight from the
+            // peer-controlled `sender_bind_addr` wire field. If it is
+            // already tracked as belonging to a DIFFERENT authenticated
+            // node_id than `sender_peer_id`, this message is a hijack
+            // attempt against that owner's bookkeeping, not a legitimate
+            // update -- fail closed rather than let it overwrite
+            // `peer_to_actors[sender_addr]` or advance/roll back
+            // `last_sequence` below. Mirrors the DNS re-resolution
+            // migration guard's collision pre-check.
+            if Self::addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
+            {
+                warn!(
+                    addr = %sender_addr,
+                    claimed_sender = %sender_peer_id,
+                    "rejecting full sync: sender_bind_addr claims an address \
+                     already owned by a different authenticated peer"
+                );
+                return false;
+            }
+
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
                 // Once a session has been armed for this peer, only the
                 // connection that armed it is treated as authoritative for

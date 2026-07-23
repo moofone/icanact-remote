@@ -4396,6 +4396,28 @@ pub(crate) fn handle_incoming_message(
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
 
+                    // Ownership guard: `sender_socket_addr` comes from the
+                    // peer-controlled `sender_bind_addr` wire field. If it
+                    // is already tracked as belonging to a DIFFERENT
+                    // authenticated node_id than `sender_peer_id`, this is
+                    // an address-hijack attempt, not a legitimate migration
+                    // -- abort before any bookkeeping is touched. Mirrors
+                    // the DNS re-resolution migration guard's collision
+                    // pre-check.
+                    if crate::registry::GossipRegistry::<()>::addr_owned_by_other_node(
+                        &gossip_state,
+                        sender_socket_addr,
+                        sender_peer_id.to_node_id(),
+                    ) {
+                        warn!(
+                            tcp_source = %_peer_addr,
+                            claimed_bind_addr = %sender_socket_addr,
+                            sender = %sender_peer_id,
+                            "Rejecting FullSync: sender_bind_addr claims an address already owned by a different authenticated peer"
+                        );
+                        return Ok(());
+                    }
+
                     // FIX: If the resolved bind address differs from the TCP source address,
                     // migrate the PeerInfo from the ephemeral port entry to the bind address.
                     // This preserves node_id, sequence, and failure state learned during TLS handshake.
@@ -4822,6 +4844,31 @@ pub(crate) fn handle_incoming_message(
                     known_actors = known_actors.len(),
                     "RECEIVED: FullSyncResponse from peer (using bind_addr)"
                 );
+
+                // Ownership guard: `sender_socket_addr` comes from the
+                // peer-controlled `sender_bind_addr` wire field. If it is
+                // already tracked as belonging to a DIFFERENT authenticated
+                // node_id than `sender_peer_id`, this is an address-hijack
+                // attempt, not a legitimate migration -- abort before any
+                // bookkeeping (including the merge below) is touched.
+                // Mirrors the DNS re-resolution migration guard's collision
+                // pre-check.
+                {
+                    let gossip_state = registry.gossip_state.lock().await;
+                    if crate::registry::GossipRegistry::<()>::addr_owned_by_other_node(
+                        &gossip_state,
+                        sender_socket_addr,
+                        sender_peer_id.to_node_id(),
+                    ) {
+                        warn!(
+                            tcp_source = %_peer_addr,
+                            claimed_bind_addr = %sender_socket_addr,
+                            sender = %sender_peer_id,
+                            "Rejecting FullSyncResponse: sender_bind_addr claims an address already owned by a different authenticated peer"
+                        );
+                        return Ok(());
+                    }
+                }
 
                 let from_current_session = registry
                     .merge_full_sync_from(
