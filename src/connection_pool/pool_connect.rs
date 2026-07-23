@@ -4841,11 +4841,26 @@ pub(crate) fn handle_incoming_message(
                     "received peer health report"
                 );
 
-                // Store the health reports
+                // Store the health reports. `peer` is a peer-chosen string,
+                // not an authenticated value, so an unbounded subject set
+                // here would let a single reporter grow this map without
+                // bound. Only accept reports whose subject is a peer this
+                // node already knows about (currently tracked or previously
+                // discovered) -- fabricated subjects are dropped.
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
                     for (peer, status) in peer_statuses {
                         if let Ok(peer_addr) = peer.parse::<SocketAddr>() {
+                            let is_known_peer = gossip_state.peers.contains_key(&peer_addr)
+                                || gossip_state.known_peers.contains(&peer_addr);
+                            if !is_known_peer {
+                                debug!(
+                                    reporter = %reporter,
+                                    subject = %peer_addr,
+                                    "dropping peer health report for unknown subject address"
+                                );
+                                continue;
+                            }
                             // For now, use the reporter's peer address from the connection
                             gossip_state
                                 .peer_health_reports

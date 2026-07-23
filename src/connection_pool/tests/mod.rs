@@ -9372,3 +9372,78 @@ async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_whe
 
     guard.disarm();
 }
+
+// A `PeerHealthReport`'s `peer_statuses` keys are peer-chosen strings, parsed
+// into arbitrary `SocketAddr`s and inserted as OUTER keys of
+// `gossip_state.peer_health_reports`. Outer entries are only ever removed for
+// addresses that show up elsewhere as a KNOWN peer (dead-peer cleanup,
+// completed pending-failure consensus, cap eviction keyed off real peers).
+// A single authenticated peer can report on addresses it invented out of
+// thin air, and those subjects match none of the known-peer cleanup paths,
+// so the outer map grows without bound. This test proves a report about many
+// fabricated subject addresses must not grow `peer_health_reports`, while a
+// report about a real, known peer must still be recorded and feed consensus.
+#[tokio::test]
+async fn peer_health_report_rejects_fabricated_subject_addresses() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_health_report_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let reporter_keypair = crate::KeyPair::new_for_testing("lrr_health_report_reporter");
+    let reporter_id = reporter_keypair.peer_id();
+    let reporter_addr: SocketAddr = "10.77.0.70:9301".parse().unwrap();
+
+    // A single real, known peer in this node's cluster view.
+    let known_peer_addr: SocketAddr = "10.77.0.71:9301".parse().unwrap();
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state.peers.insert(
+            known_peer_addr,
+            stale_peer_info(known_peer_addr, crate::current_timestamp_millis()),
+        );
+    }
+
+    let status = crate::registry::PeerHealthStatus {
+        is_alive: false,
+        last_contact: 0,
+        failure_count: 3,
+    };
+
+    // One legitimate report about the known peer, plus a flood of reports
+    // about addresses this node has never heard of.
+    let mut peer_statuses: Vec<(String, crate::registry::PeerHealthStatus)> =
+        vec![(known_peer_addr.to_string(), status.clone())];
+    for i in 0..500u16 {
+        peer_statuses.push((format!("203.0.113.99:{}", 20000 + i), status.clone()));
+    }
+
+    let report = crate::registry::RegistryMessage::PeerHealthReport {
+        reporter: reporter_id,
+        peer_statuses,
+        timestamp: crate::current_timestamp(),
+    };
+
+    super::handle_incoming_message(registry.clone(), reporter_addr, reporter_addr, report)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    let state = registry.gossip_state.lock().await;
+    assert!(
+        state.peer_health_reports.len() <= 1,
+        "peer_health_reports outer map must not grow from fabricated subject \
+         addresses (got {} outer entries)",
+        state.peer_health_reports.len()
+    );
+    assert!(
+        state.peer_health_reports.contains_key(&known_peer_addr),
+        "a report about a real, known peer must still be recorded so \
+         consensus can use it"
+    );
+}
