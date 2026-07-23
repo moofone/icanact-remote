@@ -9628,3 +9628,107 @@ async fn fresh_outbound_connect_aborts_when_identify_send_fails_instead_of_publi
          connection-instance"
     );
 }
+
+// R-11 regression coverage for `finalize_new_outbound_connection`'s own
+// arm-then-identify sequencing (as opposed to `arm_sequence_reset_for_new_session`'s
+// own internal race-safety, already covered by the `qa_r11_*` tests in
+// `registry.rs`): a fresh outbound connect to a peer that has already been
+// seen at a HIGH gossip sequence over an old session must still accept that
+// peer's post-restart sync at a LOW sequence over the NEW session finalize
+// just established. This is only possible if finalize armed the exemption
+// for the new session before anything could act on it -- exactly what
+// restoring the original arm-before-identify ordering guarantees, since the
+// two run strictly sequentially within `finalize_new_outbound_connection`
+// with no interleaving possible.
+#[tokio::test]
+async fn fresh_outbound_connect_arms_restart_exemption_so_post_restart_sync_is_accepted() {
+    use crate::{GossipConfig, RemoteActorLocation, registry::GossipRegistry};
+    use std::collections::HashMap;
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("r11-wiring-local")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let owner = crate::KeyPair::new_for_testing("r11-wiring-owner").peer_id();
+    let node_id = owner.to_node_id();
+    let peer_addr: SocketAddr = "127.0.0.1:41780".parse().unwrap();
+    let old_session_addr: SocketAddr = "127.0.0.1:57201".parse().unwrap();
+    let new_session_addr: SocketAddr = "127.0.0.1:57202".parse().unwrap();
+
+    registry.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+
+    // Pre-restart: peer is at a high sequence over an old session.
+    let mut pre_restart_actors = HashMap::new();
+    pre_restart_actors.insert(
+        "r11-wiring/x".to_string(),
+        RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            pre_restart_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(old_session_addr),
+            None,
+            40,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    // The peer restarts and we dial it fresh, threading `fresh_session_node_id`
+    // through exactly as the real dial path does -- this is what arms the
+    // one-shot lower-sequence exemption for `new_session_addr`.
+    let (io, _peer_io) = tokio::io::duplex(4096);
+    let handle = pool
+        .finalize_new_outbound_connection(
+            peer_addr,
+            io,
+            Arc::downgrade(&registry),
+            Some(node_id),
+            new_session_addr,
+            Some(node_id),
+        )
+        .await
+        .expect("finalize outbound connection");
+    drop(handle);
+
+    // The restarted peer's first sync after reconnecting resets to a LOW
+    // sequence over the NEW session. Accepted only if the exemption armed
+    // above actually took effect -- proven by a brand-new actor replacing
+    // the pre-restart set.
+    let mut restart_actors = HashMap::new();
+    restart_actors.insert(
+        "r11-wiring/y".to_string(),
+        RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            restart_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(new_session_addr),
+            None,
+            1,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    assert!(
+        registry.lookup_actor("r11-wiring/y").await.is_some(),
+        "R-11: the restarted peer's post-reconnect sync (low sequence, new \
+         session) must be accepted -- finalize_new_outbound_connection must \
+         actually arm the lower-sequence exemption for the session it just \
+         established"
+    );
+    assert!(
+        registry.lookup_actor("r11-wiring/x").await.is_none(),
+        "the restart sync must have pruned the pre-restart actor"
+    );
+}

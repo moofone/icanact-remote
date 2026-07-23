@@ -54,6 +54,13 @@ pub struct LockFreeStreamHandle {
     max_message_size: usize,
     /// Optional schema/version hash for protocol guardrails.
     schema_hash: Option<u64>,
+    /// Gates `write_routed_actor_ask` (and so `RouteBind`) behind a fresh
+    /// outbound connection's own identifying `FullSync` being enqueued
+    /// first. `true` (not gated) for every handle by default; only
+    /// `finalize_new_outbound_connection` ever arms this via
+    /// `begin_identify_gate`, immediately after construction and before
+    /// the handle is shared with anything that could enqueue onto it.
+    identify_ready: Arc<AtomicBool>,
 }
 
 impl LockFreeStreamHandle {
@@ -64,6 +71,52 @@ impl LockFreeStreamHandle {
 
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    /// Arm the identify gate: `write_routed_actor_ask` on this handle will
+    /// park in [`Self::wait_until_identified`] until [`Self::mark_identified`]
+    /// is called. Only ever called by `finalize_new_outbound_connection`,
+    /// immediately after construction and before this handle is shared with
+    /// anything that could enqueue onto it -- so there is no window in
+    /// which a caller could observe the default (not gated) state and race
+    /// ahead of the arm.
+    pub(crate) fn begin_identify_gate(&self) {
+        self.identify_ready.store(false, Ordering::Release);
+    }
+
+    /// Signal that this connection's identifying frame has been enqueued.
+    /// Wakes any `write_routed_actor_ask` parked in
+    /// [`Self::wait_until_identified`] so it can now enqueue behind it.
+    pub(crate) fn mark_identified(&self) {
+        self.identify_ready.store(true, Ordering::Release);
+        self.exit_notify.notify_waiters();
+    }
+
+    /// Park until this handle is either identified or dead. A freshly
+    /// gated outbound connection's `write_routed_actor_ask` -- and so its
+    /// `RouteBind` -- must never reach the write queue ahead of the
+    /// identifying frame; this is the wait side of that guarantee, keyed on
+    /// the exact same `exit_notify` every teardown path (`abort_tasks`,
+    /// the IO task's own `ExitGuard`) already wakes on, so a connection
+    /// that fails or tears down before ever being identified wakes any
+    /// waiter with an error instead of hanging it forever. Returns
+    /// immediately for every handle except one gated by
+    /// [`Self::begin_identify_gate`] that has not yet been identified.
+    async fn wait_until_identified(&self) -> Result<()> {
+        loop {
+            // Subscribe before checking: a `notify_waiters()` that lands
+            // between the check and a bare `.await` would otherwise be
+            // missed. `Notified` created here observes any notification
+            // from this point on, even one delivered before it is polled.
+            let notified = self.exit_notify.notified();
+            if self.identify_ready.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if self.exit_flag.load(Ordering::Acquire) {
+                return Err(GossipError::ConnectionClosed(self.addr));
+            }
+            notified.await;
+        }
     }
 
     fn allocate_stream_id(&self) -> Result<u32> {
@@ -204,6 +257,7 @@ impl LockFreeStreamHandle {
                 buffer_config,
                 max_message_size,
                 schema_hash,
+                identify_ready: Arc::new(AtomicBool::new(true)),
             },
             writer_handle,
             None,
@@ -2231,6 +2285,14 @@ impl LockFreeStreamHandle {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
+        // A brand-new outbound connection gates this behind its own
+        // identifying FullSync (see `begin_identify_gate`/`mark_identified`
+        // in `finalize_new_outbound_connection`): a `RouteBind` must never
+        // reach the write queue ahead of it, or the acceptor drops the
+        // connection outright. No-op (returns immediately) for every other
+        // handle, and for this same handle once identified.
+        self.wait_until_identified().await?;
+
         // `route_bind_gate` serializes all routed asks, and `outbound_routes`
         // has no other mutator (the IO/parse path uses the separate inbound
         // table) — this is the serialization of bind publication with routed
