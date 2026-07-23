@@ -118,16 +118,97 @@ fn stable_concurrent_removal_wins(
 fn owner_recovery_wins_tombstone(
     location: &RemoteActorLocation,
     sender_peer_id: &PeerId,
-    tombstone: &crate::VectorClock,
+    tombstone: &RemovedActorTombstone,
+    owner_restart_authenticated: bool,
 ) -> bool {
     // A peer-death tombstone is created by an observer. A direct authenticated
     // announcement from the actor owner is the recovery signal after a
     // transient disconnect, even when the actor itself did not re-register.
     // Also allow owner-clock advancement, which older equality-only recovery
     // checks rejected when the tombstone's observer component made the clocks
-    // concurrent.
-    location.peer_id == *sender_peer_id
-        && location.vector_clock.get(&location.node_id) >= tombstone.get(&location.node_id)
+    // concurrent. This forward-progress case is safe regardless of tombstone
+    // kind: a genuinely higher owner clock component proves the SAME live
+    // owner did more work after the removal was recorded, whether that
+    // removal was an explicit unregister or a peer-death reap.
+    if location.peer_id != *sender_peer_id {
+        return false;
+    }
+    if location.vector_clock.get(&location.node_id) >= tombstone.vector_clock.get(&location.node_id)
+    {
+        return true;
+    }
+
+    // Below this point the owner's clock component is LOWER than the
+    // tombstone's -- the reset-clock-after-restart shape, not mere forward
+    // progress. Bypassing the tombstone here needs BOTH:
+    //
+    // - `tombstone.kind == PeerDeath`: an explicit `unregister_actor` removal
+    //   is the owner's own deliberate decision and must NEVER be silently
+    //   undone just because its session later looks like a restart -- that
+    //   would resurrect an actor its owner intentionally took down. Only a
+    //   removal an OBSERVER inferred on the owner's behalf (the owner never
+    //   asked for it) may be reversed once the owner is confirmed live.
+    //
+    // - `owner_restart_authenticated`: durable evidence
+    //   (`PeerInfo::session_restart_confirmed`) that a genuine sequence-reset
+    //   restart was actually observed for this exact, currently-authenticated
+    //   session -- not merely that a session is currently armed. Arming
+    //   happens on every routine reconnect too, not only on restarts, so
+    //   "armed" alone proves nothing about whether the owner actually
+    //   restarted. A replay, a steady-state reconnect with no restart, or a
+    //   message from a non-current/unauthenticated connection can never set
+    //   this -- those are dropped, or leave the flag `false`, before any
+    //   upsert plan is even built.
+    owner_restart_authenticated && tombstone.kind == TombstoneKind::PeerDeath
+}
+
+/// Classifies an incoming `RegistryChange::ActorRemoved`'s tombstone kind
+/// from information available BEFORE the removal is applied -- callers must
+/// capture `owner_node_id` ahead of any mutation that could remove the
+/// `known_actors` entry being classified.
+///
+/// `owner_node_id` is the actor's current owner, if this node still has it
+/// in `known_actors`; `None` when the actor was never known here at all
+/// (e.g. its removal is gossiped in before its addition ever was).
+/// `removing_node_id` is the wire-claimed reporter of the removal.
+///
+/// `removing_node_id == owner_node_id` means the actor's own owner reported
+/// its own removal -- a deliberate `unregister_actor` decision propagating
+/// through gossip -- classified `ExplicitUnregister`. A DIFFERENT reporter
+/// is a third party (an observer reaping a peer it believes is dead)
+/// classified `PeerDeath`. When the owner is entirely unknown there is no
+/// basis to conclude this was a deliberate owner action either way, so it
+/// is conservatively classified `ExplicitUnregister` -- the choice that is
+/// NEVER later bypassed by a restart exemption.
+fn tombstone_kind_for_removal(
+    owner_node_id: Option<crate::GossipNodeId>,
+    removing_node_id: crate::GossipNodeId,
+) -> TombstoneKind {
+    match owner_node_id {
+        Some(owner) if owner == removing_node_id => TombstoneKind::ExplicitUnregister,
+        Some(_) => TombstoneKind::PeerDeath,
+        None => TombstoneKind::ExplicitUnregister,
+    }
+}
+
+/// Merges an EXISTING tombstone's kind (if any) with a newly classified
+/// removal's kind for the SAME actor, keeping the safer of the two:
+/// `ExplicitUnregister` dominates `PeerDeath`. Two independent nodes can
+/// concurrently record different removals for the same actor -- one
+/// observing the owner's own explicit unregister, another (unaware of that)
+/// inferring a peer-death reap -- and `current_actor_removal_plan`'s
+/// `Concurrent` branch merges their vector clocks into one tombstone. Once
+/// ANY report has established this was the owner's own deliberate decision,
+/// that must never be silently downgraded back to `PeerDeath` by a later
+/// merge, or a legitimately-unregistered actor could still end up
+/// resurrectable by a restart exemption.
+fn merge_tombstone_kind(existing: Option<TombstoneKind>, new: TombstoneKind) -> TombstoneKind {
+    if existing == Some(TombstoneKind::ExplicitUnregister) || new == TombstoneKind::ExplicitUnregister
+    {
+        TombstoneKind::ExplicitUnregister
+    } else {
+        new
+    }
 }
 
 #[inline]
@@ -1226,6 +1307,23 @@ pub struct PeerInfo {
     /// newer session has since been armed or the old one has expired, and
     /// the pending write must be dropped rather than applied.
     pub current_session_epoch: u64,
+    /// Durable (not one-shot) evidence that a genuine sequence-reset restart
+    /// was actually observed for THIS session -- set only by
+    /// `merge_full_sync_from` when it admits a FullSync whose sequence is
+    /// lower than `last_sequence` on the connection that armed
+    /// `accept_lower_sequence_from` (the same evidence that consumes that
+    /// one-shot exemption). Reset to `false` every time
+    /// `arm_sequence_reset_for_new_session` arms a new session: a brand-new
+    /// TLS-authenticated session is armed on every routine reconnect too,
+    /// not only on restarts, so merely being armed is not restart evidence
+    /// -- only an actually-observed sequence reset is.
+    ///
+    /// This is the exact signal the restarted-owner tombstone-recovery
+    /// exemption (`owner_recovery_wins_tombstone`) requires: a session
+    /// simply being current/armed proves nothing about whether the peer
+    /// actually restarted, but a lower sequence successfully admitted on
+    /// that exact session does.
+    pub session_restart_confirmed: bool,
 }
 
 impl PeerInfo {
@@ -1253,6 +1351,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         }
     }
 
@@ -1288,6 +1387,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         }
     }
 
@@ -1344,6 +1444,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         })
     }
 }
@@ -1396,17 +1497,60 @@ pub struct GossipResult {
     pub outcome: Result<Option<RegistryMessage>>,
 }
 
+/// Distinguishes WHY an actor was removed, so recovery logic can tell a
+/// crash/dead-peer reap (recorded by an observer on the owner's behalf, and
+/// safely undone once the owner is confirmed live again) from a deliberate,
+/// explicit removal (which must never be silently undone, restarted owner or
+/// not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneKind {
+    /// Recorded by an observer (`cleanup_dead_peers`, or a relayed removal
+    /// whose `removing_node_id` differs from the actor's own owner) that
+    /// inferred the owner is unreachable -- not a decision the owner itself
+    /// made. Safe to un-delete once the owner is confirmed to be genuinely,
+    /// authentically live again (see `owner_recovery_wins_tombstone`).
+    PeerDeath,
+    /// Recorded because the actor's own owner explicitly removed it
+    /// (`unregister_actor`, or a relayed removal whose `removing_node_id`
+    /// matches the actor's own owner). A deliberate removal must never be
+    /// un-deleted just because the same owner's session later looks like a
+    /// restart -- that would resurrect an actor its owner intentionally
+    /// took down.
+    ExplicitUnregister,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemovedActorTombstone {
     pub vector_clock: crate::VectorClock,
     pub removed_at: u64,
+    pub kind: TombstoneKind,
 }
 
 impl RemovedActorTombstone {
+    /// Peer-death tombstone (the predominant, historical shape): recorded by
+    /// an observer, not the owner itself. Use `new_explicit_unregister` for
+    /// a deliberate removal the owner itself requested.
     fn new(vector_clock: crate::VectorClock) -> Self {
         Self {
             vector_clock,
             removed_at: current_timestamp(),
+            kind: TombstoneKind::PeerDeath,
+        }
+    }
+
+    fn new_explicit_unregister(vector_clock: crate::VectorClock) -> Self {
+        Self {
+            vector_clock,
+            removed_at: current_timestamp(),
+            kind: TombstoneKind::ExplicitUnregister,
+        }
+    }
+
+    fn with_kind(vector_clock: crate::VectorClock, kind: TombstoneKind) -> Self {
+        Self {
+            vector_clock,
+            removed_at: current_timestamp(),
+            kind,
         }
     }
 }
@@ -2214,6 +2358,7 @@ impl<T: 'static> GossipRegistry<T> {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -2597,6 +2742,12 @@ impl<T: 'static> GossipRegistry<T> {
             // able to reproduce an epoch a still-in-flight, already-stale
             // apply captured against the entry it replaced.
             peer_info.current_session_epoch = next_session_epoch();
+            // A brand-new session starts with restart NOT yet confirmed --
+            // arming happens on every routine reconnect too, not only on
+            // restarts, so it must be re-proven (by an actually-observed
+            // sequence reset in `merge_full_sync_from`) before the
+            // tombstone-recovery exemption may fire for this session.
+            peer_info.session_restart_confirmed = false;
         }
     }
 
@@ -2669,6 +2820,7 @@ impl<T: 'static> GossipRegistry<T> {
                             current_session_source: None,
                             current_session_connection: None,
                             current_session_epoch: 0,
+                            session_restart_confirmed: false,
                         },
                     );
 
@@ -3444,9 +3596,12 @@ impl<T: 'static> GossipRegistry<T> {
                 // Create a new vector clock for the removal with proper causality
                 let removal_clock = location.vector_clock.clone();
                 removal_clock.increment(self.peer_id.to_node_id());
+                // This node is explicitly unregistering its OWN actor -- a
+                // deliberate decision, never to be silently undone by a
+                // later restart-looking session (see `TombstoneKind`).
                 let _ = self.actor_state.removed_actors.upsert_sync(
                     name.to_string(),
-                    RemovedActorTombstone::new(removal_clock.clone()),
+                    RemovedActorTombstone::new_explicit_unregister(removal_clock.clone()),
                 );
 
                 let change = RegistryChange::ActorRemoved {
@@ -3711,6 +3866,28 @@ impl<T: 'static> GossipRegistry<T> {
                 return Ok(Vec::new());
             }
 
+            // Bug 1 (restarted-owner tombstone recovery): `true` only when
+            // this delta arrived under a `session_guard` that was already
+            // validated by the caller as the peer's CURRENT authenticated
+            // session (`peer_info_is_from_current_session`, re-checked for
+            // races immediately above via `session_epoch_still_current`)
+            // AND `session_restart_confirmed` -- durable evidence that a
+            // genuine sequence-reset restart was actually observed for this
+            // exact session (see `merge_full_sync_from`), not merely that a
+            // session is currently armed. Arming happens on every routine
+            // reconnect too, not only on restarts, so "armed" alone is not
+            // restart evidence. This read happens under THIS call's own
+            // fresh lock acquisition, strictly after the caller's own
+            // session validation (and any self-healing it performed)
+            // already completed and committed to `gossip_state`, so it
+            // always reflects the current, post-validation state.
+            let owner_restart_authenticated = session_guard.is_some_and(|(session_peer_addr, _)| {
+                gossip_state
+                    .peers
+                    .get(&session_peer_addr)
+                    .is_some_and(|peer_info| peer_info.session_restart_confirmed)
+            });
+
             let mut log_adds = Vec::new();
             let mut sender_actors = bookkeeping_addr
                 .and_then(|addr| gossip_state.peer_to_actors.get(&addr).cloned())
@@ -3762,6 +3939,7 @@ impl<T: 'static> GossipRegistry<T> {
                             name.as_str(),
                             &location,
                             &sender_peer_id,
+                            owner_restart_authenticated,
                         ) else {
                             continue;
                         };
@@ -3809,6 +3987,32 @@ impl<T: 'static> GossipRegistry<T> {
                         removing_node_id,
                         priority,
                     } => {
+                        // Captured BEFORE `current_actor_removal_plan` (which
+                        // may `remove_sync` the entry): whether the removal
+                        // is the actor's OWN owner reporting its own
+                        // deliberate removal (`removing_node_id` matches the
+                        // owner) or a third party/observer reaping it on the
+                        // owner's behalf. See `TombstoneKind`.
+                        let this_removal_kind = tombstone_kind_for_removal(
+                            self.actor_state.known_actors.read_sync(name.as_str(), |_, loc| loc.node_id),
+                            removing_node_id,
+                        );
+                        // Also captured BEFORE any upsert below overwrites
+                        // it: an existing tombstone this message's removal
+                        // is concurrent with (see `current_actor_removal_plan`'s
+                        // `Concurrent` branch, which merges the vector clock
+                        // but not the kind) must not have its
+                        // `ExplicitUnregister` classification silently
+                        // downgraded back to `PeerDeath` just because a
+                        // later, concurrently-merged report happens to
+                        // classify as peer-death from ITS OWN sender's
+                        // perspective.
+                        let existing_kind = self
+                            .actor_state
+                            .removed_actors
+                            .read_sync(name.as_str(), |_, tombstone| tombstone.kind);
+                        let kind = merge_tombstone_kind(existing_kind, this_removal_kind);
+
                         let Some((removal_clock, tombstone_only)) = self
                             .current_actor_removal_plan(
                                 name.as_str(),
@@ -3828,7 +4032,7 @@ impl<T: 'static> GossipRegistry<T> {
                         if tombstone_only {
                             let _ = self.actor_state.removed_actors.upsert_sync(
                                 name.clone(),
-                                RemovedActorTombstone::new(removal_clock),
+                                RemovedActorTombstone::with_kind(removal_clock, kind),
                             );
                             gossip_state
                                 .pending_changes
@@ -3845,10 +4049,10 @@ impl<T: 'static> GossipRegistry<T> {
                             sender_actors.remove(&name);
                             peer_actor_names_changed.insert(name.clone());
                             applied_count += 1;
-                            let _ = self
-                                .actor_state
-                                .removed_actors
-                                .upsert_sync(name, RemovedActorTombstone::new(removal_clock));
+                            let _ = self.actor_state.removed_actors.upsert_sync(
+                                name,
+                                RemovedActorTombstone::with_kind(removal_clock, kind),
+                            );
                             gossip_state
                                 .pending_changes
                                 .push(Self::as_regular_gossip_change(&forwarded));
@@ -4185,6 +4389,7 @@ impl<T: 'static> GossipRegistry<T> {
         name: &str,
         location: &RemoteActorLocation,
         sender_peer_id: &PeerId,
+        owner_restart_authenticated: bool,
     ) -> Option<(bool, bool)> {
         if location.peer_id == self.peer_id {
             debug!(
@@ -4206,14 +4411,19 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(tombstone) = self
             .actor_state
             .removed_actors
-            .read_sync(name, |_, tombstone| tombstone.vector_clock.clone())
+            .read_sync(name, |_, tombstone| tombstone.clone())
         {
-            match location.vector_clock.compare(&tombstone) {
+            match location.vector_clock.compare(&tombstone.vector_clock) {
                 crate::ClockOrdering::After => {
                     clear_tombstone = true;
                 }
                 crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
-                    if owner_recovery_wins_tombstone(location, sender_peer_id, &tombstone) =>
+                    if owner_recovery_wins_tombstone(
+                        location,
+                        sender_peer_id,
+                        &tombstone,
+                        owner_restart_authenticated,
+                    ) =>
                 {
                     clear_tombstone = true;
                 }
@@ -4684,6 +4894,7 @@ impl<T: 'static> GossipRegistry<T> {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        session_restart_confirmed: false,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -5293,6 +5504,11 @@ impl<T: 'static> GossipRegistry<T> {
         // validated must not be allowed to write. Drawn fresh from the
         // process-wide counter -- see `next_session_epoch`.
         peer_info.current_session_epoch = next_session_epoch();
+        // This successor never itself armed a session (it self-healed in
+        // instead), so it has proven no restart either -- it must earn
+        // `session_restart_confirmed` the same way any other session does,
+        // via an actually-observed sequence reset.
+        peer_info.session_restart_confirmed = false;
         true
     }
 
@@ -5368,6 +5584,20 @@ impl<T: 'static> GossipRegistry<T> {
         // all, so a newer session can arm (or the validated one can
         // self-expire) in that gap, and this is what lets STEP 2 detect
         // and drop the now-stale pending write instead of applying it.
+        // Bug 1 (restarted-owner tombstone recovery): `owner_restart_authenticated`
+        // must reflect GENUINE restart evidence, not merely "a session is
+        // currently armed" -- a new TLS-authenticated session is armed on
+        // every routine reconnect too, not only on restarts (see
+        // `arm_sequence_reset_for_new_session`). It is therefore derived
+        // from `peer_info.session_restart_confirmed`, which is only ever set
+        // when an actual sequence-reset is observed below, and it is read
+        // AFTER session validation/self-healing (`peer_info_is_from_current_session`)
+        // AND after this call's own restart-detection has had a chance to
+        // set it -- never from a snapshot taken before either, or a
+        // just-self-healed successor that never itself armed a session (and
+        // so has proven no restart) could inherit stale restart-authenticity
+        // evidence captured against the connection it replaced.
+        let mut owner_restart_authenticated = false;
         let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
@@ -5443,6 +5673,10 @@ impl<T: 'static> GossipRegistry<T> {
                     // any other connection's traffic (see above).
                     peer_info.accept_lower_sequence_from = None;
                     peer_info.last_sequence = sequence;
+                    // Durable restart evidence for the rest of this session:
+                    // a genuine sequence reset was just observed on this
+                    // exact, currently-authenticated session.
+                    peer_info.session_restart_confirmed = true;
                 } else {
                     // Reached only for messages already confirmed to be
                     // from the current session (or before any session was
@@ -5451,6 +5685,12 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_info.accept_lower_sequence_from = None;
                     peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
                 }
+
+                // Read LAST, after validation/self-healing and after this
+                // call's own restart-detection above -- see the comment on
+                // this variable's declaration.
+                owner_restart_authenticated = peer_info.session_restart_confirmed;
+
                 Some(peer_info.current_session_epoch)
             } else {
                 None
@@ -5581,8 +5821,12 @@ impl<T: 'static> GossipRegistry<T> {
                     rejected_by_global_cap += 1;
                     continue;
                 }
-                let upsert_plan =
-                    self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id);
+                let upsert_plan = self.current_actor_upsert_plan(
+                    name.as_str(),
+                    location,
+                    &sender_peer_id,
+                    owner_restart_authenticated,
+                );
                 if upsert_plan.is_none() {
                     // An exact duplicate is still an admitted advertisement
                     // when the actor already exists. Other rejected candidates
@@ -6431,6 +6675,16 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
+        // Both branches above are reached only for a CONFIRMED teardown of
+        // `failed_peer_addr`'s own session -- the superseded/CAS-loss cases
+        // earlier in this function already returned without disturbing a
+        // still-live connection. Invalidate this peer's session-authentication
+        // state now (see `invalidate_session_state_on_teardown`), or a stale
+        // `session_source`/`session_restart_confirmed` could keep being
+        // honored as "current" for a session that no longer has any live
+        // connection behind it at all.
+        self.invalidate_session_state_on_teardown(failed_peer_addr).await;
+
         if let Some(cell) = self.peer_disconnect_handler.load_full() {
             // Skip launching the notifier if we're already shutting
             // down — the spawn would otherwise hold an Arc reference
@@ -6676,6 +6930,12 @@ impl<T: 'static> GossipRegistry<T> {
                 "connection cleanup complete"
             );
         }
+
+        // Same session-authentication invalidation as
+        // `handle_peer_connection_failure`'s address-keyed path -- see its
+        // comment for the full rationale. This path always represents a
+        // confirmed, peer-wide teardown.
+        self.invalidate_session_state_on_teardown(failed_peer_addr).await;
 
         if let Some(cell) = self.peer_disconnect_handler.load_full() {
             // Skip launching the notifier if we're already shutting
@@ -8207,6 +8467,7 @@ impl<T: 'static> GossipRegistry<T> {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -8297,6 +8558,45 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         debug!(addr = %addr, "marked peer as disconnected");
+    }
+
+    /// Invalidates `addr`'s session-authentication state on a CONFIRMED
+    /// connection teardown: clears `current_session_source` /
+    /// `current_session_connection` / `accept_lower_sequence_from`, resets
+    /// `session_restart_confirmed`, and draws a fresh session epoch.
+    ///
+    /// Without this, a torn-down connection's `current_session_source`
+    /// (and, critically, `session_restart_confirmed` if it had been set)
+    /// remain on the `PeerInfo` entry unchanged -- `arm_sequence_reset_for_new_session`
+    /// only overwrites them when a NEW session is actually armed, and
+    /// `peer_info_is_from_current_session`'s self-heal only fires when
+    /// `connection_pool` shows a DIFFERENT connection as current. Neither
+    /// condition is guaranteed to occur promptly after a genuine teardown
+    /// (the peer may not reconnect for a while, or at all). Until one does,
+    /// any message that can still present the dead connection's own
+    /// `session_source` value (a delayed/replayed frame, or a caller with no
+    /// real per-connection TCP-source verification) would still be treated
+    /// as "the peer's current authenticated session" -- and, worse, could
+    /// still carry a stale `session_restart_confirmed = true` from BEFORE
+    /// the teardown, letting it bypass a tombstone with no genuinely live
+    /// session behind it at all. Called only for a CONFIRMED teardown (the
+    /// caller has already established the failed connection was genuinely
+    /// this peer's own live session, not an already-superseded one) --
+    /// invalidating on an unconfirmed/superseded report would incorrectly
+    /// clear a still-live successor's own, unrelated session state.
+    async fn invalidate_session_state_on_teardown(&self, addr: SocketAddr) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+            peer_info.current_session_source = None;
+            peer_info.current_session_connection = None;
+            peer_info.accept_lower_sequence_from = None;
+            peer_info.session_restart_confirmed = false;
+            // Drawn fresh from the process-wide counter -- see
+            // `next_session_epoch`'s doc comment for why a locally-reset
+            // scheme is unsafe here. Invalidates any in-flight apply that
+            // captured the pre-teardown epoch as "current".
+            peer_info.current_session_epoch = next_session_epoch();
+        }
     }
 
     /// Duplicate connection tie-breaker
@@ -10241,6 +10541,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -10523,6 +10824,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         }
     }
 
@@ -10623,6 +10925,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -11441,6 +11744,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -11465,6 +11769,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -13358,6 +13663,7 @@ mod tests {
             RemovedActorTombstone {
                 vector_clock: old_clock,
                 removed_at: current_timestamp().saturating_sub(11),
+                kind: TombstoneKind::PeerDeath,
             },
         );
         let _ = registry.actor_state.removed_actors.upsert_sync(
@@ -13467,6 +13773,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -13541,6 +13848,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -13611,6 +13919,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -13663,6 +13972,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -13757,6 +14067,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
             let mut seeded = HashSet::new();
@@ -13880,6 +14191,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -14068,6 +14380,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -14159,6 +14472,7 @@ mod tests {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        session_restart_confirmed: false,
                     },
                 );
             }
@@ -14250,6 +14564,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -14333,6 +14648,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -15221,6 +15537,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -15282,6 +15599,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -15333,6 +15651,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         };
 
         // Convert to gossip format
@@ -15726,6 +16045,7 @@ mod tests {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        session_restart_confirmed: false,
                 },
             );
         }
@@ -16159,6 +16479,703 @@ mod tests {
         );
     }
 
+    /// Bug 1 (P1): a RESTARTED owner's vector clock resets to a fresh, low
+    /// value, while a pre-crash tombstone still carries the old, high owner
+    /// component. Once the owner reconnects and #156's session mechanism
+    /// arms a fresh TLS-authenticated session for it, its re-registration
+    /// must recover through the stale tombstone even though its reset
+    /// clock is strictly lower -- otherwise the subscriber stays rejected
+    /// for up to `vector_clock_retention_period`.
+    #[tokio::test]
+    async fn apply_delta_restarted_owner_recovers_through_stale_pre_crash_tombstone() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7900),
+            test_config_with_seed("restart-tombstone-owner"),
+        );
+        let actor = "actor.delta.restarted-owner";
+        let owner = test_peer_id("restart-tombstone-owner-peer");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let peer_addr = test_addr(9910);
+        let session_source = test_addr(55101);
+
+        // Pre-crash state: the owner's clock grew well beyond 1 before an
+        // observer recorded a death tombstone against it.
+        let pre_crash_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            pre_crash_clock.increment(owner_node);
+        }
+        pre_crash_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new(pre_crash_clock),
+        );
+
+        // Pre-crash: the owner had a live session with a high gossip
+        // sequence.
+        reg.add_peer_with_node_id(peer_addr, Some(owner_node)).await;
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            40,
+            current_timestamp(),
+        )
+        .await;
+
+        // The owner restarts: a fresh TLS-authenticated session is armed for
+        // it, exactly as production does on a new inbound/outbound
+        // connection (see `arm_sequence_reset_for_new_session`).
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            session_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(session_source),
+        )
+        .await;
+
+        // The restarted owner's OWN first FullSync on the new session
+        // carries a lower sequence than the pre-crash high-water mark --
+        // exactly the evidence `merge_full_sync_from` uses to durably
+        // confirm a genuine restart for this session
+        // (`PeerInfo::session_restart_confirmed`), matching the real
+        // production handshake (a fresh connection sends its FullSync
+        // before any deltas).
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(session_source),
+            Some(session_source),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let captured_epoch = {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                peer_info.session_restart_confirmed,
+                "sanity: the low-sequence FullSync above must have confirmed the restart"
+            );
+            peer_info.current_session_epoch
+        };
+
+        // Restarted process: a fresh vector clock, far below the pre-crash
+        // tombstone's owner component.
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            Some(session_source),
+            Some((peer_addr, captured_epoch)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_some(),
+            "a restarted owner's authenticated re-registration must recover through \
+             a pre-crash tombstone even though its reset clock is lower"
+        );
+    }
+
+    /// P1a (kind half): an intentional `unregister_actor` removal must NEVER
+    /// be undone by a restart, even with the exact same genuine-restart
+    /// evidence (`session_restart_confirmed`) that legitimately recovers a
+    /// peer-death tombstone in the test above. Only `TombstoneKind::PeerDeath`
+    /// may be bypassed by the restart exemption.
+    #[tokio::test]
+    async fn apply_delta_restarted_owner_does_not_recover_through_explicit_unregister_tombstone() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7909),
+            test_config_with_seed("rt-explicit-unreg"),
+        );
+        let actor = "actor.delta.explicit-unregister";
+        let owner = test_peer_id("rt-explicit-unreg-owner");
+        let owner_node = owner.to_node_id();
+        let peer_addr = test_addr(9919);
+        let session_source = test_addr(55111);
+
+        // The owner itself explicitly removed this actor before crashing --
+        // NOT an observer's peer-death inference.
+        let removal_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            removal_clock.increment(owner_node);
+        }
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new_explicit_unregister(removal_clock),
+        );
+
+        // The owner restarts and this is confirmed as a genuine restart --
+        // the exact same evidence that recovers a peer-death tombstone.
+        reg.add_peer_with_node_id(peer_addr, Some(owner_node)).await;
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            40,
+            current_timestamp(),
+        )
+        .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            session_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(session_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(session_source),
+            Some(session_source),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let captured_epoch = {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                peer_info.session_restart_confirmed,
+                "sanity: the low-sequence FullSync above must have confirmed the restart"
+            );
+            peer_info.current_session_epoch
+        };
+
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            Some(session_source),
+            Some((peer_addr, captured_epoch)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "an intentional unregister must never be undone by a restart, no matter how \
+             genuine the restart evidence"
+        );
+        assert!(
+            reg.actor_state.removed_actors.contains_sync(actor),
+            "the explicit-unregister tombstone itself must survive the restarted owner's \
+             re-registration attempt"
+        );
+    }
+
+    /// P1a (restart-evidence half): a peer's session being currently ARMED
+    /// is not restart evidence by itself -- arming happens on every routine
+    /// reconnect too. A brand-new peer's first-ever connection (no prior
+    /// sequence to reset FROM) must not be treated as a restart just because
+    /// its low clock happens to be below a pre-existing tombstone.
+    #[tokio::test]
+    async fn apply_delta_steady_state_armed_session_without_restart_does_not_bypass_tombstone() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7910),
+            test_config_with_seed("restart-tombstone-steady-state"),
+        );
+        let actor = "actor.delta.steady-state-no-restart";
+        let owner = test_peer_id("restart-tombstone-steady-state-peer");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let peer_addr = test_addr(9920);
+        let session_source = test_addr(55112);
+
+        // A peer-death tombstone exists (perhaps left over from a much
+        // earlier, unrelated incarnation of this actor name).
+        let removal_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            removal_clock.increment(owner_node);
+        }
+        removal_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new(removal_clock),
+        );
+
+        // The owner connects for the first time ever (never seen before --
+        // `last_sequence` starts at 0) and its session is armed, exactly
+        // like any ordinary connection. No restart has occurred; there is
+        // nothing to have restarted FROM.
+        reg.add_peer_with_node_id(peer_addr, Some(owner_node)).await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            session_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(session_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(session_source),
+            Some(session_source),
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let captured_epoch = {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                peer_info.current_session_source.is_some(),
+                "sanity: the session must be armed"
+            );
+            assert!(
+                !peer_info.session_restart_confirmed,
+                "sanity: a peer's very first connection is not restart evidence"
+            );
+            peer_info.current_session_epoch
+        };
+
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            Some(session_source),
+            Some((peer_addr, captured_epoch)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "a merely-armed session with no actual restart evidence must not bypass a tombstone"
+        );
+        assert!(reg.actor_state.removed_actors.contains_sync(actor));
+    }
+
+    /// P1b: a successor connection that self-heals into "current" (because
+    /// the originally-armed connection was superseded) but NEVER ITSELF
+    /// armed a session must not inherit restart-authenticity evidence from
+    /// the session it replaced -- even when that original session HAD
+    /// genuinely confirmed a restart. `session_restart_confirmed` must be
+    /// reset by the self-heal, and the un-armed successor has no way to
+    /// re-earn it (its own `accept_lower_sequence_from` is `None`, so no
+    /// FullSync on it can ever be recognized as an armed restart).
+    #[tokio::test]
+    async fn self_healed_successor_that_never_armed_does_not_get_restart_exemption() {
+        use crate::connection_pool::{ConnectionDirection, LockFreeConnection};
+
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7911),
+            test_config_with_seed("restart-tombstone-self-heal"),
+        );
+        let actor = "actor.delta.self-healed-successor";
+        let owner = test_peer_id("restart-tombstone-self-heal-peer");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let peer_addr = test_addr(9921);
+
+        let pre_crash_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            pre_crash_clock.increment(owner_node);
+        }
+        pre_crash_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new(pre_crash_clock),
+        );
+
+        // The ORIGINAL session: armed, and its restart is genuinely
+        // confirmed (so `session_restart_confirmed` starts `true` -- proving
+        // the later reset actually changes something, not just observing an
+        // already-`false` flag).
+        reg.add_peer_with_node_id(peer_addr, Some(owner_node)).await;
+        let original_source = test_addr(55211);
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            40,
+            current_timestamp(),
+        )
+        .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            original_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(original_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(original_source),
+            Some(original_source),
+            1,
+            current_timestamp(),
+        )
+        .await;
+        {
+            let state = reg.gossip_state.lock().await;
+            assert!(
+                state.peers.get(&peer_addr).unwrap().session_restart_confirmed,
+                "sanity: the original session's restart must be confirmed first"
+            );
+        }
+
+        // A DIFFERENT connection instance for the SAME identity is now
+        // published as current in the pool -- WITHOUT ever arming a session
+        // for it (no `arm_sequence_reset_for_new_session` call).
+        let new_source = test_addr(55212);
+        let new_conn = std::sync::Arc::new(LockFreeConnection::new(
+            new_source,
+            ConnectionDirection::Inbound,
+        ));
+        assert!(
+            reg.connection_pool
+                .add_connection_by_peer_id(owner.clone(), peer_addr, new_conn),
+            "the new connection instance must publish as current"
+        );
+
+        // Its own (perfectly ordinary, non-restart-shaped) FullSync makes
+        // `peer_info_is_from_current_session` self-heal: the un-armed
+        // successor becomes recognized as current, clearing the original
+        // session's discriminators -- including, per this fix,
+        // `session_restart_confirmed`.
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(new_source),
+            Some(new_source),
+            41,
+            current_timestamp(),
+        )
+        .await;
+
+        let captured_epoch = {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                !peer_info.session_restart_confirmed,
+                "the self-healed, never-armed successor must NOT inherit the original \
+                 session's restart-confirmed evidence"
+            );
+            peer_info.current_session_epoch
+        };
+
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            Some(new_source),
+            Some((peer_addr, captured_epoch)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "a self-healed successor that never itself armed a session must not get the \
+             restart exemption just because a DIFFERENT, earlier session once earned it"
+        );
+        assert!(reg.actor_state.removed_actors.contains_sync(actor));
+    }
+
+    /// Bug 1 anti-replay guard: the SAME reset-clock-below-tombstone shape as
+    /// above must NOT be admitted when there is no authenticated-current-session
+    /// evidence backing it (`apply_delta`'s `None, None` session context --
+    /// exactly what an unauthenticated or non-current-session sender would
+    /// produce). Otherwise the restart exemption becomes a general replay
+    /// hole: anyone able to get a low-clock `ActorAdded` accepted at all could
+    /// use it to resurrect any tombstoned actor.
+    #[tokio::test]
+    async fn apply_delta_unauthenticated_reset_clock_does_not_bypass_tombstone() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7901),
+            test_config_with_seed("restart-tombstone-replay"),
+        );
+        let actor = "actor.delta.replayed-reset-clock";
+        let owner = test_peer_id("restart-tombstone-replay-peer");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let peer_addr = test_addr(9911);
+
+        let pre_crash_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            pre_crash_clock.increment(owner_node);
+        }
+        pre_crash_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new(pre_crash_clock),
+        );
+
+        // No peer added, no session ever armed: this is the "no session
+        // context to validate against" path -- the same shape a forged or
+        // replayed low-clock claim would take.
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: loc,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: owner,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "a reset-looking clock below the tombstone must stay rejected without \
+             authenticated-current-session evidence of a genuine restart"
+        );
+        assert!(
+            reg.actor_state.removed_actors.contains_sync(actor),
+            "the tombstone itself must survive an unauthenticated replay attempt"
+        );
+    }
+
+    /// `merge_tombstone_kind` must keep `ExplicitUnregister` dominant over
+    /// `PeerDeath` in every combination: once any report has established a
+    /// removal was the owner's own deliberate decision, a later,
+    /// concurrently-merged peer-death report must never downgrade it back.
+    #[test]
+    fn merge_tombstone_kind_prefers_explicit_unregister() {
+        assert_eq!(
+            merge_tombstone_kind(Some(TombstoneKind::PeerDeath), TombstoneKind::ExplicitUnregister),
+            TombstoneKind::ExplicitUnregister
+        );
+        assert_eq!(
+            merge_tombstone_kind(Some(TombstoneKind::ExplicitUnregister), TombstoneKind::PeerDeath),
+            TombstoneKind::ExplicitUnregister
+        );
+        assert_eq!(
+            merge_tombstone_kind(Some(TombstoneKind::PeerDeath), TombstoneKind::PeerDeath),
+            TombstoneKind::PeerDeath
+        );
+        assert_eq!(
+            merge_tombstone_kind(None, TombstoneKind::PeerDeath),
+            TombstoneKind::PeerDeath
+        );
+        assert_eq!(
+            merge_tombstone_kind(None, TombstoneKind::ExplicitUnregister),
+            TombstoneKind::ExplicitUnregister
+        );
+    }
+
+    /// End-to-end: an already-established `ExplicitUnregister` tombstone
+    /// must survive a LATER incoming `ActorRemoved` that would, on its own,
+    /// classify as `PeerDeath` (reported by a third party, not the owner).
+    /// Without kind-merging, this later report's own classification would
+    /// silently overwrite the safer, pre-existing classification.
+    #[tokio::test]
+    async fn apply_delta_removal_preserves_explicit_unregister_kind_against_later_peer_death_report() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7912),
+            test_config_with_seed("tombstone-kind-merge"),
+        );
+        let actor = "actor.removal.kind-merge";
+        let owner = test_peer_id("tombstone-kind-merge-owner");
+        let owner_node = owner.to_node_id();
+        let observer_node = test_peer_id("tombstone-kind-merge-observer").to_node_id();
+
+        // The actor is currently known, owned by `owner`.
+        let known_loc = RemoteActorLocation::new_with_peer(test_addr(9922), owner.clone());
+        known_loc.vector_clock.increment(owner_node);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync(actor.to_string(), known_loc);
+
+        // An ExplicitUnregister tombstone has already been established
+        // (e.g. from an earlier, direct report from the owner itself).
+        let existing_clock = crate::VectorClock::new();
+        existing_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new_explicit_unregister(existing_clock),
+        );
+
+        // A LATER incoming removal, reported by a THIRD PARTY (not the
+        // owner) -- on its own this classifies as `PeerDeath` -- with a
+        // clock that causally dominates the known actor's current entry.
+        let removal_clock = crate::VectorClock::new();
+        removal_clock.increment(owner_node);
+        removal_clock.increment(owner_node);
+        removal_clock.increment(observer_node);
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: removal_clock,
+                removing_node_id: observer_node,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: test_peer_id("tombstone-kind-merge-relay"),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let kind = reg
+            .actor_state
+            .removed_actors
+            .read_sync(actor, |_, tombstone| tombstone.kind)
+            .expect("the actor must still be tombstoned");
+        assert_eq!(
+            kind,
+            TombstoneKind::ExplicitUnregister,
+            "a later third-party peer-death report must not downgrade an already-established \
+             ExplicitUnregister classification"
+        );
+    }
+
+    /// A CONFIRMED connection teardown must invalidate the peer's
+    /// session-authentication state, including `session_restart_confirmed`
+    /// -- otherwise a stale value from before the teardown could still be
+    /// honored by a later message that merely presents the dead
+    /// connection's own (by-then-meaningless) `session_source`.
+    #[tokio::test]
+    async fn handle_peer_connection_failure_invalidates_session_restart_confirmed() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7913),
+            test_config_with_seed("teardown-invalidates-restart"),
+        );
+        let peer_addr = test_addr(9923);
+        let owner = test_peer_id("teardown-invalidates-restart-peer");
+        let owner_node = owner.to_node_id();
+        let session_source = test_addr(55401);
+
+        reg.add_peer_with_node_id(peer_addr, Some(owner_node)).await;
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            40,
+            current_timestamp(),
+        )
+        .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            session_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(session_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(session_source),
+            Some(session_source),
+            1,
+            current_timestamp(),
+        )
+        .await;
+        {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                peer_info.session_restart_confirmed,
+                "sanity: the restart must be confirmed before the teardown"
+            );
+            assert!(peer_info.current_session_source.is_some());
+        }
+
+        reg.handle_peer_connection_failure(peer_addr, None)
+            .await
+            .unwrap();
+
+        let state = reg.gossip_state.lock().await;
+        let peer_info = state.peers.get(&peer_addr).unwrap();
+        assert!(
+            !peer_info.session_restart_confirmed,
+            "a confirmed teardown must invalidate restart-confirmed evidence from the \
+             now-dead session"
+        );
+        assert!(
+            peer_info.current_session_source.is_none(),
+            "a confirmed teardown must clear the dead session's source discriminator"
+        );
+        assert!(peer_info.accept_lower_sequence_from.is_none());
+    }
+
     #[tokio::test]
     async fn test_merge_full_sync_ignores_stale_sequence() {
         let reg = GossipRegistry::<()>::new(test_addr(7005), test_config());
@@ -16189,6 +17206,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16332,6 +17350,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16377,6 +17396,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16422,6 +17442,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16480,6 +17501,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16545,6 +17567,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -16642,6 +17665,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -16702,6 +17726,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16785,6 +17810,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16855,6 +17881,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }
@@ -16917,6 +17944,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                 },
             );
         }

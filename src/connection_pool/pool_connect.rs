@@ -4026,6 +4026,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_source: None,
                                 current_session_connection: None,
                                 current_session_epoch: 0,
+                                session_restart_confirmed: false,
                             });
                         }
                     }
@@ -4245,6 +4246,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_source: None,
                                 current_session_connection: None,
                                 current_session_epoch: 0,
+                                session_restart_confirmed: false,
                             });
                         }
                     }
