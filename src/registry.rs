@@ -172,6 +172,21 @@ fn next_session_epoch() -> u64 {
     SESSION_EPOCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide, never-reset counter allocating synthetic connection-instance
+/// tokens for `current_connection_instance_token`'s degenerate fallback --
+/// used only when a REAL `LockFreeStreamHandle::instance_id` cannot be
+/// resolved for the connection actually being marked connected. Started far
+/// above any realistic real instance id (those start at 1 and only grow by
+/// one per physical connection ever made) so a synthetic token can never
+/// practically collide with a real one, and each call draws a fresh value so
+/// two synthetic tokens can never accidentally match each other either.
+static SYNTHETIC_CONNECTION_INSTANCE_TOKEN_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1 << 62);
+
+fn next_synthetic_connection_instance_token() -> u64 {
+    SYNTHETIC_CONNECTION_INSTANCE_TOKEN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Atomically re-validates, under an already-held `gossip_state` lock,
 /// that `expected_epoch` (captured earlier, at session-validation time,
 /// from `PeerInfo::current_session_epoch`) still matches this peer's
@@ -8307,18 +8322,42 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// The connection-instance token (see #156's `LockFreeStreamHandle::instance_id`)
-    /// of whatever connection is CURRENTLY published in `connection_pool` for
-    /// `addr`, if any. This is the identity `PeerDiscovery::on_peer_connected`
-    /// uses to tell a genuine replacement connection at the same address
-    /// (a different token) from a redundant re-mark of the same one (an
-    /// identical token) -- reusing the exact per-connection instance
-    /// identity #156 already established for the analogous
-    /// `arm_sequence_reset_for_new_session`/`disconnect_connection_instance`
-    /// mechanisms, rather than inventing a second one.
-    fn current_connection_instance_token(&self, addr: SocketAddr) -> Option<u64> {
+    /// identifying the connection that is being marked connected for `addr`,
+    /// for `PeerDiscovery::on_peer_connected` to tell a genuine replacement
+    /// connection at the same address (a different token) from a redundant
+    /// re-mark of the same one (an identical token) -- reusing the exact
+    /// per-connection instance identity #156 already established for the
+    /// analogous `arm_sequence_reset_for_new_session`/
+    /// `disconnect_connection_instance` mechanisms, rather than inventing a
+    /// second one.
+    ///
+    /// Always returns a concrete, usable token -- never `None` -- because an
+    /// ambiguous "identity unknown" value is unsafe in EITHER direction for
+    /// the caller (see `PeerDiscovery::on_peer_connected`'s doc): the normal
+    /// case resolves the REAL instance id of whatever connection
+    /// `connection_pool` currently has published for `addr`. On the small
+    /// number of call sites where that connection has not been published
+    /// under `addr` YET at the exact moment the mark fires (e.g. the inbound
+    /// accept path, which marks connected before finalizing/publishing the
+    /// connection object for this exact session), or where no connection is
+    /// published at all (a local/test caller managing connections outside
+    /// `connection_pool`), the real id cannot be resolved. Rather than
+    /// silently treating that as "no identity" (ambiguous, unsafe either
+    /// way), this draws a FRESH, always-unique synthetic token instead: a
+    /// mark whose identity cannot be resolved is always treated as a
+    /// (possibly new) instance, so the discovery clear declines rather than
+    /// risking wiping out a replacement it cannot actually distinguish from
+    /// the failing connection. A spurious "looks new" verdict here only
+    /// ever costs a discovery clear that should have proceeded -- and that
+    /// slot still self-heals on the very next disconnect/failure event for
+    /// whatever connection is actually there -- whereas the reverse (wiping
+    /// a live replacement's state) directly corrupts capacity accounting
+    /// while the peer is up.
+    fn current_connection_instance_token(&self, addr: SocketAddr) -> u64 {
         self.connection_pool
             .get_lock_free_connection(addr)
             .and_then(|conn| conn.stream_handle.as_ref().map(|handle| handle.instance_id()))
+            .unwrap_or_else(next_synthetic_connection_instance_token)
     }
 
     fn record_peer_discovery_connected(&self, gossip_state: &mut GossipState, addr: SocketAddr) {
@@ -12005,15 +12044,16 @@ mod tests {
         );
     }
 
-    /// `on_peer_connected` carries no connection-instance identity -- just an
-    /// address -- so a REDUNDANT re-confirmation of an address that is
-    /// already `Connected` must NOT advance the connect generation. If it
-    /// did, a teardown reported for that exact still-live socket, landing in
-    /// the gap between a failure's generation capture and the discovery
-    /// clear, would see a bumped generation it never actually raced against
-    /// and wrongly decline -- permanently stranding the slot as `Connected`
-    /// with no live connection behind it at all. A genuine disconnect after
-    /// a redundant re-confirmation must still clear normally.
+    /// A REDUNDANT re-confirmation of an address that is already `Connected`
+    /// -- a second status notification resolving the SAME connection
+    /// instance token, not a new connection -- must NOT advance the connect
+    /// generation. If it did, a teardown reported for that exact still-live
+    /// socket, landing in the gap between a failure's generation capture and
+    /// the discovery clear, would see a bumped generation it never actually
+    /// raced against and wrongly decline -- permanently stranding the slot
+    /// as `Connected` with no live connection behind it at all. A genuine
+    /// disconnect after a redundant re-confirmation must still clear
+    /// normally.
     #[tokio::test]
     async fn redundant_connect_does_not_bump_generation_and_genuine_disconnect_still_clears() {
         let mut config = test_config_with_seed("discovery-redundant-connect");
@@ -12021,8 +12061,13 @@ mod tests {
         config.max_peers = 1;
         let registry = GossipRegistry::<()>::new(test_addr(7908), config);
         let peer_addr = test_addr(9918);
+        let peer_id = test_peer_id("discovery-redundant-connect-peer");
 
         registry.add_peer(peer_addr).await;
+        // A real, published connection instance -- so both marks below
+        // resolve the SAME instance token, exactly like a genuine redundant
+        // status notification for the one still-live socket would.
+        let _conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
         registry.mark_peer_connected(peer_addr).await;
 
         let generation_after_first_connect = registry
@@ -12031,8 +12076,8 @@ mod tests {
         assert!(generation_after_first_connect.is_some());
 
         // A REDUNDANT re-confirmation of the SAME still-Connected address --
-        // e.g. a second status notification for the identical live socket,
-        // not a new connection.
+        // e.g. a second status notification for the identical live socket
+        // (nothing new published in `connection_pool`), not a new connection.
         registry.mark_peer_connected(peer_addr).await;
 
         let generation_after_redundant_connect = registry
@@ -12060,6 +12105,59 @@ mod tests {
              notification was recorded for the same address in between"
         );
         assert_eq!(discovery.remaining_slots(), 1);
+    }
+
+    /// The degenerate fallback (identity unresolved) must never let two
+    /// SEPARATE unresolved connects collapse to the same "unknown identity"
+    /// value: that ambiguity is exactly what made the previous `Option<u64>`
+    /// design unsafe -- comparing `None == None` treated an unresolvable
+    /// genuine replacement the same as an unresolvable redundant re-mark,
+    /// and neither default (always-same vs always-different) is safe on its
+    /// own. Each synthetic token is fresh and therefore always distinct,
+    /// which is what lets an unresolved mark be treated as "possibly new"
+    /// (declines the clear) without ever accidentally matching a prior
+    /// unresolved mark's synthetic value.
+    #[test]
+    fn synthetic_connection_instance_tokens_are_always_distinct() {
+        let a = next_synthetic_connection_instance_token();
+        let b = next_synthetic_connection_instance_token();
+        assert_ne!(
+            a, b,
+            "two separate unresolved-identity connects must never synthesize the same token"
+        );
+    }
+
+    /// The connect-generation guard's token is structurally mandatory
+    /// (`u64`, not `Option<u64>`) precisely because an unresolved-identity
+    /// mark is unsafe in either direction (see
+    /// `GossipRegistry::current_connection_instance_token`'s doc). This
+    /// confirms the production path actually resolves the REAL connection
+    /// instance id -- not merely some non-`None` placeholder -- whenever a
+    /// connection is genuinely published, so the degenerate synthetic
+    /// fallback is exercised only on the narrow paths that truly need it.
+    #[tokio::test]
+    async fn current_connection_instance_token_resolves_the_real_instance_id_when_published() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(7912),
+            test_config_with_seed("discovery-real-token"),
+        );
+        let peer_addr = test_addr(9922);
+        let peer_id = test_peer_id("discovery-real-token-peer");
+
+        let conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
+        let expected_instance_id = conn
+            .stream_handle
+            .as_ref()
+            .expect("test setup: the published connection must have a stream handle")
+            .instance_id();
+
+        let resolved = registry.current_connection_instance_token(peer_addr);
+        assert_eq!(
+            resolved, expected_instance_id,
+            "the production connected-mark path must resolve the REAL connection instance id \
+             (not a synthetic fallback) whenever a connection is actually published for the \
+             address being marked"
+        );
     }
 
     /// The discovery clear must be a NO-OP -- not a clear -- when the
