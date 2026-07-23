@@ -3808,6 +3808,10 @@ where
                         existing_usable,
                         keep_existing,
                         keep_new_inbound,
+                        crate::connection_pool::incoming_session_is_newer(
+                            &connection_arc,
+                            &existing_conn,
+                        ),
                     ) {
                         crate::connection_pool::ConnectionConflictDecision::AcceptIncoming => {
                             info!(
@@ -3907,28 +3911,41 @@ where
                             false
                         }
                         crate::connection_pool::ConnectionConflictDecision::ReplaceExisting => {
-                            info!(
-                                target: "icanact_remote_lifecycle",
-                                peer_id = %peer_id,
-                                addr = %existing_conn.addr,
-                                peer_state_addr = %peer_state_addr,
-                                existing_direction = ?existing_conn.direction,
-                                "inbound_tiebreak_replace_wrong_direction"
-                            );
-                            crate::lifecycle::record_transport_event(
-                                crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
-                                    peer: peer_id.clone(),
-                                    addr: existing_conn.addr,
-                                    direction: match existing_conn.direction {
-                                        crate::connection_pool::ConnectionDirection::Inbound => {
-                                            crate::lifecycle::TransportDirection::Inbound
-                                        }
-                                        crate::connection_pool::ConnectionDirection::Outbound => {
-                                            crate::lifecycle::TransportDirection::Outbound
-                                        }
+                            if existing_conn.direction
+                                == crate::connection_pool::ConnectionDirection::Inbound
+                            {
+                                info!(
+                                    target: "icanact_remote_lifecycle",
+                                    peer_id = %peer_id,
+                                    old_addr = %existing_conn.addr,
+                                    new_addr = %peer_state_addr,
+                                    old_session_epoch = ?existing_conn
+                                        .stream_handle
+                                        .as_ref()
+                                        .map(|handle| handle.instance_id()),
+                                    new_session_epoch = ?connection_arc
+                                        .stream_handle
+                                        .as_ref()
+                                        .map(|handle| handle.instance_id()),
+                                    "inbound_authenticated_session_supersedes_older_epoch"
+                                );
+                            } else {
+                                info!(
+                                    target: "icanact_remote_lifecycle",
+                                    peer_id = %peer_id,
+                                    addr = %existing_conn.addr,
+                                    peer_state_addr = %peer_state_addr,
+                                    existing_direction = ?existing_conn.direction,
+                                    "inbound_tiebreak_replace_wrong_direction"
+                                );
+                                crate::lifecycle::record_transport_event(
+                                    crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
+                                        peer: peer_id.clone(),
+                                        addr: existing_conn.addr,
+                                        direction: crate::lifecycle::TransportDirection::Outbound,
                                     },
-                                },
-                            );
+                                );
+                            }
                             // Instance-scoped for the same reason as the
                             // `AcceptIncoming` arm above; the follow-up
                             // publish is compare-and-publish + bounded
