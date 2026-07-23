@@ -236,10 +236,23 @@ pub struct PeerDiscovery {
     /// Failed peers with backoff state (legacy)
     failed_peers: HashMap<SocketAddr, FailureState>,
     /// Generation stamped on `addr` every time `on_peer_connected` records a
-    /// NEW `Connected` transition for it. See `connect_generation`'s doc for
-    /// why this exists independently of the gossip registry's own
-    /// session-epoch machinery.
+    /// NEW `Connected` transition, or a genuine replacement (a different
+    /// connection instance), for it. See `connect_generation`'s doc for why
+    /// this exists independently of the gossip registry's own session-epoch
+    /// machinery. Only meaningful while `peer_states[addr]` is `Connected`
+    /// -- `connect_generation` enforces that; entries left behind after a
+    /// transition out of `Connected` are inert.
     connect_generations: HashMap<SocketAddr, u64>,
+    /// The connection-instance token (see `LockFreeConnection::instance_id`)
+    /// that most recently confirmed `addr` as `Connected`, alongside the
+    /// generation above. `on_peer_connected` receives no connection
+    /// identity of its own to compare against -- just an address -- so
+    /// this is what lets it tell a genuine REPLACEMENT connection at the
+    /// SAME address (a different token, even with no intervening
+    /// non-`Connected` observation in between) from a redundant re-mark of
+    /// the exact same still-live connection (same token): only the former
+    /// bumps the generation.
+    connect_instance_tokens: HashMap<SocketAddr, Option<u64>>,
 }
 
 /// Process-wide, never-reset counter allocating discovery connect
@@ -272,6 +285,7 @@ impl PeerDiscovery {
             pending_peers: HashMap::new(),
             failed_peers: HashMap::new(),
             connect_generations: HashMap::new(),
+            connect_instance_tokens: HashMap::new(),
         }
     }
 
@@ -505,6 +519,11 @@ impl PeerDiscovery {
             // Also clean up legacy fields
             self.pending_peers.remove(&addr);
             self.failed_peers.remove(&addr);
+            // Tidiness: `connect_generation` no longer trusts these once
+            // `peer_states` isn't `Connected`, but a transition away from
+            // `Connected` should not leave stale entries behind either.
+            self.connect_generations.remove(&addr);
+            self.connect_instance_tokens.remove(&addr);
         } else {
             self.make_room_for_failed_peer(addr);
             let retry_delay_seconds =
@@ -516,6 +535,9 @@ impl PeerDiscovery {
                 retry_delay_seconds,
             };
             self.peer_states.insert(addr, new_state);
+            // Tidiness -- see the comment in the `should_remove` branch above.
+            self.connect_generations.remove(&addr);
+            self.connect_instance_tokens.remove(&addr);
 
             // Also update legacy fields for backward compatibility
             self.pending_peers.remove(&addr);
@@ -537,16 +559,21 @@ impl PeerDiscovery {
         should_remove
     }
 
-    /// Record a successful connection to a peer
+    /// Record a successful connection to a peer.
     ///
-    /// Atomically transitions peer to Connected state.
-    /// This is a single operation that replaces any previous state.
-    pub fn on_peer_connected(&mut self, addr: SocketAddr) {
-        // Captured BEFORE the state transition below: whether this call is
-        // a genuine Pending/Failed/Disconnected/absent -> Connected
-        // transition, or a redundant re-confirmation of an address that was
-        // ALREADY `Connected`.
+    /// Atomically transitions peer to Connected state. This is a single
+    /// operation that replaces any previous state.
+    ///
+    /// `instance_token` identifies the specific connection instance that is
+    /// confirming itself as current for `addr` (see
+    /// `LockFreeConnection::instance_id`) -- `None` when no such identity is
+    /// available to the caller (e.g. a local/test caller, or a path that
+    /// hasn't resolved one). Used only to distinguish a genuine replacement
+    /// from a redundant re-mark; see `connect_instance_tokens`'s field doc.
+    pub fn on_peer_connected(&mut self, addr: SocketAddr, instance_token: Option<u64>) {
+        // Captured BEFORE the state transition below.
         let was_already_connected = matches!(self.peer_states.get(&addr), Some(PeerState::Connected));
+        let previous_token = self.connect_instance_tokens.get(&addr).copied().flatten();
 
         // Atomically transition to Connected state (single operation)
         self.peer_states.insert(addr, PeerState::Connected);
@@ -556,23 +583,29 @@ impl PeerDiscovery {
         self.failed_peers.remove(&addr);
         self.connected_peers.insert(addr);
 
-        // Advance the connect generation ONLY on a genuine transition INTO
-        // `Connected`, never on a redundant `Connected` -> `Connected`
-        // re-mark. This call carries no connection-instance identity --
-        // just an address -- so a duplicate notification for the SAME
-        // still-live socket must not look like a brand-new connection. If
-        // it did, a teardown reported for that exact socket in the gap
-        // between a failure's generation capture and its discovery clear
-        // would bump the generation out from under the capture even though
-        // nothing new actually connected, making the clear wrongly decline
-        // and permanently strand the slot as `Connected` with no live
-        // connection behind it at all -- the exact exhaustion this
-        // generation mechanism exists to prevent, reintroduced via a new
-        // path. See `connect_generation`.
-        if !was_already_connected {
+        // Advance the connect generation on a genuine transition INTO
+        // `Connected`, OR when the CURRENTLY Connected address is being
+        // confirmed by a DIFFERENT connection instance than the one that
+        // last confirmed it -- a genuine replacement, even with no
+        // intervening non-`Connected` observation at all (the ordinary
+        // teardown/failure paths only notify discovery once THEIR OWN
+        // clear runs, which can be well after a replacement has already
+        // connected). Never bump for a redundant re-mark of the exact same
+        // instance: that would make a stale failure report, captured
+        // before the redundant re-mark, wrongly decline and permanently
+        // strand the slot as `Connected` with no live connection behind it
+        // at all -- the exact exhaustion this mechanism exists to prevent.
+        //
+        // When neither confirmation carries a resolvable instance token
+        // (both `None`), there is no identity to compare and this falls
+        // back to the plain state-transition check, same as an untracked
+        // caller always got.
+        let is_replacement = was_already_connected && instance_token != previous_token;
+        if !was_already_connected || is_replacement {
             self.connect_generations
                 .insert(addr, next_discovery_connect_generation());
         }
+        self.connect_instance_tokens.insert(addr, instance_token);
     }
 
     /// Record a peer disconnection
@@ -585,6 +618,7 @@ impl PeerDiscovery {
         // Also update legacy field for backward compatibility
         self.connected_peers.remove(&addr);
         self.connect_generations.remove(&addr);
+        self.connect_instance_tokens.remove(&addr);
     }
 
     /// The generation stamped on `addr`'s most recent `Connected` transition
@@ -602,7 +636,18 @@ impl PeerDiscovery {
     /// has no entry for `addr` whatsoever. Comparing THIS generation instead
     /// catches every such transition, regardless of session-epoch or
     /// `peers`-entry state.
+    ///
+    /// Returns `Some` if and only if `addr` is CURRENTLY `Connected`: this
+    /// re-derives currency from `peer_states` directly on every call
+    /// (rather than trusting `connect_generations` alone to have been
+    /// tidied up on every possible transition out of `Connected`), so it
+    /// cannot be fooled by a stale leftover entry -- a peer that has since
+    /// moved to `Pending`/`Failed`/removed always reads back `None` here
+    /// regardless of what `connect_generations` still holds.
     pub fn connect_generation(&self, addr: &SocketAddr) -> Option<u64> {
+        if !matches!(self.peer_states.get(addr), Some(PeerState::Connected)) {
+            return None;
+        }
         self.connect_generations.get(addr).copied()
     }
 
@@ -812,7 +857,7 @@ mod tests {
 
         // Mark peer as connected
         let connected_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 8081);
-        discovery.on_peer_connected(connected_peer);
+        discovery.on_peer_connected(connected_peer, None);
 
         let peers = vec![
             create_peer_gossip("10.0.0.2:8081"), // already connected
@@ -1100,8 +1145,8 @@ mod tests {
         let mut discovery = PeerDiscovery::new(local, config);
 
         // Connect 2 peers (leaving 1 slot)
-        discovery.on_peer_connected(test_addr(9001));
-        discovery.on_peer_connected(test_addr(9002));
+        discovery.on_peer_connected(test_addr(9001), None);
+        discovery.on_peer_connected(test_addr(9002), None);
 
         assert_eq!(discovery.peer_count(), 2);
         assert_eq!(discovery.remaining_slots(), 1);
@@ -1138,7 +1183,7 @@ mod tests {
         assert!(!discovery.at_soft_cap());
 
         // Connect peer
-        discovery.on_peer_connected(peer);
+        discovery.on_peer_connected(peer, None);
         assert_eq!(discovery.peer_count(), 1);
         assert!(discovery.connected_peers.contains(&peer));
 
@@ -1215,7 +1260,7 @@ mod tests {
         assert!(discovery.failed_peers.contains_key(&peer));
 
         // Connect the peer
-        discovery.on_peer_connected(peer);
+        discovery.on_peer_connected(peer, None);
 
         // Failure state should be cleared
         assert!(!discovery.failed_peers.contains_key(&peer));
@@ -1295,11 +1340,11 @@ mod tests {
         discovery.on_peer_connected(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20)),
             8001,
-        ));
+        ), None);
         discovery.on_peer_connected(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 21)),
             8002,
-        ));
+        ), None);
 
         assert_eq!(discovery.connected_peer_count(), 2);
 
@@ -1407,7 +1452,7 @@ mod tests {
         assert!(!state.is_failed(), "should not be Failed");
 
         // Transition: Pending -> Connected (single atomic operation)
-        discovery.on_peer_connected(addr);
+        discovery.on_peer_connected(addr, None);
 
         // Verify atomically in Connected state only
         let state = discovery.get_peer_state(&addr).expect("should have state");
@@ -1454,7 +1499,7 @@ mod tests {
         assert_eq!(state.failure_info().unwrap().1, 2, "should have 2 attempts");
 
         // After successful connection: Failed -> Connected
-        discovery.on_peer_connected(addr);
+        discovery.on_peer_connected(addr, None);
         let state = discovery.get_peer_state(&addr).unwrap();
         assert!(state.is_connected(), "should be Connected after success");
         assert!(!state.is_failed(), "failure state should be cleared");
@@ -1469,8 +1514,8 @@ mod tests {
         // Add some connected peers
         let conn1: SocketAddr = "10.0.0.200:8000".parse().unwrap();
         let conn2: SocketAddr = "10.0.0.201:8001".parse().unwrap();
-        discovery.on_peer_connected(conn1);
-        discovery.on_peer_connected(conn2);
+        discovery.on_peer_connected(conn1, None);
+        discovery.on_peer_connected(conn2, None);
 
         // Verify counts match
         assert_eq!(

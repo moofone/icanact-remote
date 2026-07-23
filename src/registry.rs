@@ -8306,12 +8306,28 @@ impl<T: 'static> GossipRegistry<T> {
         self.trigger_immediate_peer_gossip();
     }
 
+    /// The connection-instance token (see #156's `LockFreeStreamHandle::instance_id`)
+    /// of whatever connection is CURRENTLY published in `connection_pool` for
+    /// `addr`, if any. This is the identity `PeerDiscovery::on_peer_connected`
+    /// uses to tell a genuine replacement connection at the same address
+    /// (a different token) from a redundant re-mark of the same one (an
+    /// identical token) -- reusing the exact per-connection instance
+    /// identity #156 already established for the analogous
+    /// `arm_sequence_reset_for_new_session`/`disconnect_connection_instance`
+    /// mechanisms, rather than inventing a second one.
+    fn current_connection_instance_token(&self, addr: SocketAddr) -> Option<u64> {
+        self.connection_pool
+            .get_lock_free_connection(addr)
+            .and_then(|conn| conn.stream_handle.as_ref().map(|handle| handle.instance_id()))
+    }
+
     fn record_peer_discovery_connected(&self, gossip_state: &mut GossipState, addr: SocketAddr) {
         let should_track_mesh_time =
             self.config.mesh_formation_target > 0 && gossip_state.mesh_formation_time_ms.is_none();
+        let instance_token = self.current_connection_instance_token(addr);
 
         if let Some(ref mut discovery) = gossip_state.peer_discovery {
-            discovery.on_peer_connected(addr);
+            discovery.on_peer_connected(addr, instance_token);
 
             if should_track_mesh_time
                 && discovery.connected_peer_count() >= self.config.mesh_formation_target
@@ -9478,6 +9494,49 @@ mod tests {
             addr,
             crate::connection_pool::ConnectionDirection::Inbound,
         ))
+    }
+
+    /// Publishes a genuinely-connected `LockFreeConnection` -- WITH a real
+    /// stream handle, so it carries its own distinct instance id (see
+    /// `LockFreeStreamHandle::instance_id`) -- into `registry`'s connection
+    /// pool for `peer_id` at `addr`, indexed by both peer id and address
+    /// (`ConnectionPool::add_connection_by_peer_id`), replacing whatever was
+    /// previously published there. Unlike `qa_r11_dummy_connection_instance`
+    /// (no stream handle, so its `instance_id()` is always `None`), this is
+    /// what a test needs to exercise `PeerDiscovery`'s per-instance
+    /// replacement-vs-redundant distinction: two calls at the SAME `addr`
+    /// yield two connections with two DIFFERENT instance ids, exactly like
+    /// two real, distinct TCP connections would.
+    async fn publish_connected_instance(
+        registry: &GossipRegistry<()>,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+    ) -> std::sync::Arc<crate::connection_pool::LockFreeConnection> {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer, _reader) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(std::sync::Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = std::sync::Arc::new(conn);
+        assert!(
+            registry
+                .connection_pool
+                .add_connection_by_peer_id(peer_id.clone(), addr, conn.clone()),
+            "test setup: publishing the connection instance must succeed"
+        );
+        conn
     }
 
     /// R-11 helper: a FullSync from `owner` advertising exactly `actors`,
@@ -11797,8 +11856,12 @@ mod tests {
     /// genuinely current -- with no `gossip_state` lock held across that gap.
     /// A replacement connection for the SAME address can call
     /// `mark_peer_connected` (re-marking discovery `Connected`) in that exact
-    /// gap, with or without arming its own TLS session. The clear must
-    /// decline in that case, or it would wipe out the replacement's
+    /// gap, with NO intervening disconnect notification at all -- this
+    /// drives the REAL production interleaving: discovery still shows the
+    /// address `Connected` (from the old connection) the entire time, and
+    /// only the connection-instance token distinguishes the replacement
+    /// from a redundant re-mark of the connection that's about to fail.
+    /// The clear must decline, or it would wipe out the replacement's
     /// legitimate `Connected` state and undercount a still-live peer.
     ///
     /// This drives the two real, production-used steps
@@ -11817,18 +11880,13 @@ mod tests {
         let owner = test_peer_id("discovery-disconnect-race-peer");
         let owner_node = owner.to_node_id();
 
-        // The original (about-to-fail) connection: armed session, discovery
-        // Connected.
+        // The original (about-to-fail) connection instance: armed session,
+        // discovery Connected.
         registry.add_peer_with_node_id(peer_addr, Some(owner_node)).await;
+        let old_conn = publish_connected_instance(&registry, &owner, peer_addr).await;
         let old_session = test_addr(55201);
         registry
-            .arm_sequence_reset_for_new_session(
-                peer_addr,
-                owner_node,
-                old_session,
-                &owner,
-                &qa_r11_dummy_connection_instance(old_session),
-            )
+            .arm_sequence_reset_for_new_session(peer_addr, owner_node, old_session, &owner, &old_conn)
             .await;
         registry.mark_peer_connected(peer_addr).await;
 
@@ -11838,25 +11896,15 @@ mod tests {
             .capture_pre_failure_discovery_generation(peer_addr)
             .await;
 
-        // The old connection's own death is independently observed (e.g. a
-        // liveness/heartbeat check, distinct from -- and faster than -- the
-        // slow teardown path whose capture is above) before the replacement
-        // connects: a genuine Connected -> not-Connected -> Connected
-        // transition, not a redundant re-mark of the same still-live socket.
-        registry.mark_peer_disconnected(peer_addr).await;
-
-        // A replacement connection arrives and arms a fresh session for the
-        // SAME identity -- in the gap between that capture and the
-        // eventual discovery clear.
+        // A REPLACEMENT connection instance connects at the SAME address --
+        // in the gap between that capture and the eventual discovery clear
+        // -- with NO intervening disconnect notification of any kind.
+        // Discovery shows the address `Connected` continuously; only the
+        // instance token differs.
+        let new_conn = publish_connected_instance(&registry, &owner, peer_addr).await;
         let new_session = test_addr(55202);
         registry
-            .arm_sequence_reset_for_new_session(
-                peer_addr,
-                owner_node,
-                new_session,
-                &owner,
-                &qa_r11_dummy_connection_instance(new_session),
-            )
+            .arm_sequence_reset_for_new_session(peer_addr, owner_node, new_session, &owner, &new_conn)
             .await;
         registry.mark_peer_connected(peer_addr).await;
 
@@ -11867,7 +11915,7 @@ mod tests {
         }
 
         // The stale failure report's discovery clear must decline: a newer
-        // session is now current for this identity.
+        // connection instance is now current for this address.
         registry
             .clear_discovery_state_if_generation_unchanged(peer_addr, pre_failure_epoch)
             .await;
@@ -11877,8 +11925,9 @@ mod tests {
         assert_eq!(
             discovery.connected_count_unified(),
             1,
-            "a replacement connection that already armed a fresh session must keep \
-             owning discovery's Connected state; a stale failure report must not clear it"
+            "a replacement connection instance must keep owning discovery's Connected state \
+             even with no intervening disconnect notification; a stale failure report must \
+             not clear it"
         );
         assert_eq!(
             discovery.get_peer_state(&peer_addr),
@@ -11905,8 +11954,10 @@ mod tests {
         config.max_peers = 1;
         let registry = GossipRegistry::<()>::new(test_addr(7907), config);
         let peer_addr = test_addr(9917);
+        let peer_id = test_peer_id("discovery-disconnect-race-no-epoch-change-peer");
 
         registry.add_peer(peer_addr).await;
+        let _old_conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
         registry.mark_peer_connected(peer_addr).await;
 
         let epoch_before = {
@@ -11920,15 +11971,12 @@ mod tests {
             .capture_pre_failure_discovery_generation(peer_addr)
             .await;
 
-        // The old connection's own death is independently observed before
-        // the replacement connects: a genuine Connected -> not-Connected ->
-        // Connected transition, not a redundant re-mark of the same
-        // still-live socket.
-        registry.mark_peer_disconnected(peer_addr).await;
-
-        // A replacement connect succeeds for the SAME address -- no TLS
-        // session is ever armed for it (no `arm_sequence_reset_for_new_session`
-        // call at all), so the session epoch does not change.
+        // A REPLACEMENT connection instance connects for the SAME address --
+        // no TLS session is ever armed for it (no
+        // `arm_sequence_reset_for_new_session` call at all), so the session
+        // epoch does not change -- and with NO intervening disconnect
+        // notification either. Only the connection-instance token differs.
+        let _new_conn = publish_connected_instance(&registry, &peer_id, peer_addr).await;
         registry.mark_peer_connected(peer_addr).await;
 
         let epoch_after = {
@@ -12061,6 +12109,69 @@ mod tests {
         );
     }
 
+    /// The end-to-end version of the previous test: a peer that WAS
+    /// genuinely `Connected` (generation captured while `Connected`, exactly
+    /// like a real failure handler would) later fails and accumulates
+    /// backoff via `on_peer_failure`, all before the stale, Connected-era
+    /// generation is ever used in a clear attempt. `connect_generation` must
+    /// read back `None` once the peer is no longer `Connected` (the
+    /// accessor's own `peer_states` check, not merely a tidied-up map), and
+    /// the clear must leave the peer's `Failed` backoff state completely
+    /// untouched.
+    #[tokio::test]
+    async fn discovery_clear_does_not_wipe_backoff_after_a_connected_peer_later_fails() {
+        let mut config = test_config_with_seed("discovery-connected-then-failed");
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(7910), config);
+        let peer_addr = test_addr(9920);
+
+        registry.add_peer(peer_addr).await;
+        registry.mark_peer_connected(peer_addr).await;
+
+        // Exactly what a real failure handler captures at entry, while the
+        // peer is still genuinely Connected.
+        let pre_failure_generation = registry
+            .capture_pre_failure_discovery_generation(peer_addr)
+            .await;
+        assert!(pre_failure_generation.is_some());
+
+        // The connection fails and discovery independently transitions the
+        // peer to Failed, accumulating backoff -- before the stale
+        // generation captured above is ever used.
+        registry.mark_peer_failed(peer_addr).await;
+
+        let failed_state_before = {
+            let state = registry.gossip_state.lock().await;
+            let discovery = state.peer_discovery.as_ref().unwrap();
+            assert_eq!(
+                discovery.connect_generation(&peer_addr),
+                None,
+                "connect_generation must read back None once the peer is no longer Connected, \
+                 regardless of what the underlying map still holds"
+            );
+            discovery.get_peer_state(&peer_addr).cloned()
+        };
+        assert!(
+            matches!(failed_state_before, Some(crate::peer_discovery::PeerState::Failed { .. })),
+            "sanity: the peer must be in the Failed state before the clear"
+        );
+
+        // The stale, Connected-era generation must not resurrect a clear
+        // here: the address is no longer Connected at all.
+        registry
+            .clear_discovery_state_if_generation_unchanged(peer_addr, pre_failure_generation)
+            .await;
+
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.get_peer_state(&peer_addr),
+            failed_state_before.as_ref(),
+            "a stale Connected-era generation must not disturb the peer's Failed backoff \
+             state once it has genuinely transitioned away from Connected"
+        );
+    }
+
     /// Edge case: `mark_peer_connected` notifies discovery unconditionally,
     /// even when `gossip_state.peers` has no entry for the address at all
     /// (and an entry can also disappear concurrently, e.g. peer-table
@@ -12169,15 +12280,10 @@ mod tests {
             .connection_pool
             .set_configured_peer_addr(&owner, peer_addr);
         registry.add_peer_with_node_id(peer_addr, Some(owner_node)).await;
+        let old_conn = publish_connected_instance(&registry, &owner, peer_addr).await;
         let old_session = test_addr(55301);
         registry
-            .arm_sequence_reset_for_new_session(
-                peer_addr,
-                owner_node,
-                old_session,
-                &owner,
-                &qa_r11_dummy_connection_instance(old_session),
-            )
+            .arm_sequence_reset_for_new_session(peer_addr, owner_node, old_session, &owner, &old_conn)
             .await;
         registry.mark_peer_connected(peer_addr).await;
 
@@ -12187,24 +12293,15 @@ mod tests {
             .capture_pre_failure_discovery_generation(peer_addr)
             .await;
 
-        // The old connection's own death is independently observed before
-        // the replacement connects: a genuine Connected -> not-Connected ->
-        // Connected transition, not a redundant re-mark of the same
-        // still-live socket.
-        registry.mark_peer_disconnected(peer_addr).await;
-
-        // A replacement connection arrives and arms a fresh session for the
-        // SAME identity, in the gap between that capture and the eventual
-        // discovery clear.
+        // A REPLACEMENT connection instance connects for the SAME address,
+        // in the gap between that capture and the eventual discovery clear
+        // -- with NO intervening disconnect notification. Discovery shows
+        // the address `Connected` continuously; only the instance token
+        // differs.
+        let new_conn = publish_connected_instance(&registry, &owner, peer_addr).await;
         let new_session = test_addr(55302);
         registry
-            .arm_sequence_reset_for_new_session(
-                peer_addr,
-                owner_node,
-                new_session,
-                &owner,
-                &qa_r11_dummy_connection_instance(new_session),
-            )
+            .arm_sequence_reset_for_new_session(peer_addr, owner_node, new_session, &owner, &new_conn)
             .await;
         registry.mark_peer_connected(peer_addr).await;
 
