@@ -2057,6 +2057,15 @@ impl<T: 'static> GossipRegistry<T> {
         Some(extensions)
     }
 
+    /// Whether an inbound clock probe is currently pending an echo for
+    /// `addr`. Read-only visibility into `record_inbound_gossip_extensions`'s
+    /// side effect, used to confirm a rejected (e.g. address-hijack) frame
+    /// never reached the point of recording clock/extension bookkeeping.
+    #[cfg(test)]
+    pub(crate) fn has_pending_clock_echo(&self, addr: SocketAddr) -> bool {
+        self.pending_clock_echoes.contains_sync(&addr)
+    }
+
     pub fn record_inbound_gossip_extensions(
         &self,
         peer_addr: SocketAddr,
@@ -2559,20 +2568,47 @@ impl<T: 'static> GossipRegistry<T> {
     /// guard's collision pre-check: an address's bookkeeping
     /// (`peers[addr]`, `addr_to_peer_id[addr]`, `peer_to_actors[addr]`)
     /// belongs to whichever authenticated node_id most recently legitimately
-    /// owned it. Returns `true` only when `addr` is already tracked AND its
-    /// known owner is a DIFFERENT node_id than `claimed_by` -- a brand-new
-    /// address (no tracked owner) or the same owner re-asserting its own
+    /// owned it. Returns `true` only when `addr` is already owned by a
+    /// DIFFERENT node_id than `claimed_by` -- a brand-new address (no
+    /// tracked owner anywhere) or the same owner re-asserting its own
     /// address are both legitimate and return `false`.
+    ///
+    /// Authoritative across every addr-keyed ownership surface, not just
+    /// `peers[addr]`:
+    /// - This node's own bind/advertised address is always self-owned, even
+    ///   though it is normally absent from `peers` -- a remote claimant
+    ///   advertising it is always a conflict.
+    /// - `addr_to_peer_id[addr]` is also consulted so a configured peer
+    ///   address, or an ephemeral alias intentionally retained after a
+    ///   prior migration, is treated as owned even when `peers[addr]`
+    ///   itself has no entry or no `node_id` yet.
     pub(crate) fn addr_owned_by_other_node(
+        &self,
         gossip_state: &GossipState,
         addr: SocketAddr,
         claimed_by: crate::GossipNodeId,
     ) -> bool {
-        gossip_state
+        if addr == self.bind_addr || addr == self.advertised_addr() {
+            return claimed_by != self.peer_id.to_node_id();
+        }
+
+        let peers_owner = gossip_state
             .peers
             .get(&addr)
-            .and_then(|peer_info| peer_info.node_id)
-            .is_some_and(|owner| owner != claimed_by)
+            .and_then(|peer_info| peer_info.node_id);
+        if peers_owner.is_some_and(|owner| owner != claimed_by) {
+            return true;
+        }
+
+        let pool_owner = self
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&addr, |_, peer_id| peer_id.clone());
+        if pool_owner.is_some_and(|owner| owner.to_node_id() != claimed_by) {
+            return true;
+        }
+
+        false
     }
 
     pub async fn add_peer_with_node_id(
@@ -2612,7 +2648,7 @@ impl<T: 'static> GossipRegistry<T> {
                 let mut gossip_state = self.gossip_state.lock().await;
 
                 owner_conflict = node_id.is_some_and(|claimed| {
-                    Self::addr_owned_by_other_node(&gossip_state, peer_addr, claimed)
+                    self.addr_owned_by_other_node(&gossip_state, peer_addr, claimed)
                 });
 
                 // Check if we already have this peer
@@ -5372,7 +5408,7 @@ impl<T: 'static> GossipRegistry<T> {
             // `peer_to_actors[sender_addr]` or advance/roll back
             // `last_sequence` below. Mirrors the DNS re-resolution
             // migration guard's collision pre-check.
-            if Self::addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
+            if self.addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
             {
                 warn!(
                     addr = %sender_addr,
@@ -5553,6 +5589,29 @@ impl<T: 'static> GossipRegistry<T> {
         );
         {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            // Atomic ownership recheck, immediately before any write in
+            // this block: STEP 1's check ran under a lock that was released
+            // before `updates_to_apply` was collected above (no lock is
+            // held across that collection), so another authenticated peer
+            // could have established ownership of `sender_addr` in that
+            // window -- e.g. `sender_addr` was unowned at STEP 1 (so
+            // `captured_epoch` is `None` and the generation recheck below
+            // is skipped entirely) and a legitimate peer has since claimed
+            // it. Re-verifying here, under the same lock as the writes
+            // themselves, closes that window rather than trusting a
+            // check-then-mutate gap.
+            if self.addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
+            {
+                warn!(
+                    addr = %sender_addr,
+                    claimed_sender = %sender_peer_id,
+                    "dropping full-sync actor apply: sender_bind_addr claims an \
+                     address that became owned by a different authenticated \
+                     peer during merge"
+                );
+                return false;
+            }
 
             // Atomic generation recheck, immediately before any write in
             // this block: if a newer session has been armed (or the

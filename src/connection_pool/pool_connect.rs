@@ -4380,31 +4380,28 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
-                registry.record_inbound_gossip_extensions(
-                    sender_socket_addr,
-                    extensions,
-                    crate::current_timestamp_nanos(),
-                );
 
-                // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
-                debug!(
-                    "Received FullSync from node '{}' at bind_addr {} (tcp_source={})",
-                    sender_peer_id, sender_socket_addr, _peer_addr
-                );
-
-                // OPTIMIZATION: Do all peer management in one lock acquisition
+                // OPTIMIZATION: Do all peer management (and the ownership
+                // guard) in one lock acquisition. Checking and mutating
+                // under the SAME held lock closes the window a separate
+                // check-then-lock pair would leave open for another
+                // authenticated peer to establish ownership in between.
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
 
-                    // Ownership guard: `sender_socket_addr` comes from the
-                    // peer-controlled `sender_bind_addr` wire field. If it
-                    // is already tracked as belonging to a DIFFERENT
-                    // authenticated node_id than `sender_peer_id`, this is
-                    // an address-hijack attempt, not a legitimate migration
-                    // -- abort before any bookkeeping is touched. Mirrors
-                    // the DNS re-resolution migration guard's collision
-                    // pre-check.
-                    if crate::registry::GossipRegistry::<()>::addr_owned_by_other_node(
+                    // Ownership guard FIRST -- before ANY address-keyed
+                    // mutation, including extension/clock bookkeeping
+                    // below. `sender_socket_addr` comes from the
+                    // peer-controlled `sender_bind_addr` wire field; if it
+                    // is already owned (via `peers[addr]`,
+                    // `addr_to_peer_id[addr]`, or is this node's own local
+                    // address) by a DIFFERENT authenticated node_id than
+                    // `sender_peer_id`, this is an address-hijack attempt,
+                    // not a legitimate migration -- abort before a
+                    // rejected frame can poison any bookkeeping keyed on
+                    // the claimed address. Mirrors the DNS re-resolution
+                    // migration guard's collision pre-check.
+                    if registry.addr_owned_by_other_node(
                         &gossip_state,
                         sender_socket_addr,
                         sender_peer_id.to_node_id(),
@@ -4417,6 +4414,18 @@ pub(crate) fn handle_incoming_message(
                         );
                         return Ok(());
                     }
+
+                    registry.record_inbound_gossip_extensions(
+                        sender_socket_addr,
+                        extensions,
+                        crate::current_timestamp_nanos(),
+                    );
+
+                    // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
+                    debug!(
+                        "Received FullSync from node '{}' at bind_addr {} (tcp_source={})",
+                        sender_peer_id, sender_socket_addr, _peer_addr
+                    );
 
                     // FIX: If the resolved bind address differs from the TCP source address,
                     // migrate the PeerInfo from the ephemeral port entry to the bind address.
@@ -4481,6 +4490,44 @@ pub(crate) fn handle_incoming_message(
                     // its return value (the same `from_current_session`
                     // verdict the actor/sequence state is already gated on).
                     gossip_state.full_sync_exchanges += 1;
+
+                    // IMPORTANT: Register the incoming connection with the
+                    // peer_id mapping so bidirectional communication works.
+                    // Kept under the SAME held lock as the ownership check
+                    // above (rather than a separate later lock/lock-free
+                    // acquisition) -- a separate acquisition would reopen a
+                    // window for another authenticated peer to establish
+                    // ownership of `sender_socket_addr` between the check
+                    // and this repoint.
+                    {
+                        let pool = &registry.connection_pool;
+
+                        // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
+                        // The reindex_connection_addr function preserves both addresses,
+                        // and disconnect_connection_by_peer_id needs both entries to clean up properly.
+
+                        let _ = pool
+                            .peer_id_to_addr
+                            .upsert_sync(sender_peer_id.clone(), sender_socket_addr);
+                        let _ = pool
+                            .addr_to_peer_id
+                            .upsert_sync(sender_socket_addr, sender_peer_id.clone());
+
+                        // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
+                        // Without this, get_connection(bind_addr) fails because the connection is
+                        // still indexed under the ephemeral port the peer connected FROM.
+                        // This allows messages to be sent back to the peer using their advertised address.
+                        // Note: reindex_connection_addr already has early-return if already indexed,
+                        // and logs internally when it actually does work.
+                        if sender_socket_addr != _peer_addr {
+                            pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
+                        }
+
+                        debug!(
+                            "BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}",
+                            sender_peer_id, sender_socket_addr
+                        );
+                    }
                 }
 
                 debug!(
@@ -4490,38 +4537,6 @@ pub(crate) fn handle_incoming_message(
                     known_actors = known_actors.len(),
                     "📨 INCOMING: Received full sync message on bidirectional connection"
                 );
-
-                // IMPORTANT: Register the incoming connection with the peer_id mapping
-                // This allows bidirectional communication to work properly
-                {
-                    let pool = &registry.connection_pool;
-
-                    // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
-                    // The reindex_connection_addr function preserves both addresses,
-                    // and disconnect_connection_by_peer_id needs both entries to clean up properly.
-
-                    let _ = pool
-                        .peer_id_to_addr
-                        .upsert_sync(sender_peer_id.clone(), sender_socket_addr);
-                    let _ = pool
-                        .addr_to_peer_id
-                        .upsert_sync(sender_socket_addr, sender_peer_id.clone());
-
-                    // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
-                    // Without this, get_connection(bind_addr) fails because the connection is
-                    // still indexed under the ephemeral port the peer connected FROM.
-                    // This allows messages to be sent back to the peer using their advertised address.
-                    // Note: reindex_connection_addr already has early-return if already indexed,
-                    // and logs internally when it actually does work.
-                    if sender_socket_addr != _peer_addr {
-                        pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
-                    }
-
-                    debug!(
-                        "BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}",
-                        sender_peer_id, sender_socket_addr
-                    );
-                }
 
                 // Only remaining async operation. Peer bookkeeping keys on
                 // the bind-derived address; address REPAIR anchors on the
@@ -4830,6 +4845,35 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
+
+                // Ownership guard FIRST -- before ANY address-keyed
+                // mutation, including extension/clock bookkeeping below.
+                // `sender_socket_addr` comes from the peer-controlled
+                // `sender_bind_addr` wire field; if it is already owned
+                // (via `peers[addr]`, `addr_to_peer_id[addr]`, or is this
+                // node's own local address) by a DIFFERENT authenticated
+                // node_id than `sender_peer_id`, this is an address-hijack
+                // attempt, not a legitimate migration -- abort before a
+                // rejected frame can poison any bookkeeping keyed on the
+                // claimed address (including the merge below). Mirrors the
+                // DNS re-resolution migration guard's collision pre-check.
+                {
+                    let gossip_state = registry.gossip_state.lock().await;
+                    if registry.addr_owned_by_other_node(
+                        &gossip_state,
+                        sender_socket_addr,
+                        sender_peer_id.to_node_id(),
+                    ) {
+                        warn!(
+                            tcp_source = %_peer_addr,
+                            claimed_bind_addr = %sender_socket_addr,
+                            sender = %sender_peer_id,
+                            "Rejecting FullSyncResponse: sender_bind_addr claims an address already owned by a different authenticated peer"
+                        );
+                        return Ok(());
+                    }
+                }
+
                 registry.record_inbound_gossip_extensions(
                     sender_socket_addr,
                     extensions,
@@ -4845,31 +4889,6 @@ pub(crate) fn handle_incoming_message(
                     "RECEIVED: FullSyncResponse from peer (using bind_addr)"
                 );
 
-                // Ownership guard: `sender_socket_addr` comes from the
-                // peer-controlled `sender_bind_addr` wire field. If it is
-                // already tracked as belonging to a DIFFERENT authenticated
-                // node_id than `sender_peer_id`, this is an address-hijack
-                // attempt, not a legitimate migration -- abort before any
-                // bookkeeping (including the merge below) is touched.
-                // Mirrors the DNS re-resolution migration guard's collision
-                // pre-check.
-                {
-                    let gossip_state = registry.gossip_state.lock().await;
-                    if crate::registry::GossipRegistry::<()>::addr_owned_by_other_node(
-                        &gossip_state,
-                        sender_socket_addr,
-                        sender_peer_id.to_node_id(),
-                    ) {
-                        warn!(
-                            tcp_source = %_peer_addr,
-                            claimed_bind_addr = %sender_socket_addr,
-                            sender = %sender_peer_id,
-                            "Rejecting FullSyncResponse: sender_bind_addr claims an address already owned by a different authenticated peer"
-                        );
-                        return Ok(());
-                    }
-                }
-
                 let from_current_session = registry
                     .merge_full_sync_from(
                         local_actors.into_iter().collect(),
@@ -4882,6 +4901,29 @@ pub(crate) fn handle_incoming_message(
                         wall_clock_time,
                     )
                     .await;
+
+                // `merge_full_sync_from` above was awaited, so ownership of
+                // `sender_socket_addr` may have changed in that window
+                // (e.g. it was unowned at the pre-check above and a
+                // legitimate peer has since claimed it). Recheck under the
+                // SAME lock as the routing repoint and peer-info migration
+                // below, atomically, rather than trusting the earlier
+                // check-then-await gap -- mirrors `merge_full_sync_from`'s
+                // own STEP1/STEP2 recheck pattern.
+                let mut gossip_state = registry.gossip_state.lock().await;
+                if registry.addr_owned_by_other_node(
+                    &gossip_state,
+                    sender_socket_addr,
+                    sender_peer_id.to_node_id(),
+                ) {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_bind_addr = %sender_socket_addr,
+                        sender = %sender_peer_id,
+                        "Rejecting FullSyncResponse post-merge routing update: sender_bind_addr claims an address already owned by a different authenticated peer"
+                    );
+                    return Ok(());
+                }
 
                 // FIX: Update peer_id mappings (mirror the FullSync handler logic)
                 // This prevents stale ephemeral addresses from being reintroduced via resolve_peer_state_addr
@@ -4912,9 +4954,6 @@ pub(crate) fn handle_incoming_message(
                         sender_peer_id, sender_socket_addr
                     );
                 }
-
-                // Reset failure state when receiving response
-                let mut gossip_state = registry.gossip_state.lock().await;
 
                 // FIX: If the resolved bind address differs from the TCP source address,
                 // migrate the PeerInfo from the ephemeral port entry to the bind address.

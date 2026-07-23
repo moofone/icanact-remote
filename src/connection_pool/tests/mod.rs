@@ -10079,3 +10079,292 @@ async fn authenticated_peer_cannot_hijack_victim_bind_addr_via_full_sync() {
         );
     }
 }
+
+/// The ownership guard must be authoritative across every addr-keyed
+/// ownership surface, not just `peers[addr]`'s tracked `node_id`. A
+/// configured/discovered peer can be owned SOLELY through
+/// `addr_to_peer_id` (e.g. `configure_peer`, or a peer whose ephemeral
+/// alias was intentionally retained after an earlier migration) with no
+/// corresponding `peers[addr]` entry at all -- checking `peers[addr]` alone
+/// would see "no tracked owner" and wrongly treat the address as
+/// claimable. This also proves a rejected hijack frame never records
+/// clock/extension bookkeeping keyed on the claimed address (a rejected
+/// frame must not mutate ANY address-keyed state, extensions included).
+#[tokio::test]
+async fn authenticated_peer_cannot_hijack_addr_owned_only_via_addr_to_peer_id_alias() {
+    let bind_addr: SocketAddr = "10.91.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("alias-guard-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let victim_kp = crate::KeyPair::new_for_testing("alias-guard-victim");
+    let victim = victim_kp.peer_id();
+    let victim_addr: SocketAddr = "10.91.0.2:9000".parse().unwrap();
+
+    // V is owned ONLY via the addr_to_peer_id alias (e.g. a configured
+    // peer) -- never added to `peers` at all.
+    registry.configure_peer(victim.clone(), victim_addr).await;
+    assert!(
+        !registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .contains_key(&victim_addr),
+        "sanity: victim must be owned only via the addr_to_peer_id alias, \
+         not `peers`"
+    );
+
+    let attacker_kp = crate::KeyPair::new_for_testing("alias-guard-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_node_id = attacker.to_node_id();
+    let attacker_ephemeral: SocketAddr = "10.91.0.3:51000".parse().unwrap();
+    registry
+        .add_peer_with_node_id(attacker_ephemeral, Some(attacker_node_id))
+        .await;
+
+    let attacker_actor = crate::RemoteActorLocation::new_with_peer(victim_addr, attacker.clone());
+    let attacker_full_sync = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![("attacker/alias-actor".to_string(), attacker_actor)],
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(victim_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::GossipExtensionsV1 {
+            clock_probe: Some(crate::ClockProbeV1 {
+                sample_id: 42,
+                sender_wall_ns: 1,
+            }),
+            clock_echo: None,
+        }),
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_ephemeral,
+        attacker_ephemeral,
+        attacker_full_sync,
+    )
+    .await
+    .expect("attacker's FullSync must not error, only be rejected/ignored");
+
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&victim_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "attacker must not be able to repoint an address owned only via the \
+         addr_to_peer_id alias"
+    );
+    assert!(
+        !registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .contains_key(&victim_addr),
+        "attacker must not be able to create a peers[addr] entry for an \
+         address already owned via the addr_to_peer_id alias"
+    );
+    assert!(
+        !registry.has_pending_clock_echo(victim_addr),
+        "a rejected hijack frame must not poison clock/extension \
+         bookkeeping for the claimed address"
+    );
+}
+
+/// This node's own bind/advertised address is never present in `peers`
+/// (nothing adds itself as its own peer), so an ownership check limited to
+/// `peers[addr]` sees it as "unowned" and claimable -- a remote,
+/// TLS-authenticated peer could advertise our own listening address as its
+/// `sender_bind_addr` and have the FullSync handler create bogus
+/// `peers[]`/routing state keyed on it. The guard must treat this node's
+/// own address as always self-owned.
+#[tokio::test]
+async fn authenticated_peer_cannot_hijack_registrys_own_local_address() {
+    let bind_addr: SocketAddr = "10.92.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("local-guard-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let attacker_kp = crate::KeyPair::new_for_testing("local-guard-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_node_id = attacker.to_node_id();
+    let attacker_ephemeral: SocketAddr = "10.92.0.3:51000".parse().unwrap();
+    registry
+        .add_peer_with_node_id(attacker_ephemeral, Some(attacker_node_id))
+        .await;
+
+    let attacker_full_sync = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![],
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(bind_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::GossipExtensionsV1 {
+            clock_probe: Some(crate::ClockProbeV1 {
+                sample_id: 7,
+                sender_wall_ns: 1,
+            }),
+            clock_echo: None,
+        }),
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_ephemeral,
+        attacker_ephemeral,
+        attacker_full_sync,
+    )
+    .await
+    .expect("attacker's FullSync must not error, only be rejected/ignored");
+
+    assert!(
+        !registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .contains_key(&bind_addr),
+        "attacker must not be able to create a peers[] entry keyed on this \
+         node's own bind address"
+    );
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&bind_addr, |_, v| v.clone());
+    assert_ne!(
+        routed_peer_id,
+        Some(attacker),
+        "attacker must not be able to repoint addr_to_peer_id[own bind addr] \
+         to itself"
+    );
+    assert!(
+        !registry.has_pending_clock_echo(bind_addr),
+        "a rejected hijack frame claiming this node's own address must not \
+         poison clock/extension bookkeeping"
+    );
+}
+
+/// The ownership check must be rechecked ATOMICALLY under the same lock as
+/// the actual `peer_to_actors`/sequence writes in `merge_full_sync_from`,
+/// not just once, earlier, before the (unlocked) actor-candidate
+/// collection pass. Uses a `FullSyncResponse`, whose routing repoint only
+/// happens AFTER `merge_full_sync_from` returns (unlike `FullSync`, which
+/// commits `addr_to_peer_id` for the sender synchronously, under the same
+/// lock as its own pre-check, before ever calling `merge_full_sync_from`)
+/// -- so `contested_addr` stays genuinely unowned for the merge's full
+/// duration unless something else claims it. A large actor set widens the
+/// window between the collection pass and the final write so the
+/// concurrently-run ownership-establishing call below has a real chance --
+/// on a genuine multi-threaded runtime -- to land inside it before the
+/// final write commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ownership_established_during_full_sync_response_merge_window_aborts_stale_apply() {
+    let bind_addr: SocketAddr = "10.93.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("race-guard-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let victim_kp = crate::KeyPair::new_for_testing("race-guard-victim");
+    let victim = victim_kp.peer_id();
+    let victim_node_id = victim.to_node_id();
+    let contested_addr: SocketAddr = "10.93.0.2:9000".parse().unwrap();
+
+    let attacker_kp = crate::KeyPair::new_for_testing("race-guard-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_ephemeral: SocketAddr = "10.93.0.3:51000".parse().unwrap();
+
+    let mut local_actors = Vec::with_capacity(8_000);
+    for i in 0..8_000u32 {
+        local_actors.push((
+            format!("race/attacker-actor-{i}"),
+            crate::RemoteActorLocation::new_with_peer(contested_addr, attacker.clone()),
+        ));
+    }
+    let attacker_full_sync_response = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors,
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(contested_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    let attacker_registry = registry.clone();
+    let attacker_task = tokio::spawn(async move {
+        super::handle_incoming_message(
+            attacker_registry,
+            attacker_ephemeral,
+            attacker_ephemeral,
+            attacker_full_sync_response,
+        )
+        .await
+    });
+
+    // Give the attacker task a real chance to get well into the
+    // actor-candidate collection pass before the victim's ownership is
+    // established.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+
+    // The victim's ownership is established WHILE the attacker's
+    // FullSyncResponse is, very likely, still being processed.
+    registry
+        .add_peer_with_node_id(contested_addr, Some(victim_node_id))
+        .await;
+
+    attacker_task
+        .await
+        .expect("attacker task must not panic")
+        .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
+
+    let gossip_state = registry.gossip_state.lock().await;
+    let actors = gossip_state
+        .peer_to_actors
+        .get(&contested_addr)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !actors.iter().any(|n| n.starts_with("race/attacker-actor-")),
+        "ownership established during the merge window must abort the stale \
+         hijack apply, not let it overwrite peer_to_actors[addr] after the fact"
+    );
+    let peer_info = gossip_state
+        .peers
+        .get(&contested_addr)
+        .expect("victim's peer entry must exist");
+    assert_eq!(
+        peer_info.node_id,
+        Some(victim_node_id),
+        "ownership established during the merge window must not be \
+         clobbered by the attacker's in-flight apply"
+    );
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&contested_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "the post-merge routing repoint must also honor the ownership \
+         established during the merge window, not blindly repoint to the \
+         attacker"
+    );
+}
