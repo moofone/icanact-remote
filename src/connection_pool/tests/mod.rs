@@ -9454,3 +9454,105 @@ async fn peer_health_report_rejects_fabricated_subject_addresses() {
          consensus can use it"
     );
 }
+
+// RED: a fresh outbound connect publishes the connection (making it
+// resolvable via `get_connection_by_addr`) before the identifying FullSync
+// is built and enqueued -- `finalize_new_outbound_connection` awaits a
+// `gossip_state` lock and an actor-pairs snapshot between those two steps.
+// A routed ask that discovers the freshly published connection in that
+// window enqueues its RouteBind onto the SAME per-connection write queue,
+// so the acceptor can see RouteBind arrive before the identifying FullSync
+// and drop the connection ("RouteBind arrived before connection setup").
+//
+// This test holds `gossip_state`'s lock from the test task so a task
+// finalizing a fresh outbound connect parks exactly at that await, publishes
+// a racing routed ask's RouteBind while it is parked, then releases the
+// lock and asserts what actually lands on the wire first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_outbound_connect_sends_identifying_fullsync_before_racing_routed_ask() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+    use tokio::io::AsyncReadExt;
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "fullsync-race-local",
+            )),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+    let addr: SocketAddr = "127.0.0.1:41777".parse().unwrap();
+
+    let (io, mut peer_io) = tokio::io::duplex(4096);
+
+    // Hold `gossip_state` from the test task. In the unfixed code the
+    // connection is published (discoverable via `get_connection_by_addr`)
+    // long before the identify build ever touches this lock, so a racing
+    // task spun up below can find and exploit that window while the lock is
+    // still held. In the fixed code the identify build -- which now runs
+    // BEFORE publish -- itself needs this same lock, so publish cannot
+    // happen at all until this test task releases it; the racing task
+    // then only ever discovers the connection after the identify has
+    // already been enqueued.
+    let guard = registry.gossip_state.lock().await;
+
+    let finalize_registry = Arc::downgrade(&registry);
+    let finalize_task = tokio::spawn(async move {
+        pool.finalize_new_outbound_connection(addr, io, finalize_registry, None, addr, None)
+            .await
+            .expect("finalize outbound connection")
+    });
+
+    // Race a routed ask against the connect on a separate task: spin trying
+    // to discover the connection and, the instant it is, enqueue a
+    // RouteBind onto its write queue exactly as a real routed ask would.
+    let racer_pool = registry.connection_pool.clone();
+    let racer_task = tokio::spawn(async move {
+        loop {
+            if let Some(conn) = racer_pool.get_connection_by_addr(&addr) {
+                let stream = conn
+                    .stream_handle
+                    .clone()
+                    .expect("finalized connection must have a stream handle");
+                stream
+                    .write_routed_actor_ask(1, 42, 99, bytes::Bytes::from_static(b"race"))
+                    .await
+                    .expect("racing routed ask must be able to enqueue");
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Hold the lock long enough that, on the multi-thread runtime, the
+    // racer task -- spinning freely on another worker thread this entire
+    // time -- has effectively unbounded opportunity to win the unfixed
+    // code's (synchronous, lock-independent) publish-then-later-identify
+    // window if it exists at all. Only then release it, letting a
+    // fixed-code finalize proceed to build and enqueue its identify.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(guard);
+
+    let handle = finalize_task.await.expect("finalize task must not panic");
+    racer_task.await.expect("racer task must not panic");
+    drop(handle);
+
+    let mut control = [0u8; 4];
+    peer_io
+        .read_exact(&mut control)
+        .await
+        .expect("a first frame must have been written to the wire");
+    let kind = crate::framing::decode_control(control).unwrap().kind;
+    assert_eq!(
+        kind,
+        crate::framing::WireKind::Gossip,
+        "the identifying FullSync must be the first frame on a fresh \
+         outbound connection, even when a routed ask races the connect and \
+         discovers the connection while the identify is still being built \
+         -- got {kind:?} first instead, which is exactly what makes the \
+         acceptor drop the connection (\"RouteBind arrived before \
+         connection setup\")"
+    );
+}

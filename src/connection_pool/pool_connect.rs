@@ -3406,6 +3406,64 @@ impl<T> ConnectionPool<T> {
 
         let connection_arc = Arc::new(conn);
 
+        // Build and enqueue the identifying FullSync on this connection's own
+        // write queue BEFORE the connection is published anywhere it could be
+        // discovered (`connections_by_addr`, `addr_to_peer_id`, the peer's
+        // session slot) and handed out to another task. `stream_handle` is
+        // brand new here and referenced by nothing outside this function yet,
+        // so nothing else can be racing to enqueue onto its write queue --
+        // this send is unconditionally the first frame in that queue's FIFO,
+        // guaranteeing the acceptor never sees a routed frame (RouteBind /
+        // ActorAsk) ahead of it. Building the message (the actor-pair
+        // snapshot and the `gossip_state` lock) can await freely here without
+        // reopening that race, since publication -- the only thing that would
+        // let a concurrent task obtain this connection's handle -- has not
+        // happened yet. A candidate that later loses the outbound tie-break
+        // below is torn down regardless; sending this one frame on a
+        // connection that ends up discarded is harmless.
+        if let Some(registry_arc) = registry_weak.upgrade() {
+            let initial_msg = {
+                let (local_actors, known_actors) = registry_arc.snapshot_actor_pairs();
+                let gossip_state = registry_arc.gossip_state.lock().await;
+
+                RegistryMessage::FullSync {
+                    local_actors,
+                    known_actors,
+                    sender_peer_id: registry_arc.peer_id.clone(),
+                    sender_bind_addr: Some(registry_arc.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
+                    sequence: gossip_state.gossip_sequence,
+                    wall_clock_time: crate::current_timestamp(),
+                    extensions: None,
+                }
+            };
+
+            // Serialize and send the initial message without flattening header + payload.
+            match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
+                Ok(data) => {
+                    // Create a connection handle to send the message
+                    let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
+                        addr,
+                        stream_handle.clone(),
+                        connection_arc
+                            .correlation
+                            .clone()
+                            .unwrap_or_else(CorrelationTracker::new),
+                    );
+                    if let Err(e) = conn_handle
+                        .send_gossip_payload(bytes::Bytes::from_owner(data))
+                        .await
+                    {
+                        warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
+                    } else {
+                        info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
+                    }
+                }
+                Err(e) => {
+                    warn!(peer = %addr, error = %e, "Failed to serialize initial FullSync message");
+                }
+            }
+        }
+
         // Snapshot any pre-existing rival for this peer BEFORE this candidate
         // is indexed by address/peer_id below, via the PURE
         // `peer_current_connection_snapshot` — never `get_connection_by_peer_id`.
@@ -3678,50 +3736,6 @@ impl<T> ConnectionPool<T> {
                     &connection_arc,
                 )
                 .await;
-        }
-
-        // Send initial FullSync message to identify ourselves
-        if let Some(registry_arc) = registry_weak.upgrade() {
-            let initial_msg = {
-                let (local_actors, known_actors) = registry_arc.snapshot_actor_pairs();
-                let gossip_state = registry_arc.gossip_state.lock().await;
-
-                RegistryMessage::FullSync {
-                    local_actors,
-                    known_actors,
-                    sender_peer_id: registry_arc.peer_id.clone(),
-                    sender_bind_addr: Some(registry_arc.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
-                    sequence: gossip_state.gossip_sequence,
-                    wall_clock_time: crate::current_timestamp(),
-                    extensions: None,
-                }
-            };
-
-            // Serialize and send the initial message without flattening header + payload.
-            match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
-                Ok(data) => {
-                    // Create a connection handle to send the message
-                    let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
-                        addr,
-                        stream_handle.clone(),
-                        connection_arc
-                            .correlation
-                            .clone()
-                            .unwrap_or_else(CorrelationTracker::new),
-                    );
-                    if let Err(e) = conn_handle
-                        .send_gossip_payload(bytes::Bytes::from_owner(data))
-                        .await
-                    {
-                        warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
-                    } else {
-                        info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
-                    }
-                }
-                Err(e) => {
-                    warn!(peer = %addr, error = %e, "Failed to serialize initial FullSync message");
-                }
-            }
         }
 
         // Reset failure state for this peer since we successfully connected.
