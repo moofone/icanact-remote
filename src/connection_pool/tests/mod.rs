@@ -3141,6 +3141,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         last_response_received_ms: stale_time,
         accept_lower_sequence_from: None,
         current_session_source: None,
+        current_session_connection: None,
     }
 }
 
@@ -4195,6 +4196,421 @@ async fn outbound_stale_finalizer_arm_after_supersession_does_not_clobber_newer_
         registry.lookup_actor("stale-arm/Q").await.is_some(),
         "R-11: the actually-live (newer) connection's FullSync must still \
          be accepted after the stale arm attempt"
+    );
+}
+
+/// R-11: the supersession recheck inside `arm_sequence_reset_for_new_session`
+/// must be atomic with the write it guards -- checked WHILE holding the
+/// `gossip_state` lock, not checked, then released, then reacquired to
+/// write. A version with a gap between the two would let a stale task pass
+/// the check, get descheduled before it ever touches the lock, let a newer
+/// connection publish in the meantime, and then resume and clobber that
+/// newer session's discriminator anyway even though it is no longer
+/// current.
+///
+/// Forces exactly that interleaving deterministically: the test itself
+/// holds the `gossip_state` lock while spawning the stale task and letting
+/// it run up to (but not past) its own lock acquisition -- proving whether
+/// the connection-pool check happens before or after that point. A version
+/// that checks BEFORE attempting the lock would observe "still current"
+/// here (the newer connection hasn't published yet) and only discover it
+/// was wrong after acquiring the lock and blindly writing; the fixed
+/// version, which acquires the lock FIRST and checks only once it holds
+/// it, sees the newer connection because publication happens while the
+/// stale task is still parked waiting for the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arm_sequence_reset_stale_task_racing_the_lock_does_not_clobber_newer_session() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("stale-arm-race-hi", "stale-arm-race-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let dial_addr: SocketAddr = "127.0.0.1:7461".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    registry
+        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .await;
+
+    fn make_connection(addr: SocketAddr) -> Arc<LockFreeConnection> {
+        let (io, _keep) = tokio::io::duplex(1024);
+        let (sh, _w, _r) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(sh));
+        conn.set_state(ConnectionState::Connected);
+        Arc::new(conn)
+    }
+
+    let stale_local_port: SocketAddr = "127.0.0.1:58101".parse().unwrap();
+    let stale = make_connection(dial_addr);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        dial_addr,
+        stale.clone()
+    ));
+
+    // Hold `gossip_state` from the test task, so the stale task's own
+    // `arm_sequence_reset_for_new_session` call -- whose first move under
+    // the fixed design is to acquire this exact lock before doing anything
+    // else -- cannot proceed past that point until released below.
+    let guard = registry.gossip_state.lock().await;
+
+    let stale_registry = registry.clone();
+    let stale_peer_id = remote_peer_id.clone();
+    let stale_conn = stale.clone();
+    let stale_task = tokio::spawn(async move {
+        stale_registry
+            .arm_sequence_reset_for_new_session(
+                dial_addr,
+                remote_node_id,
+                stale_local_port,
+                &stale_peer_id,
+                &stale_conn,
+            )
+            .await;
+    });
+
+    // Give the stale task a real chance to run up to its lock acquisition
+    // (or, on a pre-fix build, to run its whole pre-lock check) before the
+    // newer connection is published.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // The NEWER connection is published WHILE the stale task is still
+    // parked waiting for the lock this test task holds.
+    let newer = make_connection(dial_addr);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        dial_addr,
+        newer.clone()
+    ));
+
+    // Release the lock: the stale task's arm call can now proceed. Its
+    // in-lock recheck must observe the newer connection published above.
+    drop(guard);
+    stale_task.await.expect("stale task must not panic");
+
+    let gossip_state = registry.gossip_state.lock().await;
+    let peer_info = gossip_state
+        .peers
+        .get(&dial_addr)
+        .expect("peer must still be tracked");
+    assert_ne!(
+        peer_info.current_session_source,
+        Some(stale_local_port),
+        "R-11: a stale task that started its arm call before a newer \
+         connection published, but only reaches its recheck after, must \
+         not clobber the newer session's discriminator"
+    );
+    assert!(
+        peer_info.current_session_source.is_none(),
+        "R-11: no session was ever successfully armed here (the newer \
+         connection was published but never armed), so the discriminator \
+         must remain unset rather than being set by the stale task"
+    );
+}
+
+/// R-11: an old, still-draining connection's DeltaGossip must not be able
+/// to restore a restarted peer's pre-restart high-water mark. Before this
+/// fix, only `FullSync`/`FullSyncResponse` were gated on
+/// `current_session_source`; both `DeltaGossip` request and response arms
+/// in `handle_incoming_message` accepted traffic from ANY connection and
+/// the request arm unconditionally advanced `last_sequence`. After a
+/// restart's exemption is consumed and the sequence resets low, a single
+/// in-flight delta from the OLD connection carrying the numerically HIGH
+/// pre-restart sequence would silently restore it -- after which the
+/// current session's own subsequent low FullSyncs look stale again with no
+/// exemption left to rescue them.
+#[tokio::test]
+async fn old_draining_connection_delta_cannot_restore_pre_restart_high_water() {
+    let bind_addr: SocketAddr = "10.77.0.40:9500".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("delta-gate-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let owner_kp = crate::KeyPair::new_for_testing("delta-gate-owner");
+    let owner = owner_kp.peer_id();
+    let node_id = owner.to_node_id();
+    let peer_addr: SocketAddr = "10.77.0.41:9500".parse().unwrap();
+
+    // Every message in this test resolves to the SAME peer_state_addr
+    // (`peer_addr`) regardless of which physical connection delivered it.
+    registry
+        .connection_pool
+        .peer_id_to_addr
+        .upsert_sync(owner.clone(), peer_addr);
+
+    registry.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+
+    // Pre-restart: peer is at sequence 40 via a genuine FullSync from the
+    // OLD connection.
+    let old_connection: SocketAddr = "10.77.0.40:51001".parse().unwrap();
+    let full_sync = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![],
+        known_actors: vec![],
+        sender_peer_id: owner.clone(),
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 40,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(registry.clone(), old_connection, old_connection, full_sync)
+        .await
+        .expect("pre-restart FullSync must succeed");
+
+    // Peer restarts: new session armed and its first sync (seq=1) accepted.
+    let new_connection: SocketAddr = "10.77.0.40:51002".parse().unwrap();
+    registry
+        .arm_sequence_reset_for_new_session(
+            peer_addr,
+            node_id,
+            new_connection,
+            &owner,
+            &qa_r11_delta_gate_dummy_connection(new_connection),
+        )
+        .await;
+    let restart_sync = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![],
+        known_actors: vec![],
+        sender_peer_id: owner.clone(),
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(registry.clone(), new_connection, new_connection, restart_sync)
+        .await
+        .expect("restart FullSync must succeed");
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(
+            gossip_state.peers.get(&peer_addr).map(|p| p.last_sequence),
+            Some(1),
+            "sanity: the restart sync must have reset last_sequence to 1"
+        );
+    }
+
+    // The OLD connection is still draining and delivers an in-flight,
+    // pre-restart (numerically HIGH) delta AFTER the reset.
+    let stale_delta = crate::registry::RegistryMessage::DeltaGossip {
+        delta: crate::registry::RegistryDelta {
+            since_sequence: 39,
+            current_sequence: 41,
+            changes: Vec::new(),
+            sender_peer_id: owner.clone(),
+            wall_clock_time: crate::current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        },
+        extensions: None,
+    };
+    super::handle_incoming_message(registry.clone(), old_connection, old_connection, stale_delta)
+        .await
+        .expect("stale delta must not error, only be ignored");
+
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(
+            gossip_state.peers.get(&peer_addr).map(|p| p.last_sequence),
+            Some(1),
+            "R-11: the old draining connection's delta must not restore the \
+             pre-restart high-water mark"
+        );
+    }
+
+    // The restarted peer's SECOND genuine sync (seq=2), from the NEW
+    // connection, must still be accepted -- proven by a brand-new actor
+    // actually being added.
+    let mut local_actors = std::collections::HashMap::new();
+    local_actors.insert(
+        "delta-gate/Q".to_string(),
+        crate::RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+    );
+    let second_sync = crate::registry::RegistryMessage::FullSync {
+        local_actors: local_actors.into_iter().collect(),
+        known_actors: vec![],
+        sender_peer_id: owner.clone(),
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 2,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(registry.clone(), new_connection, new_connection, second_sync)
+        .await
+        .expect("second restart-session FullSync must succeed");
+
+    assert!(
+        registry.lookup_actor("delta-gate/Q").await.is_some(),
+        "R-11: the restarted peer's second genuine sync must still be \
+         accepted, not rejected as stale because the old connection's \
+         delta silently restored the pre-restart high-water mark"
+    );
+}
+
+fn qa_r11_delta_gate_dummy_connection(addr: SocketAddr) -> Arc<LockFreeConnection> {
+    let (io, _keep) = tokio::io::duplex(1024);
+    let (sh, _w, _r) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+    conn.stream_handle = Some(Arc::new(sh));
+    conn.set_state(ConnectionState::Connected);
+    Arc::new(conn)
+}
+
+/// R-11: a non-arming successor connection (e.g. a reconnect whose TLS
+/// certificate doesn't decode to a `GossipNodeId`, so `arm_sequence_reset_for_new_session`
+/// is never called for it) must not be permanently locked out once the
+/// connection that DID arm a session for this peer is gone. Before this
+/// fix, `current_session_source` was set only inside the arm path and
+/// never cleared anywhere -- if the arming connection closed and was
+/// succeeded by a connection that never re-armed, EVERY subsequent
+/// FullSync from that live successor would fail the `from_current_session`
+/// gate forever, recreating the exact stale-actor outage via a new
+/// mechanism.
+#[tokio::test]
+async fn non_arming_successor_connections_full_sync_is_accepted_after_armed_connection_closes() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("non-arming-successor-hi", "non-arming-successor-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+
+    let bind_addr: SocketAddr = "127.0.0.1:7470".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, bind_addr);
+    registry
+        .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+        .await;
+
+    // Connection A: authenticates with a decodable GossipNodeId and arms a
+    // session.
+    let a_addr: SocketAddr = "127.0.0.1:59001".parse().unwrap();
+    let (a_io, _a_keep) = tokio::io::duplex(1024);
+    let (a_sh, _a_w, _a_r) = LockFreeStreamHandle::new(
+        a_io,
+        a_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut a_conn = LockFreeConnection::new(a_addr, ConnectionDirection::Inbound);
+    a_conn.stream_handle = Some(Arc::new(a_sh));
+    a_conn.set_state(ConnectionState::Connected);
+    let a = Arc::new(a_conn);
+    assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), a_addr, a.clone()));
+    registry
+        .arm_sequence_reset_for_new_session(
+            bind_addr,
+            remote_node_id,
+            a_addr,
+            &remote_peer_id,
+            &a,
+        )
+        .await;
+
+    // A baseline FullSync from A establishes last_sequence.
+    let mut local_actors = std::collections::HashMap::new();
+    local_actors.insert(
+        "non-arming/X".to_string(),
+        crate::RemoteActorLocation::new_with_peer(bind_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            local_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            bind_addr,
+            Some(a_addr),
+            Some(a_addr),
+            5,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    // Connection A closes and is dropped entirely (no strong refs left);
+    // connection B succeeds it but is a non-arming successor (e.g. its
+    // certificate never decoded to a GossipNodeId, so nothing ever calls
+    // `arm_sequence_reset_for_new_session` for it) -- it is simply
+    // published as the peer's new current connection.
+    drop(a);
+    let b_addr: SocketAddr = "127.0.0.1:59002".parse().unwrap();
+    let (b_io, _b_keep) = tokio::io::duplex(1024);
+    let (b_sh, _b_w, _b_r) = LockFreeStreamHandle::new(
+        b_io,
+        b_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut b_conn = LockFreeConnection::new(b_addr, ConnectionDirection::Inbound);
+    b_conn.stream_handle = Some(Arc::new(b_sh));
+    b_conn.set_state(ConnectionState::Connected);
+    let b = Arc::new(b_conn);
+    assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), b_addr, b.clone()));
+
+    // B's own, advancing-sequence FullSync must be accepted -- proven by a
+    // brand-new actor actually being added.
+    let mut local_actors2 = std::collections::HashMap::new();
+    local_actors2.insert(
+        "non-arming/X".to_string(),
+        crate::RemoteActorLocation::new_with_peer(bind_addr, remote_peer_id.clone()),
+    );
+    local_actors2.insert(
+        "non-arming/R".to_string(),
+        crate::RemoteActorLocation::new_with_peer(bind_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            local_actors2,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            bind_addr,
+            Some(b_addr),
+            Some(b_addr),
+            6,
+            crate::current_timestamp(),
+        )
+        .await;
+
+    assert!(
+        registry.lookup_actor("non-arming/R").await.is_some(),
+        "R-11: a live, non-arming successor connection's advancing FullSync \
+         must be accepted once the connection that armed the old session \
+         is gone, not rejected forever by a stale current_session_source"
     );
 }
 

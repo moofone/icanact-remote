@@ -1132,6 +1132,21 @@ pub struct PeerInfo {
     /// the TLS-authenticated arming path); in that case updates are
     /// accepted from any source, matching pre-existing behavior.
     pub current_session_source: Option<SocketAddr>,
+    /// The connection instance that armed `current_session_source`, held
+    /// weakly so this never keeps a dead connection's resources alive.
+    ///
+    /// `current_session_source` alone cannot tell a live successor from a
+    /// dead predecessor: if the arming connection closes and is succeeded
+    /// by a connection that never arms (a cert-type migration, a non-mTLS
+    /// client, or simply a `node_id` mismatch), nothing ever clears
+    /// `current_session_source`, and the gate would otherwise reject the
+    /// live successor's traffic forever. `peer_info_is_from_current_session`
+    /// checks whether this instance is still `connection_pool`'s current
+    /// published connection for the peer on every use; if not, the armed
+    /// session has expired and both this and `current_session_source` /
+    /// `accept_lower_sequence_from` are cleared, falling back to the
+    /// unarmed (accept-from-any-source) behavior.
+    pub current_session_connection: Option<std::sync::Weak<crate::connection_pool::LockFreeConnection>>,
 }
 
 impl PeerInfo {
@@ -1157,6 +1172,7 @@ impl PeerInfo {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         }
     }
 
@@ -1190,6 +1206,7 @@ impl PeerInfo {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         }
     }
 
@@ -1244,6 +1261,7 @@ impl PeerInfo {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         })
     }
 }
@@ -2112,6 +2130,7 @@ impl<T: 'static> GossipRegistry<T> {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -2415,11 +2434,21 @@ impl<T: 'static> GossipRegistry<T> {
     /// a NEWER connection for the same peer has already been published --
     /// e.g. a stale outbound finalizer, or a stale inbound accept handler
     /// whose own tie-break resolution is followed by an `.await` a
-    /// concurrent, faster accept/finalize can race past. Immediately before
-    /// mutating `gossip_state`, check (a pure, non-mutating snapshot read --
-    /// never the self-healing `get_connection_by_peer_id`, whose side
-    /// effects must not fire from a decision path) whether a DIFFERENT
-    /// connection is now the peer's current published one; if so,
+    /// concurrent, faster accept/finalize can race past.
+    ///
+    /// The revalidation (a pure, non-mutating snapshot read -- never the
+    /// self-healing `get_connection_by_peer_id`, whose side effects must
+    /// not fire from a decision path) happens WHILE HOLDING the
+    /// `gossip_state` lock, immediately before writing `peer_info`: a
+    /// version checked-then-released-then-reacquired would leave the same
+    /// race window this is meant to close (a descheduled stale task could
+    /// pass the check, let a newer session arm, then resume and clobber it
+    /// anyway). `peer_current_connection_snapshot` is a synchronous,
+    /// lock-free read with no `.await` of its own, so calling it inside an
+    /// already-held async mutex cannot deadlock or block other lockers for
+    /// longer than an ordinary map read.
+    ///
+    /// If a DIFFERENT connection is now the peer's current published one,
     /// `connection_instance` has been superseded and the arm is skipped
     /// entirely rather than clobbering the newer session's discriminator
     /// with this stale caller's obsolete source. A peer with no currently
@@ -2434,24 +2463,24 @@ impl<T: 'static> GossipRegistry<T> {
         peer_id: &crate::PeerId,
         connection_instance: &std::sync::Arc<crate::connection_pool::LockFreeConnection>,
     ) {
-        let superseded_by_a_different_connection = self
-            .connection_pool
-            .peer_current_connection_snapshot(peer_id)
-            .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, connection_instance));
-        if superseded_by_a_different_connection {
-            debug!(
-                peer = %peer_addr,
-                session_source = %session_source,
-                "R-11: declining to arm sequence-reset; this connection instance \
-                 has already been superseded by a newer published session"
-            );
-            return;
-        }
-
         let mut gossip_state = self.gossip_state.lock().await;
         if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr)
             && peer_info.node_id == Some(node_id)
         {
+            let superseded_by_a_different_connection = self
+                .connection_pool
+                .peer_current_connection_snapshot(peer_id)
+                .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, connection_instance));
+            if superseded_by_a_different_connection {
+                debug!(
+                    peer = %peer_addr,
+                    session_source = %session_source,
+                    "R-11: declining to arm sequence-reset; this connection instance \
+                     has already been superseded by a newer published session"
+                );
+                return;
+            }
+
             // Nothing to do for a peer that never got past sequence 0.
             if peer_info.last_sequence > 0 {
                 debug!(
@@ -2468,6 +2497,12 @@ impl<T: 'static> GossipRegistry<T> {
             // rejecting an old, still-draining connection's traffic for the
             // rest of this peer's session, not merely for the first sync.
             peer_info.current_session_source = Some(session_source);
+            // The connection instance backing `current_session_source`.
+            // Checked by `peer_info_is_from_current_session` so a
+            // subsequently disconnected/superseded session's discriminator
+            // self-expires instead of permanently rejecting a live,
+            // non-arming successor's traffic.
+            peer_info.current_session_connection = Some(std::sync::Arc::downgrade(connection_instance));
         }
     }
 
@@ -2538,6 +2573,7 @@ impl<T: 'static> GossipRegistry<T> {
                             last_response_received_ms: current_time_ms,
                             accept_lower_sequence_from: None,
                             current_session_source: None,
+                            current_session_connection: None,
                         },
                     );
 
@@ -4516,6 +4552,7 @@ impl<T: 'static> GossipRegistry<T> {
                         last_response_received_ms: crate::current_timestamp_millis(),
                         accept_lower_sequence_from: None,
                         current_session_source: None,
+                        current_session_connection: None,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -5015,6 +5052,67 @@ impl<T: 'static> GossipRegistry<T> {
         .await
     }
 
+    /// Whether a gossip message (FullSync or Delta) claiming to arrive on
+    /// `session_source` should be treated as coming from `peer_info`'s
+    /// current authenticated session.
+    ///
+    /// Self-healing: if `peer_info.current_session_source` is set but the
+    /// connection instance that armed it (`current_session_connection`) is
+    /// no longer `connection_pool`'s current published connection for
+    /// `peer_id` -- closed, evicted, or superseded by a connection that
+    /// never itself armed a session (a cert-type migration, a non-mTLS
+    /// client, or a `node_id` mismatch) -- the armed session has expired.
+    /// `current_session_source` and `accept_lower_sequence_from` are
+    /// cleared right here so the gate falls back to accept-from-any-source
+    /// instead of permanently rejecting a live, non-arming successor's
+    /// traffic (the exact failure mode a plain "never clear it" design
+    /// would hit).
+    ///
+    /// Must be called with `peer_info` borrowed from an already-locked
+    /// `gossip_state`, and the caller must perform any subsequent mutation
+    /// before releasing that lock -- this function does not itself hold or
+    /// re-acquire `gossip_state`, so it is safe (and required, to stay
+    /// atomic with the caller's own write) to call from within an existing
+    /// critical section.
+    pub(crate) fn peer_info_is_from_current_session(
+        &self,
+        peer_id: &crate::PeerId,
+        peer_info: &mut PeerInfo,
+        session_source: Option<SocketAddr>,
+    ) -> bool {
+        if peer_info.current_session_source.is_some() {
+            // Only a POSITIVE observation that a DIFFERENT connection is now
+            // published for this peer counts as supersession. If
+            // `connection_pool` has nothing on record at all (e.g. a
+            // registry-level caller that manages sessions without
+            // registering into the pool, as most tests do, or a narrow
+            // window where the pool hasn't indexed anything yet), that is
+            // not proof the armed session is dead -- fall through and keep
+            // enforcing the recorded `current_session_source` as before.
+            let superseded = self
+                .connection_pool
+                .peer_current_connection_snapshot(peer_id)
+                .is_some_and(|current| {
+                    !peer_info
+                        .current_session_connection
+                        .as_ref()
+                        .and_then(|weak| weak.upgrade())
+                        .is_some_and(|armed| std::sync::Arc::ptr_eq(&armed, &current))
+                });
+            if superseded {
+                peer_info.current_session_source = None;
+                peer_info.accept_lower_sequence_from = None;
+                peer_info.current_session_connection = None;
+            }
+        }
+
+        peer_info
+            .current_session_source
+            .zip(session_source)
+            .is_some_and(|(current, verified)| current == verified)
+            || peer_info.current_session_source.is_none()
+    }
+
     /// Merge a full sync, resolving advertised actor addresses against the
     /// AUTHENTICATED socket address of the connection that delivered it
     /// (PEER_ID_REFACTOR §1.6). `sender_addr` is the bind-derived peer
@@ -5085,12 +5183,12 @@ impl<T: 'static> GossipRegistry<T> {
                 // spent). `None` means no session has ever been armed for
                 // this peer (fresh peer, or a local/test caller bypassing
                 // the TLS-authenticated arming path) and is accepted from
-                // any source, preserving prior behavior.
-                let from_current_session = peer_info
-                    .current_session_source
-                    .zip(session_source)
-                    .is_some_and(|(current, verified)| current == verified)
-                    || peer_info.current_session_source.is_none();
+                // any source, preserving prior behavior. See
+                // `peer_info_is_from_current_session` for the self-healing
+                // expiry check that keeps this from permanently rejecting a
+                // live successor once the armed connection is gone.
+                let from_current_session =
+                    self.peer_info_is_from_current_session(&sender_peer_id, peer_info, session_source);
 
                 if !from_current_session {
                     debug!(
@@ -7869,6 +7967,7 @@ impl<T: 'static> GossipRegistry<T> {
             last_response_received_ms: now_ms,
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -9901,6 +10000,7 @@ mod tests {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -10181,6 +10281,7 @@ mod tests {
             last_response_received_ms: now_ms,
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         }
     }
 
@@ -10279,6 +10380,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -11095,6 +11197,7 @@ mod tests {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -11117,6 +11220,7 @@ mod tests {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -13117,6 +13221,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -13189,6 +13294,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -13257,6 +13363,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -13307,6 +13414,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
             let mut actors = HashSet::new();
@@ -13399,6 +13507,7 @@ mod tests {
                     last_response_received_ms: 0,
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
             let mut seeded = HashSet::new();
@@ -13520,6 +13629,7 @@ mod tests {
                     last_response_received_ms: 0,
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -13706,6 +13816,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -13795,6 +13906,7 @@ mod tests {
                         last_response_received_ms: crate::current_timestamp_millis(),
                         accept_lower_sequence_from: None,
                         current_session_source: None,
+                        current_session_connection: None,
                     },
                 );
             }
@@ -13884,6 +13996,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
             let mut actors = HashSet::new();
@@ -13965,6 +14078,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
             let mut actors = HashSet::new();
@@ -14851,6 +14965,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -14910,6 +15025,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -14959,6 +15075,7 @@ mod tests {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         };
 
         // Convert to gossip format
@@ -15350,6 +15467,7 @@ mod tests {
                         .saturating_sub(10_000),
                         accept_lower_sequence_from: None,
                         current_session_source: None,
+                        current_session_connection: None,
                 },
             );
         }
@@ -15811,6 +15929,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -15952,6 +16071,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -15995,6 +16115,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -16038,6 +16159,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -16094,6 +16216,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -16157,6 +16280,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -16252,6 +16376,7 @@ mod tests {
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
             current_session_source: None,
+            current_session_connection: None,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -16310,6 +16435,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -16391,6 +16517,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -16459,6 +16586,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }
@@ -16519,6 +16647,7 @@ mod tests {
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
                     current_session_source: None,
+                    current_session_connection: None,
                 },
             );
         }

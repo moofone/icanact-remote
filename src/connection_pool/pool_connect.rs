@@ -4010,6 +4010,7 @@ pub(crate) fn handle_incoming_message(
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
                                 current_session_source: None,
+                                current_session_connection: None,
                             });
                         }
                     }
@@ -4033,37 +4034,66 @@ pub(crate) fn handle_incoming_message(
                             .remove(&sender_socket_addr);
                     }
 
-                    // Update peer info and check if we need to clear pending failures
+                    // Update peer info and check if we need to clear pending failures.
+                    // Gated the same way `merge_full_sync_from` gates FullSync:
+                    // once a session is armed for this peer, only its own
+                    // connection may advance `last_sequence` (or feed changes
+                    // into `apply_delta_from` below) -- an old, still-draining
+                    // connection's in-flight delta must not be able to restore
+                    // a pre-restart high-water mark after the new session's
+                    // reset, which would make the new session's own
+                    // low-sequence syncs look stale again with the one-shot
+                    // exemption already spent.
+                    let mut from_current_session = true;
                     let need_to_clear_pending =
                         if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                            // Always reset failure state when we receive messages from the peer
-                            // This proves the peer is alive and communicating
-                            let had_failures = peer_info.failures > 0;
-                            if had_failures {
-                                info!(peer = %delta.sender_peer_id,
+                            from_current_session = registry.peer_info_is_from_current_session(
+                                &delta.sender_peer_id,
+                                peer_info,
+                                Some(session_source),
+                            );
+                            if !from_current_session {
+                                false
+                            } else {
+                                // Always reset failure state when we receive messages from the peer
+                                // This proves the peer is alive and communicating
+                                let had_failures = peer_info.failures > 0;
+                                if had_failures {
+                                    info!(peer = %delta.sender_peer_id,
                               prev_failures = peer_info.failures,
                               "🔄 Resetting failure state after receiving DeltaGossip");
-                                peer_info.failures = 0;
-                                peer_info.last_failure_time = None;
+                                    peer_info.failures = 0;
+                                    peer_info.last_failure_time = None;
+                                }
+                                peer_info.last_success = crate::current_timestamp();
+                                // Inbound payload from peer — proves app-level liveness.
+                                // The response-asymmetry detector in
+                                // `apply_gossip_results` reads this field to decide
+                                // whether outbound writes that returned `Ok(None)`
+                                // were actually heard by the peer's application
+                                // layer. Mirror the inline-response path in
+                                // `GossipRegistry::handle_gossip_response`.
+                                peer_info.last_response_received_ms =
+                                    crate::current_timestamp_millis();
+
+                                peer_info.last_sequence =
+                                    std::cmp::max(peer_info.last_sequence, delta.current_sequence);
+                                peer_info.consecutive_deltas += 1;
+
+                                had_failures
                             }
-                            peer_info.last_success = crate::current_timestamp();
-                            // Inbound payload from peer — proves app-level liveness.
-                            // The response-asymmetry detector in
-                            // `apply_gossip_results` reads this field to decide
-                            // whether outbound writes that returned `Ok(None)`
-                            // were actually heard by the peer's application
-                            // layer. Mirror the inline-response path in
-                            // `GossipRegistry::handle_gossip_response`.
-                            peer_info.last_response_received_ms = crate::current_timestamp_millis();
-
-                            peer_info.last_sequence =
-                                std::cmp::max(peer_info.last_sequence, delta.current_sequence);
-                            peer_info.consecutive_deltas += 1;
-
-                            had_failures
                         } else {
                             false
                         };
+
+                    if !from_current_session {
+                        debug!(
+                            peer = %sender_socket_addr,
+                            "ignoring delta gossip from a connection that is not this \
+                             peer's current authenticated session"
+                        );
+                        return Ok(());
+                    }
 
                     // Clear pending failure record if needed
                     if need_to_clear_pending {
@@ -4197,6 +4227,7 @@ pub(crate) fn handle_incoming_message(
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
                                 current_session_source: None,
+                                current_session_connection: None,
                             });
                         }
                     }
@@ -4488,6 +4519,30 @@ pub(crate) fn handle_incoming_message(
                     extensions,
                     crate::current_timestamp_nanos(),
                 );
+
+                // Gated the same way the DeltaGossip branch above is: once a
+                // session is armed for this peer, only its own connection's
+                // deltas may be applied.
+                let from_current_session = {
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                        registry.peer_info_is_from_current_session(
+                            &delta.sender_peer_id,
+                            peer_info,
+                            Some(session_source),
+                        )
+                    } else {
+                        true
+                    }
+                };
+                if !from_current_session {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring delta gossip response from a connection that is not \
+                         this peer's current authenticated session"
+                    );
+                    return Ok(());
+                }
 
                 // Same §1.6 trust anchor as the DeltaGossip branch above:
                 // responses also carry actor additions, and repair must use
