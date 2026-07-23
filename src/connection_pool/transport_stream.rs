@@ -2,6 +2,94 @@ use super::*;
 
 static OUTBOUND_CONNECT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// R-11: the only identity a freshly-dialled outbound connection may use to
+/// arm the sequence-reset exemption is one this exact TLS session
+/// cryptographically proved via its own peer certificate. Never accept a
+/// cached/looked-up identity here — that is not evidence tied to this
+/// session and could let a peer that never re-authenticated (or a peer at a
+/// reused/hijacked address with a different identity) arm a rollback of
+/// another identity's replay high-water mark.
+///
+/// Pure over the certificate chain rustls reports for the live session, so
+/// it is unit-testable without an actual socket/handshake.
+fn r11_session_authenticated_node_id(
+    peer_certificates: Option<&[rustls::pki_types::CertificateDer<'_>]>,
+) -> Option<crate::GossipNodeId> {
+    peer_certificates?
+        .first()
+        .and_then(|cert| crate::tls::extract_node_id_from_cert(cert).ok())
+}
+
+fn outbound_session_authenticated_node_id(
+    tls_stream: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+) -> Option<crate::GossipNodeId> {
+    r11_session_authenticated_node_id(tls_stream.get_ref().1.peer_certificates())
+}
+
+#[cfg(test)]
+mod r11_outbound_arming_tests {
+    use super::r11_session_authenticated_node_id;
+    use crate::SecretKey;
+    use crate::tls::resolver::test_self_signed_cert;
+
+    /// R-11 security boundary (review finding, transport_stream.rs:525): the
+    /// old call site fell back to a cached `lookup_node_id(&addr)` lookup
+    /// whenever this handshake didn't itself yield a cert-derived identity.
+    /// That is not evidence tied to this session -- a peer at a
+    /// reused/hijacked address presenting no usable certificate must NOT be
+    /// able to arm a rollback of a *different*, previously-recorded
+    /// identity's replay high-water mark.
+    ///
+    /// RED against the pre-fix call site's logic (`discovered_node_id.or_else(||
+    /// lookup_node_id)`), which returns the cached identity here; GREEN
+    /// against `r11_session_authenticated_node_id`, which requires this
+    /// exact session's own certificate and returns `None`.
+    #[test]
+    fn no_peer_certificate_on_this_session_never_authenticates_arming() {
+        // Simulate the vulnerable fallback the review flagged: a cached
+        // identity exists for the address (as `lookup_node_id` would
+        // return), but THIS session presented no certificate at all.
+        let cached_identity_from_a_prior_session = Some(SecretKey::generate().public());
+        let this_session_presented_no_certificate: Option<&[rustls::pki_types::CertificateDer<'_>]> =
+            None;
+
+        let old_vulnerable_fallback = None::<crate::GossipNodeId>
+            .or(cached_identity_from_a_prior_session);
+        assert!(
+            old_vulnerable_fallback.is_some(),
+            "sanity: the pre-fix cache fallback would have armed using a \
+             non-fresh identity"
+        );
+
+        let armed_identity =
+            r11_session_authenticated_node_id(this_session_presented_no_certificate);
+        assert!(
+            armed_identity.is_none(),
+            "R-11: arming must require an identity THIS session's own TLS \
+             certificate proved, never a cached lookup"
+        );
+    }
+
+    /// A genuinely re-authenticated restart -- this session's own peer
+    /// certificate is present and decodes to a real identity -- must still
+    /// be accepted, otherwise the R-11 fix regresses to the original outage.
+    #[test]
+    fn fresh_peer_certificate_on_this_session_authenticates_arming() {
+        let key = SecretKey::generate();
+        let node_id = key.public();
+        let cert = test_self_signed_cert(&key).expect("cert");
+        let certs = [cert];
+
+        let armed_identity = r11_session_authenticated_node_id(Some(&certs));
+        assert_eq!(
+            armed_identity,
+            Some(node_id),
+            "R-11: a genuinely re-authenticated restart must still be able \
+             to arm the exemption"
+        );
+    }
+}
+
 impl<T> ConnectionPool<T> {
     pub(super) async fn connect_via_stream(
         &self,
@@ -508,6 +596,46 @@ impl<T> ConnectionPool<T> {
                         registry_arc.mark_peer_connected(addr).await;
                     }
 
+                    // R-11: precompute what OUTBOUND sessions need to arm
+                    // the one-shot lower-sequence exemption, but do NOT arm
+                    // it here. `finalize_new_outbound_connection` can still
+                    // reject this exact candidate (a concurrent/preferred
+                    // rival wins the tie-break, or a publish race) without
+                    // erroring the connect attempt overall; arming before
+                    // that decision is known would strand the exemption on
+                    // a socket that never becomes live while the surviving
+                    // connection's subsequent gossip is rejected (its source
+                    // no longer matches this failed candidate). Arming is
+                    // therefore done inside `finalize_new_outbound_connection`
+                    // itself, only once this candidate is confirmed to be
+                    // the peer's live connection.
+                    //
+                    // The node_id is deliberately independent of
+                    // `associated_node_id` above: that value can fall back
+                    // to a cached `lookup_node_id` lookup when this
+                    // handshake itself didn't yield a cert-derived identity,
+                    // which is not evidence tied to this session. Arming
+                    // must only ever be backed by an identity this exact TLS
+                    // handshake cryptographically proved, so it is derived
+                    // here straight from the live connection's own peer
+                    // certificate -- before `tls_stream` is moved into
+                    // `finalize_new_outbound_connection`.
+                    //
+                    // The session discriminator is this outbound socket's
+                    // OWN local ephemeral port, not the dial target `addr`.
+                    // `addr` is the peer's fixed listening port, identical
+                    // for every connection we ever make to it, so it cannot
+                    // tell a redial's new connection apart from an old one
+                    // still draining -- unlike the inbound side, where the
+                    // remote's ephemeral port is naturally unique per
+                    // connection. `local_session_addr` is threaded through
+                    // this connection's own `ReadContext` and is what the
+                    // receive path compares against, so only a FullSync
+                    // arriving on THIS socket can consume or extend the
+                    // exemption.
+                    let local_session_addr = tls_stream.get_ref().0.local_addr().ok();
+                    let fresh_session_node_id = outbound_session_authenticated_node_id(&tls_stream);
+
                     let finalize_started = Instant::now();
                     let result = self
                         .finalize_new_outbound_connection(
@@ -518,6 +646,8 @@ impl<T> ConnectionPool<T> {
                             // extracted from the peer's verified TLS cert when no
                             // GossipNodeId was pinned (bootstrap/placeholder-SNI dials).
                             discovered_node_id,
+                            local_session_addr.unwrap_or(addr),
+                            fresh_session_node_id,
                         )
                         .await;
                     match &result {

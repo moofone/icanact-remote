@@ -146,6 +146,60 @@ fn actor_location_belongs_to_peer(
         .is_ok_and(|addr| addr == peer_addr)
 }
 
+/// Process-wide, never-reset counter allocating this peer registry's
+/// session epochs. `arm_sequence_reset_for_new_session` and
+/// `peer_info_is_from_current_session`'s self-healing expiry each draw a
+/// FRESH value from here (never a locally-derived/reset one) every time a
+/// peer's current session changes.
+///
+/// A per-peer counter starting at 0 (or any locally-reset scheme) is
+/// reusable: a brand-new `PeerInfo` also starts at the same initial value,
+/// so if a peer entry is removed and recreated at the same address (or a
+/// completely different peer identity reuses that address), its first arm
+/// produces the SAME epoch value a still-in-flight, already-superseded
+/// apply captured before the removal -- the equality check in
+/// `session_epoch_still_current` would then pass for a write that is
+/// actually stale (an ABA hole). Because this counter is global and
+/// monotonic for the lifetime of the process, entry recreation always
+/// yields an epoch no earlier session ever held, so a stale captured
+/// epoch can never accidentally match again.
+static SESSION_EPOCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate a fresh, process-wide-unique session epoch. `0` is never
+/// returned, reserved as `PeerInfo::current_session_epoch`'s "no session
+/// has ever been armed for this peer" sentinel.
+fn next_session_epoch() -> u64 {
+    SESSION_EPOCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Atomically re-validates, under an already-held `gossip_state` lock,
+/// that `expected_epoch` (captured earlier, at session-validation time,
+/// from `PeerInfo::current_session_epoch`) still matches this peer's
+/// current session epoch.
+///
+/// A session-gated decision (this FullSync/delta is from the peer's
+/// current session) and the state mutation it authorizes are frequently
+/// not performed under one continuous lock hold -- candidate updates are
+/// collected, addresses resolved, or the delta handed off to
+/// `apply_delta_from` across released-and-reacquired locks or `.await`
+/// points. A mismatch here means a newer session has been armed, or the
+/// previously-validated one has self-expired, since that original
+/// validation: the caller's pending write must be dropped rather than
+/// applied, or it could silently overwrite a newer (possibly
+/// lower-sequence, restart) session's state with a stale, pre-restart
+/// snapshot. A peer no longer tracked at all is treated the same way
+/// (not current) rather than as vacuously valid.
+pub(crate) fn session_epoch_still_current(
+    gossip_state: &GossipState,
+    peer_addr: SocketAddr,
+    expected_epoch: u64,
+) -> bool {
+    gossip_state
+        .peers
+        .get(&peer_addr)
+        .is_some_and(|peer_info| peer_info.current_session_epoch == expected_epoch)
+}
+
 /// Resolve the effective peer address from sender_bind_addr with validation.
 /// Falls back to tcp_source_addr if sender_bind_addr is None or invalid.
 /// Uses the TCP source IP plus advertised port for unspecified binds (`0.0.0.0:PORT`).
@@ -1073,6 +1127,105 @@ pub struct PeerInfo {
     /// stale verdict until either we get one or the configured grace
     /// expires from `last_attempt`).
     pub last_response_received_ms: u64,
+    /// R-11: one-shot "accept a lower-sequence FullSync than `last_sequence`",
+    /// scoped to the exact connection that armed it.
+    ///
+    /// Holds the VERIFIED TCP source address (ephemeral port included) of the
+    /// newly authenticated connection. Only a FullSync whose verified source
+    /// matches consumes it. That scoping is what makes this safe:
+    /// - an old connection still draining during a reconnect has a different
+    ///   ephemeral source port, so its in-flight lower-sequence FullSync
+    ///   cannot steal the exemption and leave the real restart sync to be
+    ///   rejected;
+    /// - a replayed or relayed frame arriving by any other path cannot consume
+    ///   it either.
+    ///
+    /// Note this is armed on EVERY inbound authenticated session, not only on
+    /// restarts — a new TLS session is also established on routine reconnects.
+    /// That is harmless: a peer that merely reconnected reports its current
+    /// sequence, which is >= our high-water mark, so the exemption is simply
+    /// never exercised. It is consumed only when the peer genuinely comes back
+    /// with a lower sequence, i.e. a restart.
+    ///
+    /// `last_sequence` only ever advances (`max()`), and the `handle_peer_death`
+    /// reset the comments still reference no longer exists. A peer that crashes
+    /// and restarts at the same address resumes from sequence ~0, so every node
+    /// that saw its pre-restart sequence drops all of its FullSyncs forever.
+    /// The omission-prune never runs, and actors the peer no longer hosts sit in
+    /// `known_actors` until the 24h TTL — asks error, tells are silently
+    /// dropped — because the peer is healthy so the dead-peer reap never fires.
+    ///
+    /// Armed only when a NEW TLS-authenticated session is established for the
+    /// peer's identity (see `arm_sequence_reset_for_new_session`), which is
+    /// actual restart evidence and cannot be forged mid-session or by a
+    /// third party's gossip. Cleared on the first FullSync it admits, so the
+    /// stale gate is restored immediately and still blocks in-session replays.
+    pub accept_lower_sequence_from: Option<SocketAddr>,
+    /// The verified TCP source (ephemeral port included) of the connection
+    /// currently authenticated as this peer's live session.
+    ///
+    /// Set alongside `accept_lower_sequence_from` by
+    /// `arm_sequence_reset_for_new_session`, but unlike that one-shot flag
+    /// this is never cleared by ordinary traffic -- only overwritten by the
+    /// next new session. It is the peer's current epoch, independent of
+    /// whether the one-shot reset exemption has already been consumed.
+    ///
+    /// Every `merge_full_sync_from` update (not only the lower-sequence
+    /// exemption path) is gated on this: a message whose verified source
+    /// does not match is from a connection we know is not the peer's
+    /// current session -- e.g. an old connection still draining through a
+    /// reconnect -- and must not perturb `last_sequence` at all, even via
+    /// the ordinary non-stale path. Without this, a draining old
+    /// connection's in-flight, numerically-high (pre-restart) sequence can
+    /// bump `last_sequence` back up after the new session's reset, making
+    /// every later FullSync from the restarted peer look stale again with
+    /// no exemption left to rescue it (the one-shot was already consumed).
+    ///
+    /// `None` means no session has ever been armed for this peer (e.g. a
+    /// freshly added peer, or a local/test caller that never goes through
+    /// the TLS-authenticated arming path); in that case updates are
+    /// accepted from any source, matching pre-existing behavior.
+    pub current_session_source: Option<SocketAddr>,
+    /// The connection instance that armed `current_session_source`, held
+    /// weakly so this never keeps a dead connection's resources alive.
+    ///
+    /// `current_session_source` alone cannot tell a live successor from a
+    /// dead predecessor: if the arming connection closes and is succeeded
+    /// by a connection that never arms (a cert-type migration, a non-mTLS
+    /// client, or simply a `node_id` mismatch), nothing ever clears
+    /// `current_session_source`, and the gate would otherwise reject the
+    /// live successor's traffic forever. `peer_info_is_from_current_session`
+    /// checks whether this instance is still `connection_pool`'s current
+    /// published connection for the peer on every use; if not, the armed
+    /// session has expired and both this and `current_session_source` /
+    /// `accept_lower_sequence_from` are cleared, falling back to the
+    /// unarmed (accept-from-any-source) behavior.
+    pub current_session_connection: Option<std::sync::Weak<crate::connection_pool::LockFreeConnection>>,
+    /// Monotonic counter bumped every time `current_session_source` /
+    /// `current_session_connection` change -- armed by
+    /// `arm_sequence_reset_for_new_session`, or cleared by
+    /// `peer_info_is_from_current_session`'s self-healing expiry.
+    ///
+    /// A session-gated decision (accept this FullSync/delta, it is from
+    /// the current session) and the actual state mutation it authorizes
+    /// (known_actors/peer_to_actors upserts, omission pruning, the delta
+    /// apply) are not always performed under the same lock acquisition --
+    /// collecting candidate updates, resolving addresses, or handing off
+    /// to `apply_delta_from` can all involve released-and-reacquired locks
+    /// or `.await` points. Without this counter, a connection whose
+    /// traffic was validated as "current" at the START of that pipeline
+    /// could have its write actually land AFTER a newer session has
+    /// armed and completed its own (possibly lower-sequence, restart)
+    /// write, silently overwriting the newer session's state with the
+    /// old one's pre-restart snapshot.
+    ///
+    /// Callers capture this value at validation time and re-compare it
+    /// immediately before the actual mutation, atomically under whatever
+    /// lock guards that mutation (see `merge_full_sync_from`'s STEP 2 and
+    /// `apply_delta_from`'s `session_guard` parameter); a mismatch means a
+    /// newer session has since been armed or the old one has expired, and
+    /// the pending write must be dropped rather than applied.
+    pub current_session_epoch: u64,
 }
 
 impl PeerInfo {
@@ -1096,6 +1249,10 @@ impl PeerInfo {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         }
     }
 
@@ -1127,6 +1284,10 @@ impl PeerInfo {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         }
     }
 
@@ -1179,6 +1340,10 @@ impl PeerInfo {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         })
     }
 }
@@ -2045,6 +2210,10 @@ impl<T: 'static> GossipRegistry<T> {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -2318,7 +2487,119 @@ impl<T: 'static> GossipRegistry<T> {
         self.add_peer_with_node_id(peer_addr, None).await;
     }
 
-    /// Add a new peer with GossipNodeId for TLS verification
+    /// R-11: arm the one-shot lower-sequence acceptance for a peer whose
+    /// identity has just completed a NEW TLS-authenticated session.
+    ///
+    /// This is armed on EVERY inbound authenticated session, not only on
+    /// restarts — a new TLS session is also established on routine reconnects
+    /// (keepalive failure, network blip, LB/proxy recycle, same-pod
+    /// reconnect). That is harmless rather than restart "evidence": a peer
+    /// that merely reconnected reports its current sequence, which is >= our
+    /// high-water mark, so the exemption is never exercised. It is consumed
+    /// only when the peer comes back with a LOWER sequence, i.e. a restart.
+    ///
+    /// Two things keep it safe:
+    /// - it is scoped to the connection that armed it (see `session_source`),
+    ///   so it cannot be consumed by a replay arriving on any other path; and
+    /// - `node_id` is the TLS client certificate identity, not a wire-claimed
+    ///   field, and must match the recorded `node_id`, so a peer cannot arm
+    ///   the reset against a *victim* identity (cf. B-5).
+    ///
+    /// `session_source` is the VERIFIED TCP source address of the newly
+    /// authenticated connection, including its ephemeral port. Only a FullSync
+    /// arriving from that exact source consumes the exemption, so an old
+    /// connection still draining through a reconnect cannot steal it.
+    ///
+    /// `connection_instance` ties the arm to the exact connection object the
+    /// caller believes just went live, not merely to `node_id`. Publication
+    /// (compare-and-publish into the connection pool) and this arm are two
+    /// separate operations, so a caller can still be running this call after
+    /// a NEWER connection for the same peer has already been published --
+    /// e.g. a stale outbound finalizer, or a stale inbound accept handler
+    /// whose own tie-break resolution is followed by an `.await` a
+    /// concurrent, faster accept/finalize can race past.
+    ///
+    /// The revalidation (a pure, non-mutating snapshot read -- never the
+    /// self-healing `get_connection_by_peer_id`, whose side effects must
+    /// not fire from a decision path) happens WHILE HOLDING the
+    /// `gossip_state` lock, immediately before writing `peer_info`: a
+    /// version checked-then-released-then-reacquired would leave the same
+    /// race window this is meant to close (a descheduled stale task could
+    /// pass the check, let a newer session arm, then resume and clobber it
+    /// anyway). `peer_current_connection_snapshot` is a synchronous,
+    /// lock-free read with no `.await` of its own, so calling it inside an
+    /// already-held async mutex cannot deadlock or block other lockers for
+    /// longer than an ordinary map read.
+    ///
+    /// If a DIFFERENT connection is now the peer's current published one,
+    /// `connection_instance` has been superseded and the arm is skipped
+    /// entirely rather than clobbering the newer session's discriminator
+    /// with this stale caller's obsolete source. A peer with no currently
+    /// published connection at all (e.g. a caller that manages sessions
+    /// without registering into the connection pool, as local/test callers
+    /// do) is not evidence of supersession, so the arm proceeds.
+    pub async fn arm_sequence_reset_for_new_session(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: crate::GossipNodeId,
+        session_source: SocketAddr,
+        peer_id: &crate::PeerId,
+        connection_instance: &std::sync::Arc<crate::connection_pool::LockFreeConnection>,
+    ) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr)
+            && peer_info.node_id == Some(node_id)
+        {
+            let superseded_by_a_different_connection = self
+                .connection_pool
+                .peer_current_connection_snapshot(peer_id)
+                .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, connection_instance));
+            if superseded_by_a_different_connection {
+                debug!(
+                    peer = %peer_addr,
+                    session_source = %session_source,
+                    "R-11: declining to arm sequence-reset; this connection instance \
+                     has already been superseded by a newer published session"
+                );
+                return;
+            }
+
+            // Nothing to do for a peer that never got past sequence 0.
+            if peer_info.last_sequence > 0 {
+                debug!(
+                    peer = %peer_addr,
+                    session_source = %session_source,
+                    last_sequence = peer_info.last_sequence,
+                    "R-11: new authenticated session; will accept one \
+                     lower-sequence FullSync from this connection"
+                );
+            }
+            peer_info.accept_lower_sequence_from = Some(session_source);
+            // Persists across the one-shot's consumption -- see the field
+            // doc comment. This is what lets `merge_full_sync_from` keep
+            // rejecting an old, still-draining connection's traffic for the
+            // rest of this peer's session, not merely for the first sync.
+            peer_info.current_session_source = Some(session_source);
+            // The connection instance backing `current_session_source`.
+            // Checked by `peer_info_is_from_current_session` so a
+            // subsequently disconnected/superseded session's discriminator
+            // self-expires instead of permanently rejecting a live,
+            // non-arming successor's traffic.
+            peer_info.current_session_connection = Some(std::sync::Arc::downgrade(connection_instance));
+            // A new session epoch begins here: any in-flight apply that
+            // captured an epoch before this point must be dropped rather
+            // than allowed to write, even if it validated as "current
+            // session" moments before this arm. Drawn from the process-wide
+            // counter, NEVER derived from the current value (see
+            // `next_session_epoch`'s doc comment for why a locally-reset
+            // scheme is unsafe here): a `PeerInfo` recreated at the same
+            // address (or reused by a different peer identity) must not be
+            // able to reproduce an epoch a still-in-flight, already-stale
+            // apply captured against the entry it replaced.
+            peer_info.current_session_epoch = next_session_epoch();
+        }
+    }
+
     pub async fn add_peer_with_node_id(
         &self,
         peer_addr: SocketAddr,
@@ -2384,6 +2665,10 @@ impl<T: 'static> GossipRegistry<T> {
                             last_failure_time: None,
                             last_dns_refresh_attempt: None,
                             last_response_received_ms: current_time_ms,
+                            accept_lower_sequence_from: None,
+                            current_session_source: None,
+                            current_session_connection: None,
+                            current_session_epoch: 0,
                         },
                     );
 
@@ -3327,7 +3612,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// Duplicate deltas whose contents were all suppressed return an empty
     /// list, making delta application observably idempotent.
     pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<Vec<String>> {
-        self.apply_delta_from(delta, None).await
+        self.apply_delta_from(delta, None, None).await
     }
 
     /// Apply a delta, resolving advertised addresses against the
@@ -3336,10 +3621,25 @@ impl<T: 'static> GossipRegistry<T> {
     /// outranks any locally derived route (configured/discovered), which
     /// may be stale. Wire receive paths must pass `verified_sender_addr`;
     /// `None` (local/test callers) falls back to the connection-pool route.
+    ///
+    /// `session_guard`, when the caller already validated this delta
+    /// against `peer_info_is_from_current_session` under its own lock
+    /// acquisition, is `Some((peer_addr, captured_epoch))` -- the same
+    /// key and `PeerInfo::current_session_epoch` value observed at
+    /// that validation. It is re-checked atomically here, under the same
+    /// `gossip_state` lock this function already takes for its actual
+    /// mutations, immediately before applying any change: a mismatch means
+    /// a newer session was armed (or the validated one self-expired)
+    /// between the caller's validation and this call actually running, and
+    /// the whole delta is dropped rather than partially or fully applied.
+    /// `None` skips the recheck (no session context to validate against,
+    /// e.g. local/test callers), matching the un-gated behavior deltas had
+    /// before session scoping existed.
     pub async fn apply_delta_from(
         &self,
         delta: RegistryDelta,
         verified_sender_addr: Option<SocketAddr>,
+        session_guard: Option<(SocketAddr, u64)>,
     ) -> Result<Vec<String>> {
         let total_changes = delta.changes.len();
         let sender_peer_id = delta.sender_peer_id.clone();
@@ -3389,8 +3689,28 @@ impl<T: 'static> GossipRegistry<T> {
         let mut applied_count = 0usize;
         let mut peer_actor_names_changed = std::collections::HashSet::new();
         let mut applied_immediate: Vec<String> = Vec::new();
+        if let Some((session_peer_addr, _)) = session_guard {
+            crate::lifecycle::record_transport_event(
+                crate::lifecycle::TransportLifecycleEvent::DeltaApplyPendingMutation {
+                    peer: sender_peer_id.clone(),
+                    addr: session_peer_addr,
+                },
+            );
+        }
         let log_adds: Vec<(String, RemoteActorLocation)> = {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            if let Some((session_peer_addr, expected_epoch)) = session_guard
+                && !session_epoch_still_current(&gossip_state, session_peer_addr, expected_epoch)
+            {
+                debug!(
+                    peer = %session_peer_addr,
+                    "dropping delta apply; a newer session was armed after \
+                     this message's session validation"
+                );
+                return Ok(Vec::new());
+            }
+
             let mut log_adds = Vec::new();
             let mut sender_actors = bookkeeping_addr
                 .and_then(|addr| gossip_state.peer_to_actors.get(&addr).cloned())
@@ -4360,6 +4680,10 @@ impl<T: 'static> GossipRegistry<T> {
                         last_failure_time: None,
                         last_dns_refresh_attempt: None,
                         last_response_received_ms: crate::current_timestamp_millis(),
+                        accept_lower_sequence_from: None,
+                        current_session_source: None,
+                        current_session_connection: None,
+                        current_session_epoch: 0,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -4720,7 +5044,10 @@ impl<T: 'static> GossipRegistry<T> {
 
                 // `addr` is the verified socket address this response
                 // arrived from — the §1.6 trust anchor for address repair.
-                self.apply_delta_from(delta, Some(addr)).await?;
+                // No session_guard: this call path is unreachable for real
+                // wire traffic (see the doc comment on the FullSyncResponse
+                // arm below for the full trace).
+                self.apply_delta_from(delta, Some(addr), None).await?;
                 // Don't add peer here - peers are managed through handle_connection
 
                 let now = crate::current_timestamp_millis();
@@ -4779,12 +5106,32 @@ impl<T: 'static> GossipRegistry<T> {
                 // Peer bookkeeping keys on the peer's BIND address; address
                 // REPAIR anchors on the verified TCP source (§1.6) — the
                 // peer-controlled sender_bind_addr is never a trust anchor.
+                //
+                // `session_source: None` (falls back to `verified_sender_addr`,
+                // the peer's dial-target/bind address) is only correct
+                // because this call is unreachable for real wire traffic:
+                // `handle_gossip_response` is invoked from
+                // `apply_gossip_results`, whose `GossipResult::outcome` is
+                // always built from `send_gossip_message_zero_copy`'s
+                // `Result<()>` (see `gossip_send_outcome_to_result` in
+                // handle.rs) -- a fire-and-forget send that never carries a
+                // reply. Every FullSyncResponse actually received over the
+                // wire arrives asynchronously on its own connection's read
+                // task and is processed by `handle_incoming_message`
+                // instead, which threads that connection's real
+                // `session_source` (the dialling socket's own local
+                // ephemeral port for outbound connections). If this call
+                // path is ever wired to a genuine response, `None` here
+                // would silently drop legitimate current-session outbound
+                // FullSyncResponses under the `from_current_session` gate --
+                // thread the real per-connection session source instead.
                 self.merge_full_sync_from(
                     local_actors.into_iter().collect(),
                     known_actors.into_iter().collect(),
                     sender_peer_id,
                     sender_socket_addr,
                     Some(addr),
+                    None,
                     sequence,
                     wall_clock_time,
                 )
@@ -4794,7 +5141,14 @@ impl<T: 'static> GossipRegistry<T> {
                 let mut gossip_state = self.gossip_state.lock().await;
                 if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
                     peer_info.consecutive_deltas = 0;
-                    peer_info.last_sequence = peer_info.last_sequence.max(sequence);
+                    // `last_sequence` is NOT touched here: `merge_full_sync_from`
+                    // above already owns it atomically, including the
+                    // session-scoped restart-reset semantics. A second,
+                    // unscoped `max()` here would let this arrive-any-order,
+                    // any-connection update silently restore a stale
+                    // high-water mark that `merge_full_sync_from` correctly
+                    // rejected or reset moments earlier.
+                    //
                     // Inbound payload from peer — proves app-level liveness.
                     peer_info.last_response_received_ms =
                         peer_info.last_response_received_ms.max(now);
@@ -4819,16 +5173,127 @@ impl<T: 'static> GossipRegistry<T> {
         sequence: u64,
         wall_clock_time: u64,
     ) {
-        self.merge_full_sync_from(
-            remote_local,
-            remote_known,
-            sender_peer_id,
-            sender_addr,
-            None,
-            sequence,
-            wall_clock_time,
-        )
-        .await
+        let _ = self
+            .merge_full_sync_from(
+                remote_local,
+                remote_known,
+                sender_peer_id,
+                sender_addr,
+                None,
+                None,
+                sequence,
+                wall_clock_time,
+            )
+            .await;
+    }
+
+    /// Whether a gossip message (FullSync or Delta) claiming to arrive on
+    /// `session_source` should be treated as coming from `peer_info`'s
+    /// current authenticated session.
+    ///
+    /// Three explicit cases, in order:
+    ///
+    /// 1. `connection_pool` still shows the ARMED connection as current
+    ///    (nothing supersedes it, including when nothing has ever been
+    ///    recorded at all -- e.g. a registry-level caller that manages
+    ///    sessions without registering into the pool, as most tests do, or
+    ///    a narrow window before the pool has indexed anything): only a
+    ///    message whose `session_source` matches the armed source is
+    ///    current.
+    /// 2. `connection_pool` shows a DIFFERENT connection as current, but
+    ///    this message's `session_source` is the OLD armed source itself:
+    ///    REJECT outright. This is the superseded connection's own
+    ///    traffic -- it must not be treated as current, and critically
+    ///    must NOT trigger the self-heal clear below, which would let it
+    ///    back in via the resulting "no session armed" fallback and spend
+    ///    the exemption (via the ordinary path's unconditional
+    ///    `accept_lower_sequence_from = None`) before the actual live
+    ///    successor ever gets a chance to use it.
+    /// 3. `connection_pool` shows a DIFFERENT connection as current, and
+    ///    this message's `session_source` is neither the armed source nor
+    ///    (by elimination) unaccounted for: genuine evidence of a live
+    ///    successor. Self-heal -- clear the expired session right here so
+    ///    the fallback in case 1 accepts this (and all subsequent, until a
+    ///    new arm) traffic, instead of permanently rejecting a live,
+    ///    non-arming successor forever.
+    ///
+    /// Must be called with `peer_info` borrowed from an already-locked
+    /// `gossip_state`, and the caller must perform any subsequent mutation
+    /// before releasing that lock -- this function does not itself hold or
+    /// re-acquire `gossip_state`, so it is safe (and required, to stay
+    /// atomic with the caller's own write) to call from within an existing
+    /// critical section.
+    pub(crate) fn peer_info_is_from_current_session(
+        &self,
+        peer_id: &crate::PeerId,
+        peer_info: &mut PeerInfo,
+        session_source: Option<SocketAddr>,
+    ) -> bool {
+        let Some(armed_source) = peer_info.current_session_source else {
+            // No session has ever been armed for this peer: accept from
+            // any source, preserving prior behavior.
+            return true;
+        };
+
+        // Independent of whether THIS message came from the armed source:
+        // is `connection_pool` currently showing a DIFFERENT connection as
+        // the peer's current one than the one that armed the session?
+        let current_connection = self.connection_pool.peer_current_connection_snapshot(peer_id);
+        let pool_shows_different_connection = current_connection.as_ref().is_some_and(|current| {
+            !peer_info
+                .current_session_connection
+                .as_ref()
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|armed| std::sync::Arc::ptr_eq(&armed, current))
+        });
+
+        let from_armed_source = session_source == Some(armed_source);
+
+        if !pool_shows_different_connection {
+            // Case 1: nothing supersedes the armed connection yet.
+            return from_armed_source;
+        }
+
+        if from_armed_source {
+            // Case 2: the OLD, now-superseded connection's own traffic.
+            // Reject without touching any session state.
+            return false;
+        }
+
+        // Case 3 candidate: the pool shows a different connection is
+        // current, and this message isn't from the armed source. That
+        // alone is not proof it arrived on the PUBLISHED successor,
+        // though -- during rapid reconnects a THIRD connection (a
+        // stale/tie-break-losing candidate that never itself became
+        // current) also has a `session_source` different from the armed
+        // one. Self-heal must only fire for traffic that actually arrived
+        // on the connection instance `connection_pool` is publishing as
+        // current, confirmed here via `LockFreeConnection::session_source`
+        // -- the same non-spoofable per-connection identity `Arc::ptr_eq`
+        // checks above, applied to the receiving side instead of the
+        // armed side.
+        let from_current_published_successor = current_connection
+            .as_ref()
+            .is_some_and(|current| Some(current.session_source) == session_source);
+
+        if !from_current_published_successor {
+            // A stale or tie-break-losing third connection. Reject without
+            // self-healing or touching any session state -- only the
+            // actually-current published successor may do that.
+            return false;
+        }
+
+        // Case 3: the live successor's own traffic, confirmed. Self-heal.
+        peer_info.current_session_source = None;
+        peer_info.accept_lower_sequence_from = None;
+        peer_info.current_session_connection = None;
+        // The session epoch also ends here, for the same reason as in
+        // `arm_sequence_reset_for_new_session`: a pending apply that
+        // captured the epoch while this (now-expired) session still
+        // validated must not be allowed to write. Drawn fresh from the
+        // process-wide counter -- see `next_session_epoch`.
+        peer_info.current_session_epoch = next_session_epoch();
+        true
     }
 
     /// Merge a full sync, resolving advertised actor addresses against the
@@ -4840,7 +5305,28 @@ impl<T: 'static> GossipRegistry<T> {
     /// for address repair — a peer's self-declared bind must never be
     /// what we repair other addresses from. Wire receive paths must pass
     /// it; `None` (local/test callers) falls back to `sender_addr`.
+    ///
+    /// `session_source` (R-11) is the connection's own session
+    /// discriminator (see `ReadContext::session_source`) and is what the
+    /// restart-sequence exemption gates on. For inbound connections it is
+    /// identical to `verified_sender_addr` (the remote's ephemeral port is
+    /// already unique per connection), so callers that don't distinguish
+    /// the two may pass `None` and it falls back to `verified_sender_addr`.
+    /// For OUTBOUND connections it must be the dialling socket's own local
+    /// ephemeral port, NOT `verified_sender_addr` -- the latter is the
+    /// peer's fixed listening port there, identical for every connection we
+    /// ever make to it, so it cannot tell a redial's new connection apart
+    /// from an old one still draining.
     #[allow(clippy::too_many_arguments)]
+    /// Returns whether this message validated as being from the peer's
+    /// current authenticated session (`peer_info_is_from_current_session`'s
+    /// STEP 1 verdict) -- regardless of whether its specific sequence/actor
+    /// content went on to be applied, replay-rejected, or dropped by the
+    /// narrower STEP 2 epoch recheck. Callers use this to gate any of
+    /// THEIR OWN peer-state bookkeeping (failure/health resets,
+    /// `consecutive_deltas`, etc.) that must likewise only be touched by
+    /// the current session -- see `handle_incoming_message`'s FullSync /
+    /// FullSyncResponse arms.
     pub async fn merge_full_sync_from(
         &self,
         remote_local: HashMap<String, RemoteActorLocation>,
@@ -4848,36 +5334,128 @@ impl<T: 'static> GossipRegistry<T> {
         sender_peer_id: crate::PeerId,
         sender_addr: SocketAddr,
         verified_sender_addr: Option<SocketAddr>,
+        session_source: Option<SocketAddr>,
         sequence: u64,
         _wall_clock_time: u64,
-    ) {
+    ) -> bool {
         let repair_addr = verified_sender_addr.unwrap_or(sender_addr);
+        let session_source = session_source.or(verified_sender_addr);
         // Don't add peer here - peers are managed through handle_connection
 
         // Record comprehensive node activity
 
-        // Check if we've already processed this or a newer sequence from this peer
-        {
-            let gossip_state = self.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get(&sender_addr) {
-                if sequence < peer_info.last_sequence {
-                    debug!(
-                        last_sequence = peer_info.last_sequence,
-                        received_sequence = sequence,
-                        "ignoring old gossip message"
-                    );
-                    return;
-                }
-            }
-        }
-
-        // Update peer sequence and vector clock
-        {
+        // Check if we've already processed this or a newer sequence from this
+        // peer, and take the sequence update in the SAME critical section.
+        //
+        // R-11: a restarted peer resumes from sequence ~0, so this gate would
+        // otherwise drop all of its FullSyncs forever (`last_sequence` only
+        // advances and is never reset — the `handle_peer_death` reset the
+        // comments elsewhere reference no longer exists). The omission-prune
+        // then never runs and actors the peer no longer hosts linger until the
+        // 24h TTL. `accept_lower_sequence` is a one-shot exemption armed only
+        // by a new TLS-authenticated session; it is consumed here so the gate
+        // is restored immediately.
+        //
+        // Gate and update are one critical section because the exemption is
+        // one-shot: releasing the lock between them would let two concurrent
+        // restarted-peer FullSyncs both observe the armed flag.
+        // `captured_epoch` is `PeerInfo::current_session_epoch` as
+        // observed at the moment this message was validated as being from
+        // the peer's current session, below. STEP 2 re-checks it
+        // atomically, under its own lock, immediately before mutating
+        // `known_actors`/`peer_to_actors` -- collecting and resolving
+        // `updates_to_apply` between here and there involves no lock at
+        // all, so a newer session can arm (or the validated one can
+        // self-expire) in that gap, and this is what lets STEP 2 detect
+        // and drop the now-stale pending write instead of applying it.
+        let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
-                peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
+                // Once a session has been armed for this peer, only the
+                // connection that armed it is treated as authoritative for
+                // *any* sequence update, not merely for the lower-sequence
+                // exemption below. An old connection still draining through
+                // a reconnect can keep delivering in-flight, numerically
+                // HIGH (pre-restart) sequences after the new session's
+                // reset; letting those bump `last_sequence` back up via the
+                // ordinary non-stale path would make every later FullSync
+                // from the restarted peer look stale again with no
+                // exemption left to rescue it (the one-shot is already
+                // spent). `None` means no session has ever been armed for
+                // this peer (fresh peer, or a local/test caller bypassing
+                // the TLS-authenticated arming path) and is accepted from
+                // any source, preserving prior behavior. See
+                // `peer_info_is_from_current_session` for the self-healing
+                // expiry check that keeps this from permanently rejecting a
+                // live successor once the armed connection is gone.
+                let from_current_session =
+                    self.peer_info_is_from_current_session(&sender_peer_id, peer_info, session_source);
+
+                if !from_current_session {
+                    debug!(
+                        peer = %sender_addr,
+                        last_sequence = peer_info.last_sequence,
+                        received_sequence = sequence,
+                        "ignoring gossip from a connection that is not this \
+                         peer's current authenticated session"
+                    );
+                    return false;
+                }
+
+                if sequence < peer_info.last_sequence {
+                    // The one-shot exemption is scoped to the connection
+                    // that armed it: only a FullSync from that exact
+                    // verified TCP source (ephemeral port included) may
+                    // consume it. A replayed or relayed frame arriving by
+                    // any other path cannot consume it. Unverifiable
+                    // sources (`None`) fail closed.
+                    let armed_for_this_connection = peer_info
+                        .accept_lower_sequence_from
+                        .zip(session_source)
+                        .is_some_and(|(armed, verified)| armed == verified);
+
+                    if !armed_for_this_connection {
+                        debug!(
+                            last_sequence = peer_info.last_sequence,
+                            received_sequence = sequence,
+                            "ignoring old gossip message"
+                        );
+                        // The connection IS the peer's current session (the
+                        // check above already confirmed that); this
+                        // specific sequence just looks like an in-session
+                        // replay. `true` because the caller's own
+                        // peer-health bookkeeping is about session
+                        // authority, not this particular message's content.
+                        return true;
+                    }
+                    info!(
+                        peer = %sender_addr,
+                        last_sequence = peer_info.last_sequence,
+                        received_sequence = sequence,
+                        "R-11: accepting lower-sequence FullSync after peer restart"
+                    );
+                    // Consume the one-shot and adopt the restarted peer's
+                    // sequence line wholesale — `max()` would pin us to the
+                    // pre-restart high-water mark and re-close the gate against
+                    // every subsequent sync from the restarted peer.
+                    // `current_session_source` is untouched: it persists for
+                    // the rest of this session so later syncs keep rejecting
+                    // any other connection's traffic (see above).
+                    peer_info.accept_lower_sequence_from = None;
+                    peer_info.last_sequence = sequence;
+                } else {
+                    // Reached only for messages already confirmed to be
+                    // from the current session (or before any session was
+                    // ever armed), so clearing the one-shot here cannot be
+                    // triggered by an unrelated connection.
+                    peer_info.accept_lower_sequence_from = None;
+                    peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
+                }
+                Some(peer_info.current_session_epoch)
+            } else {
+                None
             }
-        }
+        };
 
         let mut new_actors = 0;
         let mut updated_actors = 0;
@@ -4951,8 +5529,35 @@ impl<T: 'static> GossipRegistry<T> {
         // plan-then-execute fix on `apply_delta`. See test
         // `test_apply_delta_and_cleanup_dead_peers_preserve_invariant`.
         let mut routes_to_configure: Vec<(String, crate::PeerId, SocketAddr)> = Vec::new();
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::FullSyncApplyPendingMutation {
+                peer: sender_peer_id.clone(),
+                addr: sender_addr,
+            },
+        );
         {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            // Atomic generation recheck, immediately before any write in
+            // this block: if a newer session has been armed (or the
+            // validated one has self-expired) since STEP 1 captured
+            // `captured_epoch`, this pending apply is stale and must
+            // be dropped rather than overwrite the newer session's state
+            // with this connection's (possibly pre-restart) snapshot.
+            if let Some(generation) = captured_epoch
+                && !session_epoch_still_current(&gossip_state, sender_addr, generation)
+            {
+                debug!(
+                    peer = %sender_addr,
+                    "dropping full-sync actor apply; a newer session was armed \
+                     after this message's sequence validation"
+                );
+                // Was current at STEP 1 (that is what got this far); the
+                // narrower epoch race is about this specific pending
+                // write, not session authority, so still `true`.
+                return true;
+            }
+
             let mut rejected_by_peer_cap = 0usize;
             let mut rejected_by_global_cap = 0usize;
 
@@ -5104,6 +5709,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_actor_count = peer_actors.len(),
             "merged gossip data using vector clock conflict resolution"
         );
+        true
     }
 
     /// Clean up stale actor entries (using wall clock for TTL)
@@ -7597,6 +8203,10 @@ impl<T: 'static> GossipRegistry<T> {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: now_ms,
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -8647,6 +9257,7 @@ mod tests {
             owner.clone(),
             bind_addr,
             Some(verified_addr),
+            None,
             1,
             current_timestamp(),
         )
@@ -8660,6 +9271,542 @@ mod tests {
             stored.address,
             SocketAddr::new(verified_addr.ip(), 9400).to_string(),
             "repair must use the verified TCP source IP, not the self-declared bind"
+        );
+    }
+
+    /// R-11 helper: a throwaway connection instance for
+    /// `arm_sequence_reset_for_new_session`'s instance-supersession check.
+    /// These registry-level tests never publish anything into
+    /// `connection_pool`, so `peer_current_connection_snapshot` always
+    /// returns `None` for them regardless of which instance is passed here
+    /// -- there is no "different" published connection to be superseded
+    /// by, so the arm always proceeds. Only the connection-pool-level tests
+    /// (`connection_pool::tests`, `handle::tests`) exercise the actual
+    /// supersession check against a real published connection.
+    fn qa_r11_dummy_connection_instance(
+        addr: SocketAddr,
+    ) -> std::sync::Arc<crate::connection_pool::LockFreeConnection> {
+        std::sync::Arc::new(crate::connection_pool::LockFreeConnection::new(
+            addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        ))
+    }
+
+    /// R-11 helper: a FullSync from `owner` advertising exactly `actors`,
+    /// arriving on the connection whose verified TCP source is `source`.
+    async fn qa_r11_full_sync_from(
+        reg: &GossipRegistry<()>,
+        owner: &crate::PeerId,
+        peer_addr: SocketAddr,
+        source: SocketAddr,
+        sequence: u64,
+        actors: &[&str],
+    ) {
+        let mut local_actors = HashMap::new();
+        for name in actors {
+            local_actors.insert(
+                (*name).to_string(),
+                RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+            );
+        }
+        reg.merge_full_sync_from(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(source),
+            None,
+            sequence,
+            current_timestamp(),
+        )
+        .await;
+    }
+
+    /// R-11 (review P1, both bots): the exemption must be scoped to the
+    /// connection that armed it.
+    ///
+    /// A new TLS session is established on every routine reconnect, not only
+    /// on restarts, so arming is common. If the exemption were merely
+    /// address-level, an OLD connection still draining through the reconnect
+    /// could deliver its in-flight lower-sequence FullSync first and consume
+    /// it -- and the genuine restart sync arriving on the new connection would
+    /// then be rejected by the restored gate, recreating the very outage this
+    /// change fixes.
+    ///
+    /// Scoping to the verified TCP source (ephemeral port included)
+    /// distinguishes the two connections.
+    #[tokio::test]
+    async fn qa_r11_draining_connection_cannot_consume_the_new_sessions_exemption() {
+        let reg = GossipRegistry::<()>::new(test_addr(7804), test_config_with_seed("qa-r11-drain"));
+        let owner = KeyPair::new_for_testing("qa-r11-drain-owner").peer_id();
+        let node_id = owner.to_node_id();
+        let peer_addr = test_addr(9404);
+        // Two distinct connections from the same peer identity: the old one
+        // still draining, and the freshly authenticated one.
+        let old_connection = test_addr(55001);
+        let new_connection = test_addr(55002);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        qa_r11_full_sync_from(
+            &reg,
+            &owner,
+            peer_addr,
+            old_connection,
+            40,
+            &["qa_r11d/X", "qa_r11d/Y"],
+        )
+        .await;
+
+        // The restarted peer's new connection arms the exemption.
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
+            .await;
+
+        // The OLD connection's in-flight lower-sequence FullSync arrives first.
+        // It must NOT consume the exemption.
+        qa_r11_full_sync_from(&reg, &owner, peer_addr, old_connection, 7, &["qa_r11d/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11d/Y").await.is_some(),
+            "R-11: a draining old connection must not be admitted by the new \
+             session's exemption"
+        );
+
+        // The genuine restart sync on the NEW connection is still admitted.
+        qa_r11_full_sync_from(&reg, &owner, peer_addr, new_connection, 1, &["qa_r11d/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11d/Y").await.is_none(),
+            "R-11: the exemption must still be available to the connection that \
+             armed it, so the restart sync prunes the stale actor"
+        );
+    }
+
+    /// R-11 helper: a FullSync arriving with the peer's own address as source.
+    async fn qa_r11_full_sync(
+        reg: &GossipRegistry<()>,
+        owner: &crate::PeerId,
+        peer_addr: SocketAddr,
+        sequence: u64,
+        actors: &[&str],
+    ) {
+        let mut local_actors = HashMap::new();
+        for name in actors {
+            local_actors.insert(
+                (*name).to_string(),
+                RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+            );
+        }
+        reg.merge_full_sync_from(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(peer_addr),
+            None,
+            sequence,
+            current_timestamp(),
+        )
+        .await;
+    }
+
+    /// R-11: a peer that crashes and restarts resumes from sequence ~0. The
+    /// stale gate (`sequence < last_sequence`) dropped every one of its
+    /// FullSyncs forever, because `last_sequence` only ever advances and the
+    /// `handle_peer_death` reset the comments reference no longer exists.
+    /// The omission-prune therefore never ran, so an actor the peer no longer
+    /// hosts stayed in `known_actors` until the 24h TTL — and because the peer
+    /// is healthy, the dead-peer reap never fired either.
+    #[tokio::test]
+    async fn qa_r11_restart_omission_prune_within_one_round() {
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7801), test_config_with_seed("qa-r11-restart"));
+        let owner_kp = KeyPair::new_for_testing("qa-r11-owner");
+        let owner = owner_kp.peer_id();
+        let node_id = owner.to_node_id();
+        let peer_addr = test_addr(9401);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+
+        // Pre-restart: B is at sequence 40 hosting X and Y.
+        qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11/X", "qa_r11/Y"]).await;
+        assert!(reg.lookup_actor("qa_r11/X").await.is_some());
+        assert!(reg.lookup_actor("qa_r11/Y").await.is_some());
+
+        // B restarts: new authenticated session, sequence back to 1, and it no
+        // longer hosts Y.
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11/X"]).await;
+
+        assert!(
+            reg.lookup_actor("qa_r11/X").await.is_some(),
+            "R-11: the restarted peer's surviving actor must remain"
+        );
+        assert!(
+            reg.lookup_actor("qa_r11/Y").await.is_none(),
+            "R-11: the omission-prune must drop an actor the restarted peer no \
+             longer advertises, within one sync round"
+        );
+    }
+
+    /// R-11: the one-shot must be exactly one-shot. After the restart sync is
+    /// admitted the gate is restored, so an in-session replay of an older
+    /// sequence is still dropped — that is what the gate exists for.
+    #[tokio::test]
+    async fn qa_r11_stale_gate_still_blocks_mid_session_replays() {
+        let reg = GossipRegistry::<()>::new(test_addr(7802), test_config_with_seed("qa-r11-replay"));
+        let owner_kp = KeyPair::new_for_testing("qa-r11-replay-owner");
+        let owner = owner_kp.peer_id();
+        let node_id = owner.to_node_id();
+        let peer_addr = test_addr(9402);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11r/X", "qa_r11r/Y"]).await;
+
+        // No new session — a replayed old FullSync omitting Y must NOT prune Y.
+        qa_r11_full_sync(&reg, &owner, peer_addr, 5, &["qa_r11r/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11r/Y").await.is_some(),
+            "R-11: the stale gate must still drop in-session lower-sequence replays"
+        );
+
+        // One new session admits exactly one lower-sequence sync...
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 3, &["qa_r11r/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11r/Y").await.is_none(),
+            "R-11: the armed one-shot must admit the restart sync"
+        );
+
+        // ...and is consumed: a second, still-lower replay is dropped again.
+        qa_r11_full_sync(&reg, &owner, peer_addr, 2, &["qa_r11r/X", "qa_r11r/Z"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11r/Z").await.is_none(),
+            "R-11: the one-shot must be consumed by the sync it admits"
+        );
+    }
+
+    /// R-11 (security boundary, cf. B-5): the reset is keyed to the
+    /// TLS-authenticated identity. Arming for an address whose recorded
+    /// `node_id` is a DIFFERENT identity must be a no-op, so a peer cannot
+    /// weaponise the reset against a victim's bookkeeping.
+    #[tokio::test]
+    async fn qa_r11_arming_requires_matching_authenticated_identity() {
+        let reg = GossipRegistry::<()>::new(test_addr(7803), test_config_with_seed("qa-r11-ident"));
+        let owner = KeyPair::new_for_testing("qa-r11-ident-owner").peer_id();
+        let attacker_node_id = KeyPair::new_for_testing("qa-r11-ident-attacker")
+            .peer_id()
+            .to_node_id();
+        let peer_addr = test_addr(9403);
+
+        reg.add_peer_with_node_id(peer_addr, Some(owner.to_node_id()))
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11i/X", "qa_r11i/Y"]).await;
+
+        // A different identity must not be able to arm the victim's reset.
+        reg.arm_sequence_reset_for_new_session(peer_addr, attacker_node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
+            .await;
+        qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11i/X"]).await;
+
+        assert!(
+            reg.lookup_actor("qa_r11i/Y").await.is_some(),
+            "R-11: arming under a non-matching identity must not open the stale gate"
+        );
+    }
+
+    /// R-11 helper: a FullSync arriving with an explicit, independent session
+    /// discriminator (`session_source`) distinct from the connection's
+    /// verified TCP source (`verified_addr`). Mirrors what an OUTBOUND
+    /// connection's receive path reports: `verified_addr` is the peer's
+    /// fixed dial-target address (identical for every outbound connection we
+    /// ever make to it, since the repair anchor is the connection's remote
+    /// end), while `session_source` is the dialling socket's OWN local
+    /// ephemeral port (unique per connection).
+    async fn qa_r11_full_sync_with_session_source(
+        reg: &GossipRegistry<()>,
+        owner: &crate::PeerId,
+        peer_addr: SocketAddr,
+        verified_addr: SocketAddr,
+        session_source: SocketAddr,
+        sequence: u64,
+        actors: &[&str],
+    ) {
+        let mut local_actors = HashMap::new();
+        for name in actors {
+            local_actors.insert(
+                (*name).to_string(),
+                RemoteActorLocation::new_with_peer(peer_addr, owner.clone()),
+            );
+        }
+        reg.merge_full_sync_from(
+            local_actors,
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(verified_addr),
+            Some(session_source),
+            sequence,
+            current_timestamp(),
+        )
+        .await;
+    }
+
+    /// R-11 (P1 review finding): once the restart-reset accepts the new
+    /// session's baseline sequence, it must persist as the new high-water
+    /// mark for the REST of the session, not merely for the sync that
+    /// triggered it. Before this fix, an unconditional `max()` (both
+    /// `handle_gossip_response`'s own redundant update, and the stale
+    /// gate's `else` branch before the current-session gate existed) could
+    /// let an old, still-draining connection's in-flight, numerically
+    /// higher (pre-restart) sequence silently push `last_sequence` back up
+    /// after the reset -- making the SECOND and THIRD genuine post-restart
+    /// FullSyncs look stale again, with no exemption left to rescue them
+    /// (the one-shot was already spent on the first).
+    #[tokio::test]
+    async fn qa_r11_restarted_peers_later_syncs_survive_stale_traffic_from_old_connection() {
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7806), test_config_with_seed("qa-r11-persist"));
+        let owner = KeyPair::new_for_testing("qa-r11-persist-owner").peer_id();
+        let node_id = owner.to_node_id();
+        let peer_addr = test_addr(9406);
+        let old_connection = test_addr(57001);
+        let new_connection = test_addr(57002);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        // Pre-restart: peer is at sequence 40.
+        qa_r11_full_sync_from(
+            &reg,
+            &owner,
+            peer_addr,
+            old_connection,
+            40,
+            &["qa_r11p/X", "qa_r11p/Y"],
+        )
+        .await;
+
+        // Peer restarts: new session armed, first sync (seq=1) accepted.
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
+            .await;
+        qa_r11_full_sync_from(&reg, &owner, peer_addr, new_connection, 1, &["qa_r11p/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11p/Y").await.is_none(),
+            "sanity: the first restart sync must prune Y"
+        );
+
+        // The OLD connection is still draining and delivers ANOTHER
+        // in-flight, pre-restart (numerically high) sequence AFTER the
+        // reset. It must be ignored outright, not merged into
+        // `last_sequence`.
+        qa_r11_full_sync_from(
+            &reg,
+            &owner,
+            peer_addr,
+            old_connection,
+            41,
+            &["qa_r11p/X", "qa_r11p/Y"],
+        )
+        .await;
+
+        // The restarted peer's SECOND genuine sync (seq=2) must still be
+        // accepted -- proven by a brand-new actor actually being added,
+        // which can only happen if the sync was processed rather than
+        // dropped by the stale gate.
+        qa_r11_full_sync_from(
+            &reg,
+            &owner,
+            peer_addr,
+            new_connection,
+            2,
+            &["qa_r11p/X", "qa_r11p/Q"],
+        )
+        .await;
+        assert!(
+            reg.lookup_actor("qa_r11p/Q").await.is_some(),
+            "R-11: the restarted peer's SECOND post-restart sync must be \
+             accepted, not rejected as stale because an old connection's \
+             traffic silently restored the pre-restart high-water mark"
+        );
+        assert!(
+            reg.lookup_actor("qa_r11p/Y").await.is_none(),
+            "R-11: the old connection's attempt to resurrect Y must still \
+             have been ignored"
+        );
+
+        // ...and the THIRD.
+        qa_r11_full_sync_from(
+            &reg,
+            &owner,
+            peer_addr,
+            new_connection,
+            3,
+            &["qa_r11p/X", "qa_r11p/Q", "qa_r11p/R"],
+        )
+        .await;
+        assert!(
+            reg.lookup_actor("qa_r11p/R").await.is_some(),
+            "R-11: the restarted peer's THIRD post-restart sync must also \
+             be accepted"
+        );
+    }
+
+    /// R-11 (P1 review finding): only the connection that armed the
+    /// exemption may clear it. An old, still-draining connection's in-flight
+    /// NON-lower (ordinary) sequence must be dropped outright once a newer
+    /// session is known for this peer, and must NOT disarm a still-unused
+    /// exemption meant for that newer session.
+    #[tokio::test]
+    async fn qa_r11_only_the_arming_connection_can_clear_the_exemption() {
+        let reg = GossipRegistry::<()>::new(test_addr(7807), test_config_with_seed("qa-r11-clear"));
+        let owner = KeyPair::new_for_testing("qa-r11-clear-owner").peer_id();
+        let node_id = owner.to_node_id();
+        let peer_addr = test_addr(9407);
+        let old_connection = test_addr(58001);
+        let new_connection = test_addr(58002);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        qa_r11_full_sync_from(
+            &reg,
+            &owner,
+            peer_addr,
+            old_connection,
+            40,
+            &["qa_r11c/X", "qa_r11c/Y"],
+        )
+        .await;
+
+        // New session armed for a genuine restart, but the restart sync
+        // itself hasn't arrived yet.
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
+            .await;
+
+        // The OLD connection delivers an in-flight, NON-lower sequence (its
+        // own continuation, not a restart) before the new connection's
+        // low-sequence sync arrives. It must be dropped outright (wrong
+        // session) and must NOT clear the still-armed exemption.
+        qa_r11_full_sync_from(
+            &reg,
+            &owner,
+            peer_addr,
+            old_connection,
+            41,
+            &["qa_r11c/X", "qa_r11c/Y"],
+        )
+        .await;
+
+        // The genuine restart sync on the NEW connection must still be
+        // admitted -- it would be rejected by the stale gate if the old
+        // connection's traffic above had cleared the exemption.
+        qa_r11_full_sync_from(&reg, &owner, peer_addr, new_connection, 1, &["qa_r11c/X"]).await;
+        assert!(
+            reg.lookup_actor("qa_r11c/Y").await.is_none(),
+            "R-11: an old connection's non-lower-sequence traffic must not \
+             clear the exemption meant for the new session before the \
+             restart sync arrives"
+        );
+    }
+
+    /// R-11 (P1 review finding, outbound): the outbound receive path's
+    /// `verified_sender_addr` is the peer's fixed dial-target address,
+    /// IDENTICAL for every connection we ever make to it -- unlike inbound,
+    /// where the remote's ephemeral port is naturally unique per
+    /// connection. Gating the exemption on `verified_sender_addr` alone
+    /// would let an old, still-draining OUTBOUND connection consume or
+    /// pollute a new outbound session's exemption, since both report the
+    /// SAME address. The session-source discriminator (the dialling
+    /// socket's own local ephemeral port) is what must distinguish them
+    /// instead -- this is the outbound analogue of
+    /// `qa_r11_draining_connection_cannot_consume_the_new_sessions_exemption`.
+    #[tokio::test]
+    async fn qa_r11_draining_outbound_connection_cannot_consume_the_new_sessions_exemption() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7808),
+            test_config_with_seed("qa-r11-outbound-drain"),
+        );
+        let owner = KeyPair::new_for_testing("qa-r11-outbound-drain-owner").peer_id();
+        let node_id = owner.to_node_id();
+        // The peer's fixed listening port: the dial target for every
+        // outbound connection we ever make to it, and what the outbound
+        // receive path reports as `verified_sender_addr` regardless of
+        // which physical connection delivered the message.
+        let peer_addr = test_addr(9408);
+        // Only the LOCAL ephemeral session source differs between the old
+        // (still draining) and new outbound connections.
+        let old_local_session = test_addr(56001);
+        let new_local_session = test_addr(56002);
+
+        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        qa_r11_full_sync_with_session_source(
+            &reg,
+            &owner,
+            peer_addr,
+            peer_addr,
+            old_local_session,
+            40,
+            &["qa_r11o/X", "qa_r11o/Y"],
+        )
+        .await;
+
+        // This node redials the restarted peer: a new outbound session is
+        // established and armed.
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_local_session, &owner, &qa_r11_dummy_connection_instance(new_local_session))
+            .await;
+
+        // The OLD outbound connection is still draining and delivers an
+        // in-flight, pre-restart (numerically HIGH) sequence, reporting the
+        // SAME verified_sender_addr the new connection would (the exact
+        // outbound asymmetry this fix closes).
+        qa_r11_full_sync_with_session_source(
+            &reg,
+            &owner,
+            peer_addr,
+            peer_addr,
+            old_local_session,
+            41,
+            &["qa_r11o/X", "qa_r11o/Y"],
+        )
+        .await;
+        assert!(
+            reg.lookup_actor("qa_r11o/Y").await.is_some(),
+            "R-11 (outbound): a draining old outbound connection must not \
+             be able to consume or extend the new session's exemption \
+             merely because it shares the peer's fixed dial-target address"
+        );
+
+        // The genuine restart sync on the NEW outbound connection is still
+        // admitted.
+        qa_r11_full_sync_with_session_source(
+            &reg,
+            &owner,
+            peer_addr,
+            peer_addr,
+            new_local_session,
+            1,
+            &["qa_r11o/X"],
+        )
+        .await;
+        assert!(
+            reg.lookup_actor("qa_r11o/Y").await.is_none(),
+            "R-11 (outbound): the exemption must still be available to the \
+             connection that armed it, so the restart sync prunes the \
+             stale actor"
+        );
+
+        // A later genuine sync from the NEW connection keeps advancing
+        // normally -- the old connection's dead-epoch traffic must not have
+        // poisoned `last_sequence` against it.
+        qa_r11_full_sync_with_session_source(
+            &reg,
+            &owner,
+            peer_addr,
+            peer_addr,
+            new_local_session,
+            2,
+            &["qa_r11o/X", "qa_r11o/Q"],
+        )
+        .await;
+        assert!(
+            reg.lookup_actor("qa_r11o/Q").await.is_some(),
+            "R-11 (outbound): the new connection's second sync must still \
+             be accepted"
         );
     }
 
@@ -9090,6 +10237,10 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -9368,6 +10519,10 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: now_ms,
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         }
     }
 
@@ -9464,6 +10619,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp() + 10_000),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -10278,6 +11437,10 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -10298,6 +11461,10 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -11046,6 +12213,7 @@ mod tests {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry),
             peer_addr: old_addr,
+            session_source: old_addr,
             peer_id: Some(peer_id.clone()),
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -11388,6 +12556,7 @@ mod tests {
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry),
             peer_addr: old_addr,
+            session_source: old_addr,
             peer_id: Some(peer_id.clone()),
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
@@ -12294,6 +13463,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp() - 100),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -12364,6 +13537,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp() + 10_000),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -12430,6 +13607,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp() + 10_000),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -12478,6 +13659,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
             let mut actors = HashSet::new();
@@ -12568,6 +13753,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: 0,
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
             let mut seeded = HashSet::new();
@@ -12687,6 +13876,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: 0,
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -12871,6 +14064,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -12958,6 +14155,10 @@ mod tests {
                         last_failure_time: None,
                         last_dns_refresh_attempt: None,
                         last_response_received_ms: crate::current_timestamp_millis(),
+                        accept_lower_sequence_from: None,
+                        current_session_source: None,
+                        current_session_connection: None,
+                        current_session_epoch: 0,
                     },
                 );
             }
@@ -13045,6 +14246,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
             let mut actors = HashSet::new();
@@ -13124,6 +14329,10 @@ mod tests {
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
             let mut actors = HashSet::new();
@@ -14008,6 +15217,10 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -14065,6 +15278,10 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -14112,6 +15329,10 @@ mod tests {
             last_failure_time: Some(950),
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         };
 
         // Convert to gossip format
@@ -14501,6 +15722,10 @@ mod tests {
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis()
                         .saturating_sub(10_000),
+                        accept_lower_sequence_from: None,
+                        current_session_source: None,
+                        current_session_connection: None,
+                        current_session_epoch: 0,
                 },
             );
         }
@@ -14782,6 +16007,7 @@ mod tests {
             &mut streaming_state,
             &reg,
             test_addr(7065),
+            test_addr(7065),
             None,
             None,
             Some(&attacker),
@@ -14839,6 +16065,7 @@ mod tests {
             ),
             &mut streaming_state,
             &reg,
+            test_addr(7067),
             test_addr(7067),
             None,
             None,
@@ -14958,6 +16185,10 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15097,6 +16328,10 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15138,6 +16373,10 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15179,6 +16418,10 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15233,6 +16476,10 @@ mod tests {
                     last_failure_time: Some(now),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15294,6 +16541,10 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -15387,6 +16638,10 @@ mod tests {
             last_failure_time: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -15443,6 +16698,10 @@ mod tests {
                     last_failure_time: Some(0),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15522,6 +16781,10 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15588,6 +16851,10 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -15646,6 +16913,10 @@ mod tests {
                     last_failure_time: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }

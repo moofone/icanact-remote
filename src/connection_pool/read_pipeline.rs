@@ -10,6 +10,20 @@ pub(crate) struct StreamingStateHandoff {
 pub struct ReadContext {
     pub(crate) registry_weak: std::sync::Weak<GossipRegistry>,
     pub(crate) peer_addr: SocketAddr,
+    /// R-11: this exact connection's own session discriminator, unique per
+    /// physical connection.
+    ///
+    /// For inbound connections this equals `peer_addr` (the remote client's
+    /// ephemeral source port, already unique per connection). For outbound
+    /// connections it is THIS socket's own local ephemeral port, not the
+    /// dial target -- the dial target (`peer_addr` for an outbound
+    /// connection) is the peer's fixed listening port and is identical for
+    /// every connection we ever make to it, so it cannot distinguish a
+    /// redial's new connection from an old one still draining. Threaded
+    /// through to `merge_full_sync_from` so the R-11 restart-sequence
+    /// exemption can only ever be armed or consumed by the connection that
+    /// established it.
+    pub(crate) session_source: SocketAddr,
     /// Best-effort peer identity for this connection.
     ///
     /// This is used to avoid mis-attributing disconnects from stale/duplicate
@@ -66,6 +80,7 @@ mod read_pipeline_tests {
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: "127.0.0.1:9000".parse().unwrap(),
+            session_source: "127.0.0.1:9000".parse().unwrap(),
             peer_id: None,
             max_message_size: 1024,
             expected_schema_hash: None,
@@ -99,6 +114,7 @@ mod read_pipeline_tests {
         let ctx = super::ReadContext {
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(), peer_addr: "127.0.0.1:9001".parse().unwrap(),
+            session_source: "127.0.0.1:9001".parse().unwrap(),
             peer_id: None, max_message_size: 1024, expected_schema_hash: None,
             aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
             inbound_routes: Arc::new(crate::route_interning::RouteTable::new()), response_correlation: None,
@@ -1606,6 +1622,13 @@ async fn process_read_result_io<S>(
     streaming_state: &mut crate::protocol::StreamingState,
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
+    // R-11: this connection's own session discriminator (see
+    // `ReadContext::session_source`), threaded down to `merge_full_sync_from`
+    // so the restart-sequence exemption is scoped to the exact connection
+    // that armed it, not merely to `peer_addr` (which for an outbound
+    // connection is the peer's fixed listening port, shared by every
+    // connection we ever make to it).
+    session_source: SocketAddr,
     authenticated_peer_id: Option<&crate::PeerId>,
     response_correlation: Option<&CorrelationTracker>,
     sync_actor_handler: Option<&crate::registry::ActorMessageHandlerSyncCell>,
@@ -1698,6 +1721,7 @@ where
                     streaming_state_handoff: None,
                     registry_weak: Arc::downgrade(registry),
                     peer_addr,
+                    session_source: peer_addr,
                     peer_id: None,
                     max_message_size: registry.config.max_message_size,
                     expected_schema_hash: registry.config.schema_hash,
@@ -1775,6 +1799,7 @@ where
                 streaming_state,
                 registry,
                 peer_addr,
+                session_source,
                 response_correlation,
                 None,
                 authenticated_peer_id,

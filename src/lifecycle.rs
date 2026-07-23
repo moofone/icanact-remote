@@ -238,6 +238,33 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired in `merge_full_sync_from`, after the session/sequence
+    /// validation critical section has released its lock and the
+    /// candidate actor updates have been collected, but immediately
+    /// BEFORE the second critical section re-acquires the lock to apply
+    /// them (and re-check the captured session generation). Purely
+    /// instrumentation: lets tests deterministically pin a concurrent
+    /// newer session's arm-and-restart into this exact gap, so the
+    /// generation recheck a few lines below observably has to drop this
+    /// now-stale pending apply instead of overwriting the newer session's
+    /// state with it.
+    FullSyncApplyPendingMutation {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
+    /// Fired in `apply_delta_from`, immediately before it acquires the
+    /// lock for its own single critical section (which applies all
+    /// `known_actors`/`removed_actors`/`peer_to_actors` mutations and
+    /// re-checks any caller-supplied `session_guard` generation). Purely
+    /// instrumentation: lets tests deterministically pin a concurrent
+    /// newer session's arm-and-restart into the gap between a caller's
+    /// own session validation (which happened, and released its lock,
+    /// before calling this function) and this critical section actually
+    /// running.
+    DeltaApplyPendingMutation {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
 }
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;

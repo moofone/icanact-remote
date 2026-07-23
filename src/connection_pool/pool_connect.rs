@@ -3201,6 +3201,21 @@ impl<T> ConnectionPool<T> {
         stream: S,
         registry_weak: std::sync::Weak<GossipRegistry>,
         tofu_node_id: Option<crate::GossipNodeId>,
+        // R-11: this specific outbound socket's own local ephemeral port --
+        // unique per connection, unlike `addr` (the peer's fixed listening
+        // port, shared by every connection we ever make to it). Threaded
+        // into this connection's `ReadContext` so the receive path can tell
+        // a redial's new connection apart from an old one still draining.
+        local_session_addr: SocketAddr,
+        // R-11: the identity this exact TLS handshake cryptographically
+        // proved (derived from the live connection's own peer certificate
+        // by the caller, before the stream was moved in here). `None` if
+        // the handshake didn't yield one. Used to arm the sequence-reset
+        // exemption, but ONLY once this candidate is confirmed below to be
+        // the peer's live connection -- never for a candidate that loses
+        // the tie-break, which would strand the exemption on a socket that
+        // never becomes live.
+        fresh_session_node_id: Option<crate::GossipNodeId>,
     ) -> Result<ConnectionHandle<T>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3254,6 +3269,7 @@ impl<T> ConnectionPool<T> {
                     streaming_state_handoff: None,
                     registry_weak: Arc::downgrade(&registry),
                     peer_addr: addr,
+                    session_source: local_session_addr,
                     peer_id: peer_id_opt.clone(),
                     max_message_size: registry.config.max_message_size,
                     expected_schema_hash: registry.config.schema_hash,
@@ -3291,6 +3307,12 @@ impl<T> ConnectionPool<T> {
         }
 
         let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+        // R-11: outbound session_source is this socket's own local
+        // ephemeral port (unique per connection), not the dial target
+        // `addr` this instance was constructed with (the peer's fixed
+        // listening port, shared by every connection ever made to it) --
+        // see `ReadContext::session_source` and `LockFreeConnection::session_source`.
+        conn.session_source = local_session_addr;
         conn.stream_handle = Some(stream_handle.clone());
         conn.set_state(ConnectionState::Connected);
         conn.update_last_used();
@@ -3564,6 +3586,36 @@ impl<T> ConnectionPool<T> {
         // Another task can observe and tear down the connection immediately after publication,
         // so publication must not assume the address entry remains present beyond this point.
         debug!("CONNECTION POOL: Published connection for {}", addr);
+
+        // R-11: arm the one-shot lower-sequence exemption for OUTBOUND
+        // sessions too, not just inbound. Every early return above (a rival
+        // won the tie-break, or a publish race) happens before this point,
+        // so reaching here is the confirmation that THIS candidate WAS the
+        // peer's live connection at publication time -- arming any earlier
+        // could strand the exemption on a socket that never becomes live
+        // while leaving the surviving connection's subsequent gossip
+        // rejected (its source no longer matches this failed candidate).
+        //
+        // Publication and this arm are still two separate operations,
+        // though: another task can supersede `connection_arc` between the
+        // publish above and this `.await` completing. `connection_arc` is
+        // passed through so `arm_sequence_reset_for_new_session` can
+        // revalidate it is still the peer's current connection immediately
+        // before mutating the registry, and decline to arm otherwise.
+        if let (Some(registry_arc), Some(node_id)) =
+            (registry_weak.upgrade(), fresh_session_node_id)
+        {
+            let arming_peer_id = crate::PeerId::from_public_key(&node_id);
+            registry_arc
+                .arm_sequence_reset_for_new_session(
+                    addr,
+                    node_id,
+                    local_session_addr,
+                    &arming_peer_id,
+                    &connection_arc,
+                )
+                .await;
+        }
 
         // Send initial FullSync message to identify ourselves
         if let Some(registry_arc) = registry_weak.upgrade() {
@@ -3907,6 +3959,13 @@ async fn answer_inbound_clock_probe(
 pub(crate) fn handle_incoming_message(
     registry: Arc<GossipRegistry>,
     _peer_addr: SocketAddr,
+    // R-11: this connection's own session discriminator -- see
+    // `ReadContext::session_source`. For inbound connections this equals
+    // `_peer_addr`; for outbound connections it is this specific socket's
+    // own local ephemeral port, not the (shared, non-unique) dial target.
+    // Passed to `merge_full_sync_from` so the restart-sequence exemption is
+    // scoped to the exact connection that armed it.
+    session_source: SocketAddr,
     msg: RegistryMessage,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
@@ -3927,6 +3986,14 @@ pub(crate) fn handle_incoming_message(
                     extensions,
                     crate::current_timestamp_nanos(),
                 );
+
+                // Captured alongside session validation below so
+                // `apply_delta_from` can atomically recheck it under its
+                // own lock, immediately before applying any change --
+                // collecting `delta` for that call (and releasing the lock
+                // acquired just below first) leaves a gap a newer session
+                // can arm in.
+                let mut captured_epoch: Option<u64> = None;
 
                 // OPTIMIZATION: Do all peer management in one lock acquisition
                 {
@@ -3955,60 +4022,88 @@ pub(crate) fn handle_incoming_message(
                                 last_failure_time: None,
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
+                                accept_lower_sequence_from: None,
+                                current_session_source: None,
+                                current_session_connection: None,
+                                current_session_epoch: 0,
                             });
                         }
                     }
 
-                    // Check if this is a previously failed peer
-                    let was_failed = gossip_state
-                        .peers
-                        .get(&sender_socket_addr)
-                        .map(|info| info.failures >= registry.config.max_peer_failures)
-                        .unwrap_or(false);
-
-                    if was_failed {
-                        info!(
-                            peer = %delta.sender_peer_id,
-                            "✅ Received delta from previously failed peer - connection restored!"
-                        );
-
-                        // Clear the pending failure record
-                        gossip_state
-                            .pending_peer_failures
-                            .remove(&sender_socket_addr);
-                    }
-
-                    // Update peer info and check if we need to clear pending failures
+                    // Update peer info and check if we need to clear pending failures.
+                    // Gated the same way `merge_full_sync_from` gates FullSync:
+                    // once a session is armed for this peer, only its own
+                    // connection may advance `last_sequence` (or feed changes
+                    // into `apply_delta_from` below) -- an old, still-draining
+                    // connection's in-flight delta must not be able to restore
+                    // a pre-restart high-water mark after the new session's
+                    // reset, which would make the new session's own
+                    // low-sequence syncs look stale again with the one-shot
+                    // exemption already spent. This also covers ALL
+                    // failure/health bookkeeping below (including the
+                    // "previously failed peer" pending-failure clear, folded
+                    // in here rather than checked unconditionally before
+                    // this gate): none of it may be attributable to a
+                    // connection that isn't the peer's current session.
+                    let mut from_current_session = true;
                     let need_to_clear_pending =
                         if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                            // Always reset failure state when we receive messages from the peer
-                            // This proves the peer is alive and communicating
-                            let had_failures = peer_info.failures > 0;
-                            if had_failures {
-                                info!(peer = %delta.sender_peer_id,
+                            from_current_session = registry.peer_info_is_from_current_session(
+                                &delta.sender_peer_id,
+                                peer_info,
+                                Some(session_source),
+                            );
+                            captured_epoch = Some(peer_info.current_session_epoch);
+                            if !from_current_session {
+                                false
+                            } else {
+                                let was_failed =
+                                    peer_info.failures >= registry.config.max_peer_failures;
+                                if was_failed {
+                                    info!(
+                                        peer = %delta.sender_peer_id,
+                                        "✅ Received delta from previously failed peer - connection restored!"
+                                    );
+                                }
+                                // Always reset failure state when we receive messages from the peer
+                                // This proves the peer is alive and communicating
+                                let had_failures = peer_info.failures > 0;
+                                if had_failures {
+                                    info!(peer = %delta.sender_peer_id,
                               prev_failures = peer_info.failures,
                               "🔄 Resetting failure state after receiving DeltaGossip");
-                                peer_info.failures = 0;
-                                peer_info.last_failure_time = None;
+                                    peer_info.failures = 0;
+                                    peer_info.last_failure_time = None;
+                                }
+                                peer_info.last_success = crate::current_timestamp();
+                                // Inbound payload from peer — proves app-level liveness.
+                                // The response-asymmetry detector in
+                                // `apply_gossip_results` reads this field to decide
+                                // whether outbound writes that returned `Ok(None)`
+                                // were actually heard by the peer's application
+                                // layer. Mirror the inline-response path in
+                                // `GossipRegistry::handle_gossip_response`.
+                                peer_info.last_response_received_ms =
+                                    crate::current_timestamp_millis();
+
+                                peer_info.last_sequence =
+                                    std::cmp::max(peer_info.last_sequence, delta.current_sequence);
+                                peer_info.consecutive_deltas += 1;
+
+                                had_failures
                             }
-                            peer_info.last_success = crate::current_timestamp();
-                            // Inbound payload from peer — proves app-level liveness.
-                            // The response-asymmetry detector in
-                            // `apply_gossip_results` reads this field to decide
-                            // whether outbound writes that returned `Ok(None)`
-                            // were actually heard by the peer's application
-                            // layer. Mirror the inline-response path in
-                            // `GossipRegistry::handle_gossip_response`.
-                            peer_info.last_response_received_ms = crate::current_timestamp_millis();
-
-                            peer_info.last_sequence =
-                                std::cmp::max(peer_info.last_sequence, delta.current_sequence);
-                            peer_info.consecutive_deltas += 1;
-
-                            had_failures
                         } else {
                             false
                         };
+
+                    if !from_current_session {
+                        debug!(
+                            peer = %sender_socket_addr,
+                            "ignoring delta gossip from a connection that is not this \
+                             peer's current authenticated session"
+                        );
+                        return Ok(());
+                    }
 
                     // Clear pending failure record if needed
                     if need_to_clear_pending {
@@ -4029,7 +4124,13 @@ pub(crate) fn handle_incoming_message(
                 // for advertised-address repair (outranks configured/
                 // discovered route state, which may be stale).
                 let sender_peer_id = delta.sender_peer_id.clone();
-                registry.apply_delta_from(delta, Some(_peer_addr)).await?;
+                registry
+                    .apply_delta_from(
+                        delta,
+                        Some(_peer_addr),
+                        captured_epoch.map(|generation| (sender_socket_addr, generation)),
+                    )
+                    .await?;
 
                 // R16i: An inbound-only / NAT'd peer we never dial outbound will
                 // never receive a scheduled gossip round from us, so a clock echo
@@ -4140,44 +4241,25 @@ pub(crate) fn handle_incoming_message(
                                 last_failure_time: None,
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
+                                accept_lower_sequence_from: None,
+                                current_session_source: None,
+                                current_session_connection: None,
+                                current_session_epoch: 0,
                             });
                         }
                     }
 
-                    // Update peer info and reset failure state
-                    let had_failures = gossip_state
-                        .peers
-                        .get(&sender_socket_addr)
-                        .map(|info| info.failures > 0)
-                        .unwrap_or(false);
-
-                    if had_failures {
-                        // Clear the pending failure record
-                        gossip_state
-                            .pending_peer_failures
-                            .remove(&sender_socket_addr);
-                    }
-
-                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                        let prev_failures = peer_info.failures;
-                        // Always reset failure state when we receive a FullSync from the peer
-                        // This proves the peer is alive and communicating
-                        if peer_info.failures > 0 {
-                            info!(peer = %sender_socket_addr,
-                              prev_failures = prev_failures,
-                              "🔄 Resetting failure state after receiving FullSync");
-                            peer_info.failures = 0;
-                            peer_info.last_failure_time = None;
-                        }
-                        peer_info.last_success = crate::current_timestamp();
-                        // Inbound payload from peer — proves app-level liveness.
-                        // See `handle_incoming_message::DeltaGossip` for the
-                        // full rationale.
-                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
-                        peer_info.consecutive_deltas = 0;
-                    } else {
-                        warn!(peer = %sender_socket_addr, "Peer not found in peer list when trying to reset failure state");
-                    }
+                    // Failure/health bookkeeping (failures, last_failure_time,
+                    // last_success, last_response_received_ms,
+                    // consecutive_deltas) is deliberately NOT reset here.
+                    // Resetting it proves peer liveness, which must only be
+                    // attributable to the CURRENT authenticated session --
+                    // an old, still-draining connection's in-flight FullSync
+                    // must not be able to mask real unresponsiveness or
+                    // perturb `should_use_delta_state`'s strategy choice.
+                    // Moved to after `merge_full_sync_from` below, gated on
+                    // its return value (the same `from_current_session`
+                    // verdict the actor/sequence state is already gated on).
                     gossip_state.full_sync_exchanges += 1;
                 }
 
@@ -4224,17 +4306,48 @@ pub(crate) fn handle_incoming_message(
                 // Only remaining async operation. Peer bookkeeping keys on
                 // the bind-derived address; address REPAIR anchors on the
                 // verified TCP source (§1.6).
-                registry
+                let from_current_session = registry
                     .merge_full_sync_from(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
                         sender_socket_addr,
                         Some(_peer_addr),
+                        Some(session_source),
                         sequence,
                         wall_clock_time,
                     )
                     .await;
+
+                if from_current_session {
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    let had_failures = gossip_state
+                        .peers
+                        .get(&sender_socket_addr)
+                        .map(|info| info.failures > 0)
+                        .unwrap_or(false);
+                    if had_failures {
+                        gossip_state
+                            .pending_peer_failures
+                            .remove(&sender_socket_addr);
+                    }
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                        let prev_failures = peer_info.failures;
+                        if peer_info.failures > 0 {
+                            info!(peer = %sender_socket_addr,
+                              prev_failures = prev_failures,
+                              "🔄 Resetting failure state after receiving FullSync");
+                            peer_info.failures = 0;
+                            peer_info.last_failure_time = None;
+                        }
+                        peer_info.last_success = crate::current_timestamp();
+                        // Inbound payload from peer — proves app-level liveness.
+                        // See `handle_incoming_message::DeltaGossip` for the
+                        // full rationale.
+                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
+                        peer_info.consecutive_deltas = 0;
+                    }
+                }
 
                 // Send back our state as a response so the sender can receive our actors
                 // This is critical for late-joining nodes (like Node C) to get existing state
@@ -4376,18 +4489,27 @@ pub(crate) fn handle_incoming_message(
                                   error = %e,
                                   "Could not send FullSync response immediately - will be sent in next gossip round");
 
-                                // Store in gossip state to be sent during next gossip round
-                                let mut gossip_state = registry.gossip_state.lock().await;
+                                // Store in gossip state to be sent during next gossip round.
+                                // Gated on `from_current_session`: `sender_socket_addr` is a
+                                // bind address, not a connection instance, so a stale/draining
+                                // connection's inbound traffic resolves to the SAME PeerInfo
+                                // entry the current session owns. Without this gate, a
+                                // superseded connection could force the legitimate session's
+                                // gossip strategy into full-sync-every-round by repeatedly
+                                // failing this send path.
+                                if from_current_session {
+                                    let mut gossip_state = registry.gossip_state.lock().await;
 
-                                // Mark that we need to send a full sync to this peer
-                                if let Some(peer_info) =
-                                    gossip_state.peers.get_mut(&sender_socket_addr)
-                                {
-                                    // Force a full sync on the next gossip round
-                                    peer_info.consecutive_deltas =
-                                        registry.config.max_delta_history as u64;
-                                    info!(peer = %sender_socket_addr,
-                                      "Marked peer for full sync in next gossip round");
+                                    // Mark that we need to send a full sync to this peer
+                                    if let Some(peer_info) =
+                                        gossip_state.peers.get_mut(&sender_socket_addr)
+                                    {
+                                        // Force a full sync on the next gossip round
+                                        peer_info.consecutive_deltas =
+                                            registry.config.max_delta_history as u64;
+                                        info!(peer = %sender_socket_addr,
+                                          "Marked peer for full sync in next gossip round");
+                                    }
                                 }
                             }
                         }
@@ -4431,10 +4553,46 @@ pub(crate) fn handle_incoming_message(
                     crate::current_timestamp_nanos(),
                 );
 
+                // Gated the same way the DeltaGossip branch above is: once a
+                // session is armed for this peer, only its own connection's
+                // deltas may be applied. The captured generation is
+                // rechecked atomically inside `apply_delta_from`, under its
+                // own lock, immediately before applying any change -- this
+                // lock is released before that call, leaving a gap a newer
+                // session can arm in.
+                let (from_current_session, captured_epoch) = {
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                        let allowed = registry.peer_info_is_from_current_session(
+                            &delta.sender_peer_id,
+                            peer_info,
+                            Some(session_source),
+                        );
+                        (allowed, Some(peer_info.current_session_epoch))
+                    } else {
+                        (true, None)
+                    }
+                };
+                if !from_current_session {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring delta gossip response from a connection that is not \
+                         this peer's current authenticated session"
+                    );
+                    return Ok(());
+                }
+
                 // Same §1.6 trust anchor as the DeltaGossip branch above:
                 // responses also carry actor additions, and repair must use
                 // the verified socket address of this connection.
-                if let Err(err) = registry.apply_delta_from(delta, Some(_peer_addr)).await {
+                if let Err(err) = registry
+                    .apply_delta_from(
+                        delta,
+                        Some(_peer_addr),
+                        captured_epoch.map(|generation| (sender_socket_addr, generation)),
+                    )
+                    .await
+                {
                     warn!(error = %err, "failed to apply delta from response");
                 } else {
                     let mut gossip_state = registry.gossip_state.lock().await;
@@ -4477,13 +4635,14 @@ pub(crate) fn handle_incoming_message(
                     "RECEIVED: FullSyncResponse from peer (using bind_addr)"
                 );
 
-                registry
+                let from_current_session = registry
                     .merge_full_sync_from(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
                         sender_socket_addr,
                         Some(_peer_addr),
+                        Some(session_source),
                         sequence,
                         wall_clock_time,
                     )
@@ -4543,32 +4702,38 @@ pub(crate) fn handle_incoming_message(
                     }
                 }
 
-                // Reset failure state for responding peer
-                let need_to_clear_pending =
-                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                        let had_failures = peer_info.failures > 0;
-                        if had_failures {
-                            info!(peer = %sender_socket_addr,
+                // Failure/health bookkeeping must only be attributable to
+                // the CURRENT authenticated session -- see the FullSync arm
+                // above for the full rationale. Gated on the same
+                // `from_current_session` verdict `merge_full_sync_from`
+                // already computed for the actor/sequence state.
+                if from_current_session {
+                    let need_to_clear_pending =
+                        if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                            let had_failures = peer_info.failures > 0;
+                            if had_failures {
+                                info!(peer = %sender_socket_addr,
                           prev_failures = peer_info.failures,
                           "🔄 Resetting failure state after receiving FullSyncResponse");
-                            peer_info.failures = 0;
-                            peer_info.last_failure_time = None;
-                        }
-                        peer_info.last_success = crate::current_timestamp();
-                        // Inbound payload from peer — proves app-level liveness.
-                        // See `handle_incoming_message::DeltaGossip` for the
-                        // full rationale.
-                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
-                        had_failures
-                    } else {
-                        false
-                    };
+                                peer_info.failures = 0;
+                                peer_info.last_failure_time = None;
+                            }
+                            peer_info.last_success = crate::current_timestamp();
+                            // Inbound payload from peer — proves app-level liveness.
+                            // See `handle_incoming_message::DeltaGossip` for the
+                            // full rationale.
+                            peer_info.last_response_received_ms = crate::current_timestamp_millis();
+                            had_failures
+                        } else {
+                            false
+                        };
 
-                // Clear pending failure record if needed
-                if need_to_clear_pending {
-                    gossip_state
-                        .pending_peer_failures
-                        .remove(&sender_socket_addr);
+                    // Clear pending failure record if needed
+                    if need_to_clear_pending {
+                        gossip_state
+                            .pending_peer_failures
+                            .remove(&sender_socket_addr);
+                    }
                 }
 
                 gossip_state.full_sync_exchanges += 1;

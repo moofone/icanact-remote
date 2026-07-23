@@ -1156,6 +1156,386 @@ mod tests {
         Ok(())
     }
 
+    /// R-11: a duplicate inbound candidate that loses the tie-break must not
+    /// strand the sequence-reset exemption on its own dropped ephemeral
+    /// port, and must not disturb the surviving live connection's own
+    /// session. Mirrors
+    /// `outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption`
+    /// (`connection_pool::tests`) for the inbound-accept side.
+    ///
+    /// Arming used to happen unconditionally, before the tie-break below
+    /// decided whether this candidate would actually become the peer's live
+    /// connection. A losing candidate (this exact scenario: a live,
+    /// tie-break-preferred existing inbound session already owns the peer)
+    /// would still arm `current_session_source`/`accept_lower_sequence_from`
+    /// to the LOSING candidate's own ephemeral TCP source -- a value the
+    /// surviving connection's traffic can never present, since its own
+    /// session source is different. Every subsequent FullSync on the
+    /// surviving connection would then be gated against a session that
+    /// never went live, silently breaking its gossip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_duplicate_reject_does_not_strand_the_sequence_reset_exemption()
+    -> crate::Result<()> {
+        let (local_keypair, remote_keypair) = ordered_keypairs(
+            "inbound-reject-exemption-local-lower-a",
+            "inbound-reject-exemption-remote-higher-b",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let remote_node_id = remote_peer_id.to_node_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            !handle
+                .registry
+                .should_keep_connection(&remote_peer_id, false),
+            "the lower local GossipNodeId must not prefer inbound connections from the \
+             higher remote GossipNodeId"
+        );
+
+        // Both the surviving existing connection and the losing duplicate
+        // candidate resolve to the SAME bind-derived peer_state_addr -- the
+        // realistic scenario: one peer identity, one configured/bind
+        // address, multiple physical TCP sockets over time.
+        let bind_addr: SocketAddr = "127.0.0.1:42001".parse().unwrap();
+        handle
+            .registry
+            .connection_pool
+            .set_configured_peer_addr(&remote_peer_id, bind_addr);
+
+        let existing_addr: SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let (existing_io, _existing_peer) = tokio::io::duplex(1024);
+        let (existing_stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                existing_io,
+                existing_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut existing = crate::connection_pool::LockFreeConnection::new(
+            existing_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        existing.stream_handle = Some(Arc::new(existing_stream_handle));
+        existing.set_state(crate::connection_pool::ConnectionState::Connected);
+        let existing = Arc::new(existing);
+        assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            existing_addr,
+            existing.clone(),
+        ));
+
+        // Simulate the existing connection's own earlier, successful accept:
+        // its session is armed at `bind_addr` with its OWN (`existing_addr`)
+        // source, exactly like the real accept path does after this fix.
+        handle
+            .registry
+            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .await;
+        handle
+            .registry
+            .arm_sequence_reset_for_new_session(
+                bind_addr,
+                remote_node_id,
+                existing_addr,
+                &remote_peer_id,
+                &existing,
+            )
+            .await;
+
+        // A prior FullSync from the surviving connection established a
+        // baseline sequence.
+        let mut local_actors = std::collections::HashMap::new();
+        local_actors.insert(
+            "inbound-reject/X".to_string(),
+            crate::RemoteActorLocation::new_with_peer(bind_addr, remote_peer_id.clone()),
+        );
+        handle
+            .registry
+            .merge_full_sync_from(
+                local_actors,
+                std::collections::HashMap::new(),
+                remote_peer_id.clone(),
+                bind_addr,
+                Some(existing_addr),
+                Some(existing_addr),
+                10,
+                crate::current_timestamp(),
+            )
+            .await;
+
+        // A duplicate inbound candidate arrives on a DIFFERENT ephemeral
+        // socket and loses the tie-break (non-preferred direction).
+        let attacker_addr: SocketAddr = "127.0.0.1:42003".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: remote_peer_id.clone(),
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            attacker_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_node_id),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ConnectionCloseOutcome::DroppedByTieBreaker),
+            "sanity: this must be the same reject outcome as the sibling test"
+        );
+
+        // The exemption must still point at the SURVIVING connection's own
+        // source, never at the rejected candidate's ephemeral port.
+        {
+            let gossip_state = handle.registry.gossip_state.lock().await;
+            let peer_info = gossip_state
+                .peers
+                .get(&bind_addr)
+                .expect("peer must still be tracked");
+            assert_ne!(
+                peer_info.current_session_source,
+                Some(attacker_addr),
+                "R-11: a rejected duplicate inbound candidate must not strand \
+                 current_session_source on its own dropped ephemeral port"
+            );
+            assert_eq!(
+                peer_info.current_session_source,
+                Some(existing_addr),
+                "R-11: the surviving connection's own session must remain \
+                 armed, untouched by the rejected candidate"
+            );
+        }
+
+        // The surviving connection's subsequent, advancing-sequence
+        // FullSync must still be accepted -- proven by a brand-new actor
+        // actually being added, which can only happen if the
+        // from_current_session gate didn't drop it.
+        let mut local_actors2 = std::collections::HashMap::new();
+        local_actors2.insert(
+            "inbound-reject/X".to_string(),
+            crate::RemoteActorLocation::new_with_peer(bind_addr, remote_peer_id.clone()),
+        );
+        local_actors2.insert(
+            "inbound-reject/Q".to_string(),
+            crate::RemoteActorLocation::new_with_peer(bind_addr, remote_peer_id.clone()),
+        );
+        handle
+            .registry
+            .merge_full_sync_from(
+                local_actors2,
+                std::collections::HashMap::new(),
+                remote_peer_id.clone(),
+                bind_addr,
+                Some(existing_addr),
+                Some(existing_addr),
+                11,
+                crate::current_timestamp(),
+            )
+            .await;
+
+        assert!(
+            handle.registry.lookup_actor("inbound-reject/Q").await.is_some(),
+            "R-11: the surviving connection's subsequent FullSync must still \
+             be accepted, not dropped by the from_current_session gate"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
+    /// R-11: arming and publication are two separate operations on the
+    /// inbound accept path too. `keep_connection` only proves this
+    /// candidate won the tie-break at the moment the compare-and-publish
+    /// resolved; a concurrent accept/finalize for the same peer can still
+    /// publish a NEWER connection before this handler's own arm `.await`
+    /// completes. If that stale handler's arm is allowed to complete
+    /// regardless, it overwrites the newer session's `current_session_source`
+    /// with this handler's own (superseded) ephemeral source, and the
+    /// ACTUALLY-live connection's subsequent gossip then fails the
+    /// `from_current_session` gate until another reconnect.
+    ///
+    /// Exercises `arm_sequence_reset_for_new_session` directly against real,
+    /// published `connection_pool` state (the exact primitive
+    /// `handle_incoming_connection_tls`'s arm call delegates to) rather than
+    /// re-driving the whole accept pipeline twice, since the race is
+    /// entirely about the ordering between publication and this specific
+    /// call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_stale_handler_arm_after_supersession_does_not_clobber_newer_session()
+    -> crate::Result<()> {
+        let (local_keypair, remote_keypair) = ordered_keypairs(
+            "inbound-stale-arm-local-lower-a",
+            "inbound-stale-arm-remote-higher-b",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let remote_node_id = remote_peer_id.to_node_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        let bind_addr: SocketAddr = "127.0.0.1:42010".parse().unwrap();
+        handle
+            .registry
+            .connection_pool
+            .set_configured_peer_addr(&remote_peer_id, bind_addr);
+        handle
+            .registry
+            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .await;
+
+        // The STALE inbound handler's own accepted connection: published
+        // first, but its arm call is delayed (simulating a slow scheduling
+        // / lost race between two near-simultaneous accepts).
+        let stale_addr: SocketAddr = "127.0.0.1:42011".parse().unwrap();
+        let (stale_io, _stale_keep) = tokio::io::duplex(1024);
+        let (stale_sh, _stale_w, _stale_r) = crate::connection_pool::LockFreeStreamHandle::new(
+            stale_io,
+            stale_addr,
+            crate::connection_pool::ChannelId::Global,
+            crate::connection_pool::BufferConfig::default(),
+            handle.registry.config.schema_hash,
+            None,
+        );
+        let mut stale_conn = crate::connection_pool::LockFreeConnection::new(
+            stale_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        stale_conn.stream_handle = Some(Arc::new(stale_sh));
+        stale_conn.set_state(crate::connection_pool::ConnectionState::Connected);
+        let stale = Arc::new(stale_conn);
+        assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            stale_addr,
+            stale.clone(),
+        ));
+
+        // A NEWER inbound accept for the same peer wins a concurrent race
+        // and is published, superseding the stale one -- and arms
+        // correctly, since it IS current at that moment.
+        let newer_addr: SocketAddr = "127.0.0.1:42012".parse().unwrap();
+        let (newer_io, _newer_keep) = tokio::io::duplex(1024);
+        let (newer_sh, _newer_w, _newer_r) = crate::connection_pool::LockFreeStreamHandle::new(
+            newer_io,
+            newer_addr,
+            crate::connection_pool::ChannelId::Global,
+            crate::connection_pool::BufferConfig::default(),
+            handle.registry.config.schema_hash,
+            None,
+        );
+        let mut newer_conn = crate::connection_pool::LockFreeConnection::new(
+            newer_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        newer_conn.stream_handle = Some(Arc::new(newer_sh));
+        newer_conn.set_state(crate::connection_pool::ConnectionState::Connected);
+        let newer = Arc::new(newer_conn);
+        assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+            remote_peer_id.clone(),
+            newer_addr,
+            newer.clone(),
+        ));
+        handle
+            .registry
+            .arm_sequence_reset_for_new_session(
+                bind_addr,
+                remote_node_id,
+                newer_addr,
+                &remote_peer_id,
+                &newer,
+            )
+            .await;
+
+        // The stale handler's own arm call FINALLY completes now, after
+        // having been superseded. It must be a no-op.
+        handle
+            .registry
+            .arm_sequence_reset_for_new_session(
+                bind_addr,
+                remote_node_id,
+                stale_addr,
+                &remote_peer_id,
+                &stale,
+            )
+            .await;
+
+        {
+            let gossip_state = handle.registry.gossip_state.lock().await;
+            let peer_info = gossip_state
+                .peers
+                .get(&bind_addr)
+                .expect("peer must still be tracked");
+            assert_ne!(
+                peer_info.current_session_source,
+                Some(stale_addr),
+                "R-11: a stale inbound handler's delayed arm must not \
+                 overwrite the newer, currently-published session's \
+                 discriminator"
+            );
+            assert_eq!(
+                peer_info.current_session_source,
+                Some(newer_addr),
+                "R-11: the newer session's discriminator must remain \
+                 untouched by the stale handler"
+            );
+        }
+
+        // The newer (actually live) connection's subsequent, advancing-sequence
+        // FullSync must still be accepted -- proof the stale arm did not
+        // silently break its gossip.
+        let mut local_actors = std::collections::HashMap::new();
+        local_actors.insert(
+            "inbound-stale-arm/Q".to_string(),
+            crate::RemoteActorLocation::new_with_peer(bind_addr, remote_peer_id.clone()),
+        );
+        handle
+            .registry
+            .merge_full_sync_from(
+                local_actors,
+                std::collections::HashMap::new(),
+                remote_peer_id.clone(),
+                bind_addr,
+                Some(newer_addr),
+                Some(newer_addr),
+                1,
+                crate::current_timestamp(),
+            )
+            .await;
+        assert!(
+            handle
+                .registry
+                .lookup_actor("inbound-stale-arm/Q")
+                .await
+                .is_some(),
+            "R-11: the actually-live (newer) connection's FullSync must \
+             still be accepted after the stale arm attempt"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     /// RED (review finding B, P1, `handle_incoming_connection_tls`'s
     /// `ReplaceExisting` inbound-accept arm): the arm computes its decision
     /// against a snapshotted `existing_conn`, evicts it via the
@@ -2671,7 +3051,7 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
-                                outcome: outcome.map(|_| None),
+                                outcome: gossip_send_outcome_to_result(outcome),
                             }
                         });
                         futures.push(future);
@@ -3277,6 +3657,10 @@ where
             streaming_state_handoff: Some(streaming_state_handoff.clone()),
             registry_weak: Arc::downgrade(&registry),
             peer_addr,
+            // Inbound: the remote client's actual TCP source (ephemeral
+            // port included) is already unique per connection, so it
+            // doubles as the R-11 session discriminator directly.
+            session_source: peer_addr,
             peer_id: Some(peer_id.clone()),
             max_message_size,
             expected_schema_hash: registry.config.schema_hash,
@@ -3627,6 +4011,47 @@ where
             return ConnectionCloseOutcome::DroppedByTieBreaker;
         }
 
+        // R-11: this is a new TLS-authenticated session for `node_id`, which is
+        // the only evidence we accept that the peer may have restarted. Allow
+        // exactly one lower-sequence FullSync through the stale gate, otherwise
+        // a peer that restarted at the same address has every FullSync dropped
+        // forever and its stale actors survive until the 24h TTL.
+        //
+        // `node_id` here comes from the TLS client certificate, not from the
+        // wire-claimed hello fields, so a peer cannot arm this for a victim.
+        // Scoped to THIS connection's verified TCP source (ephemeral port
+        // included), so an old connection still draining through the reconnect
+        // cannot consume the exemption meant for the new session.
+        //
+        // Deliberately placed AFTER the tie-break above confirms
+        // `keep_connection`, not alongside the rest of this candidate's
+        // bookkeeping earlier in this function: a duplicate inbound candidate
+        // that loses the tie-break never becomes the peer's live connection,
+        // so arming any earlier would strand the exemption on its own
+        // dropped ephemeral port while leaving the surviving connection's own
+        // session unarmed -- silently failing the `from_current_session`
+        // gate for every subsequent FullSync it delivers. Mirrors the
+        // outbound arm-after-finalize ordering in
+        // `finalize_new_outbound_connection`.
+        //
+        // `keep_connection` only proves this candidate won at the moment the
+        // compare-and-publish above resolved; a concurrent accept/finalize
+        // can still supersede it before this `.await` completes.
+        // `connection_arc` is passed through so the registry can revalidate
+        // it is still the peer's current connection immediately before
+        // mutating shared state, and decline to arm otherwise.
+        if let Some(node_id) = node_id_opt {
+            registry
+                .arm_sequence_reset_for_new_session(
+                    peer_state_addr,
+                    node_id,
+                    peer_addr,
+                    &peer_id,
+                    &connection_arc,
+                )
+                .await;
+        }
+
         // The ephemeral TCP source address alias (when it differs from
         // `peer_state_addr`) is written as part of the SAME guarded,
         // revalidated operation as the `peer_state_addr` alias itself —
@@ -3657,6 +4082,9 @@ where
         msg_result.unwrap(),
         &mut streaming_state,
         &registry,
+        peer_addr,
+        // Inbound: the remote client's own TCP source is already unique per
+        // connection, so it doubles as the R-11 session discriminator.
         peer_addr,
         response_correlation.as_ref().map(|c| c.as_ref()),
         Some(&response_connection),
@@ -4661,6 +5089,59 @@ mod keepalive_apply_tests {
         .await
         .unwrap();
         handle.shutdown_and_wait().await;
+    }
+}
+
+/// The periodic gossip loop's send is fire-and-forget (`tell()`): it writes
+/// the request and returns as soon as the local write completes, without
+/// waiting for or reading any reply. Whatever the peer sends back arrives
+/// later, asynchronously, on that same persistent connection's own read
+/// task, and is dispatched there via `process_read_result` ->
+/// `handle_incoming_message` -- which threads that connection's real,
+/// per-socket `session_source` correctly (see `ReadContext::session_source`).
+///
+/// `send_gossip_message_zero_copy`'s `Result<()>` return type makes this the
+/// ONLY possible mapping to `GossipResult::outcome`: there is no response to
+/// carry. `apply_gossip_results`' `handle_gossip_response` call for a
+/// `FullSyncResponse` is therefore unreachable for real wire traffic --
+/// `response_opt` is always `None` here. If `send_gossip_message_zero_copy`
+/// is ever changed to synchronously return a genuine response, this mapping
+/// must change too, and `handle_gossip_response`'s call into
+/// `merge_full_sync_from` must be updated to thread the actual connection's
+/// session source (not `None`), or a legitimate current-session
+/// FullSyncResponse for an outbound peer will be silently dropped by the
+/// R-11 `from_current_session` gate (its fallback to
+/// `verified_sender_addr` -- the peer's fixed dial-target address -- will
+/// not match `current_session_source`, which for an outbound session is the
+/// dialling socket's own local ephemeral port).
+fn gossip_send_outcome_to_result(outcome: Result<()>) -> Result<Option<crate::registry::RegistryMessage>> {
+    outcome.map(|_| None)
+}
+
+#[cfg(test)]
+mod gossip_send_outcome_tests {
+    use super::gossip_send_outcome_to_result;
+
+    /// Pins the invariant `handle_gossip_response`'s `FullSyncResponse` arm
+    /// relies on: the periodic gossip loop can never observe a real
+    /// response through `GossipResult::outcome`, because the only thing it
+    /// ever sends is a fire-and-forget write outcome. If this ever starts
+    /// returning `Ok(Some(_))`, `send_gossip_message_zero_copy`'s return
+    /// type had to change to carry a response too -- see this function's
+    /// doc comment for what must be fixed alongside that (`session_source`
+    /// threading).
+    #[test]
+    fn gossip_send_outcome_never_carries_a_response_on_success() {
+        assert!(gossip_send_outcome_to_result(Ok(())).unwrap().is_none());
+    }
+
+    #[test]
+    fn gossip_send_outcome_still_propagates_send_errors() {
+        let err = crate::GossipError::Shutdown;
+        assert!(matches!(
+            gossip_send_outcome_to_result(Err(err)),
+            Err(crate::GossipError::Shutdown)
+        ));
     }
 }
 
