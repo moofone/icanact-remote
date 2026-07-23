@@ -3584,16 +3584,30 @@ impl<T> ConnectionPool<T> {
         // R-11: arm the one-shot lower-sequence exemption for OUTBOUND
         // sessions too, not just inbound. Every early return above (a rival
         // won the tie-break, or a publish race) happens before this point,
-        // so reaching here is the confirmation that THIS candidate is the
-        // peer's live connection -- arming any earlier could strand the
-        // exemption on a socket that never becomes live while leaving the
-        // surviving connection's subsequent gossip rejected (its source no
-        // longer matches this failed candidate).
+        // so reaching here is the confirmation that THIS candidate WAS the
+        // peer's live connection at publication time -- arming any earlier
+        // could strand the exemption on a socket that never becomes live
+        // while leaving the surviving connection's subsequent gossip
+        // rejected (its source no longer matches this failed candidate).
+        //
+        // Publication and this arm are still two separate operations,
+        // though: another task can supersede `connection_arc` between the
+        // publish above and this `.await` completing. `connection_arc` is
+        // passed through so `arm_sequence_reset_for_new_session` can
+        // revalidate it is still the peer's current connection immediately
+        // before mutating the registry, and decline to arm otherwise.
         if let (Some(registry_arc), Some(node_id)) =
             (registry_weak.upgrade(), fresh_session_node_id)
         {
+            let arming_peer_id = crate::PeerId::from_public_key(&node_id);
             registry_arc
-                .arm_sequence_reset_for_new_session(addr, node_id, local_session_addr)
+                .arm_sequence_reset_for_new_session(
+                    addr,
+                    node_id,
+                    local_session_addr,
+                    &arming_peer_id,
+                    &connection_arc,
+                )
                 .await;
         }
 

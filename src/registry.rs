@@ -2407,12 +2407,47 @@ impl<T: 'static> GossipRegistry<T> {
     /// authenticated connection, including its ephemeral port. Only a FullSync
     /// arriving from that exact source consumes the exemption, so an old
     /// connection still draining through a reconnect cannot steal it.
+    ///
+    /// `connection_instance` ties the arm to the exact connection object the
+    /// caller believes just went live, not merely to `node_id`. Publication
+    /// (compare-and-publish into the connection pool) and this arm are two
+    /// separate operations, so a caller can still be running this call after
+    /// a NEWER connection for the same peer has already been published --
+    /// e.g. a stale outbound finalizer, or a stale inbound accept handler
+    /// whose own tie-break resolution is followed by an `.await` a
+    /// concurrent, faster accept/finalize can race past. Immediately before
+    /// mutating `gossip_state`, check (a pure, non-mutating snapshot read --
+    /// never the self-healing `get_connection_by_peer_id`, whose side
+    /// effects must not fire from a decision path) whether a DIFFERENT
+    /// connection is now the peer's current published one; if so,
+    /// `connection_instance` has been superseded and the arm is skipped
+    /// entirely rather than clobbering the newer session's discriminator
+    /// with this stale caller's obsolete source. A peer with no currently
+    /// published connection at all (e.g. a caller that manages sessions
+    /// without registering into the connection pool, as local/test callers
+    /// do) is not evidence of supersession, so the arm proceeds.
     pub async fn arm_sequence_reset_for_new_session(
         &self,
         peer_addr: SocketAddr,
         node_id: crate::GossipNodeId,
         session_source: SocketAddr,
+        peer_id: &crate::PeerId,
+        connection_instance: &std::sync::Arc<crate::connection_pool::LockFreeConnection>,
     ) {
+        let superseded_by_a_different_connection = self
+            .connection_pool
+            .peer_current_connection_snapshot(peer_id)
+            .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, connection_instance));
+        if superseded_by_a_different_connection {
+            debug!(
+                peer = %peer_addr,
+                session_source = %session_source,
+                "R-11: declining to arm sequence-reset; this connection instance \
+                 has already been superseded by a newer published session"
+            );
+            return;
+        }
+
         let mut gossip_state = self.gossip_state.lock().await;
         if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr)
             && peer_info.node_id == Some(node_id)
@@ -8901,6 +8936,24 @@ mod tests {
         );
     }
 
+    /// R-11 helper: a throwaway connection instance for
+    /// `arm_sequence_reset_for_new_session`'s instance-supersession check.
+    /// These registry-level tests never publish anything into
+    /// `connection_pool`, so `peer_current_connection_snapshot` always
+    /// returns `None` for them regardless of which instance is passed here
+    /// -- there is no "different" published connection to be superseded
+    /// by, so the arm always proceeds. Only the connection-pool-level tests
+    /// (`connection_pool::tests`, `handle::tests`) exercise the actual
+    /// supersession check against a real published connection.
+    fn qa_r11_dummy_connection_instance(
+        addr: SocketAddr,
+    ) -> std::sync::Arc<crate::connection_pool::LockFreeConnection> {
+        std::sync::Arc::new(crate::connection_pool::LockFreeConnection::new(
+            addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        ))
+    }
+
     /// R-11 helper: a FullSync from `owner` advertising exactly `actors`,
     /// arriving on the connection whose verified TCP source is `source`.
     async fn qa_r11_full_sync_from(
@@ -8967,7 +9020,7 @@ mod tests {
         .await;
 
         // The restarted peer's new connection arms the exemption.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection)
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
             .await;
 
         // The OLD connection's in-flight lower-sequence FullSync arrives first.
@@ -9041,7 +9094,7 @@ mod tests {
 
         // B restarts: new authenticated session, sequence back to 1, and it no
         // longer hosts Y.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr)
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
             .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11/X"]).await;
 
@@ -9078,7 +9131,7 @@ mod tests {
         );
 
         // One new session admits exactly one lower-sequence sync...
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr)
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
             .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 3, &["qa_r11r/X"]).await;
         assert!(
@@ -9112,7 +9165,7 @@ mod tests {
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11i/X", "qa_r11i/Y"]).await;
 
         // A different identity must not be able to arm the victim's reset.
-        reg.arm_sequence_reset_for_new_session(peer_addr, attacker_node_id, peer_addr)
+        reg.arm_sequence_reset_for_new_session(peer_addr, attacker_node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
             .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11i/X"]).await;
 
@@ -9193,7 +9246,7 @@ mod tests {
         .await;
 
         // Peer restarts: new session armed, first sync (seq=1) accepted.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection)
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
             .await;
         qa_r11_full_sync_from(&reg, &owner, peer_addr, new_connection, 1, &["qa_r11p/X"]).await;
         assert!(
@@ -9284,7 +9337,7 @@ mod tests {
 
         // New session armed for a genuine restart, but the restart sync
         // itself hasn't arrived yet.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection)
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
             .await;
 
         // The OLD connection delivers an in-flight, NON-lower sequence (its
@@ -9356,7 +9409,7 @@ mod tests {
 
         // This node redials the restarted peer: a new outbound session is
         // established and armed.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_local_session)
+        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_local_session, &owner, &qa_r11_dummy_connection_instance(new_local_session))
             .await;
 
         // The OLD outbound connection is still draining and delivers an

@@ -3986,7 +3986,13 @@ async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption()
         .add_peer_with_node_id(dial_addr, Some(remote_node_id))
         .await;
     registry
-        .arm_sequence_reset_for_new_session(dial_addr, remote_node_id, existing_addr)
+        .arm_sequence_reset_for_new_session(
+            dial_addr,
+            remote_node_id,
+            existing_addr,
+            &remote_peer_id,
+            &existing,
+        )
         .await;
 
     // A fresh, non-preferred OUTBOUND dial to the same peer loses the
@@ -4033,6 +4039,162 @@ async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption()
         Some(losing_candidate_local_port),
         "R-11: a losing candidate must not strand the one-shot exemption on \
          a socket that never becomes live"
+    );
+}
+
+/// R-11: arming and publication are two separate operations. A candidate
+/// can be the peer's live connection at the moment its finalize logic
+/// decides to arm, yet be superseded by a NEWER connection for the same
+/// peer before that arm's own `.await` completes (e.g. `finalize_new_outbound_connection`'s
+/// arm call, `connection_pool/pool_connect.rs`, runs after publication but is
+/// still a separate async step a faster concurrent finalize can race past).
+/// If the stale finalizer's arm is allowed to complete regardless, it
+/// overwrites the newer session's `current_session_source` with its own
+/// obsolete local port, and the ACTUALLY-live connection's subsequent
+/// gossip then fails the `from_current_session` gate until another
+/// reconnect.
+///
+/// Exercises `arm_sequence_reset_for_new_session` directly against real,
+/// published `connection_pool` state (the exact primitive
+/// `finalize_new_outbound_connection`'s arm call delegates to) rather than
+/// re-driving the whole TLS/finalize pipeline, since the race is entirely
+/// about the ordering between publication and this specific call.
+#[tokio::test]
+async fn outbound_stale_finalizer_arm_after_supersession_does_not_clobber_newer_session() {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let (hi_kp, lo_kp) = hi_lo_keypairs("stale-arm-supersede-hi", "stale-arm-supersede-lo");
+    let remote_peer_id = lo_kp.peer_id();
+    let remote_node_id = remote_peer_id.to_node_id();
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(hi_kp),
+            ..Default::default()
+        },
+    ));
+    // The instance-supersession check consults `registry.connection_pool`
+    // directly, so publication must go through that SAME pool (not a
+    // standalone one) for the check to observe it.
+    let pool = registry.connection_pool.clone();
+
+    let dial_addr: SocketAddr = "127.0.0.1:7460".parse().unwrap();
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    registry
+        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .await;
+
+    // The STALE outbound candidate: published first, but its own arm call
+    // is delayed (simulating a slow task scheduling / lost race).
+    let stale_local_port: SocketAddr = "127.0.0.1:58001".parse().unwrap();
+    let (stale_io, _stale_keep) = tokio::io::duplex(1024);
+    let (stale_sh, _stale_w, _stale_r) = LockFreeStreamHandle::new(
+        stale_io,
+        dial_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut stale_conn = LockFreeConnection::new(dial_addr, ConnectionDirection::Outbound);
+    stale_conn.stream_handle = Some(Arc::new(stale_sh));
+    stale_conn.set_state(ConnectionState::Connected);
+    let stale = Arc::new(stale_conn);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        dial_addr,
+        stale.clone()
+    ));
+
+    // A NEWER outbound candidate wins a concurrent redial and is published,
+    // superseding the stale one as the peer's current connection -- and
+    // arms correctly, since it IS current at that moment.
+    let newer_local_port: SocketAddr = "127.0.0.1:58002".parse().unwrap();
+    let (newer_io, _newer_keep) = tokio::io::duplex(1024);
+    let (newer_sh, _newer_w, _newer_r) = LockFreeStreamHandle::new(
+        newer_io,
+        dial_addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut newer_conn = LockFreeConnection::new(dial_addr, ConnectionDirection::Outbound);
+    newer_conn.stream_handle = Some(Arc::new(newer_sh));
+    newer_conn.set_state(ConnectionState::Connected);
+    let newer = Arc::new(newer_conn);
+    assert!(pool.add_connection_by_peer_id(
+        remote_peer_id.clone(),
+        dial_addr,
+        newer.clone()
+    ));
+    registry
+        .arm_sequence_reset_for_new_session(
+            dial_addr,
+            remote_node_id,
+            newer_local_port,
+            &remote_peer_id,
+            &newer,
+        )
+        .await;
+
+    // The stale finalizer's own arm call FINALLY completes now, after
+    // having been superseded. It must be a no-op.
+    registry
+        .arm_sequence_reset_for_new_session(
+            dial_addr,
+            remote_node_id,
+            stale_local_port,
+            &remote_peer_id,
+            &stale,
+        )
+        .await;
+
+    {
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get(&dial_addr)
+            .expect("peer must still be tracked");
+        assert_ne!(
+            peer_info.current_session_source,
+            Some(stale_local_port),
+            "R-11: a stale finalizer's delayed arm must not overwrite the \
+             newer, currently-published session's discriminator"
+        );
+        assert_eq!(
+            peer_info.current_session_source,
+            Some(newer_local_port),
+            "R-11: the newer session's discriminator must remain untouched \
+             by the stale finalizer"
+        );
+    }
+
+    // The newer (actually live) connection's subsequent, advancing-sequence
+    // FullSync must still be accepted -- proof the stale arm did not
+    // silently break its gossip.
+    let mut local_actors = std::collections::HashMap::new();
+    local_actors.insert(
+        "stale-arm/Q".to_string(),
+        crate::RemoteActorLocation::new_with_peer(dial_addr, remote_peer_id.clone()),
+    );
+    registry
+        .merge_full_sync_from(
+            local_actors,
+            std::collections::HashMap::new(),
+            remote_peer_id.clone(),
+            dial_addr,
+            Some(newer_local_port),
+            Some(newer_local_port),
+            1,
+            crate::current_timestamp(),
+        )
+        .await;
+    assert!(
+        registry.lookup_actor("stale-arm/Q").await.is_some(),
+        "R-11: the actually-live (newer) connection's FullSync must still \
+         be accepted after the stale arm attempt"
     );
 }
 
