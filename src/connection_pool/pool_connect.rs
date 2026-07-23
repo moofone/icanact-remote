@@ -8,11 +8,14 @@ pub(crate) enum ConnectionConflictDecision {
     /// No live rival (none exists, or the existing entry is stale/dead) and the
     /// incoming candidate is identity-preferred — take incoming as the session.
     AcceptIncoming,
-    /// A live rival exists but the tie-break prefers the incoming candidate —
-    /// evict the rival, take incoming as the session.
+    /// A live rival exists but either the tie-break prefers the incoming
+    /// candidate's direction, or both use the preferred direction and the
+    /// incoming candidate has the newer authenticated session epoch. Evict
+    /// the rival and take incoming as the session.
     ReplaceExisting,
-    /// A live rival exists and the tie-break does not strictly prefer the
-    /// incoming candidate over it — keep the rival, reject incoming.
+    /// A live rival exists and either the incoming direction is not preferred,
+    /// or both candidates use the preferred direction but the incumbent has
+    /// the newer authenticated session epoch. Keep the rival, reject incoming.
     RejectIncoming,
     /// The existing entry is stale/dead *and* the incoming candidate is not
     /// identity-preferred either — evict the stale entry, but do not accept
@@ -23,14 +26,23 @@ pub(crate) enum ConnectionConflictDecision {
 /// THE single decision authority for connection keep/drop/dedup/replace
 /// outcomes for a verified peer identity.
 ///
-/// Its inputs are *purely* identity-derived: `keep_existing` / `keep_incoming`
-/// are the results of [`GossipRegistry::should_keep_connection`], a pure
-/// function of verified peer NodeId ordering plus connection direction, and
-/// `existing_usable` is the rival's liveness. There is deliberately **no
-/// `SocketAddr` parameter** — this is enforced structurally (at the type/
+/// Direction remains *purely* identity-derived: `keep_existing` /
+/// `keep_incoming` are the results of
+/// [`GossipRegistry::should_keep_connection`], a pure function of verified
+/// peer NodeId ordering plus connection direction. Within that single valid
+/// direction, `incoming_session_is_newer` orders two fully authenticated
+/// physical sessions by their local, monotonic stream-instance epoch. This is
+/// what lets a restarted process using the same long-lived peer identity
+/// replace a still-live predecessor without making ordinary simultaneous-open
+/// races nondeterministic: an older candidate can never displace a newer
+/// incumbent.
+///
+/// There is deliberately **no `SocketAddr` parameter** — this is enforced
+/// structurally (at the type/
 /// signature level, not by a runtime check): a keep/drop/dedup outcome can
 /// never be a function of where a peer happens to be dialing from, only of
-/// its cryptographic identity. A changed socket address is handled as
+/// its cryptographic identity, direction, and authenticated session epoch. A
+/// changed socket address is handled as
 /// reindex-only metadata (see [`ConnectionPool::reindex_connection_addr`]) and
 /// never reaches this function. This structural absence — no caller can even
 /// attempt to pass an address in — is the invariant that prevents the
@@ -94,6 +106,7 @@ pub(crate) fn resolve_connection_conflict(
     existing_usable: bool,
     keep_existing: bool,
     keep_incoming: bool,
+    incoming_session_is_newer: bool,
 ) -> ConnectionConflictDecision {
     if !existing_usable {
         return if keep_incoming {
@@ -102,13 +115,40 @@ pub(crate) fn resolve_connection_conflict(
             ConnectionConflictDecision::EvictStaleRejectIncoming
         };
     }
-    if !keep_existing && keep_incoming {
+    if keep_incoming && (!keep_existing || incoming_session_is_newer) {
         return ConnectionConflictDecision::ReplaceExisting;
     }
-    // Covers both "the rival is kept" and "neither side is strictly
-    // preferred" (equal/degenerate) — in both cases the live rival survives
-    // rather than being displaced by an equally-unpreferred incoming.
+    // Covers "the incoming direction is not preferred", "the incumbent has
+    // the newer same-direction session epoch", and the equal/degenerate
+    // inputs. In all three cases the live rival survives.
     ConnectionConflictDecision::RejectIncoming
+}
+
+/// Compare the local authenticated-session epochs of two physical
+/// connections. `LockFreeStreamHandle::instance_id` is process-global,
+/// monotonic, and allocated once for each completed transport stream.
+///
+/// A missing stream handle is never evidence that a candidate is newer. Real
+/// TLS candidates and live incumbents always have handles; the conservative
+/// fallback keeps synthetic/incomplete connections from displacing a live
+/// session.
+pub(crate) fn incoming_session_is_newer(
+    incoming: &Arc<LockFreeConnection>,
+    existing: &Arc<LockFreeConnection>,
+) -> bool {
+    match (
+        incoming
+            .stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id()),
+        existing
+            .stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id()),
+    ) {
+        (Some(incoming_epoch), Some(existing_epoch)) => incoming_epoch > existing_epoch,
+        _ => false,
+    }
 }
 
 impl<T> ConnectionPool<T> {
@@ -669,7 +709,18 @@ impl<T> ConnectionPool<T> {
                     rival.direction == ConnectionDirection::Outbound,
                 );
                 let keep_incoming = registry.should_keep_connection(peer_id, true);
-                resolve_connection_conflict(rival.has_live_stream(), keep_existing, keep_incoming)
+                resolve_connection_conflict(
+                    rival.has_live_stream(),
+                    keep_existing,
+                    keep_incoming,
+                    // `rival` was observed only after our candidate lost a
+                    // compare-and-publish against its original snapshot. Its
+                    // later publication is the newer session-generation
+                    // boundary, regardless of which physical stream object
+                    // happened to be allocated first. Never let a stale
+                    // snapshot clobber that concurrent publication.
+                    false,
+                )
             })
             .unwrap_or(ConnectionConflictDecision::RejectIncoming);
         match decision {
@@ -1158,7 +1209,16 @@ impl<T> ConnectionPool<T> {
                 // connection — `is_outbound == false`, mirroring
                 // `handle_incoming_connection_tls`'s own `keep_new_inbound`.
                 let keep_incoming = registry.should_keep_connection(peer_id, false);
-                resolve_connection_conflict(rival.has_live_stream(), keep_existing, keep_incoming)
+                resolve_connection_conflict(
+                    rival.has_live_stream(),
+                    keep_existing,
+                    keep_incoming,
+                    // Same publication-order rule as outbound finalize: a
+                    // rival discovered only after this candidate lost its
+                    // original CAS is the newer generation and must win over
+                    // the stale candidate snapshot.
+                    false,
+                )
             })
             .unwrap_or(ConnectionConflictDecision::RejectIncoming);
         match decision {
@@ -3401,8 +3461,10 @@ impl<T> ConnectionPool<T> {
             // concurrently: publishing the outbound here, then evicting it as the
             // wrong direction on the next tick, collaterally tore down the good
             // inbound — the single-node-restart reconnect thrash. The decision is
-            // purely identity-derived (`should_keep_connection`), never keyed on
-            // `addr`. If the existing preferred session wins, we leave the
+            // identity-derived for direction (`should_keep_connection`) and
+            // monotonic by authenticated stream epoch within that direction,
+            // never keyed on `addr`. If the existing preferred, newer session
+            // wins, we leave the
             // outbound indexed by address only (its FullSync/handle still work)
             // without making it the session; it is retired by its own IO
             // lifecycle, and the next outbound tie-break tick reuses the
@@ -3421,6 +3483,7 @@ impl<T> ConnectionPool<T> {
                             existing.has_live_stream(),
                             keep_existing,
                             keep_incoming,
+                            incoming_session_is_newer(&connection_arc, existing),
                         )
                     })
                     .unwrap_or(ConnectionConflictDecision::AcceptIncoming),

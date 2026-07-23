@@ -196,7 +196,8 @@ impl<T> ConnectionPool<T> {
                     // dial-vs-wait-for-preferred-inbound decision to the
                     // `keep_outbound_dial` check below, regardless of which of
                     // the two decisions comes back.
-                    let decision = resolve_connection_conflict(false, false, keep_outbound_dial);
+                    let decision =
+                        resolve_connection_conflict(false, false, keep_outbound_dial, false);
                     debug_assert!(
                         matches!(
                             decision,

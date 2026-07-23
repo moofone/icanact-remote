@@ -146,59 +146,58 @@ fn print_io_perf(label: &str) {
 }
 
 #[test]
-fn resolve_connection_conflict_is_identity_only() {
+fn resolve_connection_conflict_uses_identity_direction_then_session_epoch() {
     use super::ConnectionConflictDecision::*;
     // No live rival (stale/dead entry, or none at all) and incoming is
     // identity-preferred -> take the incoming.
     assert_eq!(
-        resolve_connection_conflict(false, true, true),
+        resolve_connection_conflict(false, true, true, false),
         AcceptIncoming
     );
     assert_eq!(
-        resolve_connection_conflict(false, false, true),
+        resolve_connection_conflict(false, false, true, false),
         AcceptIncoming
     );
     // No live rival, but incoming is *not* identity-preferred either -> evict
     // the stale rival, but do not accept the incoming as the session.
     assert_eq!(
-        resolve_connection_conflict(false, true, false),
+        resolve_connection_conflict(false, true, false, false),
         EvictStaleRejectIncoming
     );
     assert_eq!(
-        resolve_connection_conflict(false, false, false),
+        resolve_connection_conflict(false, false, false, false),
         EvictStaleRejectIncoming
     );
     // Live rival the tie-break prefers, incoming not preferred -> keep rival.
     assert_eq!(
-        resolve_connection_conflict(true, true, false),
+        resolve_connection_conflict(true, true, false, true),
         RejectIncoming
     );
     // Live rival, tie-break does not prefer it, incoming preferred -> replace.
     assert_eq!(
-        resolve_connection_conflict(true, false, true),
+        resolve_connection_conflict(true, false, true, false),
         ReplaceExisting
     );
-    // Live rival the tie-break prefers AND incoming also nominally preferred
-    // (a redundant simultaneous success on the same, already-correct,
-    // direction) -> keep the rival rather than orphaning it for an
-    // equally-valid duplicate. This is stricter than treating `keep_incoming`
-    // as an automatic override: `keep_existing` already answered "is this
-    // session tie-break-correct" and must not be second-guessed by a
-    // redundant incoming candidate that asks the identical question.
+    // Both sessions use the preferred direction. The later authenticated
+    // session replaces the incumbent; an older candidate does not.
     assert_eq!(
-        resolve_connection_conflict(true, true, true),
+        resolve_connection_conflict(true, true, true, true),
+        ReplaceExisting
+    );
+    assert_eq!(
+        resolve_connection_conflict(true, true, true, false),
         RejectIncoming
     );
     // Neither side is strictly preferred and the rival is live (degenerate
     // input; not reachable via `should_keep_connection` in practice, but the
     // function must still resolve it deterministically) -> keep the rival.
     assert_eq!(
-        resolve_connection_conflict(true, false, false),
+        resolve_connection_conflict(true, false, false, true),
         RejectIncoming
     );
     // The decision signature carries no SocketAddr: the structural invariant
     // that a keep/drop outcome can never depend on a peer's address, only on
-    // its verified identity. (Compile-time: the calls above pass only bools.)
+    // its verified identity, direction, and local session epoch.
 }
 
 /// Pins the exact (existing_usable, keep_existing, keep_incoming) -> decision
@@ -220,26 +219,29 @@ fn resolve_connection_conflict_matches_all_routed_call_sites() {
     // existing usable, wrong direction, incoming preferred -> replace ("outbound
     // finalize" publish path).
     assert_eq!(
-        resolve_connection_conflict(true, false, true),
+        resolve_connection_conflict(true, false, true, false),
         ReplaceExisting
     );
-    // existing usable and preferred (redundant simultaneous outbound success)
-    // -> keep existing, do not republish ("outbound finalize kept existing
-    // preferred session; not displacing it").
+    // Existing usable and preferred. An older concurrent candidate is
+    // rejected; a later authenticated session supersedes it.
     assert_eq!(
-        resolve_connection_conflict(true, true, true),
+        resolve_connection_conflict(true, true, true, false),
         RejectIncoming
+    );
+    assert_eq!(
+        resolve_connection_conflict(true, true, true, true),
+        ReplaceExisting
     );
     // existing stale, incoming (outbound) not preferred (higher-NodeId
     // fallback dial) -> evict stale, do not publish ("outbound finalize
     // evicted a stale rival but declined to publish...").
     assert_eq!(
-        resolve_connection_conflict(false, false, false),
+        resolve_connection_conflict(false, false, false, false),
         EvictStaleRejectIncoming
     );
     // existing stale, incoming (outbound) preferred -> accept.
     assert_eq!(
-        resolve_connection_conflict(false, false, true),
+        resolve_connection_conflict(false, false, true, false),
         AcceptIncoming
     );
 
@@ -250,29 +252,34 @@ fn resolve_connection_conflict_matches_all_routed_call_sites() {
     // existing stale, new inbound preferred -> accept ("inbound_tiebreak_evict_stale"
     // + "inbound_connection_accepted").
     assert_eq!(
-        resolve_connection_conflict(false, false, true),
+        resolve_connection_conflict(false, false, true, false),
         AcceptIncoming
     );
     // existing stale, new inbound NOT preferred -> evict stale, reject
     // ("inbound_tiebreak_evict_stale" + "inbound_tiebreak_reject_non_preferred_inbound").
     assert_eq!(
-        resolve_connection_conflict(false, false, false),
+        resolve_connection_conflict(false, false, false, false),
         EvictStaleRejectIncoming
     );
     // existing usable, wrong direction, new inbound preferred -> replace
     // ("inbound_tiebreak_replace_wrong_direction").
     assert_eq!(
-        resolve_connection_conflict(true, false, true),
+        resolve_connection_conflict(true, false, true, false),
         ReplaceExisting
     );
-    // existing usable and preferred (duplicate inbound, or existing outbound
-    // correctly kept) -> reject ("inbound_tiebreak_reject_live_duplicate").
+    // Existing usable and preferred. A non-preferred inbound remains rejected.
     assert_eq!(
-        resolve_connection_conflict(true, true, false),
+        resolve_connection_conflict(true, true, false, true),
         RejectIncoming
     );
+    // A later authenticated inbound in the preferred direction replaces the
+    // incumbent; an older one remains rejected.
     assert_eq!(
-        resolve_connection_conflict(true, true, true),
+        resolve_connection_conflict(true, true, true, true),
+        ReplaceExisting
+    );
+    assert_eq!(
+        resolve_connection_conflict(true, true, true, false),
         RejectIncoming
     );
 
@@ -282,7 +289,7 @@ fn resolve_connection_conflict_matches_all_routed_call_sites() {
     // identical action there (evict); pinned here so a future change cannot
     // silently make the stale branch stop evicting for either outcome.
     for keep_incoming in [true, false] {
-        let decision = resolve_connection_conflict(false, false, keep_incoming);
+        let decision = resolve_connection_conflict(false, false, keep_incoming, false);
         assert!(
             matches!(decision, AcceptIncoming | EvictStaleRejectIncoming),
             "outbound top-of-dial's stale-rival branch expects only \

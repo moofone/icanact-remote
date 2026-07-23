@@ -68,10 +68,25 @@ async fn node(
     label: &'static str,
     asks: Arc<AtomicU64>,
 ) -> icanact_remote::Result<TlsHandle> {
+    node_with_keypair(
+        KeyPair::new_for_testing(seed),
+        label,
+        asks,
+        static_mesh_cfg(),
+    )
+    .await
+}
+
+async fn node_with_keypair(
+    keypair: KeyPair,
+    label: &'static str,
+    asks: Arc<AtomicU64>,
+    config: GossipConfig,
+) -> icanact_remote::Result<TlsHandle> {
     let handle = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse().unwrap(),
-        KeyPair::new_for_testing(seed).to_secret_key(),
-        Some(static_mesh_cfg()),
+        keypair.to_secret_key(),
+        Some(config),
         BuilderTlsBootstrap,
     )
     .await?;
@@ -80,6 +95,111 @@ async fn node(
         .set_actor_message_handler_sync(Arc::new(EchoHandler { label, asks }))
         .await;
     Ok(handle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn newer_authenticated_same_direction_session_replaces_live_incumbent()
+-> icanact_remote::Result<()> {
+    let first = KeyPair::new_for_testing("live-session-replacement-a");
+    let second = KeyPair::new_for_testing("live-session-replacement-b");
+    let (replica_key, observer_key) =
+        if first.peer_id().to_node_id().as_bytes() < second.peer_id().to_node_id().as_bytes() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+    let quiet_config = GossipConfig {
+        gossip_interval: Duration::from_secs(300),
+        cleanup_interval: Duration::from_secs(300),
+        peer_retry_interval: Duration::from_secs(300),
+        peer_supervisor_interval: Duration::from_secs(300),
+        ..Default::default()
+    };
+    let old_asks = Arc::new(AtomicU64::new(0));
+    let new_asks = Arc::new(AtomicU64::new(0));
+    let observer = node_with_keypair(
+        observer_key,
+        "observer",
+        Arc::new(AtomicU64::new(0)),
+        quiet_config.clone(),
+    )
+    .await?;
+    let old_replica = node_with_keypair(
+        replica_key.clone(),
+        "old",
+        old_asks.clone(),
+        quiet_config.clone(),
+    )
+    .await?;
+
+    assert!(
+        old_replica
+            .registry
+            .should_keep_connection(&observer.registry.peer_id, true),
+        "the replica identity must own the preferred outbound direction"
+    );
+    old_replica
+        .add_peer(&observer.registry.peer_id)
+        .await
+        .connect(&observer.registry.bind_addr)
+        .await?;
+
+    ask_until_success(
+        &observer,
+        &old_replica.registry.peer_id,
+        b"before",
+        b"old:before",
+        Duration::from_secs(2),
+    )
+    .await
+    .map_err(icanact_remote::GossipError::InvalidKeyPair)?;
+    // Start a second live registry with the same authenticated identity. The
+    // old registry deliberately remains alive: the transport must treat this
+    // later, tie-break-correct TLS connection as the next session epoch and
+    // replace the incumbent without an application-side disconnect.
+    let replacement = node_with_keypair(replica_key, "new", new_asks.clone(), quiet_config).await?;
+    replacement
+        .add_peer(&observer.registry.peer_id)
+        .await
+        .connect(&observer.registry.bind_addr)
+        .await?;
+
+    ask_until_success(
+        &observer,
+        &replacement.registry.peer_id,
+        b"after",
+        b"new:after",
+        Duration::from_secs(2),
+    )
+    .await
+    .map_err(icanact_remote::GossipError::InvalidKeyPair)?;
+
+    let old_hits_after_replacement = old_asks.load(Ordering::Acquire);
+    ask_until_success(
+        &observer,
+        &replacement.registry.peer_id,
+        b"steady",
+        b"new:steady",
+        Duration::from_secs(2),
+    )
+    .await
+    .map_err(icanact_remote::GossipError::InvalidKeyPair)?;
+
+    assert_eq!(
+        old_asks.load(Ordering::Acquire),
+        old_hits_after_replacement,
+        "post-replacement traffic must not reach the superseded handler"
+    );
+    assert!(
+        new_asks.load(Ordering::Acquire) >= 2,
+        "the replacement handler must serve post-restart traffic"
+    );
+
+    replacement.shutdown_and_wait().await;
+    old_replica.shutdown_and_wait().await;
+    observer.shutdown_and_wait().await;
+    Ok(())
 }
 
 async fn configure_static_peer(left: &TlsHandle, right: &TlsHandle) {
