@@ -9556,3 +9556,75 @@ async fn fresh_outbound_connect_sends_identifying_fullsync_before_racing_routed_
          connection setup\")"
     );
 }
+
+// RED: the reader/writer IO tasks for a fresh outbound connection are
+// already running by the time its identify build reaches the `gossip_state`
+// await (identify is built and sent before this candidate is published
+// anywhere). If the peer disconnects while that await is contended, the IO
+// tasks notice and exit -- but nothing is indexed for this candidate yet,
+// so no other cleanup path can reach it. The identify send that follows
+// then fails on the now-dead stream. A finalize that merely logs that
+// failure and continues would go on to publish and count this dead
+// candidate as the peer's live "current" connection: it can never actually
+// identify itself, nothing will ever reap it, and it permanently suppresses
+// a redial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_outbound_connect_aborts_when_identify_send_fails_instead_of_publishing_dead_candidate()
+ {
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("identify-fail-local")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+    let addr: SocketAddr = "127.0.0.1:41778".parse().unwrap();
+
+    let (io, peer_io) = tokio::io::duplex(4096);
+
+    // Hold `gossip_state` so the finalize task's identify build parks here,
+    // exactly as in the identify-first race test above.
+    let guard = registry.gossip_state.lock().await;
+
+    let finalize_registry = Arc::downgrade(&registry);
+    let pool_for_finalize = pool.clone();
+    let finalize_task = tokio::spawn(async move {
+        pool_for_finalize
+            .finalize_new_outbound_connection(addr, io, finalize_registry, None, addr, None)
+            .await
+    });
+
+    // Simulate the peer disconnecting while the candidate is parked here --
+    // before anything is indexed for it, so the IO tasks' own dead-stream
+    // cleanup has nothing to reach.
+    drop(peer_io);
+
+    // Give the reader/writer IO tasks, already running against the now-
+    // closed stream, real time to notice and mark themselves exited before
+    // the finalize task is allowed to proceed past the lock.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(guard);
+
+    let result = finalize_task.await.expect("finalize task must not panic");
+
+    assert!(
+        result.is_err(),
+        "finalize must fail when the identifying FullSync could not be \
+         sent to a dead stream, not silently succeed with a dead candidate"
+    );
+    assert!(
+        pool.get_connection_by_addr(&addr).is_none(),
+        "a candidate whose identify send failed must never be published -- \
+         it can never actually identify itself to the acceptor and nothing \
+         can later reap it, which would otherwise suppress a redial forever"
+    );
+    assert_eq!(
+        pool.connection_count(),
+        0,
+        "a candidate whose identify send failed must not leak a counted \
+         connection-instance"
+    );
+}
