@@ -894,10 +894,13 @@ mod tests {
 
         let peer = test_addr(9000);
 
-        // Apply failures up to MAX_PEER_FAILURES - 1
-        for i in 1..MAX_PEER_FAILURES {
+        let failures_before_removal = MAX_PEER_FAILURES - 1;
+        for failure in 1..=failures_before_removal {
             let removed = discovery.on_peer_failure(peer);
-            assert!(!removed, "peer should not be removed after {} failures", i);
+            assert!(
+                !removed,
+                "peer should not be removed after {failure} failures"
+            );
             assert!(
                 discovery
                     .get_peer_state(&peer)
@@ -905,7 +908,7 @@ mod tests {
             );
         }
 
-        // The MAX_PEER_FAILURES-th failure should remove the peer
+        // The next failure reaches MAX_PEER_FAILURES and removes the peer.
         let removed = discovery.on_peer_failure(peer);
         assert!(
             removed,
