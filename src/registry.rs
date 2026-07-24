@@ -3335,13 +3335,21 @@ impl<T: 'static> GossipRegistry<T> {
         // contested address first and asking afterwards would leave the peer
         // half-moved, with the old address stranded and the new one
         // attributed to someone else.
-        let migrate_outcome = self.registry_owner.migrate(peer_addr, new_addr).await;
+        // The move is also pinned to the identity resolved just above: that
+        // resolution and this command are not one step, so another claimant
+        // could have taken `peer_addr` in between and PHASE 2 would then
+        // re-key the wrong identity onto `new_addr`.
+        let migrate_outcome = self
+            .registry_owner
+            .migrate(peer_addr, new_addr, migrating_peer_id.clone())
+            .await;
         if migrate_outcome.is_blocked() {
             warn!(
                 old_addr = %peer_addr,
                 new_addr = %new_addr,
                 dns_name = %dns_name,
-                "DNS refresh: new address is owned by a different identity, aborting migration"
+                outcome = ?migrate_outcome,
+                "DNS refresh: address ownership no longer permits this move, aborting migration"
             );
             return None;
         }
@@ -3404,17 +3412,23 @@ impl<T: 'static> GossipRegistry<T> {
 
         if !migration_result {
             // The peer entry did not move, so ownership must not stay moved
-            // either. Put it back, and accept that the restore itself can be
-            // refused if the old address has since been claimed by someone
-            // else — in that case the address genuinely belongs to its new
-            // claimant and forcing it back would be the very overwrite this
-            // ordering exists to prevent.
-            let restore = self.registry_owner.migrate(new_addr, peer_addr).await;
+            // either. Put it back, pinned to the same identity that was moved
+            // out: a newer claimant may already hold `new_addr`, and an
+            // unpinned restore would drag THAT identity back onto the old
+            // address. Accept that the restore can therefore be refused, at
+            // either end — in that case the addresses genuinely belong to
+            // their current claimants and forcing the move would be the very
+            // overwrite this ordering exists to prevent.
+            let restore = self
+                .registry_owner
+                .migrate(new_addr, peer_addr, migrating_peer_id.clone())
+                .await;
             if restore.is_blocked() {
                 warn!(
                     old_addr = %peer_addr,
                     new_addr = %new_addr,
-                    "DNS refresh: peer entry did not move and the old address has a new owner; \
+                    outcome = ?restore,
+                    "DNS refresh: peer entry did not move and ownership can no longer be restored; \
                      leaving ownership with the current claimant"
                 );
             }
@@ -18551,7 +18565,7 @@ mod tests {
 
         let move_seq = registry
             .registry_owner
-            .migrate(from, to)
+            .migrate(from, to, None)
             .await
             .commit_seq()
             .expect("an owned source must move onto a free destination");
@@ -18682,6 +18696,196 @@ mod tests {
             registry.registry_owner.routes_to(&new_addr),
             Some(holder),
             "the contested address must still belong to its owner"
+        );
+    }
+
+    /// A DNS re-resolution resolves the identity to carry across BEFORE it
+    /// asks the owner actor to move ownership. If that identity has been
+    /// displaced on the source address in between, the move is refused and
+    /// the connection-index re-key that would otherwise follow is not
+    /// performed for the wrong identity.
+    #[tokio::test]
+    async fn dns_refresh_aborts_when_the_source_owner_was_displaced() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5100".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5100".parse().unwrap();
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_140),
+            test_config_with_seed("dns-refresh-displaced-source"),
+        );
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![new_addr])))
+            .await;
+
+        let captured = test_peer_id("dns-refresh-captured");
+        let usurper = test_peer_id("dns-refresh-usurper");
+
+        // Ownership of the source address ends up with `usurper`.
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    old_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: captured.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Provisional,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    old_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: usurper.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        // The pool index is what the refresh reads to resolve the identity to
+        // carry across. Pin it to the identity that has since been displaced,
+        // which is exactly the state a refresh that sampled it earlier holds.
+        let _ = registry
+            .connection_pool
+            .addr_to_peer_id
+            .upsert_sync(old_addr, captured.clone());
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(old_addr);
+            peer.node_id = Some(captured.to_node_id());
+            peer.dns_name = Some("displaced.invalid:5100".to_string());
+            gossip_state.peers.insert(old_addr, peer);
+        }
+
+        assert_eq!(
+            registry.refresh_peer_dns(old_addr).await,
+            None,
+            "a displaced source identity must report that no migration happened"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state.peers.contains_key(&old_addr),
+            "the peer entry must stay at its original address"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&new_addr),
+            "no peer entry may be published onto the new address"
+        );
+        drop(gossip_state);
+        assert!(
+            registry
+                .connection_pool
+                .get_peer_id_by_addr(&new_addr)
+                .is_none(),
+            "the connection index must not be re-keyed onto the new address"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .peer_id_to_addr
+                .read_sync(&captured, |_, addr| *addr)
+                .is_none_or(|addr| addr != new_addr),
+            "the displaced identity must not be re-keyed onto the new address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            Some(usurper),
+            "ownership of the source address must stay with the identity that holds it"
+        );
+        assert_eq!(
+            registry.registry_owner.owner_of(&new_addr),
+            None,
+            "and the destination must be left unowned"
+        );
+    }
+
+    /// An outbound dial whose cert-verified identity loses address
+    /// arbitration attributes nothing: the accepted owner's routing entry is
+    /// the one that survives. This is the state the outbound connect path
+    /// acts on when it refuses to continue to the finalize step, which would
+    /// otherwise republish the address for the losing identity.
+    #[tokio::test]
+    async fn a_rejected_address_claim_publishes_no_route_for_the_loser() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_141),
+            test_config_with_seed("rejected-claim-publishes-nothing"),
+        );
+        let contested: SocketAddr = "9.10.11.12:5200".parse().unwrap();
+        let accepted = test_peer_id("arbitration-winner");
+        let loser = test_peer_id("arbitration-loser");
+
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    contested,
+                    Some(accepted.to_node_id()),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+        assert_eq!(
+            registry.connection_pool.get_peer_id_by_addr(&contested),
+            Some(accepted.clone())
+        );
+
+        // The losing dial submits the very same claim the outbound connect
+        // path submits from a cert-verified identity.
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    contested,
+                    Some(loser.to_node_id()),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Rejected
+        );
+
+        assert_eq!(
+            registry.connection_pool.get_peer_id_by_addr(&contested),
+            Some(accepted.clone()),
+            "the accepted owner's route must be untouched by a rejected claim"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&contested),
+            Some(accepted.clone()),
+            "and ownership must stay with the accepted owner"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .peer_id_to_addr
+                .read_sync(&loser, |_, _| ())
+                .is_none(),
+            "the losing identity must have no address attributed to it"
+        );
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(
+            gossip_state
+                .peers
+                .get(&contested)
+                .and_then(|peer| peer.node_id),
+            Some(accepted.to_node_id()),
+            "and the peer entry must not be re-attributed to the loser"
         );
     }
 

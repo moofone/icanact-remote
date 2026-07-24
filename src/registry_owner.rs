@@ -194,13 +194,26 @@ pub enum MigrateOutcome {
     /// `to` is already owned by a DIFFERENT identity. Ownership stays where
     /// it is and the caller must not move address-keyed state onto `to`.
     TargetOwnedByOther,
+    /// The caller named an expected owner for `from` and that is no longer
+    /// the identity holding it.
+    ///
+    /// A caller that re-keys its own identity-scoped state alongside the move
+    /// must resolve the identity to re-key BEFORE issuing the command, and
+    /// that resolution is not part of the command. Between the two, another
+    /// claimant can displace the source's owner. Naming the expected owner
+    /// makes the move conditional on the caller's resolution still holding,
+    /// so a displaced caller re-keys nothing instead of re-keying the wrong
+    /// identity onto the destination.
+    SourceOwnerMismatch,
 }
 
 impl MigrateOutcome {
-    /// Whether a competing identity owns the destination, which forbids the
-    /// caller from re-keying its own state onto that address.
+    /// Whether the caller is forbidden from re-keying its own address-keyed
+    /// state onto the destination: either a competing identity owns the
+    /// destination, or the source is no longer held by the identity the
+    /// caller resolved.
     pub fn is_blocked(&self) -> bool {
-        matches!(self, Self::TargetOwnedByOther)
+        matches!(self, Self::TargetOwnedByOther | Self::SourceOwnerMismatch)
     }
 
     /// Whether ownership actually moved.
@@ -212,7 +225,7 @@ impl MigrateOutcome {
     pub fn commit_seq(&self) -> Option<CommitSeq> {
         match self {
             Self::Migrated { commit_seq } => Some(*commit_seq),
-            Self::SourceUnowned | Self::TargetOwnedByOther => None,
+            Self::SourceUnowned | Self::TargetOwnedByOther | Self::SourceOwnerMismatch => None,
         }
     }
 }
@@ -264,6 +277,11 @@ enum OwnerCommand {
     Migrate {
         from: SocketAddr,
         to: SocketAddr,
+        /// When set, only move if this identity still owns `from`, so a
+        /// caller that resolved the moving identity before submitting the
+        /// command cannot re-key a different identity that displaced it in
+        /// the meantime.
+        expected_source: Option<PeerId>,
         reply: oneshot::Sender<MigrateOutcome>,
     },
 }
@@ -392,10 +410,30 @@ impl RegistryOwnerHandle {
     /// whether the destination has meanwhile been claimed by someone else. An
     /// unreachable owner is reported as blocked: without a committed decision
     /// no address-keyed move may proceed.
-    pub async fn migrate(&self, from: SocketAddr, to: SocketAddr) -> MigrateOutcome {
+    ///
+    /// `expected_source` pins the identity the caller believes owns `from`.
+    /// Any caller that resolved that identity separately — before submitting
+    /// this command — must pass it, because the resolution and the move are
+    /// not one atomic step and a competing claimant can displace the source's
+    /// owner in between; the move is then refused rather than silently
+    /// carrying a different identity onto the destination. `None` waives the
+    /// check and is correct only when the caller re-keys no identity-scoped
+    /// state, e.g. a seed configured by host name that has never been
+    /// claimed.
+    pub async fn migrate(
+        &self,
+        from: SocketAddr,
+        to: SocketAddr,
+        expected_source: Option<PeerId>,
+    ) -> MigrateOutcome {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
-        let command = OwnerCommand::Migrate { from, to, reply };
+        let command = OwnerCommand::Migrate {
+            from,
+            to,
+            expected_source,
+            reply,
+        };
         if self.shared.tx.send(command).await.is_err() {
             warn!(from = %from, to = %to, "registry owner unavailable; failing address migration closed");
             return MigrateOutcome::TargetOwnedByOther;
@@ -477,8 +515,13 @@ impl PeerRegistryOwner {
                 let released = self.release(addr, expected.as_ref());
                 let _ = reply.send(released);
             }
-            OwnerCommand::Migrate { from, to, reply } => {
-                let migrated = self.migrate(from, to);
+            OwnerCommand::Migrate {
+                from,
+                to,
+                expected_source,
+                reply,
+            } => {
+                let migrated = self.migrate(from, to, expected_source.as_ref());
                 let _ = reply.send(migrated);
             }
         }
@@ -547,9 +590,35 @@ impl PeerRegistryOwner {
     /// identity legitimately owns, silently stealing that identity's routing.
     /// "Nothing to move" is therefore only reported once the destination is
     /// known to be free (or already held by the source's own identity).
-    fn migrate(&mut self, from: SocketAddr, to: SocketAddr) -> MigrateOutcome {
+    ///
+    /// `expected_source`, when set, additionally pins the identity the caller
+    /// resolved as the source's owner. It is checked here, inside the
+    /// serialized command, so the caller's separately-resolved identity and
+    /// the move are decided against the same ownership state.
+    fn migrate(
+        &mut self,
+        from: SocketAddr,
+        to: SocketAddr,
+        expected_source: Option<&PeerId>,
+    ) -> MigrateOutcome {
         let source = self.addr_ownership.get(&from).cloned();
-        if let Some(existing) = self.addr_ownership.get(&to) {
+        if let Some(expected) = expected_source
+            && source
+                .as_ref()
+                .is_none_or(|owner| owner.node_id != *expected)
+        {
+            // Includes the source having become unowned: the caller resolved
+            // an identity to carry across, and it is no longer there to carry.
+            trace!(
+                from = %from,
+                to = %to,
+                expected = %expected,
+                "address migration refused: the source's owner is not the expected identity"
+            );
+            return MigrateOutcome::SourceOwnerMismatch;
+        }
+        let destination = self.addr_ownership.get(&to).cloned();
+        if let Some(existing) = destination.as_ref() {
             let same_identity = source
                 .as_ref()
                 .is_some_and(|owner| owner.node_id == existing.node_id);
@@ -559,6 +628,24 @@ impl PeerRegistryOwner {
         }
         let Some(owner) = source else {
             return MigrateOutcome::SourceUnowned;
+        };
+        // Merging onto an address the same identity already holds keeps the
+        // stronger of the two kinds. Carrying the source's kind across
+        // unconditionally could turn a destination that is already backed by
+        // an observed connection back into a self-reported one, making it
+        // displaceable again by a claim it had already earned the right to
+        // refuse. The never-downgrade rule is the arbitration core's, reused
+        // here rather than restated.
+        let kind = resolved_kind(
+            destination.as_ref(),
+            &Claim {
+                node_id: owner.node_id.clone(),
+                kind: owner.kind,
+            },
+        );
+        let owner = Owner {
+            node_id: owner.node_id,
+            kind,
         };
         self.addr_ownership.remove(&from);
         self.addr_ownership.insert(to, owner.clone());
@@ -943,7 +1030,7 @@ mod tests {
             .claim(from, claim_of(node.clone(), ClaimKind::Verified), false)
             .await;
         assert!(
-            owner.migrate(from, to).await.moved(),
+            owner.migrate(from, to, None).await.moved(),
             "an owned source must move onto a free destination"
         );
         assert_eq!(owner.owner_of(&from), None);
@@ -966,21 +1053,21 @@ mod tests {
             )
             .await;
         assert_eq!(
-            owner.migrate(to, contested).await,
+            owner.migrate(to, contested, None).await,
             MigrateOutcome::TargetOwnedByOther
         );
         // An UNOWNED source moving onto an address someone else owns is
         // blocked too: "nothing to move" would invite the caller to re-key
         // its own state onto the other identity's address.
         assert_eq!(
-            owner.migrate(addr(30_012), contested).await,
+            owner.migrate(addr(30_012), contested, None).await,
             MigrateOutcome::TargetOwnedByOther,
             "an unowned source must not be allowed onto another identity's address"
         );
         // With a free destination, an unclaimed source is still reported as
         // "nothing to move" — the non-blocking outcome.
         assert_eq!(
-            owner.migrate(addr(30_012), addr(30_013)).await,
+            owner.migrate(addr(30_012), addr(30_013), None).await,
             MigrateOutcome::SourceUnowned,
             "an unclaimed source with a free destination has nothing to move"
         );
@@ -1002,7 +1089,7 @@ mod tests {
         let events_before = publisher.events();
 
         assert_eq!(
-            owner.migrate(unowned, held).await,
+            owner.migrate(unowned, held, None).await,
             MigrateOutcome::TargetOwnedByOther
         );
         assert_eq!(
@@ -1041,5 +1128,199 @@ mod tests {
         );
         assert!(publisher.events().is_empty());
         assert!(owner.snapshot().is_empty());
+    }
+
+    /// A caller that resolved the moving identity separately, then had it
+    /// displaced before the command was processed, moves nothing: naming the
+    /// expected owner makes the move conditional on that resolution, so the
+    /// displacing identity is not silently carried onto the destination.
+    #[tokio::test]
+    async fn migrate_is_refused_when_the_source_owner_is_not_the_expected_identity() {
+        let (owner, publisher) = owner_handle();
+        let expected = peer("mismatch-expected");
+        let usurper = peer("mismatch-usurper");
+        let from = addr(30_030);
+        let to = addr(30_031);
+
+        // The caller's resolution: `expected` owns `from`.
+        owner
+            .claim(
+                from,
+                claim_of(expected.clone(), ClaimKind::Provisional),
+                false,
+            )
+            .await;
+        // ... and is displaced before the migrate command is processed.
+        assert!(
+            owner
+                .claim(from, claim_of(usurper.clone(), ClaimKind::Verified), false)
+                .await
+                .is_accepted()
+        );
+        let events_before = publisher.events();
+
+        assert_eq!(
+            owner.migrate(from, to, Some(expected.clone())).await,
+            MigrateOutcome::SourceOwnerMismatch
+        );
+        assert!(
+            owner
+                .migrate(from, to, Some(expected.clone()))
+                .await
+                .is_blocked(),
+            "a refused move must tell the caller to perform no address-keyed mutation"
+        );
+        assert_eq!(
+            owner.routes_to(&from),
+            Some(usurper),
+            "the displacing identity keeps the source address"
+        );
+        assert_eq!(
+            owner.owner_of(&to),
+            None,
+            "nothing may be carried onto the destination"
+        );
+        assert_eq!(
+            publisher.events(),
+            events_before,
+            "a refused migration must publish nothing"
+        );
+
+        // A source that has been released entirely is a mismatch too: the
+        // identity the caller resolved is no longer there to carry across.
+        let vacant = addr(30_032);
+        assert_eq!(
+            owner.migrate(vacant, to, Some(expected)).await,
+            MigrateOutcome::SourceOwnerMismatch
+        );
+        assert!(owner.owner_of(&to).is_none());
+    }
+
+    /// The restore leg of a failed re-resolution is scoped the same way: if a
+    /// newer claimant took the address the ownership was moved to, putting it
+    /// back would drag THAT identity onto the old address. The restore is
+    /// refused and the newer claimant is left undisturbed.
+    #[tokio::test]
+    async fn migrate_rollback_is_refused_when_a_newer_claimant_took_the_address() {
+        let (owner, _publisher) = owner_handle();
+        let original = peer("rollback-original");
+        let newer = peer("rollback-newer");
+        let old_addr = addr(30_033);
+        let new_addr = addr(30_034);
+
+        // `original`'s ownership has already been moved onto `new_addr`.
+        owner
+            .claim(
+                old_addr,
+                claim_of(original.clone(), ClaimKind::Provisional),
+                false,
+            )
+            .await;
+        assert!(
+            owner
+                .migrate(old_addr, new_addr, Some(original.clone()))
+                .await
+                .moved()
+        );
+
+        // A newer claimant takes `new_addr` before the restore runs.
+        assert!(
+            owner
+                .claim(
+                    new_addr,
+                    claim_of(newer.clone(), ClaimKind::Verified),
+                    false
+                )
+                .await
+                .is_accepted()
+        );
+
+        assert_eq!(
+            owner
+                .migrate(new_addr, old_addr, Some(original.clone()))
+                .await,
+            MigrateOutcome::SourceOwnerMismatch,
+            "the restore must not move an identity the caller never held"
+        );
+        assert_eq!(
+            owner.routes_to(&new_addr),
+            Some(newer),
+            "the newer claimant's ownership must be undisturbed"
+        );
+        assert_eq!(
+            owner.owner_of(&old_addr),
+            None,
+            "and nothing may be force-restored onto the old address"
+        );
+
+        // The same restore DOES succeed while the original identity still
+        // holds the address — the pin refuses only the unsafe case.
+        let other_old = addr(30_035);
+        let other_new = addr(30_036);
+        owner
+            .claim(
+                other_old,
+                claim_of(original.clone(), ClaimKind::Provisional),
+                false,
+            )
+            .await;
+        assert!(
+            owner
+                .migrate(other_old, other_new, Some(original.clone()))
+                .await
+                .moved()
+        );
+        assert!(
+            owner
+                .migrate(other_new, other_old, Some(original.clone()))
+                .await
+                .moved(),
+            "an undisturbed address must still be restorable"
+        );
+        assert_eq!(owner.routes_to(&other_old), Some(original));
+    }
+
+    /// Merging onto an address the same identity already holds keeps the
+    /// stronger kind. A destination already backed by an observed connection
+    /// must not be turned back into a self-reported one by a move, which
+    /// would make it displaceable again.
+    #[tokio::test]
+    async fn same_owner_merge_does_not_downgrade_a_verified_destination() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("merge-node");
+        let challenger = peer("merge-challenger");
+        let from = addr(30_037);
+        let to = addr(30_038);
+
+        owner
+            .claim(to, claim_of(node.clone(), ClaimKind::Verified), false)
+            .await;
+        owner
+            .claim(from, claim_of(node.clone(), ClaimKind::Provisional), false)
+            .await;
+
+        assert!(owner.migrate(from, to, Some(node.clone())).await.moved());
+        assert_eq!(
+            owner.owner_of(&to),
+            Some(Owner {
+                node_id: node.clone(),
+                kind: ClaimKind::Verified,
+            }),
+            "a same-identity merge must keep the destination's verified kind"
+        );
+        assert_eq!(owner.owner_of(&from), None);
+
+        // The consequence that matters: the destination is still able to
+        // refuse a competing verified claim, which a downgrade would have
+        // let through.
+        assert_eq!(
+            owner
+                .claim(to, claim_of(challenger, ClaimKind::Verified), false)
+                .await,
+            ClaimCommit::Rejected(ClaimRejection::Arbitration(
+                RejectReason::VerifiedOwnerPresent
+            ))
+        );
+        assert_eq!(owner.routes_to(&to), Some(node));
     }
 }
