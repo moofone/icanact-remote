@@ -61,7 +61,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
 pub use ask_forwarder::{AskForwardObserver, AskForwarder};
 pub use ask_responder::{AskContext, AskResponder, TellContext, TryReplyError};
-pub use config::{ConnectionRecoveryPolicy, GossipConfig, PeerHealthMode};
+pub use config::{ConnectionRecoveryPolicy, GossipConfig};
 pub use dns::{DnsResolver, TokioDnsResolver};
 
 /// Maximum allowed size for streaming payloads (hard cap).
