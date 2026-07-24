@@ -501,25 +501,28 @@ impl PeerDiscovery {
         self.peer_states.get(addr)
     }
 
-    /// Remove expired pending/failed peers based on configured TTLs
-    ///
-    /// Also cleans up unified peer_states to stay in sync.
+    /// Expire pending/failed peers while retaining retry history.
     pub fn cleanup_expired(&mut self, now: u64) -> PeerDiscoveryCleanupStats {
         let mut stats = PeerDiscoveryCleanupStats::default();
         let pending_ttl = self.config.pending_ttl.as_secs();
         let fail_ttl = self.config.fail_ttl.as_secs();
 
-        // Collect addresses to remove from unified state
         let mut to_remove = Vec::new();
+        let mut expired_retries = Vec::new();
 
-        // Check unified peer_states for expired entries
         for (addr, state) in self.peer_states.iter() {
             match state {
-                PeerState::Pending { since, .. }
-                    if pending_ttl > 0 && now.saturating_sub(*since) > pending_ttl =>
-                {
-                    to_remove.push(*addr);
+                PeerState::Pending {
+                    since,
+                    attempts,
+                    previous_retry_delay_seconds,
+                } if pending_ttl > 0 && now.saturating_sub(*since) > pending_ttl => {
                     stats.pending_removed += 1;
+                    if *attempts == 0 {
+                        to_remove.push(*addr);
+                    } else {
+                        expired_retries.push((*addr, *attempts, *previous_retry_delay_seconds));
+                    }
                 }
                 PeerState::Failed { since, .. }
                     if fail_ttl > 0 && now.saturating_sub(*since) > fail_ttl =>
@@ -533,6 +536,16 @@ impl PeerDiscovery {
 
         for addr in &to_remove {
             self.peer_states.remove(addr);
+        }
+        for (addr, attempts, retry_delay_seconds) in expired_retries {
+            self.peer_states.insert(
+                addr,
+                PeerState::Failed {
+                    since: now,
+                    attempts,
+                    retry_delay_seconds,
+                },
+            );
         }
 
         stats
@@ -1091,6 +1104,38 @@ mod tests {
         let stats = discovery.cleanup_expired(now + 2);
         assert_eq!(stats.failed_removed, 1);
         assert!(discovery.get_peer_state(&failed_peer).is_none());
+    }
+
+    #[test]
+    fn expired_pending_retry_preserves_failure_history() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::new(
+            local,
+            PeerDiscoveryConfig {
+                pending_ttl: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+        let peer = test_addr(9002);
+        discovery.peer_states.insert(
+            peer,
+            PeerState::Pending {
+                since: 0,
+                attempts: 4,
+                previous_retry_delay_seconds: 7,
+            },
+        );
+
+        let stats = discovery.cleanup_expired(2);
+        assert_eq!(stats.pending_removed, 1);
+        assert_eq!(
+            discovery.get_peer_state(&peer),
+            Some(&PeerState::Failed {
+                since: 2,
+                attempts: 4,
+                retry_delay_seconds: 7,
+            })
+        );
     }
 
     /// Test that slot calculation respects pending peers
