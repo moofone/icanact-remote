@@ -2675,6 +2675,28 @@ impl<T: 'static> GossipRegistry<T> {
                 return;
             }
 
+            // CLAIM-FIRST: reserve `addr_to_peer_id[peer_addr]` for this
+            // node_id BEFORE the `peers[addr]`/capability-map mutations
+            // below, not after. `claim_addr_to_peer_id` is synchronous
+            // (holds the map's own bucket lock across the
+            // read-then-write, no `.await`), so it is safe to call while
+            // still holding `gossip_state` -- keeping the ownership check
+            // above, this claim, and the mutations below in one
+            // uninterrupted section. A lost claim returns immediately,
+            // before any `peers[addr]` insert/update.
+            if let Some(claimed) = node_id {
+                let peer_id = claimed.to_peer_id();
+                if !self.connection_pool.claim_addr_to_peer_id(peer_addr, &peer_id) {
+                    warn!(
+                        peer = %peer_addr,
+                        claimed_node_id = ?node_id,
+                        "refusing to add/update peer: address a concurrent writer just \
+                         assigned to a different authenticated peer"
+                    );
+                    return;
+                }
+            }
+
             // Check if we already have this peer
             if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
                 // Update GossipNodeId if provided and not already set
@@ -2766,9 +2788,12 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
 
+                // `addr_to_peer_id[peer_addr]` was already reserved above,
+                // under `gossip_state`, before the `peers[addr]` mutation
+                // -- nothing left to do here but finish reindexing the
+                // connection now that the claim is known-good.
                 let pool = &self.connection_pool;
                 pool.set_discovered_peer_addr(&peer_id, peer_addr);
-                let _ = pool.addr_to_peer_id.upsert_sync(peer_addr, peer_id.clone());
                 pool.reindex_connection_addr(&peer_id, peer_addr);
             }
         } else {
@@ -5632,6 +5657,32 @@ impl<T: 'static> GossipRegistry<T> {
                     "dropping full-sync actor apply: sender_bind_addr claims an \
                      address that became owned by a different authenticated \
                      peer during merge"
+                );
+                return false;
+            }
+
+            // CLAIM-FIRST, reconfirmed here: the caller (the FullSync /
+            // FullSyncResponse handler) already reserved
+            // `addr_to_peer_id[sender_addr]` before ever calling this
+            // function, but `addr_owned_by_other_node` above only READS
+            // that map -- it does not re-hold or re-assert the reservation.
+            // Re-claiming it here, immediately before the commit below and
+            // still under this same `gossip_state` lock, confirms the
+            // reservation is still this sender's at the latest possible
+            // moment (closing the actor-candidate-collection-pass window
+            // between STEP 1 and here) rather than trusting a read that
+            // could already be stale with respect to any OTHER
+            // `addr_to_peer_id` writer.
+            if !self
+                .connection_pool
+                .claim_addr_to_peer_id(sender_addr, &sender_peer_id)
+            {
+                warn!(
+                    addr = %sender_addr,
+                    claimed_sender = %sender_peer_id,
+                    "dropping full-sync actor apply: sender_bind_addr claims an \
+                     address a concurrent writer just assigned to a different \
+                     authenticated peer"
                 );
                 return false;
             }

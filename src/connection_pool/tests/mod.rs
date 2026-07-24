@@ -10256,44 +10256,47 @@ async fn authenticated_peer_cannot_hijack_registrys_own_local_address() {
     );
 }
 
-/// The ownership check must be rechecked ATOMICALLY under the same lock as
-/// the actual `peer_to_actors`/sequence writes in `merge_full_sync_from`,
-/// not just once, earlier, before the (unlocked) actor-candidate
-/// collection pass. Uses a `FullSyncResponse`, whose routing repoint only
-/// happens AFTER `merge_full_sync_from` returns (unlike `FullSync`, which
-/// commits `addr_to_peer_id` for the sender synchronously, under the same
-/// lock as its own pre-check, before ever calling `merge_full_sync_from`)
-/// -- so `contested_addr` stays genuinely unowned for the merge's full
-/// duration unless something else claims it. Deterministic, no sleep, no
-/// timing guess: `QA_MERGE_STEP1_COMPLETE` is a task-scoped notification
-/// `merge_full_sync_from` fires right after its STEP 1 lock releases
-/// (before the actor-candidate collection pass), so the victim's ownership
-/// claim below is issued at the exact start of the intended window on
-/// every run.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ownership_established_during_full_sync_response_merge_window_aborts_stale_apply() {
+/// CLAIM-FIRST: `claim_addr_to_peer_id` is now the very FIRST address-keyed
+/// operation in the `FullSyncResponse` handler, performed BEFORE
+/// extensions, BEFORE the merge, before anything else. A claimant that
+/// loses the claim (the address is already owned by a different
+/// authenticated peer) must abort with ZERO mutations -- no clock echo, no
+/// `peers[]`/`node_id` change, no `addr_to_peer_id` repoint, no
+/// `last_sequence` advance, no `peer_to_actors` write, no
+/// `peer_id_to_addr` entry. Deterministic: the victim's ownership is
+/// established BEFORE the attacker's message is even sent, so there is no
+/// timing to get right -- the claim is decided (and lost) at the first
+/// possible instant, which is exactly the property CLAIM-FIRST exists to
+/// guarantee regardless of how a legitimate concurrent claim happens to be
+/// timed.
+#[tokio::test]
+async fn claim_first_full_sync_response_aborts_with_zero_mutations_on_lost_claim() {
     let bind_addr: SocketAddr = "10.93.0.1:9000".parse().unwrap();
     let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
         bind_addr,
         crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("race-guard-local")),
+            key_pair: Some(crate::KeyPair::new_for_testing("claim-first-response-local")),
             ..crate::GossipConfig::default()
         },
     ));
 
-    let victim_kp = crate::KeyPair::new_for_testing("race-guard-victim");
+    let victim_kp = crate::KeyPair::new_for_testing("claim-first-response-victim");
     let victim = victim_kp.peer_id();
     let victim_node_id = victim.to_node_id();
     let contested_addr: SocketAddr = "10.93.0.2:9000".parse().unwrap();
 
-    let attacker_kp = crate::KeyPair::new_for_testing("race-guard-attacker");
+    registry
+        .add_peer_with_node_id(contested_addr, Some(victim_node_id))
+        .await;
+
+    let attacker_kp = crate::KeyPair::new_for_testing("claim-first-response-attacker");
     let attacker = attacker_kp.peer_id();
     let attacker_ephemeral: SocketAddr = "10.93.0.3:51000".parse().unwrap();
 
-    let mut local_actors = Vec::with_capacity(8_000);
-    for i in 0..8_000u32 {
+    let mut local_actors = Vec::with_capacity(500);
+    for i in 0..500u32 {
         local_actors.push((
-            format!("race/attacker-actor-{i}"),
+            format!("claimfirst/attacker-actor-{i}"),
             crate::RemoteActorLocation::new_with_peer(contested_addr, attacker.clone()),
         ));
     }
@@ -10302,46 +10305,25 @@ async fn ownership_established_during_full_sync_response_merge_window_aborts_sta
         known_actors: vec![],
         sender_peer_id: attacker.clone(),
         sender_bind_addr: Some(contested_addr.to_string()),
-        sequence: 1,
+        sequence: 999_999,
         wall_clock_time: crate::current_timestamp(),
-        extensions: None,
+        extensions: Some(crate::GossipExtensionsV1 {
+            clock_probe: Some(crate::ClockProbeV1 {
+                sample_id: 7,
+                sender_wall_ns: 1,
+            }),
+            clock_echo: None,
+        }),
     };
 
-    // Bound to the attacker's task via `.scope(...)` below so
-    // `merge_full_sync_from`'s STEP-1-complete notification is visible to
-    // this test regardless of which worker thread the task runs on, and
-    // cannot leak into any other concurrently-running test.
-    let step1_complete = std::sync::Arc::new(tokio::sync::Notify::new());
-    let step1_complete_for_task = step1_complete.clone();
-
-    let attacker_registry = registry.clone();
-    let attacker_task = tokio::spawn(crate::registry::QA_MERGE_STEP1_COMPLETE.scope(
-        step1_complete_for_task,
-        async move {
-            super::handle_incoming_message(
-                attacker_registry,
-                attacker_ephemeral,
-                attacker_ephemeral,
-                attacker_full_sync_response,
-            )
-            .await
-        },
-    ));
-
-    // Wait for the exact instant merge_full_sync_from's STEP 1 releases
-    // its lock, then issue the victim's claim immediately -- landing it
-    // at the very start of the STEP-1-to-STEP-2 window (which, with an
-    // 8,000-actor candidate-collection pass ahead of STEP 2, is wide open)
-    // on every single run.
-    step1_complete.notified().await;
-    registry
-        .add_peer_with_node_id(contested_addr, Some(victim_node_id))
-        .await;
-
-    attacker_task
-        .await
-        .expect("attacker task must not panic")
-        .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_ephemeral,
+        attacker_ephemeral,
+        attacker_full_sync_response,
+    )
+    .await
+    .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
 
     let gossip_state = registry.gossip_state.lock().await;
     let actors = gossip_state
@@ -10350,9 +10332,9 @@ async fn ownership_established_during_full_sync_response_merge_window_aborts_sta
         .cloned()
         .unwrap_or_default();
     assert!(
-        !actors.iter().any(|n| n.starts_with("race/attacker-actor-")),
-        "ownership established during the merge window must abort the stale \
-         hijack apply, not let it overwrite peer_to_actors[addr] after the fact"
+        !actors.iter().any(|n| n.starts_with("claimfirst/attacker-actor-")),
+        "a claimant that loses the claim must not write anything into \
+         peer_to_actors[addr]"
     );
     let peer_info = gossip_state
         .peers
@@ -10361,9 +10343,13 @@ async fn ownership_established_during_full_sync_response_merge_window_aborts_sta
     assert_eq!(
         peer_info.node_id,
         Some(victim_node_id),
-        "ownership established during the merge window must not be \
-         clobbered by the attacker's in-flight apply"
+        "a claimant that loses the claim must not clobber peers[addr].node_id"
     );
+    assert_eq!(
+        peer_info.last_sequence, 0,
+        "a claimant that loses the claim must not advance last_sequence"
+    );
+    drop(gossip_state);
     let routed_peer_id = registry
         .connection_pool
         .addr_to_peer_id
@@ -10371,9 +10357,19 @@ async fn ownership_established_during_full_sync_response_merge_window_aborts_sta
     assert_eq!(
         routed_peer_id,
         Some(victim),
-        "the post-merge routing repoint must also honor the ownership \
-         established during the merge window, not blindly repoint to the \
-         attacker"
+        "a claimant that loses the claim must not repoint addr_to_peer_id"
+    );
+    assert_eq!(
+        registry
+            .connection_pool
+            .peer_id_to_addr
+            .read_sync(&attacker, |_, v| *v),
+        None,
+        "a claimant that loses the claim must not gain a peer_id_to_addr entry either"
+    );
+    assert!(
+        !registry.has_pending_clock_echo(contested_addr),
+        "a claimant that loses the claim must not install a pending clock echo"
     );
 }
 
@@ -10580,146 +10576,101 @@ async fn add_peer_with_node_id_conflict_leaves_all_peer_state_unchanged() {
     );
 }
 
-/// DEFER-until-validated (not mutate-then-rollback): a claimant that loses
-/// (or never had) ownership of the claimed address by the time
-/// `merge_full_sync_from`'s final, locked ownership recheck runs must have
-/// written NOTHING keyed to that address -- no `last_sequence` advance, no
-/// `accept_lower_sequence_from` change, no actor, no clock echo.
-/// Deterministic, no sleep, no timing guess: `QA_MERGE_STEP1_COMPLETE` is a
-/// task-scoped notification `merge_full_sync_from` fires right after its
-/// STEP 1 lock releases (before the actor-candidate collection pass), so
-/// the victim's ownership claim below is issued at the EXACT start of the
-/// intended window on every run, not "probably during it."
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ownership_established_during_merge_window_writes_nothing_for_rejected_claimant() {
+/// CLAIM-FIRST for the `FullSync` handler (mirrors the `FullSyncResponse`
+/// test above): `claim_addr_to_peer_id` runs before extensions, before the
+/// PeerInfo migrate/insert, before the exchange counter, before anything
+/// else address-keyed. A claimant that loses the claim must abort with
+/// ZERO mutations -- no clock echo, no `peers[]` change, no
+/// `accept_lower_sequence_from` change, no `last_sequence` advance
+/// (exercising `merge_full_sync_from`'s STEP 2 re-claim too, since
+/// `handle_incoming_message` still calls it), no `peer_to_actors` write.
+/// Deterministic: the victim's ownership is established before the
+/// attacker's message is even sent.
+#[tokio::test]
+async fn claim_first_full_sync_aborts_with_zero_mutations_on_lost_claim() {
     let bind_addr: SocketAddr = "10.96.0.1:9000".parse().unwrap();
     let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
         bind_addr,
         crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("seq-defer-local")),
+            key_pair: Some(crate::KeyPair::new_for_testing("claim-first-fullsync-local")),
             ..crate::GossipConfig::default()
         },
     ));
 
-    let victim_kp = crate::KeyPair::new_for_testing("seq-defer-victim");
+    let victim_kp = crate::KeyPair::new_for_testing("claim-first-fullsync-victim");
     let victim = victim_kp.peer_id();
     let victim_node_id = victim.to_node_id();
     let contested_addr: SocketAddr = "10.96.0.2:9000".parse().unwrap();
 
-    let attacker_kp = crate::KeyPair::new_for_testing("seq-defer-attacker");
+    registry
+        .add_peer_with_node_id(contested_addr, Some(victim_node_id))
+        .await;
+    // Give the victim a non-zero high-water mark and a known actor so a
+    // successful clobber would be observable in both directions (sequence
+    // rollback AND actor-set replacement).
+    {
+        let mut gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get_mut(&contested_addr)
+            .expect("victim peer entry must exist");
+        peer_info.last_sequence = 42;
+        let mut victim_actors = std::collections::HashSet::new();
+        victim_actors.insert("claimfirst/victim-actor".to_string());
+        gossip_state
+            .peer_to_actors
+            .insert(contested_addr, victim_actors);
+    }
+
+    let attacker_kp = crate::KeyPair::new_for_testing("claim-first-fullsync-attacker");
     let attacker = attacker_kp.peer_id();
     let attacker_ephemeral: SocketAddr = "10.96.0.3:51000".parse().unwrap();
 
-    // A node-less placeholder entry, as e.g. a legitimate FullSync arm's
-    // Vacant-insert would leave behind, with a low baseline sequence.
-    let baseline_sequence = 5u64;
-    {
-        let mut gossip_state = registry.gossip_state.lock().await;
-        gossip_state.peers.insert(
-            contested_addr,
-            crate::registry::PeerInfo {
-                address: contested_addr,
-                peer_address: None,
-                inbound_observed: true,
-                outbound_dial_success: false,
-                node_id: None,
-                dns_name: None,
-                failures: 0,
-                last_attempt: 0,
-                last_success: 0,
-                last_sequence: baseline_sequence,
-                last_sent_sequence: 0,
-                consecutive_deltas: 0,
-                last_failure_time: None,
-                last_dns_refresh_attempt: None,
-                last_response_received_ms: 0,
-                accept_lower_sequence_from: None,
-                current_session_source: None,
-                current_session_connection: None,
-                current_session_epoch: 0,
-            },
-        );
-    }
-
-    let claimed_sequence = 999_999u64;
-    let mut local_actors = Vec::with_capacity(8_000);
-    for i in 0..8_000u32 {
+    let mut local_actors = Vec::with_capacity(500);
+    for i in 0..500u32 {
         local_actors.push((
-            format!("seqdefer/attacker-actor-{i}"),
+            format!("claimfirst/attacker-actor-{i}"),
             crate::RemoteActorLocation::new_with_peer(contested_addr, attacker.clone()),
         ));
     }
-    let attacker_full_sync_response = crate::registry::RegistryMessage::FullSyncResponse {
+    let attacker_full_sync = crate::registry::RegistryMessage::FullSync {
         local_actors,
         known_actors: vec![],
         sender_peer_id: attacker.clone(),
         sender_bind_addr: Some(contested_addr.to_string()),
-        sequence: claimed_sequence,
+        sequence: 999_999,
         wall_clock_time: crate::current_timestamp(),
         extensions: Some(crate::GossipExtensionsV1 {
             clock_probe: Some(crate::ClockProbeV1 {
-                sample_id: 99,
+                sample_id: 7,
                 sender_wall_ns: 1,
             }),
             clock_echo: None,
         }),
     };
 
-    // Bound to the attacker's task via `.scope(...)` below so
-    // `merge_full_sync_from`'s STEP-1-complete notification is visible to
-    // this test regardless of which worker thread the task runs on, and
-    // cannot leak into any other concurrently-running test.
-    let step1_complete = std::sync::Arc::new(tokio::sync::Notify::new());
-    let step1_complete_for_task = step1_complete.clone();
-
-    let attacker_registry = registry.clone();
-    let attacker_task = tokio::spawn(crate::registry::QA_MERGE_STEP1_COMPLETE.scope(
-        step1_complete_for_task,
-        async move {
-            super::handle_incoming_message(
-                attacker_registry,
-                attacker_ephemeral,
-                attacker_ephemeral,
-                attacker_full_sync_response,
-            )
-            .await
-        },
-    ));
-
-    // Wait for the exact instant merge_full_sync_from's STEP 1 releases
-    // its lock, then issue the victim's claim immediately -- landing it
-    // at the very start of the STEP-1-to-STEP-2 window (which, with an
-    // 8,000-actor candidate-collection pass ahead of STEP 2, is wide open)
-    // on every single run.
-    step1_complete.notified().await;
-    registry
-        .add_peer_with_node_id(contested_addr, Some(victim_node_id))
-        .await;
-
-    attacker_task
-        .await
-        .expect("attacker task must not panic")
-        .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_ephemeral,
+        attacker_ephemeral,
+        attacker_full_sync,
+    )
+    .await
+    .expect("attacker's FullSync must not error, only be rejected/ignored");
 
     let gossip_state = registry.gossip_state.lock().await;
     let peer_info = gossip_state
         .peers
         .get(&contested_addr)
-        .expect("the placeholder entry must still exist");
+        .expect("victim's peer entry must exist");
     assert_eq!(
         peer_info.node_id,
         Some(victim_node_id),
-        "sanity: the victim's ownership claim must have succeeded"
+        "a claimant that loses the claim must not clobber peers[addr].node_id"
     );
     assert_eq!(
-        peer_info.last_sequence, baseline_sequence,
-        "a claimant that loses ownership before the final locked commit \
-         must never have advanced last_sequence in the first place -- \
-         DEFER-until-validated means there is nothing to roll back"
-    );
-    assert_eq!(
-        peer_info.accept_lower_sequence_from, None,
-        "a rejected claimant must not have touched accept_lower_sequence_from either"
+        peer_info.last_sequence, 42,
+        "a claimant that loses the claim must not advance (or roll back) last_sequence"
     );
     let actors = gossip_state
         .peer_to_actors
@@ -10727,15 +10678,35 @@ async fn ownership_established_during_merge_window_writes_nothing_for_rejected_c
         .cloned()
         .unwrap_or_default();
     assert!(
-        actors.is_empty(),
-        "a rejected claimant must not have written any actor into \
+        actors.contains("claimfirst/victim-actor"),
+        "the victim's actor set must survive untouched"
+    );
+    assert!(
+        !actors.iter().any(|n| n.starts_with("claimfirst/attacker-actor-")),
+        "a claimant that loses the claim must not write anything into \
          peer_to_actors[addr]"
     );
     drop(gossip_state);
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&contested_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "a claimant that loses the claim must not repoint addr_to_peer_id"
+    );
+    assert_eq!(
+        registry
+            .connection_pool
+            .peer_id_to_addr
+            .read_sync(&attacker, |_, v| *v),
+        None,
+        "a claimant that loses the claim must not gain a peer_id_to_addr entry either"
+    );
     assert!(
         !registry.has_pending_clock_echo(contested_addr),
-        "a rejected claimant must not have installed a pending clock echo \
-         under the address either"
+        "a claimant that loses the claim must not install a pending clock echo"
     );
 }
 

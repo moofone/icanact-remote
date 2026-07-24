@@ -4440,6 +4440,35 @@ pub(crate) fn handle_incoming_message(
                         return Ok(());
                     }
 
+                    // CLAIM-FIRST: `gossip_state`'s lock does NOT serialize
+                    // `addr_to_peer_id` (an independent, lock-free
+                    // concurrent map with its own bucket synchronization,
+                    // also written by `configure_peer`, DNS refresh, and
+                    // `reindex_connection_addr`), so the read-only check
+                    // above can be stale by the time anything downstream
+                    // runs. Reserve the routing entry HERE, as the very
+                    // FIRST address-keyed operation in this handler --
+                    // before extensions, PeerInfo insert/migrate, or the
+                    // exchange counter -- so a lost claim aborts with ZERO
+                    // mutations, rather than after this handler has
+                    // already poisoned bookkeeping under the address it
+                    // then fails to actually own. `claim_addr_to_peer_id`
+                    // is a conditional upsert (holds the map's own bucket
+                    // lock across the read-then-write) that only succeeds
+                    // if the slot is vacant or already this claimant's.
+                    if !registry
+                        .connection_pool
+                        .claim_addr_to_peer_id(sender_socket_addr, &sender_peer_id)
+                    {
+                        warn!(
+                            tcp_source = %_peer_addr,
+                            claimed_bind_addr = %sender_socket_addr,
+                            sender = %sender_peer_id,
+                            "Rejecting FullSync: sender_bind_addr claims an address a concurrent writer just assigned to a different authenticated peer"
+                        );
+                        return Ok(());
+                    }
+
                     registry.record_inbound_gossip_extensions(
                         sender_socket_addr,
                         extensions,
@@ -4518,35 +4547,17 @@ pub(crate) fn handle_incoming_message(
 
                     // IMPORTANT: Register the incoming connection with the
                     // peer_id mapping so bidirectional communication works.
-                    // Kept under the SAME held `gossip_state` lock as the
-                    // ownership check above -- but `gossip_state` does NOT
-                    // serialize `addr_to_peer_id` writers (it is an
-                    // independent, lock-free concurrent map with its own
-                    // synchronization: `configure_peer`, DNS refresh,
-                    // reindexing, etc. can all write it without ever
-                    // touching `gossip_state`). So the ownership verdict
-                    // above can still be stale by the time of this write.
-                    // `claim_addr_to_peer_id` makes the check-and-write
-                    // atomic with respect to every `addr_to_peer_id`
-                    // writer by holding THAT map's own bucket lock across
-                    // both: it is a conditional upsert that only succeeds
-                    // if the slot is vacant or already this claimant's.
+                    // The routing entry itself was already reserved (and
+                    // gated on) above, as the first address-keyed
+                    // operation in this handler; this just finishes
+                    // populating the reverse mapping and reindexing the
+                    // connection now that the claim is known-good.
                     {
                         let pool = &registry.connection_pool;
 
                         // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
                         // The reindex_connection_addr function preserves both addresses,
                         // and disconnect_connection_by_peer_id needs both entries to clean up properly.
-
-                        if !pool.claim_addr_to_peer_id(sender_socket_addr, &sender_peer_id) {
-                            warn!(
-                                tcp_source = %_peer_addr,
-                                claimed_bind_addr = %sender_socket_addr,
-                                sender = %sender_peer_id,
-                                "Rejecting FullSync: sender_bind_addr claims an address a concurrent writer just assigned to a different authenticated peer"
-                            );
-                            return Ok(());
-                        }
 
                         let _ = pool
                             .peer_id_to_addr
@@ -4903,6 +4914,22 @@ pub(crate) fn handle_incoming_message(
                 // it does not end up owning. It is deferred to the END of
                 // this handler, after the post-merge ownership recheck has
                 // also passed -- see there.
+                //
+                // CLAIM-FIRST: immediately after the read-only check,
+                // reserve `addr_to_peer_id[sender_socket_addr]` via
+                // `claim_addr_to_peer_id` -- BEFORE extensions, BEFORE the
+                // merge, before anything else address-keyed. `gossip_state`
+                // does NOT serialize `addr_to_peer_id` (an independent,
+                // lock-free concurrent map also written by `configure_peer`,
+                // DNS refresh, and `reindex_connection_addr`), so the
+                // read-only check alone can be stale by the time anything
+                // downstream runs; the claim itself is a conditional upsert
+                // (holds the map's own bucket lock across the
+                // read-then-write) that only succeeds if the slot is vacant
+                // or already this claimant's. A lost claim aborts here with
+                // ZERO mutations, rather than after the merge has already
+                // written state under an address this handler doesn't
+                // actually own.
                 {
                     let gossip_state = registry.gossip_state.lock().await;
                     if registry.addr_owned_by_other_node(
@@ -4918,6 +4945,18 @@ pub(crate) fn handle_incoming_message(
                         );
                         return Ok(());
                     }
+                }
+                if !registry
+                    .connection_pool
+                    .claim_addr_to_peer_id(sender_socket_addr, &sender_peer_id)
+                {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_bind_addr = %sender_socket_addr,
+                        sender = %sender_peer_id,
+                        "Rejecting FullSyncResponse: sender_bind_addr claims an address a concurrent writer just assigned to a different authenticated peer"
+                    );
+                    return Ok(());
                 }
 
                 debug!(
@@ -4981,30 +5020,17 @@ pub(crate) fn handle_incoming_message(
                 // FIX: Update peer_id mappings (mirror the FullSync handler logic)
                 // This prevents stale ephemeral addresses from being reintroduced via resolve_peer_state_addr
                 //
-                // `gossip_state` does NOT serialize `addr_to_peer_id`
-                // writers (it is an independent, lock-free concurrent map
-                // with its own synchronization), so the post-merge
-                // ownership recheck above -- which only consulted
-                // `gossip_state` -- can still be stale by the time of this
-                // write. `claim_addr_to_peer_id` makes the check-and-write
-                // atomic with respect to every `addr_to_peer_id` writer by
-                // holding THAT map's own bucket lock across both.
+                // The routing entry itself was already reserved (and gated
+                // on) via `claim_addr_to_peer_id` before the merge above --
+                // this just finishes populating the reverse mapping and
+                // reindexing the connection now that the claim is
+                // known-good.
                 {
                     let pool = &registry.connection_pool;
 
                     // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
                     // The reindex_connection_addr function preserves both addresses,
                     // and disconnect_connection_by_peer_id needs both entries to clean up properly.
-
-                    if !pool.claim_addr_to_peer_id(sender_socket_addr, &sender_peer_id) {
-                        warn!(
-                            tcp_source = %_peer_addr,
-                            claimed_bind_addr = %sender_socket_addr,
-                            sender = %sender_peer_id,
-                            "Rejecting FullSyncResponse: sender_bind_addr claims an address a concurrent writer just assigned to a different authenticated peer"
-                        );
-                        return Ok(());
-                    }
 
                     let _ = pool
                         .peer_id_to_addr
