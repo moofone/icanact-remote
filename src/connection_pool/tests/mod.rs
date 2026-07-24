@@ -10264,11 +10264,12 @@ async fn authenticated_peer_cannot_hijack_registrys_own_local_address() {
 /// commits `addr_to_peer_id` for the sender synchronously, under the same
 /// lock as its own pre-check, before ever calling `merge_full_sync_from`)
 /// -- so `contested_addr` stays genuinely unowned for the merge's full
-/// duration unless something else claims it. A large actor set widens the
-/// window between the collection pass and the final write so the
-/// concurrently-run ownership-establishing call below has a real chance --
-/// on a genuine multi-threaded runtime -- to land inside it before the
-/// final write commits.
+/// duration unless something else claims it. Deterministic, no sleep, no
+/// timing guess: `QA_MERGE_STEP1_COMPLETE` is a task-scoped notification
+/// `merge_full_sync_from` fires right after its STEP 1 lock releases
+/// (before the actor-candidate collection pass), so the victim's ownership
+/// claim below is issued at the exact start of the intended window on
+/// every run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ownership_established_during_full_sync_response_merge_window_aborts_stale_apply() {
     let bind_addr: SocketAddr = "10.93.0.1:9000".parse().unwrap();
@@ -10306,26 +10307,33 @@ async fn ownership_established_during_full_sync_response_merge_window_aborts_sta
         extensions: None,
     };
 
+    // Bound to the attacker's task via `.scope(...)` below so
+    // `merge_full_sync_from`'s STEP-1-complete notification is visible to
+    // this test regardless of which worker thread the task runs on, and
+    // cannot leak into any other concurrently-running test.
+    let step1_complete = std::sync::Arc::new(tokio::sync::Notify::new());
+    let step1_complete_for_task = step1_complete.clone();
+
     let attacker_registry = registry.clone();
-    let attacker_task = tokio::spawn(async move {
-        super::handle_incoming_message(
-            attacker_registry,
-            attacker_ephemeral,
-            attacker_ephemeral,
-            attacker_full_sync_response,
-        )
-        .await
-    });
+    let attacker_task = tokio::spawn(crate::registry::QA_MERGE_STEP1_COMPLETE.scope(
+        step1_complete_for_task,
+        async move {
+            super::handle_incoming_message(
+                attacker_registry,
+                attacker_ephemeral,
+                attacker_ephemeral,
+                attacker_full_sync_response,
+            )
+            .await
+        },
+    ));
 
-    // Give the attacker task a real chance to get well into the
-    // actor-candidate collection pass before the victim's ownership is
-    // established.
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
-    tokio::time::sleep(std::time::Duration::from_micros(200)).await;
-
-    // The victim's ownership is established WHILE the attacker's
-    // FullSyncResponse is, very likely, still being processed.
+    // Wait for the exact instant merge_full_sync_from's STEP 1 releases
+    // its lock, then issue the victim's claim immediately -- landing it
+    // at the very start of the STEP-1-to-STEP-2 window (which, with an
+    // 8,000-actor candidate-collection pass ahead of STEP 2, is wide open)
+    // on every single run.
+    step1_complete.notified().await;
     registry
         .add_peer_with_node_id(contested_addr, Some(victim_node_id))
         .await;
@@ -10366,6 +10374,135 @@ async fn ownership_established_during_full_sync_response_merge_window_aborts_sta
         "the post-merge routing repoint must also honor the ownership \
          established during the merge window, not blindly repoint to the \
          attacker"
+    );
+}
+
+/// STEP 1 is read-only (DEFER-until-validated), so two genuinely
+/// same-session FullSync messages can both pass STEP 1's freshness check
+/// before either commits -- whichever reaches STEP 2 first advances
+/// `last_sequence`, and the OTHER must then be judged stale against THAT,
+/// not against the value it originally observed. A lower-sequence message
+/// that loses this race must not overwrite `peer_to_actors[addr]` with its
+/// now-stale actor snapshot just because it does not hold a restart
+/// exemption. Deterministic ordering: the low-sequence task is bound to
+/// `QA_MERGE_STEP1_COMPLETE` so the test knows the EXACT instant its STEP 1
+/// (observing the pre-race `last_sequence`) has passed, before ever
+/// running the high-sequence message -- so the high-sequence commit is
+/// guaranteed to happen first, and a large actor set on the low-sequence
+/// message keeps it from reaching its own STEP 2 commit until well after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_sequence_losing_the_step2_race_does_not_overwrite_fresher_actor_state() {
+    let bind_addr: SocketAddr = "10.99.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("seq-race-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_kp = crate::KeyPair::new_for_testing("seq-race-peer");
+    let peer = peer_kp.peer_id();
+    let peer_node_id = peer.to_node_id();
+    let peer_addr: SocketAddr = "10.99.0.2:9000".parse().unwrap();
+    // Both messages arrive on the SAME connection/session.
+    let session_source: SocketAddr = "10.99.0.3:51000".parse().unwrap();
+
+    registry
+        .add_peer_with_node_id(peer_addr, Some(peer_node_id))
+        .await;
+
+    let mut stale_actors = Vec::with_capacity(9_500);
+    for i in 0..9_500u32 {
+        stale_actors.push((
+            format!("seqrace/stale-actor-{i}"),
+            crate::RemoteActorLocation::new_with_peer(peer_addr, peer.clone()),
+        ));
+    }
+    let low_sequence_msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: stale_actors,
+        known_actors: vec![],
+        sender_peer_id: peer.clone(),
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 50,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    let high_sequence_msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: vec![(
+            "seqrace/fresh-actor".to_string(),
+            crate::RemoteActorLocation::new_with_peer(peer_addr, peer.clone()),
+        )],
+        known_actors: vec![],
+        sender_peer_id: peer.clone(),
+        sender_bind_addr: Some(peer_addr.to_string()),
+        sequence: 100,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    // Bound to the low-sequence task via `.scope(...)` so the test knows
+    // the exact instant its STEP 1 (observing the pre-race, low
+    // `last_sequence`) completes -- before the high-sequence message is
+    // ever processed -- rather than guessing via yields/sleep.
+    let low_step1_complete = std::sync::Arc::new(tokio::sync::Notify::new());
+    let low_step1_complete_for_task = low_step1_complete.clone();
+
+    let low_registry = registry.clone();
+    let low_task = tokio::spawn(crate::registry::QA_MERGE_STEP1_COMPLETE.scope(
+        low_step1_complete_for_task,
+        async move {
+            super::handle_incoming_message(
+                low_registry,
+                session_source,
+                session_source,
+                low_sequence_msg,
+            )
+            .await
+        },
+    ));
+
+    // Wait for the low-sequence message's STEP 1 to complete (it has now
+    // observed the pre-race `last_sequence` and is about to enter its
+    // 9,500-actor collection pass) before processing the high-sequence
+    // message, which reliably completes -- including its own STEP 2
+    // commit -- well before the low-sequence task's collection pass does.
+    low_step1_complete.notified().await;
+
+    super::handle_incoming_message(registry.clone(), session_source, session_source, high_sequence_msg)
+        .await
+        .expect("high-sequence FullSyncResponse must succeed");
+
+    low_task
+        .await
+        .expect("low-sequence task must not panic")
+        .expect("low-sequence FullSyncResponse must not error, only be dropped as stale");
+
+    let gossip_state = registry.gossip_state.lock().await;
+    let peer_info = gossip_state
+        .peers
+        .get(&peer_addr)
+        .expect("peer entry must exist");
+    assert_eq!(
+        peer_info.last_sequence, 100,
+        "the higher-sequence message's high-water mark must win regardless \
+         of arrival order"
+    );
+    let actors = gossip_state
+        .peer_to_actors
+        .get(&peer_addr)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        actors.contains("seqrace/fresh-actor"),
+        "the higher-sequence message's actor snapshot must be the one \
+         retained"
+    );
+    assert!(
+        !actors.iter().any(|n| n.starts_with("seqrace/stale-actor-")),
+        "a lower-sequence message that loses the STEP 2 race must not \
+         overwrite peer_to_actors[addr] with its stale actor snapshot just \
+         because it lacks a restart exemption"
     );
 }
 

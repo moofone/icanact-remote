@@ -5664,6 +5664,19 @@ impl<T: 'static> GossipRegistry<T> {
             // never clobber a legitimate concurrent update to the same
             // entry -- there isn't a stale snapshot to apply, only a
             // fresh re-derivation of "what should this become right now."
+            //
+            // This is also the freshness gate for the actor writes below:
+            // STEP 1 is read-only, so two same-session messages (e.g.
+            // sequence 100 and sequence 50, both genuinely from the
+            // current session) can both pass STEP 1 before either commits
+            // -- whichever reaches here first advances `last_sequence`,
+            // and the other must then see itself as stale RELATIVE TO
+            // THAT, not relative to the value STEP 1 originally observed.
+            // A message found stale here must `return` before
+            // `updates_to_apply` is applied: falling through would let a
+            // second, lower-sequence message's stale actor snapshot
+            // overwrite `peer_to_actors[sender_addr]` after a fresher,
+            // higher-sequence message already committed here.
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
                 if sequence < peer_info.last_sequence {
                     let armed_for_this_connection = peer_info
@@ -5687,12 +5700,22 @@ impl<T: 'static> GossipRegistry<T> {
                         // connection's traffic.
                         peer_info.accept_lower_sequence_from = None;
                         peer_info.last_sequence = sequence;
+                    } else {
+                        // Stale relative to the CURRENT high-water mark --
+                        // either a genuine replay, or a concurrent
+                        // same-session message with a higher sequence
+                        // already committed here first. Either way, this
+                        // message's actor snapshot must not be applied:
+                        // it does not reflect the freshest known state.
+                        debug!(
+                            peer = %sender_addr,
+                            last_sequence = peer_info.last_sequence,
+                            received_sequence = sequence,
+                            "dropping full-sync actor apply: sequence is stale \
+                             against the current high-water mark"
+                        );
+                        return true;
                     }
-                    // Else: the exemption was consumed by a concurrent
-                    // message from the same session between STEP 1 and
-                    // here. Nothing to commit for THIS message's sequence
-                    // -- but ownership and session epoch both just
-                    // validated, so the actor writes below still proceed.
                 } else {
                     peer_info.accept_lower_sequence_from = None;
                     peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
