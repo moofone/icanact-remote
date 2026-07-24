@@ -466,9 +466,30 @@ impl PeerDiscovery {
 
     /// Clear the pending state for an address (e.g., after timeout)
     ///
-    /// Atomically removes peer if it's in Pending state.
+    /// Removes a first-attempt pending peer, or restores the previous failure
+    /// state when the pending dial was a retry.
     pub fn clear_pending(&mut self, addr: &SocketAddr) {
-        if matches!(self.peer_states.get(addr), Some(PeerState::Pending { .. })) {
+        let retry = match self.peer_states.get(addr) {
+            Some(PeerState::Pending {
+                attempts,
+                previous_retry_delay_seconds,
+                ..
+            }) if *attempts > 0 => Some((*attempts, *previous_retry_delay_seconds)),
+            Some(PeerState::Pending { .. }) => None,
+            _ => return,
+        };
+
+        if let Some((attempts, retry_delay_seconds)) = retry {
+            self.make_room_for_failed_peer(*addr);
+            self.peer_states.insert(
+                *addr,
+                PeerState::Failed {
+                    since: current_timestamp(),
+                    attempts,
+                    retry_delay_seconds,
+                },
+            );
+        } else {
             self.peer_states.remove(addr);
         }
     }
@@ -538,6 +559,7 @@ impl PeerDiscovery {
             self.peer_states.remove(addr);
         }
         for (addr, attempts, retry_delay_seconds) in expired_retries {
+            self.make_room_for_failed_peer(addr);
             self.peer_states.insert(
                 addr,
                 PeerState::Failed {
@@ -1034,6 +1056,32 @@ mod tests {
     }
 
     #[test]
+    fn clear_pending_preserves_retry_failure_history() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::with_defaults(local);
+        let peer = test_addr(9003);
+        discovery.peer_states.insert(
+            peer,
+            PeerState::Pending {
+                since: 1,
+                attempts: 3,
+                previous_retry_delay_seconds: 7,
+            },
+        );
+
+        discovery.clear_pending(&peer);
+
+        assert!(matches!(
+            discovery.get_peer_state(&peer),
+            Some(PeerState::Failed {
+                attempts: 3,
+                retry_delay_seconds: 7,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn test_connection_clears_failure_state() {
         let local = test_addr(8080);
         let mut discovery = PeerDiscovery::with_defaults(local);
@@ -1136,6 +1184,46 @@ mod tests {
                 retry_delay_seconds: 7,
             })
         );
+    }
+
+    #[test]
+    fn expired_pending_retry_respects_failed_peer_cap() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::new(
+            local,
+            PeerDiscoveryConfig {
+                max_peers: 1,
+                pending_ttl: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+        let existing_failed = test_addr(9003);
+        let expired_retry = test_addr(9004);
+        discovery.peer_states.insert(
+            existing_failed,
+            PeerState::Failed {
+                since: 0,
+                attempts: 1,
+                retry_delay_seconds: 2,
+            },
+        );
+        discovery.peer_states.insert(
+            expired_retry,
+            PeerState::Pending {
+                since: 0,
+                attempts: 2,
+                previous_retry_delay_seconds: 5,
+            },
+        );
+
+        discovery.cleanup_expired(2);
+
+        assert_eq!(discovery.failed_peer_count(), 1);
+        assert!(matches!(
+            discovery.get_peer_state(&expired_retry),
+            Some(PeerState::Failed { attempts: 2, .. })
+        ));
+        assert!(discovery.get_peer_state(&existing_failed).is_none());
     }
 
     /// Test that slot calculation respects pending peers
@@ -1318,7 +1406,7 @@ mod tests {
         assert!(!state.is_failed(), "failure state should be cleared");
     }
 
-    /// Test that unified state counts match legacy counts during migration
+    /// Test state-map counts after each transition.
     #[test]
     fn test_unified_and_legacy_counts_match() {
         let local = test_addr(8080);
@@ -1330,11 +1418,6 @@ mod tests {
         discovery.on_peer_connected(conn1);
         discovery.on_peer_connected(conn2);
 
-        // Verify counts match
-        assert_eq!(
-            discovery.connected_peer_count(),
-            discovery.connected_peer_count()
-        );
         assert_eq!(discovery.connected_peer_count(), 2);
 
         // Add pending peers via gossip
@@ -1344,11 +1427,6 @@ mod tests {
         ];
         discovery.on_peer_list_gossip(&peers);
 
-        // Verify counts match
-        assert_eq!(
-            discovery.pending_peer_count(),
-            discovery.pending_peer_count()
-        );
         assert_eq!(discovery.pending_peer_count(), 2);
 
         // Add a failed peer
@@ -1357,8 +1435,6 @@ mod tests {
         discovery.on_peer_list_gossip(&peers);
         discovery.on_peer_failure(fail_peer);
 
-        // Verify counts match
-        assert_eq!(discovery.failed_peer_count(), discovery.failed_peer_count());
         assert_eq!(discovery.failed_peer_count(), 1);
     }
 
