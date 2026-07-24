@@ -268,6 +268,13 @@ impl PeerDiscovery {
                 continue;
             }
 
+            // A gossip batch may contain the same endpoint more than once.
+            // Marking candidates happens after this scan, so ignore duplicates
+            // here to preserve any retry history carried into Pending.
+            if candidates.contains(&addr) {
+                continue;
+            }
+
             // Check state using unified peer_states
             if let Some(state) = self.peer_states.get(&addr) {
                 match state {
@@ -1224,6 +1231,30 @@ mod tests {
             Some(PeerState::Failed { attempts: 2, .. })
         ));
         assert!(discovery.get_peer_state(&existing_failed).is_none());
+    }
+
+    #[test]
+    fn duplicate_gossip_does_not_reset_retry_history() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::with_defaults(local);
+        let peer = test_addr(9005);
+        discovery.peer_states.insert(
+            peer,
+            PeerState::Failed {
+                since: 0,
+                attempts: 4,
+                retry_delay_seconds: MIN_BACKOFF_SECONDS,
+            },
+        );
+        let gossip = create_peer_gossip("10.0.0.1:9005");
+
+        let candidates = discovery.on_peer_list_gossip(&[gossip.clone(), gossip]);
+
+        assert_eq!(candidates, vec![peer]);
+        assert!(matches!(
+            discovery.get_peer_state(&peer),
+            Some(PeerState::Pending { attempts: 4, .. })
+        ));
     }
 
     /// Test that slot calculation respects pending peers
