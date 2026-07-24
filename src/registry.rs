@@ -1285,20 +1285,27 @@ impl PeerInfo {
     /// arbitration (`crate::addr_ownership::arbitrate`).
     ///
     /// A `node_id` alone does not make an entry a verified owner: it can be
-    /// filled in purely from a peer's self-report (e.g. `add_peer_with_node_id`
-    /// called with a node id looked up from an unrelated, unauthenticated
-    /// context). Treat the entry as verified only when it is additionally
-    /// backed by an observed connection: an inbound accept, a successful
-    /// outbound dial, or a live authenticated session
-    /// (`current_session_source`). Otherwise it is provisional. An entry
-    /// with no `node_id` at all has no arbitratable owner.
+    /// filled in purely from a peer's self-report. `identity_verified` is
+    /// the SOLE source of truth for whether this address's owner is
+    /// verified: it is set exclusively by `add_peer_with_node_id`'s
+    /// `resolved_kind` computation, which reasons specifically about
+    /// whether the CLAIM FOR THIS ADDRESS was corroborated (raw TCP source
+    /// match, outbound dial we initiated, or local `configure_peer`).
+    ///
+    /// Deliberately does NOT also treat `inbound_observed`,
+    /// `outbound_dial_success`, or `current_session_source` as verification
+    /// evidence here, even though they sound related: those flags can be
+    /// set by callers that observed *a* connection without that connection
+    /// having corroborated *this specific address* (e.g. a self-reported
+    /// advertised address that merely happens to share a `PeerInfo` entry
+    /// with a genuinely observed session). Treating them as verification
+    /// previously let an authenticated peer "launder" a bare self-reported
+    /// claim into an undisplaceable verified one — exactly the class of bug
+    /// this arbitration module exists to prevent. An entry with no
+    /// `node_id` at all has no arbitratable owner.
     pub fn ownership_owner(&self) -> Option<crate::addr_ownership::Owner> {
         let node_id = self.node_id?;
-        let kind = if self.identity_verified
-            || self.inbound_observed
-            || self.outbound_dial_success
-            || self.current_session_source.is_some()
-        {
+        let kind = if self.identity_verified {
             crate::addr_ownership::ClaimKind::Verified
         } else {
             crate::addr_ownership::ClaimKind::Provisional
@@ -2697,7 +2704,16 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // Check if we already have this peer
+        // Captured only when this is a genuine owner change (below), so the
+        // displaced identity's actors can be released from `known_actors`
+        // and their admission budget freed AFTER the lock is dropped.
+        let mut displaced_owner_actors: Option<(
+            crate::GossipNodeId,
+            std::collections::HashSet<String>,
+        )> = None;
+
         if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
+            let old_node_id = existing_peer.node_id;
             // Update the GossipNodeId when one is claimed and either none
             // was recorded yet, or arbitration above accepted a change of
             // owner (e.g. a verified claim displacing a provisional one).
@@ -2725,10 +2741,22 @@ impl<T: 'static> GossipRegistry<T> {
                 existing_peer.last_attempt = now;
                 existing_peer.last_success = now;
                 existing_peer.last_response_received_ms = now_ms;
-                gossip_state.peer_to_actors.remove(&peer_addr);
+
+                // Release the displaced identity's admission budget for the
+                // actors it had routed through this address, and free the
+                // side table itself, BEFORE dropping the old actor names.
+                let old_actors = gossip_state.peer_to_actors.remove(&peer_addr);
+                if let Some(actor_names) = &old_actors {
+                    for actor_name in actor_names {
+                        gossip_state.release_actor_admission(actor_name);
+                    }
+                }
+                if let Some(old_node_id) = old_node_id {
+                    displaced_owner_actors = Some((old_node_id, old_actors.unwrap_or_default()));
+                }
                 debug!(
                     peer = %peer_addr,
-                    "address ownership changed: rekeying actor routes, session/sequence, and capabilities"
+                    "address ownership changed: rekeying actor routes, session/sequence, admission, and capabilities"
                 );
             }
         } else {
@@ -2786,13 +2814,16 @@ impl<T: 'static> GossipRegistry<T> {
         }
         drop(gossip_state);
 
-        if owner_changed {
-            // Capabilities are keyed by address in a separate lock-free
-            // table; clear them here too so a stale mapping to the old
-            // identity cannot outlive the ownership change.
-            self.clear_peer_capabilities(&peer_addr);
-        }
-
+        // Publish the routing mapping IMMEDIATELY after the committed
+        // ownership decision, with no intervening `.await` and before any
+        // other follow-up cleanup: this is the closest this function can
+        // get to atomicity between the `peers` decision and the
+        // lock-free `addr_to_peer_id` publish without the two sharing a
+        // lock (a genuine single critical section spanning both is Stage 2
+        // work — see `arbitrate`'s module doc). A rejected claim already
+        // returned above and never reaches here, so nothing is published
+        // for a claim that lost arbitration.
+        //
         // Safely update connection pool if we have a GossipNodeId
         // This is critical for TLS connections to work (get_connection_to_peer needs this mapping)
         if let Some(id) = node_id {
@@ -2824,6 +2855,41 @@ impl<T: 'static> GossipRegistry<T> {
             pool.set_discovered_peer_addr(&peer_id, peer_addr);
             let _ = pool.addr_to_peer_id.upsert_sync(peer_addr, peer_id.clone());
             pool.reindex_connection_addr(&peer_id, peer_addr);
+        }
+
+        // Lower-priority owner-change cleanup: not part of the routing
+        // publish, so it runs after, not before.
+        if owner_changed {
+            // Capabilities are keyed by address in a separate lock-free
+            // table; clear them here too so a stale mapping to the old
+            // identity cannot outlive the ownership change.
+            self.clear_peer_capabilities(&peer_addr);
+        }
+
+        if let Some((old_node_id, actor_names)) = displaced_owner_actors {
+            // The displaced identity's admission budget was already
+            // released above; now drop its entries from `known_actors` too,
+            // so routing (`lookup_actor`) stops returning the squatter's
+            // actors once its address has been taken over by the genuine
+            // owner. Re-verify ownership by identity (not just presence in
+            // the old side-table snapshot) so a concurrent, unrelated
+            // update to the same actor name is never clobbered here.
+            for actor_name in &actor_names {
+                let still_owned_by_old = self
+                    .actor_state
+                    .known_actors
+                    .read_sync(actor_name.as_str(), |_, location| {
+                        location.node_id == old_node_id
+                            || location.peer_id.to_node_id() == old_node_id
+                    })
+                    .unwrap_or(false);
+                if still_owned_by_old {
+                    let _ = self
+                        .actor_state
+                        .known_actors
+                        .remove_sync(actor_name.as_str());
+                }
+            }
         }
 
         AddrClaimOutcome::Accepted
@@ -17692,6 +17758,81 @@ mod tests {
         );
     }
 
+    /// Reproduces the `Verified`-laundering attack: an authenticated
+    /// attacker inbound-connects and advertises an unowned victim address
+    /// that is not its own TCP source (a Provisional claim). Even if
+    /// inbound-observation bookkeeping ends up recorded against that
+    /// address by some other code path, `ownership_owner` must not treat it
+    /// as `Verified` -- only the address-scoped `identity_verified` flag
+    /// `add_peer_with_node_id` persists from `arbitrate()` may do that.
+    /// Otherwise the attacker's merely-Provisional claim is laundered into
+    /// an undisplaceable `Verified` one, and the victim's later genuinely
+    /// verified claim is wrongly rejected -- permanent address squatting.
+    #[tokio::test]
+    async fn addr_ownership_inbound_observed_does_not_launder_provisional_to_verified() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_010), test_config());
+        let victim_addr = test_addr(20_011);
+        let attacker_source_addr = test_addr(20_012);
+        let attacker = test_peer_id("addr-ownership-launder-attacker").to_node_id();
+        let victim = test_peer_id("addr-ownership-launder-victim").to_node_id();
+
+        // Attacker's self-reported advertised address does not match its
+        // own TCP source, so this is a Provisional claim -- exactly like
+        // the corrected inbound-accept provenance rule in handle.rs.
+        let outcome = registry
+            .add_peer_with_node_id(
+                victim_addr,
+                Some(attacker),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // Some other code path records inbound observation for the
+        // attacker's connection. Even if it were ever mis-attributed to
+        // `victim_addr` -- exactly the bug this test guards against -- it
+        // must not upgrade the recorded ownership kind.
+        registry
+            .mark_inbound_connection_observed(victim_addr, attacker_source_addr)
+            .await;
+
+        let owner_after_observation = {
+            let gossip_state = registry.gossip_state.lock().await;
+            gossip_state
+                .peers
+                .get(&victim_addr)
+                .and_then(PeerInfo::ownership_owner)
+        };
+        assert_eq!(
+            owner_after_observation,
+            Some(crate::addr_ownership::Owner {
+                node_id: attacker.to_peer_id(),
+                kind: crate::addr_ownership::ClaimKind::Provisional,
+            }),
+            "inbound_observed on a merely self-reported address must not launder \
+             a Provisional claim into a Verified one"
+        );
+
+        // The victim's later genuinely verified claim must be ACCEPTED and
+        // displace the attacker's provisional squat.
+        let victim_outcome = registry
+            .add_peer_with_node_id(
+                victim_addr,
+                Some(victim),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(
+            victim_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+        assert_eq!(
+            snapshot_peer(&registry, victim_addr).await.node_id,
+            Some(victim),
+            "the victim's genuinely verified claim must displace the laundered attacker"
+        );
+    }
+
     /// Owner-change rekey: when a verified claimant displaces a DIFFERENT
     /// (provisional) owner, none of the old identity's actor routes or
     /// session/sequence state survive onto the new owner.
@@ -17699,8 +17840,10 @@ mod tests {
     async fn addr_ownership_owner_change_rekeys_actor_routes_and_sequence_state() {
         let registry = GossipRegistry::<()>::new(test_addr(20_008), test_config());
         let addr = test_addr(20_009);
-        let old_owner = test_peer_id("addr-ownership-rekey-old").to_node_id();
+        let old_owner_peer_id = test_peer_id("addr-ownership-rekey-old");
+        let old_owner = old_owner_peer_id.to_node_id();
         let new_owner = test_peer_id("addr-ownership-rekey-new").to_node_id();
+        let actor_name = "old_owner_actor".to_string();
 
         registry
             .add_peer_with_node_id(
@@ -17710,15 +17853,17 @@ mod tests {
             )
             .await;
 
-        // Poison the old owner's identity-scoped state: actor routes and a
-        // high sequence number that a legitimate new owner must not inherit.
+        // Poison the old owner's identity-scoped state: actor routes, admission
+        // budget, a known_actors entry, and a high sequence number that a
+        // legitimate new owner must not inherit.
         {
             let mut gossip_state = registry.gossip_state.lock().await;
             gossip_state
                 .peer_to_actors
                 .entry(addr)
                 .or_default()
-                .insert("old_owner_actor".to_string());
+                .insert(actor_name.clone());
+            gossip_state.record_actor_admission(&old_owner_peer_id, &actor_name);
             if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
                 peer_info.last_sequence = 999_999;
                 peer_info.last_sent_sequence = 999_999;
@@ -17726,6 +17871,10 @@ mod tests {
                 peer_info.failures = 3;
             }
         }
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            actor_name.clone(),
+            RemoteActorLocation::new_with_peer(addr, old_owner_peer_id.clone()),
+        );
         registry.set_peer_capabilities(addr, clock_caps());
         registry
             .associate_peer_capabilities_with_node(addr, old_owner)
@@ -17733,6 +17882,15 @@ mod tests {
         assert!(
             registry.peer_capabilities_by_node.contains_sync(&old_owner),
             "capability fixture did not attach as expected"
+        );
+        assert_eq!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .actor_admission_count(&old_owner_peer_id),
+            1,
+            "admission fixture did not attach as expected"
         );
 
         // A genuinely verified claim from a DIFFERENT node displaces the
@@ -17766,6 +17924,23 @@ mod tests {
         assert!(
             !registry.peer_capabilities_by_node.contains_sync(&old_owner),
             "the old owner's capabilities must not survive the ownership change"
+        );
+        assert_eq!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .actor_admission_count(&old_owner_peer_id),
+            0,
+            "the old owner's admission budget must be released on ownership change"
+        );
+        assert!(
+            registry
+                .actor_state
+                .known_actors
+                .read_sync(&actor_name, |_, _| ())
+                .is_none(),
+            "the old owner's actor must be gone from known_actors after ownership change"
         );
     }
 

@@ -3681,8 +3681,17 @@ where
 
             // Notify peer discovery that a connection is established (incoming)
             registry.mark_peer_connected(effective_addr).await;
+            // Inbound-observation evidence must be recorded on the address
+            // it actually corroborates: the raw TCP source of this
+            // connection, `peer_addr`. Recording it on `effective_addr`
+            // instead -- which can be a merely self-reported, Provisional
+            // claim -- would flip `PeerInfo::inbound_observed` on an address
+            // that was never itself observed. `mark_peer_connected` above
+            // already covers the health/discovery bookkeeping for
+            // `effective_addr`; only the observation flag needs to stay
+            // pinned to the address it is actually evidence for.
             registry
-                .mark_inbound_connection_observed(effective_addr, peer_addr)
+                .mark_inbound_connection_observed(peer_addr, peer_addr)
                 .await;
 
             debug!(
