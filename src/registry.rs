@@ -2637,96 +2637,98 @@ impl<T: 'static> GossipRegistry<T> {
         if peer_addr != self.bind_addr {
             // Ownership guard: `peer_addr` may come straight from the
             // peer-controlled `sender_bind_addr` wire field (via the
-            // caller's address resolution). If it is already tracked as
-            // belonging to a DIFFERENT authenticated node_id than the one
-            // being asserted here, the connection-pool routing update below
-            // must not repoint `addr_to_peer_id`/the connection route to
-            // the claimant -- fail closed, mirroring the DNS re-resolution
-            // migration guard's collision pre-check.
-            let owner_conflict;
+            // caller's address resolution). Checked FIRST, under the same
+            // lock as every mutation below, and on conflict this returns
+            // IMMEDIATELY -- no `peers[addr]` insert/update, no node_id
+            // assignment onto a node-less existing entry, no capability-map
+            // write, and (below) no connection-pool routing repoint. A
+            // partial application (e.g. skipping only the routing repoint
+            // while still assigning node_id to someone else's entry) would
+            // leave `peers[addr]` poisoned for the legitimate owner even
+            // though routing itself was protected. Fail closed on the
+            // entire operation, mirroring the DNS re-resolution migration
+            // guard's collision pre-check.
+            let mut gossip_state = self.gossip_state.lock().await;
+
+            if let Some(claimed) = node_id
+                && self.addr_owned_by_other_node(&gossip_state, peer_addr, claimed)
             {
-                let mut gossip_state = self.gossip_state.lock().await;
-
-                owner_conflict = node_id.is_some_and(|claimed| {
-                    self.addr_owned_by_other_node(&gossip_state, peer_addr, claimed)
-                });
-
-                // Check if we already have this peer
-                if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
-                    // Update GossipNodeId if provided and not already set
-                    // (never overwritten once set -- see `owner_conflict`
-                    // above, which uses this same never-overwritten
-                    // invariant to gate the pool-routing update below).
-                    if node_id.is_some() && existing_peer.node_id.is_none() {
-                        existing_peer.node_id = node_id;
-                        debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
-                    } else {
-                        debug!(peer = %peer_addr, "peer already tracked");
-                    }
-                } else {
-                    // New peer
-                    // Check if we have a dns_name from known_peers (discovered via gossip)
-                    // Do this before the entry check to avoid borrow conflicts
-                    let dns_name = gossip_state
-                        .known_peers
-                        .peek(&peer_addr)
-                        .and_then(|p| p.dns_name.clone());
-
-                    let current_time = current_timestamp();
-                    let current_time_ms = crate::current_timestamp_millis();
-                    gossip_state.peers.insert(
-                        peer_addr,
-                        PeerInfo {
-                            address: peer_addr,
-                            peer_address: None,
-                            inbound_observed: false,
-                            outbound_dial_success: false,
-                            node_id,
-                            dns_name,
-                            failures: 0,
-                            last_attempt: current_time,
-                            last_success: current_time,
-                            last_sequence: 0,
-                            last_sent_sequence: 0,
-                            consecutive_deltas: 0,
-                            last_failure_time: None,
-                            last_dns_refresh_attempt: None,
-                            last_response_received_ms: current_time_ms,
-                            accept_lower_sequence_from: None,
-                            current_session_source: None,
-                            current_session_connection: None,
-                            current_session_epoch: 0,
-                        },
-                    );
-
-                    if let Some(node_id) = node_id {
-                        let _ = self
-                            .peer_capability_addr_to_node
-                            .upsert_sync(peer_addr, node_id);
-                        let caps = self.peer_capabilities.read_sync(&peer_addr, |_, v| *v);
-                        if let Some(caps) = caps {
-                            let _ = self.peer_capabilities_by_node.upsert_sync(node_id, caps);
-                        }
-                    }
-                    debug!(
-                        peer = %peer_addr,
-                        peers_count = gossip_state.peers.len(),
-                        has_node_id = node_id.is_some(),
-                        "📌 Added new peer (listening address)"
-                    );
-                }
-            } // Lock dropped
-
-            // Safely update connection pool if we have a GossipNodeId
-            // This is critical for TLS connections to work (get_connection_to_peer needs this mapping)
-            if owner_conflict {
                 warn!(
                     peer = %peer_addr,
                     claimed_node_id = ?node_id,
-                    "refusing to repoint addr_to_peer_id/connection routing: address already \
-                     owned by a different authenticated peer"
+                    "refusing to add/update peer: address already owned by a \
+                     different authenticated peer"
                 );
-            } else if let Some(id) = node_id {
+                return;
+            }
+
+            // Check if we already have this peer
+            if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
+                // Update GossipNodeId if provided and not already set
+                // (never overwritten once set).
+                if node_id.is_some() && existing_peer.node_id.is_none() {
+                    existing_peer.node_id = node_id;
+                    debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
+                } else {
+                    debug!(peer = %peer_addr, "peer already tracked");
+                }
+            } else {
+                // New peer
+                // Check if we have a dns_name from known_peers (discovered via gossip)
+                // Do this before the entry check to avoid borrow conflicts
+                let dns_name = gossip_state
+                    .known_peers
+                    .peek(&peer_addr)
+                    .and_then(|p| p.dns_name.clone());
+
+                let current_time = current_timestamp();
+                let current_time_ms = crate::current_timestamp_millis();
+                gossip_state.peers.insert(
+                    peer_addr,
+                    PeerInfo {
+                        address: peer_addr,
+                        peer_address: None,
+                        inbound_observed: false,
+                        outbound_dial_success: false,
+                        node_id,
+                        dns_name,
+                        failures: 0,
+                        last_attempt: current_time,
+                        last_success: current_time,
+                        last_sequence: 0,
+                        last_sent_sequence: 0,
+                        consecutive_deltas: 0,
+                        last_failure_time: None,
+                        last_dns_refresh_attempt: None,
+                        last_response_received_ms: current_time_ms,
+                        accept_lower_sequence_from: None,
+                        current_session_source: None,
+                        current_session_connection: None,
+                        current_session_epoch: 0,
+                    },
+                );
+
+                if let Some(node_id) = node_id {
+                    let _ = self
+                        .peer_capability_addr_to_node
+                        .upsert_sync(peer_addr, node_id);
+                    let caps = self.peer_capabilities.read_sync(&peer_addr, |_, v| *v);
+                    if let Some(caps) = caps {
+                        let _ = self.peer_capabilities_by_node.upsert_sync(node_id, caps);
+                    }
+                }
+                debug!(
+                    peer = %peer_addr,
+                    peers_count = gossip_state.peers.len(),
+                    has_node_id = node_id.is_some(),
+                    "📌 Added new peer (listening address)"
+                );
+            }
+            drop(gossip_state); // Lock dropped before touching connection_pool below.
+
+            // Safely update connection pool if we have a GossipNodeId
+            // This is critical for TLS connections to work (get_connection_to_peer needs this mapping)
+            if let Some(id) = node_id {
                 let peer_id = id.to_peer_id();
 
                 // A peer re-announced at a new address (e.g. a restart on a
@@ -5396,7 +5398,18 @@ impl<T: 'static> GossipRegistry<T> {
         // all, so a newer session can arm (or the validated one can
         // self-expire) in that gap, and this is what lets STEP 2 detect
         // and drop the now-stale pending write instead of applying it.
-        let captured_epoch: Option<u64> = {
+        // `pre_sequence_snapshot` is `(last_sequence, accept_lower_sequence_from)`
+        // as observed BEFORE this block's own mutation below, `Some` only
+        // when a `peers[sender_addr]` entry existed to mutate. STEP 2's
+        // atomic ownership recheck uses it to ROLL BACK that mutation if
+        // ownership turns out to belong to someone else by the time STEP 2
+        // runs -- e.g. a node-less placeholder entry (no `node_id` yet)
+        // lets this block set an arbitrary `last_sequence` high-water mark
+        // before the entry's true owner is ever established; nothing that
+        // advances peer sequence state may survive a failed ownership
+        // recheck, so a poisoned mark must be undone, not merely left in
+        // place while only the actor writes are skipped.
+        let (captured_epoch, pre_sequence_snapshot): (Option<u64>, Option<(u64, Option<SocketAddr>)>) = {
             let mut gossip_state = self.gossip_state.lock().await;
 
             // Ownership guard: `sender_addr` may come straight from the
@@ -5420,6 +5433,8 @@ impl<T: 'static> GossipRegistry<T> {
             }
 
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
+                let pre_sequence_snapshot =
+                    Some((peer_info.last_sequence, peer_info.accept_lower_sequence_from));
                 // Once a session has been armed for this peer, only the
                 // connection that armed it is treated as authoritative for
                 // *any* sequence update, not merely for the lower-sequence
@@ -5503,9 +5518,9 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_info.accept_lower_sequence_from = None;
                     peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
                 }
-                Some(peer_info.current_session_epoch)
+                (Some(peer_info.current_session_epoch), pre_sequence_snapshot)
             } else {
-                None
+                (None, None)
             }
         };
 
@@ -5603,6 +5618,22 @@ impl<T: 'static> GossipRegistry<T> {
             // check-then-mutate gap.
             if self.addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
             {
+                // Nothing that advances peer sequence/state may survive a
+                // failed ownership recheck: roll back STEP 1's
+                // `last_sequence`/`accept_lower_sequence_from` mutation
+                // (if it made one) to what it observed BEFORE that
+                // mutation, undoing it as if this message had never been
+                // processed. Otherwise a since-established legitimate
+                // owner would inherit a poisoned high-water mark from the
+                // rejected claimant and see its own later, genuine syncs
+                // rejected as stale.
+                if let Some((pre_last_sequence, pre_accept_lower_sequence_from)) =
+                    pre_sequence_snapshot
+                    && let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr)
+                {
+                    peer_info.last_sequence = pre_last_sequence;
+                    peer_info.accept_lower_sequence_from = pre_accept_lower_sequence_from;
+                }
                 warn!(
                     addr = %sender_addr,
                     claimed_sender = %sender_peer_id,

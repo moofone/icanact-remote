@@ -10368,3 +10368,375 @@ async fn ownership_established_during_full_sync_response_merge_window_aborts_sta
          attacker"
     );
 }
+
+/// `add_peer_with_node_id` must abort BEFORE any address-keyed mutation on
+/// an ownership conflict, not just the later connection-pool routing
+/// repoint. Victim owns `contested_addr` via the addr_to_peer_id alias
+/// only (no `peers[]` entry yet); an attacker's conflicting claim must
+/// leave `peers[]` (no new entry created), the capability maps, and the
+/// alias itself completely untouched.
+#[tokio::test]
+async fn add_peer_with_node_id_conflict_leaves_all_peer_state_unchanged() {
+    let bind_addr: SocketAddr = "10.94.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("addpeer-guard-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let victim_kp = crate::KeyPair::new_for_testing("addpeer-guard-victim");
+    let victim = victim_kp.peer_id();
+    let contested_addr: SocketAddr = "10.94.0.2:9000".parse().unwrap();
+
+    // Victim owns `contested_addr` via the addr_to_peer_id alias only.
+    registry.configure_peer(victim.clone(), contested_addr).await;
+    assert!(
+        !registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .contains_key(&contested_addr),
+        "sanity: no peers[] entry exists yet, ownership is alias-only"
+    );
+
+    let attacker_kp = crate::KeyPair::new_for_testing("addpeer-guard-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_node_id = attacker.to_node_id();
+
+    registry
+        .add_peer_with_node_id(contested_addr, Some(attacker_node_id))
+        .await;
+
+    assert!(
+        !registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .contains_key(&contested_addr),
+        "a conflicting claimant must not be able to create a peers[addr] \
+         entry for an address it does not own"
+    );
+    assert!(
+        !registry
+            .peer_capability_addr_to_node
+            .contains_sync(&contested_addr),
+        "a conflicting claimant must not populate the capability maps for \
+         an address it does not own"
+    );
+    assert!(
+        !registry.peer_capabilities_by_node.contains_sync(&attacker_node_id),
+        "a conflicting claimant's own node_id must not gain a capability \
+         entry via an address it does not own"
+    );
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&contested_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "the addr_to_peer_id alias must remain pointed at the true owner"
+    );
+}
+
+/// A failed atomic ownership recheck must roll back ANY peer-sequence
+/// state STEP 1 mutated, not merely skip the actor writes STEP 2 guards.
+/// A node-less placeholder lets an attacker's FullSyncResponse set an
+/// arbitrarily high `last_sequence` before the address's true owner is
+/// established; once ownership is established during the merge window
+/// (reusing the same widened-window technique as the merge-window test
+/// above) and the recheck rejects the apply, `last_sequence` must be
+/// restored to its pre-attack value, not left poisoned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ownership_established_during_merge_window_rolls_back_poisoned_last_sequence() {
+    let bind_addr: SocketAddr = "10.96.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("seq-rollback-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let victim_kp = crate::KeyPair::new_for_testing("seq-rollback-victim");
+    let victim = victim_kp.peer_id();
+    let victim_node_id = victim.to_node_id();
+    let contested_addr: SocketAddr = "10.96.0.2:9000".parse().unwrap();
+
+    let attacker_kp = crate::KeyPair::new_for_testing("seq-rollback-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_ephemeral: SocketAddr = "10.96.0.3:51000".parse().unwrap();
+
+    // A node-less placeholder entry, as e.g. a legitimate FullSync arm's
+    // Vacant-insert would leave behind, with a low baseline sequence.
+    let baseline_sequence = 5u64;
+    {
+        let mut gossip_state = registry.gossip_state.lock().await;
+        gossip_state.peers.insert(
+            contested_addr,
+            crate::registry::PeerInfo {
+                address: contested_addr,
+                peer_address: None,
+                inbound_observed: true,
+                outbound_dial_success: false,
+                node_id: None,
+                dns_name: None,
+                failures: 0,
+                last_attempt: 0,
+                last_success: 0,
+                last_sequence: baseline_sequence,
+                last_sent_sequence: 0,
+                consecutive_deltas: 0,
+                last_failure_time: None,
+                last_dns_refresh_attempt: None,
+                last_response_received_ms: 0,
+                accept_lower_sequence_from: None,
+                current_session_source: None,
+                current_session_connection: None,
+                current_session_epoch: 0,
+            },
+        );
+    }
+
+    let poisoned_sequence = 999_999u64;
+    let mut local_actors = Vec::with_capacity(8_000);
+    for i in 0..8_000u32 {
+        local_actors.push((
+            format!("seqrb/attacker-actor-{i}"),
+            crate::RemoteActorLocation::new_with_peer(contested_addr, attacker.clone()),
+        ));
+    }
+    let attacker_full_sync_response = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors,
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(contested_addr.to_string()),
+        sequence: poisoned_sequence,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    let attacker_registry = registry.clone();
+    let attacker_task = tokio::spawn(async move {
+        super::handle_incoming_message(
+            attacker_registry,
+            attacker_ephemeral,
+            attacker_ephemeral,
+            attacker_full_sync_response,
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    // The victim establishes ownership of the SAME node-less placeholder
+    // WHILE the attacker's FullSyncResponse is, very likely, still being
+    // processed -- succeeding because the placeholder has no node_id and
+    // no addr_to_peer_id alias exists yet (the FullSyncResponse handler
+    // only repoints routing AFTER `merge_full_sync_from` returns).
+    registry
+        .add_peer_with_node_id(contested_addr, Some(victim_node_id))
+        .await;
+
+    attacker_task
+        .await
+        .expect("attacker task must not panic")
+        .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
+
+    let gossip_state = registry.gossip_state.lock().await;
+    let peer_info = gossip_state
+        .peers
+        .get(&contested_addr)
+        .expect("the placeholder entry must still exist");
+    assert_eq!(
+        peer_info.node_id,
+        Some(victim_node_id),
+        "sanity: the victim's ownership claim must have succeeded"
+    );
+    assert_eq!(
+        peer_info.last_sequence, baseline_sequence,
+        "a failed atomic ownership recheck must roll back the poisoned \
+         high-water mark, not merely skip the actor writes -- the \
+         legitimate owner's own later, genuinely-lower syncs must not be \
+         rejected as stale because of a rejected claimant's sequence"
+    );
+}
+
+/// A rejected claimant must never be able to install clock-echo/extension
+/// bookkeeping under an address that already belongs to a different
+/// authenticated peer. The ownership check and
+/// `record_inbound_gossip_extensions` now run as ONE atomic critical
+/// section in the `FullSyncResponse` handler (previously: check-then-unlock
+/// followed by an unguarded write), so an address already owned at the
+/// instant the check runs can never have extension state written afterward
+/// by the rejected claimant. Includes a non-vacuous sanity check that
+/// extensions ARE recorded for a genuinely unowned address, so the main
+/// assertion isn't trivially true because extensions are never recorded at
+/// all.
+#[tokio::test]
+async fn rejected_claimant_installs_no_clock_echo_under_an_owned_address() {
+    let bind_addr: SocketAddr = "10.97.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("extension-guard-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let victim_kp = crate::KeyPair::new_for_testing("extension-guard-victim");
+    let victim_node_id = victim_kp.peer_id().to_node_id();
+    let owned_addr: SocketAddr = "10.97.0.2:9000".parse().unwrap();
+    registry
+        .add_peer_with_node_id(owned_addr, Some(victim_node_id))
+        .await;
+
+    let attacker_kp = crate::KeyPair::new_for_testing("extension-guard-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_ephemeral: SocketAddr = "10.97.0.3:51000".parse().unwrap();
+
+    let claim_owned = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: vec![],
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(owned_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::GossipExtensionsV1 {
+            clock_probe: Some(crate::ClockProbeV1 {
+                sample_id: 1,
+                sender_wall_ns: 1,
+            }),
+            clock_echo: None,
+        }),
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_ephemeral,
+        attacker_ephemeral,
+        claim_owned,
+    )
+    .await
+    .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
+
+    assert!(
+        !registry.has_pending_clock_echo(owned_addr),
+        "a rejected claimant must not install a pending clock echo under an \
+         address already owned by a different authenticated peer"
+    );
+
+    // Sanity: the same probe, claiming a genuinely UNOWNED address, DOES
+    // get recorded -- proving the assertion above isn't vacuous.
+    let unowned_addr: SocketAddr = "10.97.0.4:9000".parse().unwrap();
+    let claim_unowned = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: vec![],
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(unowned_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::GossipExtensionsV1 {
+            clock_probe: Some(crate::ClockProbeV1 {
+                sample_id: 2,
+                sender_wall_ns: 1,
+            }),
+            clock_echo: None,
+        }),
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_ephemeral,
+        attacker_ephemeral,
+        claim_unowned,
+    )
+    .await
+    .expect("a legitimate FullSyncResponse for an unowned address must succeed");
+    assert!(
+        registry.has_pending_clock_echo(unowned_addr),
+        "sanity: a probe claiming a genuinely unowned address must still \
+         be recorded -- otherwise the rejection above would be vacuous"
+    );
+}
+
+/// Concurrency-safety smoke test: many concurrent attacker/ownership-claim
+/// pairs racing the SAME ownership-guarded lock, on a genuine multi-thread
+/// runtime, must never panic, deadlock, or hang. The ownership check and
+/// `record_inbound_gossip_extensions` being one atomic critical section
+/// (see the deterministic test above) means every possible interleaving
+/// resolves to one of two internally-consistent outcomes -- this test's
+/// job is only to confirm sustained concurrent contention on that lock
+/// doesn't itself misbehave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_full_sync_response_ownership_races_do_not_panic_or_hang() {
+    for i in 0..200u32 {
+        let bind_addr: SocketAddr = format!("10.98.0.1:{}", 20_000 + i).parse().unwrap();
+        let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            bind_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(format!(
+                    "extension-race-local-{i}"
+                ))),
+                ..crate::GossipConfig::default()
+            },
+        ));
+
+        let victim_kp = crate::KeyPair::new_for_testing(format!("extension-race-victim-{i}"));
+        let victim_node_id = victim_kp.peer_id().to_node_id();
+        let contested_addr: SocketAddr = format!("10.98.0.2:{}", 20_000 + i).parse().unwrap();
+
+        let attacker_kp = crate::KeyPair::new_for_testing(format!("extension-race-attacker-{i}"));
+        let attacker = attacker_kp.peer_id();
+        let attacker_ephemeral: SocketAddr = format!("10.98.0.3:{}", 20_000 + i).parse().unwrap();
+
+        let attacker_full_sync_response = crate::registry::RegistryMessage::FullSyncResponse {
+            local_actors: vec![],
+            known_actors: vec![],
+            sender_peer_id: attacker.clone(),
+            sender_bind_addr: Some(contested_addr.to_string()),
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+            extensions: Some(crate::GossipExtensionsV1 {
+                clock_probe: Some(crate::ClockProbeV1 {
+                    sample_id: u64::from(i),
+                    sender_wall_ns: 1,
+                }),
+                clock_echo: None,
+            }),
+        };
+
+        let attacker_registry = registry.clone();
+        let attacker_task = tokio::spawn(async move {
+            super::handle_incoming_message(
+                attacker_registry,
+                attacker_ephemeral,
+                attacker_ephemeral,
+                attacker_full_sync_response,
+            )
+            .await
+        });
+
+        let establisher_registry = registry.clone();
+        let establisher_task = tokio::spawn(async move {
+            establisher_registry
+                .add_peer_with_node_id(contested_addr, Some(victim_node_id))
+                .await;
+        });
+
+        let attacker_result = tokio::time::timeout(std::time::Duration::from_secs(5), attacker_task)
+            .await
+            .expect("iteration {i}: attacker task must not hang");
+        attacker_result
+            .expect("attacker task must not panic")
+            .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
+        tokio::time::timeout(std::time::Duration::from_secs(5), establisher_task)
+            .await
+            .expect("iteration {i}: establisher task must not hang")
+            .expect("establisher task must not panic");
+    }
+}

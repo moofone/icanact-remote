@@ -4847,7 +4847,14 @@ pub(crate) fn handle_incoming_message(
                 };
 
                 // Ownership guard FIRST -- before ANY address-keyed
-                // mutation, including extension/clock bookkeeping below.
+                // mutation, including extension/clock bookkeeping. Held
+                // as ONE lock acquisition together with
+                // `record_inbound_gossip_extensions` below (rather than a
+                // separate, earlier check-then-unlock) so another task
+                // establishing ownership of `sender_socket_addr` cannot
+                // land in the gap between the check and the extension
+                // write -- a rejected claimant must install no pending
+                // clock echo under the claimed address either.
                 // `sender_socket_addr` comes from the peer-controlled
                 // `sender_bind_addr` wire field; if it is already owned
                 // (via `peers[addr]`, `addr_to_peer_id[addr]`, or is this
@@ -4872,13 +4879,13 @@ pub(crate) fn handle_incoming_message(
                         );
                         return Ok(());
                     }
-                }
 
-                registry.record_inbound_gossip_extensions(
-                    sender_socket_addr,
-                    extensions,
-                    crate::current_timestamp_nanos(),
-                );
+                    registry.record_inbound_gossip_extensions(
+                        sender_socket_addr,
+                        extensions,
+                        crate::current_timestamp_nanos(),
+                    );
+                }
 
                 debug!(
                     sender = %sender_peer_id,
