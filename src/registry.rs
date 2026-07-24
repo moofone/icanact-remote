@@ -1566,6 +1566,19 @@ impl Drop for DiscoveryTaskTracker {
     }
 }
 
+// Test-only deterministic synchronization point for `merge_full_sync_from`.
+// Task-scoped (not global/thread-local) so it is visible correctly across
+// worker threads for exactly the task it is bound to via `.scope(...)`, and
+// never leaks between concurrently-running tests. See its use in
+// `merge_full_sync_from` and the tests that call `.scope(...)` around a
+// `handle_incoming_message` future to deterministically land a concurrent
+// ownership change inside the STEP-1-to-STEP-2 window without a
+// timing-based sleep.
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static QA_MERGE_STEP1_COMPLETE: std::sync::Arc<tokio::sync::Notify>;
+}
+
 impl<T: 'static> GossipRegistry<T> {
     /// The address this node should advertise to peers for anything it
     /// hosts (gossip `sender_addr`, peer-list snapshots, routed-pubsub
@@ -5398,18 +5411,20 @@ impl<T: 'static> GossipRegistry<T> {
         // all, so a newer session can arm (or the validated one can
         // self-expire) in that gap, and this is what lets STEP 2 detect
         // and drop the now-stale pending write instead of applying it.
-        // `pre_sequence_snapshot` is `(last_sequence, accept_lower_sequence_from)`
-        // as observed BEFORE this block's own mutation below, `Some` only
-        // when a `peers[sender_addr]` entry existed to mutate. STEP 2's
-        // atomic ownership recheck uses it to ROLL BACK that mutation if
-        // ownership turns out to belong to someone else by the time STEP 2
-        // runs -- e.g. a node-less placeholder entry (no `node_id` yet)
-        // lets this block set an arbitrary `last_sequence` high-water mark
-        // before the entry's true owner is ever established; nothing that
-        // advances peer sequence state may survive a failed ownership
-        // recheck, so a poisoned mark must be undone, not merely left in
-        // place while only the actor writes are skipped.
-        let (captured_epoch, pre_sequence_snapshot): (Option<u64>, Option<(u64, Option<SocketAddr>)>) = {
+        // DEFER-until-validated, not mutate-then-rollback: this block is
+        // now READ-ONLY with respect to `last_sequence`/
+        // `accept_lower_sequence_from`. It only decides whether the
+        // message is obviously acceptable/rejectable *before* doing the
+        // (potentially expensive) actor-candidate collection below: an
+        // early `return false`/`return true` here never wrote anything,
+        // so there is nothing to undo. The actual write is committed in
+        // STEP 2, atomically with the ownership recheck there, RECOMPUTED
+        // from CURRENT state at that point rather than carried forward
+        // from here -- so a claimant that turns out not to own
+        // `sender_addr` never mutates it at all (no rollback needed), and
+        // a legitimate owner's own concurrent update is never clobbered
+        // by a stale decision made under this earlier lock.
+        let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
 
             // Ownership guard: `sender_addr` may come straight from the
@@ -5417,9 +5432,7 @@ impl<T: 'static> GossipRegistry<T> {
             // already tracked as belonging to a DIFFERENT authenticated
             // node_id than `sender_peer_id`, this message is a hijack
             // attempt against that owner's bookkeeping, not a legitimate
-            // update -- fail closed rather than let it overwrite
-            // `peer_to_actors[sender_addr]` or advance/roll back
-            // `last_sequence` below. Mirrors the DNS re-resolution
+            // update -- fail closed. Mirrors the DNS re-resolution
             // migration guard's collision pre-check.
             if self.addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
             {
@@ -5433,8 +5446,6 @@ impl<T: 'static> GossipRegistry<T> {
             }
 
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
-                let pre_sequence_snapshot =
-                    Some((peer_info.last_sequence, peer_info.accept_lower_sequence_from));
                 // Once a session has been armed for this peer, only the
                 // connection that armed it is treated as authoritative for
                 // *any* sequence update, not merely for the lower-sequence
@@ -5475,7 +5486,10 @@ impl<T: 'static> GossipRegistry<T> {
                     // verified TCP source (ephemeral port included) may
                     // consume it. A replayed or relayed frame arriving by
                     // any other path cannot consume it. Unverifiable
-                    // sources (`None`) fail closed.
+                    // sources (`None`) fail closed. This is a read-only
+                    // precheck -- STEP 2 redoes the same test against
+                    // CURRENT state before actually consuming the
+                    // exemption.
                     let armed_for_this_connection = peer_info
                         .accept_lower_sequence_from
                         .zip(session_source)
@@ -5495,34 +5509,24 @@ impl<T: 'static> GossipRegistry<T> {
                         // authority, not this particular message's content.
                         return true;
                     }
-                    info!(
-                        peer = %sender_addr,
-                        last_sequence = peer_info.last_sequence,
-                        received_sequence = sequence,
-                        "R-11: accepting lower-sequence FullSync after peer restart"
-                    );
-                    // Consume the one-shot and adopt the restarted peer's
-                    // sequence line wholesale — `max()` would pin us to the
-                    // pre-restart high-water mark and re-close the gate against
-                    // every subsequent sync from the restarted peer.
-                    // `current_session_source` is untouched: it persists for
-                    // the rest of this session so later syncs keep rejecting
-                    // any other connection's traffic (see above).
-                    peer_info.accept_lower_sequence_from = None;
-                    peer_info.last_sequence = sequence;
-                } else {
-                    // Reached only for messages already confirmed to be
-                    // from the current session (or before any session was
-                    // ever armed), so clearing the one-shot here cannot be
-                    // triggered by an unrelated connection.
-                    peer_info.accept_lower_sequence_from = None;
-                    peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
+                    // Falls through: looks like a legitimate R-11 restart
+                    // acceptance. STEP 2 re-derives and commits it.
                 }
-                (Some(peer_info.current_session_epoch), pre_sequence_snapshot)
+                Some(peer_info.current_session_epoch)
             } else {
-                (None, None)
+                None
             }
         };
+
+        // Test-only synchronization point: notified right after STEP 1's
+        // lock is released above (before the potentially large
+        // actor-candidate collection pass below), letting tests
+        // deterministically land a concurrent state change inside that
+        // window without a sleep-based race.
+        #[cfg(test)]
+        {
+            let _ = QA_MERGE_STEP1_COMPLETE.try_with(|notify| notify.notify_one());
+        }
 
         let mut new_actors = 0;
         let mut updated_actors = 0;
@@ -5615,25 +5619,13 @@ impl<T: 'static> GossipRegistry<T> {
             // is skipped entirely) and a legitimate peer has since claimed
             // it. Re-verifying here, under the same lock as the writes
             // themselves, closes that window rather than trusting a
-            // check-then-mutate gap.
+            // check-then-mutate gap. Nothing keyed to `sender_addr` --
+            // `last_sequence`, `accept_lower_sequence_from`,
+            // `peer_to_actors`, `known_actors` -- has been written by this
+            // call yet, so a failed check here simply returns: there is
+            // no partial write to undo.
             if self.addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
             {
-                // Nothing that advances peer sequence/state may survive a
-                // failed ownership recheck: roll back STEP 1's
-                // `last_sequence`/`accept_lower_sequence_from` mutation
-                // (if it made one) to what it observed BEFORE that
-                // mutation, undoing it as if this message had never been
-                // processed. Otherwise a since-established legitimate
-                // owner would inherit a poisoned high-water mark from the
-                // rejected claimant and see its own later, genuine syncs
-                // rejected as stale.
-                if let Some((pre_last_sequence, pre_accept_lower_sequence_from)) =
-                    pre_sequence_snapshot
-                    && let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr)
-                {
-                    peer_info.last_sequence = pre_last_sequence;
-                    peer_info.accept_lower_sequence_from = pre_accept_lower_sequence_from;
-                }
                 warn!(
                     addr = %sender_addr,
                     claimed_sender = %sender_peer_id,
@@ -5662,6 +5654,49 @@ impl<T: 'static> GossipRegistry<T> {
                 // narrower epoch race is about this specific pending
                 // write, not session authority, so still `true`.
                 return true;
+            }
+
+            // Commit the `last_sequence`/`accept_lower_sequence_from`
+            // update deferred from STEP 1, now that ownership and session
+            // epoch have both just validated under this same lock.
+            // Recomputed from CURRENT `peer_info` state (not a value
+            // carried forward from STEP 1's earlier lock) so this can
+            // never clobber a legitimate concurrent update to the same
+            // entry -- there isn't a stale snapshot to apply, only a
+            // fresh re-derivation of "what should this become right now."
+            if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
+                if sequence < peer_info.last_sequence {
+                    let armed_for_this_connection = peer_info
+                        .accept_lower_sequence_from
+                        .zip(session_source)
+                        .is_some_and(|(armed, verified)| armed == verified);
+                    if armed_for_this_connection {
+                        info!(
+                            peer = %sender_addr,
+                            last_sequence = peer_info.last_sequence,
+                            received_sequence = sequence,
+                            "R-11: accepting lower-sequence FullSync after peer restart"
+                        );
+                        // Consume the one-shot and adopt the restarted
+                        // peer's sequence line wholesale -- `max()` would
+                        // pin us to the pre-restart high-water mark and
+                        // re-close the gate against every subsequent sync
+                        // from the restarted peer. `current_session_source`
+                        // is untouched: it persists for the rest of this
+                        // session so later syncs keep rejecting any other
+                        // connection's traffic.
+                        peer_info.accept_lower_sequence_from = None;
+                        peer_info.last_sequence = sequence;
+                    }
+                    // Else: the exemption was consumed by a concurrent
+                    // message from the same session between STEP 1 and
+                    // here. Nothing to commit for THIS message's sequence
+                    // -- but ownership and session epoch both just
+                    // validated, so the actor writes below still proceed.
+                } else {
+                    peer_info.accept_lower_sequence_from = None;
+                    peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
+                }
             }
 
             let mut rejected_by_peer_cap = 0usize;

@@ -4847,23 +4847,23 @@ pub(crate) fn handle_incoming_message(
                 };
 
                 // Ownership guard FIRST -- before ANY address-keyed
-                // mutation, including extension/clock bookkeeping. Held
-                // as ONE lock acquisition together with
-                // `record_inbound_gossip_extensions` below (rather than a
-                // separate, earlier check-then-unlock) so another task
-                // establishing ownership of `sender_socket_addr` cannot
-                // land in the gap between the check and the extension
-                // write -- a rejected claimant must install no pending
-                // clock echo under the claimed address either.
-                // `sender_socket_addr` comes from the peer-controlled
-                // `sender_bind_addr` wire field; if it is already owned
-                // (via `peers[addr]`, `addr_to_peer_id[addr]`, or is this
-                // node's own local address) by a DIFFERENT authenticated
-                // node_id than `sender_peer_id`, this is an address-hijack
-                // attempt, not a legitimate migration -- abort before a
-                // rejected frame can poison any bookkeeping keyed on the
-                // claimed address (including the merge below). Mirrors the
-                // DNS re-resolution migration guard's collision pre-check.
+                // mutation. `sender_socket_addr` comes from the
+                // peer-controlled `sender_bind_addr` wire field; if it is
+                // already owned (via `peers[addr]`, `addr_to_peer_id[addr]`,
+                // or is this node's own local address) by a DIFFERENT
+                // authenticated node_id than `sender_peer_id`, this is an
+                // address-hijack attempt, not a legitimate migration --
+                // abort before a rejected frame can poison any bookkeeping
+                // keyed on the claimed address (including the merge below).
+                // Mirrors the DNS re-resolution migration guard's collision
+                // pre-check. `record_inbound_gossip_extensions` is
+                // deliberately NOT called here: recording it now, this
+                // early, would let a claimant that later loses ownership
+                // during the awaited merge below (see the post-merge
+                // recheck) still install clock-echo state under an address
+                // it does not end up owning. It is deferred to the END of
+                // this handler, after the post-merge ownership recheck has
+                // also passed -- see there.
                 {
                     let gossip_state = registry.gossip_state.lock().await;
                     if registry.addr_owned_by_other_node(
@@ -4879,12 +4879,6 @@ pub(crate) fn handle_incoming_message(
                         );
                         return Ok(());
                     }
-
-                    registry.record_inbound_gossip_extensions(
-                        sender_socket_addr,
-                        extensions,
-                        crate::current_timestamp_nanos(),
-                    );
                 }
 
                 debug!(
@@ -4931,6 +4925,19 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 }
+
+                // Deferred from the pre-check above: ownership has now
+                // validated TWICE under lock (pre-check and this post-merge
+                // recheck) with nothing in between able to have changed it
+                // again undetected, so it is safe to record clock-echo
+                // bookkeeping for this address now. A claimant that lost
+                // ownership at any point up to here returned early above
+                // and reached this line having installed nothing.
+                registry.record_inbound_gossip_extensions(
+                    sender_socket_addr,
+                    extensions,
+                    crate::current_timestamp_nanos(),
+                );
 
                 // FIX: Update peer_id mappings (mirror the FullSync handler logic)
                 // This prevents stale ephemeral addresses from being reintroduced via resolve_peer_state_addr

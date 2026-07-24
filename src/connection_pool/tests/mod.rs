@@ -10443,31 +10443,33 @@ async fn add_peer_with_node_id_conflict_leaves_all_peer_state_unchanged() {
     );
 }
 
-/// A failed atomic ownership recheck must roll back ANY peer-sequence
-/// state STEP 1 mutated, not merely skip the actor writes STEP 2 guards.
-/// A node-less placeholder lets an attacker's FullSyncResponse set an
-/// arbitrarily high `last_sequence` before the address's true owner is
-/// established; once ownership is established during the merge window
-/// (reusing the same widened-window technique as the merge-window test
-/// above) and the recheck rejects the apply, `last_sequence` must be
-/// restored to its pre-attack value, not left poisoned.
+/// DEFER-until-validated (not mutate-then-rollback): a claimant that loses
+/// (or never had) ownership of the claimed address by the time
+/// `merge_full_sync_from`'s final, locked ownership recheck runs must have
+/// written NOTHING keyed to that address -- no `last_sequence` advance, no
+/// `accept_lower_sequence_from` change, no actor, no clock echo.
+/// Deterministic, no sleep, no timing guess: `QA_MERGE_STEP1_COMPLETE` is a
+/// task-scoped notification `merge_full_sync_from` fires right after its
+/// STEP 1 lock releases (before the actor-candidate collection pass), so
+/// the victim's ownership claim below is issued at the EXACT start of the
+/// intended window on every run, not "probably during it."
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ownership_established_during_merge_window_rolls_back_poisoned_last_sequence() {
+async fn ownership_established_during_merge_window_writes_nothing_for_rejected_claimant() {
     let bind_addr: SocketAddr = "10.96.0.1:9000".parse().unwrap();
     let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
         bind_addr,
         crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("seq-rollback-local")),
+            key_pair: Some(crate::KeyPair::new_for_testing("seq-defer-local")),
             ..crate::GossipConfig::default()
         },
     ));
 
-    let victim_kp = crate::KeyPair::new_for_testing("seq-rollback-victim");
+    let victim_kp = crate::KeyPair::new_for_testing("seq-defer-victim");
     let victim = victim_kp.peer_id();
     let victim_node_id = victim.to_node_id();
     let contested_addr: SocketAddr = "10.96.0.2:9000".parse().unwrap();
 
-    let attacker_kp = crate::KeyPair::new_for_testing("seq-rollback-attacker");
+    let attacker_kp = crate::KeyPair::new_for_testing("seq-defer-attacker");
     let attacker = attacker_kp.peer_id();
     let attacker_ephemeral: SocketAddr = "10.96.0.3:51000".parse().unwrap();
 
@@ -10502,11 +10504,11 @@ async fn ownership_established_during_merge_window_rolls_back_poisoned_last_sequ
         );
     }
 
-    let poisoned_sequence = 999_999u64;
+    let claimed_sequence = 999_999u64;
     let mut local_actors = Vec::with_capacity(8_000);
     for i in 0..8_000u32 {
         local_actors.push((
-            format!("seqrb/attacker-actor-{i}"),
+            format!("seqdefer/attacker-actor-{i}"),
             crate::RemoteActorLocation::new_with_peer(contested_addr, attacker.clone()),
         ));
     }
@@ -10515,31 +10517,44 @@ async fn ownership_established_during_merge_window_rolls_back_poisoned_last_sequ
         known_actors: vec![],
         sender_peer_id: attacker.clone(),
         sender_bind_addr: Some(contested_addr.to_string()),
-        sequence: poisoned_sequence,
+        sequence: claimed_sequence,
         wall_clock_time: crate::current_timestamp(),
-        extensions: None,
+        extensions: Some(crate::GossipExtensionsV1 {
+            clock_probe: Some(crate::ClockProbeV1 {
+                sample_id: 99,
+                sender_wall_ns: 1,
+            }),
+            clock_echo: None,
+        }),
     };
 
+    // Bound to the attacker's task via `.scope(...)` below so
+    // `merge_full_sync_from`'s STEP-1-complete notification is visible to
+    // this test regardless of which worker thread the task runs on, and
+    // cannot leak into any other concurrently-running test.
+    let step1_complete = std::sync::Arc::new(tokio::sync::Notify::new());
+    let step1_complete_for_task = step1_complete.clone();
+
     let attacker_registry = registry.clone();
-    let attacker_task = tokio::spawn(async move {
-        super::handle_incoming_message(
-            attacker_registry,
-            attacker_ephemeral,
-            attacker_ephemeral,
-            attacker_full_sync_response,
-        )
-        .await
-    });
+    let attacker_task = tokio::spawn(crate::registry::QA_MERGE_STEP1_COMPLETE.scope(
+        step1_complete_for_task,
+        async move {
+            super::handle_incoming_message(
+                attacker_registry,
+                attacker_ephemeral,
+                attacker_ephemeral,
+                attacker_full_sync_response,
+            )
+            .await
+        },
+    ));
 
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
-    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-
-    // The victim establishes ownership of the SAME node-less placeholder
-    // WHILE the attacker's FullSyncResponse is, very likely, still being
-    // processed -- succeeding because the placeholder has no node_id and
-    // no addr_to_peer_id alias exists yet (the FullSyncResponse handler
-    // only repoints routing AFTER `merge_full_sync_from` returns).
+    // Wait for the exact instant merge_full_sync_from's STEP 1 releases
+    // its lock, then issue the victim's claim immediately -- landing it
+    // at the very start of the STEP-1-to-STEP-2 window (which, with an
+    // 8,000-actor candidate-collection pass ahead of STEP 2, is wide open)
+    // on every single run.
+    step1_complete.notified().await;
     registry
         .add_peer_with_node_id(contested_addr, Some(victim_node_id))
         .await;
@@ -10561,10 +10576,29 @@ async fn ownership_established_during_merge_window_rolls_back_poisoned_last_sequ
     );
     assert_eq!(
         peer_info.last_sequence, baseline_sequence,
-        "a failed atomic ownership recheck must roll back the poisoned \
-         high-water mark, not merely skip the actor writes -- the \
-         legitimate owner's own later, genuinely-lower syncs must not be \
-         rejected as stale because of a rejected claimant's sequence"
+        "a claimant that loses ownership before the final locked commit \
+         must never have advanced last_sequence in the first place -- \
+         DEFER-until-validated means there is nothing to roll back"
+    );
+    assert_eq!(
+        peer_info.accept_lower_sequence_from, None,
+        "a rejected claimant must not have touched accept_lower_sequence_from either"
+    );
+    let actors = gossip_state
+        .peer_to_actors
+        .get(&contested_addr)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        actors.is_empty(),
+        "a rejected claimant must not have written any actor into \
+         peer_to_actors[addr]"
+    );
+    drop(gossip_state);
+    assert!(
+        !registry.has_pending_clock_echo(contested_addr),
+        "a rejected claimant must not have installed a pending clock echo \
+         under the address either"
     );
 }
 
