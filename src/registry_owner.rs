@@ -89,6 +89,11 @@ pub enum ClaimRejection {
     OwnerUnavailable,
 }
 
+/// Monotonic position of a committed mutation in the owner task's total
+/// order. Issued by the owner task alone, so it is a true sequence number and
+/// not a timestamp: `a < b` means `a` was committed strictly before `b`.
+pub type CommitSeq = u64;
+
 /// The committed result of a claim. An `Accepted` value is only ever produced
 /// after the ownership entry AND the routing publication have already been
 /// applied, so any state the caller derives from it cannot precede it.
@@ -102,6 +107,16 @@ pub enum ClaimCommit {
         /// the owner (a different node id). `None` for a first claim or a
         /// same-node refresh. Drives identity-scoped rekey at the caller.
         displaced: Option<PeerId>,
+        /// This claim's position in the owner task's commit order.
+        ///
+        /// The decision is atomic inside the task, but a caller then projects
+        /// it into address-keyed state it does not hold any lock over while
+        /// awaiting the reply (`peers[].node_id`, connection indexing). Two
+        /// callers can therefore reach their projection step out of commit
+        /// order and the loser would overwrite the winner. Carrying the
+        /// commit position lets a caller discard a projection that is older
+        /// than one already applied for the same address.
+        commit_seq: CommitSeq,
     },
     Rejected(ClaimRejection),
 }
@@ -118,6 +133,14 @@ impl ClaimCommit {
     /// Whether the claim was committed.
     pub fn is_accepted(&self) -> bool {
         matches!(self, Self::Accepted { .. })
+    }
+
+    /// This claim's position in the owner's commit order, if it committed.
+    pub fn commit_seq(&self) -> Option<CommitSeq> {
+        match self {
+            Self::Accepted { commit_seq, .. } => Some(*commit_seq),
+            Self::Rejected(_) => None,
+        }
     }
 
     /// Whether the accepted claim displaced a DIFFERENT identity, which
@@ -142,6 +165,38 @@ impl ClaimCommit {
                 ..
             }
         )
+    }
+}
+
+/// The committed result of an ownership move between two addresses.
+///
+/// Distinguishing "there was nothing to move" from "the destination belongs
+/// to someone else" matters to the caller: only the latter means a competing
+/// identity now owns the destination, and only the latter must stop the
+/// caller from publishing the address change into its own address-keyed
+/// state. An address that was never claimed (a seed configured by host name
+/// before any handshake) has no ownership record to move and no conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrateOutcome {
+    /// Ownership (and its routing publication) moved from `from` to `to`.
+    Migrated,
+    /// `from` had no recorded owner: nothing to move, nothing in conflict.
+    SourceUnowned,
+    /// `to` is already owned by a DIFFERENT identity. Ownership stays where
+    /// it is and the caller must not move address-keyed state onto `to`.
+    TargetOwnedByOther,
+}
+
+impl MigrateOutcome {
+    /// Whether a competing identity owns the destination, which forbids the
+    /// caller from re-keying its own state onto that address.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Self::TargetOwnedByOther)
+    }
+
+    /// Whether ownership actually moved.
+    pub fn moved(&self) -> bool {
+        matches!(self, Self::Migrated)
     }
 }
 
@@ -192,7 +247,7 @@ enum OwnerCommand {
     Migrate {
         from: SocketAddr,
         to: SocketAddr,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<MigrateOutcome>,
     },
 }
 
@@ -307,17 +362,22 @@ impl RegistryOwnerHandle {
         response.await.unwrap_or(false)
     }
 
-    /// Move ownership of `from` onto `to` (address re-resolution). No-op when
-    /// `from` is unowned, or when `to` is already owned by a different
-    /// identity.
-    pub async fn migrate(&self, from: SocketAddr, to: SocketAddr) -> bool {
+    /// Move ownership of `from` onto `to` (address re-resolution).
+    ///
+    /// Callers that also re-key their own address-keyed state must issue this
+    /// FIRST and act on the outcome, because only the owner task can tell
+    /// whether the destination has meanwhile been claimed by someone else. An
+    /// unreachable owner is reported as blocked: without a committed decision
+    /// no address-keyed move may proceed.
+    pub async fn migrate(&self, from: SocketAddr, to: SocketAddr) -> MigrateOutcome {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::Migrate { from, to, reply };
         if self.shared.tx.send(command).await.is_err() {
-            return false;
+            warn!(from = %from, to = %to, "registry owner unavailable; failing address migration closed");
+            return MigrateOutcome::TargetOwnedByOther;
         }
-        response.await.unwrap_or(false)
+        response.await.unwrap_or(MigrateOutcome::TargetOwnedByOther)
     }
 
     /// Spawn the owner task on first use. The single-slot queue makes this
@@ -329,6 +389,7 @@ impl RegistryOwnerHandle {
                 addr_ownership: HashMap::new(),
                 snapshot: Arc::clone(&self.shared.snapshot),
                 routing,
+                commit_seq: 0,
             };
             tokio::spawn(owner.run(rx));
         }
@@ -348,6 +409,13 @@ struct PeerRegistryOwner {
     addr_ownership: HashMap<SocketAddr, Owner>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     routing: Weak<dyn RoutingPublisher>,
+    /// Position of the last committed mutation. A plain `u64` rather than an
+    /// atomic: the field is reached only through `&mut self` from the single
+    /// owner task, so the type system already provides the exclusivity an
+    /// atomic would be buying at a cost. Advanced by EVERY committed mutation
+    /// — accepted claim, release, migrate — so a claim's position orders it
+    /// against all of them, not just against other claims.
+    commit_seq: CommitSeq,
 }
 
 impl PeerRegistryOwner {
@@ -414,11 +482,16 @@ impl PeerRegistryOwner {
                         kind,
                     },
                 );
+                let commit_seq = self.advance();
                 self.publish();
                 if let Some(routing) = self.routing.upgrade() {
                     routing.publish_owner(addr, &node_id);
                 }
-                ClaimCommit::Accepted { kind, displaced }
+                ClaimCommit::Accepted {
+                    kind,
+                    displaced,
+                    commit_seq,
+                }
             }
         }
     }
@@ -434,6 +507,7 @@ impl PeerRegistryOwner {
         let Some(owner) = self.addr_ownership.remove(&addr) else {
             return false;
         };
+        self.advance();
         self.publish();
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(addr, &owner.node_id);
@@ -441,25 +515,33 @@ impl PeerRegistryOwner {
         true
     }
 
-    fn migrate(&mut self, from: SocketAddr, to: SocketAddr) -> bool {
+    fn migrate(&mut self, from: SocketAddr, to: SocketAddr) -> MigrateOutcome {
         let Some(owner) = self.addr_ownership.get(&from).cloned() else {
-            return false;
+            return MigrateOutcome::SourceUnowned;
         };
         if self
             .addr_ownership
             .get(&to)
             .is_some_and(|existing| existing.node_id != owner.node_id)
         {
-            return false;
+            return MigrateOutcome::TargetOwnedByOther;
         }
         self.addr_ownership.remove(&from);
         self.addr_ownership.insert(to, owner.clone());
+        self.advance();
         self.publish();
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(from, &owner.node_id);
             routing.publish_owner(to, &owner.node_id);
         }
-        true
+        MigrateOutcome::Migrated
+    }
+
+    /// Take the next position in the commit order. Called exactly once per
+    /// committed mutation, before the snapshot that mutation publishes.
+    fn advance(&mut self) -> CommitSeq {
+        self.commit_seq += 1;
+        self.commit_seq
     }
 
     /// Republish the immutable snapshot readers load.
@@ -578,6 +660,7 @@ mod tests {
             ClaimCommit::Accepted {
                 kind: ClaimKind::Provisional,
                 displaced: None,
+                commit_seq: 1,
             }
         );
 
@@ -589,6 +672,7 @@ mod tests {
             ClaimCommit::Accepted {
                 kind: ClaimKind::Verified,
                 displaced: Some(squatter.clone()),
+                commit_seq: 2,
             }
         );
         assert!(
@@ -626,6 +710,7 @@ mod tests {
             ClaimCommit::Accepted {
                 kind: ClaimKind::Verified,
                 displaced: None,
+                commit_seq: 2,
             }
         );
         assert_eq!(
@@ -823,7 +908,7 @@ mod tests {
         owner
             .claim(from, claim_of(node.clone(), ClaimKind::Verified), false)
             .await;
-        assert!(owner.migrate(from, to).await);
+        assert_eq!(owner.migrate(from, to).await, MigrateOutcome::Migrated);
         assert_eq!(owner.owner_of(&from), None);
         assert_eq!(
             owner.owner_of(&to),
@@ -833,7 +918,8 @@ mod tests {
             })
         );
 
-        // A migration onto an address a different identity owns is refused.
+        // A migration onto an address a different identity owns is refused,
+        // and is reported distinctly from "there was nothing to move".
         let contested = addr(30_011);
         owner
             .claim(
@@ -842,7 +928,15 @@ mod tests {
                 false,
             )
             .await;
-        assert!(!owner.migrate(to, contested).await);
+        assert_eq!(
+            owner.migrate(to, contested).await,
+            MigrateOutcome::TargetOwnedByOther
+        );
+        assert_eq!(
+            owner.migrate(addr(30_012), contested).await,
+            MigrateOutcome::SourceUnowned,
+            "an unclaimed source has nothing to move and nothing in conflict"
+        );
     }
 
     /// Shutdown: a claim submitted when the owner is gone fails closed with a
