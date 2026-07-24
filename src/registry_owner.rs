@@ -179,8 +179,17 @@ impl ClaimCommit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrateOutcome {
     /// Ownership (and its routing publication) moved from `from` to `to`.
-    Migrated,
+    Migrated {
+        /// This move's position in the owner task's commit order. Callers
+        /// use it to fence their own address-keyed state: both the vacated
+        /// and the occupied address advance to this position, so a claim
+        /// that committed before the move can no longer project onto either.
+        commit_seq: CommitSeq,
+    },
     /// `from` had no recorded owner: nothing to move, nothing in conflict.
+    /// Only reported once the destination has been checked and found free
+    /// (or held by the source's own identity) — see [`PeerRegistryOwner`]'s
+    /// `migrate`.
     SourceUnowned,
     /// `to` is already owned by a DIFFERENT identity. Ownership stays where
     /// it is and the caller must not move address-keyed state onto `to`.
@@ -196,7 +205,15 @@ impl MigrateOutcome {
 
     /// Whether ownership actually moved.
     pub fn moved(&self) -> bool {
-        matches!(self, Self::Migrated)
+        matches!(self, Self::Migrated { .. })
+    }
+
+    /// The move's position in the commit order, if it moved.
+    pub fn commit_seq(&self) -> Option<CommitSeq> {
+        match self {
+            Self::Migrated { commit_seq } => Some(*commit_seq),
+            Self::SourceUnowned | Self::TargetOwnedByOther => None,
+        }
     }
 }
 
@@ -242,7 +259,7 @@ enum OwnerCommand {
         /// When set, only release if this identity still owns `addr`, so a
         /// late release from a displaced owner cannot evict its successor.
         expected: Option<PeerId>,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Option<CommitSeq>>,
     },
     Migrate {
         from: SocketAddr,
@@ -347,8 +364,14 @@ impl RegistryOwnerHandle {
     }
 
     /// Drop the recorded ownership of `addr`, optionally only when `expected`
-    /// still owns it. Returns whether an entry was actually removed.
-    pub async fn release(&self, addr: SocketAddr, expected: Option<PeerId>) -> bool {
+    /// still owns it.
+    ///
+    /// Returns the release's position in the commit order when an entry was
+    /// actually removed, so the caller can fence its own address-keyed state
+    /// at that position: a claim that committed BEFORE the release must not
+    /// be able to project peer or connection state back onto an address the
+    /// release has since vacated.
+    pub async fn release(&self, addr: SocketAddr, expected: Option<PeerId>) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::Release {
@@ -357,9 +380,9 @@ impl RegistryOwnerHandle {
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
-            return false;
+            return None;
         }
-        response.await.unwrap_or(false)
+        response.await.unwrap_or(None)
     }
 
     /// Move ownership of `from` onto `to` (address re-resolution).
@@ -496,45 +519,56 @@ impl PeerRegistryOwner {
         }
     }
 
-    fn release(&mut self, addr: SocketAddr, expected: Option<&PeerId>) -> bool {
+    fn release(&mut self, addr: SocketAddr, expected: Option<&PeerId>) -> Option<CommitSeq> {
         let matches_expectation = self
             .addr_ownership
             .get(&addr)
             .is_some_and(|owner| expected.is_none_or(|expected| *expected == owner.node_id));
         if !matches_expectation {
-            return false;
+            return None;
         }
-        let Some(owner) = self.addr_ownership.remove(&addr) else {
-            return false;
-        };
-        self.advance();
+        let owner = self.addr_ownership.remove(&addr)?;
+        let commit_seq = self.advance();
         self.publish();
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(addr, &owner.node_id);
         }
-        true
+        Some(commit_seq)
     }
 
+    /// Move ownership of `from` onto `to`.
+    ///
+    /// The DESTINATION is inspected first, and a destination held by another
+    /// identity blocks the move even when the source has no owner at all. An
+    /// unowned source is the normal state of a seed configured by host name
+    /// before any handshake; reporting "nothing to move" for it without
+    /// looking at the destination would tell the caller it is free to re-key
+    /// its peer entry and connection index onto an address that another
+    /// identity legitimately owns, silently stealing that identity's routing.
+    /// "Nothing to move" is therefore only reported once the destination is
+    /// known to be free (or already held by the source's own identity).
     fn migrate(&mut self, from: SocketAddr, to: SocketAddr) -> MigrateOutcome {
-        let Some(owner) = self.addr_ownership.get(&from).cloned() else {
+        let source = self.addr_ownership.get(&from).cloned();
+        if let Some(existing) = self.addr_ownership.get(&to) {
+            let same_identity = source
+                .as_ref()
+                .is_some_and(|owner| owner.node_id == existing.node_id);
+            if !same_identity {
+                return MigrateOutcome::TargetOwnedByOther;
+            }
+        }
+        let Some(owner) = source else {
             return MigrateOutcome::SourceUnowned;
         };
-        if self
-            .addr_ownership
-            .get(&to)
-            .is_some_and(|existing| existing.node_id != owner.node_id)
-        {
-            return MigrateOutcome::TargetOwnedByOther;
-        }
         self.addr_ownership.remove(&from);
         self.addr_ownership.insert(to, owner.clone());
-        self.advance();
+        let commit_seq = self.advance();
         self.publish();
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(from, &owner.node_id);
             routing.publish_owner(to, &owner.node_id);
         }
-        MigrateOutcome::Migrated
+        MigrateOutcome::Migrated { commit_seq }
     }
 
     /// Take the next position in the commit order. Called exactly once per
@@ -874,12 +908,12 @@ mod tests {
             .claim(target, claim_of(holder.clone(), ClaimKind::Verified), false)
             .await;
         assert!(
-            !owner.release(target, Some(other)).await,
+            owner.release(target, Some(other)).await.is_none(),
             "a non-owner must not be able to release the address"
         );
         assert_eq!(owner.routes_to(&target), Some(holder.clone()));
 
-        assert!(owner.release(target, Some(holder)).await);
+        assert!(owner.release(target, Some(holder)).await.is_some());
         assert!(owner.snapshot().is_empty());
         assert_eq!(
             publisher.events().last().map(|event| event.1.clone()),
@@ -908,7 +942,10 @@ mod tests {
         owner
             .claim(from, claim_of(node.clone(), ClaimKind::Verified), false)
             .await;
-        assert_eq!(owner.migrate(from, to).await, MigrateOutcome::Migrated);
+        assert!(
+            owner.migrate(from, to).await.moved(),
+            "an owned source must move onto a free destination"
+        );
         assert_eq!(owner.owner_of(&from), None);
         assert_eq!(
             owner.owner_of(&to),
@@ -932,10 +969,51 @@ mod tests {
             owner.migrate(to, contested).await,
             MigrateOutcome::TargetOwnedByOther
         );
+        // An UNOWNED source moving onto an address someone else owns is
+        // blocked too: "nothing to move" would invite the caller to re-key
+        // its own state onto the other identity's address.
         assert_eq!(
             owner.migrate(addr(30_012), contested).await,
+            MigrateOutcome::TargetOwnedByOther,
+            "an unowned source must not be allowed onto another identity's address"
+        );
+        // With a free destination, an unclaimed source is still reported as
+        // "nothing to move" — the non-blocking outcome.
+        assert_eq!(
+            owner.migrate(addr(30_012), addr(30_013)).await,
             MigrateOutcome::SourceUnowned,
-            "an unclaimed source has nothing to move and nothing in conflict"
+            "an unclaimed source with a free destination has nothing to move"
+        );
+    }
+
+    /// The destination is inspected before the source: a migration off an
+    /// address that was never claimed must still be blocked when the
+    /// destination belongs to a different identity.
+    #[tokio::test]
+    async fn migrate_blocks_an_unowned_source_from_a_foreign_destination() {
+        let (owner, publisher) = owner_handle();
+        let holder = peer("destination-holder");
+        let unowned = addr(30_020);
+        let held = addr(30_021);
+
+        owner
+            .claim(held, claim_of(holder.clone(), ClaimKind::Verified), false)
+            .await;
+        let events_before = publisher.events();
+
+        assert_eq!(
+            owner.migrate(unowned, held).await,
+            MigrateOutcome::TargetOwnedByOther
+        );
+        assert_eq!(
+            owner.routes_to(&held),
+            Some(holder),
+            "the destination's owner must keep its routing"
+        );
+        assert_eq!(
+            publisher.events(),
+            events_before,
+            "a blocked migration must publish nothing"
         );
     }
 

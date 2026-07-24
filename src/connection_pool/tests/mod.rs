@@ -9989,3 +9989,152 @@ async fn fresh_outbound_connect_cancelled_mid_identify_does_not_strand_a_publish
         }
     }
 }
+
+/// A full-sync handler that resumes after its address has been claimed by a
+/// newer commit must apply NOTHING that is keyed on that address.
+///
+/// The displacement is constructed statically: the address is fenced at a
+/// position no claim can beat before the handler runs, which is the same state
+/// the handler would observe had a competing claim committed and projected
+/// while it was suspended.
+#[tokio::test]
+async fn displaced_full_sync_claim_records_no_address_keyed_state() {
+    let bind_addr: SocketAddr = "10.77.0.90:9601".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("displaced-full-sync-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_id = crate::KeyPair::new_for_testing("displaced-full-sync-remote").peer_id();
+    let tcp_source: SocketAddr = "10.77.0.91:40001".parse().unwrap();
+    let advertised: SocketAddr = "10.77.0.91:9601".parse().unwrap();
+
+    // The address has already moved past anything this handler can commit.
+    registry
+        .gossip_state
+        .lock()
+        .await
+        .tombstone_ownership_projection(advertised, crate::registry_owner::CommitSeq::MAX);
+
+    let msg = crate::registry::RegistryMessage::FullSync {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some(advertised.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::registry::GossipExtensionsV1 {
+            clock_probe: Some(crate::registry::ClockProbeV1 {
+                sample_id: 7,
+                sender_wall_ns: crate::current_timestamp_nanos(),
+            }),
+            clock_echo: None,
+        }),
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, tcp_source, msg)
+        .await
+        .expect("a displaced FullSync must be dropped, not error");
+
+    assert!(
+        !registry.has_pending_clock_echo(&advertised),
+        "a displaced claim must not record address-keyed clock state"
+    );
+    let state = registry.gossip_state.lock().await;
+    assert!(
+        !state.peers.contains_key(&advertised),
+        "a displaced claim must not create a peer entry at the contested address"
+    );
+    assert_eq!(
+        state.full_sync_exchanges, 0,
+        "a displaced claim must not book the exchange against the contested address"
+    );
+    drop(state);
+    assert!(
+        registry
+            .connection_pool
+            .get_configured_peer_addr(&peer_id)
+            .is_none(),
+        "a displaced claim must not reindex the connection under the contested address"
+    );
+}
+
+/// Same rule on the response arm: a FullSyncResponse whose claim has been
+/// superseded records no extensions, no peer/session state and no connection
+/// index at the contested address.
+#[tokio::test]
+async fn displaced_full_sync_response_claim_records_no_address_keyed_state() {
+    let bind_addr: SocketAddr = "10.77.0.92:9601".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "displaced-full-sync-response-local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_id = crate::KeyPair::new_for_testing("displaced-full-sync-response-remote").peer_id();
+    let tcp_source: SocketAddr = "10.77.0.93:40002".parse().unwrap();
+    let advertised: SocketAddr = "10.77.0.93:9601".parse().unwrap();
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        let mut peer = stale_peer_info(advertised, stale_time);
+        peer.failures = 3;
+        state.peers.insert(advertised, peer);
+        state.tombstone_ownership_projection(advertised, crate::registry_owner::CommitSeq::MAX);
+    }
+
+    let msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some(advertised.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::registry::GossipExtensionsV1 {
+            clock_probe: Some(crate::registry::ClockProbeV1 {
+                sample_id: 11,
+                sender_wall_ns: crate::current_timestamp_nanos(),
+            }),
+            clock_echo: None,
+        }),
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, tcp_source, msg)
+        .await
+        .expect("a displaced FullSyncResponse must be dropped, not error");
+
+    assert!(
+        !registry.has_pending_clock_echo(&advertised),
+        "a displaced claim must not record address-keyed clock state"
+    );
+    let state = registry.gossip_state.lock().await;
+    assert_eq!(
+        state
+            .peers
+            .get(&advertised)
+            .expect("the pre-existing peer entry must survive")
+            .failures,
+        3,
+        "a displaced claim must not reset another owner's failure state"
+    );
+    assert_eq!(
+        state.full_sync_exchanges, 0,
+        "a displaced claim must not book the exchange against the contested address"
+    );
+    drop(state);
+    assert!(
+        registry
+            .connection_pool
+            .get_configured_peer_addr(&peer_id)
+            .is_none(),
+        "a displaced claim must not reindex the connection under the contested address"
+    );
+}

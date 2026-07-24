@@ -4404,12 +4404,11 @@ pub(crate) fn handle_incoming_message(
                     node_id: sender_peer_id.clone(),
                     kind: claim_kind,
                 };
-                if !registry
+                let commit = registry
                     .registry_owner
                     .claim(sender_socket_addr, claim, is_local_addr)
-                    .await
-                    .is_accepted()
-                {
+                    .await;
+                let Some(commit_seq) = commit.commit_seq() else {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
@@ -4417,13 +4416,7 @@ pub(crate) fn handle_incoming_message(
                         "Rejecting FullSync address claim: ownership conflict"
                     );
                     return Ok(());
-                }
-
-                registry.record_inbound_gossip_extensions(
-                    sender_socket_addr,
-                    extensions,
-                    crate::current_timestamp_nanos(),
-                );
+                };
 
                 // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
                 debug!(
@@ -4434,6 +4427,34 @@ pub(crate) fn handle_incoming_message(
                 // OPTIMIZATION: Do all peer management in one lock acquisition
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
+
+                    // The claim was accepted, but this handler resumes long
+                    // after the owner actor replied, and a newer claim can
+                    // have taken the address in between. Every mutation keyed
+                    // on `sender_socket_addr` below therefore runs in the same
+                    // critical section as the check that authorizes it — the
+                    // watermark lives inside `GossipState` precisely so the
+                    // two cannot be split. Extension/clock state is recorded
+                    // here, under the same guard, for the same reason: it is
+                    // address-keyed and would otherwise be attributed to the
+                    // losing claimant.
+                    if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                        drop(gossip_state);
+                        debug!(
+                            tcp_source = %_peer_addr,
+                            sender = %sender_peer_id,
+                            claimed_addr = %sender_socket_addr,
+                            commit_seq,
+                            "address ownership advanced past this FullSync claim; dropping it"
+                        );
+                        return Ok(());
+                    }
+
+                    registry.record_inbound_gossip_extensions(
+                        sender_socket_addr,
+                        extensions,
+                        crate::current_timestamp_nanos(),
+                    );
 
                     // FIX: If the resolved bind address differs from the TCP source address,
                     // migrate the PeerInfo from the ephemeral port entry to the bind address.
@@ -4512,6 +4533,24 @@ pub(crate) fn handle_incoming_message(
                 // IMPORTANT: Register the incoming connection with the peer_id mapping
                 // This allows bidirectional communication to work properly
                 {
+                    // Address-keyed connection indexing, so it is admitted and
+                    // applied under one `gossip_state` guard like every other
+                    // projection of this claim. The pool indexes are lock-free
+                    // `scc` maps with no `.await` and no path back into
+                    // `gossip_state`, so holding the guard across them adds no
+                    // lock-order edge.
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                        drop(gossip_state);
+                        debug!(
+                            sender = %sender_peer_id,
+                            claimed_addr = %sender_socket_addr,
+                            commit_seq,
+                            "address ownership advanced past this FullSync claim; \
+                             skipping connection indexing"
+                        );
+                        return Ok(());
+                    }
                     let pool = &registry.connection_pool;
 
                     // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
@@ -4561,7 +4600,19 @@ pub(crate) fn handle_incoming_message(
 
                 if from_current_session {
                     let mut gossip_state = registry.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                    // Same guard, same check: peer/session bookkeeping is
+                    // address-keyed and must not be applied on behalf of a
+                    // claim the address has since moved past. Only the
+                    // bookkeeping is skipped here; the response below is
+                    // addressed to the sender's identity, not to the
+                    // contested address, and still goes out.
+                    let admitted =
+                        gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq);
+                    if let Some(peer_info) = gossip_state
+                        .peers
+                        .get_mut(&sender_socket_addr)
+                        .filter(|_| admitted)
+                    {
                         let prev_failures = peer_info.failures;
                         if peer_info.failures > 0 {
                             info!(peer = %sender_socket_addr,
@@ -4866,12 +4917,11 @@ pub(crate) fn handle_incoming_message(
                     node_id: sender_peer_id.clone(),
                     kind: claim_kind,
                 };
-                if !registry
+                let commit = registry
                     .registry_owner
                     .claim(sender_socket_addr, claim, is_local_addr)
-                    .await
-                    .is_accepted()
-                {
+                    .await;
+                let Some(commit_seq) = commit.commit_seq() else {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
@@ -4879,13 +4929,32 @@ pub(crate) fn handle_incoming_message(
                         "Rejecting FullSyncResponse address claim: ownership conflict"
                     );
                     return Ok(());
-                }
+                };
 
-                registry.record_inbound_gossip_extensions(
-                    sender_socket_addr,
-                    extensions,
-                    crate::current_timestamp_nanos(),
-                );
+                {
+                    // Extension/clock state is address-keyed, so it is
+                    // admitted and written under the same `gossip_state`
+                    // guard, exactly like the FullSync arm: a claim the
+                    // address has already moved past must record nothing.
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                        drop(gossip_state);
+                        debug!(
+                            tcp_source = %_peer_addr,
+                            sender = %sender_peer_id,
+                            claimed_addr = %sender_socket_addr,
+                            commit_seq,
+                            "address ownership advanced past this FullSyncResponse claim; \
+                             dropping it"
+                        );
+                        return Ok(());
+                    }
+                    registry.record_inbound_gossip_extensions(
+                        sender_socket_addr,
+                        extensions,
+                        crate::current_timestamp_nanos(),
+                    );
+                }
 
                 debug!(
                     sender = %sender_peer_id,
@@ -4912,6 +4981,20 @@ pub(crate) fn handle_incoming_message(
                 // FIX: Update peer_id mappings (mirror the FullSync handler logic)
                 // This prevents stale ephemeral addresses from being reintroduced via resolve_peer_state_addr
                 {
+                    // Connection indexing is address-keyed: admitted and
+                    // applied under one guard, mirroring the FullSync arm.
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                        drop(gossip_state);
+                        debug!(
+                            sender = %sender_peer_id,
+                            claimed_addr = %sender_socket_addr,
+                            commit_seq,
+                            "address ownership advanced past this FullSyncResponse claim; \
+                             skipping connection indexing"
+                        );
+                        return Ok(());
+                    }
                     let pool = &registry.connection_pool;
 
                     // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
@@ -4942,6 +5025,22 @@ pub(crate) fn handle_incoming_message(
 
                 // Reset failure state when receiving response
                 let mut gossip_state = registry.gossip_state.lock().await;
+
+                // Same guard, same check: the peer-entry migration and the
+                // failure/health bookkeeping below are both keyed on the
+                // claimed address and must not be applied on behalf of a
+                // claim that has since been displaced.
+                if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                    drop(gossip_state);
+                    debug!(
+                        sender = %sender_peer_id,
+                        claimed_addr = %sender_socket_addr,
+                        commit_seq,
+                        "address ownership advanced past this FullSyncResponse claim; \
+                         skipping peer-state update"
+                    );
+                    return Ok(());
+                }
 
                 // FIX: If the resolved bind address differs from the TCP source address,
                 // migrate the PeerInfo from the ephemeral port entry to the bind address.

@@ -18,6 +18,8 @@ use rand::seq::SliceRandom;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::{debug, info, trace, warn};
 
+use crate::registry_owner::CommitSeq;
+
 use crate::{
     GossipConfig, GossipError, GossipNodeId, PeerId, RegistrationPriority, RemoteActorLocation,
     Result,
@@ -1428,9 +1430,133 @@ pub struct GossipState {
     pub known_peers: LruCache<SocketAddr, PeerInfo>,
     /// Timestamp (in millis since start_time) when mesh formation completed
     pub mesh_formation_time_ms: Option<u64>,
+    /// Newest owner-actor commit whose outcome has already been applied to
+    /// the address-keyed state guarded by THIS struct's mutex
+    /// (`peers[].node_id`, `identity_verified`, and the connection indexing
+    /// performed alongside them).
+    ///
+    /// It lives inside `GossipState`, and is therefore only reachable through
+    /// the same guard as the state it protects, on purpose. The ownership
+    /// DECISION is serialized by the owner actor, but the PROJECTION of that
+    /// decision is not: a claimant awaits the reply and only then takes this
+    /// guard, so an arbitrary number of later commits can land in between.
+    /// Keeping the watermark in a separate, independently synchronized map
+    /// would let a claimant pass admission and then stall before acquiring
+    /// this mutex, allowing a newer claimant to project first and be
+    /// overwritten afterwards — the check would guard state in a different
+    /// synchronization domain from the one it is checked in, which is exactly
+    /// the class of race this whole design exists to remove. Read-compare-
+    /// write and the mutation it authorizes therefore happen in one critical
+    /// section, and callers never re-check outside it.
+    ownership_commit_seq: HashMap<SocketAddr, CommitSeq>,
 }
 
+/// Soft bound on the number of retained ownership watermarks, including
+/// tombstones for addresses whose owner was released or migrated away. Sized
+/// well above any realistic live peer set so pruning is reached only under
+/// sustained address churn.
+const OWNERSHIP_WATERMARK_CAPACITY: usize = 8192;
+
+/// Size the watermark table is pruned back down to, so pruning is amortized
+/// over many insertions instead of running on every one.
+const OWNERSHIP_WATERMARK_TARGET: usize = 6144;
+
 impl GossipState {
+    /// Admit an ownership projection for `peer_addr` only when the commit it
+    /// carries is at least as recent as the newest commit already applied to
+    /// this address, and record it as the newest when admitted.
+    ///
+    /// MUST be called with the mutation it authorizes in the same critical
+    /// section — see `ownership_commit_seq`.
+    ///
+    /// `>=` rather than `>` so the SAME commit may be admitted more than once
+    /// (one handler applies its outcome across several guarded steps);
+    /// commit positions are unique per mutation, so this can never re-admit a
+    /// different, older one.
+    pub(crate) fn admit_ownership_projection(
+        &mut self,
+        peer_addr: SocketAddr,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        match self.ownership_commit_seq.entry(peer_addr) {
+            std::collections::hash_map::Entry::Occupied(mut newest) => {
+                if commit_seq >= *newest.get() {
+                    newest.insert(commit_seq);
+                } else {
+                    return false;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(commit_seq);
+            }
+        }
+        self.prune_ownership_watermarks();
+        true
+    }
+
+    /// Record that ownership of `peer_addr` was retracted or moved away at
+    /// `commit_seq`, as a monotonic floor rather than a deletion.
+    ///
+    /// Deleting the entry would be unsafe: a claim that committed BEFORE the
+    /// release/migration can still be in flight, not yet holding this guard.
+    /// Against a missing entry it would pass admission and recreate peer and
+    /// connection state for an identity the address no longer belongs to.
+    /// Left as a tombstone, the same claim fails admission and is dropped,
+    /// which is the correct outcome — the address is not its claimant's any
+    /// more.
+    pub(crate) fn tombstone_ownership_projection(
+        &mut self,
+        peer_addr: SocketAddr,
+        commit_seq: CommitSeq,
+    ) {
+        let floor = self.ownership_commit_seq.entry(peer_addr).or_insert(0);
+        *floor = (*floor).max(commit_seq);
+        self.prune_ownership_watermarks();
+    }
+
+    /// Retention policy for the watermark table.
+    ///
+    /// Entries for addresses that still have a `peers` entry are never
+    /// dropped: they are the live projections' fences. Everything else is a
+    /// tombstone, kept until the table exceeds its soft bound, at which point
+    /// the numerically OLDEST tombstones are dropped first. A dropped
+    /// tombstone can only be defeated by a claim older still — one that has
+    /// been stalled between its reply and this guard across the entire
+    /// remaining table's worth of newer ownership commits — and such a claim
+    /// simply degrades to the unfenced behaviour for that one address rather
+    /// than corrupting anything else. The bound is what keeps address churn
+    /// (ephemeral ports, restarts) from growing this table without limit.
+    fn prune_ownership_watermarks(&mut self) {
+        if self.ownership_commit_seq.len() <= OWNERSHIP_WATERMARK_CAPACITY {
+            return;
+        }
+        let peers = &self.peers;
+        let mut tombstones: Vec<(SocketAddr, CommitSeq)> = self
+            .ownership_commit_seq
+            .iter()
+            .filter(|(addr, _)| !peers.contains_key(*addr))
+            .map(|(addr, seq)| (*addr, *seq))
+            .collect();
+        let excess = self
+            .ownership_commit_seq
+            .len()
+            .saturating_sub(OWNERSHIP_WATERMARK_TARGET);
+        if tombstones.len() > excess {
+            tombstones.select_nth_unstable_by_key(excess, |(_, seq)| *seq);
+            tombstones.truncate(excess);
+        }
+        for (addr, _) in tombstones {
+            self.ownership_commit_seq.remove(&addr);
+        }
+    }
+
+    /// The newest ownership commit applied to `peer_addr`, if any. Test-only
+    /// observation point for the fence itself.
+    #[cfg(test)]
+    pub(crate) fn ownership_watermark(&self, peer_addr: &SocketAddr) -> Option<CommitSeq> {
+        self.ownership_commit_seq.get(peer_addr).copied()
+    }
+
     fn actor_admission_count(&self, peer_id: &crate::PeerId) -> usize {
         self.actor_admissions_by_peer
             .get(peer_id)
@@ -1508,18 +1634,6 @@ pub struct GossipRegistry<T = ()> {
     /// `identity_verified` are derived projections of what this handle
     /// returns, never inputs to the decision.
     pub registry_owner: crate::registry_owner::RegistryOwnerHandle,
-    /// Newest owner-actor commit whose outcome has already been projected
-    /// into the address-keyed state this registry owns (`peers[].node_id`,
-    /// `identity_verified`, and the connection indexing that follows them).
-    ///
-    /// The ownership DECISION is serialized by `registry_owner`, but the
-    /// projection of that decision is not: a claimant awaits the reply,
-    /// then takes the `gossip_state` guard, and any number of later commits
-    /// can land in between. Recording the newest projected commit position
-    /// per address lets a claimant that arrives out of order recognize that
-    /// its outcome has been superseded and drop it, instead of overwriting a
-    /// newer owner's projection with a stale one.
-    ownership_commit_seq: Arc<SccHashMap<SocketAddr, crate::registry_owner::CommitSeq>>,
     pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
@@ -1787,10 +1901,10 @@ impl<T: 'static> GossipRegistry<T> {
                         .unwrap_or(NonZeroUsize::new(10_000).unwrap()),
                 ),
                 mesh_formation_time_ms: None,
+                ownership_commit_seq: HashMap::new(),
             })),
             connection_pool,
             registry_owner,
-            ownership_commit_seq: Arc::new(SccHashMap::default()),
             tls_config: None,
             peer_capabilities: peer_capabilities.clone(),
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
@@ -2099,6 +2213,14 @@ impl<T: 'static> GossipRegistry<T> {
             responder_send_wall_ns: send_wall_ns,
         });
         Some(extensions)
+    }
+
+    /// Whether an inbound clock probe from `peer_addr` has been recorded and
+    /// is still awaiting an echo. Test-only observation point for the
+    /// address-keyed extension state a refused claim must not write.
+    #[cfg(test)]
+    pub(crate) fn has_pending_clock_echo(&self, peer_addr: &SocketAddr) -> bool {
+        self.pending_clock_echoes.contains_sync(peer_addr)
     }
 
     pub fn record_inbound_gossip_extensions(
@@ -2607,46 +2729,6 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// Admit an ownership projection for `peer_addr` only when the commit it
-    /// carries is at least as recent as the newest commit already projected
-    /// for that address, and record it as the newest when admitted.
-    ///
-    /// The read-compare-write is performed inside the map entry's own guard,
-    /// so two callers racing to project their outcomes cannot both observe
-    /// the same predecessor: exactly the later commit survives, whichever
-    /// caller happens to arrive first.
-    ///
-    /// `>=` rather than `>` so the SAME commit may be admitted more than once
-    /// (the claimant projects it into `peers` first, then into the connection
-    /// index); commit positions are unique per mutation, so this can never
-    /// re-admit a different, older one.
-    fn admit_ownership_projection(
-        &self,
-        peer_addr: SocketAddr,
-        commit_seq: crate::registry_owner::CommitSeq,
-    ) -> bool {
-        let mut admitted = true;
-        self.ownership_commit_seq
-            .entry_sync(peer_addr)
-            .and_modify(|newest| {
-                if commit_seq >= *newest {
-                    *newest = commit_seq;
-                } else {
-                    admitted = false;
-                }
-            })
-            .or_insert(commit_seq);
-        admitted
-    }
-
-    /// Forget the projection watermark for an address that no longer has an
-    /// owner, so the table stays bounded by the live peer set. Safe because a
-    /// future claim on the address necessarily commits at a HIGHER position
-    /// than anything already projected for it, and so is admitted either way.
-    fn forget_ownership_projection(&self, peer_addr: &SocketAddr) {
-        let _ = self.ownership_commit_seq.remove_sync(peer_addr);
-    }
-
     pub async fn add_peer_with_node_id(
         &self,
         peer_addr: SocketAddr,
@@ -2735,31 +2817,38 @@ impl<T: 'static> GossipRegistry<T> {
             owner_changed = displaced.is_some();
             resolved_identity_verified = Some(kind == crate::addr_ownership::ClaimKind::Verified);
             projected_commit_seq = Some(commit_seq);
-
-            // A commit that has already been superseded for this address must
-            // not be mirrored anywhere: the newer owner's projection is
-            // already in place and re-applying this one would attribute the
-            // address to an identity the actor no longer routes it to. The
-            // ownership decision itself stands (it is the actor's, not ours);
-            // only the derived projection is dropped.
-            if !self.admit_ownership_projection(peer_addr, commit_seq) {
-                debug!(
-                    peer = %peer_addr,
-                    claimant = %claimed_node_id.fmt_short(),
-                    commit_seq,
-                    "address ownership advanced past this claim; skipping stale projection"
-                );
-                // Reported as a rejection, not a success: from this caller's
-                // point of view the address is no longer attributable to its
-                // claimant, which is exactly what a rejection means to the
-                // fallback paths that consume this outcome.
-                return AddrClaimOutcome::Rejected;
-            }
         }
 
         // Everything below mirrors the committed decision into the state that
-        // is keyed by address but NOT authoritative for ownership.
+        // is keyed by address but NOT authoritative for ownership. It runs
+        // under ONE `gossip_state` guard, taken once: the admission check and
+        // every mutation it authorizes — the `peers` projection AND the
+        // connection indexing that follows it — must be in the same critical
+        // section as the watermark they are checked against, or a claimant
+        // could pass the check and then be overtaken before applying.
         let mut gossip_state = self.gossip_state.lock().await;
+
+        // A commit that has already been superseded for this address must not
+        // be mirrored anywhere: the newer owner's projection is already in
+        // place and re-applying this one would attribute the address to an
+        // identity the actor no longer routes it to. The ownership decision
+        // itself stands (it is the actor's, not ours); only the derived
+        // projection is dropped.
+        if let Some(commit_seq) = projected_commit_seq
+            && !gossip_state.admit_ownership_projection(peer_addr, commit_seq)
+        {
+            drop(gossip_state);
+            debug!(
+                peer = %peer_addr,
+                commit_seq,
+                "address ownership advanced past this claim; skipping stale projection"
+            );
+            // Reported as a rejection, not a success: from this caller's
+            // point of view the address is no longer attributable to its
+            // claimant, which is exactly what a rejection means to the
+            // fallback paths that consume this outcome.
+            return AddrClaimOutcome::Rejected;
+        }
 
         // Check if we already have this peer
         // Captured only when this is a genuine owner change (below), so the
@@ -2875,30 +2964,22 @@ impl<T: 'static> GossipRegistry<T> {
                 "📌 Added new peer (listening address)"
             );
         }
-        drop(gossip_state);
-
         // `addr_to_peer_id` was already published by the owner actor, in the
         // same serialized command that committed the ownership decision, and
-        // a rejected claim returned long before reaching here. What remains
+        // a superseded claim returned long before reaching here. What remains
         // is the connection-lifecycle indexing that follows an accepted
         // claim: the dial-route hint and the address reindex of any live
         // connection.
-        // Re-checked rather than carried over from the projection above: the
-        // `gossip_state` guard was released in between, so a newer commit for
-        // this address can have been projected since. Indexing a connection
-        // under an address a newer owner now holds would point the dial route
-        // and the live-connection index at the wrong identity.
-        let indexing_admitted = projected_commit_seq
-            .is_none_or(|commit_seq| self.admit_ownership_projection(peer_addr, commit_seq));
-        if !indexing_admitted {
-            debug!(
-                peer = %peer_addr,
-                commit_seq = ?projected_commit_seq,
-                "address ownership advanced past this claim; skipping stale connection indexing"
-            );
-        }
-
-        if let Some(id) = node_id.filter(|_| indexing_admitted) {
+        //
+        // Performed while STILL holding the `gossip_state` guard that admitted
+        // this commit, deliberately. Releasing it first and re-checking would
+        // put the check and the mutation it protects in different critical
+        // sections again, which is precisely how a claimant ends up indexing a
+        // connection under an address a newer owner has already taken. The
+        // pool indexes below are lock-free `scc` maps with no `.await` and no
+        // path back into `gossip_state`, so holding the guard across them adds
+        // no lock-order edge.
+        if let Some(id) = node_id {
             let peer_id = id.to_peer_id();
 
             // A peer re-announced at a new address (e.g. a restart on a
@@ -2927,6 +3008,7 @@ impl<T: 'static> GossipRegistry<T> {
             pool.set_discovered_peer_addr(&peer_id, peer_addr);
             pool.reindex_connection_addr(&peer_id, peer_addr);
         }
+        drop(gossip_state);
 
         // Lower-priority owner-change cleanup: not part of the routing
         // publish, so it runs after, not before.
@@ -2963,11 +3045,7 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        if indexing_admitted {
-            AddrClaimOutcome::Accepted
-        } else {
-            AddrClaimOutcome::Rejected
-        }
+        AddrClaimOutcome::Accepted
     }
 
     /// Configure a peer by peer ID and its expected connection address
@@ -3257,12 +3335,8 @@ impl<T: 'static> GossipRegistry<T> {
         // contested address first and asking afterwards would leave the peer
         // half-moved, with the old address stranded and the new one
         // attributed to someone else.
-        if self
-            .registry_owner
-            .migrate(peer_addr, new_addr)
-            .await
-            .is_blocked()
-        {
+        let migrate_outcome = self.registry_owner.migrate(peer_addr, new_addr).await;
+        if migrate_outcome.is_blocked() {
             warn!(
                 old_addr = %peer_addr,
                 new_addr = %new_addr,
@@ -3271,14 +3345,24 @@ impl<T: 'static> GossipRegistry<T> {
             );
             return None;
         }
-        // The address changed, so the old address's projection watermark is
-        // meaningless; a later claim on it starts from a clean slate.
-        self.forget_ownership_projection(&peer_addr);
 
         // PHASE 1: Check for gossip_state collisions and perform migration
         // Release lock before acquiring connection_pool to prevent deadlock
         let migration_result = {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            // Fence both ends of the move at the position the move committed
+            // at, in the same critical section as the peer-entry move below.
+            // The vacated address is tombstoned rather than cleared: a claim
+            // that committed before the move can still be in flight, and
+            // against a cleared entry it would be admitted and would rebuild
+            // peer state at an address its claimant no longer holds. The
+            // destination is fenced for the same reason in the other
+            // direction — nothing older than this move may project onto it.
+            if let Some(commit_seq) = migrate_outcome.commit_seq() {
+                gossip_state.tombstone_ownership_projection(peer_addr, commit_seq);
+                gossip_state.tombstone_ownership_projection(new_addr, commit_seq);
+            }
 
             // Check if the new address is already used by another peer in gossip_state
             if gossip_state.peers.contains_key(&new_addr) {
@@ -3325,18 +3409,19 @@ impl<T: 'static> GossipRegistry<T> {
             // else — in that case the address genuinely belongs to its new
             // claimant and forcing it back would be the very overwrite this
             // ordering exists to prevent.
-            if self
-                .registry_owner
-                .migrate(new_addr, peer_addr)
-                .await
-                .is_blocked()
-            {
+            let restore = self.registry_owner.migrate(new_addr, peer_addr).await;
+            if restore.is_blocked() {
                 warn!(
                     old_addr = %peer_addr,
                     new_addr = %new_addr,
                     "DNS refresh: peer entry did not move and the old address has a new owner; \
                      leaving ownership with the current claimant"
                 );
+            }
+            if let Some(commit_seq) = restore.commit_seq() {
+                let mut gossip_state = self.gossip_state.lock().await;
+                gossip_state.tombstone_ownership_projection(new_addr, commit_seq);
+                gossip_state.tombstone_ownership_projection(peer_addr, commit_seq);
             }
             return None;
         }
@@ -7298,7 +7383,6 @@ impl<T: 'static> GossipRegistry<T> {
             for addr in &evicted_addrs {
                 self.clear_peer_capabilities(addr);
                 self.remove_clock_state_for_addr(addr);
-                self.forget_ownership_projection(addr);
             }
             // Ownership outlives `peers`, so an evicted address must be
             // released explicitly or it stays permanently attributed to the
@@ -7308,8 +7392,26 @@ impl<T: 'static> GossipRegistry<T> {
             // very window had already committed, silently breaking routing
             // to a peer that is in fact live. Addresses whose entry carried
             // no identity never had an ownership record to retract.
+            let mut released = Vec::new();
             for (addr, evicted_id) in evicted_owners {
-                self.registry_owner.release(addr, Some(evicted_id)).await;
+                if let Some(commit_seq) = self.registry_owner.release(addr, Some(evicted_id)).await
+                {
+                    released.push((addr, commit_seq));
+                }
+            }
+            // Fence each vacated address at the position its release
+            // committed at, instead of forgetting it. A claim that committed
+            // before the release can still be in flight; against a forgotten
+            // address it would be admitted and would recreate the evicted
+            // peer's entry and connection index at an address it no longer
+            // owns. The tombstone makes that claim fail admission, which is
+            // the correct outcome, and a genuine later re-claim commits at a
+            // higher position and is admitted normally.
+            if !released.is_empty() {
+                let mut gossip_state = self.gossip_state.lock().await;
+                for (addr, commit_seq) in released {
+                    gossip_state.tombstone_ownership_projection(addr, commit_seq);
+                }
             }
         }
     }
@@ -18195,31 +18297,38 @@ mod tests {
             )
             .await;
         assert_eq!(b_outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
-        let b_seq = registry
-            .ownership_commit_seq
-            .read_sync(&addr, |_, seq| *seq)
-            .expect("claim B must have recorded a projection watermark");
-        assert!(
-            b_seq > a_seq,
-            "the displacing claim must commit after the claim it displaced"
-        );
-        assert_eq!(
-            snapshot_peer(&registry, addr).await.node_id,
-            Some(real.to_node_id())
-        );
 
-        // Claim A's caller finally gets around to projecting. Its outcome is
-        // older than what is already applied for this address, so it is
-        // refused rather than allowed to reattribute the address.
-        assert!(
-            !registry.admit_ownership_projection(addr, a_seq),
-            "a projection older than the newest applied one must be refused"
-        );
-        assert_eq!(
-            snapshot_peer(&registry, addr).await.node_id,
-            Some(real.to_node_id()),
-            "the newer owner's projection must survive the stale one"
-        );
+        // The watermark is reachable ONLY through the `gossip_state` guard,
+        // so the check and the state it protects are read in one critical
+        // section here, exactly as the production path applies them.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let b_seq = gossip_state
+                .ownership_watermark(&addr)
+                .expect("claim B must have recorded a projection watermark");
+            assert!(
+                b_seq > a_seq,
+                "the displacing claim must commit after the claim it displaced"
+            );
+            assert_eq!(
+                gossip_state.peers.get(&addr).and_then(|peer| peer.node_id),
+                Some(real.to_node_id())
+            );
+
+            // Claim A's caller finally gets around to projecting. Its outcome
+            // is older than what is already applied for this address, so it
+            // is refused, and the refusal is observed against the very state
+            // it would have overwritten, under this same guard.
+            assert!(
+                !gossip_state.admit_ownership_projection(addr, a_seq),
+                "a projection older than the newest applied one must be refused"
+            );
+            assert_eq!(
+                gossip_state.peers.get(&addr).and_then(|peer| peer.node_id),
+                Some(real.to_node_id()),
+                "the newer owner's projection must survive the stale one"
+            );
+        }
         assert_eq!(registry.registry_owner.routes_to(&addr), Some(real.clone()));
 
         // The same rule end to end through the production path: a claim whose
@@ -18227,9 +18336,11 @@ mod tests {
         // address mirrors nothing and reports a rejection.
         let contended = test_addr(20_103);
         let latecomer = test_peer_id("projection-order-latecomer");
-        let _ = registry
-            .ownership_commit_seq
-            .insert_sync(contended, crate::registry_owner::CommitSeq::MAX);
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .tombstone_ownership_projection(contended, CommitSeq::MAX);
 
         let late_outcome = registry
             .add_peer_with_node_id(
@@ -18258,6 +18369,209 @@ mod tests {
                 .get_configured_peer_addr(&latecomer)
                 .is_none(),
             "a superseded claim must not run the follow-up connection indexing"
+        );
+    }
+
+    /// The admission check and the projection it authorizes must occupy ONE
+    /// critical section.
+    ///
+    /// A claimant is started while this test holds the `gossip_state` guard,
+    /// so it has already obtained its committed outcome from the owner actor
+    /// and is parked on the mutex. The address is then advanced past that
+    /// outcome and given a different owner INSIDE the held guard. Because the
+    /// claimant can only test its outcome after it acquires the same guard, it
+    /// necessarily observes the advance and stands down. Were the check made
+    /// in a separate structure before the guard — as a lock-free side map
+    /// would allow — it would have passed before the advance was applied and
+    /// the claimant would then have overwritten the newer owner's projection
+    /// on acquiring the mutex.
+    #[tokio::test]
+    async fn ownership_admission_and_projection_share_one_critical_section() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_111),
+            test_config_with_seed("ownership-single-section"),
+        );
+        let addr = test_addr(20_112);
+        let stalled = test_peer_id("single-section-stalled");
+        let winner = test_peer_id("single-section-winner");
+
+        let mut guard = registry.gossip_state.lock().await;
+
+        // The claimant runs concurrently: it reaches the owner actor (which
+        // never touches `gossip_state`) and then parks on this guard.
+        let claimant = tokio::spawn({
+            let registry = registry.clone();
+            let stalled = stalled.clone();
+            async move {
+                registry
+                    .add_peer_with_node_id(
+                        addr,
+                        Some(stalled.to_node_id()),
+                        crate::addr_ownership::ClaimKind::Provisional,
+                    )
+                    .await
+            }
+        });
+
+        // A newer commit takes the address and projects, entirely inside the
+        // critical section the claimant is waiting for.
+        guard.tombstone_ownership_projection(addr, CommitSeq::MAX);
+        guard.peers.insert(
+            addr,
+            PeerInfo {
+                address: addr,
+                peer_address: None,
+                inbound_observed: false,
+                outbound_dial_success: false,
+                node_id: Some(winner.to_node_id()),
+                dns_name: None,
+                failures: 0,
+                last_attempt: current_timestamp(),
+                last_success: current_timestamp(),
+                last_sequence: 0,
+                last_sent_sequence: 0,
+                consecutive_deltas: 0,
+                last_failure_time: None,
+                last_dns_refresh_attempt: None,
+                last_response_received_ms: crate::current_timestamp_millis(),
+                accept_lower_sequence_from: None,
+                current_session_source: None,
+                current_session_connection: None,
+                current_session_epoch: 0,
+                identity_verified: true,
+            },
+        );
+        drop(guard);
+
+        let outcome = claimant.await.expect("claimant task must not panic");
+        assert_eq!(
+            outcome,
+            crate::addr_ownership::AddrClaimOutcome::Rejected,
+            "a claimant that can only test its outcome inside the guard must \
+             see the advance that happened there"
+        );
+        assert_eq!(
+            snapshot_peer(&registry, addr).await.node_id,
+            Some(winner.to_node_id()),
+            "the projection made inside the guard must survive the stalled claimant"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .get_configured_peer_addr(&stalled)
+                .is_none(),
+            "a refused claimant must not index its connection either"
+        );
+    }
+
+    /// A release does not clear the address's watermark, it advances it.
+    ///
+    /// Clearing would let a claim that committed BEFORE the release pass
+    /// admission against an absent entry and rebuild peer/connection state at
+    /// an address its claimant no longer owns.
+    #[tokio::test]
+    async fn release_tombstone_blocks_a_stalled_older_claim() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_121),
+            test_config_with_seed("ownership-release-tombstone"),
+        );
+        let addr = test_addr(20_122);
+        let leaver = test_peer_id("tombstone-leaver");
+
+        // The claim commits, and its caller stalls before projecting.
+        let commit = registry
+            .registry_owner
+            .claim(
+                addr,
+                crate::addr_ownership::Claim {
+                    node_id: leaver.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let stalled_seq = commit.commit_seq().expect("the claim must commit");
+
+        // The address is then released, at a strictly later position.
+        let release_seq = registry
+            .registry_owner
+            .release(addr, Some(leaver.clone()))
+            .await
+            .expect("the owner must release the address it holds");
+        assert!(release_seq > stalled_seq);
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .tombstone_ownership_projection(addr, release_seq);
+
+        // The stalled caller finally arrives: refused, and nothing projected.
+        let mut gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.admit_ownership_projection(addr, stalled_seq),
+            "a claim older than the release tombstone must be refused"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&addr),
+            "a refused claim must not recreate the released peer entry"
+        );
+        assert_eq!(
+            gossip_state.ownership_watermark(&addr),
+            Some(release_seq),
+            "the tombstone must remain as the floor, not be replaced by the stale claim"
+        );
+        drop(gossip_state);
+        assert!(registry.registry_owner.routes_to(&addr).is_none());
+    }
+
+    /// A migration tombstones the address it vacated for the same reason a
+    /// release does, and fences the destination it occupied.
+    #[tokio::test]
+    async fn migrate_tombstone_blocks_a_stalled_older_claim() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_131),
+            test_config_with_seed("ownership-migrate-tombstone"),
+        );
+        let from = test_addr(20_132);
+        let to = test_addr(20_133);
+        let mover = test_peer_id("tombstone-mover");
+
+        let commit = registry
+            .registry_owner
+            .claim(
+                from,
+                crate::addr_ownership::Claim {
+                    node_id: mover.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let stalled_seq = commit.commit_seq().expect("the claim must commit");
+
+        let move_seq = registry
+            .registry_owner
+            .migrate(from, to)
+            .await
+            .commit_seq()
+            .expect("an owned source must move onto a free destination");
+        assert!(move_seq > stalled_seq);
+
+        let mut gossip_state = registry.gossip_state.lock().await;
+        gossip_state.tombstone_ownership_projection(from, move_seq);
+        gossip_state.tombstone_ownership_projection(to, move_seq);
+
+        assert!(
+            !gossip_state.admit_ownership_projection(from, stalled_seq),
+            "a claim older than the migration must not project onto the vacated address"
+        );
+        assert!(
+            !gossip_state.admit_ownership_projection(to, stalled_seq),
+            "nor onto the address the migration moved to"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&from) && !gossip_state.peers.contains_key(&to),
+            "a refused claim must project no peer entry at either address"
         );
     }
 
@@ -18368,6 +18682,91 @@ mod tests {
             registry.registry_owner.routes_to(&new_addr),
             Some(holder),
             "the contested address must still belong to its owner"
+        );
+    }
+
+    /// A seed configured by host name has no ownership record until it
+    /// completes a handshake, so its re-resolution starts from an UNOWNED
+    /// source. That must not license moving its peer entry and connection
+    /// index onto an address a different identity owns.
+    #[tokio::test]
+    async fn dns_refresh_from_an_unowned_source_cannot_take_a_foreign_address() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5100".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5100".parse().unwrap();
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_141),
+            test_config_with_seed("dns-refresh-unowned-source"),
+        );
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![new_addr])))
+            .await;
+
+        let holder = test_peer_id("dns-unowned-holder");
+        // Only the DESTINATION is owned; the source was never claimed.
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    new_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: holder.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        let _ = registry
+            .connection_pool
+            .addr_to_peer_id
+            .remove_sync(&new_addr);
+        assert!(registry.registry_owner.owner_of(&old_addr).is_none());
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(old_addr);
+            peer.dns_name = Some("seed.invalid:5100".to_string());
+            gossip_state.peers.insert(old_addr, peer);
+        }
+
+        assert_eq!(
+            registry.refresh_peer_dns(old_addr).await,
+            None,
+            "an unowned source must not be migrated onto another identity's address"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state.peers.contains_key(&old_addr),
+            "the seed entry must stay where it was"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&new_addr),
+            "no peer entry may be published onto the owned destination"
+        );
+        drop(gossip_state);
+        assert!(
+            registry
+                .connection_pool
+                .get_peer_id_by_addr(&new_addr)
+                .is_none(),
+            "the connection index must not be re-keyed onto the owned destination"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&new_addr),
+            Some(holder),
+            "the destination's owner keeps its routing"
         );
     }
 
