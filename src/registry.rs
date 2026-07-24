@@ -3303,8 +3303,13 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                 }
 
-                // Clean up old addr_to_peer_id mapping
-                let _ = pool.addr_to_peer_id.remove_sync(&peer_addr);
+                // Clean up old addr_to_peer_id mapping. Routed through
+                // `release_addr_ownership` so the companion
+                // `addr_ownership_meta` entry at the OLD address is cleared
+                // too -- leaving it behind would let a later, unrelated
+                // peer directly claiming this same old address inherit this
+                // peer's stale VERIFIED provenance.
+                let _ = pool.release_addr_ownership(&peer_addr);
             }
         } // connection_pool lock released here
 
@@ -6098,10 +6103,19 @@ impl<T: 'static> GossipRegistry<T> {
         for (name, peer_id, addr) in routes_to_configure {
             self.connection_pool
                 .set_discovered_peer_addr(&peer_id, addr);
-            let _ = self
-                .connection_pool
-                .addr_to_peer_id
-                .upsert_sync(addr, peer_id.clone());
+            // PROVISIONAL: this dial hint is learned only from a peer's own
+            // actor-location gossip (`location.peer_id`/`addr`), never from
+            // an actually-observed connection -- the same provenance as the
+            // PeerListGossip discovery loop. Routed through
+            // `claim_addr_ownership` so it can never silently overwrite an
+            // already-VERIFIED owner of `addr`, and so it leaves correct
+            // provenance/generation metadata for a later verified claimant
+            // to yield against.
+            let _ = self.connection_pool.claim_addr_ownership(
+                addr,
+                &peer_id,
+                crate::connection_pool::AddrClaimKind::Provisional,
+            );
             debug!(
                 actor = %name,
                 peer_addr = %addr,
@@ -8622,7 +8636,6 @@ impl<T: 'static> GossipRegistry<T> {
 mod tests {
     use super::*;
     use crate::{KeyPair, PeerId};
-    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
@@ -13528,7 +13541,13 @@ mod tests {
             }))
         };
 
-        let indexed = pool.finish_indexing_accepted_connection(&peer_id, addr, None, &conn);
+        let indexed = pool.finish_indexing_accepted_connection(
+            &peer_id,
+            addr,
+            crate::connection_pool::AddrClaimKind::Verified,
+            None,
+            &conn,
+        );
         assert!(
             !indexed,
             "the mid-window teardown must be observed by the revalidation and this \

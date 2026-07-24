@@ -628,7 +628,7 @@ impl<T> ConnectionPool<T> {
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, expected))
                 .is_some();
             if removed {
-                let _ = self.addr_to_peer_id.remove_sync(&addr);
+                let _ = self.release_addr_ownership(&addr);
                 self.clear_capabilities_for_addr(&addr);
             }
         }
@@ -1083,10 +1083,25 @@ impl<T> ConnectionPool<T> {
                   treat the candidate as rejected exactly like a re-resolved tie-break loss, \
                   never report it as the accepted session, and must NEVER separately index \
                   either address itself"]
+    ///
+    /// `peer_state_addr_kind` is the PROVENANCE of `peer_state_addr` (see
+    /// [`AddrClaimKind`]): callers must pass `Verified` only when it equals
+    /// the connection's own actual TCP source, `Provisional` when it was
+    /// instead resolved from a peer-controlled wire field (e.g.
+    /// `sender_bind_addr`) or a prior configured address. `ephemeral_addr`
+    /// (when distinct) is always claimed `Verified`: it is, by construction,
+    /// the raw TCP source address this exact connection was accepted from.
+    /// Both claims go through [`Self::claim_addr_ownership`] so a lost claim
+    /// never leaves `addr_ownership_meta` out of sync with `addr_to_peer_id`
+    /// -- and, mirroring [`Self::reindex_connection_addr`], a lost claim
+    /// simply skips indexing `connections_by_addr` for that one address
+    /// rather than failing the whole accept: the connection can still be
+    /// reached via whichever address it *did* successfully claim.
     pub(crate) fn finish_indexing_accepted_connection(
         &self,
         peer_id: &crate::PeerId,
         peer_state_addr: SocketAddr,
+        peer_state_addr_kind: AddrClaimKind,
         ephemeral_addr: Option<SocketAddr>,
         connection: &Arc<LockFreeConnection>,
     ) -> bool {
@@ -1097,12 +1112,22 @@ impl<T> ConnectionPool<T> {
             },
         );
         self.set_discovered_peer_addr(peer_id, peer_state_addr);
-        let _ = self
-            .addr_to_peer_id
-            .upsert_sync(peer_state_addr, peer_id.clone());
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(peer_state_addr, connection.clone());
+        let peer_state_addr_claimed = self
+            .claim_addr_ownership(peer_state_addr, peer_id, peer_state_addr_kind)
+            .is_some();
+        if peer_state_addr_claimed {
+            let _ = self
+                .connections_by_addr
+                .upsert_sync(peer_state_addr, connection.clone());
+        } else {
+            warn!(
+                peer_state_addr = %peer_state_addr,
+                peer_id = %peer_id,
+                "finish_indexing_accepted_connection: refusing to claim peer_state_addr -- \
+                 already owned by a different authenticated peer; connection remains reachable \
+                 only via its other address, if any"
+            );
+        }
 
         // Dedupe: the ephemeral TCP source address and the peer's
         // configured/advertised bind address are frequently identical
@@ -1116,12 +1141,22 @@ impl<T> ConnectionPool<T> {
                     addr: ephemeral_addr,
                 },
             );
-            let _ = self
-                .addr_to_peer_id
-                .upsert_sync(ephemeral_addr, peer_id.clone());
-            let _ = self
-                .connections_by_addr
-                .upsert_sync(ephemeral_addr, connection.clone());
+            let ephemeral_addr_claimed = self
+                .claim_addr_ownership(ephemeral_addr, peer_id, AddrClaimKind::Verified)
+                .is_some();
+            if ephemeral_addr_claimed {
+                let _ = self
+                    .connections_by_addr
+                    .upsert_sync(ephemeral_addr, connection.clone());
+            } else {
+                warn!(
+                    ephemeral_addr = %ephemeral_addr,
+                    peer_id = %peer_id,
+                    "finish_indexing_accepted_connection: refusing to claim the connection's own \
+                     ephemeral TCP source -- already verified-owned by a different authenticated \
+                     peer"
+                );
+            }
         }
 
         // Paired, insert-gated: `count_in_new_instance` only bumps
@@ -1209,7 +1244,7 @@ impl<T> ConnectionPool<T> {
                         .remove_if_sync(&addr, |v| Arc::ptr_eq(v, connection))
                         .is_some();
                     if removed {
-                        let _ = self.addr_to_peer_id.remove_sync(&addr);
+                        let _ = self.release_addr_ownership(&addr);
                         self.clear_capabilities_for_addr(&addr);
                     }
                 }
@@ -2033,12 +2068,20 @@ impl<T> ConnectionPool<T> {
 
     /// Add an additional address mapping for a peer ID.
     /// Used when a peer connects from an ephemeral port that differs from their bind address.
+    ///
+    /// Routed through [`Self::claim_addr_ownership`] as VERIFIED: this is
+    /// only ever called for an address the caller has itself actually
+    /// connected to (an additional alias of a live connection), never a
+    /// merely peer-claimed address -- so it must set the same provenance
+    /// and generation metadata every other ownership writer does, rather
+    /// than leaving `addr_ownership_meta[addr]` unset (which would make a
+    /// live, authenticated mapping look PROVISIONAL and displaceable).
     pub fn add_addr_to_peer_id(&self, addr: SocketAddr, peer_id: crate::PeerId) {
         debug!(
             "CONNECTION POOL: Adding additional address {} -> peer_id {}",
             addr, peer_id
         );
-        let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id);
+        let _ = self.claim_addr_ownership(addr, &peer_id, AddrClaimKind::Verified);
     }
 
     /// Atomically claim address-ownership of `addr` for `peer_id`, with
@@ -2127,6 +2170,30 @@ impl<T> ConnectionPool<T> {
         }
     }
 
+    /// Atomically release address-ownership of `addr`, clearing BOTH
+    /// `addr_to_peer_id` and its companion `addr_ownership_meta` entry in
+    /// the SAME held bucket lock (`entry_sync`) -- the removal counterpart
+    /// of [`Self::claim_addr_ownership`].
+    ///
+    /// Every teardown path that removes an `addr_to_peer_id` mapping must
+    /// go through this instead of a bare `addr_to_peer_id.remove_sync`:
+    /// leaving `addr_ownership_meta[addr]` behind after the routing entry
+    /// itself is gone means a LATER, completely unrelated peer that is
+    /// directly upserted (or provisionally claims) that same address would
+    /// silently inherit the previous, now-stale owner's VERIFIED provenance
+    /// and generation -- letting a fresh, unauthenticated claim masquerade
+    /// as already-verified. Returns the peer id that owned `addr`, if any.
+    pub(crate) fn release_addr_ownership(&self, addr: &SocketAddr) -> Option<crate::PeerId> {
+        match self.addr_to_peer_id.entry_sync(*addr) {
+            scc::hash_map::Entry::Occupied(occupied) => {
+                let (_, peer_id) = occupied.remove_entry();
+                let _ = self.addr_ownership_meta.remove_sync(addr);
+                Some(peer_id)
+            }
+            scc::hash_map::Entry::Vacant(_) => None,
+        }
+    }
+
     /// Whether `addr`'s current ownership record is still exactly
     /// `expected_generation` -- the re-validation half of the claim/commit
     /// transaction. Call this atomically (under whatever lock guards the
@@ -2211,9 +2278,16 @@ impl<T> ConnectionPool<T> {
             let _ = self.get_or_create_peer_session(&peer_id);
         }
 
-        // Update the address mappings
+        // Update the address mappings. VERIFIED: this publishes a
+        // genuinely-connected instance (see the doc comment on this
+        // function's callers / `publish_connected_instance`) -- always an
+        // actually-observed connection, never a merely peer-claimed
+        // address -- so it must carry the same provenance/generation
+        // metadata every other ownership writer sets, through the single
+        // `claim_addr_ownership` gateway rather than a bare upsert that
+        // would leave `addr_ownership_meta[addr]` unset.
         self.set_discovered_peer_addr(&peer_id, addr);
-        let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+        let _ = self.claim_addr_ownership(addr, &peer_id, AddrClaimKind::Verified);
 
         debug!(
             "CONNECTION POOL: Added connection for peer '{}' (address: {})",
@@ -2327,12 +2401,12 @@ impl<T> ConnectionPool<T> {
                 });
 
             let mut peer_ids = Vec::new();
-            if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&addr) {
+            if let Some(node_id) = self.release_addr_ownership(&addr) {
                 peer_ids.push(node_id);
             }
             for alias_addr in alias_addrs {
                 let _ = self.connections_by_addr.remove_sync(&alias_addr);
-                if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&alias_addr)
+                if let Some(node_id) = self.release_addr_ownership(&alias_addr)
                     && !peer_ids.contains(&node_id)
                 {
                     peer_ids.push(node_id);
@@ -2526,7 +2600,7 @@ impl<T> ConnectionPool<T> {
             }
 
             for addr in &addrs_to_remove {
-                let _ = self.addr_to_peer_id.remove_sync(addr);
+                let _ = self.release_addr_ownership(addr);
                 let _ = self.connections_by_addr.remove_sync(addr);
                 self.clear_capabilities_for_addr(addr);
             }
@@ -2606,11 +2680,14 @@ impl<T> ConnectionPool<T> {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
                     let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
-                    let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+                    // `existing` is a still-live rival connection genuinely
+                    // owned at this exact address -- self-evidently VERIFIED,
+                    // the same as `reindex_connection_addr`'s `old_addr`.
+                    let _ = self.claim_addr_ownership(addr, peer_id, AddrClaimKind::Verified);
                     keep_correlation = candidate.shares_correlation_tracker(existing);
                 }
                 _ => {
-                    let _ = self.addr_to_peer_id.remove_sync(&addr);
+                    let _ = self.release_addr_ownership(&addr);
                     self.clear_capabilities_for_addr(&addr);
                 }
             }
@@ -2768,7 +2845,7 @@ impl<T> ConnectionPool<T> {
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, target))
                 .is_some();
             if removed {
-                let _ = self.addr_to_peer_id.remove_sync(&addr);
+                let _ = self.release_addr_ownership(&addr);
                 self.clear_capabilities_for_addr(&addr);
             }
         }
@@ -2809,7 +2886,7 @@ impl<T> ConnectionPool<T> {
         });
         let (_, connection) = removed?;
 
-        let _ = self.addr_to_peer_id.remove_sync(&addr);
+        let _ = self.release_addr_ownership(&addr);
         self.clear_capabilities_for_addr(&addr);
 
         // The same instance may also be indexed under other aliases (e.g. an
@@ -2828,7 +2905,7 @@ impl<T> ConnectionPool<T> {
                 .remove_if_sync(&alias_addr, |v| Arc::ptr_eq(v, &connection))
                 .is_some();
             if removed_alias {
-                let _ = self.addr_to_peer_id.remove_sync(&alias_addr);
+                let _ = self.release_addr_ownership(&alias_addr);
                 self.clear_capabilities_for_addr(&alias_addr);
             }
         }
@@ -3075,7 +3152,7 @@ impl<T> ConnectionPool<T> {
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, current))
                 .is_some();
             if removed {
-                let _ = self.addr_to_peer_id.remove_sync(&addr);
+                let _ = self.release_addr_ownership(&addr);
                 self.clear_capabilities_for_addr(&addr);
             }
         }
@@ -3394,7 +3471,9 @@ impl<T> ConnectionPool<T> {
         // After successful connection, ensure it's indexed by node ID
         if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
             self.publish_current_peer_connection(peer_id, conn);
-            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+            // VERIFIED: `addr` is the dial target this exact call chose and
+            // just successfully connected to.
+            let _ = self.claim_addr_ownership(addr, peer_id, AddrClaimKind::Verified);
             debug!(
                 "CONNECTION POOL: Indexed new connection under peer ID '{}'",
                 peer_id
@@ -3551,7 +3630,7 @@ impl<T> ConnectionPool<T> {
         // `embedded_peer_id`) would then black-hole every frame. The cached maps
         // are consulted only as a fallback for non-TLS paths that carry no cert
         // identity. The `addr -> peer` row is refreshed to the bound identity
-        // below (see `addr_to_peer_id.upsert_sync`). Binding `embedded_peer_id`
+        // below (see `claim_addr_ownership`). Binding `embedded_peer_id`
         // is also what makes every subsequent per-message gossip frame on this
         // link cert-identity checked (the protocol guard requires
         // `embedded_peer_id.is_some()`); bootstrap dials previously left it
@@ -3717,7 +3796,9 @@ impl<T> ConnectionPool<T> {
             .connections_by_addr
             .upsert_sync(addr, connection_arc.clone());
         if let Some(peer_id) = peer_id_opt.as_ref() {
-            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+            // VERIFIED: `addr` is the outbound dial target this instance
+            // itself chose and just connected to.
+            let _ = self.claim_addr_ownership(addr, peer_id, AddrClaimKind::Verified);
             // Identity-keyed publish gate. This freshly-dialed OUTBOUND must not
             // displace an existing live session the tie-break says to keep. A
             // higher-NodeId node that fell back to dialing (its preferred-inbound
@@ -5223,7 +5304,7 @@ pub(crate) fn handle_incoming_message(
                 // This prevents stale ephemeral addresses from being reintroduced via resolve_peer_state_addr
                 //
                 // The routing entry itself was already reserved (and gated
-                // on) via `claim_addr_to_peer_id` before the merge above --
+                // on) via `claim_addr_ownership` before the merge above --
                 // this just finishes populating the reverse mapping and
                 // reindexing the connection now that the claim is
                 // known-good.

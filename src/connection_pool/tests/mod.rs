@@ -10413,6 +10413,125 @@ async fn unauthenticated_claim_cannot_steal_a_verified_owners_address() {
     );
 }
 
+/// COMPLETENESS: the side table (`addr_ownership_meta`) must never desync
+/// from `addr_to_peer_id` for a mapping created via the REAL
+/// connection-establishment primitive (`add_connection_by_peer_id` --
+/// the production chokepoint every accept/finalize path routes through),
+/// not just for mappings created via `add_peer_with_node_id_kind`. Before
+/// this fix, `add_connection_by_peer_id` upserted `addr_to_peer_id`
+/// directly, leaving `addr_ownership_meta[addr]` unset; missing metadata
+/// reads as PROVISIONAL (`addr_ownership_verified` defaults `false`), so a
+/// live, genuinely-authenticated mapping could be silently displaced by
+/// the next VERIFIED claim from a completely different peer -- exactly
+/// the hijack this whole guard exists to prevent, just re-opened through
+/// the one write path the provenance system didn't know to look at.
+#[tokio::test]
+async fn live_connection_establishment_sets_verified_metadata_and_resists_displacement() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let addr: SocketAddr = "10.102.0.1:9000".parse().unwrap();
+    let victim = crate::KeyPair::new_for_testing("completeness-victim").peer_id();
+
+    let conn = make_live_connection(addr, ConnectionDirection::Inbound).await;
+    assert!(
+        pool.add_connection_by_peer_id(victim.clone(), addr, conn),
+        "test setup: establishing the connection must succeed"
+    );
+
+    // The single production connection-establishment primitive must have
+    // recorded VERIFIED metadata for this address -- not left it missing
+    // (which would read as provisional).
+    assert!(
+        pool.addr_ownership_verified(&addr),
+        "a mapping created by `add_connection_by_peer_id` (the real \
+         connection-establish chokepoint) must be recorded as VERIFIED in \
+         `addr_ownership_meta`, not left without metadata"
+    );
+
+    let attacker = crate::KeyPair::new_for_testing("completeness-attacker").peer_id();
+
+    // Neither a provisional nor a competing verified claim from a
+    // DIFFERENT peer may displace it.
+    assert!(
+        pool.claim_addr_ownership(addr, &attacker, crate::connection_pool::AddrClaimKind::Provisional)
+            .is_none(),
+        "a provisional claim must not displace a verified mapping created via \
+         the real connection-establishment path"
+    );
+    assert!(
+        pool.claim_addr_ownership(addr, &attacker, crate::connection_pool::AddrClaimKind::Verified)
+            .is_none(),
+        "a competing verified claim from a different peer must not displace an \
+         already-verified owner"
+    );
+    assert_eq!(
+        pool.addr_to_peer_id.read_sync(&addr, |_, v| v.clone()),
+        Some(victim),
+        "addr_to_peer_id must still route to the original, verified owner"
+    );
+}
+
+/// COMPLETENESS: removing an `addr_to_peer_id` mapping must clear its
+/// companion `addr_ownership_meta` entry too, through every teardown path
+/// (`release_addr_ownership`) -- otherwise a stale VERIFIED/high-generation
+/// record survives the removal and silently attaches itself to whatever
+/// COMPLETELY UNRELATED peer is next directly established at that same
+/// address, making that new owner's mapping look more authoritative than
+/// it actually is (or, worse, letting its own legitimately-provisional
+/// claim resist a later genuinely-verified claimant because the stale
+/// metadata says "already verified").
+#[tokio::test]
+async fn removed_mapping_does_not_leave_stale_verified_provenance_for_the_next_owner() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let addr: SocketAddr = "10.103.0.1:9000".parse().unwrap();
+    let old_owner = crate::KeyPair::new_for_testing("completeness-old-owner").peer_id();
+
+    let conn = make_live_connection(addr, ConnectionDirection::Inbound).await;
+    assert!(
+        pool.add_connection_by_peer_id(old_owner.clone(), addr, conn),
+        "test setup: establishing the old owner's connection must succeed"
+    );
+    assert!(
+        pool.addr_ownership_verified(&addr),
+        "sanity: the old owner's mapping must be verified before teardown"
+    );
+
+    assert!(
+        pool.disconnect_connection_by_peer_id(&old_owner).is_some(),
+        "test setup: disconnecting the old owner must succeed"
+    );
+    assert!(
+        pool.addr_to_peer_id.read_sync(&addr, |_, v| v.clone()).is_none(),
+        "sanity: addr_to_peer_id must be empty after disconnect"
+    );
+    assert!(
+        pool.addr_ownership_generation(&addr).is_none(),
+        "release_addr_ownership must clear the companion generation/verified \
+         metadata in the SAME operation that removes addr_to_peer_id, not \
+         leave it behind for a later, unrelated owner to inherit"
+    );
+
+    // A brand-new, unrelated peer directly establishes at the SAME address
+    // with only a PROVISIONAL claim (e.g. discovered via peer-list gossip,
+    // never actually connected to).
+    let new_owner = crate::KeyPair::new_for_testing("completeness-new-owner").peer_id();
+    assert!(
+        pool.claim_addr_ownership(
+            addr,
+            &new_owner,
+            crate::connection_pool::AddrClaimKind::Provisional
+        )
+        .is_some(),
+        "the address must be genuinely vacant (both maps) for the new owner \
+         to claim it"
+    );
+    assert!(
+        !pool.addr_ownership_verified(&addr),
+        "the new owner's merely-provisional claim must not inherit the OLD \
+         owner's stale VERIFIED provenance -- release_addr_ownership must have \
+         actually cleared it, not left it to be silently re-read"
+    );
+}
+
 /// The ownership GENERATION/transaction (bumped by every ownership writer,
 /// including `configure_peer`) closes the gap a plain boolean
 /// re-read-then-compare cannot: a legitimate `configure_peer` call landing
