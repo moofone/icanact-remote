@@ -6446,7 +6446,7 @@ impl<T: 'static> GossipRegistry<T> {
         // here so the slot is reclaimed: without this, a peer that ever
         // connected stays `Connected` in `peer_discovery` forever (nothing
         // else on the ordinary socket-failure/teardown path ever notifies
-        // discovery of a real disconnect), `connected_count_unified` only
+        // discovery of a real disconnect), `connected_peer_count` only
         // grows, and once it reaches `max_peers` discovery permanently
         // stops admitting new gossip candidates even with zero live
         // connections.
@@ -11750,7 +11750,7 @@ mod tests {
     /// had zero production callers on the ordinary socket-failure/teardown
     /// path -- only `cleanup_peer_state`'s max_peers cap eviction ever
     /// cleared a peer's discovery `Connected` state. So every peer that ever
-    /// connected stayed `Connected` forever, `connected_count_unified` only
+    /// connected stayed `Connected` forever, `connected_peer_count` only
     /// grew, and once it hit `max_peers` discovery permanently stopped
     /// admitting new gossip candidates even with zero live connections.
     /// `handle_peer_connection_failure` is the real teardown path (invoked
@@ -11771,7 +11771,7 @@ mod tests {
         {
             let state = registry.gossip_state.lock().await;
             let discovery = state.peer_discovery.as_ref().unwrap();
-            assert_eq!(discovery.connected_count_unified(), 1);
+            assert_eq!(discovery.connected_peer_count(), 1);
             assert_eq!(
                 discovery.remaining_slots(),
                 0,
@@ -11787,7 +11787,7 @@ mod tests {
         let state = registry.gossip_state.lock().await;
         let discovery = state.peer_discovery.as_ref().unwrap();
         assert_eq!(
-            discovery.connected_count_unified(),
+            discovery.connected_peer_count(),
             0,
             "a real disconnect/teardown with no live connection remaining must clear the \
              peer's discovery Connected state, or the slot is exhausted forever"
@@ -11826,7 +11826,7 @@ mod tests {
                 "sanity: no gossip_state.peers entry was ever created for this address"
             );
             let discovery = state.peer_discovery.as_ref().unwrap();
-            assert_eq!(discovery.connected_count_unified(), 1);
+            assert_eq!(discovery.connected_peer_count(), 1);
         }
 
         registry
@@ -11837,7 +11837,7 @@ mod tests {
         let state = registry.gossip_state.lock().await;
         let discovery = state.peer_discovery.as_ref().unwrap();
         assert_eq!(
-            discovery.connected_count_unified(),
+            discovery.connected_peer_count(),
             0,
             "a genuine disconnect (no replacement) for a peer with no gossip_state.peers \
              entry must still clear discovery's Connected state, or the slot is exhausted \
@@ -11868,7 +11868,7 @@ mod tests {
         {
             let state = registry.gossip_state.lock().await;
             let discovery = state.peer_discovery.as_ref().unwrap();
-            assert_eq!(discovery.connected_count_unified(), 1);
+            assert_eq!(discovery.connected_peer_count(), 1);
             assert_eq!(discovery.remaining_slots(), 0);
         }
 
@@ -11880,7 +11880,7 @@ mod tests {
         let state = registry.gossip_state.lock().await;
         let discovery = state.peer_discovery.as_ref().unwrap();
         assert_eq!(
-            discovery.connected_count_unified(),
+            discovery.connected_peer_count(),
             0,
             "a genuine disconnect via the peer-ID path must clear discovery's Connected \
              state, or the slot is exhausted forever"
@@ -11908,7 +11908,7 @@ mod tests {
         {
             let state = registry.gossip_state.lock().await;
             let discovery = state.peer_discovery.as_ref().unwrap();
-            assert_eq!(discovery.connected_count_unified(), 1);
+            assert_eq!(discovery.connected_peer_count(), 1);
         }
 
         // A hard socket error jumps straight to `max_peer_failures` in one
@@ -11927,7 +11927,7 @@ mod tests {
         let state = registry.gossip_state.lock().await;
         let discovery = state.peer_discovery.as_ref().unwrap();
         assert_eq!(
-            discovery.connected_count_unified(),
+            discovery.connected_peer_count(),
             0,
             "crossing the failure threshold with no live connection remaining must clear \
              discovery's Connected state"
@@ -11963,7 +11963,7 @@ mod tests {
         {
             let state = registry.gossip_state.lock().await;
             let discovery = state.peer_discovery.as_ref().unwrap();
-            assert_eq!(discovery.connected_count_unified(), 1);
+            assert_eq!(discovery.connected_peer_count(), 1);
         }
 
         registry
@@ -11973,7 +11973,7 @@ mod tests {
         let state = registry.gossip_state.lock().await;
         let discovery = state.peer_discovery.as_ref().unwrap();
         assert_eq!(
-            discovery.connected_count_unified(),
+            discovery.connected_peer_count(),
             1,
             "a live connection for this address must keep owning discovery's Connected \
              state; a stale failure report must not clear it"
@@ -12030,7 +12030,7 @@ mod tests {
             let state = registry.gossip_state.lock().await;
             let discovery = state.peer_discovery.as_ref().unwrap();
             assert_eq!(
-                discovery.connected_count_unified(),
+                discovery.connected_peer_count(),
                 0,
                 "sanity: the pre-publish window can be legitimately cleared"
             );
@@ -12054,7 +12054,7 @@ mod tests {
         let state = registry.gossip_state.lock().await;
         let discovery = state.peer_discovery.as_ref().unwrap();
         assert_eq!(
-            discovery.connected_count_unified(),
+            discovery.connected_peer_count(),
             1,
             "the guaranteed post-publish re-mark must make discovery's Connected state \
              reflect the now-published live connection, surviving a later clear"

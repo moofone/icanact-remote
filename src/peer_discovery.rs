@@ -5,7 +5,7 @@
 //! - Exponential backoff for failed connection attempts
 //! - Soft cap enforcement for connection limits
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -33,50 +33,7 @@ fn decorrelated_backoff_seconds(previous: u64, entropy: u64) -> u64 {
         .saturating_add(entropy % upper.saturating_sub(MIN_BACKOFF_SECONDS).saturating_add(1))
 }
 
-/// Failure state for tracking backoff
-#[derive(Debug, Clone)]
-pub struct FailureState {
-    /// Number of consecutive failures
-    pub consecutive_failures: u8,
-    /// Timestamp of last failure
-    pub last_failure: u64,
-    /// Delay selected for this retry window. Kept with the failure state so
-    /// repeated eligibility checks cannot re-roll the deadline.
-    pub retry_delay_seconds: u64,
-}
-
-impl FailureState {
-    /// Create a new failure state with initial failure
-    pub fn new() -> Self {
-        Self {
-            consecutive_failures: 1,
-            last_failure: current_timestamp(),
-            retry_delay_seconds: decorrelated_backoff_seconds(
-                MIN_BACKOFF_SECONDS,
-                rand::rng().random(),
-            ),
-        }
-    }
-
-    /// Return the stored decorrelated retry delay in seconds.
-    pub fn backoff_seconds(&self) -> u64 {
-        self.retry_delay_seconds
-    }
-
-    /// Check if we should retry connecting to this peer
-    pub fn should_retry(&self, now: u64) -> bool {
-        let backoff = self.backoff_seconds();
-        now >= self.last_failure.saturating_add(backoff)
-    }
-}
-
-impl Default for FailureState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Unified peer state (replaces separate pending/failed/connected HashMaps)
+/// Complete discovery state for one peer.
 ///
 /// Enables atomic state transitions - a peer is always in exactly ONE state.
 /// Prevents race conditions where concurrent operations could leave a peer
@@ -87,6 +44,10 @@ pub enum PeerState {
     Pending {
         /// Timestamp (seconds since epoch) when peer was added to pending
         since: u64,
+        /// Failures accumulated before this retry attempt.
+        attempts: u8,
+        /// Delay used by the preceding failure window.
+        previous_retry_delay_seconds: u64,
     },
     /// Connection attempt failed, in backoff
     Failed {
@@ -120,7 +81,7 @@ impl PeerState {
     /// Get the pending timestamp if in Pending state
     pub fn pending_since(&self) -> Option<u64> {
         match self {
-            PeerState::Pending { since } => Some(*since),
+            PeerState::Pending { since, .. } => Some(*since),
             _ => None,
         }
     }
@@ -135,7 +96,7 @@ impl PeerState {
         }
     }
 
-    /// Calculate backoff time for Failed state (same formula as FailureState)
+    /// Return the stable retry delay for a failed peer.
     pub fn backoff_seconds(&self) -> u64 {
         match self {
             PeerState::Failed {
@@ -206,9 +167,8 @@ pub struct PeerDiscoveryCleanupStats {
 ///
 /// ## State Management
 ///
-/// Uses a unified `peer_states` HashMap for atomic state transitions.
+/// Uses one `peer_states` map for atomic state transitions.
 /// Each peer is in exactly ONE of: Pending, Failed, or Connected state.
-/// Legacy HashMaps are maintained for backward compatibility during migration.
 #[derive(Debug)]
 pub struct PeerDiscovery {
     /// Configuration
@@ -227,14 +187,8 @@ pub struct PeerDiscovery {
     /// them. Both addresses must therefore be filtered here so neither one
     /// can become a dial candidate that reintroduces a self-connect loop.
     additional_self_addr: Option<SocketAddr>,
-    /// Unified peer state map (atomic state transitions)
+    /// The sole peer-discovery state map.
     peer_states: HashMap<SocketAddr, PeerState>,
-    /// Currently connected peers (legacy, kept for backward compatibility)
-    connected_peers: HashSet<SocketAddr>,
-    /// Peers pending connection (legacy, addr -> timestamp when added to pending)
-    pending_peers: HashMap<SocketAddr, u64>,
-    /// Failed peers with backoff state (legacy)
-    failed_peers: HashMap<SocketAddr, FailureState>,
 }
 
 impl PeerDiscovery {
@@ -245,9 +199,6 @@ impl PeerDiscovery {
             local_addr,
             additional_self_addr: None,
             peer_states: HashMap::new(),
-            connected_peers: HashSet::new(),
-            pending_peers: HashMap::new(),
-            failed_peers: HashMap::new(),
         }
     }
 
@@ -285,8 +236,8 @@ impl PeerDiscovery {
 
         // Calculate how many more peers we can connect to using unified state
         // IMPORTANT: Include pending to prevent concurrent gossip overcommit
-        let connected_count = self.connected_count_unified();
-        let pending_count = self.pending_count_unified();
+        let connected_count = self.connected_peer_count();
+        let pending_count = self.pending_peer_count();
         let current_count = connected_count + pending_count;
         let remaining_slots = self.config.max_peers.saturating_sub(current_count);
 
@@ -357,22 +308,24 @@ impl PeerDiscovery {
             }
         }
 
-        // Atomically mark candidates as pending using peer_states.
-        //
-        // A candidate here may be a brand-new peer OR a previously-Failed
-        // peer whose backoff window has just elapsed (see the `Failed`
-        // arm above): it is legitimately dial-eligible again, so it still
-        // needs to move out of `Failed` to be returned as a fresh dial
-        // candidate. Overwriting with `Pending` here does NOT lose its
-        // failure history: the legacy `failed_peers` ledger is intentionally
-        // left untouched (unlike `on_peer_connected`, which clears it on
-        // genuine recovery), so `on_peer_failure` can recover `attempts` /
-        // `retry_delay_seconds` from it if this dial fails again (R-P).
+        // Preserve failure history inside Pending while the retry is in flight.
         for addr in &candidates {
-            self.peer_states
-                .insert(*addr, PeerState::Pending { since: now });
-            // Also update legacy fields for backward compatibility
-            self.pending_peers.insert(*addr, now);
+            let (attempts, previous_retry_delay_seconds) = match self.peer_states.get(addr) {
+                Some(PeerState::Failed {
+                    attempts,
+                    retry_delay_seconds,
+                    ..
+                }) => (*attempts, *retry_delay_seconds),
+                _ => (0, MIN_BACKOFF_SECONDS),
+            };
+            self.peer_states.insert(
+                *addr,
+                PeerState::Pending {
+                    since: now,
+                    attempts,
+                    previous_retry_delay_seconds,
+                },
+            );
         }
 
         candidates
@@ -408,7 +361,7 @@ impl PeerDiscovery {
         }
 
         let failed_cap = self.config.max_peers.max(1);
-        if self.failed_count_unified() < failed_cap {
+        if self.failed_peer_count() < failed_cap {
             return;
         }
 
@@ -423,8 +376,6 @@ impl PeerDiscovery {
 
         if let Some((_, evicted_addr)) = oldest {
             self.peer_states.remove(&evicted_addr);
-            self.pending_peers.remove(&evicted_addr);
-            self.failed_peers.remove(&evicted_addr);
             warn!(
                 addr = %evicted_addr,
                 failed_cap,
@@ -440,31 +391,18 @@ impl PeerDiscovery {
     pub fn on_peer_failure(&mut self, addr: SocketAddr) -> bool {
         let now = current_timestamp();
 
-        // Get current attempts from unified state, falling back to the
-        // legacy failure ledger (`failed_peers`) when the unified state is
-        // no longer `Failed`. This handles a peer that is still in backoff
-        // but whose `PeerState` was transitioned to `Pending` by an
-        // intervening `on_peer_list_gossip` re-observation (see that
-        // method): the peer has NOT actually recovered, so its accumulated
-        // `attempts`/`retry_delay_seconds` must survive the transition.
-        // Without this fallback, backoff never escalates past the first
-        // window and a permanently-dead gossiped peer is redialed forever
-        // instead of eventually hitting MAX_PEER_FAILURES (R-P).
-        //
-        // `failed_peers` is only cleared on genuine recovery
-        // (`on_peer_connected`), on TTL expiry (`cleanup_expired`), or on
-        // removal (the `should_remove` branch below), so a brand-new peer
-        // correctly falls through to `(0, MIN_BACKOFF_SECONDS)`.
         let (current_attempts, previous_delay) = match self.peer_states.get(&addr) {
             Some(PeerState::Failed {
                 attempts,
                 retry_delay_seconds,
                 ..
             }) => (*attempts, *retry_delay_seconds),
-            _ => match self.failed_peers.get(&addr) {
-                Some(legacy) => (legacy.consecutive_failures, legacy.retry_delay_seconds),
-                None => (0, MIN_BACKOFF_SECONDS), // Truly new peer: first failure
-            },
+            Some(PeerState::Pending {
+                attempts,
+                previous_retry_delay_seconds,
+                ..
+            }) => (*attempts, *previous_retry_delay_seconds),
+            _ => (0, MIN_BACKOFF_SECONDS),
         };
 
         let new_attempts = current_attempts.saturating_add(1);
@@ -476,38 +414,19 @@ impl PeerDiscovery {
                 failures = new_attempts,
                 "peer exceeded max failures, removing from discovery"
             );
-            // Remove from unified state
             self.peer_states.remove(&addr);
-            // Also clean up legacy fields
-            self.pending_peers.remove(&addr);
-            self.failed_peers.remove(&addr);
         } else {
             self.make_room_for_failed_peer(addr);
             let retry_delay_seconds =
                 decorrelated_backoff_seconds(previous_delay, rand::rng().random());
-            // Atomically transition to Failed state
-            let new_state = PeerState::Failed {
-                since: now,
-                attempts: new_attempts,
-                retry_delay_seconds,
-            };
-            self.peer_states.insert(addr, new_state);
-
-            // Also update legacy fields for backward compatibility
-            self.pending_peers.remove(&addr);
-            if let Some(legacy_state) = self.failed_peers.get_mut(&addr) {
-                legacy_state.consecutive_failures = new_attempts;
-                legacy_state.last_failure = now;
-            } else {
-                self.failed_peers.insert(
-                    addr,
-                    FailureState {
-                        consecutive_failures: new_attempts,
-                        last_failure: now,
-                        retry_delay_seconds,
-                    },
-                );
-            }
+            self.peer_states.insert(
+                addr,
+                PeerState::Failed {
+                    since: now,
+                    attempts: new_attempts,
+                    retry_delay_seconds,
+                },
+            );
         }
 
         should_remove
@@ -518,53 +437,40 @@ impl PeerDiscovery {
     /// Atomically transitions peer to Connected state. This is a single
     /// operation that replaces any previous state.
     pub fn on_peer_connected(&mut self, addr: SocketAddr) {
-        // Atomically transition to Connected state (single operation)
         self.peer_states.insert(addr, PeerState::Connected);
-
-        // Also update legacy fields for backward compatibility
-        self.pending_peers.remove(&addr);
-        self.failed_peers.remove(&addr);
-        self.connected_peers.insert(addr);
     }
 
     /// Record a peer disconnection
     ///
     /// Atomically removes peer from tracking.
     pub fn on_peer_disconnected(&mut self, addr: SocketAddr) {
-        // Atomically remove from unified state
         self.peer_states.remove(&addr);
-
-        // Also update legacy field for backward compatibility
-        self.connected_peers.remove(&addr);
     }
 
     /// Get the current number of connected peers
     pub fn peer_count(&self) -> usize {
-        self.connected_peers.len()
+        self.connected_peer_count()
     }
 
     /// Check if we're at the soft cap
     pub fn at_soft_cap(&self) -> bool {
-        self.connected_peers.len() >= self.config.max_peers
+        self.connected_peer_count() >= self.config.max_peers
     }
 
     /// Get remaining slots available for new connections
     pub fn remaining_slots(&self) -> usize {
         self.config
             .max_peers
-            .saturating_sub(self.connected_peers.len())
+            .saturating_sub(self.connected_peer_count() + self.pending_peer_count())
     }
 
     /// Clear the pending state for an address (e.g., after timeout)
     ///
     /// Atomically removes peer if it's in Pending state.
     pub fn clear_pending(&mut self, addr: &SocketAddr) {
-        // Only remove if currently in Pending state
         if matches!(self.peer_states.get(addr), Some(PeerState::Pending { .. })) {
             self.peer_states.remove(addr);
         }
-        // Also update legacy field
-        self.pending_peers.remove(addr);
     }
 
     /// Get configuration
@@ -574,35 +480,20 @@ impl PeerDiscovery {
 
     /// Get the count of failed peers (for monitoring metrics)
     pub fn failed_peer_count(&self) -> usize {
-        self.failed_peers.len()
+        self.peer_states.values().filter(|s| s.is_failed()).count()
     }
 
     /// Get the count of connected peers
     pub fn connected_peer_count(&self) -> usize {
-        self.connected_peers.len()
-    }
-
-    /// Get the count of pending peers
-    pub fn pending_peer_count(&self) -> usize {
-        self.pending_peers.len()
-    }
-
-    /// Count peers in Connected state (from unified peer_states)
-    pub fn connected_count_unified(&self) -> usize {
         self.peer_states
             .values()
             .filter(|s| s.is_connected())
             .count()
     }
 
-    /// Count peers in Pending state (from unified peer_states)
-    pub fn pending_count_unified(&self) -> usize {
+    /// Get the count of pending peers
+    pub fn pending_peer_count(&self) -> usize {
         self.peer_states.values().filter(|s| s.is_pending()).count()
-    }
-
-    /// Count peers in Failed state (from unified peer_states)
-    pub fn failed_count_unified(&self) -> usize {
-        self.peer_states.values().filter(|s| s.is_failed()).count()
     }
 
     /// Get the unified peer state for an address
@@ -624,7 +515,7 @@ impl PeerDiscovery {
         // Check unified peer_states for expired entries
         for (addr, state) in self.peer_states.iter() {
             match state {
-                PeerState::Pending { since }
+                PeerState::Pending { since, .. }
                     if pending_ttl > 0 && now.saturating_sub(*since) > pending_ttl =>
                 {
                     to_remove.push(*addr);
@@ -640,19 +531,8 @@ impl PeerDiscovery {
             }
         }
 
-        // Remove expired entries from unified state
         for addr in &to_remove {
             self.peer_states.remove(addr);
-        }
-
-        // Also update legacy fields for backward compatibility
-        if pending_ttl > 0 {
-            self.pending_peers
-                .retain(|_, added_at| now.saturating_sub(*added_at) <= pending_ttl);
-        }
-        if fail_ttl > 0 {
-            self.failed_peers
-                .retain(|_, state| now.saturating_sub(state.last_failure) <= fail_ttl);
         }
 
         stats
@@ -763,13 +643,6 @@ mod tests {
 
     #[test]
     fn test_decorrelated_backoff() {
-        let state = FailureState {
-            consecutive_failures: 0,
-            last_failure: 0,
-            retry_delay_seconds: MIN_BACKOFF_SECONDS,
-        };
-
-        assert_eq!(state.backoff_seconds(), MIN_BACKOFF_SECONDS);
         assert_eq!(decorrelated_backoff_seconds(2, 0), 2);
         assert_eq!(decorrelated_backoff_seconds(2, 4), 6);
         assert_eq!(decorrelated_backoff_seconds(MAX_BACKOFF_SECONDS, 0), 2);
@@ -983,7 +856,11 @@ mod tests {
         for i in 1..MAX_PEER_FAILURES {
             let removed = discovery.on_peer_failure(peer);
             assert!(!removed, "peer should not be removed after {} failures", i);
-            assert!(discovery.failed_peers.contains_key(&peer));
+            assert!(
+                discovery
+                    .get_peer_state(&peer)
+                    .is_some_and(PeerState::is_failed)
+            );
         }
 
         // The MAX_PEER_FAILURES-th failure should remove the peer
@@ -993,7 +870,7 @@ mod tests {
             "peer should be removed after {} failures",
             MAX_PEER_FAILURES
         );
-        assert!(!discovery.failed_peers.contains_key(&peer));
+        assert!(discovery.get_peer_state(&peer).is_none());
     }
 
     #[test]
@@ -1011,7 +888,6 @@ mod tests {
             assert!(!discovery.on_peer_failure(test_addr(port)));
         }
 
-        assert_eq!(discovery.failed_count_unified(), 3);
         assert_eq!(discovery.failed_peer_count(), 3);
         assert!(discovery.peer_states.len() <= 3);
         for port in 9000..9007 {
@@ -1049,13 +925,15 @@ mod tests {
 
         let candidates = discovery.on_peer_list_gossip(&peers);
 
-        // Should only return 1 candidate (remaining slot based on connected peers)
+        // The final slot is reserved by the pending candidate.
         assert_eq!(candidates.len(), 1);
-        // remaining_slots only considers connected peers, not pending
-        assert_eq!(discovery.remaining_slots(), 1);
-        // The candidate should be in pending
-        assert_eq!(discovery.pending_peers.len(), 1);
-        assert!(discovery.pending_peers.contains_key(&candidates[0]));
+        assert_eq!(discovery.remaining_slots(), 0);
+        assert_eq!(discovery.pending_peer_count(), 1);
+        assert!(
+            discovery
+                .get_peer_state(&candidates[0])
+                .is_some_and(PeerState::is_pending)
+        );
     }
 
     #[test]
@@ -1072,12 +950,16 @@ mod tests {
         // Connect peer
         discovery.on_peer_connected(peer);
         assert_eq!(discovery.peer_count(), 1);
-        assert!(discovery.connected_peers.contains(&peer));
+        assert!(
+            discovery
+                .get_peer_state(&peer)
+                .is_some_and(PeerState::is_connected)
+        );
 
         // Disconnect peer
         discovery.on_peer_disconnected(peer);
         assert_eq!(discovery.peer_count(), 0);
-        assert!(!discovery.connected_peers.contains(&peer));
+        assert!(discovery.get_peer_state(&peer).is_none());
     }
 
     #[test]
@@ -1096,8 +978,8 @@ mod tests {
         // Immediately after failure - should NOT retry
         // (depends on timing, but backoff is within the base jitter window)
         // We check the state directly
-        let state = discovery.failed_peers.get(&peer).unwrap();
-        assert_eq!(state.consecutive_failures, 1);
+        let state = discovery.get_peer_state(&peer).expect("failed state");
+        assert_eq!(state.failure_info().map(|(_, attempts)| attempts), Some(1));
         assert!((MIN_BACKOFF_SECONDS..=MIN_BACKOFF_SECONDS * 3).contains(&state.backoff_seconds()));
     }
 
@@ -1127,11 +1009,15 @@ mod tests {
         let peer = candidates[0];
 
         // Peer should be in pending
-        assert!(discovery.pending_peers.contains_key(&peer));
+        assert!(
+            discovery
+                .get_peer_state(&peer)
+                .is_some_and(PeerState::is_pending)
+        );
 
         // Clear pending
         discovery.clear_pending(&peer);
-        assert!(!discovery.pending_peers.contains_key(&peer));
+        assert!(discovery.get_peer_state(&peer).is_none());
     }
 
     #[test]
@@ -1144,14 +1030,21 @@ mod tests {
         // Add some failures
         discovery.on_peer_failure(peer);
         discovery.on_peer_failure(peer);
-        assert!(discovery.failed_peers.contains_key(&peer));
+        assert!(
+            discovery
+                .get_peer_state(&peer)
+                .is_some_and(PeerState::is_failed)
+        );
 
         // Connect the peer
         discovery.on_peer_connected(peer);
 
         // Failure state should be cleared
-        assert!(!discovery.failed_peers.contains_key(&peer));
-        assert!(discovery.connected_peers.contains(&peer));
+        assert!(
+            discovery
+                .get_peer_state(&peer)
+                .is_some_and(PeerState::is_connected)
+        );
     }
 
     #[test]
@@ -1169,10 +1062,14 @@ mod tests {
         let pending_peer = test_addr(9000);
         let failed_peer = test_addr(9001);
 
-        // Insert into unified peer_states (primary) and legacy fields
-        discovery
-            .peer_states
-            .insert(pending_peer, PeerState::Pending { since: 0 });
+        discovery.peer_states.insert(
+            pending_peer,
+            PeerState::Pending {
+                since: 0,
+                attempts: 0,
+                previous_retry_delay_seconds: MIN_BACKOFF_SECONDS,
+            },
+        );
         discovery.peer_states.insert(
             failed_peer,
             PeerState::Failed {
@@ -1181,39 +1078,23 @@ mod tests {
                 retry_delay_seconds: MIN_BACKOFF_SECONDS,
             },
         );
-        discovery.pending_peers.insert(pending_peer, 0);
-        discovery.failed_peers.insert(
-            failed_peer,
-            FailureState {
-                consecutive_failures: 1,
-                last_failure: 1,
-                retry_delay_seconds: MIN_BACKOFF_SECONDS,
-            },
-        );
-
         // Advance time beyond pending TTL but within failed TTL
         let now = 3;
 
         let stats = discovery.cleanup_expired(now);
         assert_eq!(stats.pending_removed, 1);
         assert_eq!(stats.failed_removed, 0);
-        assert!(!discovery.pending_peers.contains_key(&pending_peer));
-        assert!(discovery.failed_peers.contains_key(&failed_peer));
-        // Also verify unified state
         assert!(discovery.get_peer_state(&pending_peer).is_none());
         assert!(discovery.get_peer_state(&failed_peer).is_some());
 
         // Advance past fail_ttl as well
         let stats = discovery.cleanup_expired(now + 2);
         assert_eq!(stats.failed_removed, 1);
-        assert!(!discovery.failed_peers.contains_key(&failed_peer));
-        // Also verify unified state
         assert!(discovery.get_peer_state(&failed_peer).is_none());
     }
 
     /// Test that slot calculation respects pending peers
-    /// Bug: remaining_slots only counts connected_peers, ignoring pending_peers
-    /// This allows concurrent gossip rounds to overcommit beyond max_peers
+    /// Pending peers consume capacity so concurrent gossip cannot overcommit.
     #[test]
     fn test_on_peer_list_gossip_respects_pending_peers() {
         let local = test_addr(8080);
@@ -1223,7 +1104,7 @@ mod tests {
         };
         let mut discovery = PeerDiscovery::new(local, config);
 
-        // Add 2 peers to connected_peers
+        // Connect two peers.
         discovery.on_peer_connected(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20)),
             8001,
@@ -1235,7 +1116,7 @@ mod tests {
 
         assert_eq!(discovery.connected_peer_count(), 2);
 
-        // First gossip call adds 2 peers to pending_peers (slots: 5-2=3, takes 2)
+        // First gossip call makes two peers pending (slots: 5-2=3, takes 2).
         let peers_first = vec![
             create_peer_gossip("10.0.0.30:8010"),
             create_peer_gossip("10.0.0.31:8011"),
@@ -1348,16 +1229,16 @@ mod tests {
         assert!(!state.is_failed(), "should not be Failed");
 
         // Verify counts are consistent
-        assert_eq!(discovery.connected_count_unified(), 1);
-        assert_eq!(discovery.pending_count_unified(), 0);
-        assert_eq!(discovery.failed_count_unified(), 0);
+        assert_eq!(discovery.connected_peer_count(), 1);
+        assert_eq!(discovery.pending_peer_count(), 0);
+        assert_eq!(discovery.failed_peer_count(), 0);
 
         // Transition: Connected -> Removed (disconnect)
         discovery.on_peer_disconnected(addr);
 
         // Should be completely removed
         assert!(discovery.get_peer_state(&addr).is_none());
-        assert_eq!(discovery.connected_count_unified(), 0);
+        assert_eq!(discovery.connected_peer_count(), 0);
     }
 
     /// Test that failure transitions are atomic and track attempts correctly
@@ -1406,10 +1287,10 @@ mod tests {
 
         // Verify counts match
         assert_eq!(
-            discovery.connected_count_unified(),
+            discovery.connected_peer_count(),
             discovery.connected_peer_count()
         );
-        assert_eq!(discovery.connected_count_unified(), 2);
+        assert_eq!(discovery.connected_peer_count(), 2);
 
         // Add pending peers via gossip
         let peers = vec![
@@ -1420,10 +1301,10 @@ mod tests {
 
         // Verify counts match
         assert_eq!(
-            discovery.pending_count_unified(),
+            discovery.pending_peer_count(),
             discovery.pending_peer_count()
         );
-        assert_eq!(discovery.pending_count_unified(), 2);
+        assert_eq!(discovery.pending_peer_count(), 2);
 
         // Add a failed peer
         let fail_peer: SocketAddr = "10.0.0.220:7000".parse().unwrap();
@@ -1432,11 +1313,8 @@ mod tests {
         discovery.on_peer_failure(fail_peer);
 
         // Verify counts match
-        assert_eq!(
-            discovery.failed_count_unified(),
-            discovery.failed_peer_count()
-        );
-        assert_eq!(discovery.failed_count_unified(), 1);
+        assert_eq!(discovery.failed_peer_count(), discovery.failed_peer_count());
+        assert_eq!(discovery.failed_peer_count(), 1);
     }
 
     /// R-P (P1): a PeerListGossip re-observation of a peer that is currently
@@ -1473,7 +1351,9 @@ mod tests {
 
             if i < MAX_PEER_FAILURES {
                 assert!(!removed, "peer removed too early on iteration {i}");
-                let state = discovery.get_peer_state(&peer).expect("must still be tracked");
+                let state = discovery
+                    .get_peer_state(&peer)
+                    .expect("must still be tracked");
                 let (_, attempts) = state.failure_info().expect("must be in Failed state");
                 assert_eq!(
                     attempts, i,
@@ -1538,14 +1418,17 @@ mod tests {
             },
         );
 
-        // Manually insert into unified state for testing
         let pending_peer = test_addr(9100);
         let failed_peer = test_addr(9101);
 
-        // Insert with old timestamps (will be expired)
-        discovery
-            .peer_states
-            .insert(pending_peer, PeerState::Pending { since: 0 });
+        discovery.peer_states.insert(
+            pending_peer,
+            PeerState::Pending {
+                since: 0,
+                attempts: 0,
+                previous_retry_delay_seconds: MIN_BACKOFF_SECONDS,
+            },
+        );
         discovery.peer_states.insert(
             failed_peer,
             PeerState::Failed {
@@ -1554,17 +1437,6 @@ mod tests {
                 retry_delay_seconds: MIN_BACKOFF_SECONDS,
             },
         );
-        // Also update legacy for consistency
-        discovery.pending_peers.insert(pending_peer, 0);
-        discovery.failed_peers.insert(
-            failed_peer,
-            FailureState {
-                consecutive_failures: 1,
-                last_failure: 1,
-                retry_delay_seconds: MIN_BACKOFF_SECONDS,
-            },
-        );
-
         // Advance time beyond pending TTL but within failed TTL
         let now = 3;
         let stats = discovery.cleanup_expired(now);
