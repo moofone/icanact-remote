@@ -38,6 +38,7 @@ pub mod priority;
 pub mod protocol;
 pub mod pubsub;
 pub mod registry;
+pub mod registry_owner;
 pub mod remote_actor_location;
 pub mod remote_actor_ref;
 mod route_interning;

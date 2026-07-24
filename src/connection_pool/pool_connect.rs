@@ -4382,12 +4382,17 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
-                // Arbitrate the address claim before ANY mutation keyed on
-                // `sender_socket_addr` — including extension/clock-echo
-                // recording below. `sender_socket_addr == _peer_addr` means
-                // the claimed bind address is backed by the raw TCP source of
-                // this connection (verified); a mismatch means it is only the
-                // sender's self-report (provisional).
+                // Claim the address through the single-owner registry actor
+                // before ANY mutation keyed on `sender_socket_addr` —
+                // including extension/clock-echo recording below.
+                // `sender_socket_addr == _peer_addr` means the claimed bind
+                // address is backed by the raw TCP source of this connection
+                // (verified); a mismatch means it is only the sender's
+                // self-report (provisional). No `gossip_state` guard is held
+                // across this await: the ownership inputs no longer live in
+                // `gossip_state`, so there is nothing to read under it, and
+                // the claim commits and publishes routing inside the owner's
+                // own serialized command.
                 let claim_kind = if sender_socket_addr == _peer_addr {
                     crate::addr_ownership::ClaimKind::Verified
                 } else {
@@ -4395,25 +4400,20 @@ pub(crate) fn handle_incoming_message(
                 };
                 let is_local_addr = sender_socket_addr == registry.bind_addr
                     || sender_socket_addr == registry.advertised_addr();
-                let current_owner = {
-                    let gossip_state = registry.gossip_state.lock().await;
-                    gossip_state
-                        .peers
-                        .get(&sender_socket_addr)
-                        .and_then(crate::registry::PeerInfo::ownership_owner)
-                };
                 let claim = crate::addr_ownership::Claim {
                     node_id: sender_peer_id.clone(),
                     kind: claim_kind,
                 };
-                if let crate::addr_ownership::Decision::Reject(reason) =
-                    crate::addr_ownership::arbitrate(current_owner, claim, is_local_addr)
+                if !registry
+                    .registry_owner
+                    .claim(sender_socket_addr, claim, is_local_addr)
+                    .await
+                    .is_accepted()
                 {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
                         claimed_addr = %sender_socket_addr,
-                        ?reason,
                         "Rejecting FullSync address claim: ownership conflict"
                     );
                     return Ok(());
@@ -4517,13 +4517,15 @@ pub(crate) fn handle_incoming_message(
                     // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
                     // The reindex_connection_addr function preserves both addresses,
                     // and disconnect_connection_by_peer_id needs both entries to clean up properly.
+                    //
+                    // `addr_to_peer_id[sender_socket_addr]` is NOT written here:
+                    // the owner actor published it in the same command that
+                    // accepted the claim above, and it is the only writer of
+                    // the address->identity routing decision.
 
                     let _ = pool
                         .peer_id_to_addr
                         .upsert_sync(sender_peer_id.clone(), sender_socket_addr);
-                    let _ = pool
-                        .addr_to_peer_id
-                        .upsert_sync(sender_socket_addr, sender_peer_id.clone());
 
                     // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
                     // Without this, get_connection(bind_addr) fails because the connection is
@@ -4849,8 +4851,10 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
-                // Arbitrate before any mutation keyed on `sender_socket_addr`,
-                // mirroring the FullSync handler above.
+                // Claim through the single-owner registry actor before any
+                // mutation keyed on `sender_socket_addr`, mirroring the
+                // FullSync handler above (including holding no `gossip_state`
+                // guard across the claim).
                 let claim_kind = if sender_socket_addr == _peer_addr {
                     crate::addr_ownership::ClaimKind::Verified
                 } else {
@@ -4858,25 +4862,20 @@ pub(crate) fn handle_incoming_message(
                 };
                 let is_local_addr = sender_socket_addr == registry.bind_addr
                     || sender_socket_addr == registry.advertised_addr();
-                let current_owner = {
-                    let gossip_state = registry.gossip_state.lock().await;
-                    gossip_state
-                        .peers
-                        .get(&sender_socket_addr)
-                        .and_then(crate::registry::PeerInfo::ownership_owner)
-                };
                 let claim = crate::addr_ownership::Claim {
                     node_id: sender_peer_id.clone(),
                     kind: claim_kind,
                 };
-                if let crate::addr_ownership::Decision::Reject(reason) =
-                    crate::addr_ownership::arbitrate(current_owner, claim, is_local_addr)
+                if !registry
+                    .registry_owner
+                    .claim(sender_socket_addr, claim, is_local_addr)
+                    .await
+                    .is_accepted()
                 {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
                         claimed_addr = %sender_socket_addr,
-                        ?reason,
                         "Rejecting FullSyncResponse address claim: ownership conflict"
                     );
                     return Ok(());
@@ -4918,13 +4917,14 @@ pub(crate) fn handle_incoming_message(
                     // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
                     // The reindex_connection_addr function preserves both addresses,
                     // and disconnect_connection_by_peer_id needs both entries to clean up properly.
+                    //
+                    // `addr_to_peer_id[sender_socket_addr]` is published by the
+                    // owner actor as part of the accepted claim above; this
+                    // path only records the reverse dial hint.
 
                     let _ = pool
                         .peer_id_to_addr
                         .upsert_sync(sender_peer_id.clone(), sender_socket_addr);
-                    let _ = pool
-                        .addr_to_peer_id
-                        .upsert_sync(sender_socket_addr, sender_peer_id.clone());
 
                     // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
                     // Mirror the FullSync handler fix - allows sending to advertised address

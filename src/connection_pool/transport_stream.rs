@@ -514,16 +514,33 @@ impl<T> ConnectionPool<T> {
                                     // backed by an outbound connection we initiated, not a
                                     // self-report, so it is a verified claim. Submit it
                                     // unconditionally (not just when nothing was known for
-                                    // `addr` yet) and let `arbitrate` decide -- this is exactly
-                                    // how a genuinely verified identity is meant to displace a
-                                    // provisional one gossip may have installed earlier.
-                                    let _ = registry_arc
+                                    // `addr` yet) and let the single-owner registry actor
+                                    // decide -- this is exactly how a genuinely verified
+                                    // identity is meant to displace a provisional one gossip
+                                    // may have installed earlier. No lock is held here; the
+                                    // claim commits and publishes routing in one serialized
+                                    // command inside the owner task.
+                                    let claim_outcome = registry_arc
                                         .add_peer_with_node_id(
                                             addr,
                                             Some(node_id),
                                             crate::addr_ownership::ClaimKind::Verified,
                                         )
                                         .await;
+                                    if claim_outcome
+                                        == crate::addr_ownership::AddrClaimOutcome::Rejected
+                                    {
+                                        // The address stays attributed to whoever owns it; the
+                                        // certificate identity is still the peer we actually
+                                        // handshaked with, so it remains available to the
+                                        // self-dial guard and connection bookkeeping below.
+                                        warn!(
+                                            addr = %addr,
+                                            node_id = %node_id.fmt_short(),
+                                            "outbound dial identity lost address arbitration; \
+                                             not attributing this address to it"
+                                        );
+                                    }
                                     discovered_node_id = Some(node_id);
                                 }
                             }
