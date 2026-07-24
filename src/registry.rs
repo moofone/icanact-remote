@@ -19,8 +19,8 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    GossipConfig, GossipError, GossipNodeId, PeerHealthMode, PeerId, RegistrationPriority,
-    RemoteActorLocation, Result,
+    GossipConfig, GossipError, GossipNodeId, PeerId, RegistrationPriority, RemoteActorLocation,
+    Result,
     connection_pool::ConnectionPool,
     current_timestamp,
     handshake::PeerCapabilities,
@@ -971,28 +971,6 @@ fn compute_clock_sample(
     Some((offset as i64, rtt, rtt / 2))
 }
 
-/// Peer health status from a reporter's perspective
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-pub struct PeerHealthStatus {
-    /// Is the peer reachable from this reporter
-    pub is_alive: bool,
-    /// Last successful contact timestamp
-    pub last_contact: u64,
-    /// Number of failed connection attempts
-    pub failure_count: u32,
-}
-
-/// Pending peer failure awaiting consensus
-#[derive(Debug, Clone)]
-pub struct PendingFailure {
-    /// When we first detected the failure
-    pub first_detected: u64,
-    /// Timeout for collecting consensus
-    pub consensus_deadline: u64,
-    /// Have we queried other peers yet
-    pub query_sent: bool,
-}
-
 /// Message types for the gossip protocol
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 #[repr(u8)]
@@ -1034,18 +1012,6 @@ pub enum RegistryMessage {
         wall_clock_time: u64,
         extensions: Option<GossipExtensionsV1>,
     } = 4,
-    /// Peer health status report
-    PeerHealthReport {
-        reporter: crate::PeerId,
-        peer_statuses: Vec<(String, PeerHealthStatus)>, // Use Vec for rkyv serialization
-        timestamp: u64,
-    } = 5,
-    /// Query for peer health consensus
-    PeerHealthQuery {
-        sender: crate::PeerId,
-        target_peer: String,
-        timestamp: u64,
-    } = 7,
     /// Peer list gossip for automatic peer discovery
     /// Contains list of known peers with their connection info
     PeerListGossip {
@@ -1200,7 +1166,8 @@ pub struct PeerInfo {
     /// session has expired and both this and `current_session_source` /
     /// `accept_lower_sequence_from` are cleared, falling back to the
     /// unarmed (accept-from-any-source) behavior.
-    pub current_session_connection: Option<std::sync::Weak<crate::connection_pool::LockFreeConnection>>,
+    pub current_session_connection:
+        Option<std::sync::Weak<crate::connection_pool::LockFreeConnection>>,
     /// Monotonic counter bumped every time `current_session_source` /
     /// `current_session_connection` change -- armed by
     /// `arm_sequence_reset_for_new_session`, or cleared by
@@ -1436,11 +1403,6 @@ pub struct GossipState {
     pub actor_admissions_by_peer: HashMap<crate::PeerId, HashSet<String>>,
     /// Reverse index used to release per-peer admission capacity on removal.
     pub actor_admission_peer_by_name: HashMap<String, crate::PeerId>,
-    /// Legacy peer-health consensus reports from different observers.
-    pub peer_health_reports: HashMap<SocketAddr, HashMap<SocketAddr, PeerHealthStatus>>,
-    /// Legacy pending peer failures that need consensus.
-    pub pending_peer_failures: HashMap<SocketAddr, PendingFailure>,
-
     // =================== Peer Discovery State ===================
     /// Last time we sent peer list gossip (for rate limiting)
     pub last_peer_gossip_time: u64,
@@ -1619,13 +1581,6 @@ impl<T: 'static> GossipRegistry<T> {
         self.config.advertise_address.unwrap_or(self.bind_addr)
     }
 
-    fn peer_health_consensus_enabled(&self) -> bool {
-        matches!(
-            self.config.peer_health_mode,
-            PeerHealthMode::LegacyConsensus
-        )
-    }
-
     fn duration_millis_u64(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
@@ -1752,8 +1707,6 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_to_actors: HashMap::new(),
                 actor_admissions_by_peer: HashMap::new(),
                 actor_admission_peer_by_name: HashMap::new(),
-                peer_health_reports: HashMap::new(),
-                pending_peer_failures: HashMap::new(),
                 // Peer discovery state
                 last_peer_gossip_time: 0,
                 peer_discovery: if config.enable_peer_discovery {
@@ -2585,7 +2538,8 @@ impl<T: 'static> GossipRegistry<T> {
             // subsequently disconnected/superseded session's discriminator
             // self-expires instead of permanently rejecting a live,
             // non-arming successor's traffic.
-            peer_info.current_session_connection = Some(std::sync::Arc::downgrade(connection_instance));
+            peer_info.current_session_connection =
+                Some(std::sync::Arc::downgrade(connection_instance));
             // A new session epoch begins here: any in-flight apply that
             // captured an epoch before this point must be dropped rather
             // than allowed to write, even if it validated as "current
@@ -3027,22 +2981,6 @@ impl<T: 'static> GossipRegistry<T> {
                 // Migrate peer_to_actors mapping if it exists
                 if let Some(actors) = gossip_state.peer_to_actors.remove(&peer_addr) {
                     gossip_state.peer_to_actors.insert(new_addr, actors);
-                }
-
-                // Migrate peer_health_reports - both as subject and as reporter
-                if let Some(reports) = gossip_state.peer_health_reports.remove(&peer_addr) {
-                    gossip_state.peer_health_reports.insert(new_addr, reports);
-                }
-                // Also update any reports about this peer from other reporters
-                for (_, reports) in gossip_state.peer_health_reports.iter_mut() {
-                    if let Some(status) = reports.remove(&peer_addr) {
-                        reports.insert(new_addr, status);
-                    }
-                }
-
-                // Migrate pending_peer_failures if exists
-                if let Some(failure) = gossip_state.pending_peer_failures.remove(&peer_addr) {
-                    gossip_state.pending_peer_failures.insert(new_addr, failure);
                 }
 
                 // Also update known_peers to avoid stale addresses being re-gossiped
@@ -5246,7 +5184,9 @@ impl<T: 'static> GossipRegistry<T> {
         // Independent of whether THIS message came from the armed source:
         // is `connection_pool` currently showing a DIFFERENT connection as
         // the peer's current one than the one that armed the session?
-        let current_connection = self.connection_pool.peer_current_connection_snapshot(peer_id);
+        let current_connection = self
+            .connection_pool
+            .peer_current_connection_snapshot(peer_id);
         let pool_shows_different_connection = current_connection.as_ref().is_some_and(|current| {
             !peer_info
                 .current_session_connection
@@ -5396,8 +5336,11 @@ impl<T: 'static> GossipRegistry<T> {
                 // `peer_info_is_from_current_session` for the self-healing
                 // expiry check that keeps this from permanently rejecting a
                 // live successor once the armed connection is gone.
-                let from_current_session =
-                    self.peer_info_is_from_current_session(&sender_peer_id, peer_info, session_source);
+                let from_current_session = self.peer_info_is_from_current_session(
+                    &sender_peer_id,
+                    peer_info,
+                    session_source,
+                );
 
                 if !from_current_session {
                     debug!(
@@ -5959,17 +5902,6 @@ impl<T: 'static> GossipRegistry<T> {
                         "cleaned up actors from long-disconnected peer (peer retained for reconnection)"
                     );
                 }
-
-                // Clean up health reports but keep the peer entry.
-                // Strip this peer both as subject (outer key) and as
-                // reporter (inner key in every other peer's report
-                // map) — otherwise inner entries leak across peer
-                // churn.
-                gossip_state.peer_health_reports.remove(peer_addr);
-                for inner in gossip_state.peer_health_reports.values_mut() {
-                    inner.remove(peer_addr);
-                }
-                gossip_state.pending_peer_failures.remove(peer_addr);
             }
             drop(gossip_state);
 
@@ -6517,79 +6449,9 @@ impl<T: 'static> GossipRegistry<T> {
         if crossed_threshold {
             info!(
                 failed_peer = %failed_peer_addr,
-                "socket-close crossed failure threshold; retaining actors until consensus/timeout"
+                "socket-close crossed failure threshold; retaining transport failure state for retry"
             );
             self.trigger_immediate_peer_gossip();
-        }
-
-        if !self.peer_health_consensus_enabled() {
-            info!(
-                failed_peer = %failed_peer_addr,
-                "peer-health consensus disabled; retaining transport failure state for retry and TTL cleanup"
-            );
-            return Ok(());
-        }
-
-        // Now start consensus process for actor invalidation.
-        //
-        // IMPORTANT: Do not spawn an untracked delayed task here. Under churn this can
-        // accumulate background work and keep registry state alive longer than intended.
-        // Instead, we do the 100ms delay inline, but only on the first observation of
-        // a pending failure for this peer.
-        let should_send_query = {
-            let mut gossip_state = self.gossip_state.lock().await;
-
-            // Record our own health report.
-            let our_report = PeerHealthStatus {
-                is_alive: false,
-                last_contact: current_time,
-                failure_count: 1,
-            };
-
-            gossip_state
-                .peer_health_reports
-                .entry(failed_peer_addr)
-                .or_insert_with(HashMap::new)
-                .insert(self.bind_addr, our_report);
-
-            // If we don't have a pending failure, create one.
-            match gossip_state.pending_peer_failures.entry(failed_peer_addr) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let pending = PendingFailure {
-                        first_detected: current_time,
-                        consensus_deadline: current_time + 5, // 5 second timeout
-                        query_sent: false,
-                    };
-                    e.insert(pending);
-
-                    info!(
-                        failed_peer = %failed_peer_addr,
-                        deadline = current_time + 5,
-                        "created pending failure record, waiting for consensus on actor invalidation"
-                    );
-                    true
-                }
-                std::collections::hash_map::Entry::Occupied(_) => false,
-            }
-        };
-
-        if should_send_query {
-            // Don't query immediately - give other nodes time to detect their own disconnections.
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                return Ok(());
-            }
-
-            info!(
-                failed_peer = %failed_peer_addr,
-                "delayed query: now checking peer consensus after 100ms"
-            );
-
-            // Query other peers for their view of the failed peer.
-            // This is to determine if we should invalidate actors, not the connection status.
-            if let Err(e) = self.query_peer_health_consensus(failed_peer_addr).await {
-                warn!(error = %e, "failed to query peer health consensus");
-            }
         }
 
         Ok(())
@@ -6761,272 +6623,11 @@ impl<T: 'static> GossipRegistry<T> {
             info!(
                 failed_peer = %failed_peer_addr,
                 node_id = %failed_peer_id,
-                "socket-close crossed failure threshold; retaining actors until consensus/timeout"
+                "socket-close crossed failure threshold; retaining transport failure state for retry"
             );
-        }
-
-        if !self.peer_health_consensus_enabled() {
-            info!(
-                failed_peer = %failed_peer_addr,
-                node_id = %failed_peer_id,
-                "peer-health consensus disabled; retaining transport failure state for retry and TTL cleanup"
-            );
-            return Ok(());
-        }
-
-        // Now start consensus process for actor invalidation (same as address-based method).
-        let should_send_query = {
-            let mut gossip_state = self.gossip_state.lock().await;
-
-            // Record our own health report.
-            let our_report = PeerHealthStatus {
-                is_alive: false,
-                last_contact: current_time,
-                failure_count: 1,
-            };
-
-            gossip_state
-                .peer_health_reports
-                .entry(failed_peer_addr)
-                .or_insert_with(HashMap::new)
-                .insert(self.bind_addr, our_report);
-
-            // If we don't have a pending failure, create one.
-            match gossip_state.pending_peer_failures.entry(failed_peer_addr) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let pending = PendingFailure {
-                        first_detected: current_time,
-                        consensus_deadline: current_time + 5, // 5 second timeout
-                        query_sent: false,
-                    };
-                    e.insert(pending);
-
-                    info!(
-                        failed_peer = %failed_peer_addr,
-                        node_id = %failed_peer_id,
-                        deadline = current_time + 5,
-                        "created pending failure record, waiting for consensus on actor invalidation"
-                    );
-                    true
-                }
-                std::collections::hash_map::Entry::Occupied(_) => false,
-            }
-        };
-
-        if should_send_query {
-            // Don't query immediately - give other nodes time to detect their own disconnections.
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                return Ok(());
-            }
-
-            info!(
-                failed_peer = %failed_peer_addr,
-                "delayed query: now checking peer consensus after 100ms"
-            );
-
-            // Query other peers for their view of the failed peer.
-            // This is to determine if we should invalidate actors, not the connection status.
-            if let Err(e) = self.query_peer_health_consensus(failed_peer_addr).await {
-                warn!(error = %e, "failed to query peer health consensus");
-            }
         }
 
         Ok(())
-    }
-
-    /// Query other peers for their view of a potentially failed peer
-    async fn query_peer_health_consensus(&self, target_peer: SocketAddr) -> Result<()> {
-        if !self.peer_health_consensus_enabled() {
-            debug!(
-                target_peer = %target_peer,
-                "peer-health consensus disabled; skipping peer-health query"
-            );
-            return Ok(());
-        }
-
-        // Note: We may have a connection to this address but for a different peer (after reconnection)
-        // This is OK - we query other peers to get consensus about the ORIGINAL peer
-
-        // TODO: Ideally we'd track which peer_id a connection was established for and check that
-        // For now, we rely on the fact that if we're querying, we've already decided the peer might be failed
-
-        warn!(
-            target_peer = %target_peer,
-            "🔍 Starting consensus query for peer (may have active connection to different peer after reconnection)"
-        );
-
-        let query_msg = RegistryMessage::PeerHealthQuery {
-            sender: self.peer_id.clone(),
-            target_peer: target_peer.to_string(),
-            timestamp: current_timestamp(),
-        };
-
-        // Get list of healthy peers to query
-        let peers_to_query = {
-            let gossip_state = self.gossip_state.lock().await;
-            gossip_state
-                .peers
-                .iter()
-                .filter(|(addr, info)| {
-                    **addr != target_peer && // Don't query the target
-                    info.failures < self.config.max_peer_failures // Only query healthy peers
-                })
-                .map(|(addr, _)| *addr)
-                .collect::<Vec<_>>()
-        };
-
-        info!(
-            target_peer = %target_peer,
-            querying_peers = peers_to_query.len(),
-            "querying peers for health consensus"
-        );
-
-        // Send queries to all healthy peers
-        let payload = bytes::Bytes::from_owner(
-            rkyv::to_bytes::<rkyv::rancor::Error>(&query_msg).map_err(crate::GossipError::from)?,
-        );
-        for peer in peers_to_query {
-            // Try to send through existing connection
-            let pool = &self.connection_pool;
-            if let Ok(conn) = pool.get_connection(peer).await {
-                let _ = conn.send_gossip_payload(payload.clone()).await;
-            }
-        }
-
-        // Mark query as sent
-        {
-            let mut gossip_state = self.gossip_state.lock().await;
-            if let Some(pending) = gossip_state.pending_peer_failures.get_mut(&target_peer) {
-                pending.query_sent = true;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Check if we have consensus about any pending peer failures
-    pub async fn check_peer_consensus(&self) {
-        if !self.peer_health_consensus_enabled() {
-            return;
-        }
-
-        let current_time = current_timestamp();
-
-        {
-            let mut gossip_state = self.gossip_state.lock().await;
-            let mut completed_failures = Vec::new();
-            let mut active_connection_recoveries = Vec::new();
-
-            for (peer_addr, pending) in &gossip_state.pending_peer_failures {
-                // Check if we've reached the deadline or have enough reports
-                let reports = gossip_state.peer_health_reports.get(peer_addr);
-                let total_peers = gossip_state.peers.len();
-
-                if let Some(reports) = reports {
-                    let alive_count = reports.values().filter(|r| r.is_alive).count();
-                    let dead_count = reports.values().filter(|r| !r.is_alive).count();
-                    let total_reports = reports.len();
-
-                    info!(
-                        peer = %peer_addr,
-                        alive_votes = alive_count,
-                        dead_votes = dead_count,
-                        total_reports = total_reports,
-                        total_peers = total_peers,
-                        "checking peer consensus"
-                    );
-
-                    // We NO LONGER remove actors even if consensus says the peer is dead
-                    // The actors remain configured and available for when the node reconnects
-
-                    if total_peers <= 1 {
-                        // Only us and the failed peer
-                        completed_failures.push(*peer_addr);
-                        info!(
-                            peer = %peer_addr,
-                            "2-node cluster: peer is disconnected, keeping actors for potential reconnection"
-                        );
-                    } else {
-                        // Multiple nodes - check consensus
-                        let majority = total_peers.div_ceil(2);
-
-                        if dead_count >= majority || current_time >= pending.consensus_deadline {
-                            completed_failures.push(*peer_addr);
-
-                            let has_active_connection = gossip_state
-                                .peers
-                                .get(peer_addr)
-                                .is_some_and(|peer| self.peer_has_live_connection(peer));
-
-                            if has_active_connection {
-                                active_connection_recoveries.push((
-                                    *peer_addr,
-                                    dead_count,
-                                    alive_count,
-                                ));
-                                info!(
-                                    peer = %peer_addr,
-                                    dead_votes = dead_count,
-                                    alive_votes = alive_count,
-                                    "consensus: local active connection wins, clearing stale pending failure"
-                                );
-                                continue;
-                            }
-
-                            if dead_count > alive_count {
-                                // Majority says dead
-                                info!(
-                                    peer = %peer_addr,
-                                    dead_votes = dead_count,
-                                    alive_votes = alive_count,
-                                    "consensus: majority says peer is dead, but keeping actors for reconnection"
-                                );
-                            } else if alive_count > dead_count {
-                                // Majority says alive
-                                info!(
-                                    peer = %peer_addr,
-                                    alive_votes = alive_count,
-                                    dead_votes = dead_count,
-                                    "consensus: peer is alive elsewhere, keeping actors"
-                                );
-                            } else {
-                                // Tie or timeout
-                                info!(
-                                    peer = %peer_addr,
-                                    "consensus timeout or tie, keeping actors"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            let now_ms = crate::current_timestamp_millis();
-            for (peer_addr, _, _) in &active_connection_recoveries {
-                if let Some(peer_info) = gossip_state.peers.get_mut(peer_addr) {
-                    peer_info.failures = 0;
-                    peer_info.last_failure_time = None;
-                    peer_info.last_success = peer_info.last_success.max(current_time);
-                    peer_info.last_response_received_ms =
-                        peer_info.last_response_received_ms.max(now_ms);
-                }
-                if let Some(peer_info) = gossip_state.known_peers.get_mut(peer_addr) {
-                    peer_info.failures = 0;
-                    peer_info.last_failure_time = None;
-                    peer_info.last_success = peer_info.last_success.max(current_time);
-                }
-            }
-
-            // Remove completed failures
-            for peer in completed_failures {
-                gossip_state.pending_peer_failures.remove(&peer);
-                gossip_state.peer_health_reports.remove(&peer);
-            }
-        }
-
-        // We no longer invalidate actors based on consensus
-        // The connection state is already updated, actors remain available
     }
 
     /// Deduplicate changes, keeping the causally-most-recent change for each actor.
@@ -7323,15 +6924,6 @@ impl<T: 'static> GossipRegistry<T> {
             for addr in &evicted_addrs {
                 gossip_state.peers.remove(addr);
                 gossip_state.peer_to_actors.remove(addr);
-                gossip_state.pending_peer_failures.remove(addr);
-
-                // peer_health_reports has two leak shapes: the outer
-                // entry (this peer as subject) and inner entries keyed
-                // by this peer as reporter. Clear both.
-                gossip_state.peer_health_reports.remove(addr);
-                for inner in gossip_state.peer_health_reports.values_mut() {
-                    inner.remove(addr);
-                }
 
                 if let Some(ref mut discovery) = gossip_state.peer_discovery {
                     discovery.on_peer_disconnected(*addr);
@@ -9557,8 +9149,14 @@ mod tests {
         .await;
 
         // The restarted peer's new connection arms the exemption.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
-            .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            node_id,
+            new_connection,
+            &owner,
+            &qa_r11_dummy_connection_instance(new_connection),
+        )
+        .await;
 
         // The OLD connection's in-flight lower-sequence FullSync arrives first.
         // It must NOT consume the exemption.
@@ -9631,8 +9229,14 @@ mod tests {
 
         // B restarts: new authenticated session, sequence back to 1, and it no
         // longer hosts Y.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
-            .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            node_id,
+            peer_addr,
+            &owner,
+            &qa_r11_dummy_connection_instance(peer_addr),
+        )
+        .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11/X"]).await;
 
         assert!(
@@ -9651,7 +9255,8 @@ mod tests {
     /// sequence is still dropped — that is what the gate exists for.
     #[tokio::test]
     async fn qa_r11_stale_gate_still_blocks_mid_session_replays() {
-        let reg = GossipRegistry::<()>::new(test_addr(7802), test_config_with_seed("qa-r11-replay"));
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7802), test_config_with_seed("qa-r11-replay"));
         let owner_kp = KeyPair::new_for_testing("qa-r11-replay-owner");
         let owner = owner_kp.peer_id();
         let node_id = owner.to_node_id();
@@ -9668,8 +9273,14 @@ mod tests {
         );
 
         // One new session admits exactly one lower-sequence sync...
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
-            .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            node_id,
+            peer_addr,
+            &owner,
+            &qa_r11_dummy_connection_instance(peer_addr),
+        )
+        .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 3, &["qa_r11r/X"]).await;
         assert!(
             reg.lookup_actor("qa_r11r/Y").await.is_none(),
@@ -9702,8 +9313,14 @@ mod tests {
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11i/X", "qa_r11i/Y"]).await;
 
         // A different identity must not be able to arm the victim's reset.
-        reg.arm_sequence_reset_for_new_session(peer_addr, attacker_node_id, peer_addr, &owner, &qa_r11_dummy_connection_instance(peer_addr))
-            .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            attacker_node_id,
+            peer_addr,
+            &owner,
+            &qa_r11_dummy_connection_instance(peer_addr),
+        )
+        .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 1, &["qa_r11i/X"]).await;
 
         assert!(
@@ -9783,8 +9400,14 @@ mod tests {
         .await;
 
         // Peer restarts: new session armed, first sync (seq=1) accepted.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
-            .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            node_id,
+            new_connection,
+            &owner,
+            &qa_r11_dummy_connection_instance(new_connection),
+        )
+        .await;
         qa_r11_full_sync_from(&reg, &owner, peer_addr, new_connection, 1, &["qa_r11p/X"]).await;
         assert!(
             reg.lookup_actor("qa_r11p/Y").await.is_none(),
@@ -9874,8 +9497,14 @@ mod tests {
 
         // New session armed for a genuine restart, but the restart sync
         // itself hasn't arrived yet.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_connection, &owner, &qa_r11_dummy_connection_instance(new_connection))
-            .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            node_id,
+            new_connection,
+            &owner,
+            &qa_r11_dummy_connection_instance(new_connection),
+        )
+        .await;
 
         // The OLD connection delivers an in-flight, NON-lower sequence (its
         // own continuation, not a restart) before the new connection's
@@ -9946,8 +9575,14 @@ mod tests {
 
         // This node redials the restarted peer: a new outbound session is
         // established and armed.
-        reg.arm_sequence_reset_for_new_session(peer_addr, node_id, new_local_session, &owner, &qa_r11_dummy_connection_instance(new_local_session))
-            .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            node_id,
+            new_local_session,
+            &owner,
+            &qa_r11_dummy_connection_instance(new_local_session),
+        )
+        .await;
 
         // The OLD outbound connection is still draining and delivers an
         // in-flight, pre-restart (numerically HIGH) sequence, reporting the
@@ -10302,19 +9937,6 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_health_status() {
-        let status = PeerHealthStatus {
-            is_alive: true,
-            last_contact: 1000,
-            failure_count: 2,
-        };
-
-        assert!(status.is_alive);
-        assert_eq!(status.last_contact, 1000);
-        assert_eq!(status.failure_count, 2);
-    }
-
-    #[test]
     fn test_registry_message_variants() {
         // Test DeltaGossip
         let delta = RegistryDelta {
@@ -10353,36 +9975,6 @@ mod tests {
             }
             _ => panic!("Wrong message type"),
         }
-    }
-
-    #[test]
-    fn test_registry_message_wire_fixture_hash_is_stable() {
-        let fixture_messages = vec![
-            RegistryMessage::FullSyncRequest {
-                sender_peer_id: test_peer_id("fixture-peer-a"),
-                sender_bind_addr: Some("127.0.0.1:9200".to_string()),
-                sequence: 42,
-                wall_clock_time: 1_700_000_001,
-            },
-            RegistryMessage::PeerHealthQuery {
-                sender: test_peer_id("fixture-peer-b"),
-                target_peer: test_peer_id("fixture-peer-c").to_string(),
-                timestamp: 1_700_000_123,
-            },
-        ];
-
-        let mut hasher = Sha256::new();
-        for msg in fixture_messages {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes.as_ref());
-        }
-
-        let digest = hex::encode(hasher.finalize());
-        assert_eq!(
-            digest,
-            "410133a9bd50aee88fc0da1b30ece8a53313492dfcf3a8c4ff5f3048121c1d85"
-        );
     }
 
     #[test]
@@ -12096,7 +11688,10 @@ mod tests {
             let mut state = registry.gossip_state.lock().await;
             state.peers.get_mut(&peer_addr).unwrap().failures
         };
-        assert!(failures_before > 0, "sanity: failure bookkeeping is non-zero before the re-mark");
+        assert!(
+            failures_before > 0,
+            "sanity: failure bookkeeping is non-zero before the re-mark"
+        );
 
         // The connection was published, but its own I/O task has ALREADY
         // failed and torn itself down (removing the pool entry -- and, in
@@ -12200,7 +11795,10 @@ mod tests {
             discovery.get_peer_state(&peer_addr).cloned()
         };
         assert!(
-            matches!(failed_state_before, Some(crate::peer_discovery::PeerState::Failed { .. })),
+            matches!(
+                failed_state_before,
+                Some(crate::peer_discovery::PeerState::Failed { .. })
+            ),
             "sanity: the peer must be in the Failed state before the clear"
         );
 
@@ -12244,7 +11842,10 @@ mod tests {
             discovery.get_peer_state(&peer_addr).cloned()
         };
         assert!(
-            matches!(failed_state_before, Some(crate::peer_discovery::PeerState::Failed { .. })),
+            matches!(
+                failed_state_before,
+                Some(crate::peer_discovery::PeerState::Failed { .. })
+            ),
             "sanity: the peer must be in the Failed state before the clear"
         );
 
@@ -13771,27 +13372,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_only_peer_failure_does_not_start_health_consensus() {
-        let mut config = test_config();
-        config.peer_health_mode = PeerHealthMode::TransportOnly;
-        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
-
-        registry.add_peer(test_addr(8081)).await;
-
-        registry
-            .handle_peer_connection_failure(test_addr(8081), None)
-            .await
-            .unwrap();
-
-        let gossip_state = registry.gossip_state.lock().await;
-        let peer = gossip_state.peers.get(&test_addr(8081)).unwrap();
-        assert_eq!(peer.failures, registry.config.max_peer_failures);
-        assert!(peer.last_failure_time.is_some());
-        assert!(gossip_state.pending_peer_failures.is_empty());
-        assert!(gossip_state.peer_health_reports.is_empty());
-    }
-
-    #[tokio::test]
     async fn peer_connection_failure_retains_remote_actors_for_reconnection() {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         let peer_addr = test_addr(8081);
@@ -13835,10 +13415,6 @@ mod tests {
         assert!(
             gossip_state.peer_to_actors.contains_key(&peer_addr),
             "actor attribution must remain so reconnect/full-sync can repair cleanly"
-        );
-        assert!(
-            gossip_state.pending_peer_failures.contains_key(&peer_addr),
-            "failure should still enter the consensus/timeout path"
         );
         assert!(
             gossip_state.urgent_changes.is_empty(),
@@ -15224,19 +14800,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pending_failure() {
-        let pending = PendingFailure {
-            first_detected: 1000,
-            consensus_deadline: 1005,
-            query_sent: false,
-        };
-
-        assert_eq!(pending.first_detected, 1000);
-        assert_eq!(pending.consensus_deadline, 1005);
-        assert!(!pending.query_sent);
-    }
-
-    #[tokio::test]
     async fn test_historical_delta() {
         let recorded_at = Instant::now();
         let delta = HistoricalDelta {
@@ -15515,93 +15078,6 @@ mod tests {
             surviving_removals, 100,
             "R-12: the newest ActorRemoved entries must survive the bound; \
              dropping them loses removal propagation permanently"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_check_peer_consensus() {
-        let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
-
-        // Add a pending failure
-        {
-            let mut gossip_state = registry.gossip_state.lock().await;
-            let pending = PendingFailure {
-                first_detected: current_timestamp() - 10,
-                consensus_deadline: current_timestamp() - 5, // Past deadline
-                query_sent: true,
-            };
-            gossip_state
-                .pending_peer_failures
-                .insert(test_addr(8081), pending);
-
-            // Add some health reports
-            let mut reports = HashMap::new();
-            reports.insert(
-                test_addr(8080),
-                PeerHealthStatus {
-                    is_alive: false,
-                    last_contact: current_timestamp(),
-                    failure_count: 1,
-                },
-            );
-            gossip_state
-                .peer_health_reports
-                .insert(test_addr(8081), reports);
-        }
-
-        registry.check_peer_consensus().await;
-
-        // Verify pending failure was processed
-        let gossip_state = registry.gossip_state.lock().await;
-        assert!(
-            !gossip_state
-                .pending_peer_failures
-                .contains_key(&test_addr(8081))
-        );
-    }
-
-    #[tokio::test]
-    async fn transport_only_check_peer_consensus_is_noop() {
-        let mut config = test_config();
-        config.peer_health_mode = PeerHealthMode::TransportOnly;
-        let registry = GossipRegistry::<()>::new(test_addr(8080), config);
-
-        {
-            let mut gossip_state = registry.gossip_state.lock().await;
-            gossip_state.pending_peer_failures.insert(
-                test_addr(8081),
-                PendingFailure {
-                    first_detected: current_timestamp() - 10,
-                    consensus_deadline: current_timestamp() - 5,
-                    query_sent: true,
-                },
-            );
-            let mut reports = HashMap::new();
-            reports.insert(
-                test_addr(8080),
-                PeerHealthStatus {
-                    is_alive: false,
-                    last_contact: current_timestamp(),
-                    failure_count: 1,
-                },
-            );
-            gossip_state
-                .peer_health_reports
-                .insert(test_addr(8081), reports);
-        }
-
-        registry.check_peer_consensus().await;
-
-        let gossip_state = registry.gossip_state.lock().await;
-        assert!(
-            gossip_state
-                .pending_peer_failures
-                .contains_key(&test_addr(8081))
-        );
-        assert!(
-            gossip_state
-                .peer_health_reports
-                .contains_key(&test_addr(8081))
         );
     }
 
@@ -16437,10 +15913,10 @@ mod tests {
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis()
                         .saturating_sub(10_000),
-                        accept_lower_sequence_from: None,
-                        current_session_source: None,
-                        current_session_connection: None,
-                        current_session_epoch: 0,
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
                 },
             );
         }
@@ -17316,9 +16792,7 @@ mod tests {
                 *sender_bind_addr = None;
                 *wall_clock_time = 0;
             }
-            RegistryMessage::PeerHealthReport { timestamp, .. }
-            | RegistryMessage::PeerHealthQuery { timestamp, .. }
-            | RegistryMessage::PeerListGossip { timestamp, .. } => {
+            RegistryMessage::PeerListGossip { timestamp, .. } => {
                 *timestamp = 0;
             }
         }

@@ -3893,10 +3893,7 @@ impl<T> ConnectionPool<T> {
             tokio::spawn(async move {
                 let mut gossip_state = registry_clone.gossip_state.lock().await;
 
-                // Check if we need to reset failures and clear pending
-                let need_to_clear_pending = if let Some(peer_info) =
-                    gossip_state.peers.get_mut(&peer_addr)
-                {
+                if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
                     let had_failures = peer_info.failures > 0;
                     peer_info.outbound_dial_success = true;
                     if had_failures {
@@ -3907,14 +3904,6 @@ impl<T> ConnectionPool<T> {
                         peer_info.last_failure_time = None;
                     }
                     peer_info.last_success = crate::current_timestamp();
-                    had_failures
-                } else {
-                    false
-                };
-
-                // Clear pending failure record if needed
-                if need_to_clear_pending {
-                    gossip_state.pending_peer_failures.remove(&peer_addr);
                 }
             });
         }
@@ -4163,15 +4152,13 @@ async fn answer_inbound_clock_probe(
         }
     };
     let payload = bytes::Bytes::from_owner(response_data);
-    let header =
-        bytes::Bytes::copy_from_slice(&framing::write_gossip_frame_prefix(payload.len()));
+    let header = bytes::Bytes::copy_from_slice(&framing::write_gossip_frame_prefix(payload.len()));
     let pool = &registry.connection_pool;
     let send_result = match pool.send_to_peer_id_parts(peer_id, header, payload.clone()) {
         Ok(()) => Ok(()),
         Err(_) => {
-            let fallback_header = bytes::Bytes::copy_from_slice(
-                &framing::write_gossip_frame_prefix(payload.len()),
-            );
+            let fallback_header =
+                bytes::Bytes::copy_from_slice(&framing::write_gossip_frame_prefix(payload.len()));
             pool.send_lock_free_parts(peer_addr, fallback_header, payload)
         }
     };
@@ -4271,55 +4258,49 @@ pub(crate) fn handle_incoming_message(
                     // this gate): none of it may be attributable to a
                     // connection that isn't the peer's current session.
                     let mut from_current_session = true;
-                    let need_to_clear_pending =
-                        if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                            from_current_session = registry.peer_info_is_from_current_session(
-                                &delta.sender_peer_id,
-                                peer_info,
-                                Some(session_source),
-                            );
-                            captured_epoch = Some(peer_info.current_session_epoch);
-                            if !from_current_session {
-                                false
-                            } else {
-                                let was_failed =
-                                    peer_info.failures >= registry.config.max_peer_failures;
-                                if was_failed {
-                                    info!(
-                                        peer = %delta.sender_peer_id,
-                                        "✅ Received delta from previously failed peer - connection restored!"
-                                    );
-                                }
-                                // Always reset failure state when we receive messages from the peer
-                                // This proves the peer is alive and communicating
-                                let had_failures = peer_info.failures > 0;
-                                if had_failures {
-                                    info!(peer = %delta.sender_peer_id,
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                        from_current_session = registry.peer_info_is_from_current_session(
+                            &delta.sender_peer_id,
+                            peer_info,
+                            Some(session_source),
+                        );
+                        captured_epoch = Some(peer_info.current_session_epoch);
+                        if !from_current_session {
+                            // The post-lock guard below rejects stale sessions.
+                        } else {
+                            let was_failed =
+                                peer_info.failures >= registry.config.max_peer_failures;
+                            if was_failed {
+                                info!(
+                                    peer = %delta.sender_peer_id,
+                                    "✅ Received delta from previously failed peer - connection restored!"
+                                );
+                            }
+                            // Always reset failure state when we receive messages from the peer
+                            // This proves the peer is alive and communicating
+                            let had_failures = peer_info.failures > 0;
+                            if had_failures {
+                                info!(peer = %delta.sender_peer_id,
                               prev_failures = peer_info.failures,
                               "🔄 Resetting failure state after receiving DeltaGossip");
-                                    peer_info.failures = 0;
-                                    peer_info.last_failure_time = None;
-                                }
-                                peer_info.last_success = crate::current_timestamp();
-                                // Inbound payload from peer — proves app-level liveness.
-                                // The response-asymmetry detector in
-                                // `apply_gossip_results` reads this field to decide
-                                // whether outbound writes that returned `Ok(None)`
-                                // were actually heard by the peer's application
-                                // layer. Mirror the inline-response path in
-                                // `GossipRegistry::handle_gossip_response`.
-                                peer_info.last_response_received_ms =
-                                    crate::current_timestamp_millis();
-
-                                peer_info.last_sequence =
-                                    std::cmp::max(peer_info.last_sequence, delta.current_sequence);
-                                peer_info.consecutive_deltas += 1;
-
-                                had_failures
+                                peer_info.failures = 0;
+                                peer_info.last_failure_time = None;
                             }
-                        } else {
-                            false
-                        };
+                            peer_info.last_success = crate::current_timestamp();
+                            // Inbound payload from peer — proves app-level liveness.
+                            // The response-asymmetry detector in
+                            // `apply_gossip_results` reads this field to decide
+                            // whether outbound writes that returned `Ok(None)`
+                            // were actually heard by the peer's application
+                            // layer. Mirror the inline-response path in
+                            // `GossipRegistry::handle_gossip_response`.
+                            peer_info.last_response_received_ms = crate::current_timestamp_millis();
+
+                            peer_info.last_sequence =
+                                std::cmp::max(peer_info.last_sequence, delta.current_sequence);
+                            peer_info.consecutive_deltas += 1;
+                        }
+                    }
 
                     if !from_current_session {
                         debug!(
@@ -4330,12 +4311,6 @@ pub(crate) fn handle_incoming_message(
                         return Ok(());
                     }
 
-                    // Clear pending failure record if needed
-                    if need_to_clear_pending {
-                        gossip_state
-                            .pending_peer_failures
-                            .remove(&sender_socket_addr);
-                    }
                     gossip_state.delta_exchanges += 1;
                 }
 
@@ -4437,8 +4412,6 @@ pub(crate) fn handle_incoming_message(
                             old_peer_info.peer_address = Some(_peer_addr);
                             // Insert with new key (bind address), preserving all state
                             gossip_state.peers.insert(sender_socket_addr, old_peer_info);
-                            // Also clean up pending failures for the old address
-                            gossip_state.pending_peer_failures.remove(&_peer_addr);
                         }
                     }
 
@@ -4546,16 +4519,6 @@ pub(crate) fn handle_incoming_message(
 
                 if from_current_session {
                     let mut gossip_state = registry.gossip_state.lock().await;
-                    let had_failures = gossip_state
-                        .peers
-                        .get(&sender_socket_addr)
-                        .map(|info| info.failures > 0)
-                        .unwrap_or(false);
-                    if had_failures {
-                        gossip_state
-                            .pending_peer_failures
-                            .remove(&sender_socket_addr);
-                    }
                     if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
                         let prev_failures = peer_info.failures;
                         if peer_info.failures > 0 {
@@ -4922,8 +4885,6 @@ pub(crate) fn handle_incoming_message(
                         old_peer_info.peer_address = Some(_peer_addr);
                         // Insert with new key (bind address), preserving all state
                         gossip_state.peers.insert(sender_socket_addr, old_peer_info);
-                        // Also clean up pending failures for the old address
-                        gossip_state.pending_peer_failures.remove(&_peer_addr);
                     }
                 }
 
@@ -4933,172 +4894,21 @@ pub(crate) fn handle_incoming_message(
                 // `from_current_session` verdict `merge_full_sync_from`
                 // already computed for the actor/sequence state.
                 if from_current_session {
-                    let need_to_clear_pending =
-                        if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
-                            let had_failures = peer_info.failures > 0;
-                            if had_failures {
-                                info!(peer = %sender_socket_addr,
-                          prev_failures = peer_info.failures,
-                          "🔄 Resetting failure state after receiving FullSyncResponse");
-                                peer_info.failures = 0;
-                                peer_info.last_failure_time = None;
-                            }
-                            peer_info.last_success = crate::current_timestamp();
-                            // Inbound payload from peer — proves app-level liveness.
-                            // See `handle_incoming_message::DeltaGossip` for the
-                            // full rationale.
-                            peer_info.last_response_received_ms = crate::current_timestamp_millis();
-                            had_failures
-                        } else {
-                            false
-                        };
-
-                    // Clear pending failure record if needed
-                    if need_to_clear_pending {
-                        gossip_state
-                            .pending_peer_failures
-                            .remove(&sender_socket_addr);
+                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                        if peer_info.failures > 0 {
+                            info!(peer = %sender_socket_addr,
+                                prev_failures = peer_info.failures,
+                                "resetting failure state after receiving FullSyncResponse");
+                            peer_info.failures = 0;
+                            peer_info.last_failure_time = None;
+                        }
+                        peer_info.last_success = crate::current_timestamp();
+                        // Inbound payload from peer — proves app-level liveness.
+                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
                     }
                 }
 
                 gossip_state.full_sync_exchanges += 1;
-                Ok(())
-            }
-            RegistryMessage::PeerHealthQuery {
-                sender,
-                target_peer,
-                timestamp: _,
-            } => {
-                let sender_socket_addr =
-                    resolve_peer_state_addr(&registry, Some(&sender), _peer_addr).await;
-                debug!(
-                    sender = %sender,
-                    target = %target_peer,
-                    "received peer health query"
-                );
-
-                // Check our connection status to the target peer
-                let target_addr = match target_peer.parse::<SocketAddr>() {
-                    Ok(addr) => addr,
-                    Err(_) => {
-                        warn!(
-                            "Invalid target peer address in health query: {}",
-                            target_peer
-                        );
-                        return Ok(());
-                    }
-                };
-
-                let is_alive = {
-                    let pool = &registry.connection_pool;
-                    pool.has_connection(&target_addr)
-                };
-
-                let last_contact = if is_alive {
-                    crate::current_timestamp()
-                } else {
-                    // Check when we last had successful contact
-                    let gossip_state = registry.gossip_state.lock().await;
-                    gossip_state
-                        .peers
-                        .get(&target_addr)
-                        .map(|info| info.last_success)
-                        .unwrap_or(0)
-                };
-
-                // Send our health report back
-                let mut peer_statuses = HashMap::new();
-
-                // Get actual failure count from gossip state
-                let failure_count = {
-                    let gossip_state = registry.gossip_state.lock().await;
-                    gossip_state
-                        .peers
-                        .get(&target_addr)
-                        .map(|info| info.failures as u32)
-                        .unwrap_or(0)
-                };
-
-                peer_statuses.insert(
-                    target_peer,
-                    crate::registry::PeerHealthStatus {
-                        is_alive,
-                        last_contact,
-                        failure_count,
-                    },
-                );
-
-                let report = RegistryMessage::PeerHealthReport {
-                    reporter: registry.peer_id.clone(),
-                    peer_statuses: peer_statuses.into_iter().collect(),
-                    timestamp: crate::current_timestamp(),
-                };
-
-                // Send report back to the querying peer
-                if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&report) {
-                    // Use the actual peer address we received from
-                    let sender_addr = sender_socket_addr;
-
-                    let pool = &registry.connection_pool;
-                    let payload = bytes::Bytes::from_owner(data);
-                    let header = bytes::Bytes::copy_from_slice(
-                        &framing::write_gossip_frame_prefix(payload.len()),
-                    );
-
-                    // Use send_lock_free_parts which doesn't copy payload bytes.
-                    if let Err(e) = pool.send_lock_free_parts(sender_addr, header, payload) {
-                        warn!(peer = %sender_addr, error = %e, "Failed to send peer health report");
-                    }
-                }
-
-                Ok(())
-            }
-            RegistryMessage::PeerHealthReport {
-                reporter,
-                peer_statuses,
-                timestamp: _,
-            } => {
-                let reporter_addr =
-                    resolve_peer_state_addr(&registry, Some(&reporter), _peer_addr).await;
-                debug!(
-                    reporter = %reporter,
-                    peers = peer_statuses.len(),
-                    "received peer health report"
-                );
-
-                // Store the health reports. `peer` is a peer-chosen string,
-                // not an authenticated value, so an unbounded subject set
-                // here would let a single reporter grow this map without
-                // bound. Only accept reports whose subject is a peer this
-                // node already knows about (currently tracked or previously
-                // discovered) -- fabricated subjects are dropped.
-                {
-                    let mut gossip_state = registry.gossip_state.lock().await;
-                    for (peer, status) in peer_statuses {
-                        if let Ok(peer_addr) = peer.parse::<SocketAddr>() {
-                            let is_known_peer = gossip_state.peers.contains_key(&peer_addr)
-                                || gossip_state.known_peers.contains(&peer_addr);
-                            if !is_known_peer {
-                                debug!(
-                                    reporter = %reporter,
-                                    subject = %peer_addr,
-                                    "dropping peer health report for unknown subject address"
-                                );
-                                continue;
-                            }
-                            // For now, use the reporter's peer address from the connection
-                            gossip_state
-                                .peer_health_reports
-                                .entry(peer_addr)
-                                .or_insert_with(HashMap::new)
-                                .insert(reporter_addr, status);
-                        }
-                    }
-                }
-
-                // Check if we have enough reports to make a decision
-                registry.check_peer_consensus().await;
-
                 Ok(())
             }
             RegistryMessage::PeerListGossip {

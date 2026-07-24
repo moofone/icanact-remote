@@ -655,11 +655,6 @@ impl<T> GossipClient<T> {
         }
     }
 
-    /// Peer-health mode configured for this registry.
-    pub fn peer_health_mode(&self) -> crate::PeerHealthMode {
-        self.registry.config.peer_health_mode
-    }
-
     pub fn lookup_connected_connection(
         &self,
         peer_id: &crate::PeerId,
@@ -1350,7 +1345,11 @@ mod tests {
             .await;
 
         assert!(
-            handle.registry.lookup_actor("inbound-reject/Q").await.is_some(),
+            handle
+                .registry
+                .lookup_actor("inbound-reject/Q")
+                .await
+                .is_some(),
             "R-11: the surviving connection's subsequent FullSync must still \
              be accepted, not dropped by the from_current_session gate"
         );
@@ -3082,8 +3081,6 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                     break;
                 }
                 registry.cleanup_stale_actors().await;
-                // Also check for consensus timeouts
-                registry.check_peer_consensus().await;
                 // Clean up peers that have been dead for too long
                 registry.cleanup_dead_peers().await;
                 // Clean up stale peers from peer discovery (Phase 4)
@@ -3415,8 +3412,6 @@ where
                 RegistryMessage::DeltaGossipResponse { delta, .. } => {
                     (delta.sender_peer_id.to_hex(), None)
                 }
-                RegistryMessage::PeerHealthQuery { sender, .. } => (sender.to_hex(), None),
-                RegistryMessage::PeerHealthReport { reporter, .. } => (reporter.to_hex(), None),
                 RegistryMessage::PeerListGossip { sender_addr, .. } => (sender_addr.clone(), None),
             };
             (node_id, *correlation_id, bind_addr)
@@ -4054,9 +4049,7 @@ where
         // returning and this `.await` acquiring the lock, and an
         // unconditional re-mark would resurrect `Connected` for a session
         // that is already dead, with nothing left to clear it again later.
-        registry
-            .mark_peer_connected_if_live(peer_state_addr)
-            .await;
+        registry.mark_peer_connected_if_live(peer_state_addr).await;
 
         // R-11: this is a new TLS-authenticated session for `node_id`, which is
         // the only evidence we accept that the peer may have restarted. Allow
@@ -5161,7 +5154,9 @@ mod keepalive_apply_tests {
 /// `verified_sender_addr` -- the peer's fixed dial-target address -- will
 /// not match `current_session_source`, which for an outbound session is the
 /// dialling socket's own local ephemeral port).
-fn gossip_send_outcome_to_result(outcome: Result<()>) -> Result<Option<crate::registry::RegistryMessage>> {
+fn gossip_send_outcome_to_result(
+    outcome: Result<()>,
+) -> Result<Option<crate::registry::RegistryMessage>> {
     outcome.map(|_| None)
 }
 

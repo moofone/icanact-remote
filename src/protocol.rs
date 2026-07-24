@@ -821,8 +821,6 @@ fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
         RegistryMessage::FullSyncRequest { sender_peer_id, .. }
         | RegistryMessage::FullSync { sender_peer_id, .. }
         | RegistryMessage::FullSyncResponse { sender_peer_id, .. } => Some(sender_peer_id),
-        RegistryMessage::PeerHealthReport { reporter, .. } => Some(reporter),
-        RegistryMessage::PeerHealthQuery { sender, .. } => Some(sender),
         RegistryMessage::PeerListGossip { .. } => None,
     }
 }

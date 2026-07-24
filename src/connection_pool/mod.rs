@@ -12,9 +12,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::task::{Context, Poll};
-use std::{
-    collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc, time::Duration, time::Instant,
-};
+use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration, time::Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;

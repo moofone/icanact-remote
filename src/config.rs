@@ -134,21 +134,6 @@ impl ConnectionRecoveryPolicy {
     }
 }
 
-/// Controls whether registry peer-health consensus is active.
-///
-/// This is distinct from transport connection health. SWIM-backed deployments
-/// should use `TransportOnly` so SWIM remains the only cluster-membership
-/// authority while icanact-remote still owns connection retry, backoff, and
-/// registry route cleanup.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PeerHealthMode {
-    /// Preserve the historical peer-health query/report path.
-    #[default]
-    LegacyConsensus,
-    /// Treat peer failures as transport-local state only.
-    TransportOnly,
-}
-
 /// Configuration for the gossip registry
 #[derive(Debug, Clone)]
 pub struct GossipConfig {
@@ -223,9 +208,6 @@ pub struct GossipConfig {
     pub tcp_keepalive: Option<TcpKeepaliveConfig>,
     /// Optional domain-specific recovery policy for cached transport sessions.
     pub connection_recovery: ConnectionRecoveryPolicy,
-    /// Whether registry peer-health consensus is active.
-    pub peer_health_mode: PeerHealthMode,
-
     // =================== Peer Discovery Configuration ===================
     /// NAT-only escape hatch: the address told to peers that cannot reach
     /// this node at its bind address (spec/PEER_ID_REFACTOR.md §1.8).
@@ -379,7 +361,6 @@ impl Default for GossipConfig {
                 retries: Some(DEFAULT_TCP_KEEPALIVE_RETRIES),
             }),
             connection_recovery: ConnectionRecoveryPolicy::default(),
-            peer_health_mode: PeerHealthMode::LegacyConsensus,
             // Peer discovery defaults
             advertise_address: None,
             enable_peer_discovery: false, // Safe rollout: disabled by default
@@ -590,7 +571,6 @@ mod tests {
             config.connection_recovery,
             ConnectionRecoveryPolicy::default()
         );
-        assert_eq!(config.peer_health_mode, PeerHealthMode::LegacyConsensus);
         // Peer discovery defaults
         assert!(config.advertise_address.is_none());
         assert!(!config.enable_peer_discovery); // Disabled by default for safe rollout
