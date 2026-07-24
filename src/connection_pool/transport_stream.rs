@@ -50,11 +50,12 @@ mod r11_outbound_arming_tests {
         // identity exists for the address (as `lookup_node_id` would
         // return), but THIS session presented no certificate at all.
         let cached_identity_from_a_prior_session = Some(SecretKey::generate().public());
-        let this_session_presented_no_certificate: Option<&[rustls::pki_types::CertificateDer<'_>]> =
-            None;
+        let this_session_presented_no_certificate: Option<
+            &[rustls::pki_types::CertificateDer<'_>],
+        > = None;
 
-        let old_vulnerable_fallback = None::<crate::GossipNodeId>
-            .or(cached_identity_from_a_prior_session);
+        let old_vulnerable_fallback =
+            None::<crate::GossipNodeId>.or(cached_identity_from_a_prior_session);
         assert!(
             old_vulnerable_fallback.is_some(),
             "sanity: the pre-fix cache fallback would have armed using a \
@@ -509,7 +510,17 @@ impl<T> ConnectionPool<T> {
                             if let Some(cert) = certs.first() {
                                 if let Ok(node_id) = crate::tls::extract_node_id_from_cert(cert) {
                                     if registry_arc.lookup_node_id(&addr).await.is_none() {
-                                        registry_arc.add_peer_with_node_id(addr, Some(node_id)).await;
+                                        // We dialed `addr` ourselves and just completed a TLS
+                                        // handshake with it: the peer certificate's node id is
+                                        // backed by an outbound connection we initiated, not a
+                                        // self-report, so it is a verified claim.
+                                        registry_arc
+                                            .add_peer_with_node_id(
+                                                addr,
+                                                Some(node_id),
+                                                crate::addr_ownership::ClaimKind::Verified,
+                                            )
+                                            .await;
                                     }
                                     discovered_node_id = Some(node_id);
                                 }

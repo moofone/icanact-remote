@@ -1234,7 +1234,11 @@ mod tests {
         // source, exactly like the real accept path does after this fix.
         handle
             .registry
-            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .add_peer_with_node_id(
+                bind_addr,
+                Some(remote_node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         handle
             .registry
@@ -1401,7 +1405,11 @@ mod tests {
             .set_configured_peer_addr(&remote_peer_id, bind_addr);
         handle
             .registry
-            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .add_peer_with_node_id(
+                bind_addr,
+                Some(remote_node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // The STALE inbound handler's own accepted connection: published
@@ -3599,7 +3607,11 @@ where
 
     if let Some(node_id) = node_id_opt {
         registry
-            .add_peer_with_node_id(peer_state_addr, Some(node_id))
+            .add_peer_with_node_id(
+                peer_state_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         // Associate capabilities captured during the Hello handshake (stored under peer_addr).
         registry

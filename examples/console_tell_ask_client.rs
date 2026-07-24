@@ -138,7 +138,11 @@ async fn main() -> Result<()> {
     let server_addr = "127.0.0.1:29200".parse()?;
     registry
         .registry
-        .add_peer_with_node_id(server_addr, Some(server_node_id))
+        .add_peer_with_node_id(
+            server_addr,
+            Some(server_node_id),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Establish TLS connection to the server.

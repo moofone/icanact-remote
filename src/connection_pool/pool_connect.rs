@@ -4238,6 +4238,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_source: None,
                                 current_session_connection: None,
                                 current_session_epoch: 0,
+                                identity_verified: false,
                             });
                         }
                     }
@@ -4380,6 +4381,43 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
+
+                // Arbitrate the address claim before ANY mutation keyed on
+                // `sender_socket_addr` — including extension/clock-echo
+                // recording below. `sender_socket_addr == _peer_addr` means
+                // the claimed bind address is backed by the raw TCP source of
+                // this connection (verified); a mismatch means it is only the
+                // sender's self-report (provisional).
+                let claim_kind = if sender_socket_addr == _peer_addr {
+                    crate::addr_ownership::ClaimKind::Verified
+                } else {
+                    crate::addr_ownership::ClaimKind::Provisional
+                };
+                let is_local_addr = sender_socket_addr == registry.bind_addr;
+                let current_owner = {
+                    let gossip_state = registry.gossip_state.lock().await;
+                    gossip_state
+                        .peers
+                        .get(&sender_socket_addr)
+                        .and_then(crate::registry::PeerInfo::ownership_owner)
+                };
+                let claim = crate::addr_ownership::Claim {
+                    node_id: sender_peer_id.clone(),
+                    kind: claim_kind,
+                };
+                if let crate::addr_ownership::Decision::Reject(reason) =
+                    crate::addr_ownership::arbitrate(current_owner, claim, is_local_addr)
+                {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        claimed_addr = %sender_socket_addr,
+                        ?reason,
+                        "Rejecting FullSync address claim: ownership conflict"
+                    );
+                    return Ok(());
+                }
+
                 registry.record_inbound_gossip_extensions(
                     sender_socket_addr,
                     extensions,
@@ -4443,6 +4481,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_source: None,
                                 current_session_connection: None,
                                 current_session_epoch: 0,
+                                identity_verified: false,
                             });
                         }
                     }
@@ -4808,6 +4847,39 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
+
+                // Arbitrate before any mutation keyed on `sender_socket_addr`,
+                // mirroring the FullSync handler above.
+                let claim_kind = if sender_socket_addr == _peer_addr {
+                    crate::addr_ownership::ClaimKind::Verified
+                } else {
+                    crate::addr_ownership::ClaimKind::Provisional
+                };
+                let is_local_addr = sender_socket_addr == registry.bind_addr;
+                let current_owner = {
+                    let gossip_state = registry.gossip_state.lock().await;
+                    gossip_state
+                        .peers
+                        .get(&sender_socket_addr)
+                        .and_then(crate::registry::PeerInfo::ownership_owner)
+                };
+                let claim = crate::addr_ownership::Claim {
+                    node_id: sender_peer_id.clone(),
+                    kind: claim_kind,
+                };
+                if let crate::addr_ownership::Decision::Reject(reason) =
+                    crate::addr_ownership::arbitrate(current_owner, claim, is_local_addr)
+                {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        claimed_addr = %sender_socket_addr,
+                        ?reason,
+                        "Rejecting FullSyncResponse address claim: ownership conflict"
+                    );
+                    return Ok(());
+                }
+
                 registry.record_inbound_gossip_extensions(
                     sender_socket_addr,
                     extensions,
@@ -4958,7 +5030,17 @@ pub(crate) fn handle_incoming_message(
                 let discovery_handle = tokio::spawn(async move {
                     for addr in candidates {
                         let node_id = registry_clone.lookup_node_id(&addr).await;
-                        registry_clone.add_peer_with_node_id(addr, node_id).await;
+                        // `addr` came from a peer's PeerListGossip payload: a
+                        // third party's self-report about a node we have not
+                        // ourselves observed a connection from yet. Provisional
+                        // until an actual dial/accept verifies it.
+                        registry_clone
+                            .add_peer_with_node_id(
+                                addr,
+                                node_id,
+                                crate::addr_ownership::ClaimKind::Provisional,
+                            )
+                            .await;
 
                         match registry_clone.get_connection(addr).await {
                             Ok(_) => {

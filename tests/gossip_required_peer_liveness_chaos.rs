@@ -379,7 +379,11 @@ async fn configured_peers_retry_until_late_peer_comes_online() -> Result<(), Dyn
 
     node_a
         .registry
-        .add_peer_with_node_id(addr_b, Some(peer_b_id.to_node_id()))
+        .add_peer_with_node_id(
+            addr_b,
+            Some(peer_b_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     node_a
         .registry
@@ -397,6 +401,7 @@ async fn configured_peers_retry_until_late_peer_comes_online() -> Result<(), Dyn
         .add_peer_with_node_id(
             node_a.registry.bind_addr,
             Some(node_a.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
     node_b
@@ -548,7 +553,11 @@ async fn configured_peer_reconnects_within_one_second_after_drop_and_return() ->
     .await?;
     node_a
         .registry
-        .add_peer_with_node_id(addr_b, Some(peer_b_id.to_node_id()))
+        .add_peer_with_node_id(
+            addr_b,
+            Some(peer_b_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     node_a
         .registry
@@ -559,6 +568,7 @@ async fn configured_peer_reconnects_within_one_second_after_drop_and_return() ->
         .add_peer_with_node_id(
             node_a.registry.bind_addr,
             Some(node_a.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
     node_b
@@ -590,6 +600,7 @@ async fn configured_peer_reconnects_within_one_second_after_drop_and_return() ->
         .add_peer_with_node_id(
             node_a.registry.bind_addr,
             Some(node_a.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
     node_b

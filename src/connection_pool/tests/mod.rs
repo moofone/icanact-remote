@@ -3168,6 +3168,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         current_session_source: None,
         current_session_connection: None,
         current_session_epoch: 0,
+        identity_verified: false,
     }
 }
 
@@ -4063,7 +4064,11 @@ async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption()
     let dial_addr: SocketAddr = "127.0.0.1:7451".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
     registry
-        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            dial_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     registry
         .arm_sequence_reset_for_new_session(
@@ -4162,7 +4167,11 @@ async fn outbound_stale_finalizer_arm_after_supersession_does_not_clobber_newer_
     let dial_addr: SocketAddr = "127.0.0.1:7460".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
     registry
-        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            dial_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // The STALE outbound candidate: published first, but its own arm call
@@ -4309,7 +4318,11 @@ async fn arm_sequence_reset_stale_task_racing_the_lock_does_not_clobber_newer_se
     let dial_addr: SocketAddr = "127.0.0.1:7461".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
     registry
-        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            dial_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     fn make_connection(addr: SocketAddr) -> Arc<LockFreeConnection> {
@@ -4423,7 +4436,11 @@ async fn old_draining_connection_delta_cannot_restore_pre_restart_high_water() {
         .upsert_sync(owner.clone(), peer_addr);
 
     registry
-        .add_peer_with_node_id(peer_addr, Some(node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Pre-restart: peer is at sequence 40 via a genuine FullSync from the
@@ -4591,7 +4608,11 @@ async fn non_arming_successor_connections_full_sync_is_accepted_after_armed_conn
     let bind_addr: SocketAddr = "127.0.0.1:7470".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, bind_addr);
     registry
-        .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            bind_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Connection A: authenticates with a decodable GossipNodeId and arms a
@@ -4739,7 +4760,11 @@ async fn full_sync_stale_apply_paused_between_validation_and_mutation_is_dropped
     let peer_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59101".parse().unwrap();
@@ -4914,7 +4939,11 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
     // starts at the "never armed" sentinel 0), the precondition an
     // ABA-vulnerable per-peer counter would collide on after recreation.
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     let old_addr: SocketAddr = "127.0.0.1:59401".parse().unwrap();
     let old_conn = qa_r11_generation_race_connection(old_addr);
@@ -4981,7 +5010,11 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
                         gossip_state.peers.remove(&peer_addr);
                     }
                     registry_for_hook
-                        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+                        .add_peer_with_node_id(
+                            peer_addr,
+                            Some(remote_node_id),
+                            crate::addr_ownership::ClaimKind::Verified,
+                        )
                         .await;
 
                     // The replacement's arm is this FRESH PeerInfo's
@@ -5093,7 +5126,11 @@ async fn late_message_from_superseded_armed_source_is_rejected_not_self_healed()
     let peer_addr: SocketAddr = "127.0.0.1:7484".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Baseline established BEFORE any session is armed: last_sequence=40,
@@ -5284,7 +5321,11 @@ async fn stale_third_connection_cannot_self_heal_while_a_different_successor_is_
     let peer_addr: SocketAddr = "127.0.0.1:7486".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Baseline, before any session is armed.
@@ -5449,7 +5490,11 @@ async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_book
         .upsert_sync(remote_peer_id.clone(), peer_addr);
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Seed failure/health state that a stale message must NOT be able to
@@ -5576,7 +5621,11 @@ async fn delta_gossip_stale_apply_paused_between_validation_and_mutation_is_drop
         .upsert_sync(remote_peer_id.clone(), peer_addr);
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59201".parse().unwrap();
@@ -5736,7 +5785,11 @@ async fn delta_gossip_response_stale_apply_paused_between_validation_and_mutatio
         .upsert_sync(remote_peer_id.clone(), peer_addr);
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59301".parse().unwrap();
@@ -9629,7 +9682,11 @@ async fn fresh_outbound_connect_arms_restart_exemption_so_post_restart_sync_is_a
     let new_session_addr: SocketAddr = "127.0.0.1:57202".parse().unwrap();
 
     registry
-        .add_peer_with_node_id(peer_addr, Some(node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Pre-restart: peer is at a high sequence over an old session.

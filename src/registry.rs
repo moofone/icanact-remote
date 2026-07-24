@@ -1193,6 +1193,17 @@ pub struct PeerInfo {
     /// newer session has since been armed or the old one has expired, and
     /// the pending write must be dropped rather than applied.
     pub current_session_epoch: u64,
+    /// Whether `node_id`'s ownership of this address has been established by
+    /// a `ClaimKind::Verified` claim (see `crate::addr_ownership`): an
+    /// observed connection (inbound accept, successful outbound dial) or an
+    /// explicit local `configure_peer`, as opposed to a peer's bare
+    /// self-report or a third-party gossip mention. Consulted by
+    /// `ownership_owner` alongside `inbound_observed`/`outbound_dial_success`/
+    /// `current_session_source` so a verified claim recorded purely via
+    /// `add_peer_with_node_id` (which does not itself flip those
+    /// connection-lifecycle flags) is still remembered as verified for the
+    /// next arbitration decision on this address.
+    pub identity_verified: bool,
 }
 
 impl PeerInfo {
@@ -1220,6 +1231,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         }
     }
 
@@ -1255,6 +1267,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         }
     }
 
@@ -1266,6 +1279,34 @@ impl PeerInfo {
     /// Get the DNS name if configured
     pub fn get_dns_name(&self) -> Option<&str> {
         self.dns_name.as_deref()
+    }
+
+    /// The current owner of this entry's address, for address-ownership
+    /// arbitration (`crate::addr_ownership::arbitrate`).
+    ///
+    /// A `node_id` alone does not make an entry a verified owner: it can be
+    /// filled in purely from a peer's self-report (e.g. `add_peer_with_node_id`
+    /// called with a node id looked up from an unrelated, unauthenticated
+    /// context). Treat the entry as verified only when it is additionally
+    /// backed by an observed connection: an inbound accept, a successful
+    /// outbound dial, or a live authenticated session
+    /// (`current_session_source`). Otherwise it is provisional. An entry
+    /// with no `node_id` at all has no arbitratable owner.
+    pub fn ownership_owner(&self) -> Option<crate::addr_ownership::Owner> {
+        let node_id = self.node_id?;
+        let kind = if self.identity_verified
+            || self.inbound_observed
+            || self.outbound_dial_success
+            || self.current_session_source.is_some()
+        {
+            crate::addr_ownership::ClaimKind::Verified
+        } else {
+            crate::addr_ownership::ClaimKind::Provisional
+        };
+        Some(crate::addr_ownership::Owner {
+            node_id: node_id.to_peer_id(),
+            kind,
+        })
     }
 
     /// Update the resolved address (called after DNS re-resolution)
@@ -1311,6 +1352,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         })
     }
 }
@@ -2167,6 +2209,7 @@ impl<T: 'static> GossipRegistry<T> {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -2437,7 +2480,15 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Add a new peer (called when receiving connections)
     pub async fn add_peer(&self, peer_addr: SocketAddr) {
-        self.add_peer_with_node_id(peer_addr, None).await;
+        // No identity is claimed here, so arbitration inside
+        // `add_peer_with_node_id` is a no-op regardless of `claim_kind`;
+        // `Provisional` documents that nothing is being verified.
+        self.add_peer_with_node_id(
+            peer_addr,
+            None,
+            crate::addr_ownership::ClaimKind::Provisional,
+        )
+        .await;
     }
 
     /// R-11: arm the one-shot lower-sequence acceptance for a peer whose
@@ -2558,6 +2609,7 @@ impl<T: 'static> GossipRegistry<T> {
         &self,
         peer_addr: SocketAddr,
         node_id: Option<crate::GossipNodeId>,
+        claim_kind: crate::addr_ownership::ClaimKind,
     ) {
         debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
         if peer_addr.ip().is_unspecified() || peer_addr.port() == 0 {
@@ -2578,17 +2630,62 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         }
         if peer_addr != self.bind_addr {
+            // Arbitrate the address claim before any address-keyed mutation.
+            // `peer_addr != self.bind_addr` above already rules out the
+            // local-address case, so `is_local_addr` is always false here.
+            // No claimed identity means nothing to arbitrate; fall through
+            // to the existing no-identity bookkeeping unchanged.
+            // Effective verification kind to persist on this address's
+            // PeerInfo when the claim is accepted below, applying the
+            // never-downgrade rule for same-node refreshes. `None` when
+            // there is no claimed identity at all (nothing to persist).
+            let mut resolved_identity_verified: Option<bool> = None;
+            if let Some(claimed_node_id) = node_id {
+                let claimant = claimed_node_id.to_peer_id();
+                let current_owner = {
+                    let gossip_state = self.gossip_state.lock().await;
+                    gossip_state
+                        .peers
+                        .get(&peer_addr)
+                        .and_then(PeerInfo::ownership_owner)
+                };
+                let claim = crate::addr_ownership::Claim {
+                    node_id: claimant.clone(),
+                    kind: claim_kind,
+                };
+                if let crate::addr_ownership::Decision::Reject(reason) =
+                    crate::addr_ownership::arbitrate(current_owner.clone(), claim.clone(), false)
+                {
+                    debug!(
+                        peer = %peer_addr,
+                        claimant = %claimant,
+                        ?reason,
+                        "rejecting address claim: ownership conflict"
+                    );
+                    return;
+                }
+                resolved_identity_verified = Some(matches!(
+                    crate::addr_ownership::resolved_kind(current_owner.as_ref(), &claim),
+                    crate::addr_ownership::ClaimKind::Verified
+                ));
+            }
             {
                 let mut gossip_state = self.gossip_state.lock().await;
 
                 // Check if we already have this peer
                 if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
-                    // Update GossipNodeId if provided and not already set
-                    if node_id.is_some() && existing_peer.node_id.is_none() {
+                    // Update the GossipNodeId when one is claimed and either
+                    // none was recorded yet, or arbitration above accepted a
+                    // change of owner (e.g. a verified claim displacing a
+                    // provisional one).
+                    if node_id.is_some() && existing_peer.node_id != node_id {
                         existing_peer.node_id = node_id;
                         debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
                     } else {
                         debug!(peer = %peer_addr, "peer already tracked");
+                    }
+                    if let Some(identity_verified) = resolved_identity_verified {
+                        existing_peer.identity_verified = identity_verified;
                     }
                 } else {
                     // New peer
@@ -2623,6 +2720,7 @@ impl<T: 'static> GossipRegistry<T> {
                             current_session_source: None,
                             current_session_connection: None,
                             current_session_epoch: 0,
+                            identity_verified: resolved_identity_verified.unwrap_or(false),
                         },
                     );
 
@@ -4622,6 +4720,7 @@ impl<T: 'static> GossipRegistry<T> {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        identity_verified: false,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -7878,6 +7977,7 @@ impl<T: 'static> GossipRegistry<T> {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -8166,7 +8266,6 @@ impl<T: 'static> GossipRegistry<T> {
 mod tests {
     use super::*;
     use crate::{KeyPair, PeerId};
-    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
@@ -9137,7 +9236,12 @@ mod tests {
         let old_connection = test_addr(55001);
         let new_connection = test_addr(55002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync_from(
             &reg,
             &owner,
@@ -9220,7 +9324,12 @@ mod tests {
         let node_id = owner.to_node_id();
         let peer_addr = test_addr(9401);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
 
         // Pre-restart: B is at sequence 40 hosting X and Y.
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11/X", "qa_r11/Y"]).await;
@@ -9262,7 +9371,12 @@ mod tests {
         let node_id = owner.to_node_id();
         let peer_addr = test_addr(9402);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11r/X", "qa_r11r/Y"]).await;
 
         // No new session — a replayed old FullSync omitting Y must NOT prune Y.
@@ -9308,8 +9422,12 @@ mod tests {
             .to_node_id();
         let peer_addr = test_addr(9403);
 
-        reg.add_peer_with_node_id(peer_addr, Some(owner.to_node_id()))
-            .await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(owner.to_node_id()),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11i/X", "qa_r11i/Y"]).await;
 
         // A different identity must not be able to arm the victim's reset.
@@ -9387,7 +9505,12 @@ mod tests {
         let old_connection = test_addr(57001);
         let new_connection = test_addr(57002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         // Pre-restart: peer is at sequence 40.
         qa_r11_full_sync_from(
             &reg,
@@ -9484,7 +9607,12 @@ mod tests {
         let old_connection = test_addr(58001);
         let new_connection = test_addr(58002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync_from(
             &reg,
             &owner,
@@ -9561,7 +9689,12 @@ mod tests {
         let old_local_session = test_addr(56001);
         let new_local_session = test_addr(56002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync_with_session_source(
             &reg,
             &owner,
@@ -10032,6 +10165,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -10314,6 +10448,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         }
     }
 
@@ -10414,6 +10549,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -11232,6 +11368,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -11256,6 +11393,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -13301,7 +13439,11 @@ mod tests {
 
         // Peer re-announced at a new address with the same identity.
         registry
-            .add_peer_with_node_id(new_addr, Some(node_id))
+            .add_peer_with_node_id(
+                new_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         let after = pool.get_connection_by_peer_id(&peer_id);
@@ -13354,7 +13496,11 @@ mod tests {
 
         // Peer re-announced at a new address with the same identity.
         registry
-            .add_peer_with_node_id(new_addr, Some(node_id))
+            .add_peer_with_node_id(
+                new_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         assert_eq!(
@@ -13758,6 +13904,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -13832,6 +13979,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -13902,6 +14050,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -13954,6 +14103,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -14048,6 +14198,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut seeded = HashSet::new();
@@ -14171,6 +14322,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -14359,6 +14511,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -14450,6 +14603,7 @@ mod tests {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        identity_verified: false,
                     },
                 );
             }
@@ -14541,6 +14695,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -14624,6 +14779,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -15412,6 +15568,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -15473,6 +15630,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -15524,6 +15682,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
 
         // Convert to gossip format
@@ -15917,6 +16076,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16380,6 +16540,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16523,6 +16684,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16568,6 +16730,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16613,6 +16776,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16671,6 +16835,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16736,6 +16901,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -16831,6 +16997,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -16891,6 +17058,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16974,6 +17142,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -17044,6 +17213,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -17106,6 +17276,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -17260,6 +17431,271 @@ mod tests {
                 .read_sync(&required, |_, _| ())
                 .is_some(),
             "configured-peer liveness edge state must survive periodic pruning"
+        );
+    }
+
+    // ===================== addr_ownership wiring (Stage 1) =====================
+    //
+    // These exercise `add_peer_with_node_id`'s fail-closed early return via
+    // `crate::addr_ownership::arbitrate`. The check and the eventual
+    // gossip_state/addr_to_peer_id mutation are still two separate lock
+    // acquisitions here (Stage 2 will make that atomic via a single-owner
+    // actor); these tests only assert the decision itself is fail-closed and
+    // that a rejected claim mutates nothing.
+
+    /// A comparable snapshot of the fields `add_peer_with_node_id` could
+    /// possibly touch, used to assert "nothing mutated" byte-for-byte.
+    /// `current_session_connection` (a `Weak`) is intentionally omitted: it
+    /// is never written by `add_peer_with_node_id` and `Weak` has no
+    /// meaningful equality.
+    #[derive(Debug, PartialEq, Eq)]
+    struct PeerInfoSnapshot {
+        address: SocketAddr,
+        peer_address: Option<SocketAddr>,
+        inbound_observed: bool,
+        outbound_dial_success: bool,
+        node_id: Option<crate::GossipNodeId>,
+        dns_name: Option<String>,
+        failures: usize,
+        last_attempt: u64,
+        last_success: u64,
+        last_sequence: u64,
+        last_sent_sequence: u64,
+        consecutive_deltas: u64,
+        last_failure_time: Option<u64>,
+        last_dns_refresh_attempt: Option<u64>,
+        last_response_received_ms: u64,
+        accept_lower_sequence_from: Option<SocketAddr>,
+        current_session_source: Option<SocketAddr>,
+        current_session_epoch: u64,
+    }
+
+    impl From<&PeerInfo> for PeerInfoSnapshot {
+        fn from(p: &PeerInfo) -> Self {
+            Self {
+                address: p.address,
+                peer_address: p.peer_address,
+                inbound_observed: p.inbound_observed,
+                outbound_dial_success: p.outbound_dial_success,
+                node_id: p.node_id,
+                dns_name: p.dns_name.clone(),
+                failures: p.failures,
+                last_attempt: p.last_attempt,
+                last_success: p.last_success,
+                last_sequence: p.last_sequence,
+                last_sent_sequence: p.last_sent_sequence,
+                consecutive_deltas: p.consecutive_deltas,
+                last_failure_time: p.last_failure_time,
+                last_dns_refresh_attempt: p.last_dns_refresh_attempt,
+                last_response_received_ms: p.last_response_received_ms,
+                accept_lower_sequence_from: p.accept_lower_sequence_from,
+                current_session_source: p.current_session_source,
+                current_session_epoch: p.current_session_epoch,
+            }
+        }
+    }
+
+    async fn snapshot_peer(registry: &GossipRegistry<()>, addr: SocketAddr) -> PeerInfoSnapshot {
+        let gossip_state = registry.gossip_state.lock().await;
+        PeerInfoSnapshot::from(
+            gossip_state
+                .peers
+                .get(&addr)
+                .expect("peer must exist for snapshot"),
+        )
+    }
+
+    /// Steady-state hijack blocked: an attacker claiming a verified peer's
+    /// address, even with a `Verified`-flavored claim, mutates NOTHING —
+    /// `peers`, `addr_to_peer_id`, `peer_to_actors`, and `last_sequence` are
+    /// all byte-for-byte (field-for-field) unchanged after the rejected claim.
+    #[tokio::test]
+    async fn addr_ownership_hijack_of_verified_owner_mutates_nothing() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_001), test_config());
+        let addr = test_addr(20_002);
+        let victim = test_peer_id("addr-ownership-victim").to_node_id();
+        let attacker = test_peer_id("addr-ownership-attacker").to_node_id();
+
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(victim),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        // Give the victim some actor/routing state so a hijack that DID
+        // mutate would show up here too.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert("victim_actor".to_string());
+            if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                peer_info.last_sequence = 42;
+            }
+        }
+
+        let before_snapshot = snapshot_peer(&registry, addr).await;
+        let before_addr_to_peer_id = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&addr, |_, v| v.clone());
+        let before_peer_to_actors = {
+            let gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peer_to_actors.get(&addr).cloned()
+        };
+
+        // Attacker claims the same address with a DIFFERENT node id, even as
+        // a Verified claim (the strongest kind) -- a verified owner must
+        // never be displaced.
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(attacker),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let after_snapshot = snapshot_peer(&registry, addr).await;
+        let after_addr_to_peer_id = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&addr, |_, v| v.clone());
+        let after_peer_to_actors = {
+            let gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peer_to_actors.get(&addr).cloned()
+        };
+
+        assert_eq!(
+            before_snapshot, after_snapshot,
+            "rejected hijack claim must not mutate the victim's PeerInfo"
+        );
+        assert_eq!(
+            before_addr_to_peer_id, after_addr_to_peer_id,
+            "rejected hijack claim must not touch addr_to_peer_id"
+        );
+        assert_eq!(
+            before_peer_to_actors, after_peer_to_actors,
+            "rejected hijack claim must not touch peer_to_actors"
+        );
+        assert_eq!(
+            after_snapshot.node_id,
+            Some(victim),
+            "victim must still own the address"
+        );
+    }
+
+    /// A provisional alias yields to a genuinely verified claim for the same
+    /// address: the new (verified) owner replaces the old (provisional) one.
+    #[tokio::test]
+    async fn addr_ownership_provisional_alias_yields_to_verified_claim() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_003), test_config());
+        let addr = test_addr(20_004);
+        let provisional_claimant = test_peer_id("addr-ownership-provisional").to_node_id();
+        let verified_claimant = test_peer_id("addr-ownership-verified").to_node_id();
+
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(provisional_claimant),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        let mid_snapshot = snapshot_peer(&registry, addr).await;
+        assert_eq!(mid_snapshot.node_id, Some(provisional_claimant));
+
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(verified_claimant),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let final_snapshot = snapshot_peer(&registry, addr).await;
+        assert_eq!(
+            final_snapshot.node_id,
+            Some(verified_claimant),
+            "a genuinely verified claim must displace a merely provisional alias"
+        );
+        let addr_to_peer_id_entry = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&addr, |_, v| v.clone());
+        assert_eq!(
+            addr_to_peer_id_entry,
+            Some(verified_claimant.to_peer_id()),
+            "connection pool routing must follow the newly verified owner"
+        );
+    }
+
+    /// A remote peer claiming this node's own bind/advertised address is
+    /// rejected outright, regardless of current ownership state.
+    #[tokio::test]
+    async fn addr_ownership_local_address_claim_is_rejected() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_005), test_config());
+        let attacker = test_peer_id("addr-ownership-local-attacker").to_node_id();
+
+        registry
+            .add_peer_with_node_id(
+                registry.bind_addr,
+                Some(attacker),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.peers.contains_key(&registry.bind_addr),
+            "a remote claim on this node's own bind address must never be adopted"
+        );
+        drop(gossip_state);
+        let addr_to_peer_id_entry = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&registry.bind_addr, |_, v| v.clone());
+        assert_eq!(
+            addr_to_peer_id_entry, None,
+            "the local address must never be routed to a remote claimant"
+        );
+    }
+
+    /// Regression: a legitimate same-owner refresh, and a first claim of a
+    /// brand-new address, both still succeed after the arbitration wiring.
+    #[tokio::test]
+    async fn addr_ownership_same_owner_refresh_and_new_address_claim_still_succeed() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_006), test_config());
+        let owner = test_peer_id("addr-ownership-legit-owner").to_node_id();
+
+        // First claim of a brand-new (unowned) address.
+        let new_addr = test_addr(20_007);
+        registry
+            .add_peer_with_node_id(
+                new_addr,
+                Some(owner),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        assert_eq!(
+            snapshot_peer(&registry, new_addr).await.node_id,
+            Some(owner)
+        );
+
+        // Same-owner refresh, now with a Verified claim (kind upgrade path).
+        registry
+            .add_peer_with_node_id(
+                new_addr,
+                Some(owner),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(
+            snapshot_peer(&registry, new_addr).await.node_id,
+            Some(owner),
+            "a same-owner refresh must still succeed"
         );
     }
 }

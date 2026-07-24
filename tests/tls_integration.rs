@@ -130,11 +130,19 @@ fn test_mutual_authentication() {
         // Add peers with GossipNodeIds for TLS
         registry_a
             .registry
-            .add_peer_with_node_id(addr_b, Some(node_id_b))
+            .add_peer_with_node_id(
+                addr_b,
+                Some(node_id_b),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         registry_b
             .registry
-            .add_peer_with_node_id(addr_a, Some(node_id_a))
+            .add_peer_with_node_id(
+                addr_a,
+                Some(node_id_a),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // Manually trigger connection from the lexicographically smaller GossipNodeId to
@@ -236,11 +244,19 @@ fn test_impersonation_prevention() {
         // This should fail during TLS handshake
         registry_a
             .registry
-            .add_peer_with_node_id(addr_imposter, Some(node_id_a))
+            .add_peer_with_node_id(
+                addr_imposter,
+                Some(node_id_a),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await; // Wrong GossipNodeId!
         registry_imposter
             .registry
-            .add_peer_with_node_id(addr_a, Some(node_id_imposter))
+            .add_peer_with_node_id(
+                addr_a,
+                Some(node_id_imposter),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // Register an actor on imposter
@@ -317,11 +333,19 @@ fn test_bidirectional_tls_communication() {
         // Both sides need to know about each other for bidirectional gossip
         registry_a
             .registry
-            .add_peer_with_node_id(addr_b, Some(node_id_b))
+            .add_peer_with_node_id(
+                addr_b,
+                Some(node_id_b),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         registry_b
             .registry
-            .add_peer_with_node_id(addr_a, Some(node_id_a))
+            .add_peer_with_node_id(
+                addr_a,
+                Some(node_id_a),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // Register actors on both sides
@@ -409,11 +433,19 @@ fn test_multi_node_tls_chain() {
         // Set up chain topology
         registry_a
             .registry
-            .add_peer_with_node_id(addr_b, Some(node_id_b))
+            .add_peer_with_node_id(
+                addr_b,
+                Some(node_id_b),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         registry_b
             .registry
-            .add_peer_with_node_id(addr_c, Some(node_id_c))
+            .add_peer_with_node_id(
+                addr_c,
+                Some(node_id_c),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         connect_preferred(&registry_a, &registry_b).await;
         connect_preferred(&registry_b, &registry_c).await;
@@ -504,11 +536,19 @@ fn test_tls_reconnection() {
         // Connect them
         registry_a
             .registry
-            .add_peer_with_node_id(addr_b, Some(node_id_b))
+            .add_peer_with_node_id(
+                addr_b,
+                Some(node_id_b),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         registry_b
             .registry
-            .add_peer_with_node_id(addr_a, Some(node_id_a))
+            .add_peer_with_node_id(
+                addr_a,
+                Some(node_id_a),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // Register an actor on A
@@ -560,7 +600,11 @@ fn test_tls_reconnection() {
         // Update A's peer info to point to B's new address
         registry_a
             .registry
-            .add_peer_with_node_id(addr_b_new, Some(node_id_b))
+            .add_peer_with_node_id(
+                addr_b_new,
+                Some(node_id_b),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // Manually trigger immediate connection to new address for robustness, using the
@@ -708,13 +752,21 @@ fn test_instant_gossip_with_long_interval() {
         // Connect B to A
         registry_b
             .registry
-            .add_peer_with_node_id(addr_a, Some(node_id_a))
+            .add_peer_with_node_id(
+                addr_a,
+                Some(node_id_a),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // Connect A to B for bidirectional communication
         registry_a
             .registry
-            .add_peer_with_node_id(addr_b, Some(node_id_b))
+            .add_peer_with_node_id(
+                addr_b,
+                Some(node_id_b),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // Manually trigger immediate connection since add_peer is passive and gossip interval is
