@@ -68,6 +68,21 @@ pub enum Decision {
     Reject(RejectReason),
 }
 
+/// Outcome of a caller's attempt to claim an address for an identity (e.g.
+/// via `GossipRegistry::add_peer_with_node_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrClaimOutcome {
+    /// The address is now attributed to the claimed identity, or already
+    /// was. Safe to perform further address-keyed work for this address.
+    Accepted,
+    /// The claim was refused — an ownership conflict, an invalid address,
+    /// or a self-identity/self-address filter. Callers must not perform any
+    /// further address-keyed mutation for this address; either stop, or
+    /// retry the claim against a different, unambiguous address (e.g. the
+    /// raw observed TCP source of the connection).
+    Rejected,
+}
+
 /// Decide whether `claim` may take (or refresh) ownership of an address
 /// currently recorded as owned by `current` (`None` if unowned).
 ///
@@ -409,17 +424,24 @@ mod tests {
 
     #[test]
     fn t_arb_resolved_kind_other_node_takes_claim_kind() {
+        // current is a Verified OTHER node, claim is Provisional: if
+        // resolved_kind wrongly consulted the old owner's kind instead of
+        // recognizing the node id differs, it would wrongly return Verified
+        // here. Only reached in practice when arbitrate() already returned
+        // Accept for a differing-node case (not this exact combination —
+        // this test exercises resolved_kind in isolation to prove it keys
+        // off node identity, not merely "was there a prior owner").
         let current = Owner {
             node_id: node_a(),
             kind: ClaimKind::Verified,
         };
         let claim = Claim {
             node_id: node_b(),
-            kind: ClaimKind::Verified,
+            kind: ClaimKind::Provisional,
         };
-        // Only reached when arbitrate() already returned Accept (provisional
-        // other + verified claim); resolved_kind must not consult the old
-        // owner's kind in that case.
-        assert_eq!(resolved_kind(Some(&current), &claim), ClaimKind::Verified);
+        assert_eq!(
+            resolved_kind(Some(&current), &claim),
+            ClaimKind::Provisional
+        );
     }
 }

@@ -509,19 +509,21 @@ impl<T> ConnectionPool<T> {
                         if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
                             if let Some(cert) = certs.first() {
                                 if let Ok(node_id) = crate::tls::extract_node_id_from_cert(cert) {
-                                    if registry_arc.lookup_node_id(&addr).await.is_none() {
-                                        // We dialed `addr` ourselves and just completed a TLS
-                                        // handshake with it: the peer certificate's node id is
-                                        // backed by an outbound connection we initiated, not a
-                                        // self-report, so it is a verified claim.
-                                        registry_arc
-                                            .add_peer_with_node_id(
-                                                addr,
-                                                Some(node_id),
-                                                crate::addr_ownership::ClaimKind::Verified,
-                                            )
-                                            .await;
-                                    }
+                                    // We dialed `addr` ourselves and just completed a TLS
+                                    // handshake with it: the peer certificate's node id is
+                                    // backed by an outbound connection we initiated, not a
+                                    // self-report, so it is a verified claim. Submit it
+                                    // unconditionally (not just when nothing was known for
+                                    // `addr` yet) and let `arbitrate` decide -- this is exactly
+                                    // how a genuinely verified identity is meant to displace a
+                                    // provisional one gossip may have installed earlier.
+                                    let _ = registry_arc
+                                        .add_peer_with_node_id(
+                                            addr,
+                                            Some(node_id),
+                                            crate::addr_ownership::ClaimKind::Verified,
+                                        )
+                                        .await;
                                     discovered_node_id = Some(node_id);
                                 }
                             }

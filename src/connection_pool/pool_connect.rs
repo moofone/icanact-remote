@@ -4393,7 +4393,8 @@ pub(crate) fn handle_incoming_message(
                 } else {
                     crate::addr_ownership::ClaimKind::Provisional
                 };
-                let is_local_addr = sender_socket_addr == registry.bind_addr;
+                let is_local_addr = sender_socket_addr == registry.bind_addr
+                    || sender_socket_addr == registry.advertised_addr();
                 let current_owner = {
                     let gossip_state = registry.gossip_state.lock().await;
                     gossip_state
@@ -4855,7 +4856,8 @@ pub(crate) fn handle_incoming_message(
                 } else {
                     crate::addr_ownership::ClaimKind::Provisional
                 };
-                let is_local_addr = sender_socket_addr == registry.bind_addr;
+                let is_local_addr = sender_socket_addr == registry.bind_addr
+                    || sender_socket_addr == registry.advertised_addr();
                 let current_owner = {
                     let gossip_state = registry.gossip_state.lock().await;
                     gossip_state
