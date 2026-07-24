@@ -461,7 +461,7 @@ impl PeerDiscovery {
 
     /// Check if we're at the soft cap
     pub fn at_soft_cap(&self) -> bool {
-        self.connected_peer_count() >= self.config.max_peers
+        self.connected_peer_count() + self.pending_peer_count() >= self.config.max_peers
     }
 
     /// Get remaining slots available for new connections
@@ -1063,6 +1063,23 @@ mod tests {
         // Clear pending
         discovery.clear_pending(&peer);
         assert!(discovery.get_peer_state(&peer).is_none());
+    }
+
+    #[test]
+    fn pending_peer_reaches_soft_cap() {
+        let local = test_addr(8080);
+        let mut discovery = PeerDiscovery::new(
+            local,
+            PeerDiscoveryConfig {
+                max_peers: 1,
+                ..Default::default()
+            },
+        );
+
+        let candidates = discovery.on_peer_list_gossip(&[create_peer_gossip("10.0.0.1:9006")]);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(discovery.at_soft_cap());
     }
 
     #[test]
