@@ -1,3 +1,50 @@
+/// Provenance of an address-ownership claim: whether it is backed by an
+/// actually-observed connection at this exact address, or merely inferred
+/// from a peer's self-reported claim (e.g. the wire `sender_bind_addr`
+/// field, or a third-party relay in peer-list gossip).
+///
+/// A VERIFIED claim is anchored to something WE observed directly: the raw
+/// TCP source of an authenticated connection, a successful outbound dial
+/// target we chose ourselves, or explicit local configuration
+/// (`configure_peer`). A PROVISIONAL claim is anchored to nothing but the
+/// claimant's own say-so about a DIFFERENT address than the one it is
+/// actually connected from -- exactly the case a malicious peer can
+/// exploit by advertising an address it does not own. Ownership
+/// arbitration (`claim_addr_ownership`) lets a provisional alias YIELD to a
+/// subsequently-verified claim from a different peer (so a malicious
+/// peer's early, unverified claim can never permanently lock out the real
+/// owner once it authenticates), while a VERIFIED owner is never displaced,
+/// and two competing provisional claims resolve first-come-first-served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddrClaimKind {
+    Verified,
+    Provisional,
+}
+
+/// Address-ownership provenance and generation, stored alongside (keyed by
+/// the same address as) `addr_to_peer_id`. `generation` is bumped on EVERY
+/// successful `claim_addr_ownership` call for that address -- by ANY
+/// caller, not just the one that captured it -- so a claim-then-commit
+/// sequence spanning an `.await` (or any gap between two lock
+/// acquisitions) can cheaply detect whether some OTHER ownership writer
+/// (`configure_peer`, DNS refresh, reindexing, another handler) has
+/// claimed or re-claimed the address in the interim, even if ownership
+/// superficially looks unchanged (an ABA change is still a change). This
+/// mirrors the `current_session_epoch` / `session_epoch_still_current`
+/// pattern already used for session-arming races.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AddrOwnershipMeta {
+    pub verified: bool,
+    pub generation: u64,
+}
+
+static ADDR_OWNERSHIP_GENERATION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_addr_ownership_generation() -> u64 {
+    ADDR_OWNERSHIP_GENERATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Outcome of a connection keep/drop/dedup conflict for a single peer identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a connection conflict decision must be acted on explicitly by the \
@@ -252,6 +299,7 @@ impl<T> ConnectionPool<T> {
         let pool = Self {
             connections_by_peer: SccHashMap::default(),
             addr_to_peer_id: SccHashMap::default(),
+            addr_ownership_meta: SccHashMap::default(),
             peer_id_to_addr: SccHashMap::default(),
             connections_by_addr: SccHashMap::default(),
             peer_sessions: SccHashMap::default(),
@@ -1746,93 +1794,96 @@ impl<T> ConnectionPool<T> {
     /// This is needed when a peer connects FROM an ephemeral TCP port but advertises
     /// a different bind address in gossip. We need to update `connections_by_addr` so
     /// that lookups by the advertised address find the connection.
-    pub fn reindex_connection_addr(&self, peer_id: &crate::PeerId, new_addr: SocketAddr) {
+    ///
+    /// `new_addr_kind` is the PROVENANCE of `new_addr` (see
+    /// [`AddrClaimKind`]) -- callers resolving it from a peer-controlled
+    /// wire field must pass `Provisional` when it differs from the
+    /// connection's own actual source. `old_addr` (the connection's own raw
+    /// address, `connection.addr`) is always claimed as `Verified`: it is
+    /// self-evidently this peer's own address, since we are already
+    /// connected there.
+    ///
+    /// Every `addr_to_peer_id` write here now goes through
+    /// `claim_addr_ownership` -- the same atomic claim/generation primitive
+    /// every other ownership writer uses -- rather than an unconditional
+    /// upsert (previously: a conflicting different-peer mapping at
+    /// `new_addr` was simply evicted and overwritten). A lost claim at
+    /// `new_addr` skips indexing it (the connection remains reachable via
+    /// `old_addr`) rather than displacing whatever legitimately owns it.
+    pub(crate) fn reindex_connection_addr(
+        &self,
+        peer_id: &crate::PeerId,
+        new_addr: SocketAddr,
+        new_addr_kind: AddrClaimKind,
+    ) {
         // First, check if this peer still has an active connection
         // This guards against race conditions where disconnect happens between checks
         let Some(connection) = self.get_connection_by_peer_id(peer_id) else {
             // Peer was disconnected, nothing to reindex.
             return;
         };
+        let old_addr = connection.addr;
 
-        // Check if new_addr is already indexed
-        if let Some(existing_peer_id) = self.addr_to_peer_id.read_sync(&new_addr, |_, v| v.clone())
-        {
-            if existing_peer_id == *peer_id {
-                // Already indexed under the advertised address for this peer.
-                // Callers commonly upsert `addr_to_peer_id[new_addr]` themselves
-                // BEFORE calling this function (e.g. registry.rs's same-identity
-                // address-change path), so this branch fires on essentially
-                // every reindex. If we trusted the alias alone and returned, we
-                // could leave `connections_by_addr[new_addr]` missing or
-                // pointed at a stale/dead connection while
-                // `addr_to_peer_id[new_addr]` looks correct — a lookup/dial by
-                // the new address would then miss the live session and spin up
-                // a duplicate connection instead of reusing it. Always repair
-                // `connections_by_addr[new_addr]` to the current live
-                // connection so both maps stay consistent.
-                let _ = self
-                    .connections_by_addr
-                    .upsert_sync(new_addr, connection.clone());
-                // We still need to ensure the OLD (ephemeral) address is indexed too!
-                // Without this, lookups by ephemeral address fail after gossip rounds.
-                let old_addr = connection.addr;
-                if old_addr != new_addr && !self.connections_by_addr.contains_sync(&old_addr) {
-                    let _ = self
-                        .connections_by_addr
-                        .upsert_sync(old_addr, connection.clone());
-                    let _ = self.addr_to_peer_id.upsert_sync(old_addr, peer_id.clone());
-                    debug!(
-                        old_addr = %old_addr,
-                        new_addr = %new_addr,
-                        peer_id = %peer_id,
-                        "📍 Added missing ephemeral address mapping"
-                    );
-                }
-                return;
-            } else {
-                // Stale entry from different peer - remove it before reindexing
-                // This can happen if an old connection wasn't fully cleaned up
-                warn!(
-                    "CONNECTION POOL: Removing stale address mapping {} (was peer {}, now peer {})",
-                    new_addr, existing_peer_id, peer_id
-                );
-                let _ = self.connections_by_addr.remove_sync(&new_addr);
-                let _ = self.addr_to_peer_id.remove_sync(&new_addr);
-            }
+        // `old_addr` is the connection's own actually-observed source --
+        // self-evidently VERIFIED. Claim (or reconfirm) it before doing
+        // anything else; a rejection here means something is already
+        // deeply inconsistent (a different VERIFIED peer owns our own
+        // connection's raw address), so skip indexing it rather than
+        // displacing that owner.
+        let old_addr_claimed = self
+            .claim_addr_ownership(old_addr, peer_id, AddrClaimKind::Verified)
+            .is_some();
+        if !old_addr_claimed {
+            warn!(
+                old_addr = %old_addr,
+                peer_id = %peer_id,
+                "reindex: refusing to claim the connection's own address -- \
+                 already verified-owned by a different authenticated peer"
+            );
         }
 
-        let old_addr = connection.addr;
+        let new_addr_claimed = if new_addr == old_addr {
+            old_addr_claimed
+        } else {
+            self.claim_addr_ownership(new_addr, peer_id, new_addr_kind)
+                .is_some()
+        };
+        if !new_addr_claimed {
+            warn!(
+                new_addr = %new_addr,
+                peer_id = %peer_id,
+                "reindex: refusing to claim the advertised address -- already \
+                 owned by a different authenticated peer; connection remains \
+                 reachable only via its own observed address"
+            );
+        }
 
         // Double-check peer still exists (guard against concurrent disconnect)
         if !self.has_connection_by_peer_id(peer_id) {
             return;
         }
 
-        // Insert the connection under the new (advertised) address
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(new_addr, connection.clone());
-        let _ = self.addr_to_peer_id.upsert_sync(new_addr, peer_id.clone());
-        // Also update peer_id_to_addr so disconnect uses the correct address
-        self.set_discovered_peer_addr(peer_id, new_addr);
-
-        // IMPORTANT: Keep the old (ephemeral) address entry as well!
-        // Inbound messages still arrive with the TCP source address (old_addr),
-        // so we need both addresses to point to the same connection.
-        // The old entry is NOT removed - both addresses are valid for this peer.
-        if old_addr != new_addr {
-            // Re-insert connection under old addr to ensure both addresses work
-            let _ = self.connections_by_addr.upsert_sync(old_addr, connection);
-            // Keep addr_to_peer_id for old_addr so lookups work
-            let _ = self.addr_to_peer_id.upsert_sync(old_addr, peer_id.clone());
+        if old_addr_claimed {
+            let _ = self
+                .connections_by_addr
+                .upsert_sync(old_addr, connection.clone());
         }
 
-        info!(
-            old_addr = %old_addr,
-            new_addr = %new_addr,
-            peer_id = %peer_id,
-            "📍 Reindexed connection from ephemeral port to bind address"
-        );
+        if new_addr != old_addr && new_addr_claimed {
+            // Insert the connection under the new (advertised) address
+            let _ = self
+                .connections_by_addr
+                .upsert_sync(new_addr, connection.clone());
+            // Also update peer_id_to_addr so disconnect uses the correct address
+            self.set_discovered_peer_addr(peer_id, new_addr);
+
+            info!(
+                old_addr = %old_addr,
+                new_addr = %new_addr,
+                peer_id = %peer_id,
+                "📍 Reindexed connection from ephemeral port to bind address"
+            );
+        }
     }
 
     /// Get a connection by peer ID
@@ -1990,10 +2041,10 @@ impl<T> ConnectionPool<T> {
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id);
     }
 
-    /// Atomically claim `addr_to_peer_id[addr]` for `peer_id`: if the slot
-    /// is vacant, or already mapped to `peer_id` itself, set/confirm it and
-    /// return `true`. If it is already mapped to a DIFFERENT peer_id, the
-    /// slot is left completely untouched and this returns `false`.
+    /// Atomically claim address-ownership of `addr` for `peer_id`, with
+    /// PROVENANCE (`kind`) and a GENERATION counter that every ownership
+    /// writer bumps and every dependent commit re-validates -- the #156
+    /// session-epoch pattern applied to address ownership.
     ///
     /// `gossip_state`'s lock has no bearing on `addr_to_peer_id`'s own
     /// synchronization -- it is an independent, lock-free concurrent map,
@@ -2001,18 +2052,116 @@ impl<T> ConnectionPool<T> {
     /// address is currently unowned") can be stale by the time a caller
     /// gets around to writing here, racing every OTHER writer of this map
     /// (`configure_peer`, DNS refresh, reindexing, etc). `entry_sync` holds
-    /// this map's own per-bucket lock across the read-then-write, making
-    /// the check and the write a single atomic operation with respect to
-    /// every one of those writers, not just the caller's own prior
-    /// `gossip_state`-guarded check.
-    pub(crate) fn claim_addr_to_peer_id(&self, addr: SocketAddr, peer_id: &crate::PeerId) -> bool {
+    /// this map's own per-bucket lock across the read-then-write, and the
+    /// companion `addr_ownership_meta` write happens inside that SAME held
+    /// lock, making the check, the `addr_to_peer_id` write, and the
+    /// provenance/generation write one atomic operation with respect to
+    /// every other caller of this function -- not just the caller's own
+    /// prior `gossip_state`-guarded check.
+    ///
+    /// Rules:
+    /// - Vacant, or already `peer_id`'s own: claimed. Provisional claims by
+    ///   the same peer_id can be upgraded to verified, never downgraded.
+    /// - Occupied by a DIFFERENT peer_id, existing ownership PROVISIONAL,
+    ///   new claim VERIFIED: the provisional (wire-advertised) alias YIELDS
+    ///   to the genuinely-authenticated peer -- this is what stops a
+    ///   malicious peer's unverified `sender_bind_addr` claim from
+    ///   permanently locking out the real, later-authenticating owner.
+    /// - Occupied by a DIFFERENT peer_id in every other case (existing
+    ///   VERIFIED regardless of the new claim's kind, or both PROVISIONAL):
+    ///   rejected, untouched -- a verified owner is never displaced, and
+    ///   among equally-unverified claims the first one standing wins.
+    ///
+    /// Returns the (possibly bumped) generation on success, `None` on
+    /// rejection.
+    pub(crate) fn claim_addr_ownership(
+        &self,
+        addr: SocketAddr,
+        peer_id: &crate::PeerId,
+        kind: AddrClaimKind,
+    ) -> Option<u64> {
+        let claims_verified = kind == AddrClaimKind::Verified;
         match self.addr_to_peer_id.entry_sync(addr) {
             scc::hash_map::Entry::Vacant(vacant) => {
+                let generation = next_addr_ownership_generation();
                 vacant.insert_entry(peer_id.clone());
-                true
+                let _ = self.addr_ownership_meta.upsert_sync(
+                    addr,
+                    AddrOwnershipMeta {
+                        verified: claims_verified,
+                        generation,
+                    },
+                );
+                Some(generation)
             }
-            scc::hash_map::Entry::Occupied(occupied) => *occupied == *peer_id,
+            scc::hash_map::Entry::Occupied(mut occupied) => {
+                let existing_verified = self
+                    .addr_ownership_meta
+                    .read_sync(&addr, |_, m| m.verified)
+                    .unwrap_or(false);
+                if *occupied == *peer_id {
+                    let generation = next_addr_ownership_generation();
+                    let _ = self.addr_ownership_meta.upsert_sync(
+                        addr,
+                        AddrOwnershipMeta {
+                            verified: existing_verified || claims_verified,
+                            generation,
+                        },
+                    );
+                    Some(generation)
+                } else if !existing_verified && claims_verified {
+                    let generation = next_addr_ownership_generation();
+                    *occupied = peer_id.clone();
+                    let _ = self.addr_ownership_meta.upsert_sync(
+                        addr,
+                        AddrOwnershipMeta {
+                            verified: true,
+                            generation,
+                        },
+                    );
+                    Some(generation)
+                } else {
+                    None
+                }
+            }
         }
+    }
+
+    /// Whether `addr`'s current ownership record is still exactly
+    /// `expected_generation` -- the re-validation half of the claim/commit
+    /// transaction. Call this atomically (under whatever lock guards the
+    /// dependent commit) immediately before applying it: if some OTHER
+    /// ownership writer has claimed/re-claimed `addr` since the generation
+    /// was captured (even back to the same peer_id -- an ABA change is
+    /// still a change), this returns `false` and the pending commit must be
+    /// dropped rather than applied against a claim that is no longer
+    /// current.
+    pub(crate) fn addr_ownership_generation_still_current(
+        &self,
+        addr: &SocketAddr,
+        expected_generation: u64,
+    ) -> bool {
+        self.addr_ownership_generation(addr) == Some(expected_generation)
+    }
+
+    /// The CURRENT generation of `addr`'s ownership record, if any -- the
+    /// capture half of the claim/commit transaction (see
+    /// `addr_ownership_generation_still_current` for the re-validation
+    /// half).
+    pub(crate) fn addr_ownership_generation(&self, addr: &SocketAddr) -> Option<u64> {
+        self.addr_ownership_meta.read_sync(addr, |_, m| m.generation)
+    }
+
+    /// Whether `addr`'s ownership record (if any) is VERIFIED -- backed by
+    /// an actually-observed connection at this exact address, rather than
+    /// merely inferred from a peer's self-reported claim. Shared provenance
+    /// signal consulted by ownership-conflict arbitration wherever it needs
+    /// to know not just WHO currently owns an address but HOW authoritative
+    /// that ownership is.
+    pub(crate) fn addr_ownership_verified(&self, addr: &SocketAddr) -> bool {
+        self.addr_ownership_meta
+            .read_sync(addr, |_, m| m.verified)
+            .unwrap_or(false)
     }
 
     /// Get the shared correlation tracker for a peer ID
@@ -4406,6 +4555,20 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
+                // PROVENANCE: `sender_socket_addr` is VERIFIED only when it
+                // equals the connection's own actual TCP source
+                // (`_peer_addr`) -- i.e. the peer is connecting FROM the
+                // exact address it claims. Whenever `sender_bind_addr`
+                // resolved to something ELSE, this is a PROVISIONAL claim
+                // about a DIFFERENT address than the one it is actually
+                // connected from -- the wire-hijack surface this guard
+                // exists for.
+                let claim_kind = if sender_socket_addr == _peer_addr {
+                    crate::connection_pool::AddrClaimKind::Verified
+                } else {
+                    crate::connection_pool::AddrClaimKind::Provisional
+                };
+
                 // OPTIMIZATION: Do all peer management (and the ownership
                 // guard) in one lock acquisition. Checking and mutating
                 // under the SAME held lock closes the window a separate
@@ -4425,11 +4588,14 @@ pub(crate) fn handle_incoming_message(
                     // not a legitimate migration -- abort before a
                     // rejected frame can poison any bookkeeping keyed on
                     // the claimed address. Mirrors the DNS re-resolution
-                    // migration guard's collision pre-check.
+                    // migration guard's collision pre-check. A PROVISIONAL
+                    // existing owner yields to THIS claim only when this
+                    // claim is itself VERIFIED (see `addr_owned_by_other_node`).
                     if registry.addr_owned_by_other_node(
                         &gossip_state,
                         sender_socket_addr,
                         sender_peer_id.to_node_id(),
+                        claim_kind,
                     ) {
                         warn!(
                             tcp_source = %_peer_addr,
@@ -4452,13 +4618,15 @@ pub(crate) fn handle_incoming_message(
                     // exchange counter -- so a lost claim aborts with ZERO
                     // mutations, rather than after this handler has
                     // already poisoned bookkeeping under the address it
-                    // then fails to actually own. `claim_addr_to_peer_id`
+                    // then fails to actually own. `claim_addr_ownership`
                     // is a conditional upsert (holds the map's own bucket
                     // lock across the read-then-write) that only succeeds
-                    // if the slot is vacant or already this claimant's.
-                    if !registry
+                    // if the slot is vacant, already this claimant's, or a
+                    // provisional alias yielding to this VERIFIED claim.
+                    if registry
                         .connection_pool
-                        .claim_addr_to_peer_id(sender_socket_addr, &sender_peer_id)
+                        .claim_addr_ownership(sender_socket_addr, &sender_peer_id, claim_kind)
+                        .is_none()
                     {
                         warn!(
                             tcp_source = %_peer_addr,
@@ -4570,7 +4738,7 @@ pub(crate) fn handle_incoming_message(
                         // Note: reindex_connection_addr already has early-return if already indexed,
                         // and logs internally when it actually does work.
                         if sender_socket_addr != _peer_addr {
-                            pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
+                            pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr, claim_kind);
                         }
 
                         debug!(
@@ -4896,6 +5064,15 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
+                // PROVENANCE: see the FullSync handler above for the same
+                // rule -- verified only when the peer is connecting FROM
+                // the exact address it claims.
+                let claim_kind = if sender_socket_addr == _peer_addr {
+                    crate::connection_pool::AddrClaimKind::Verified
+                } else {
+                    crate::connection_pool::AddrClaimKind::Provisional
+                };
+
                 // Ownership guard FIRST -- before ANY address-keyed
                 // mutation. `sender_socket_addr` comes from the
                 // peer-controlled `sender_bind_addr` wire field; if it is
@@ -4906,18 +5083,20 @@ pub(crate) fn handle_incoming_message(
                 // abort before a rejected frame can poison any bookkeeping
                 // keyed on the claimed address (including the merge below).
                 // Mirrors the DNS re-resolution migration guard's collision
-                // pre-check. `record_inbound_gossip_extensions` is
-                // deliberately NOT called here: recording it now, this
-                // early, would let a claimant that later loses ownership
-                // during the awaited merge below (see the post-merge
-                // recheck) still install clock-echo state under an address
-                // it does not end up owning. It is deferred to the END of
-                // this handler, after the post-merge ownership recheck has
-                // also passed -- see there.
+                // pre-check. A PROVISIONAL existing owner yields to THIS
+                // claim only when this claim is itself VERIFIED.
+                // `record_inbound_gossip_extensions` is deliberately NOT
+                // called here: recording it now, this early, would let a
+                // claimant that later loses ownership during the awaited
+                // merge below (see the post-merge recheck) still install
+                // clock-echo state under an address it does not end up
+                // owning. It is deferred to the END of this handler, after
+                // the post-merge ownership recheck has also passed -- see
+                // there.
                 //
                 // CLAIM-FIRST: immediately after the read-only check,
                 // reserve `addr_to_peer_id[sender_socket_addr]` via
-                // `claim_addr_to_peer_id` -- BEFORE extensions, BEFORE the
+                // `claim_addr_ownership` -- BEFORE extensions, BEFORE the
                 // merge, before anything else address-keyed. `gossip_state`
                 // does NOT serialize `addr_to_peer_id` (an independent,
                 // lock-free concurrent map also written by `configure_peer`,
@@ -4925,8 +5104,9 @@ pub(crate) fn handle_incoming_message(
                 // read-only check alone can be stale by the time anything
                 // downstream runs; the claim itself is a conditional upsert
                 // (holds the map's own bucket lock across the
-                // read-then-write) that only succeeds if the slot is vacant
-                // or already this claimant's. A lost claim aborts here with
+                // read-then-write) that only succeeds if the slot is vacant,
+                // already this claimant's, or a provisional alias yielding
+                // to this VERIFIED claim. A lost claim aborts here with
                 // ZERO mutations, rather than after the merge has already
                 // written state under an address this handler doesn't
                 // actually own.
@@ -4936,6 +5116,7 @@ pub(crate) fn handle_incoming_message(
                         &gossip_state,
                         sender_socket_addr,
                         sender_peer_id.to_node_id(),
+                        claim_kind,
                     ) {
                         warn!(
                             tcp_source = %_peer_addr,
@@ -4946,9 +5127,10 @@ pub(crate) fn handle_incoming_message(
                         return Ok(());
                     }
                 }
-                if !registry
+                if registry
                     .connection_pool
-                    .claim_addr_to_peer_id(sender_socket_addr, &sender_peer_id)
+                    .claim_addr_ownership(sender_socket_addr, &sender_peer_id, claim_kind)
+                    .is_none()
                 {
                     warn!(
                         tcp_source = %_peer_addr,
@@ -4994,12 +5176,32 @@ pub(crate) fn handle_incoming_message(
                     &gossip_state,
                     sender_socket_addr,
                     sender_peer_id.to_node_id(),
+                    claim_kind,
                 ) {
                     warn!(
                         tcp_source = %_peer_addr,
                         claimed_bind_addr = %sender_socket_addr,
                         sender = %sender_peer_id,
                         "Rejecting FullSyncResponse post-merge routing update: sender_bind_addr claims an address already owned by a different authenticated peer"
+                    );
+                    return Ok(());
+                }
+                // Re-claim (not just re-read): bumps the generation once
+                // more so this reservation is confirmed current at the
+                // latest possible moment, immediately before the routing
+                // repoint below -- the gap between `merge_full_sync_from`
+                // returning and this lock acquisition is a real yield
+                // point another `addr_to_peer_id` writer could have used.
+                if registry
+                    .connection_pool
+                    .claim_addr_ownership(sender_socket_addr, &sender_peer_id, claim_kind)
+                    .is_none()
+                {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_bind_addr = %sender_socket_addr,
+                        sender = %sender_peer_id,
+                        "Rejecting FullSyncResponse post-merge routing update: sender_bind_addr claims an address a concurrent writer just assigned to a different authenticated peer"
                     );
                     return Ok(());
                 }
@@ -5041,7 +5243,7 @@ pub(crate) fn handle_incoming_message(
                     // Note: reindex_connection_addr already has early-return if already indexed,
                     // and logs internally when it actually does work.
                     if sender_socket_addr != _peer_addr {
-                        pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
+                        pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr, claim_kind);
                     }
 
                     debug!(
@@ -5139,7 +5341,21 @@ pub(crate) fn handle_incoming_message(
                 let discovery_handle = tokio::spawn(async move {
                     for addr in candidates {
                         let node_id = registry_clone.lookup_node_id(&addr).await;
-                        registry_clone.add_peer_with_node_id(addr, node_id).await;
+                        // PROVISIONAL: `addr` is a third-party relay from
+                        // peer-list gossip -- another peer's unauthenticated
+                        // claim about a THIRD party's address, the least
+                        // trustworthy provenance of all. It must never
+                        // block (let alone displace) a genuinely-verified
+                        // owner; it may only settle an otherwise-unowned
+                        // address as a placeholder pending that peer's own
+                        // actual authenticated connection.
+                        registry_clone
+                            .add_peer_with_node_id_kind(
+                                addr,
+                                node_id,
+                                crate::connection_pool::AddrClaimKind::Provisional,
+                            )
+                            .await;
 
                         match registry_clone.get_connection(addr).await {
                             Ok(_) => {

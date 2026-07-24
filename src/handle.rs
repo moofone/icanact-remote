@@ -3598,8 +3598,19 @@ where
         resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, configured_addr);
 
     if let Some(node_id) = node_id_opt {
+        // PROVENANCE: `peer_state_addr` is VERIFIED only when it equals the
+        // actual TCP source (`peer_addr`) -- i.e. the peer is connecting
+        // FROM the exact address it claims. `resolve_inbound_peer_state_addr`
+        // may instead have resolved it from the peer-controlled
+        // `sender_bind_addr` wire field (or a prior configured address),
+        // either of which is a PROVISIONAL claim about a DIFFERENT address.
+        let claim_kind = if peer_state_addr == peer_addr {
+            crate::connection_pool::AddrClaimKind::Verified
+        } else {
+            crate::connection_pool::AddrClaimKind::Provisional
+        };
         registry
-            .add_peer_with_node_id(peer_state_addr, Some(node_id))
+            .add_peer_with_node_id_kind(peer_state_addr, Some(node_id), claim_kind)
             .await;
         // Associate capabilities captured during the Hello handshake (stored under peer_addr).
         registry

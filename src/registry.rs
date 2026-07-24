@@ -1566,17 +1566,29 @@ impl Drop for DiscoveryTaskTracker {
     }
 }
 
-// Test-only deterministic synchronization point for `merge_full_sync_from`.
-// Task-scoped (not global/thread-local) so it is visible correctly across
-// worker threads for exactly the task it is bound to via `.scope(...)`, and
-// never leaks between concurrently-running tests. See its use in
-// `merge_full_sync_from` and the tests that call `.scope(...)` around a
-// `handle_incoming_message` future to deterministically land a concurrent
-// ownership change inside the STEP-1-to-STEP-2 window without a
-// timing-based sleep.
+// Test-only deterministic synchronization points for `merge_full_sync_from`.
+// Task-scoped (not global/thread-local) so they are visible correctly
+// across worker threads for exactly the task bound via `.scope(...)`, and
+// never leak between concurrently-running tests.
+//
+// `QA_MERGE_STEP1_COMPLETE` is notified right after STEP 1's lock releases
+// (before the actor-candidate collection pass), letting a test land a
+// concurrent state change inside that window deterministically instead of
+// guessing via yields/sleep.
+//
+// `QA_MERGE_STEP1_RELEASE`, if bound, is AWAITED immediately after that
+// notification -- a hard barrier that PARKS this call until the test
+// explicitly releases it. Without this, a test that only waits for
+// `QA_MERGE_STEP1_COMPLETE` and then races a second operation is still
+// racing: this call keeps running unattended on its own thread the moment
+// the notification fires, so which one reaches its own commit first is
+// still a matter of relative speed, not construction. Binding both
+// together makes the ordering deterministic: the test controls exactly
+// when this call is allowed to proceed into its own STEP 2.
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static QA_MERGE_STEP1_COMPLETE: std::sync::Arc<tokio::sync::Notify>;
+    pub(crate) static QA_MERGE_STEP1_RELEASE: std::sync::Arc<tokio::sync::Notify>;
 }
 
 impl<T: 'static> GossipRegistry<T> {
@@ -2595,21 +2607,46 @@ impl<T: 'static> GossipRegistry<T> {
     ///   address, or an ephemeral alias intentionally retained after a
     ///   prior migration, is treated as owned even when `peers[addr]`
     ///   itself has no entry or no `node_id` yet.
+    ///
+    /// `claim_kind` is the PROVENANCE of `claimed_by`'s OWN claim to `addr`
+    /// (see [`crate::connection_pool::AddrClaimKind`]): whether it is
+    /// backed by an actually-observed connection at this exact address, or
+    /// merely a peer-controlled claim (e.g. `sender_bind_addr`) about a
+    /// DIFFERENT address than the one it is actually connected from.
+    ///
+    /// An existing owner only blocks a DIFFERENT claimant when it is
+    /// itself VERIFIED, or when the new claim is ALSO merely provisional
+    /// (first-come-first-served among equally-unverified claims). A
+    /// provisional existing alias YIELDS to a genuinely-VERIFIED new claim
+    /// from a different peer -- this is what stops an attacker's early,
+    /// unverified `sender_bind_addr` claim on a victim's address from
+    /// permanently locking the real, later-authenticating owner out of its
+    /// own address.
     pub(crate) fn addr_owned_by_other_node(
         &self,
         gossip_state: &GossipState,
         addr: SocketAddr,
         claimed_by: crate::GossipNodeId,
+        claim_kind: crate::connection_pool::AddrClaimKind,
     ) -> bool {
         if addr == self.bind_addr || addr == self.advertised_addr() {
             return claimed_by != self.peer_id.to_node_id();
         }
 
+        let claims_verified = claim_kind == crate::connection_pool::AddrClaimKind::Verified;
+        // Both `peers[addr].node_id` and `addr_to_peer_id[addr]` represent
+        // the same underlying "who owns this address" fact (set together
+        // by `add_peer_with_node_id`/the FullSync handlers), so the
+        // connection-pool side's verified/generation record is the single
+        // shared provenance signal for both checks below.
+        let existing_verified = self.connection_pool.addr_ownership_verified(&addr);
+        let blocks_different_claimant = existing_verified || !claims_verified;
+
         let peers_owner = gossip_state
             .peers
             .get(&addr)
             .and_then(|peer_info| peer_info.node_id);
-        if peers_owner.is_some_and(|owner| owner != claimed_by) {
+        if peers_owner.is_some_and(|owner| owner != claimed_by) && blocks_different_claimant {
             return true;
         }
 
@@ -2617,17 +2654,40 @@ impl<T: 'static> GossipRegistry<T> {
             .connection_pool
             .addr_to_peer_id
             .read_sync(&addr, |_, peer_id| peer_id.clone());
-        if pool_owner.is_some_and(|owner| owner.to_node_id() != claimed_by) {
+        if pool_owner.is_some_and(|owner| owner.to_node_id() != claimed_by) && blocks_different_claimant
+        {
             return true;
         }
 
         false
     }
 
+    /// Defaults to `AddrClaimKind::Verified` -- correct for the overwhelming
+    /// majority of callers (an outbound dial target we chose and
+    /// authenticated ourselves, local test/setup code establishing ground
+    /// truth, etc). Callers resolving `peer_addr` from a peer-controlled
+    /// wire field that may differ from the connection's actual observed
+    /// source (i.e. the `sender_bind_addr` hijack surface) must use
+    /// [`Self::add_peer_with_node_id_kind`] with the correct
+    /// [`AddrClaimKind`] instead.
     pub async fn add_peer_with_node_id(
         &self,
         peer_addr: SocketAddr,
         node_id: Option<crate::GossipNodeId>,
+    ) {
+        self.add_peer_with_node_id_kind(
+            peer_addr,
+            node_id,
+            crate::connection_pool::AddrClaimKind::Verified,
+        )
+        .await;
+    }
+
+    pub(crate) async fn add_peer_with_node_id_kind(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: Option<crate::GossipNodeId>,
+        kind: crate::connection_pool::AddrClaimKind,
     ) {
         debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
         if peer_addr.ip().is_unspecified() || peer_addr.port() == 0 {
@@ -2664,7 +2724,7 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
 
             if let Some(claimed) = node_id
-                && self.addr_owned_by_other_node(&gossip_state, peer_addr, claimed)
+                && self.addr_owned_by_other_node(&gossip_state, peer_addr, claimed, kind)
             {
                 warn!(
                     peer = %peer_addr,
@@ -2677,7 +2737,7 @@ impl<T: 'static> GossipRegistry<T> {
 
             // CLAIM-FIRST: reserve `addr_to_peer_id[peer_addr]` for this
             // node_id BEFORE the `peers[addr]`/capability-map mutations
-            // below, not after. `claim_addr_to_peer_id` is synchronous
+            // below, not after. `claim_addr_ownership` is synchronous
             // (holds the map's own bucket lock across the
             // read-then-write, no `.await`), so it is safe to call while
             // still holding `gossip_state` -- keeping the ownership check
@@ -2686,7 +2746,11 @@ impl<T: 'static> GossipRegistry<T> {
             // before any `peers[addr]` insert/update.
             if let Some(claimed) = node_id {
                 let peer_id = claimed.to_peer_id();
-                if !self.connection_pool.claim_addr_to_peer_id(peer_addr, &peer_id) {
+                if self
+                    .connection_pool
+                    .claim_addr_ownership(peer_addr, &peer_id, kind)
+                    .is_none()
+                {
                     warn!(
                         peer = %peer_addr,
                         claimed_node_id = ?node_id,
@@ -2699,9 +2763,19 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Check if we already have this peer
             if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
-                // Update GossipNodeId if provided and not already set
-                // (never overwritten once set).
-                if node_id.is_some() && existing_peer.node_id.is_none() {
+                // Update GossipNodeId if provided. The ownership guard
+                // above (`addr_owned_by_other_node` + `claim_addr_ownership`)
+                // already established that THIS claim is authoritative for
+                // `peer_addr` -- whether the existing entry had no node_id
+                // yet, already matched this same node_id, or held a
+                // DIFFERENT node_id that was only PROVISIONALLY owned and
+                // is now correctly yielding to this VERIFIED claim. So this
+                // always applies the claimed node_id once we reach here;
+                // it must not still gate on "only if currently unset",
+                // which would leave `peers[addr].node_id` pointing at a
+                // provisional claimant even after ownership itself has
+                // already legitimately transferred.
+                if node_id.is_some() {
                     existing_peer.node_id = node_id;
                     debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
                 } else {
@@ -2794,7 +2868,7 @@ impl<T: 'static> GossipRegistry<T> {
                 // connection now that the claim is known-good.
                 let pool = &self.connection_pool;
                 pool.set_discovered_peer_addr(&peer_id, peer_addr);
-                pool.reindex_connection_addr(&peer_id, peer_addr);
+                pool.reindex_connection_addr(&peer_id, peer_addr, kind);
             }
         } else {
             info!(peer = %peer_addr, "not adding peer - same as self");
@@ -2806,10 +2880,33 @@ impl<T: 'static> GossipRegistry<T> {
         let pool = &self.connection_pool;
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
         pool.set_configured_peer_addr(&peer_id, connect_addr);
-        let _ = pool
-            .addr_to_peer_id
-            .upsert_sync(connect_addr, peer_id.clone());
-        pool.reindex_connection_addr(&peer_id, connect_addr);
+        // VERIFIED: explicit, locally/administratively-driven configuration,
+        // never wire-derived. Goes through the same claim/generation
+        // primitive as every other address-ownership writer so a
+        // provisional (wire-advertised) alias yields to this explicit
+        // configuration, while a genuinely VERIFIED different owner is not
+        // silently displaced by a local misconfiguration.
+        if pool
+            .claim_addr_ownership(
+                connect_addr,
+                &peer_id,
+                crate::connection_pool::AddrClaimKind::Verified,
+            )
+            .is_none()
+        {
+            warn!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                "refusing to configure peer: address already verified-owned by a \
+                 different authenticated peer"
+            );
+            return;
+        }
+        pool.reindex_connection_addr(
+            &peer_id,
+            connect_addr,
+            crate::connection_pool::AddrClaimKind::Verified,
+        );
         if let Some(cell) = self.peer_connect_handler.load_full() {
             cell.handler
                 .handle_peer_connect(connect_addr, Some(peer_id))
@@ -3050,28 +3147,38 @@ impl<T: 'static> GossipRegistry<T> {
             "🔄 DNS re-resolution: peer IP changed (old IP not in DNS results)"
         );
 
-        // PRE-CHECK: Verify no collisions in connection pool BEFORE any migration
-        // This prevents inconsistent state if we migrate gossip_state but pool has collision
+        // PRE-CHECK: claim `new_addr` in connection_pool BEFORE any
+        // gossip_state migration, not merely check-then-migrate-then-claim
+        // -- claiming first here means PHASE 1 below never migrates
+        // gossip_state into a `peer_to_actors`/`peers[]` state connection_pool
+        // ownership then fails to also secure, leaving the two
+        // permanently inconsistent. VERIFIED: WE performed the DNS
+        // resolution and are choosing this address ourselves.
         {
             let pool = &self.connection_pool;
-            if let Some(existing_peer_id) = pool
-                .addr_to_peer_id
-                .read_sync(&new_addr, |_, peer_id| peer_id.clone())
+            let Some(old_peer_id) = pool.get_peer_id_by_addr(&peer_addr) else {
+                debug!(
+                    old_addr = %peer_addr,
+                    dns_name = %dns_name,
+                    "DNS re-resolution: no known peer_id for old address, skipping update"
+                );
+                return None;
+            };
+            if pool
+                .claim_addr_ownership(
+                    new_addr,
+                    &old_peer_id,
+                    crate::connection_pool::AddrClaimKind::Verified,
+                )
+                .is_none()
             {
-                if let Some(old_peer_id) = pool
-                    .addr_to_peer_id
-                    .read_sync(&peer_addr, |_, peer_id| peer_id.clone())
-                {
-                    if existing_peer_id != old_peer_id {
-                        warn!(
-                            old_addr = %peer_addr,
-                            new_addr = %new_addr,
-                            dns_name = %dns_name,
-                            "DNS refresh: new address already mapped to different peer in pool, aborting"
-                        );
-                        return None;
-                    }
-                }
+                warn!(
+                    old_addr = %peer_addr,
+                    new_addr = %new_addr,
+                    dns_name = %dns_name,
+                    "DNS refresh: new address already verified-owned by a different peer, aborting"
+                );
+                return None;
             }
         } // pool lock released
 
@@ -3145,8 +3252,30 @@ impl<T: 'static> GossipRegistry<T> {
                 // Update peer_id_to_addr mapping without making DNS-refreshed
                 // discovered routes required supervisor peers.
                 pool.set_discovered_peer_addr(&peer_id, new_addr);
-                // Add new address to addr_to_peer_id mapping
-                pool.add_addr_to_peer_id(new_addr, peer_id.clone());
+                // VERIFIED: WE performed the DNS resolution and chose this
+                // address ourselves; not a peer-controlled wire claim. Goes
+                // through the same claim/generation primitive as every
+                // other ownership writer -- a lost claim here means a
+                // different VERIFIED peer already legitimately owns the
+                // resolved address, so this refresh must abort rather than
+                // silently displace it.
+                if pool
+                    .claim_addr_ownership(
+                        new_addr,
+                        &peer_id,
+                        crate::connection_pool::AddrClaimKind::Verified,
+                    )
+                    .is_none()
+                {
+                    warn!(
+                        old_addr = %peer_addr,
+                        new_addr = %new_addr,
+                        dns_name = %dns_name,
+                        "DNS refresh: new address already verified-owned by a different \
+                         authenticated peer, aborting"
+                    );
+                    return None;
+                }
 
                 // Migrate connections_by_addr: move connection from old addr to new addr
                 // ONLY if the connection is still connected - dead connections should be removed
@@ -5410,6 +5539,20 @@ impl<T: 'static> GossipRegistry<T> {
         let session_source = session_source.or(verified_sender_addr);
         // Don't add peer here - peers are managed through handle_connection
 
+        // PROVENANCE: `sender_addr` is VERIFIED only when it equals the
+        // connection's own actually-observed source (`verified_sender_addr`
+        // -- the raw TCP source, the ONLY trust anchor for address
+        // repair per PEER_ID_REFACTOR §1.6). Whenever the caller resolved
+        // `sender_addr` from the peer-controlled `sender_bind_addr` wire
+        // field to something ELSE, this is a PROVISIONAL claim: a
+        // self-report about a DIFFERENT address than the one the peer is
+        // actually connected from.
+        let claim_kind = if verified_sender_addr == Some(sender_addr) {
+            crate::connection_pool::AddrClaimKind::Verified
+        } else {
+            crate::connection_pool::AddrClaimKind::Provisional
+        };
+
         // Record comprehensive node activity
 
         // Check if we've already processed this or a newer sequence from this
@@ -5449,6 +5592,18 @@ impl<T: 'static> GossipRegistry<T> {
         // `sender_addr` never mutates it at all (no rollback needed), and
         // a legitimate owner's own concurrent update is never clobbered
         // by a stale decision made under this earlier lock.
+        // Captured together with `captured_epoch` below: the CURRENT
+        // address-ownership generation (see `AddrOwnershipMeta`), as
+        // observed at the moment the ownership check just above passed.
+        // STEP 2 re-validates this is unchanged before committing, in
+        // addition to re-claiming (which also bumps it) -- catching any
+        // OTHER ownership writer (`configure_peer`, DNS refresh,
+        // reindexing) that claimed or re-claimed `sender_addr` in the
+        // actor-candidate-collection-pass gap between here and there, even
+        // if ownership superficially looks unchanged by the time STEP 2
+        // runs (an ABA change is still a change).
+        let captured_addr_generation = self.connection_pool.addr_ownership_generation(&sender_addr);
+
         let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
 
@@ -5459,8 +5614,12 @@ impl<T: 'static> GossipRegistry<T> {
             // attempt against that owner's bookkeeping, not a legitimate
             // update -- fail closed. Mirrors the DNS re-resolution
             // migration guard's collision pre-check.
-            if self.addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
-            {
+            if self.addr_owned_by_other_node(
+                &gossip_state,
+                sender_addr,
+                sender_peer_id.to_node_id(),
+                claim_kind,
+            ) {
                 warn!(
                     addr = %sender_addr,
                     claimed_sender = %sender_peer_id,
@@ -5547,10 +5706,18 @@ impl<T: 'static> GossipRegistry<T> {
         // lock is released above (before the potentially large
         // actor-candidate collection pass below), letting tests
         // deterministically land a concurrent state change inside that
-        // window without a sleep-based race.
+        // window without a sleep-based race. If the test also bound
+        // `QA_MERGE_STEP1_RELEASE`, this call now PARKS here until the test
+        // explicitly releases it -- a hard barrier, not a timing
+        // assumption about how long the collection pass below takes
+        // relative to whatever the test does concurrently.
         #[cfg(test)]
         {
             let _ = QA_MERGE_STEP1_COMPLETE.try_with(|notify| notify.notify_one());
+            let release = QA_MERGE_STEP1_RELEASE.try_with(|notify| notify.clone()).ok();
+            if let Some(release) = release {
+                release.notified().await;
+            }
         }
 
         let mut new_actors = 0;
@@ -5649,14 +5816,37 @@ impl<T: 'static> GossipRegistry<T> {
             // `peer_to_actors`, `known_actors` -- has been written by this
             // call yet, so a failed check here simply returns: there is
             // no partial write to undo.
-            if self.addr_owned_by_other_node(&gossip_state, sender_addr, sender_peer_id.to_node_id())
-            {
+            if self.addr_owned_by_other_node(
+                &gossip_state,
+                sender_addr,
+                sender_peer_id.to_node_id(),
+                claim_kind,
+            ) {
                 warn!(
                     addr = %sender_addr,
                     claimed_sender = %sender_peer_id,
                     "dropping full-sync actor apply: sender_bind_addr claims an \
                      address that became owned by a different authenticated \
                      peer during merge"
+                );
+                return false;
+            }
+
+            // Generation recheck: catches an ABA change `addr_owned_by_other_node`
+            // alone cannot -- e.g. a DIFFERENT peer claimed `sender_addr` and a
+            // (re-)claim by `sender_peer_id` landed again before this point,
+            // leaving the boolean ownership check looking clean while a
+            // legitimate other owner's commit may have happened in between.
+            if let Some(generation) = captured_addr_generation
+                && !self
+                    .connection_pool
+                    .addr_ownership_generation_still_current(&sender_addr, generation)
+            {
+                warn!(
+                    addr = %sender_addr,
+                    claimed_sender = %sender_peer_id,
+                    "dropping full-sync actor apply: sender_bind_addr's ownership \
+                     generation changed during merge"
                 );
                 return false;
             }
@@ -5668,14 +5858,16 @@ impl<T: 'static> GossipRegistry<T> {
             // that map -- it does not re-hold or re-assert the reservation.
             // Re-claiming it here, immediately before the commit below and
             // still under this same `gossip_state` lock, confirms the
-            // reservation is still this sender's at the latest possible
-            // moment (closing the actor-candidate-collection-pass window
-            // between STEP 1 and here) rather than trusting a read that
-            // could already be stale with respect to any OTHER
-            // `addr_to_peer_id` writer.
-            if !self
+            // reservation is still this sender's -- and bumps its
+            // generation once more -- at the latest possible moment
+            // (closing the actor-candidate-collection-pass window between
+            // STEP 1 and here) rather than trusting a read that could
+            // already be stale with respect to any OTHER `addr_to_peer_id`
+            // writer.
+            if self
                 .connection_pool
-                .claim_addr_to_peer_id(sender_addr, &sender_peer_id)
+                .claim_addr_ownership(sender_addr, &sender_peer_id, claim_kind)
+                .is_none()
             {
                 warn!(
                     addr = %sender_addr,

@@ -10256,6 +10256,274 @@ async fn authenticated_peer_cannot_hijack_registrys_own_local_address() {
     );
 }
 
+/// PROVENANCE: a PROVISIONAL claim (e.g. inferred from a peer's
+/// self-reported `sender_bind_addr`, not backed by any connection actually
+/// observed at that address) on a currently-unowned address must not
+/// permanently lock out the real owner once it later authenticates with a
+/// VERIFIED claim to the SAME address -- otherwise the ownership guard
+/// itself would become a new denial-of-service: an attacker advertises a
+/// victim's (currently unowned) address first, and the victim's own
+/// later, genuine connection is rejected because the attacker's
+/// provisional alias already "owns" it.
+#[tokio::test]
+async fn provisional_alias_yields_to_later_authenticated_real_owner() {
+    let bind_addr: SocketAddr = "10.100.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("provenance-yield-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let contested_addr: SocketAddr = "10.100.0.2:9000".parse().unwrap();
+
+    let attacker_kp = crate::KeyPair::new_for_testing("provenance-yield-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_node_id = attacker.to_node_id();
+
+    // The attacker advertises the (currently unowned) address via a
+    // provisional (wire-inferred) claim -- this succeeds, since a
+    // brand-new, unowned address is legitimately claimable by whoever
+    // arrives first, REGARDLESS of provenance.
+    registry
+        .add_peer_with_node_id_kind(
+            contested_addr,
+            Some(attacker_node_id),
+            crate::connection_pool::AddrClaimKind::Provisional,
+        )
+        .await;
+    assert_eq!(
+        registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&contested_addr, |_, v| v.clone()),
+        Some(attacker.clone()),
+        "sanity: the attacker's provisional claim on an unowned address must succeed"
+    );
+
+    let victim_kp = crate::KeyPair::new_for_testing("provenance-yield-victim");
+    let victim = victim_kp.peer_id();
+    let victim_node_id = victim.to_node_id();
+
+    // The REAL owner now authenticates with a VERIFIED claim (e.g. it
+    // connected FROM this exact address) to the SAME address.
+    registry
+        .add_peer_with_node_id_kind(
+            contested_addr,
+            Some(victim_node_id),
+            crate::connection_pool::AddrClaimKind::Verified,
+        )
+        .await;
+
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&contested_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "a genuinely-verified claim must be able to take over a provisional \
+         alias left by an earlier, unverified claimant -- otherwise the \
+         ownership guard becomes a permanent lockout of the real owner"
+    );
+    let peer_info = registry
+        .gossip_state
+        .lock()
+        .await
+        .peers
+        .get(&contested_addr)
+        .cloned();
+    assert_eq!(
+        peer_info.and_then(|p| p.node_id),
+        Some(victim_node_id),
+        "peers[addr].node_id must also reflect the verified owner, not the \
+         earlier provisional claimant"
+    );
+}
+
+/// PROVENANCE, the other direction: a competing claim that is ITSELF only
+/// PROVISIONAL (e.g. a different attacker's self-reported claim) must
+/// never be able to steal an address away from an already-VERIFIED owner.
+/// Provisional-yields-to-verified is a one-way street -- it must not be
+/// exploitable to bounce a legitimately-verified address back down to
+/// contested/provisional status.
+#[tokio::test]
+async fn unauthenticated_claim_cannot_steal_a_verified_owners_address() {
+    let bind_addr: SocketAddr = "10.101.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("provenance-guard-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let contested_addr: SocketAddr = "10.101.0.2:9000".parse().unwrap();
+
+    let victim_kp = crate::KeyPair::new_for_testing("provenance-guard-victim");
+    let victim = victim_kp.peer_id();
+    let victim_node_id = victim.to_node_id();
+
+    // The real owner establishes a VERIFIED claim first.
+    registry
+        .add_peer_with_node_id_kind(
+            contested_addr,
+            Some(victim_node_id),
+            crate::connection_pool::AddrClaimKind::Verified,
+        )
+        .await;
+
+    let attacker_kp = crate::KeyPair::new_for_testing("provenance-guard-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_node_id = attacker.to_node_id();
+
+    // A DIFFERENT peer now tries to claim the SAME address, but only
+    // provisionally (e.g. a self-reported wire claim, not backed by any
+    // connection actually observed there).
+    registry
+        .add_peer_with_node_id_kind(
+            contested_addr,
+            Some(attacker_node_id),
+            crate::connection_pool::AddrClaimKind::Provisional,
+        )
+        .await;
+
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&contested_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "a merely provisional competing claim must never be able to steal \
+         an already-verified owner's address"
+    );
+    let peer_info = registry
+        .gossip_state
+        .lock()
+        .await
+        .peers
+        .get(&contested_addr)
+        .cloned();
+    assert_eq!(
+        peer_info.and_then(|p| p.node_id),
+        Some(victim_node_id),
+        "peers[addr].node_id must remain the verified owner's"
+    );
+}
+
+/// The ownership GENERATION/transaction (bumped by every ownership writer,
+/// including `configure_peer`) closes the gap a plain boolean
+/// re-read-then-compare cannot: a legitimate `configure_peer` call landing
+/// DURING an in-flight merge (after the merge's own initial claim, before
+/// its STEP 2 commit) must mean the merge's stale actor data never lands
+/// under the now-differently-owned address. Deterministic via the
+/// `QA_MERGE_STEP1_COMPLETE`/`QA_MERGE_STEP1_RELEASE` hooks: `configure_peer`
+/// is called for the SAME address while the attacker's task is parked
+/// between STEP 1 and STEP 2, guaranteeing the race lands inside the
+/// intended window on every run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_configure_peer_during_merge_leaves_no_attacker_state() {
+    let bind_addr: SocketAddr = "10.102.0.1:9000".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("configure-race-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let contested_addr: SocketAddr = "10.102.0.2:9000".parse().unwrap();
+
+    let attacker_kp = crate::KeyPair::new_for_testing("configure-race-attacker");
+    let attacker = attacker_kp.peer_id();
+    let attacker_ephemeral: SocketAddr = "10.102.0.3:51000".parse().unwrap();
+
+    let mut attacker_actors = Vec::with_capacity(500);
+    for i in 0..500u32 {
+        attacker_actors.push((
+            format!("configrace/attacker-actor-{i}"),
+            crate::RemoteActorLocation::new_with_peer(contested_addr, attacker.clone()),
+        ));
+    }
+    // Claims `sender_bind_addr == contested_addr` while actually connecting
+    // from `attacker_ephemeral` -- a PROVISIONAL claim on the (initially
+    // unowned) address, exactly the wire-hijack surface this whole guard
+    // exists for.
+    let attacker_full_sync_response = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: attacker_actors,
+        known_actors: vec![],
+        sender_peer_id: attacker.clone(),
+        sender_bind_addr: Some(contested_addr.to_string()),
+        sequence: 999_999,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    let step1_complete = std::sync::Arc::new(tokio::sync::Notify::new());
+    let step1_complete_for_task = step1_complete.clone();
+    let step1_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let step1_release_for_task = step1_release.clone();
+
+    let attacker_registry = registry.clone();
+    let attacker_task = tokio::spawn(crate::registry::QA_MERGE_STEP1_COMPLETE.scope(
+        step1_complete_for_task,
+        crate::registry::QA_MERGE_STEP1_RELEASE.scope(step1_release_for_task, async move {
+            super::handle_incoming_message(
+                attacker_registry,
+                attacker_ephemeral,
+                attacker_ephemeral,
+                attacker_full_sync_response,
+            )
+            .await
+        }),
+    ));
+
+    // Wait until the attacker's merge has passed its own initial ownership
+    // check (STEP 1) and is now parked, before its STEP 2 commit.
+    step1_complete.notified().await;
+
+    // A legitimate, local, VERIFIED configuration lands for the SAME
+    // address WHILE the attacker's merge is parked mid-flight -- this
+    // succeeds (the attacker's own claim was only provisional) and bumps
+    // the address-ownership generation.
+    let victim_kp = crate::KeyPair::new_for_testing("configure-race-victim");
+    let victim = victim_kp.peer_id();
+    registry.configure_peer(victim.clone(), contested_addr).await;
+
+    // Release the attacker's merge to proceed into STEP 2.
+    step1_release.notify_one();
+
+    attacker_task
+        .await
+        .expect("attacker task must not panic")
+        .expect("attacker's FullSyncResponse must not error, only be rejected/ignored");
+
+    let routed_peer_id = registry
+        .connection_pool
+        .addr_to_peer_id
+        .read_sync(&contested_addr, |_, v| v.clone());
+    assert_eq!(
+        routed_peer_id,
+        Some(victim),
+        "the concurrent configure_peer call must win -- its VERIFIED claim \
+         must not be displaced by the attacker's merge finishing afterward"
+    );
+    let gossip_state = registry.gossip_state.lock().await;
+    let actors = gossip_state
+        .peer_to_actors
+        .get(&contested_addr)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !actors.iter().any(|n| n.starts_with("configrace/attacker-actor-")),
+        "a concurrent configure_peer landing during the merge must mean the \
+         attacker's stale actor data can never land under the \
+         now-differently-owned address"
+    );
+}
+
 /// CLAIM-FIRST: `claim_addr_to_peer_id` is now the very FIRST address-keyed
 /// operation in the `FullSyncResponse` handler, performed BEFORE
 /// extensions, BEFORE the merge, before anything else. A claimant that
@@ -10380,12 +10648,16 @@ async fn claim_first_full_sync_response_aborts_with_zero_mutations_on_lost_claim
 /// not against the value it originally observed. A lower-sequence message
 /// that loses this race must not overwrite `peer_to_actors[addr]` with its
 /// now-stale actor snapshot just because it does not hold a restart
-/// exemption. Deterministic ordering: the low-sequence task is bound to
-/// `QA_MERGE_STEP1_COMPLETE` so the test knows the EXACT instant its STEP 1
-/// (observing the pre-race `last_sequence`) has passed, before ever
-/// running the high-sequence message -- so the high-sequence commit is
-/// guaranteed to happen first, and a large actor set on the low-sequence
-/// message keeps it from reaching its own STEP 2 commit until well after.
+/// exemption. Deterministic ordering via a HARD barrier, not a timing
+/// assumption: the low-sequence task is bound to BOTH
+/// `QA_MERGE_STEP1_COMPLETE` (so the test knows the exact instant its
+/// STEP 1 -- observing the pre-race `last_sequence` -- has passed) AND
+/// `QA_MERGE_STEP1_RELEASE`, which PARKS it right there until the test
+/// explicitly releases it. The test processes the high-sequence message to
+/// full completion (including its own STEP 2 commit) BEFORE releasing the
+/// low task -- so the low task can only ever reach its own STEP 2 after
+/// the high-sequence commit has already landed, on every single run,
+/// regardless of relative thread scheduling speed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_sequence_losing_the_step2_race_does_not_overwrite_fresher_actor_state() {
     let bind_addr: SocketAddr = "10.99.0.1:9000".parse().unwrap();
@@ -10437,17 +10709,21 @@ async fn stale_sequence_losing_the_step2_race_does_not_overwrite_fresher_actor_s
         extensions: None,
     };
 
-    // Bound to the low-sequence task via `.scope(...)` so the test knows
+    // Bound to the low-sequence task via `.scope(...)` -- BOTH task-locals
+    // together, not just the completion notification -- so the test knows
     // the exact instant its STEP 1 (observing the pre-race, low
-    // `last_sequence`) completes -- before the high-sequence message is
-    // ever processed -- rather than guessing via yields/sleep.
+    // `last_sequence`) completes AND can hold it there with a hard barrier
+    // until explicitly released, rather than trusting relative thread
+    // scheduling speed.
     let low_step1_complete = std::sync::Arc::new(tokio::sync::Notify::new());
     let low_step1_complete_for_task = low_step1_complete.clone();
+    let low_step1_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let low_step1_release_for_task = low_step1_release.clone();
 
     let low_registry = registry.clone();
     let low_task = tokio::spawn(crate::registry::QA_MERGE_STEP1_COMPLETE.scope(
         low_step1_complete_for_task,
-        async move {
+        crate::registry::QA_MERGE_STEP1_RELEASE.scope(low_step1_release_for_task, async move {
             super::handle_incoming_message(
                 low_registry,
                 session_source,
@@ -10455,19 +10731,25 @@ async fn stale_sequence_losing_the_step2_race_does_not_overwrite_fresher_actor_s
                 low_sequence_msg,
             )
             .await
-        },
+        }),
     ));
 
     // Wait for the low-sequence message's STEP 1 to complete (it has now
-    // observed the pre-race `last_sequence` and is about to enter its
-    // 9,500-actor collection pass) before processing the high-sequence
-    // message, which reliably completes -- including its own STEP 2
-    // commit -- well before the low-sequence task's collection pass does.
+    // observed the pre-race `last_sequence`) -- it is now PARKED, awaiting
+    // `low_step1_release`, and cannot proceed into its actor-candidate
+    // collection pass or STEP 2 no matter how fast its own thread runs.
     low_step1_complete.notified().await;
 
+    // Process the high-sequence message to FULL completion -- including
+    // its own STEP 2 commit -- while the low task is still parked.
     super::handle_incoming_message(registry.clone(), session_source, session_source, high_sequence_msg)
         .await
         .expect("high-sequence FullSyncResponse must succeed");
+
+    // Only now release the low task: its STEP 2 (whenever it gets there)
+    // is guaranteed to observe the high-sequence commit that already
+    // landed above, every single run.
+    low_step1_release.notify_one();
 
     low_task
         .await

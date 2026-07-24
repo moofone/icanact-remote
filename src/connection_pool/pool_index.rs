@@ -7,6 +7,10 @@ pub struct ConnectionPool<T = ()> {
     pub connections_by_peer: SccHashMap<crate::PeerId, Arc<LockFreeConnection>>,
     /// SECONDARY: Mapping SocketAddr -> Peer ID (for incoming connection identification)
     pub addr_to_peer_id: SccHashMap<SocketAddr, crate::PeerId>,
+    /// Provenance (verified/provisional) and generation for each
+    /// `addr_to_peer_id` entry -- see `AddrOwnershipMeta` and
+    /// `claim_addr_ownership`.
+    pub(crate) addr_ownership_meta: SccHashMap<SocketAddr, AddrOwnershipMeta>,
     /// Configuration: Peer ID -> Expected SocketAddr (where to connect)
     pub peer_id_to_addr: SccHashMap<crate::PeerId, SocketAddr>,
     /// Address-based connection index for fast lookup by SocketAddr

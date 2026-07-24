@@ -854,18 +854,26 @@ impl<T: 'static> Peer<T> {
             )));
         }
 
-        // First configure the address for this peer
+        // First configure the address for this peer. VERIFIED: this is an
+        // address WE chose to dial for a KNOWN peer_id, not a peer's
+        // self-reported claim.
         {
             let pool = &self.registry.connection_pool;
             if required_peer {
                 pool.set_configured_peer_addr(&self.peer_id, *addr);
             } else {
                 pool.set_discovered_peer_addr(&self.peer_id, *addr);
-                let _ = pool
-                    .addr_to_peer_id
-                    .upsert_sync(*addr, self.peer_id.clone());
+                let _ = pool.claim_addr_ownership(
+                    *addr,
+                    &self.peer_id,
+                    crate::connection_pool::AddrClaimKind::Verified,
+                );
             }
-            pool.reindex_connection_addr(&self.peer_id, *addr);
+            pool.reindex_connection_addr(
+                &self.peer_id,
+                *addr,
+                crate::connection_pool::AddrClaimKind::Verified,
+            );
         }
 
         // Add the peer to gossip state so it can be selected for gossip rounds
