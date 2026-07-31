@@ -70,14 +70,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Add Node B as a peer of Node A with GossipNodeId
     registry_a
         .registry
-        .add_peer_with_node_id(addr_b, Some(node_id_b))
+        .add_peer_with_node_id(
+            addr_b,
+            Some(node_id_b),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     info!("Node A added Node B as peer with GossipNodeId");
 
     // Add Node A as a peer of Node B with GossipNodeId
     registry_b
         .registry
-        .add_peer_with_node_id(addr_a, Some(node_id_a))
+        .add_peer_with_node_id(
+            addr_a,
+            Some(node_id_a),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     info!("Node B added Node A as peer with GossipNodeId");
 

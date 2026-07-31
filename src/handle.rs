@@ -1234,7 +1234,11 @@ mod tests {
         // source, exactly like the real accept path does after this fix.
         handle
             .registry
-            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .add_peer_with_node_id(
+                bind_addr,
+                Some(remote_node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         handle
             .registry
@@ -1401,7 +1405,11 @@ mod tests {
             .set_configured_peer_addr(&remote_peer_id, bind_addr);
         handle
             .registry
-            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .add_peer_with_node_id(
+                bind_addr,
+                Some(remote_node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // The STALE inbound handler's own accepted connection: published
@@ -3598,36 +3606,108 @@ where
         resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, configured_addr);
 
     if let Some(node_id) = node_id_opt {
-        registry
-            .add_peer_with_node_id(peer_state_addr, Some(node_id))
+        // TLS authenticates `node_id`, but that alone does not prove
+        // ownership of `peer_state_addr`: it usually comes straight from
+        // the peer's own self-reported `sender_bind_addr`, which the peer
+        // fully controls. Only treat the address claim itself as Verified
+        // when it is independently corroborated — it matches the raw
+        // observed TCP source of this connection, or it matches an address
+        // we ourselves configured for this peer. Otherwise the identity is
+        // authenticated but the address is merely self-reported:
+        // Provisional, and subject to displacement by a genuinely verified
+        // claim for the same address (see `addr_ownership::arbitrate`).
+        let addr_claim_kind =
+            if peer_state_addr == peer_addr || configured_addr == Some(peer_state_addr) {
+                crate::addr_ownership::ClaimKind::Verified
+            } else {
+                crate::addr_ownership::ClaimKind::Provisional
+            };
+
+        let claim_outcome = registry
+            .add_peer_with_node_id(peer_state_addr, Some(node_id), addr_claim_kind)
             .await;
-        // Associate capabilities captured during the Hello handshake (stored under peer_addr).
+
+        // The address this connection is actually attributed to after
+        // arbitration. On rejection, fall back to the raw observed TCP
+        // source instead of abandoning bookkeeping outright: that claim is
+        // inherently Verified (it depends on nothing the peer can forge),
+        // so it is always safe to retry there.
+        let effective_addr = match claim_outcome {
+            crate::addr_ownership::AddrClaimOutcome::Accepted => Some(peer_state_addr),
+            crate::addr_ownership::AddrClaimOutcome::Rejected if peer_state_addr == peer_addr => {
+                // The observed source itself was rejected (a different,
+                // already-verified owner holds it) -- no safe address is
+                // left to attribute this connection to.
+                None
+            }
+            crate::addr_ownership::AddrClaimOutcome::Rejected => {
+                warn!(
+                    peer_addr = %peer_addr,
+                    peer_state_addr = %peer_state_addr,
+                    node_id = %node_id.fmt_short(),
+                    "rejecting claimed advertised address for inbound peer; falling back to observed source"
+                );
+                match registry
+                    .add_peer_with_node_id(
+                        peer_addr,
+                        Some(node_id),
+                        crate::addr_ownership::ClaimKind::Verified,
+                    )
+                    .await
+                {
+                    crate::addr_ownership::AddrClaimOutcome::Accepted => Some(peer_addr),
+                    crate::addr_ownership::AddrClaimOutcome::Rejected => None,
+                }
+            }
+        };
+
+        // Associate capabilities captured during the Hello handshake (stored
+        // under peer_addr) -- always safe, since peer_addr is the raw
+        // address this exact connection was observed on.
         registry
             .associate_peer_capabilities_with_node(peer_addr, node_id)
             .await;
-        if peer_state_addr != peer_addr {
-            registry
-                .associate_peer_capabilities_with_node(peer_state_addr, node_id)
-                .await;
-        }
-        if peer_state_addr != peer_addr {
-            let mut gossip_state = registry.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get_mut(&peer_state_addr) {
-                peer_info.peer_address = Some(peer_addr);
+
+        if let Some(effective_addr) = effective_addr {
+            if effective_addr != peer_addr {
+                registry
+                    .associate_peer_capabilities_with_node(effective_addr, node_id)
+                    .await;
+                let mut gossip_state = registry.gossip_state.lock().await;
+                if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
+                    peer_info.peer_address = Some(peer_addr);
+                }
             }
+
+            // Notify peer discovery that a connection is established (incoming)
+            registry.mark_peer_connected(effective_addr).await;
+            // Inbound-observation evidence must be recorded on the address
+            // it actually corroborates: the raw TCP source of this
+            // connection, `peer_addr`. Recording it on `effective_addr`
+            // instead -- which can be a merely self-reported, Provisional
+            // claim -- would flip `PeerInfo::inbound_observed` on an address
+            // that was never itself observed. `mark_peer_connected` above
+            // already covers the health/discovery bookkeeping for
+            // `effective_addr`; only the observation flag needs to stay
+            // pinned to the address it is actually evidence for.
+            registry
+                .mark_inbound_connection_observed(peer_addr, peer_addr)
+                .await;
+
+            debug!(
+                peer_addr = %peer_addr,
+                peer_state_addr = %peer_state_addr,
+                effective_addr = %effective_addr,
+                "Updated gossip state with GossipNodeId for incoming TLS connection"
+            );
+        } else {
+            warn!(
+                peer_addr = %peer_addr,
+                peer_state_addr = %peer_state_addr,
+                node_id = %node_id.fmt_short(),
+                "no address claim accepted for inbound peer; connection proceeds without gossip address attribution"
+            );
         }
-
-        // Notify peer discovery that a connection is established (incoming)
-        registry.mark_peer_connected(peer_state_addr).await;
-        registry
-            .mark_inbound_connection_observed(peer_state_addr, peer_addr)
-            .await;
-
-        debug!(
-            peer_addr = %peer_addr,
-            peer_state_addr = %peer_state_addr,
-            "Updated gossip state with GossipNodeId for incoming TLS connection"
-        );
     }
 
     // R-6: handoff for the first-frame StreamingState (see io_task). Created

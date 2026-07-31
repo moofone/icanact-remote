@@ -19,6 +19,7 @@
     reason = "legacy lint debt outside the focused gossip QA fix"
 )]
 
+pub mod addr_ownership;
 pub mod aligned;
 mod ask_forwarder;
 mod ask_responder;
@@ -37,6 +38,7 @@ pub mod priority;
 pub mod protocol;
 pub mod pubsub;
 pub mod registry;
+pub mod registry_owner;
 pub mod remote_actor_location;
 pub mod remote_actor_ref;
 mod route_interning;
@@ -910,6 +912,7 @@ impl<T: 'static> Peer<T> {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let peers_after = gossip_state.peers.len();

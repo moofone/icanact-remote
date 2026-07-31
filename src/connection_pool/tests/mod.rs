@@ -3168,6 +3168,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         current_session_source: None,
         current_session_connection: None,
         current_session_epoch: 0,
+        identity_verified: false,
     }
 }
 
@@ -4063,7 +4064,11 @@ async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption()
     let dial_addr: SocketAddr = "127.0.0.1:7451".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
     registry
-        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            dial_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     registry
         .arm_sequence_reset_for_new_session(
@@ -4162,7 +4167,11 @@ async fn outbound_stale_finalizer_arm_after_supersession_does_not_clobber_newer_
     let dial_addr: SocketAddr = "127.0.0.1:7460".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
     registry
-        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            dial_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // The STALE outbound candidate: published first, but its own arm call
@@ -4309,7 +4318,11 @@ async fn arm_sequence_reset_stale_task_racing_the_lock_does_not_clobber_newer_se
     let dial_addr: SocketAddr = "127.0.0.1:7461".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
     registry
-        .add_peer_with_node_id(dial_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            dial_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     fn make_connection(addr: SocketAddr) -> Arc<LockFreeConnection> {
@@ -4423,7 +4436,11 @@ async fn old_draining_connection_delta_cannot_restore_pre_restart_high_water() {
         .upsert_sync(owner.clone(), peer_addr);
 
     registry
-        .add_peer_with_node_id(peer_addr, Some(node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Pre-restart: peer is at sequence 40 via a genuine FullSync from the
@@ -4591,7 +4608,11 @@ async fn non_arming_successor_connections_full_sync_is_accepted_after_armed_conn
     let bind_addr: SocketAddr = "127.0.0.1:7470".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, bind_addr);
     registry
-        .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            bind_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Connection A: authenticates with a decodable GossipNodeId and arms a
@@ -4739,7 +4760,11 @@ async fn full_sync_stale_apply_paused_between_validation_and_mutation_is_dropped
     let peer_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59101".parse().unwrap();
@@ -4914,7 +4939,11 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
     // starts at the "never armed" sentinel 0), the precondition an
     // ABA-vulnerable per-peer counter would collide on after recreation.
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     let old_addr: SocketAddr = "127.0.0.1:59401".parse().unwrap();
     let old_conn = qa_r11_generation_race_connection(old_addr);
@@ -4981,7 +5010,11 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
                         gossip_state.peers.remove(&peer_addr);
                     }
                     registry_for_hook
-                        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+                        .add_peer_with_node_id(
+                            peer_addr,
+                            Some(remote_node_id),
+                            crate::addr_ownership::ClaimKind::Verified,
+                        )
                         .await;
 
                     // The replacement's arm is this FRESH PeerInfo's
@@ -5093,7 +5126,11 @@ async fn late_message_from_superseded_armed_source_is_rejected_not_self_healed()
     let peer_addr: SocketAddr = "127.0.0.1:7484".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Baseline established BEFORE any session is armed: last_sequence=40,
@@ -5284,7 +5321,11 @@ async fn stale_third_connection_cannot_self_heal_while_a_different_successor_is_
     let peer_addr: SocketAddr = "127.0.0.1:7486".parse().unwrap();
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Baseline, before any session is armed.
@@ -5449,7 +5490,11 @@ async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_book
         .upsert_sync(remote_peer_id.clone(), peer_addr);
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Seed failure/health state that a stale message must NOT be able to
@@ -5576,7 +5621,11 @@ async fn delta_gossip_stale_apply_paused_between_validation_and_mutation_is_drop
         .upsert_sync(remote_peer_id.clone(), peer_addr);
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59201".parse().unwrap();
@@ -5736,7 +5785,11 @@ async fn delta_gossip_response_stale_apply_paused_between_validation_and_mutatio
         .upsert_sync(remote_peer_id.clone(), peer_addr);
     pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
     registry
-        .add_peer_with_node_id(peer_addr, Some(remote_node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(remote_node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59301".parse().unwrap();
@@ -9629,7 +9682,11 @@ async fn fresh_outbound_connect_arms_restart_exemption_so_post_restart_sync_is_a
     let new_session_addr: SocketAddr = "127.0.0.1:57202".parse().unwrap();
 
     registry
-        .add_peer_with_node_id(peer_addr, Some(node_id))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // Pre-restart: peer is at a high sequence over an old session.
@@ -9931,4 +9988,153 @@ async fn fresh_outbound_connect_cancelled_mid_identify_does_not_strand_a_publish
             );
         }
     }
+}
+
+/// A full-sync handler that resumes after its address has been claimed by a
+/// newer commit must apply NOTHING that is keyed on that address.
+///
+/// The displacement is constructed statically: the address is fenced at a
+/// position no claim can beat before the handler runs, which is the same state
+/// the handler would observe had a competing claim committed and projected
+/// while it was suspended.
+#[tokio::test]
+async fn displaced_full_sync_claim_records_no_address_keyed_state() {
+    let bind_addr: SocketAddr = "10.77.0.90:9601".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("displaced-full-sync-local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_id = crate::KeyPair::new_for_testing("displaced-full-sync-remote").peer_id();
+    let tcp_source: SocketAddr = "10.77.0.91:40001".parse().unwrap();
+    let advertised: SocketAddr = "10.77.0.91:9601".parse().unwrap();
+
+    // The address has already moved past anything this handler can commit.
+    registry
+        .gossip_state
+        .lock()
+        .await
+        .tombstone_ownership_projection(advertised, crate::registry_owner::CommitSeq::MAX);
+
+    let msg = crate::registry::RegistryMessage::FullSync {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some(advertised.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::registry::GossipExtensionsV1 {
+            clock_probe: Some(crate::registry::ClockProbeV1 {
+                sample_id: 7,
+                sender_wall_ns: crate::current_timestamp_nanos(),
+            }),
+            clock_echo: None,
+        }),
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, tcp_source, msg)
+        .await
+        .expect("a displaced FullSync must be dropped, not error");
+
+    assert!(
+        !registry.has_pending_clock_echo(&advertised),
+        "a displaced claim must not record address-keyed clock state"
+    );
+    let state = registry.gossip_state.lock().await;
+    assert!(
+        !state.peers.contains_key(&advertised),
+        "a displaced claim must not create a peer entry at the contested address"
+    );
+    assert_eq!(
+        state.full_sync_exchanges, 0,
+        "a displaced claim must not book the exchange against the contested address"
+    );
+    drop(state);
+    assert!(
+        registry
+            .connection_pool
+            .get_configured_peer_addr(&peer_id)
+            .is_none(),
+        "a displaced claim must not reindex the connection under the contested address"
+    );
+}
+
+/// Same rule on the response arm: a FullSyncResponse whose claim has been
+/// superseded records no extensions, no peer/session state and no connection
+/// index at the contested address.
+#[tokio::test]
+async fn displaced_full_sync_response_claim_records_no_address_keyed_state() {
+    let bind_addr: SocketAddr = "10.77.0.92:9601".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "displaced-full-sync-response-local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_id = crate::KeyPair::new_for_testing("displaced-full-sync-response-remote").peer_id();
+    let tcp_source: SocketAddr = "10.77.0.93:40002".parse().unwrap();
+    let advertised: SocketAddr = "10.77.0.93:9601".parse().unwrap();
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        let mut peer = stale_peer_info(advertised, stale_time);
+        peer.failures = 3;
+        state.peers.insert(advertised, peer);
+        state.tombstone_ownership_projection(advertised, crate::registry_owner::CommitSeq::MAX);
+    }
+
+    let msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some(advertised.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: Some(crate::registry::GossipExtensionsV1 {
+            clock_probe: Some(crate::registry::ClockProbeV1 {
+                sample_id: 11,
+                sender_wall_ns: crate::current_timestamp_nanos(),
+            }),
+            clock_echo: None,
+        }),
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, tcp_source, msg)
+        .await
+        .expect("a displaced FullSyncResponse must be dropped, not error");
+
+    assert!(
+        !registry.has_pending_clock_echo(&advertised),
+        "a displaced claim must not record address-keyed clock state"
+    );
+    let state = registry.gossip_state.lock().await;
+    assert_eq!(
+        state
+            .peers
+            .get(&advertised)
+            .expect("the pre-existing peer entry must survive")
+            .failures,
+        3,
+        "a displaced claim must not reset another owner's failure state"
+    );
+    assert_eq!(
+        state.full_sync_exchanges, 0,
+        "a displaced claim must not book the exchange against the contested address"
+    );
+    drop(state);
+    assert!(
+        registry
+            .connection_pool
+            .get_configured_peer_addr(&peer_id)
+            .is_none(),
+        "a displaced claim must not reindex the connection under the contested address"
+    );
 }

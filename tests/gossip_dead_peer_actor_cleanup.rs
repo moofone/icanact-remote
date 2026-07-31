@@ -88,10 +88,18 @@ async fn connect_pair(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
     let addr_b = b.registry.bind_addr;
 
     a.registry
-        .add_peer_with_node_id(addr_b, Some(b.registry.peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            addr_b,
+            Some(b.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     b.registry
-        .add_peer_with_node_id(addr_a, Some(a.registry.peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            addr_a,
+            Some(a.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     a.bootstrap_non_blocking(vec![addr_b]).await;
@@ -128,7 +136,11 @@ async fn seed_known_actor_for_synthetic_peer(
 
     let peer_id = SecretKey::generate().to_keypair().peer_id();
     node.registry
-        .add_peer_with_node_id(peer_addr, Some(peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            peer_addr,
+            Some(peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     node.registry.actor_state.known_actors.upsert_sync(
         actor_name.to_string(),
@@ -447,12 +459,20 @@ fn required_peer_connects_within_one_second_without_waiting_for_discovery_gossip
 
         peer_a
             .registry
-            .add_peer_with_node_id(addr_b, Some(id_b.to_node_id()))
+            .add_peer_with_node_id(
+                addr_b,
+                Some(id_b.to_node_id()),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
         peer_b
             .registry
-            .add_peer_with_node_id(addr_a, Some(id_a.to_node_id()))
+            .add_peer_with_node_id(
+                addr_a,
+                Some(id_a.to_node_id()),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         peer_b.registry.configure_peer(id_a.clone(), addr_a).await;
 
@@ -496,7 +516,11 @@ fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() ->
 
         peer_a
             .registry
-            .add_peer_with_node_id(addr_b, Some(id_b.to_node_id()))
+            .add_peer_with_node_id(
+                addr_b,
+                Some(id_b.to_node_id()),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
         peer_a.registry.connect_to_peer(&id_b).await?;
@@ -974,7 +998,11 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
         // "no close signal" condition.
         publisher
             .registry
-            .add_peer_with_node_id(sub_addr, Some(sub_peer_id.to_node_id()))
+            .add_peer_with_node_id(
+                sub_addr,
+                Some(sub_peer_id.to_node_id()),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         publisher
             .registry
