@@ -1449,6 +1449,13 @@ pub struct GossipState {
     /// write and the mutation it authorizes therefore happen in one critical
     /// section, and callers never re-check outside it.
     ownership_commit_seq: HashMap<SocketAddr, CommitSeq>,
+    /// Global rejection floor retained when old per-address tombstones are
+    /// compacted. Commit positions are process-global and monotonic, so a
+    /// delayed projection at or below this floor is necessarily older than
+    /// ownership state we have already retired. Rejecting it may defer a
+    /// still-current but extremely delayed projection until its next refresh;
+    /// admitting it could resurrect a released or migrated owner.
+    ownership_pruned_through: CommitSeq,
 }
 
 /// Soft bound on the number of retained ownership watermarks, including
@@ -1487,6 +1494,9 @@ impl GossipState {
                 }
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
+                if commit_seq <= self.ownership_pruned_through {
+                    return false;
+                }
                 slot.insert(commit_seq);
             }
         }
@@ -1519,13 +1529,11 @@ impl GossipState {
     /// Entries for addresses that still have a `peers` entry are never
     /// dropped: they are the live projections' fences. Everything else is a
     /// tombstone, kept until the table exceeds its soft bound, at which point
-    /// the numerically OLDEST tombstones are dropped first. A dropped
-    /// tombstone can only be defeated by a claim older still — one that has
-    /// been stalled between its reply and this guard across the entire
-    /// remaining table's worth of newer ownership commits — and such a claim
-    /// simply degrades to the unfenced behaviour for that one address rather
-    /// than corrupting anything else. The bound is what keeps address churn
-    /// (ephemeral ports, restarts) from growing this table without limit.
+    /// the numerically OLDEST tombstones are dropped first. Their maximum
+    /// commit position advances `ownership_pruned_through`, so a delayed
+    /// projection cannot pass merely because its address-specific tombstone
+    /// was compacted. The bound keeps address churn (ephemeral ports,
+    /// restarts) from growing this table without weakening the fence.
     fn prune_ownership_watermarks(&mut self) {
         if self.ownership_commit_seq.len() <= OWNERSHIP_WATERMARK_CAPACITY {
             return;
@@ -1545,8 +1553,9 @@ impl GossipState {
             tombstones.select_nth_unstable_by_key(excess, |(_, seq)| *seq);
             tombstones.truncate(excess);
         }
-        for (addr, _) in tombstones {
+        for (addr, commit_seq) in tombstones {
             self.ownership_commit_seq.remove(&addr);
+            self.ownership_pruned_through = self.ownership_pruned_through.max(commit_seq);
         }
     }
 
@@ -1902,6 +1911,7 @@ impl<T: 'static> GossipRegistry<T> {
                 ),
                 mesh_formation_time_ms: None,
                 ownership_commit_seq: HashMap::new(),
+                ownership_pruned_through: 0,
             })),
             connection_pool,
             registry_owner,
@@ -2001,6 +2011,36 @@ impl<T: 'static> GossipRegistry<T> {
             if !still_has_addr.load(Ordering::Relaxed) {
                 let _ = self.peer_capabilities_by_node.remove_sync(&node_id);
             }
+        }
+    }
+
+    /// Detach only capability state belonging to an identity displaced from
+    /// `addr`.  The address-keyed Hello capabilities are deliberately kept:
+    /// the winning connection can publish its Hello before its verified
+    /// identity claim is projected here, and deleting the whole address entry
+    /// would erase that newer owner's negotiation.
+    fn clear_displaced_peer_capability_identity(
+        &self,
+        addr: &SocketAddr,
+        displaced: &crate::PeerId,
+    ) {
+        let displaced_node_id = displaced.to_node_id();
+        let _ = self
+            .peer_capability_addr_to_node
+            .remove_if_sync(addr, |mapped| *mapped == displaced_node_id);
+
+        let still_has_addr = AtomicBool::new(false);
+        self.peer_capability_addr_to_node.iter_sync(|_, mapped| {
+            if *mapped == displaced_node_id {
+                still_has_addr.store(true, Ordering::Relaxed);
+                return false;
+            }
+            true
+        });
+        if !still_has_addr.load(Ordering::Relaxed) {
+            let _ = self
+                .peer_capabilities_by_node
+                .remove_sync(&displaced_node_id);
         }
     }
 
@@ -2777,6 +2817,7 @@ impl<T: 'static> GossipRegistry<T> {
         // squatter inherits that squatter's actor routes or a poisoned high
         // sequence that stalls its own first sync.
         let mut owner_changed = false;
+        let mut displaced_owner: Option<crate::PeerId> = None;
         // Position in the owner actor's commit order of the claim this call
         // is projecting, once it has one. Everything below runs after the
         // reply, outside the actor, so a newer claim for the same address can
@@ -2815,6 +2856,7 @@ impl<T: 'static> GossipRegistry<T> {
                 return AddrClaimOutcome::Rejected;
             };
             owner_changed = displaced.is_some();
+            displaced_owner = displaced;
             resolved_identity_verified = Some(kind == crate::addr_ownership::ClaimKind::Verified);
             projected_commit_seq = Some(commit_seq);
         }
@@ -2964,6 +3006,18 @@ impl<T: 'static> GossipRegistry<T> {
                 "📌 Added new peer (listening address)"
             );
         }
+
+        // Owner-change side tables must be cleaned while the same ownership
+        // watermark guard that admitted this projection is still held.  A
+        // post-guard cleanup can race a newer winning claim and erase the new
+        // owner's capabilities or clock state.
+        if let Some(displaced) = displaced_owner.as_ref() {
+            self.clear_displaced_peer_capability_identity(&peer_addr, displaced);
+            self.remove_clock_state_for_addr(&peer_addr);
+            self.connection_pool
+                .clear_displaced_peer_addr(displaced, peer_addr);
+        }
+
         // `addr_to_peer_id` was already published by the owner actor, in the
         // same serialized command that committed the ownership decision, and
         // a superseded claim returned long before reaching here. What remains
@@ -3009,15 +3063,6 @@ impl<T: 'static> GossipRegistry<T> {
             pool.reindex_connection_addr(&peer_id, peer_addr);
         }
         drop(gossip_state);
-
-        // Lower-priority owner-change cleanup: not part of the routing
-        // publish, so it runs after, not before.
-        if owner_changed {
-            // Capabilities are keyed by address in a separate lock-free
-            // table; clear them here too so a stale mapping to the old
-            // identity cannot outlive the ownership change.
-            self.clear_peer_capabilities(&peer_addr);
-        }
 
         if let Some((old_node_id, actor_names)) = displaced_owner_actors {
             // The displaced identity's admission budget was already
@@ -5723,7 +5768,64 @@ impl<T: 'static> GossipRegistry<T> {
         verified_sender_addr: Option<SocketAddr>,
         session_source: Option<SocketAddr>,
         sequence: u64,
+        wall_clock_time: u64,
+    ) -> bool {
+        self.merge_full_sync_from_guarded(
+            remote_local,
+            remote_known,
+            sender_peer_id,
+            sender_addr,
+            verified_sender_addr,
+            session_source,
+            sequence,
+            wall_clock_time,
+            None,
+        )
+        .await
+    }
+
+    /// Merge a FullSync whose address claim was committed by the registry
+    /// owner.  The commit is revalidated in every state-mutation phase so a
+    /// newer claim cannot win between phases and leave partial projections.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn merge_full_sync_from_owned(
+        &self,
+        remote_local: HashMap<String, RemoteActorLocation>,
+        remote_known: HashMap<String, RemoteActorLocation>,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        verified_sender_addr: Option<SocketAddr>,
+        session_source: Option<SocketAddr>,
+        sequence: u64,
+        wall_clock_time: u64,
+        ownership_commit: CommitSeq,
+    ) -> bool {
+        self.merge_full_sync_from_guarded(
+            remote_local,
+            remote_known,
+            sender_peer_id,
+            sender_addr,
+            verified_sender_addr,
+            session_source,
+            sequence,
+            wall_clock_time,
+            Some(ownership_commit),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn merge_full_sync_from_guarded(
+        &self,
+        remote_local: HashMap<String, RemoteActorLocation>,
+        remote_known: HashMap<String, RemoteActorLocation>,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        verified_sender_addr: Option<SocketAddr>,
+        session_source: Option<SocketAddr>,
+        sequence: u64,
         _wall_clock_time: u64,
+        ownership_commit: Option<CommitSeq>,
     ) -> bool {
         let repair_addr = verified_sender_addr.unwrap_or(sender_addr);
         let session_source = session_source.or(verified_sender_addr);
@@ -5757,6 +5859,16 @@ impl<T: 'static> GossipRegistry<T> {
         // and drop the now-stale pending write instead of applying it.
         let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
+            if let Some(commit_seq) = ownership_commit
+                && !gossip_state.admit_ownership_projection(sender_addr, commit_seq)
+            {
+                debug!(
+                    peer = %sender_addr,
+                    commit_seq,
+                    "dropping full-sync sequence projection after address ownership advanced"
+                );
+                return false;
+            }
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
                 // Once a session has been armed for this peer, only the
                 // connection that armed it is treated as authoritative for
@@ -5928,6 +6040,17 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let mut gossip_state = self.gossip_state.lock().await;
 
+            if let Some(commit_seq) = ownership_commit
+                && !gossip_state.admit_ownership_projection(sender_addr, commit_seq)
+            {
+                debug!(
+                    peer = %sender_addr,
+                    commit_seq,
+                    "dropping full-sync actor projection after address ownership advanced"
+                );
+                return false;
+            }
+
             // Atomic generation recheck, immediately before any write in
             // this block: if a newer session has been armed (or the
             // validated one has self-expired) since STEP 1 captured
@@ -6072,24 +6195,48 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
             }
+
+            // Apply learned routes before releasing the ownership watermark
+            // guard.  The address route itself is authoritative and may only
+            // be published by the registry owner; this phase records the
+            // reverse dial hint only when the owner snapshot still agrees.
+            for (name, peer_id, addr) in &routes_to_configure {
+                let ownership_agrees = self.registry_owner.routes_to(addr).as_ref()
+                    == Some(peer_id)
+                    || self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .read_sync(addr, |_, owner| owner == peer_id)
+                        .unwrap_or(false);
+                if ownership_commit.is_some() && !ownership_agrees {
+                    debug!(
+                        actor = %name,
+                        peer = %peer_id,
+                        peer_addr = %addr,
+                        "skipping learned direct route whose address ownership changed"
+                    );
+                    continue;
+                }
+                self.connection_pool
+                    .set_discovered_peer_addr(peer_id, *addr);
+                // Legacy/local callers of the unguarded merge API do not
+                // arrive through an ownership claim. Preserve that API's
+                // route-learning contract; authenticated wire handlers use
+                // the guarded path above and never publish ownership here.
+                if ownership_commit.is_none() {
+                    let _ = self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .upsert_sync(*addr, peer_id.clone());
+                }
+                debug!(
+                    actor = %name,
+                    peer_addr = %addr,
+                    "Recorded learned direct route for actor's host"
+                );
+            }
             // _gossip_state guard drops here.
             let _ = gossip_state;
-        }
-
-        // STEP 3: Record learned direct routes outside the lock (these
-        // invoke user handlers and may not be held under gossip_state).
-        for (name, peer_id, addr) in routes_to_configure {
-            self.connection_pool
-                .set_discovered_peer_addr(&peer_id, addr);
-            let _ = self
-                .connection_pool
-                .addr_to_peer_id
-                .upsert_sync(addr, peer_id.clone());
-            debug!(
-                actor = %name,
-                peer_addr = %addr,
-                "Recorded learned direct route for actor's host"
-            );
         }
 
         debug!(
@@ -18073,6 +18220,13 @@ mod tests {
             "inbound_observed on a merely self-reported address must not launder \
              a Provisional claim into a Verified one"
         );
+        assert!(
+            !snapshot_peer(&registry, victim_addr)
+                .await
+                .identity_verified,
+            "the derived PeerInfo projection must not launder inbound observation into \
+             verified address ownership"
+        );
 
         // The victim's later genuinely verified claim must be ACCEPTED and
         // displace the attacker's provisional squat.
@@ -18202,6 +18356,96 @@ mod tests {
                 .read_sync(&actor_name, |_, _| ())
                 .is_none(),
             "the old owner's actor must be gone from known_actors after ownership change"
+        );
+    }
+
+    /// A release/migration tombstone may be compacted out of the per-address
+    /// table, but a handler carrying an older accepted commit can still be
+    /// paused before its projection. Compaction must retain a global floor so
+    /// that handler fails closed instead of recreating released state.
+    #[tokio::test]
+    async fn addr_ownership_compaction_rejects_projection_older_than_pruned_tombstone() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_110), test_config());
+        let stale_addr = test_addr(20_111);
+        let stale_commit = 1;
+        let mut state = registry.gossip_state.lock().await;
+        state.tombstone_ownership_projection(stale_addr, stale_commit);
+
+        for index in 0..(OWNERSHIP_WATERMARK_CAPACITY + 1) {
+            let octet_hi = ((index >> 8) & 0xff) as u8;
+            let octet_lo = (index & 0xff) as u8;
+            let addr = SocketAddr::from(([10, octet_hi, octet_lo, 7], 31_000));
+            state.tombstone_ownership_projection(addr, (index as CommitSeq) + 2);
+        }
+
+        assert_eq!(
+            state.ownership_watermark(&stale_addr),
+            None,
+            "precondition: the oldest per-address tombstone was compacted"
+        );
+        assert!(
+            !state.admit_ownership_projection(stale_addr, stale_commit),
+            "a delayed projection older than the compacted tombstone must remain rejected"
+        );
+    }
+
+    /// A verified owner can displace a provisional identity after the new
+    /// TLS Hello has already published capabilities at the shared address.
+    /// Cleanup must remove only the displaced identity's capability record,
+    /// never the new handshake's address-keyed value.
+    #[tokio::test]
+    async fn addr_ownership_displacement_preserves_new_owner_hello_capabilities() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_112), test_config());
+        let addr = test_addr(20_113);
+        let old_owner = test_peer_id("addr-caps-old").to_node_id();
+        let new_owner = test_peer_id("addr-caps-new").to_node_id();
+        let old_caps = clock_caps();
+        let hello =
+            crate::handshake::Hello::with_features(vec![crate::handshake::Feature::PeerListGossip]);
+        let new_caps = crate::handshake::PeerCapabilities::from_hello_exchange(&hello, &hello);
+
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(old_owner),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        registry.set_peer_capabilities(addr, old_caps);
+        registry
+            .associate_peer_capabilities_with_node(addr, old_owner)
+            .await;
+
+        // Real inbound order: Hello publishes the new address capabilities
+        // before the authenticated identity claim displaces the provisional
+        // owner. The addr->node association still names the old owner here.
+        registry.set_peer_capabilities(addr, new_caps);
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(new_owner),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        registry
+            .associate_peer_capabilities_with_node(addr, new_owner)
+            .await;
+
+        assert_eq!(
+            registry.peer_capabilities.read_sync(&addr, |_, caps| *caps),
+            Some(new_caps),
+            "owner-change cleanup must preserve the new Hello capabilities at the address"
+        );
+        assert_eq!(
+            registry
+                .peer_capabilities_by_node
+                .read_sync(&new_owner, |_, caps| *caps),
+            Some(new_caps),
+            "the displacing owner must retain negotiated capabilities for this session"
+        );
+        assert!(
+            !registry.peer_capabilities_by_node.contains_sync(&old_owner),
+            "the displaced owner's identity-keyed capabilities must be removed"
         );
     }
 

@@ -887,6 +887,7 @@ pub(crate) async fn process_read_result(
                 registry.clone(),
                 peer_addr,
                 session_source,
+                authenticated_peer_id.cloned(),
                 msg,
             )
             .await

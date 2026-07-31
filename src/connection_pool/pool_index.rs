@@ -121,6 +121,16 @@ impl PeerSession {
             .expect("peer session route_addr poisoned") = Some(addr);
     }
 
+    fn clear_route_addr_if(&self, addr: SocketAddr) {
+        let mut route = self
+            .route_addr
+            .write()
+            .expect("peer session route_addr poisoned");
+        if *route == Some(addr) {
+            *route = None;
+        }
+    }
+
     fn route_addr(&self) -> Option<SocketAddr> {
         *self
             .route_addr
