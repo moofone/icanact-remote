@@ -12,7 +12,7 @@ use tokio::{
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
+    GossipConfig, GossipError, GossipNodeId, RegistrationPriority, RemoteActorLocation, Result,
     registry::{GossipRegistry, GossipResult, GossipTask, RegistryMessage, RegistryStats},
     transport::{RegistryTransportBootstrap, TransportWireKind},
 };
@@ -98,6 +98,29 @@ fn resolve_inbound_peer_state_addr(
         "ignoring non-dialable inbound advertised bind; using observed source address"
     );
     peer_addr
+}
+
+/// Attach Hello capabilities only after address arbitration accepted an
+/// attribution for this authenticated connection. The observed-source entry
+/// is safe to associate when any claim succeeds, but a fully rejected
+/// handshake must not mutate the capability projections of an existing owner.
+async fn associate_inbound_capabilities_after_claim(
+    registry: &GossipRegistry,
+    observed_addr: SocketAddr,
+    node_id: GossipNodeId,
+    effective_addr: Option<SocketAddr>,
+) {
+    let Some(effective_addr) = effective_addr else {
+        return;
+    };
+    registry
+        .associate_peer_capabilities_with_node(observed_addr, node_id)
+        .await;
+    if effective_addr != observed_addr {
+        registry
+            .associate_peer_capabilities_with_node(effective_addr, node_id)
+            .await;
+    }
 }
 
 /// Main API for the gossip registry with vector clocks and separated locks
@@ -947,6 +970,48 @@ mod tests {
         let resolved = resolve_inbound_peer_state_addr(Some("0.0.0.0:9301"), peer_addr, None);
 
         assert_eq!(resolved, "10.10.0.10:9301".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejected_inbound_claim_does_not_associate_hello_capabilities() {
+        let keypair = KeyPair::new_for_testing("rejected-capability-association-local");
+        let registry = GossipRegistry::<()>::new(
+            "127.0.0.1:39001".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(keypair),
+                ..Default::default()
+            },
+        );
+        let observed: SocketAddr = "127.0.0.1:49001".parse().unwrap();
+        let claimant = KeyPair::new_for_testing("rejected-capability-association-remote")
+            .peer_id()
+            .to_node_id();
+        let caps = crate::handshake::PeerCapabilities::from_hello_exchange(
+            &crate::handshake::Hello::new(),
+            &crate::handshake::Hello::new(),
+        );
+        registry.set_peer_capabilities(observed, caps);
+
+        associate_inbound_capabilities_after_claim(&registry, observed, claimant, None).await;
+
+        assert_eq!(
+            registry
+                .peer_capability_addr_to_node
+                .read_sync(&observed, |_, node| *node),
+            None,
+            "a fully rejected arbitration must not associate the losing identity with the address"
+        );
+        assert!(
+            !registry.peer_capabilities_by_node.contains_sync(&claimant),
+            "a fully rejected arbitration must not publish node-scoped capabilities"
+        );
+        assert_eq!(
+            registry
+                .peer_capabilities
+                .read_sync(&observed, |_, caps| *caps),
+            Some(caps),
+            "raw Hello capabilities remain available for the connection cleanup path"
+        );
     }
 
     #[test]
@@ -3661,18 +3726,11 @@ where
             }
         };
 
-        // Associate capabilities captured during the Hello handshake (stored
-        // under peer_addr) -- always safe, since peer_addr is the raw
-        // address this exact connection was observed on.
-        registry
-            .associate_peer_capabilities_with_node(peer_addr, node_id)
+        associate_inbound_capabilities_after_claim(&registry, peer_addr, node_id, effective_addr)
             .await;
 
         if let Some(effective_addr) = effective_addr {
             if effective_addr != peer_addr {
-                registry
-                    .associate_peer_capabilities_with_node(effective_addr, node_id)
-                    .await;
                 let mut gossip_state = registry.gossip_state.lock().await;
                 if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
                     peer_info.peer_address = Some(peer_addr);
@@ -3681,17 +3739,15 @@ where
 
             // Notify peer discovery that a connection is established (incoming)
             registry.mark_peer_connected(effective_addr).await;
-            // Inbound-observation evidence must be recorded on the address
-            // it actually corroborates: the raw TCP source of this
-            // connection, `peer_addr`. Recording it on `effective_addr`
-            // instead -- which can be a merely self-reported, Provisional
-            // claim -- would flip `PeerInfo::inbound_observed` on an address
-            // that was never itself observed. `mark_peer_connected` above
-            // already covers the health/discovery bookkeeping for
-            // `effective_addr`; only the observation flag needs to stay
-            // pinned to the address it is actually evidence for.
+            // Attribute liveness to the address arbitration accepted and
+            // retain the raw TCP source in `PeerInfo::peer_address`. Creating
+            // a separate PeerInfo at the ephemeral source would let the first
+            // FullSync migration overwrite this identity-bearing entry. The
+            // observation bit is only liveness metadata; ownership kind stays
+            // exactly as resolved by the owner actor and cannot be upgraded by
+            // this call.
             registry
-                .mark_inbound_connection_observed(peer_addr, peer_addr)
+                .mark_inbound_connection_observed(effective_addr, peer_addr)
                 .await;
 
             debug!(

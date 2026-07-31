@@ -47,10 +47,10 @@ const OWNER_MAILBOX_CAPACITY: usize = 512;
 
 /// Immutable, lock-free-readable publication of the address ownership table.
 ///
-/// Republished in full on every committed mutation. The table is sized by the
-/// peer count (tens to low thousands) and mutations happen at connection /
-/// full-sync cadence, so rebuilding it is far cheaper than the per-read
-/// synchronization a shared mutable map would impose on the many readers.
+/// Republished in full whenever an owner or resolved claim kind changes.
+/// Unchanged same-owner refreshes still advance their projection commit fence
+/// but reuse this snapshot, avoiding O(peer-count) copying on routine gossip.
+/// Reads remain lock-free and never enter the owner mailbox.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RoutingSnapshot {
     owners: HashMap<SocketAddr, Owner>,
@@ -538,20 +538,24 @@ impl PeerRegistryOwner {
             Decision::Accept => {
                 let kind = resolved_kind(current.as_ref(), &claim);
                 let displaced = current
+                    .as_ref()
                     .filter(|owner| owner.node_id != claim.node_id)
-                    .map(|owner| owner.node_id);
+                    .map(|owner| owner.node_id.clone());
                 let node_id = claim.node_id;
-                self.addr_ownership.insert(
-                    addr,
-                    Owner {
-                        node_id: node_id.clone(),
-                        kind,
-                    },
-                );
+                let next_owner = Owner {
+                    node_id: node_id.clone(),
+                    kind,
+                };
+                let ownership_changed = current.as_ref() != Some(&next_owner);
+                if ownership_changed {
+                    self.addr_ownership.insert(addr, next_owner);
+                }
                 let commit_seq = self.advance();
-                self.publish();
-                if let Some(routing) = self.routing.upgrade() {
-                    routing.publish_owner(addr, &node_id);
+                if ownership_changed {
+                    self.publish();
+                    if let Some(routing) = self.routing.upgrade() {
+                        routing.publish_owner(addr, &node_id);
+                    }
                 }
                 ClaimCommit::Accepted {
                     kind,
@@ -837,6 +841,41 @@ mod tests {
         assert_eq!(
             owner.owner_of(&target).map(|owner| owner.kind),
             Some(ClaimKind::Verified)
+        );
+    }
+
+    /// Routine FullSync refreshes advance the projection fence but do not
+    /// rebuild the whole immutable ownership table when neither identity nor
+    /// resolved claim kind changed.
+    #[tokio::test]
+    async fn unchanged_same_owner_refresh_reuses_snapshot_and_route_publication() {
+        let (owner, publisher) = owner_handle();
+        let node = peer("unchanged-refresh");
+        let target = addr(30_023);
+
+        owner
+            .claim(target, claim_of(node.clone(), ClaimKind::Verified), false)
+            .await;
+        let snapshot = owner.snapshot();
+        let published = publisher.events();
+
+        let refresh = owner
+            .claim(target, claim_of(node, ClaimKind::Provisional), false)
+            .await;
+
+        assert_eq!(
+            refresh.commit_seq(),
+            Some(2),
+            "the projection fence advances"
+        );
+        assert!(
+            Arc::ptr_eq(&snapshot, &owner.snapshot()),
+            "an unchanged refresh must not clone and republish the full ownership map"
+        );
+        assert_eq!(
+            publisher.events(),
+            published,
+            "an unchanged refresh must not republish an identical address route"
         );
     }
 

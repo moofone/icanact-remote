@@ -575,3 +575,74 @@ async fn competing_provisional_claim_cannot_displace_first_owner() -> icanact_re
     observer.shutdown().await;
     Ok(())
 }
+
+/// A normal inbound peer's advertised listening address differs from its raw
+/// TCP source port. Recording observed-source evidence must not create a
+/// phantom source PeerInfo that the first FullSync then migrates over the
+/// identity-bearing advertised entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nat_inbound_full_sync_preserves_advertised_peer_identity() -> icanact_remote::Result<()> {
+    let observer_addr = loopback_addr();
+    let sender_addr = loopback_addr();
+    let observer_key =
+        KeyPair::new_for_testing(format!("ownership-nat-observer-{}", observer_addr.port()));
+    let sender_key =
+        KeyPair::new_for_testing(format!("ownership-nat-sender-{}", sender_addr.port()));
+    let observer = start_node(observer_addr, &observer_key).await?;
+    let sender = start_node(sender_addr, &sender_key).await?;
+
+    sender
+        .add_peer(&observer.registry.peer_id)
+        .await
+        .connect(&observer_addr)
+        .await?;
+    wait_for_connection(&observer, &sender.registry.peer_id).await;
+
+    {
+        let state = observer.registry.gossip_state.lock().await;
+        assert_eq!(
+            state.peers.get(&sender_addr).and_then(|peer| peer.node_id),
+            Some(sender.registry.peer_id.to_node_id()),
+            "authenticated handshake must establish the advertised peer identity"
+        );
+    }
+
+    let actor = "ownership/nat/identity-barrier";
+    send_registry_message(
+        &sender,
+        &observer.registry.peer_id,
+        full_sync_message(
+            FullSyncKind::Request,
+            sender.registry.peer_id.clone(),
+            sender_addr,
+            actor,
+            sender_addr,
+            13_001,
+            None,
+        ),
+    );
+    let _ = wait_for_actor(&observer.registry, actor).await;
+
+    let state = observer.registry.gossip_state.lock().await;
+    let advertised = state
+        .peers
+        .get(&sender_addr)
+        .expect("advertised peer entry must survive FullSync");
+    assert_eq!(
+        advertised.node_id,
+        Some(sender.registry.peer_id.to_node_id()),
+        "FullSync migration must not overwrite the authenticated node id with a phantom source entry"
+    );
+    assert!(
+        state
+            .peers
+            .values()
+            .all(|peer| peer.address == sender_addr || peer.node_id.is_some()),
+        "raw observed-source bookkeeping must not gossip a phantom identity-less PeerInfo"
+    );
+    drop(state);
+
+    sender.shutdown().await;
+    observer.shutdown().await;
+    Ok(())
+}
