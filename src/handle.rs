@@ -100,6 +100,18 @@ fn resolve_inbound_peer_state_addr(
     peer_addr
 }
 
+fn inbound_addr_claim_kind(
+    peer_state_addr: SocketAddr,
+    observed_addr: SocketAddr,
+    required_addr: Option<SocketAddr>,
+) -> crate::addr_ownership::ClaimKind {
+    if peer_state_addr == observed_addr || required_addr == Some(peer_state_addr) {
+        crate::addr_ownership::ClaimKind::Verified
+    } else {
+        crate::addr_ownership::ClaimKind::Provisional
+    }
+}
+
 /// Attach Hello capabilities only after address arbitration accepted an
 /// attribution for this authenticated connection. The observed-source entry
 /// is safe to associate when any claim succeeds, but a fully rejected
@@ -970,6 +982,36 @@ mod tests {
         let resolved = resolve_inbound_peer_state_addr(Some("0.0.0.0:9301"), peer_addr, None);
 
         assert_eq!(resolved, "10.10.0.10:9301".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn discovered_route_does_not_verify_reconnected_inbound_claim() {
+        let registry = GossipRegistry::<()>::new(
+            "127.0.0.1:39002".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(KeyPair::new_for_testing("discovered-route-local")),
+                ..Default::default()
+            },
+        );
+        let claimant = KeyPair::new_for_testing("discovered-route-claimant").peer_id();
+        let claimed: SocketAddr = "10.90.0.7:9400".parse().unwrap();
+        let observed: SocketAddr = "10.90.0.8:49002".parse().unwrap();
+        registry
+            .connection_pool
+            .set_discovered_peer_addr(&claimant, claimed);
+        let cached_route = registry.connection_pool.get_configured_peer_addr(&claimant);
+        assert_eq!(cached_route, Some(claimed));
+        let required_route = registry.connection_pool.get_required_peer_addr(&claimant);
+        assert_eq!(
+            required_route, None,
+            "precondition: the route was learned, not operator configured"
+        );
+
+        assert_eq!(
+            inbound_addr_claim_kind(claimed, observed, required_route),
+            crate::addr_ownership::ClaimKind::Provisional,
+            "a cached learned route must not upgrade the next self-report to Verified"
+        );
     }
 
     #[tokio::test]
@@ -3661,14 +3703,17 @@ where
     // is rejected, preserve any configured stable address instead of letting an
     // ephemeral TCP source address replace the peer's dial target.
     let sender_bind_addr = sender_bind_addr_opt.as_deref();
-    let configured_addr = {
+    let (route_addr, required_addr) = {
         let pool = &registry.connection_pool;
-        pool.peer_id_to_addr
-            .read_sync(&peer_id, |_, v| *v)
-            .filter(|addr| addr.port() != 0 && !addr.ip().is_unspecified())
+        let is_valid = |addr: SocketAddr| addr.port() != 0 && !addr.ip().is_unspecified();
+        (
+            pool.get_configured_peer_addr(&peer_id)
+                .filter(|addr| is_valid(*addr)),
+            pool.get_required_peer_addr(&peer_id)
+                .filter(|addr| is_valid(*addr)),
+        )
     };
-    let peer_state_addr =
-        resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, configured_addr);
+    let peer_state_addr = resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, route_addr);
 
     if let Some(node_id) = node_id_opt {
         // TLS authenticates `node_id`, but that alone does not prove
@@ -3681,12 +3726,7 @@ where
         // authenticated but the address is merely self-reported:
         // Provisional, and subject to displacement by a genuinely verified
         // claim for the same address (see `addr_ownership::arbitrate`).
-        let addr_claim_kind =
-            if peer_state_addr == peer_addr || configured_addr == Some(peer_state_addr) {
-                crate::addr_ownership::ClaimKind::Verified
-            } else {
-                crate::addr_ownership::ClaimKind::Provisional
-            };
+        let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
 
         let claim_outcome = registry
             .add_peer_with_node_id(peer_state_addr, Some(node_id), addr_claim_kind)

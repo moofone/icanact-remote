@@ -3095,12 +3095,29 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Configure a peer by peer ID and its expected connection address
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
+        // Operator configuration is verified ownership evidence. Reserve the
+        // address in the single-owner authority before publishing the required
+        // dial route, so an offline configured peer cannot be displaced by a
+        // provisional remote self-report.
+        let outcome = self
+            .add_peer_with_node_id(
+                connect_addr,
+                Some(peer_id.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        if outcome == crate::addr_ownership::AddrClaimOutcome::Rejected {
+            warn!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                "refusing configured peer route because the ownership authority rejected it"
+            );
+            return;
+        }
+
         let pool = &self.connection_pool;
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
         pool.set_configured_peer_addr(&peer_id, connect_addr);
-        let _ = pool
-            .addr_to_peer_id
-            .upsert_sync(connect_addr, peer_id.clone());
         pool.reindex_connection_addr(&peer_id, connect_addr);
         if let Some(cell) = self.peer_connect_handler.load_full() {
             cell.handler
@@ -18245,6 +18262,44 @@ mod tests {
             snapshot_peer(&registry, victim_addr).await.node_id,
             Some(victim),
             "the victim's genuinely verified claim must displace the laundered attacker"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_offline_peer_reserves_address_in_owner_authority() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_013), test_config());
+        let configured_addr = test_addr(20_014);
+        let intended = test_peer_id("configured-address-intended");
+        let attacker = test_peer_id("configured-address-attacker");
+
+        registry
+            .configure_peer(intended.clone(), configured_addr)
+            .await;
+        let attacker_outcome = registry
+            .add_peer_with_node_id(
+                configured_addr,
+                Some(attacker.to_node_id()),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+
+        assert_eq!(
+            attacker_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Rejected,
+            "a provisional remote claim must not steal an offline operator-configured address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&configured_addr),
+            Some(intended.clone()),
+            "operator configuration must be registered in the ownership authority"
+        );
+        assert_eq!(
+            registry
+                .connection_pool
+                .addr_to_peer_id
+                .read_sync(&configured_addr, |_, peer| peer.clone()),
+            Some(intended),
+            "published address routing must agree with the owner authority"
         );
     }
 
