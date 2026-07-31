@@ -2879,17 +2879,25 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(commit_seq) = projected_commit_seq
             && !gossip_state.admit_ownership_projection(peer_addr, commit_seq)
         {
+            let authoritative_owner_unchanged = node_id.is_some_and(|node_id| {
+                self.registry_owner.routes_to(&peer_addr) == Some(node_id.to_peer_id())
+            });
             drop(gossip_state);
             debug!(
                 peer = %peer_addr,
                 commit_seq,
+                authoritative_owner_unchanged,
                 "address ownership advanced past this claim; skipping stale projection"
             );
-            // Reported as a rejection, not a success: from this caller's
-            // point of view the address is no longer attributable to its
-            // claimant, which is exactly what a rejection means to the
-            // fallback paths that consume this outcome.
-            return AddrClaimOutcome::Rejected;
+            // A newer projection for the SAME identity is not an ownership
+            // conflict. Its state already won the watermark race, so this
+            // call must stand down without replaying anything but still tell
+            // connection/configuration callers that their claim is valid.
+            return if authoritative_owner_unchanged {
+                AddrClaimOutcome::Accepted
+            } else {
+                AddrClaimOutcome::Rejected
+            };
         }
 
         // Check if we already have this peer
@@ -2898,11 +2906,12 @@ impl<T: 'static> GossipRegistry<T> {
         // and their admission budget freed AFTER the lock is dropped.
         let mut displaced_owner_actors: Option<(
             crate::GossipNodeId,
-            std::collections::HashSet<String>,
+            HashMap<String, RemoteActorLocation>,
         )> = None;
 
         if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
             let old_node_id = existing_peer.node_id;
+            let old_connection_addr = existing_peer.peer_address;
             // Derived projection: authoritative ownership lives in
             // `PeerRegistryOwner`; `node_id`/`identity_verified` mirror the
             // decision it just committed, for the gossip/discovery consumers
@@ -2943,7 +2952,25 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                 }
                 if let Some(old_node_id) = old_node_id {
-                    displaced_owner_actors = Some((old_node_id, old_actors.unwrap_or_default()));
+                    let mut exact_locations = HashMap::new();
+                    for actor_name in old_actors.iter().flatten() {
+                        if let Some(location) = self
+                            .actor_state
+                            .known_actors
+                            .read_sync(actor_name.as_str(), |_, location| location.clone())
+                            && (location.node_id == old_node_id
+                                || location.peer_id.to_node_id() == old_node_id)
+                            && location.address.parse::<SocketAddr>().ok().is_some_and(
+                                |location_addr| {
+                                    location_addr == peer_addr
+                                        || Some(location_addr) == old_connection_addr
+                                },
+                            )
+                        {
+                            exact_locations.insert(actor_name.clone(), location);
+                        }
+                    }
+                    displaced_owner_actors = Some((old_node_id, exact_locations));
                 }
                 debug!(
                     peer = %peer_addr,
@@ -3064,29 +3091,19 @@ impl<T: 'static> GossipRegistry<T> {
         }
         drop(gossip_state);
 
-        if let Some((old_node_id, actor_names)) = displaced_owner_actors {
+        if let Some((_old_node_id, actor_locations)) = displaced_owner_actors {
             // The displaced identity's admission budget was already
             // released above; now drop its entries from `known_actors` too,
             // so routing (`lookup_actor`) stops returning the squatter's
             // actors once its address has been taken over by the genuine
-            // owner. Re-verify ownership by identity (not just presence in
-            // the old side-table snapshot) so a concurrent, unrelated
-            // update to the same actor name is never clobbered here.
-            for actor_name in &actor_names {
-                let still_owned_by_old = self
+            // owner. Each removal atomically compares the exact location
+            // captured while the displacement guard was held; a concurrent
+            // refresh or transfer of the same actor name therefore survives.
+            for (actor_name, displaced_location) in &actor_locations {
+                let _ = self
                     .actor_state
                     .known_actors
-                    .read_sync(actor_name.as_str(), |_, location| {
-                        location.node_id == old_node_id
-                            || location.peer_id.to_node_id() == old_node_id
-                    })
-                    .unwrap_or(false);
-                if still_owned_by_old {
-                    let _ = self
-                        .actor_state
-                        .known_actors
-                        .remove_sync(actor_name.as_str());
-                }
+                    .remove_if_sync(actor_name.as_str(), |current| current == displaced_location);
             }
         }
 
@@ -18504,6 +18521,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_same_owner_projection_reports_accepted_when_authority_still_matches() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_114), test_config());
+        let addr = test_addr(20_115);
+        let owner = test_peer_id("same-owner-stale-projection").to_node_id();
+
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    addr,
+                    Some(owner),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .tombstone_ownership_projection(addr, CommitSeq::MAX);
+
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    addr,
+                    Some(owner),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Accepted,
+            "a superseded projection is still an accepted claim when the authoritative owner is unchanged"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(owner.to_peer_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn displacement_cleanup_preserves_same_identity_actor_refreshed_at_new_address() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_116), test_config());
+        let contested = test_addr(20_117);
+        let refreshed_addr = test_addr(20_118);
+        let displaced_peer = test_peer_id("displaced-actor-refresh-old");
+        let displaced_node = displaced_peer.to_node_id();
+        let successor = test_peer_id("displaced-actor-refresh-new").to_node_id();
+        let actor_name = "displaced/actor/refreshed".to_string();
+
+        registry
+            .add_peer_with_node_id(
+                contested,
+                Some(displaced_node),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .peer_to_actors
+            .entry(contested)
+            .or_default()
+            .insert(actor_name.clone());
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            actor_name.clone(),
+            RemoteActorLocation::new_with_peer(refreshed_addr, displaced_peer.clone()),
+        );
+
+        registry
+            .add_peer_with_node_id(
+                contested,
+                Some(successor),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let refreshed = registry
+            .actor_state
+            .known_actors
+            .read_sync(&actor_name, |_, location| location.clone());
+        assert_eq!(
+            refreshed.map(|location| location.address),
+            Some(refreshed_addr.to_string()),
+            "cleanup for the displaced address must not delete a fresh route for the same identity at another address"
+        );
+    }
+
     /// A remote peer claiming this node's own bind/advertised address is
     /// rejected outright, regardless of current ownership state.
     #[tokio::test]
@@ -18646,7 +18751,9 @@ mod tests {
 
         // The same rule end to end through the production path: a claim whose
         // commit lands behind a projection that is already applied for the
-        // address mirrors nothing and reports a rejection.
+        // address mirrors nothing. Because no different authoritative owner
+        // was installed in this synthetic case, the claim itself remains
+        // accepted even though its stale projection is skipped.
         let contended = test_addr(20_103);
         let latecomer = test_peer_id("projection-order-latecomer");
         registry
@@ -18664,8 +18771,8 @@ mod tests {
             .await;
         assert_eq!(
             late_outcome,
-            crate::addr_ownership::AddrClaimOutcome::Rejected,
-            "a superseded claim must not report success to its caller"
+            crate::addr_ownership::AddrClaimOutcome::Accepted,
+            "a skipped projection is not an ownership conflict while authority still matches"
         );
         assert!(
             !registry
@@ -18726,9 +18833,36 @@ mod tests {
             }
         });
 
-        // A newer commit takes the address and projects, entirely inside the
-        // critical section the claimant is waiting for.
-        guard.tombstone_ownership_projection(addr, CommitSeq::MAX);
+        // Wait until the stalled task has committed in the owner actor and is
+        // genuinely parked only on this guard.
+        for _ in 0..100 {
+            if registry.registry_owner.routes_to(&addr) == Some(stalled.clone()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(stalled.clone()),
+            "stalled claimant must commit before the winner"
+        );
+
+        // A newer authoritative commit takes the address and its derived
+        // projection is applied entirely inside the critical section the
+        // claimant is waiting for.
+        let winner_commit = registry
+            .registry_owner
+            .claim(
+                addr,
+                crate::addr_ownership::Claim {
+                    node_id: winner.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let winner_seq = winner_commit.commit_seq().expect("winner must commit");
+        guard.tombstone_ownership_projection(addr, winner_seq);
         guard.peers.insert(
             addr,
             PeerInfo {
