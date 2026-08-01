@@ -1228,6 +1228,63 @@ impl AsyncWrite for RecordingWriter {
     }
 }
 
+#[tokio::test]
+async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
+    let (mut writer, recorded) = RecordingWriter::new();
+    let queue = StreamingQueue::new(1, "127.0.0.1:40493".parse().unwrap());
+    let header =
+        crate::framing::write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17);
+    let payload = bytes::Bytes::from(vec![0xA7; STREAM_WRITE_SLICE_BYTES + 17]);
+    let pending =
+        PendingStreamingCommand::shared(StreamingCommand::VectoredWrite(VectoredSendItem {
+            header: InlineFrameHeader::from_array(header),
+            payload,
+        }));
+    let mut pending_slot = Some(pending);
+    let mut turns = 0usize;
+    loop {
+        let mut pending = pending_slot.take().unwrap();
+        let (written, complete) = write_streaming_command_slice(&mut writer, &mut pending)
+            .await
+            .unwrap();
+        assert!(written > 0);
+        assert!(written <= STREAM_WRITE_SLICE_BYTES);
+        turns += 1;
+        finish_streaming_command_slice(pending, complete, &queue, &mut pending_slot);
+        if complete {
+            break;
+        }
+        assert_eq!(
+            queue.space_notification_count(),
+            0,
+            "partial progress must not release shared queue capacity"
+        );
+    }
+
+    assert!(turns >= 2, "an oversized command must remain resumable");
+    assert!(pending_slot.is_none());
+    assert_eq!(
+        queue.space_notification_count(),
+        1,
+        "a shared queue slot is released once, after full command completion"
+    );
+
+    let mut local = PendingStreamingCommand::local(StreamingCommand::Flush);
+    let (_, local_complete) = write_streaming_command_slice(&mut writer, &mut local)
+        .await
+        .unwrap();
+    finish_streaming_command_slice(local, local_complete, &queue, &mut pending_slot);
+    assert_eq!(
+        queue.space_notification_count(),
+        1,
+        "IO-owner-local responses must not fabricate shared queue capacity"
+    );
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        header.len() + STREAM_WRITE_SLICE_BYTES + 17
+    );
+}
+
 #[derive(Clone, Copy, Default)]
 struct ClosedWriter;
 
