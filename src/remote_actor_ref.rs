@@ -567,8 +567,22 @@ impl<T> RemoteActorRef<T> {
         failed: &Arc<RemoteConnection>,
         err: crate::GossipError,
     ) -> crate::GossipError {
-        if let Err(repair_err) = self.reheal_connection(failed).await {
-            tracing::debug!(error = ?repair_err, "failed to repair cached connection after ambiguous ask failure");
+        let Some(registry) = self.registry.upgrade() else {
+            return err;
+        };
+        let recovery_timeout = registry.config.connection_timeout;
+        let repair = tokio::time::timeout(recovery_timeout, self.reheal_connection(failed)).await;
+        match repair {
+            Ok(Ok(_)) => {}
+            Ok(Err(repair_err)) => {
+                tracing::debug!(error = ?repair_err, "failed to repair cached connection after ambiguous ask failure");
+            }
+            Err(_) => {
+                tracing::debug!(
+                    timeout = ?recovery_timeout,
+                    "timed out repairing cached connection after ambiguous ask failure"
+                );
+            }
         }
         err
     }
