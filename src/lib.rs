@@ -12,7 +12,6 @@
     clippy::needless_lifetimes,
     clippy::option_as_ref_deref,
     clippy::question_mark,
-    clippy::redundant_pattern_matching,
     clippy::too_many_arguments,
     clippy::type_complexity,
     clippy::vec_box,
