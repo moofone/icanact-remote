@@ -10324,9 +10324,14 @@ async fn run_full_sync_displaced_during_merge_is_dropped(response: bool) {
             let stale = stale_for_hook.clone();
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
+                    let stale_generation = registry
+                        .registry_owner
+                        .claim_generation_for_test(advertised)
+                        .await
+                        .expect("in-flight FullSync claim generation");
                     registry
                         .registry_owner
-                        .release(advertised, Some(stale))
+                        .release(advertised, stale, stale_generation)
                         .await
                         .expect("stale session releases before successor claim");
                     let outcome = registry

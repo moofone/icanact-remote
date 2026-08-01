@@ -143,11 +143,12 @@ async fn rollback_rejected_inbound_claim(
     registry: &GossipRegistry,
     addr: SocketAddr,
     peer_id: &crate::PeerId,
+    claim_generation: crate::registry_owner::CommitSeq,
     prior_peer: Option<crate::registry::PeerInfo>,
 ) {
     let Some(release_seq) = registry
         .registry_owner
-        .release(addr, Some(peer_id.clone()))
+        .release(addr, peer_id.clone(), claim_generation)
         .await
     else {
         return;
@@ -3787,7 +3788,11 @@ where
                 .flatten(),
         )
     };
-    let mut rollback_claim: Option<(SocketAddr, Option<crate::registry::PeerInfo>)> = None;
+    let mut rollback_claim: Option<(
+        SocketAddr,
+        crate::registry_owner::CommitSeq,
+        Option<crate::registry::PeerInfo>,
+    )> = None;
 
     if let Some(node_id) = node_id_opt {
         // TLS authenticates `node_id`, but that alone does not prove
@@ -3802,8 +3807,8 @@ where
         // claim for the same address (see `addr_ownership::arbitrate`).
         let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
 
-        let claim_outcome = registry
-            .add_peer_with_node_id(peer_state_addr, Some(node_id), addr_claim_kind)
+        let (claim_outcome, claim_generation) = registry
+            .add_peer_with_node_id_generation(peer_state_addr, Some(node_id), addr_claim_kind)
             .await;
 
         // The address this connection is actually attributed to after
@@ -3811,8 +3816,10 @@ where
         // source instead of abandoning bookkeeping outright: that claim is
         // inherently Verified (it depends on nothing the peer can forge),
         // so it is always safe to retry there.
-        let effective_addr = match claim_outcome {
-            crate::addr_ownership::AddrClaimOutcome::Accepted => Some(peer_state_addr),
+        let effective_claim = match claim_outcome {
+            crate::addr_ownership::AddrClaimOutcome::Accepted => {
+                claim_generation.map(|generation| (peer_state_addr, generation))
+            }
             crate::addr_ownership::AddrClaimOutcome::Rejected if peer_state_addr == peer_addr => {
                 // The observed source itself was rejected (a different,
                 // already-verified owner holds it) -- no safe address is
@@ -3826,21 +3833,23 @@ where
                     node_id = %node_id.fmt_short(),
                     "rejecting claimed advertised address for inbound peer; falling back to observed source"
                 );
-                match registry
-                    .add_peer_with_node_id(
+                let (fallback_outcome, fallback_generation) = registry
+                    .add_peer_with_node_id_generation(
                         peer_addr,
                         Some(node_id),
                         crate::addr_ownership::ClaimKind::Verified,
                     )
-                    .await
-                {
-                    crate::addr_ownership::AddrClaimOutcome::Accepted => Some(peer_addr),
+                    .await;
+                match fallback_outcome {
+                    crate::addr_ownership::AddrClaimOutcome::Accepted => {
+                        fallback_generation.map(|generation| (peer_addr, generation))
+                    }
                     crate::addr_ownership::AddrClaimOutcome::Rejected => None,
                 }
             }
         };
 
-        let Some(effective_addr) = effective_addr else {
+        let Some((effective_addr, claim_generation)) = effective_claim else {
             warn!(
                 peer_addr = %peer_addr,
                 peer_state_addr = %peer_state_addr,
@@ -3857,7 +3866,7 @@ where
             (observed_owner_before.as_ref(), observed_peer_before)
         };
         if owner_before.is_none() {
-            rollback_claim = Some((effective_addr, peer_before));
+            rollback_claim = Some((effective_addr, claim_generation, peer_before));
         }
         peer_state_addr = effective_addr;
 
@@ -4284,9 +4293,15 @@ where
             if let Some(handle) = connection_arc.stream_handle.as_ref() {
                 handle.shutdown();
             }
-            if let Some((claimed_addr, prior_peer)) = rollback_claim {
-                rollback_rejected_inbound_claim(&registry, claimed_addr, &peer_id, prior_peer)
-                    .await;
+            if let Some((claimed_addr, claim_generation, prior_peer)) = rollback_claim {
+                rollback_rejected_inbound_claim(
+                    &registry,
+                    claimed_addr,
+                    &peer_id,
+                    claim_generation,
+                    prior_peer,
+                )
+                .await;
             }
             return ConnectionCloseOutcome::DroppedByTieBreaker;
         }

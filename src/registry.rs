@@ -1578,9 +1578,9 @@ impl GossipState {
         }
     }
 
-    /// The newest ownership commit applied to `peer_addr`, if any. Test-only
-    /// observation point for the fence itself.
-    #[cfg(test)]
+    /// The newest ownership commit applied to `peer_addr`, if any. Lifecycle
+    /// cleanup captures this under the same guard as the peer entry it is
+    /// retiring, then presents it as the exact generation release fence.
     pub(crate) fn ownership_watermark(&self, peer_addr: &SocketAddr) -> Option<CommitSeq> {
         self.ownership_commit_seq.get(peer_addr).copied()
     }
@@ -2794,6 +2794,24 @@ impl<T: 'static> GossipRegistry<T> {
         node_id: Option<crate::GossipNodeId>,
         claim_kind: crate::addr_ownership::ClaimKind,
     ) -> crate::addr_ownership::AddrClaimOutcome {
+        self.add_peer_with_node_id_generation(peer_addr, node_id, claim_kind)
+            .await
+            .0
+    }
+
+    /// Add/project a peer and return the exact owner-actor claim generation
+    /// accepted for this call. Connection lifecycle code retains that token
+    /// so a delayed callback cannot release a newer reconnect by the same
+    /// authenticated identity.
+    pub(crate) async fn add_peer_with_node_id_generation(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: Option<crate::GossipNodeId>,
+        claim_kind: crate::addr_ownership::ClaimKind,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        Option<crate::registry_owner::CommitSeq>,
+    ) {
         use crate::addr_ownership::AddrClaimOutcome;
 
         debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
@@ -2802,7 +2820,7 @@ impl<T: 'static> GossipRegistry<T> {
                 peer = %peer_addr,
                 "refusing to add peer with unspecified address or zero port"
             );
-            return AddrClaimOutcome::Rejected;
+            return (AddrClaimOutcome::Rejected, None);
         }
         // Identity self-filter (authoritative — address alone is not
         // sufficient when advertise_address != bind_addr; see
@@ -2812,14 +2830,14 @@ impl<T: 'static> GossipRegistry<T> {
                 peer = %peer_addr,
                 "refusing to add self as peer (node_id identifies this node)"
             );
-            return AddrClaimOutcome::Rejected;
+            return (AddrClaimOutcome::Rejected, None);
         }
         // Both the raw bind address and the (possibly different, e.g. NAT/
         // Kubernetes) advertised address identify this node; a remote claim
         // on either must be refused.
         if peer_addr == self.bind_addr || peer_addr == self.advertised_addr() {
             info!(peer = %peer_addr, "not adding peer - same as self");
-            return AddrClaimOutcome::Rejected;
+            return (AddrClaimOutcome::Rejected, None);
         }
 
         // Effective verification kind to persist on this address's PeerInfo
@@ -2872,7 +2890,7 @@ impl<T: 'static> GossipRegistry<T> {
                     claimant = %claimed_node_id.fmt_short(),
                     "rejecting address claim: ownership conflict"
                 );
-                return AddrClaimOutcome::Rejected;
+                return (AddrClaimOutcome::Rejected, None);
             };
             owner_changed = displaced.is_some();
             displaced_owner = displaced;
@@ -2913,9 +2931,9 @@ impl<T: 'static> GossipRegistry<T> {
             // call must stand down without replaying anything but still tell
             // connection/configuration callers that their claim is valid.
             return if authoritative_owner_unchanged {
-                AddrClaimOutcome::Accepted
+                (AddrClaimOutcome::Accepted, projected_commit_seq)
             } else {
-                AddrClaimOutcome::Rejected
+                (AddrClaimOutcome::Rejected, projected_commit_seq)
             };
         }
 
@@ -3140,7 +3158,7 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        AddrClaimOutcome::Accepted
+        (AddrClaimOutcome::Accepted, projected_commit_seq)
     }
 
     /// Configure a peer by peer ID and its expected connection address
@@ -3453,7 +3471,12 @@ impl<T: 'static> GossipRegistry<T> {
         // re-key the wrong identity onto `new_addr`.
         let migrate_outcome = self
             .registry_owner
-            .migrate(peer_addr, new_addr, migrating_peer_id.clone())
+            .migrate(
+                peer_addr,
+                new_addr,
+                migrating_peer_id.clone(),
+                new_addr == self.bind_addr || new_addr == self.advertised_addr(),
+            )
             .await;
         if migrate_outcome.is_blocked() {
             warn!(
@@ -3558,7 +3581,12 @@ impl<T: 'static> GossipRegistry<T> {
             // overwrite this ordering exists to prevent.
             let restore = self
                 .registry_owner
-                .migrate(new_addr, peer_addr, migrating_peer_id.clone())
+                .migrate(
+                    new_addr,
+                    peer_addr,
+                    migrating_peer_id.clone(),
+                    peer_addr == self.bind_addr || peer_addr == self.advertised_addr(),
+                )
                 .await;
             if restore.is_blocked() {
                 warn!(
@@ -7597,7 +7625,7 @@ impl<T: 'static> GossipRegistry<T> {
         let mut evicted_addrs: Vec<SocketAddr> = Vec::new();
         // Address plus the identity that held it at eviction time, so the
         // ownership release below cannot evict a successor.
-        let mut evicted_owners: Vec<(SocketAddr, crate::PeerId)> = Vec::new();
+        let mut evicted_owners: Vec<(SocketAddr, crate::PeerId, CommitSeq)> = Vec::new();
         if gossip_state.peers.len() > max_peers {
             let configured = self.connection_pool.list_configured_peers();
             let configured_peer_ids: std::collections::HashSet<crate::PeerId> = configured
@@ -7634,9 +7662,12 @@ impl<T: 'static> GossipRegistry<T> {
                 // peer may legitimately have re-claimed the address; the
                 // release is scoped to this identity so it can only ever
                 // retract the ownership this eviction actually invalidated.
+                let evicted_generation = gossip_state.ownership_watermark(addr);
                 let evicted = gossip_state.peers.remove(addr);
-                if let Some(node_id) = evicted.and_then(|peer| peer.node_id) {
-                    evicted_owners.push((*addr, node_id.to_peer_id()));
+                if let (Some(node_id), Some(generation)) =
+                    (evicted.and_then(|peer| peer.node_id), evicted_generation)
+                {
+                    evicted_owners.push((*addr, node_id.to_peer_id(), generation));
                 }
                 gossip_state.peer_to_actors.remove(addr);
 
@@ -7671,8 +7702,11 @@ impl<T: 'static> GossipRegistry<T> {
             // to a peer that is in fact live. Addresses whose entry carried
             // no identity never had an ownership record to retract.
             let mut released = Vec::new();
-            for (addr, evicted_id) in evicted_owners {
-                if let Some(commit_seq) = self.registry_owner.release(addr, Some(evicted_id)).await
+            for (addr, evicted_id, generation) in evicted_owners {
+                if let Some(commit_seq) = self
+                    .registry_owner
+                    .release(addr, evicted_id, generation)
+                    .await
                 {
                     released.push((addr, commit_seq));
                 }
@@ -18798,7 +18832,7 @@ mod tests {
         // stalled.
         registry
             .registry_owner
-            .release(addr, Some(squatter.clone()))
+            .release(addr, squatter.clone(), a_seq)
             .await
             .expect("claim A owner releases before claim B");
         let b_outcome = registry
@@ -18940,13 +18974,18 @@ mod tests {
             Some(stalled.clone()),
             "stalled claimant must commit before the winner"
         );
+        let stalled_generation = registry
+            .registry_owner
+            .claim_generation_for_test(addr)
+            .await
+            .expect("stalled claim generation must be authoritative");
 
         // The stalled session releases authority and a newer verified commit
         // takes the address. Its derived projection is applied entirely
         // inside the critical section the claimant is waiting for.
         registry
             .registry_owner
-            .release(addr, Some(stalled.clone()))
+            .release(addr, stalled.clone(), stalled_generation)
             .await
             .expect("stalled owner releases before winner");
         let winner_commit = registry
@@ -19041,7 +19080,7 @@ mod tests {
         // The address is then released, at a strictly later position.
         let release_seq = registry
             .registry_owner
-            .release(addr, Some(leaver.clone()))
+            .release(addr, leaver.clone(), stalled_seq)
             .await
             .expect("the owner must release the address it holds");
         assert!(release_seq > stalled_seq);
@@ -19097,7 +19136,7 @@ mod tests {
 
         let move_seq = registry
             .registry_owner
-            .migrate(from, to, None)
+            .migrate(from, to, None, false)
             .await
             .commit_seq()
             .expect("an owned source must move onto a free destination");
@@ -19455,23 +19494,23 @@ mod tests {
         let usurper = test_peer_id("dns-refresh-usurper");
 
         // Ownership of the source address ends up with `usurper`.
-        assert!(
-            registry
-                .registry_owner
-                .claim(
-                    old_addr,
-                    crate::addr_ownership::Claim {
-                        node_id: captured.clone(),
-                        kind: crate::addr_ownership::ClaimKind::Verified,
-                    },
-                    false,
-                )
-                .await
-                .is_accepted()
-        );
+        let captured_claim = registry
+            .registry_owner
+            .claim(
+                old_addr,
+                crate::addr_ownership::Claim {
+                    node_id: captured.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let captured_generation = captured_claim
+            .commit_seq()
+            .expect("captured owner claim commits");
         registry
             .registry_owner
-            .release(old_addr, Some(captured.clone()))
+            .release(old_addr, captured.clone(), captured_generation)
             .await
             .expect("captured owner releases before usurper");
         assert!(
@@ -19722,23 +19761,23 @@ mod tests {
 
         // The evicted identity owned the address, and a successor then took
         // it over -- the state a reconnect racing an eviction produces.
-        assert!(
-            registry
-                .registry_owner
-                .claim(
-                    victim_addr,
-                    crate::addr_ownership::Claim {
-                        node_id: evicted.clone(),
-                        kind: crate::addr_ownership::ClaimKind::Verified,
-                    },
-                    false,
-                )
-                .await
-                .is_accepted()
-        );
+        let evicted_claim = registry
+            .registry_owner
+            .claim(
+                victim_addr,
+                crate::addr_ownership::Claim {
+                    node_id: evicted.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let evicted_generation = evicted_claim
+            .commit_seq()
+            .expect("evicted owner claim commits");
         registry
             .registry_owner
-            .release(victim_addr, Some(evicted.clone()))
+            .release(victim_addr, evicted.clone(), evicted_generation)
             .await
             .expect("evicted session releases before successor");
         assert!(
@@ -19762,6 +19801,7 @@ mod tests {
             victim.node_id = Some(evicted.to_node_id());
             victim.last_success = 1;
             gossip_state.peers.insert(victim_addr, victim);
+            assert!(gossip_state.admit_ownership_projection(victim_addr, evicted_generation));
 
             let mut keeper = PeerInfo::local(keeper_addr);
             keeper.last_success = 9_999;
@@ -19789,26 +19829,29 @@ mod tests {
         // still the owner at release time.
         let uncontested_addr = test_addr(20_108);
         let uncontested = test_peer_id("eviction-uncontested-owner");
-        assert!(
-            registry
-                .registry_owner
-                .claim(
-                    uncontested_addr,
-                    crate::addr_ownership::Claim {
-                        node_id: uncontested.clone(),
-                        kind: crate::addr_ownership::ClaimKind::Verified,
-                    },
-                    false,
-                )
-                .await
-                .is_accepted()
-        );
+        let uncontested_claim = registry
+            .registry_owner
+            .claim(
+                uncontested_addr,
+                crate::addr_ownership::Claim {
+                    node_id: uncontested.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let uncontested_generation = uncontested_claim
+            .commit_seq()
+            .expect("uncontested owner claim commits");
         {
             let mut gossip_state = registry.gossip_state.lock().await;
             let mut peer = PeerInfo::local(uncontested_addr);
             peer.node_id = Some(uncontested.to_node_id());
             peer.last_success = 1;
             gossip_state.peers.insert(uncontested_addr, peer);
+            assert!(
+                gossip_state.admit_ownership_projection(uncontested_addr, uncontested_generation)
+            );
         }
 
         registry.enforce_bounds().await;

@@ -13,8 +13,9 @@
 //! performs routing publication. A claim is therefore decided AND published
 //! inside one serialized command with no `.await` in between and no lock at
 //! all: there is no interleaving point for a second claimant to observe stale
-//! state, so no generation tokens, CAS retry loop, or cross-lock ordering
-//! rule is needed.
+//! state. Lifecycle callbacks do carry the accepted claim's generation back
+//! to this task: peer identity alone cannot distinguish an old connection
+//! from a newer reconnect by the same authenticated peer.
 //!
 //! Reads never enter the mailbox. After every committed mutation the owner
 //! task publishes an immutable [`RoutingSnapshot`] through an
@@ -228,6 +229,9 @@ pub enum MigrateOutcome {
     /// `to` is already owned by a DIFFERENT identity. Ownership stays where
     /// it is and the caller must not move address-keyed state onto `to`.
     TargetOwnedByOther,
+    /// `to` names this registry's own bind or advertised address. A remote
+    /// peer can never own it, regardless of what DNS returned.
+    TargetIsLocal,
     /// The caller named an expected owner for `from` and that is no longer
     /// the identity holding it.
     ///
@@ -247,7 +251,10 @@ impl MigrateOutcome {
     /// destination, or the source is no longer held by the identity the
     /// caller resolved.
     pub fn is_blocked(&self) -> bool {
-        matches!(self, Self::TargetOwnedByOther | Self::SourceOwnerMismatch)
+        matches!(
+            self,
+            Self::TargetOwnedByOther | Self::TargetIsLocal | Self::SourceOwnerMismatch
+        )
     }
 
     /// Whether ownership actually moved.
@@ -259,7 +266,10 @@ impl MigrateOutcome {
     pub fn commit_seq(&self) -> Option<CommitSeq> {
         match self {
             Self::Migrated { commit_seq } => Some(*commit_seq),
-            Self::SourceUnowned | Self::TargetOwnedByOther | Self::SourceOwnerMismatch => None,
+            Self::SourceUnowned
+            | Self::TargetOwnedByOther
+            | Self::TargetIsLocal
+            | Self::SourceOwnerMismatch => None,
         }
     }
 }
@@ -303,20 +313,30 @@ enum OwnerCommand {
     },
     Release {
         addr: SocketAddr,
-        /// When set, only release if this identity still owns `addr`, so a
-        /// late release from a displaced owner cannot evict its successor.
-        expected: Option<PeerId>,
+        /// Only release the exact identity AND claim generation accepted by
+        /// the lifecycle callback. A peer identity can reconnect before an
+        /// old callback runs, so identity alone is not a sufficient fence.
+        expected_owner: PeerId,
+        expected_generation: CommitSeq,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
     Migrate {
         from: SocketAddr,
         to: SocketAddr,
+        /// Whether `to` names this registry itself. DNS is external input, so
+        /// the serialized owner command must enforce this just like claims do.
+        is_local_addr: bool,
         /// When set, only move if this identity still owns `from`, so a
         /// caller that resolved the moving identity before submitting the
         /// command cannot re-key a different identity that displaced it in
         /// the meantime.
         expected_source: Option<PeerId>,
         reply: oneshot::Sender<MigrateOutcome>,
+    },
+    #[cfg(test)]
+    InspectGeneration {
+        addr: SocketAddr,
+        reply: oneshot::Sender<Option<CommitSeq>>,
     },
 }
 
@@ -415,20 +435,26 @@ impl RegistryOwnerHandle {
         }
     }
 
-    /// Drop the recorded ownership of `addr`, optionally only when `expected`
-    /// still owns it.
+    /// Drop the recorded ownership of `addr` only when both `expected_owner`
+    /// and `expected_generation` still match its latest accepted claim.
     ///
     /// Returns the release's position in the commit order when an entry was
     /// actually removed, so the caller can fence its own address-keyed state
     /// at that position: a claim that committed BEFORE the release must not
     /// be able to project peer or connection state back onto an address the
     /// release has since vacated.
-    pub async fn release(&self, addr: SocketAddr, expected: Option<PeerId>) -> Option<CommitSeq> {
+    pub async fn release(
+        &self,
+        addr: SocketAddr,
+        expected_owner: PeerId,
+        expected_generation: CommitSeq,
+    ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::Release {
             addr,
-            expected,
+            expected_owner,
+            expected_generation,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -459,6 +485,7 @@ impl RegistryOwnerHandle {
         from: SocketAddr,
         to: SocketAddr,
         expected_source: Option<PeerId>,
+        is_local_addr: bool,
     ) -> MigrateOutcome {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
@@ -466,6 +493,7 @@ impl RegistryOwnerHandle {
             from,
             to,
             expected_source,
+            is_local_addr,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -482,6 +510,7 @@ impl RegistryOwnerHandle {
         if let Some(StartKit { rx, routing }) = self.shared.pending_start.pop() {
             let owner = PeerRegistryOwner {
                 addr_ownership: HashMap::new(),
+                claim_generation: HashMap::new(),
                 snapshot: Arc::clone(&self.shared.snapshot),
                 routing,
                 commit_seq: 0,
@@ -496,12 +525,30 @@ impl RegistryOwnerHandle {
     fn simulate_owner_gone(&self) {
         let _ = self.shared.pending_start.pop();
     }
+
+    /// Observe the authoritative generation in deterministic race tests.
+    /// Production lifecycle paths retain the generation returned by their
+    /// own claim and never perform a racy read-back.
+    #[cfg(test)]
+    pub(crate) async fn claim_generation_for_test(&self, addr: SocketAddr) -> Option<CommitSeq> {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        self.shared
+            .tx
+            .send(OwnerCommand::InspectGeneration { addr, reply })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
 }
 
 /// The single writer. Owns `addr_ownership` outright — no `Arc`, no mutex, no
 /// interior mutability — so `&mut self` alone proves exclusivity.
 struct PeerRegistryOwner {
     addr_ownership: HashMap<SocketAddr, Owner>,
+    /// Latest accepted claim generation for each owned address. This is
+    /// lifecycle fencing metadata, not part of the arbitration truth table.
+    claim_generation: HashMap<SocketAddr, CommitSeq>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     routing: Weak<dyn RoutingPublisher>,
     /// Position of the last committed mutation. A plain `u64` rather than an
@@ -543,20 +590,26 @@ impl PeerRegistryOwner {
             }
             OwnerCommand::Release {
                 addr,
-                expected,
+                expected_owner,
+                expected_generation,
                 reply,
             } => {
-                let released = self.release(addr, expected.as_ref());
+                let released = self.release(addr, &expected_owner, expected_generation);
                 let _ = reply.send(released);
             }
             OwnerCommand::Migrate {
                 from,
                 to,
                 expected_source,
+                is_local_addr,
                 reply,
             } => {
-                let migrated = self.migrate(from, to, expected_source.as_ref());
+                let migrated = self.migrate(from, to, expected_source.as_ref(), is_local_addr);
                 let _ = reply.send(migrated);
+            }
+            #[cfg(test)]
+            OwnerCommand::InspectGeneration { addr, reply } => {
+                let _ = reply.send(self.claim_generation.get(&addr).copied());
             }
         }
     }
@@ -585,6 +638,9 @@ impl PeerRegistryOwner {
                     self.addr_ownership.insert(addr, next_owner.clone());
                 }
                 let commit_seq = self.advance();
+                // Every accepted refresh is a new lifecycle generation even
+                // when peer identity and claim kind are unchanged.
+                self.claim_generation.insert(addr, commit_seq);
                 if ownership_changed {
                     self.publish_owner_snapshot(addr, Some(next_owner));
                     if let Some(routing) = self.routing.upgrade() {
@@ -600,15 +656,22 @@ impl PeerRegistryOwner {
         }
     }
 
-    fn release(&mut self, addr: SocketAddr, expected: Option<&PeerId>) -> Option<CommitSeq> {
+    fn release(
+        &mut self,
+        addr: SocketAddr,
+        expected_owner: &PeerId,
+        expected_generation: CommitSeq,
+    ) -> Option<CommitSeq> {
         let matches_expectation = self
             .addr_ownership
             .get(&addr)
-            .is_some_and(|owner| expected.is_none_or(|expected| *expected == owner.node_id));
+            .is_some_and(|owner| owner.node_id == *expected_owner)
+            && self.claim_generation.get(&addr) == Some(&expected_generation);
         if !matches_expectation {
             return None;
         }
         let owner = self.addr_ownership.remove(&addr)?;
+        self.claim_generation.remove(&addr);
         let commit_seq = self.advance();
         self.publish_owner_snapshot(addr, None);
         if let Some(routing) = self.routing.upgrade() {
@@ -638,7 +701,16 @@ impl PeerRegistryOwner {
         from: SocketAddr,
         to: SocketAddr,
         expected_source: Option<&PeerId>,
+        is_local_addr: bool,
     ) -> MigrateOutcome {
+        if is_local_addr {
+            trace!(
+                from = %from,
+                to = %to,
+                "address migration refused: destination is local"
+            );
+            return MigrateOutcome::TargetIsLocal;
+        }
         let source = self.addr_ownership.get(&from).cloned();
         if let Some(expected) = expected_source
             && source
@@ -688,6 +760,8 @@ impl PeerRegistryOwner {
         self.addr_ownership.remove(&from);
         self.addr_ownership.insert(to, owner.clone());
         let commit_seq = self.advance();
+        self.claim_generation.remove(&from);
+        self.claim_generation.insert(to, commit_seq);
         let snapshot = self.snapshot.load_full();
         let snapshot = snapshot
             .with_owner(from, None)
@@ -1117,16 +1191,17 @@ mod tests {
         let other = peer("release-other");
         let target = addr(30_008);
 
-        owner
+        let claim = owner
             .claim(target, claim_of(holder.clone(), ClaimKind::Verified), false)
             .await;
+        let generation = claim.commit_seq().expect("holder claim commits");
         assert!(
-            owner.release(target, Some(other)).await.is_none(),
+            owner.release(target, other, generation).await.is_none(),
             "a non-owner must not be able to release the address"
         );
         assert_eq!(owner.routes_to(&target), Some(holder.clone()));
 
-        assert!(owner.release(target, Some(holder)).await.is_some());
+        assert!(owner.release(target, holder, generation).await.is_some());
         assert!(owner.snapshot().is_empty());
         assert_eq!(
             publisher.events().last().map(|event| event.1.clone()),
@@ -1165,7 +1240,7 @@ mod tests {
         assert!(new_generation > old_generation);
 
         let events_before_stale_release = publisher.events();
-        let stale_release = owner.release(target, Some(node.clone())).await;
+        let stale_release = owner.release(target, node.clone(), old_generation).await;
 
         assert_eq!(
             stale_release, None,
@@ -1194,7 +1269,7 @@ mod tests {
             .claim(from, claim_of(node.clone(), ClaimKind::Provisional), false)
             .await;
         assert!(
-            owner.migrate(from, to, None).await.moved(),
+            owner.migrate(from, to, None, false).await.moved(),
             "an owned source must move onto a free destination"
         );
         assert_eq!(owner.owner_of(&from), None);
@@ -1217,21 +1292,21 @@ mod tests {
             )
             .await;
         assert_eq!(
-            owner.migrate(to, contested, None).await,
+            owner.migrate(to, contested, None, false).await,
             MigrateOutcome::TargetOwnedByOther
         );
         // An UNOWNED source moving onto an address someone else owns is
         // blocked too: "nothing to move" would invite the caller to re-key
         // its own state onto the other identity's address.
         assert_eq!(
-            owner.migrate(addr(30_012), contested, None).await,
+            owner.migrate(addr(30_012), contested, None, false).await,
             MigrateOutcome::TargetOwnedByOther,
             "an unowned source must not be allowed onto another identity's address"
         );
         // With a free destination, an unclaimed source is still reported as
         // "nothing to move" — the non-blocking outcome.
         assert_eq!(
-            owner.migrate(addr(30_012), addr(30_013), None).await,
+            owner.migrate(addr(30_012), addr(30_013), None, false).await,
             MigrateOutcome::SourceUnowned,
             "an unclaimed source with a free destination has nothing to move"
         );
@@ -1253,7 +1328,7 @@ mod tests {
         let events_before = publisher.events();
 
         assert_eq!(
-            owner.migrate(unowned, held, None).await,
+            owner.migrate(unowned, held, None, false).await,
             MigrateOutcome::TargetOwnedByOther
         );
         assert_eq!(
@@ -1266,6 +1341,29 @@ mod tests {
             events_before,
             "a blocked migration must publish nothing"
         );
+    }
+
+    /// Local-address rejection lives inside the serialized owner command,
+    /// not only in DNS caller prechecks, so no derived state can move first.
+    #[tokio::test]
+    async fn migrate_refuses_a_local_destination_without_mutation() {
+        let (owner, publisher) = owner_handle();
+        let node = peer("local-migration");
+        let from = addr(30_039);
+        let local = addr(30_040);
+
+        owner
+            .claim(from, claim_of(node.clone(), ClaimKind::Verified), false)
+            .await;
+        let events_before = publisher.events();
+
+        assert_eq!(
+            owner.migrate(from, local, Some(node.clone()), true).await,
+            MigrateOutcome::TargetIsLocal
+        );
+        assert_eq!(owner.routes_to(&from), Some(node));
+        assert_eq!(owner.routes_to(&local), None);
+        assert_eq!(publisher.events(), events_before);
     }
 
     /// Shutdown: a claim submitted when the owner is gone fails closed with a
@@ -1324,12 +1422,12 @@ mod tests {
         let events_before = publisher.events();
 
         assert_eq!(
-            owner.migrate(from, to, Some(expected.clone())).await,
+            owner.migrate(from, to, Some(expected.clone()), false).await,
             MigrateOutcome::SourceOwnerMismatch
         );
         assert!(
             owner
-                .migrate(from, to, Some(expected.clone()))
+                .migrate(from, to, Some(expected.clone()), false)
                 .await
                 .is_blocked(),
             "a refused move must tell the caller to perform no address-keyed mutation"
@@ -1354,7 +1452,7 @@ mod tests {
         // identity the caller resolved is no longer there to carry across.
         let vacant = addr(30_032);
         assert_eq!(
-            owner.migrate(vacant, to, Some(expected)).await,
+            owner.migrate(vacant, to, Some(expected), false).await,
             MigrateOutcome::SourceOwnerMismatch
         );
         assert!(owner.owner_of(&to).is_none());
@@ -1380,18 +1478,18 @@ mod tests {
                 false,
             )
             .await;
-        assert!(
-            owner
-                .migrate(old_addr, new_addr, Some(original.clone()))
-                .await
-                .moved()
-        );
+        let migration = owner
+            .migrate(old_addr, new_addr, Some(original.clone()), false)
+            .await;
+        let migrated_generation = migration
+            .commit_seq()
+            .expect("original ownership migrates to the new address");
 
         // A newer claimant takes `new_addr` before the restore runs. Verified
         // ownership cannot be displaced directly, so model the old session's
         // release followed by the new session's verified claim.
         owner
-            .release(new_addr, Some(original.clone()))
+            .release(new_addr, original.clone(), migrated_generation)
             .await
             .expect("original owner releases the migrated address");
         assert!(
@@ -1407,7 +1505,7 @@ mod tests {
 
         assert_eq!(
             owner
-                .migrate(new_addr, old_addr, Some(original.clone()))
+                .migrate(new_addr, old_addr, Some(original.clone()), false)
                 .await,
             MigrateOutcome::SourceOwnerMismatch,
             "the restore must not move an identity the caller never held"
@@ -1436,13 +1534,13 @@ mod tests {
             .await;
         assert!(
             owner
-                .migrate(other_old, other_new, Some(original.clone()))
+                .migrate(other_old, other_new, Some(original.clone()), false)
                 .await
                 .moved()
         );
         assert!(
             owner
-                .migrate(other_new, other_old, Some(original.clone()))
+                .migrate(other_new, other_old, Some(original.clone()), false)
                 .await
                 .moved(),
             "an undisturbed address must still be restorable"
@@ -1472,7 +1570,12 @@ mod tests {
             .claim(from, claim_of(node.clone(), ClaimKind::Provisional), false)
             .await;
 
-        assert!(owner.migrate(from, to, Some(node.clone())).await.moved());
+        assert!(
+            owner
+                .migrate(from, to, Some(node.clone()), false)
+                .await
+                .moved()
+        );
         assert_eq!(
             owner.owner_of(&to),
             Some(Owner {
