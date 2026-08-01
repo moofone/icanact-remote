@@ -28,6 +28,35 @@ enum StreamingCommand {
     Abort { stream_id: u32, reason: u32 },
 }
 
+/// Consumer-owned progress for one streaming command. A command can be much
+/// larger than the transport's writable capacity, so the IO task retains it
+/// across turns and writes only a bounded prefix before returning to inbound
+/// reads. `from_shared_queue` preserves the existing queue-capacity contract:
+/// producers are notified only when the popped command is fully consumed.
+struct PendingStreamingCommand {
+    command: StreamingCommand,
+    offset: usize,
+    from_shared_queue: bool,
+}
+
+impl PendingStreamingCommand {
+    fn shared(command: StreamingCommand) -> Self {
+        Self {
+            command,
+            offset: 0,
+            from_shared_queue: true,
+        }
+    }
+
+    fn local(command: StreamingCommand) -> Self {
+        Self {
+            command,
+            offset: 0,
+            from_shared_queue: false,
+        }
+    }
+}
+
 impl std::fmt::Debug for StreamingCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

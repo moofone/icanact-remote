@@ -1,3 +1,140 @@
+/// Maximum streaming bytes offered before the connection owner returns to its
+/// read side. Ordinary tell/ask commands never use this slice machinery.
+const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
+
+fn write_zero() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "streaming transport made no write progress",
+    )
+}
+
+async fn write_streaming_command_slice<S>(
+    stream: &mut S,
+    pending: &mut PendingStreamingCommand,
+) -> std::io::Result<(usize, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    let offset = pending.offset;
+    let (written, total_len) = match &pending.command {
+        StreamingCommand::WriteBytes(data) => {
+            if offset >= data.len() {
+                return Ok((0, true));
+            }
+            let end = (offset + STREAM_WRITE_SLICE_BYTES).min(data.len());
+            (stream.write(&data[offset..end]).await?, data.len())
+        }
+        StreamingCommand::Flush => {
+            stream.flush().await?;
+            return Ok((0, true));
+        }
+        StreamingCommand::Abort { stream_id, reason } => {
+            let header = crate::framing::write_stream_abort_header(*stream_id, *reason);
+            if offset >= header.len() {
+                return Ok((0, true));
+            }
+            let end = (offset + STREAM_WRITE_SLICE_BYTES).min(header.len());
+            (stream.write(&header[offset..end]).await?, header.len())
+        }
+        StreamingCommand::VectoredWrite(command) => {
+            let header = command.header.as_slice();
+            let total_len = header.len() + command.payload.len();
+            if offset >= total_len {
+                return Ok((0, true));
+            }
+            let budget = STREAM_WRITE_SLICE_BYTES.min(total_len - offset);
+            if offset < header.len() {
+                let header_end = (offset + budget).min(header.len());
+                let header_slice = std::io::IoSlice::new(&header[offset..header_end]);
+                let header_bytes = header_end - offset;
+                if header_bytes < budget && stream.is_write_vectored() {
+                    let payload_slice =
+                        std::io::IoSlice::new(&command.payload[..budget - header_bytes]);
+                    (
+                        stream
+                            .write_vectored(&[header_slice, payload_slice])
+                            .await?,
+                        total_len,
+                    )
+                } else {
+                    (stream.write(header_slice.as_ref()).await?, total_len)
+                }
+            } else {
+                let payload_offset = offset - header.len();
+                (
+                    stream
+                        .write(&command.payload[payload_offset..payload_offset + budget])
+                        .await?,
+                    total_len,
+                )
+            }
+        }
+        StreamingCommand::OwnedChunks(chunks) => {
+            let total_len: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+            if offset >= total_len {
+                return Ok((0, true));
+            }
+            let mut skip = offset;
+            let mut remaining = STREAM_WRITE_SLICE_BYTES.min(total_len - offset);
+            const MAX_IOV: usize = 64;
+            let mut storage: [MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV] = unsafe {
+                MaybeUninit::<[MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV]>::uninit()
+                    .assume_init()
+            };
+            let mut count = 0usize;
+            for chunk in chunks {
+                if skip >= chunk.len() {
+                    skip -= chunk.len();
+                    continue;
+                }
+                let start = skip;
+                skip = 0;
+                let take = remaining.min(chunk.len() - start);
+                storage[count].write(std::io::IoSlice::new(&chunk[start..start + take]));
+                count += 1;
+                remaining -= take;
+                if remaining == 0 || count == MAX_IOV {
+                    break;
+                }
+            }
+            let slices = unsafe {
+                std::slice::from_raw_parts(
+                    storage.as_ptr() as *const std::io::IoSlice<'_>,
+                    count,
+                )
+            };
+            let written = if stream.is_write_vectored() {
+                stream.write_vectored(slices).await?
+            } else {
+                stream.write(slices[0].as_ref()).await?
+            };
+            (written, total_len)
+        }
+    };
+    if written == 0 {
+        return Err(write_zero());
+    }
+    pending.offset += written;
+    Ok((written, pending.offset == total_len))
+}
+
+#[inline]
+fn finish_streaming_command_slice(
+    pending: PendingStreamingCommand,
+    complete: bool,
+    streaming_queue: &StreamingQueue,
+    pending_slot: &mut Option<PendingStreamingCommand>,
+) {
+    if complete {
+        if pending.from_shared_queue {
+            streaming_queue.notify_space();
+        }
+    } else {
+        *pending_slot = Some(pending);
+    }
+}
+
 /// Truly lock-free streaming handle with dedicated background writer
 #[derive(Clone)]
 pub struct LockFreeStreamHandle {
@@ -640,13 +777,7 @@ impl LockFreeStreamHandle {
         const OWNER_BATCH_SIZE: usize = 64;
         const READ_BATCH_LIMIT: usize = 2048;
         const ASK_READ_BATCH_LIMIT: usize = 8192;
-        // ACTOR_REM_2 R8: while a large stream is in flight, service the normal
-        // write queue after every ~256 KiB of stream data rather than draining
-        // the whole stream first, so latency-sensitive tell/ask/control frames
-        // are not starved behind a long stream (head-of-line blocking). The
-        // per-turn control-frame batch is kept small during active streaming so
-        // stream throughput stays dominant.
-        const STREAM_INTERLEAVE_BYTES: usize = 256 * 1024;
+        // Large stream slices yield to the normal queue and socket read side.
         const STREAM_ACTIVE_WRITE_BATCH: usize = 16;
         // Drain a bounded priority burst before regular traffic. Admission is
         // reserved by `immediate_write_queue`; this budget preserves regular
@@ -666,7 +797,8 @@ impl LockFreeStreamHandle {
         let mut direct_response_batch = DirectResponseBatch::new(READ_BATCH_LIMIT);
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_immediate_cmd: Option<WriteCommand> = None;
-        let mut pending_stream_cmd: Option<StreamingCommand> = None;
+        let mut pending_stream_cmd: Option<PendingStreamingCommand> = None;
+        let mut local_streaming_queue = std::collections::VecDeque::new();
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
         let mut streaming_state = match read_context
             .as_ref()
@@ -716,165 +848,44 @@ impl LockFreeStreamHandle {
             response_batch.clear();
             direct_response_batch.clear();
 
-            // ACTOR_REM_2 R8: bound the stream chunks written per turn so the
-            // normal write queue below is serviced periodically instead of only
-            // after the whole stream drains.
-            let stream_turn_start = total_bytes_written;
-            while let Some(cmd) = pending_stream_cmd.take().or_else(|| streaming_queue.pop()) {
+            // Complete one bounded piece of the current frame before handling
+            // normal writes and inbound reads. A partial frame stays ahead of
+            // every other streaming command, preserving wire framing.
+            if let Some(mut pending) = pending_stream_cmd
+                .take()
+                .or_else(|| {
+                    local_streaming_queue
+                        .pop_front()
+                        .map(PendingStreamingCommand::local)
+                })
+                .or_else(|| {
+                    streaming_queue
+                        .pop()
+                        .map(PendingStreamingCommand::shared)
+                })
+            {
                 did_work = true;
-                match cmd {
-                    StreamingCommand::WriteBytes(data) => match stream.write_all(&data).await {
-                        Ok(_) => {
-                            bytes_written_counter.fetch_add(data.len(), Ordering::Relaxed);
-                            total_bytes_written += data.len();
-                        }
-                        Err(e) => {
-                            error!("Streaming write error: {}", e);
+                let command_is_flush = matches!(&pending.command, StreamingCommand::Flush);
+                let (written, complete) =
+                    match write_streaming_command_slice(&mut stream, &mut pending).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            error!(%error, "streaming write error");
                             return;
                         }
-                    },
-                    StreamingCommand::Flush => {
-                        let _ = stream.flush().await;
-                        flush_pending.store(false, Ordering::Release);
-                        bytes_since_flush = 0;
-                    }
-                    StreamingCommand::Abort { stream_id, reason } => {
-                        let header = crate::framing::write_stream_abort_header(stream_id, reason);
-                        if let Err(error) = stream.write_all(&header).await {
-                            warn!(stream_id, reason, %error, "failed to write stream abort");
-                            return;
-                        }
-                        bytes_written_counter.fetch_add(header.len(), Ordering::Relaxed);
-                        total_bytes_written += header.len();
-                    }
-                    StreamingCommand::VectoredWrite(cmd) => {
-                        // Handle short writes by falling back to sequential write_all
-                        // TCP can return partial writes under backpressure
-                        let total_len = cmd.header.len() + cmd.payload.len();
-                        let header_slice = std::io::IoSlice::new(cmd.header.as_slice());
-                        let payload_slice = std::io::IoSlice::new(&cmd.payload);
-                        let bufs = &[header_slice, payload_slice];
-
-                        match write_vectored_all(&mut stream, bufs).await {
-                            Ok(n) if n == total_len => {
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                            }
-                            Ok(n) => {
-                                // Short write - write remaining bytes sequentially using stack buffer
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                                let _remaining = total_len - n;
-                                let mut offset = n;
-                                // Write header portion if needed
-                                if offset < cmd.header.len() {
-                                    let h_rem = cmd.header.len() - offset;
-                                    if let Err(_) = stream.write_all(&cmd.header.as_slice()[offset..]).await {
-                                        return;
-                                    }
-                                    bytes_written_counter.fetch_add(h_rem, Ordering::Relaxed);
-                                    total_bytes_written += h_rem;
-                                    offset = 0;
-                                } else {
-                                    offset -= cmd.header.len();
-                                }
-                                // Write payload portion
-                                if let Err(_) = stream.write_all(&cmd.payload[offset..]).await {
-                                    return;
-                                }
-                                bytes_written_counter
-                                    .fetch_add(cmd.payload.len() - offset, Ordering::Relaxed);
-                                total_bytes_written += cmd.payload.len() - offset;
-                            }
-                            Err(e) => {
-                                error!("Vectored write error: {}", e);
-                                return;
-                            }
-                        }
-                    }
-                    StreamingCommand::OwnedChunks(chunks) => {
-                        // Handle short writes for owned chunks
-                        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
-                        const MAX_IOV: usize = 64;
-                        let mut slice_storage: [MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV] = unsafe {
-                            MaybeUninit::<[MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV]>::uninit()
-                                .assume_init()
-                        };
-                        let chunk_count = chunks.len().min(MAX_IOV);
-                        for (idx, chunk) in chunks.iter().take(MAX_IOV).enumerate() {
-                            slice_storage[idx].write(std::io::IoSlice::new(&chunk));
-                        }
-                        let slices = unsafe {
-                            std::slice::from_raw_parts(
-                                slice_storage.as_ptr() as *const std::io::IoSlice<'_>,
-                                chunk_count,
-                            )
-                        };
-
-                        match write_vectored_all(&mut stream, slices).await {
-                            Ok(n) if n == total_len => {
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                            }
-                            Ok(n) => {
-                                // Short write - write remaining bytes sequentially
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                                let mut remaining = total_len - n;
-                                let mut chunk_idx = 0;
-                                let mut offset_in_chunk = n;
-                                // Find which chunk we left off in
-                                while chunk_idx < chunks.len()
-                                    && offset_in_chunk >= chunks[chunk_idx].len()
-                                {
-                                    offset_in_chunk -= chunks[chunk_idx].len();
-                                    chunk_idx += 1;
-                                }
-                                // Continue writing from current position. Use `write_all`
-                                // (not a raw `write()`) so a legal `Ok(0)` reply from
-                                // `poll_write` — distinct from `Pending`, meaning the
-                                // transport is no longer accepting bytes (e.g. a
-                                // half-closed write side) — is folded into
-                                // `ErrorKind::WriteZero` exactly like every other write
-                                // path in this file (`write_all`/`write_vectored_all`).
-                                // A raw `write()` here previously left `remaining`/
-                                // `offset_in_chunk` unchanged on `Ok(0)`, spinning the
-                                // writer task forever with no progress and no yield
-                                // point (R4 livelock).
-                                while chunk_idx < chunks.len() && remaining > 0 {
-                                    let chunk_remaining =
-                                        chunks[chunk_idx].len() - offset_in_chunk;
-                                    if let Err(e) = stream
-                                        .write_all(&chunks[chunk_idx][offset_in_chunk..])
-                                        .await
-                                    {
-                                        error!("Chunk batch write completion error: {}", e);
-                                        return;
-                                    }
-                                    bytes_written_counter
-                                        .fetch_add(chunk_remaining, Ordering::Relaxed);
-                                    total_bytes_written += chunk_remaining;
-                                    remaining -= chunk_remaining;
-                                    chunk_idx += 1;
-                                    offset_in_chunk = 0;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Chunk batch write error: {}", e);
-                                return;
-                            }
-                        }
-                    }
+                    };
+                bytes_written_counter.fetch_add(written, Ordering::Relaxed);
+                total_bytes_written += written;
+                if command_is_flush {
+                    flush_pending.store(false, Ordering::Release);
+                    bytes_since_flush = 0;
                 }
-                streaming_queue.notify_space();
-                if total_bytes_written.saturating_sub(stream_turn_start)
-                    >= STREAM_INTERLEAVE_BYTES
-                {
-                    // Yield to the normal write queue before writing more of the
-                    // stream (ACTOR_REM_2 R8). `did_work` stays true, so the
-                    // outer loop re-enters and resumes the stream next turn.
-                    break;
-                }
+                finish_streaming_command_slice(
+                    pending,
+                    complete,
+                    &streaming_queue,
+                    &mut pending_stream_cmd,
+                );
             }
 
             // ACTOR_REM_2 R8: always service the normal write queue — even while
@@ -1732,6 +1743,7 @@ impl LockFreeStreamHandle {
                                 &bytes_written_counter,
                                 &mut bytes_since_flush,
                                 &mut response_batch,
+                                &mut local_streaming_queue,
                                 &mut direct_response_batch,
                                 &mut wrote_fast_responses,
                                 perf,
@@ -1761,6 +1773,7 @@ impl LockFreeStreamHandle {
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
                                     &mut response_batch,
+                                    &mut local_streaming_queue,
                                     &mut direct_response_batch,
                                     perf,
                                 )
@@ -1851,7 +1864,7 @@ impl LockFreeStreamHandle {
                         continue;
                     }
                     if let Some(cmd) = streaming_queue.prepare_park() {
-                        pending_stream_cmd = Some(cmd);
+                        pending_stream_cmd = Some(PendingStreamingCommand::shared(cmd));
                         continue;
                     }
                     tokio::select! {
@@ -1888,6 +1901,7 @@ impl LockFreeStreamHandle {
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
                                     &mut response_batch,
+                                    &mut local_streaming_queue,
                                     &mut direct_response_batch,
                                     &mut wrote_fast_responses,
                                     perf,
@@ -1915,6 +1929,7 @@ impl LockFreeStreamHandle {
                                             &bytes_written_counter,
                                             &mut bytes_since_flush,
                                             &mut response_batch,
+                                            &mut local_streaming_queue,
                                             &mut direct_response_batch,
                                             perf,
                                         )
@@ -2011,6 +2026,7 @@ impl LockFreeStreamHandle {
                                         &bytes_written_counter,
                                         &mut bytes_since_flush,
                                         &mut response_batch,
+                                        &mut local_streaming_queue,
                                         &mut direct_response_batch,
                                         &mut wrote_fast_responses,
                                         perf,
@@ -2040,6 +2056,7 @@ impl LockFreeStreamHandle {
                                             &bytes_written_counter,
                                             &mut bytes_since_flush,
                                             &mut response_batch,
+                                            &mut local_streaming_queue,
                                             &mut direct_response_batch,
                                             perf,
                                         )
@@ -2136,7 +2153,7 @@ impl LockFreeStreamHandle {
                         continue;
                     }
                     if let Some(cmd) = streaming_queue.prepare_park() {
-                        pending_stream_cmd = Some(cmd);
+                        pending_stream_cmd = Some(PendingStreamingCommand::shared(cmd));
                         continue;
                     }
                     tokio::select! {

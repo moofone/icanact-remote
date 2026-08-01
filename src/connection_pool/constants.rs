@@ -883,6 +883,8 @@ struct StreamingQueue {
     try_push_state: AtomicUsize,
     /// Peer address used to construct the `ConnectionClosed` error on teardown.
     addr: SocketAddr,
+    #[cfg(test)]
+    space_notification_count: AtomicUsize,
 }
 
 const STREAMING_QUEUE_CLOSED: usize = 1usize << (usize::BITS - 1);
@@ -908,6 +910,8 @@ impl StreamingQueue {
             closed: AtomicBool::new(false),
             try_push_state: AtomicUsize::new(0),
             addr,
+            #[cfg(test)]
+            space_notification_count: AtomicUsize::new(0),
         })
     }
 
@@ -1014,7 +1018,14 @@ impl StreamingQueue {
     }
 
     fn notify_space(&self) {
+        #[cfg(test)]
+        self.space_notification_count.fetch_add(1, Ordering::Relaxed);
         self.space_notify.notify_one();
+    }
+
+    #[cfg(test)]
+    fn space_notification_count(&self) -> usize {
+        self.space_notification_count.load(Ordering::Relaxed)
     }
 }
 
