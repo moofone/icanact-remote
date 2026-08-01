@@ -135,6 +135,57 @@ async fn associate_inbound_capabilities_after_claim(
     }
 }
 
+/// Undo ownership created solely for an inbound candidate that subsequently
+/// loses the connection tie-break. The release is identity-scoped and only
+/// used when the address had no owner before this candidate, so an incumbent
+/// session's pre-existing ownership is never withdrawn.
+async fn rollback_rejected_inbound_claim(
+    registry: &GossipRegistry,
+    addr: SocketAddr,
+    peer_id: &crate::PeerId,
+    prior_peer: Option<crate::registry::PeerInfo>,
+) {
+    let Some(release_seq) = registry
+        .registry_owner
+        .release(addr, Some(peer_id.clone()))
+        .await
+    else {
+        return;
+    };
+
+    let mut state = registry.gossip_state.lock().await;
+    state.tombstone_ownership_projection(addr, release_seq);
+    let still_candidate = state
+        .peers
+        .get(&addr)
+        .and_then(|peer| peer.node_id)
+        .is_some_and(|node_id| node_id == peer_id.to_node_id());
+    let had_prior_peer = prior_peer.is_some();
+    if still_candidate {
+        match prior_peer {
+            Some(prior) => {
+                state.peers.insert(addr, prior);
+            }
+            None => {
+                state.peers.remove(&addr);
+                state.peer_to_actors.remove(&addr);
+                if let Some(discovery) = state.peer_discovery.as_mut() {
+                    discovery.on_peer_disconnected(addr);
+                }
+            }
+        }
+    }
+    drop(state);
+
+    registry
+        .connection_pool
+        .clear_displaced_peer_addr(peer_id, addr);
+    if !had_prior_peer {
+        registry.clear_peer_capabilities(&addr);
+        registry.remove_clock_state_for_addr(&addr);
+    }
+}
+
 /// Main API for the gossip registry with vector clocks and separated locks
 pub struct GossipRegistryHandle<T = crate::BuilderTlsBootstrap> {
     pub registry: Arc<GossipRegistry>,
@@ -2386,6 +2437,14 @@ mod tests {
             attacker_addr, advertised_bind_addr,
             "test precondition: peer_addr and peer_state_addr must genuinely differ"
         );
+        // This test is about the post-verification two-alias indexing window,
+        // not about trusting a self-reported address. Reserve the advertised
+        // address as operator-owned so it remains Verified under the address
+        // ownership policy.
+        handle
+            .registry
+            .configure_peer(remote_peer_id.clone(), advertised_bind_addr)
+            .await;
 
         let _guard = {
             let pool = handle.registry.connection_pool.clone();
@@ -3713,7 +3772,22 @@ where
                 .filter(|addr| is_valid(*addr)),
         )
     };
-    let peer_state_addr = resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, route_addr);
+    let mut peer_state_addr =
+        resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, route_addr);
+    let advertised_owner_before = registry.registry_owner.owner_of(&peer_state_addr);
+    let observed_owner_before = (peer_state_addr != peer_addr)
+        .then(|| registry.registry_owner.owner_of(&peer_addr))
+        .flatten();
+    let (advertised_peer_before, observed_peer_before) = {
+        let state = registry.gossip_state.lock().await;
+        (
+            state.peers.get(&peer_state_addr).cloned(),
+            (peer_state_addr != peer_addr)
+                .then(|| state.peers.get(&peer_addr).cloned())
+                .flatten(),
+        )
+    };
+    let mut rollback_claim: Option<(SocketAddr, Option<crate::registry::PeerInfo>)> = None;
 
     if let Some(node_id) = node_id_opt {
         // TLS authenticates `node_id`, but that alone does not prove
@@ -3766,44 +3840,58 @@ where
             }
         };
 
-        associate_inbound_capabilities_after_claim(&registry, peer_addr, node_id, effective_addr)
-            .await;
-
-        if let Some(effective_addr) = effective_addr {
-            if effective_addr != peer_addr {
-                let mut gossip_state = registry.gossip_state.lock().await;
-                if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
-                    peer_info.peer_address = Some(peer_addr);
-                }
-            }
-
-            // Notify peer discovery that a connection is established (incoming)
-            registry.mark_peer_connected(effective_addr).await;
-            // Attribute liveness to the address arbitration accepted and
-            // retain the raw TCP source in `PeerInfo::peer_address`. Creating
-            // a separate PeerInfo at the ephemeral source would let the first
-            // FullSync migration overwrite this identity-bearing entry. The
-            // observation bit is only liveness metadata; ownership kind stays
-            // exactly as resolved by the owner actor and cannot be upgraded by
-            // this call.
-            registry
-                .mark_inbound_connection_observed(effective_addr, peer_addr)
-                .await;
-
-            debug!(
-                peer_addr = %peer_addr,
-                peer_state_addr = %peer_state_addr,
-                effective_addr = %effective_addr,
-                "Updated gossip state with GossipNodeId for incoming TLS connection"
-            );
-        } else {
+        let Some(effective_addr) = effective_addr else {
             warn!(
                 peer_addr = %peer_addr,
                 peer_state_addr = %peer_state_addr,
                 node_id = %node_id.fmt_short(),
-                "no address claim accepted for inbound peer; connection proceeds without gossip address attribution"
+                "no safe address attribution remains for inbound peer; dropping connection"
             );
+            return ConnectionCloseOutcome::Normal {
+                node_id: Some(sender_node_id),
+            };
+        };
+        let (owner_before, peer_before) = if effective_addr == peer_state_addr {
+            (advertised_owner_before.as_ref(), advertised_peer_before)
+        } else {
+            (observed_owner_before.as_ref(), observed_peer_before)
+        };
+        if owner_before.is_none() {
+            rollback_claim = Some((effective_addr, peer_before));
         }
+        peer_state_addr = effective_addr;
+
+        associate_inbound_capabilities_after_claim(
+            &registry,
+            peer_addr,
+            node_id,
+            Some(effective_addr),
+        )
+        .await;
+
+        if effective_addr != peer_addr {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
+                peer_info.peer_address = Some(peer_addr);
+            }
+        }
+
+        // Notify peer discovery that a connection is established (incoming)
+        registry.mark_peer_connected(effective_addr).await;
+        // Attribute liveness to the address arbitration accepted and retain
+        // the raw TCP source in `PeerInfo::peer_address`. Creating a separate
+        // PeerInfo at the ephemeral source would let the first FullSync
+        // migration overwrite this identity-bearing entry.
+        registry
+            .mark_inbound_connection_observed(effective_addr, peer_addr)
+            .await;
+
+        debug!(
+            peer_addr = %peer_addr,
+            peer_state_addr = %peer_state_addr,
+            effective_addr = %effective_addr,
+            "Updated gossip state with GossipNodeId for incoming TLS connection"
+        );
     }
 
     // R-6: handoff for the first-frame StreamingState (see io_task). Created
@@ -4195,6 +4283,10 @@ where
         if !keep_connection {
             if let Some(handle) = connection_arc.stream_handle.as_ref() {
                 handle.shutdown();
+            }
+            if let Some((claimed_addr, prior_peer)) = rollback_claim {
+                rollback_rejected_inbound_claim(&registry, claimed_addr, &peer_id, prior_peer)
+                    .await;
             }
             return ConnectionCloseOutcome::DroppedByTieBreaker;
         }

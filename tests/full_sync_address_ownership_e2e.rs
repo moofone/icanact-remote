@@ -158,9 +158,7 @@ struct ProtectedProjection {
     peer_last_sequence: Option<u64>,
     peer_to_actors: Option<HashSet<String>>,
     victim_actor: Option<(PeerId, String)>,
-    poison_actor: Option<(PeerId, String)>,
     victim_admissions: Option<HashSet<String>>,
-    poison_admission_owner: Option<PeerId>,
     capability_by_addr: Option<icanact_remote::handshake::PeerCapabilities>,
     capability_by_node: Option<icanact_remote::handshake::PeerCapabilities>,
     capability_addr_node: Option<GossipNodeId>,
@@ -182,10 +180,6 @@ async fn protected_projection(
         .read_sync(victim_peer_id, |_, addr| *addr);
     let victim_actor = registry
         .lookup_actor(VICTIM_ACTOR)
-        .await
-        .map(|location| (location.peer_id, location.address));
-    let poison_actor = registry
-        .lookup_actor(POISON_ACTOR)
         .await
         .map(|location| (location.peer_id, location.address));
     let victim_node_id = victim_peer_id.to_node_id();
@@ -211,12 +205,7 @@ async fn protected_projection(
         peer_last_sequence: peer.map(|info| info.last_sequence),
         peer_to_actors: state.peer_to_actors.get(&victim_addr).cloned(),
         victim_actor,
-        poison_actor,
         victim_admissions: state.actor_admissions_by_peer.get(victim_peer_id).cloned(),
-        poison_admission_owner: state
-            .actor_admission_peer_by_name
-            .get(POISON_ACTOR)
-            .cloned(),
         capability_by_addr,
         capability_by_node,
         capability_addr_node,
@@ -241,6 +230,13 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
     victim
         .register(VICTIM_ACTOR.to_string(), victim_addr)
         .await?;
+    // Operator configuration is independent evidence that the victim owns
+    // this listening address. The victim's later inbound self-report may
+    // refresh it, but cannot be what creates exclusive ownership.
+    observer
+        .registry
+        .configure_peer(victim.registry.peer_id.clone(), victim_addr)
+        .await;
     victim
         .add_peer(&observer.registry.peer_id)
         .await
@@ -282,7 +278,7 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
         Some(&victim.registry.peer_id),
         "precondition: the live victim owns its advertised address"
     );
-    assert!(before.poison_actor.is_none());
+    assert!(observer.registry.lookup_actor(POISON_ACTOR).await.is_none());
     assert!(before.clock_snapshot.is_none());
     let victim_connection_before = observer
         .registry
@@ -342,6 +338,14 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
         after, before,
         "a rejected authenticated claim must mutate none of the victim's projections"
     );
+    if let Some(poison) = observer.registry.lookup_actor(POISON_ACTOR).await {
+        assert_eq!(poison.peer_id, attacker.registry.peer_id);
+        assert_ne!(
+            poison.address,
+            victim_addr.to_string(),
+            "the victim address must not survive verified-source actor repair"
+        );
+    }
     let victim_connection_after = observer
         .registry
         .connection_pool
@@ -354,8 +358,8 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
     );
     assert_eq!(
         observer.registry.get_stats().await.full_sync_exchanges,
-        full_sync_count_before + 1,
-        "only the legitimate FIFO barrier may count as an applied full sync"
+        full_sync_count_before + 2,
+        "both authenticated frames apply, rebound to the attacker's verified transport source"
     );
 
     attacker.shutdown().await;
@@ -460,7 +464,7 @@ async fn authenticated_full_sync_variants_cannot_claim_local_address() -> icanac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn competing_provisional_claim_cannot_displace_first_owner() -> icanact_remote::Result<()> {
+async fn provisional_self_reports_never_publish_exclusive_aliases() -> icanact_remote::Result<()> {
     let observer_addr = loopback_addr();
     let first_addr = loopback_addr();
     let second_addr = loopback_addr();
@@ -501,8 +505,7 @@ async fn competing_provisional_claim_cannot_displace_first_owner() -> icanact_re
             None,
         ),
     );
-    // First peer's actual-address message is a FIFO barrier only. It does not
-    // release the additional claimed-address alias.
+    // First peer's actual-address message is a FIFO barrier.
     send_registry_message(
         &first,
         &observer.registry.peer_id,
@@ -523,10 +526,9 @@ async fn competing_provisional_claim_cannot_displace_first_owner() -> icanact_re
             .connection_pool
             .addr_to_peer_id
             .read_sync(&claimed_addr, |_, peer| peer.clone()),
-        Some(first.registry.peer_id.clone()),
-        "precondition: first provisional claimant owns the previously-unowned alias"
+        None,
+        "a first provisional self-report must not own a previously-unowned alias"
     );
-    assert!(observer.registry.lookup_actor(first_actor).await.is_some());
 
     send_registry_message(
         &second,
@@ -562,13 +564,12 @@ async fn competing_provisional_claim_cannot_displace_first_owner() -> icanact_re
             .connection_pool
             .addr_to_peer_id
             .read_sync(&claimed_addr, |_, peer| peer.clone()),
-        Some(first.registry.peer_id.clone()),
-        "a later provisional claimant must not displace the first owner"
+        None,
+        "no provisional claimant may publish the alias"
     );
-    assert!(
-        observer.registry.lookup_actor(POISON_ACTOR).await.is_none(),
-        "rejected competing claim must not project actor ownership"
-    );
+    // The FIFO barrier is itself a complete snapshot and may prune the prior
+    // actor, so actor presence is intentionally not used as evidence here.
+    // The address route is the durable security boundary under test.
 
     second.shutdown().await;
     first.shutdown().await;
@@ -576,12 +577,12 @@ async fn competing_provisional_claim_cannot_displace_first_owner() -> icanact_re
     Ok(())
 }
 
-/// A normal inbound peer's advertised listening address differs from its raw
-/// TCP source port. Recording observed-source evidence must not create a
-/// phantom source PeerInfo that the first FullSync then migrates over the
-/// identity-bearing advertised entry.
+/// A normal unconfigured inbound peer's advertised listening address differs
+/// from its raw TCP source port. That self-report must remain non-exclusive;
+/// identity and actor state bind to the authenticated transport source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nat_inbound_full_sync_preserves_advertised_peer_identity() -> icanact_remote::Result<()> {
+async fn nat_inbound_full_sync_binds_identity_to_observed_transport() -> icanact_remote::Result<()>
+{
     let observer_addr = loopback_addr();
     let sender_addr = loopback_addr();
     let observer_key =
@@ -598,14 +599,25 @@ async fn nat_inbound_full_sync_preserves_advertised_peer_identity() -> icanact_r
         .await?;
     wait_for_connection(&observer, &sender.registry.peer_id).await;
 
-    {
+    let observed_addr = {
         let state = observer.registry.gossip_state.lock().await;
-        assert_eq!(
-            state.peers.get(&sender_addr).and_then(|peer| peer.node_id),
-            Some(sender.registry.peer_id.to_node_id()),
-            "authenticated handshake must establish the advertised peer identity"
+        assert!(
+            state
+                .peers
+                .get(&sender_addr)
+                .and_then(|peer| peer.node_id)
+                .is_none(),
+            "an unconfigured advertised address is only a self-report"
         );
-    }
+        state
+            .peers
+            .iter()
+            .find_map(|(addr, peer)| {
+                (peer.node_id == Some(sender.registry.peer_id.to_node_id())).then_some(*addr)
+            })
+            .expect("authenticated transport source must carry the peer identity")
+    };
+    assert_ne!(observed_addr, sender_addr);
 
     let actor = "ownership/nat/identity-barrier";
     send_registry_message(
@@ -624,23 +636,31 @@ async fn nat_inbound_full_sync_preserves_advertised_peer_identity() -> icanact_r
     let _ = wait_for_actor(&observer.registry, actor).await;
 
     let state = observer.registry.gossip_state.lock().await;
-    let advertised = state
-        .peers
-        .get(&sender_addr)
-        .expect("advertised peer entry must survive FullSync");
-    assert_eq!(
-        advertised.node_id,
-        Some(sender.registry.peer_id.to_node_id()),
-        "FullSync migration must not overwrite the authenticated node id with a phantom source entry"
-    );
     assert!(
         state
             .peers
-            .values()
-            .all(|peer| peer.address == sender_addr || peer.node_id.is_some()),
-        "raw observed-source bookkeeping must not gossip a phantom identity-less PeerInfo"
+            .get(&sender_addr)
+            .and_then(|peer| peer.node_id)
+            .is_none(),
+        "FullSync must not promote its advertised self-report"
+    );
+    let observed = state
+        .peers
+        .get(&observed_addr)
+        .expect("observed transport peer entry must survive FullSync");
+    assert_eq!(
+        observed.node_id,
+        Some(sender.registry.peer_id.to_node_id()),
+        "FullSync must retain identity at the authenticated transport source"
     );
     drop(state);
+    let location = observer
+        .registry
+        .lookup_actor(actor)
+        .await
+        .expect("FullSync actor must be applied");
+    assert_eq!(location.peer_id, sender.registry.peer_id);
+    assert_eq!(location.address, observed_addr.to_string());
 
     sender.shutdown().await;
     observer.shutdown().await;

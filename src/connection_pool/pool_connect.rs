@@ -4175,6 +4175,67 @@ async fn answer_inbound_clock_probe(
     }
 }
 
+/// Bind FullSync address-keyed state to evidence this process observed.
+/// A peer-authenticated `sender_bind_addr` is still only a self-report, so a
+/// rejected provisional advertisement falls back to the raw address of this
+/// authenticated transport. The fallback is verified and session-scoped by
+/// construction; an arbitrary advertised address never receives an exclusive
+/// route merely because it appeared in a frame.
+async fn claim_authenticated_gossip_addr(
+    registry: &GossipRegistry,
+    advertised_addr: SocketAddr,
+    observed_addr: SocketAddr,
+    peer_id: &crate::PeerId,
+) -> Option<(SocketAddr, crate::registry_owner::CommitSeq)> {
+    let claim_kind = if advertised_addr == observed_addr {
+        crate::addr_ownership::ClaimKind::Verified
+    } else {
+        crate::addr_ownership::ClaimKind::Provisional
+    };
+    let is_local_addr =
+        advertised_addr == registry.bind_addr || advertised_addr == registry.advertised_addr();
+    let commit = registry
+        .registry_owner
+        .claim(
+            advertised_addr,
+            crate::addr_ownership::Claim {
+                node_id: peer_id.clone(),
+                kind: claim_kind,
+            },
+            is_local_addr,
+        )
+        .await;
+    if let Some(commit_seq) = commit.commit_seq() {
+        return Some((advertised_addr, commit_seq));
+    }
+
+    if advertised_addr == observed_addr {
+        return None;
+    }
+
+    debug!(
+        peer = %peer_id,
+        advertised_addr = %advertised_addr,
+        observed_addr = %observed_addr,
+        "provisional gossip address was not admitted; binding frame to authenticated transport source"
+    );
+    let observed_is_local =
+        observed_addr == registry.bind_addr || observed_addr == registry.advertised_addr();
+    registry
+        .registry_owner
+        .claim(
+            observed_addr,
+            crate::addr_ownership::Claim {
+                node_id: peer_id.clone(),
+                kind: crate::addr_ownership::ClaimKind::Verified,
+            },
+            observed_is_local,
+        )
+        .await
+        .commit_seq()
+        .map(|commit_seq| (observed_addr, commit_seq))
+}
+
 /// Handle an incoming message on a bidirectional connection
 pub(crate) fn handle_incoming_message(
     registry: Arc<GossipRegistry>,
@@ -4401,7 +4462,7 @@ pub(crate) fn handle_incoming_message(
                 // Use the peer's advertised listening address when it is dialable.
                 // Remote loopback binds are local-only and must not be rewritten into
                 // remote-ip:ephemeral-port peer entries.
-                let Some(sender_socket_addr) =
+                let Some(advertised_sender_addr) =
                     resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
                 else {
                     warn!(
@@ -4413,37 +4474,22 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
-                // Claim the address through the single-owner registry actor
-                // before ANY mutation keyed on `sender_socket_addr` —
-                // including extension/clock-echo recording below.
-                // `sender_socket_addr == _peer_addr` means the claimed bind
-                // address is backed by the raw TCP source of this connection
-                // (verified); a mismatch means it is only the sender's
-                // self-report (provisional). No `gossip_state` guard is held
-                // across this await: the ownership inputs no longer live in
-                // `gossip_state`, so there is nothing to read under it, and
-                // the claim commits and publishes routing inside the owner's
-                // own serialized command.
-                let claim_kind = if sender_socket_addr == _peer_addr {
-                    crate::addr_ownership::ClaimKind::Verified
-                } else {
-                    crate::addr_ownership::ClaimKind::Provisional
-                };
-                let is_local_addr = sender_socket_addr == registry.bind_addr
-                    || sender_socket_addr == registry.advertised_addr();
-                let claim = crate::addr_ownership::Claim {
-                    node_id: authenticated_sender_peer_id.clone(),
-                    kind: claim_kind,
-                };
-                let commit = registry
-                    .registry_owner
-                    .claim(sender_socket_addr, claim, is_local_addr)
-                    .await;
-                let Some(commit_seq) = commit.commit_seq() else {
+                // Claim before ANY address-keyed mutation. A mismatched
+                // advertised bind is only a self-report; if it cannot create
+                // ownership, bind this frame to the authenticated transport's
+                // observed source instead.
+                let Some((sender_socket_addr, commit_seq)) = claim_authenticated_gossip_addr(
+                    &registry,
+                    advertised_sender_addr,
+                    _peer_addr,
+                    authenticated_sender_peer_id,
+                )
+                .await
+                else {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
-                        claimed_addr = %sender_socket_addr,
+                        claimed_addr = %advertised_sender_addr,
                         "Rejecting FullSync address claim: ownership conflict"
                     );
                     return Ok(());
@@ -4906,7 +4952,7 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 }
 
-                let Some(sender_socket_addr) =
+                let Some(advertised_sender_addr) =
                     resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
                 else {
                     warn!(
@@ -4918,30 +4964,18 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
-                // Claim through the single-owner registry actor before any
-                // mutation keyed on `sender_socket_addr`, mirroring the
-                // FullSync handler above (including holding no `gossip_state`
-                // guard across the claim).
-                let claim_kind = if sender_socket_addr == _peer_addr {
-                    crate::addr_ownership::ClaimKind::Verified
-                } else {
-                    crate::addr_ownership::ClaimKind::Provisional
-                };
-                let is_local_addr = sender_socket_addr == registry.bind_addr
-                    || sender_socket_addr == registry.advertised_addr();
-                let claim = crate::addr_ownership::Claim {
-                    node_id: authenticated_sender_peer_id.clone(),
-                    kind: claim_kind,
-                };
-                let commit = registry
-                    .registry_owner
-                    .claim(sender_socket_addr, claim, is_local_addr)
-                    .await;
-                let Some(commit_seq) = commit.commit_seq() else {
+                let Some((sender_socket_addr, commit_seq)) = claim_authenticated_gossip_addr(
+                    &registry,
+                    advertised_sender_addr,
+                    _peer_addr,
+                    authenticated_sender_peer_id,
+                )
+                .await
+                else {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
-                        claimed_addr = %sender_socket_addr,
+                        claimed_addr = %advertised_sender_addr,
                         "Rejecting FullSyncResponse address claim: ownership conflict"
                     );
                     return Ok(());
@@ -5120,18 +5154,12 @@ pub(crate) fn handle_incoming_message(
                 let registry_clone = registry.clone();
                 let discovery_handle = tokio::spawn(async move {
                     for addr in candidates {
-                        let node_id = registry_clone.lookup_node_id(&addr).await;
-                        // `addr` came from a peer's PeerListGossip payload: a
-                        // third party's self-report about a node we have not
-                        // ourselves observed a connection from yet. Provisional
-                        // until an actual dial/accept verifies it.
-                        registry_clone
-                            .add_peer_with_node_id(
-                                addr,
-                                node_id,
-                                crate::addr_ownership::ClaimKind::Provisional,
-                            )
-                            .await;
+                        // PeerListGossip is only a discovery hint. Keep its
+                        // claimed identity in `known_peers` (where
+                        // `on_peer_list_gossip` put it), but create no
+                        // exclusive owner/route until a TLS dial or accept
+                        // verifies the address itself.
+                        registry_clone.add_peer(addr).await;
 
                         match registry_clone.get_connection(addr).await {
                             Ok(_) => {

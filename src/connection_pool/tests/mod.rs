@@ -10113,16 +10113,14 @@ async fn displaced_full_sync_claim_records_no_address_keyed_state() {
         "a displaced claim must not create a peer entry at the contested address"
     );
     assert_eq!(
-        state.full_sync_exchanges, 0,
-        "a displaced claim must not book the exchange against the contested address"
+        state.full_sync_exchanges, 1,
+        "the authenticated frame remains valid after rebinding to its observed transport"
     );
     drop(state);
-    assert!(
-        registry
-            .connection_pool
-            .get_configured_peer_addr(&peer_id)
-            .is_none(),
-        "a displaced claim must not reindex the connection under the contested address"
+    assert_eq!(
+        registry.connection_pool.get_configured_peer_addr(&peer_id),
+        Some(tcp_source),
+        "a refused advertised alias must route only through the verified transport source"
     );
 }
 
@@ -10245,16 +10243,14 @@ async fn displaced_full_sync_response_claim_records_no_address_keyed_state() {
         "a displaced claim must not reset another owner's failure state"
     );
     assert_eq!(
-        state.full_sync_exchanges, 0,
-        "a displaced claim must not book the exchange against the contested address"
+        state.full_sync_exchanges, 1,
+        "the authenticated response remains valid after rebinding to its observed transport"
     );
     drop(state);
-    assert!(
-        registry
-            .connection_pool
-            .get_configured_peer_addr(&peer_id)
-            .is_none(),
-        "a displaced claim must not reindex the connection under the contested address"
+    assert_eq!(
+        registry.connection_pool.get_configured_peer_addr(&peer_id),
+        Some(tcp_source),
+        "a refused advertised alias must route only through the verified transport source"
     );
 }
 
@@ -10298,6 +10294,18 @@ async fn run_full_sync_displaced_during_merge_is_dropped(response: bool) {
         "ownership-race/full-sync/stale"
     };
 
+    assert_eq!(
+        registry
+            .add_peer_with_node_id(
+                advertised,
+                Some(stale_peer.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await,
+        crate::addr_ownership::AddrClaimOutcome::Accepted,
+        "test precondition: the current authenticated session owns its advertised address"
+    );
+
     let registry_for_hook = Arc::clone(&registry);
     let stale_for_hook = stale_peer.clone();
     let successor_for_hook = successor.clone();
@@ -10313,8 +10321,14 @@ async fn run_full_sync_displaced_during_merge_is_dropped(response: bool) {
             crate::set_transport_lifecycle_recorder(None);
             let registry = Arc::clone(&registry_for_hook);
             let successor = successor_for_hook.clone();
+            let stale = stale_for_hook.clone();
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
+                    registry
+                        .registry_owner
+                        .release(advertised, Some(stale))
+                        .await
+                        .expect("stale session releases before successor claim");
                     let outcome = registry
                         .add_peer_with_node_id(
                             advertised,

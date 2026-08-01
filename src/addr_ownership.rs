@@ -53,6 +53,10 @@ pub enum RejectReason {
     /// The claimed address is this node's own bind/advertised address; no
     /// remote node may ever claim it.
     LocalAddress,
+    /// An identity was authenticated, but the address itself was only a
+    /// self-report or third-party discovery hint. Unverified evidence may
+    /// not create an exclusive address owner.
+    UnverifiedAddress,
     /// The address already has a verified owner and a verified owner is
     /// never displaced by a later claim, verified or not.
     VerifiedOwnerPresent,
@@ -96,6 +100,15 @@ pub fn arbitrate(current: Option<Owner>, claim: Claim, is_local_addr: bool) -> D
     }
 
     match current {
+        // A TLS identity authenticates who sent a claim, not that the sender
+        // owns an arbitrary address carried in the payload. Publishing an
+        // exclusive first-owner route from that evidence lets any connected
+        // peer reserve unlimited victim addresses. First ownership therefore
+        // requires independently verified address evidence; callers may keep
+        // provisional data as a non-authoritative discovery hint instead.
+        None if claim.kind == ClaimKind::Provisional => {
+            Decision::Reject(RejectReason::UnverifiedAddress)
+        }
         None => Decision::Accept,
         Some(owner) if owner.node_id == claim.node_id => {
             // Same-node refresh: kind only ever upgrades (Provisional ->
@@ -154,7 +167,7 @@ mod tests {
     /// {unowned, provisional-self, provisional-other, verified-self, verified-other}
     /// x {Provisional claim, Verified claim}, plus the is_local_addr=true cases.
     #[test]
-    fn t_arb_unowned_accepts_provisional_claim() {
+    fn t_arb_unowned_rejects_provisional_claim() {
         let d = arbitrate(
             None,
             Claim {
@@ -163,7 +176,7 @@ mod tests {
             },
             false,
         );
-        assert_eq!(d, Decision::Accept);
+        assert_eq!(d, Decision::Reject(RejectReason::UnverifiedAddress));
     }
 
     #[test]

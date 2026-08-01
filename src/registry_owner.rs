@@ -26,6 +26,7 @@
 //! actor returns.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 
@@ -47,34 +48,67 @@ const OWNER_MAILBOX_CAPACITY: usize = 512;
 
 /// Immutable, lock-free-readable publication of the address ownership table.
 ///
-/// Republished in full whenever an owner or resolved claim kind changes.
-/// Unchanged same-owner refreshes still advance their projection commit fence
-/// but reuse this snapshot, avoiding O(peer-count) copying on routine gossip.
-/// Reads remain lock-free and never enter the owner mailbox.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// A mutation clones only one bounded shard (two for an address migration),
+/// while every untouched shard remains structurally shared with the previous
+/// snapshot. This keeps adversarial address churn from turning publication
+/// into quadratic whole-map copying. Reads remain lock-free and never enter
+/// the owner mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingSnapshot {
-    owners: HashMap<SocketAddr, Owner>,
+    owner_shards: [Arc<HashMap<SocketAddr, Owner>>; ROUTING_SNAPSHOT_SHARDS],
+}
+
+const ROUTING_SNAPSHOT_SHARDS: usize = 64;
+
+impl Default for RoutingSnapshot {
+    fn default() -> Self {
+        Self {
+            owner_shards: std::array::from_fn(|_| Arc::new(HashMap::new())),
+        }
+    }
 }
 
 impl RoutingSnapshot {
+    fn shard_index(addr: &SocketAddr) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        addr.hash(&mut hasher);
+        hasher.finish() as usize % ROUTING_SNAPSHOT_SHARDS
+    }
+
     /// The recorded owner of `addr`, if any.
     pub fn owner(&self, addr: &SocketAddr) -> Option<&Owner> {
-        self.owners.get(addr)
+        self.owner_shards[Self::shard_index(addr)].get(addr)
     }
 
     /// The identity `addr` currently routes to, if any.
     pub fn peer_id(&self, addr: &SocketAddr) -> Option<&PeerId> {
-        self.owners.get(addr).map(|owner| &owner.node_id)
+        self.owner(addr).map(|owner| &owner.node_id)
     }
 
     /// Number of addresses with a recorded owner.
     pub fn len(&self) -> usize {
-        self.owners.len()
+        self.owner_shards.iter().map(|shard| shard.len()).sum()
     }
 
     /// Whether no address has a recorded owner.
     pub fn is_empty(&self) -> bool {
-        self.owners.is_empty()
+        self.owner_shards.iter().all(|shard| shard.is_empty())
+    }
+
+    fn with_owner(&self, addr: SocketAddr, owner: Option<Owner>) -> Self {
+        let mut next = self.clone();
+        let shard_index = Self::shard_index(&addr);
+        let mut shard = (*next.owner_shards[shard_index]).clone();
+        match owner {
+            Some(owner) => {
+                shard.insert(addr, owner);
+            }
+            None => {
+                shard.remove(&addr);
+            }
+        }
+        next.owner_shards[shard_index] = Arc::new(shard);
+        next
     }
 }
 
@@ -548,11 +582,11 @@ impl PeerRegistryOwner {
                 };
                 let ownership_changed = current.as_ref() != Some(&next_owner);
                 if ownership_changed {
-                    self.addr_ownership.insert(addr, next_owner);
+                    self.addr_ownership.insert(addr, next_owner.clone());
                 }
                 let commit_seq = self.advance();
                 if ownership_changed {
-                    self.publish();
+                    self.publish_owner_snapshot(addr, Some(next_owner));
                     if let Some(routing) = self.routing.upgrade() {
                         routing.publish_owner(addr, &node_id);
                     }
@@ -576,7 +610,7 @@ impl PeerRegistryOwner {
         }
         let owner = self.addr_ownership.remove(&addr)?;
         let commit_seq = self.advance();
-        self.publish();
+        self.publish_owner_snapshot(addr, None);
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(addr, &owner.node_id);
         }
@@ -654,7 +688,11 @@ impl PeerRegistryOwner {
         self.addr_ownership.remove(&from);
         self.addr_ownership.insert(to, owner.clone());
         let commit_seq = self.advance();
-        self.publish();
+        let snapshot = self.snapshot.load_full();
+        let snapshot = snapshot
+            .with_owner(from, None)
+            .with_owner(to, Some(owner.clone()));
+        self.snapshot.store(Arc::new(snapshot));
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(from, &owner.node_id);
             routing.publish_owner(to, &owner.node_id);
@@ -669,11 +707,12 @@ impl PeerRegistryOwner {
         self.commit_seq
     }
 
-    /// Republish the immutable snapshot readers load.
-    fn publish(&self) {
-        self.snapshot.store(Arc::new(RoutingSnapshot {
-            owners: self.addr_ownership.clone(),
-        }));
+    /// Publish one address update while structurally sharing every untouched
+    /// shard with the previous immutable snapshot.
+    fn publish_owner_snapshot(&self, addr: SocketAddr, owner: Option<Owner>) {
+        let snapshot = self.snapshot.load_full();
+        self.snapshot
+            .store(Arc::new(snapshot.with_owner(addr, owner)));
     }
 }
 
@@ -763,11 +802,11 @@ mod tests {
         assert_eq!(owner.routes_to(&target), Some(a));
     }
 
-    /// Provisional first, then a genuinely Verified claim: the verified
-    /// claimant displaces the provisional squatter and the displacement is
-    /// reported so the caller can rekey identity-scoped state.
+    /// A self-reported address cannot become a first owner. The subsequent
+    /// genuinely verified claim becomes the first published owner without
+    /// inheriting or displacing any squatter state.
     #[tokio::test]
-    async fn provisional_then_verified_displaces_and_reports_owner_change() {
+    async fn provisional_first_claim_publishes_nothing_then_verified_claim_owns() {
         let (owner, publisher) = owner_handle();
         let squatter = peer("squatter");
         let real = peer("real");
@@ -782,12 +821,10 @@ mod tests {
             .await;
         assert_eq!(
             first,
-            ClaimCommit::Accepted {
-                kind: ClaimKind::Provisional,
-                displaced: None,
-                commit_seq: 1,
-            }
+            ClaimCommit::Rejected(ClaimRejection::Arbitration(RejectReason::UnverifiedAddress))
         );
+        assert!(owner.routes_to(&target).is_none());
+        assert!(publisher.events().is_empty());
 
         let second = owner
             .claim(target, claim_of(real.clone(), ClaimKind::Verified), false)
@@ -796,19 +833,19 @@ mod tests {
             second,
             ClaimCommit::Accepted {
                 kind: ClaimKind::Verified,
-                displaced: Some(squatter.clone()),
-                commit_seq: 2,
+                displaced: None,
+                commit_seq: 1,
             }
         );
         assert!(
-            second.owner_changed(),
-            "owner-change rekey must be signalled"
+            !second.owner_changed(),
+            "a refused self-report never became an owner to displace"
         );
         assert_eq!(owner.routes_to(&target), Some(real.clone()));
         assert_eq!(
             publisher.events(),
-            vec![(target, Some(squatter)), (target, Some(real))],
-            "routing must be republished exactly once per accepted claim"
+            vec![(target, Some(real))],
+            "only the verified claim may publish routing"
         );
     }
 
@@ -876,6 +913,56 @@ mod tests {
             publisher.events(),
             published,
             "an unchanged refresh must not republish an identical address route"
+        );
+    }
+
+    /// A distinct accepted claim must copy only its bounded routing shard,
+    /// not every ownership entry accumulated so far. Keeping the prior
+    /// snapshot alive makes allocation reuse impossible, so pointer identity
+    /// of an owner in another shard proves that storage was structurally
+    /// shared across the publication.
+    #[tokio::test]
+    async fn distinct_claim_reuses_untouched_routing_snapshot_shard() {
+        use std::hash::{Hash, Hasher};
+
+        fn intended_shard(addr: &SocketAddr) -> usize {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            addr.hash(&mut hasher);
+            hasher.finish() as usize % 64
+        }
+
+        let (owner, _publisher) = owner_handle();
+        let retained_addr = addr(30_024);
+        let retained_peer = peer("structural-share-retained");
+        owner
+            .claim(
+                retained_addr,
+                claim_of(retained_peer, ClaimKind::Verified),
+                false,
+            )
+            .await;
+        let before = owner.snapshot();
+        let retained_ptr = before.owner(&retained_addr).expect("retained owner") as *const Owner;
+
+        let inserted_addr = (30_025..=u16::MAX)
+            .map(addr)
+            .find(|candidate| intended_shard(candidate) != intended_shard(&retained_addr))
+            .expect("an address in another shard");
+        owner
+            .claim(
+                inserted_addr,
+                claim_of(peer("structural-share-inserted"), ClaimKind::Verified),
+                false,
+            )
+            .await;
+
+        let after = owner.snapshot();
+        let retained_after_ptr = after
+            .owner(&retained_addr)
+            .expect("retained owner after update") as *const Owner;
+        assert_eq!(
+            retained_ptr, retained_after_ptr,
+            "an accepted claim must reuse every untouched snapshot shard"
         );
     }
 
@@ -1068,6 +1155,9 @@ mod tests {
         owner
             .claim(from, claim_of(node.clone(), ClaimKind::Verified), false)
             .await;
+        owner
+            .claim(from, claim_of(node.clone(), ClaimKind::Provisional), false)
+            .await;
         assert!(
             owner.migrate(from, to, None).await.moved(),
             "an owned source must move onto a free destination"
@@ -1251,7 +1341,7 @@ mod tests {
         owner
             .claim(
                 old_addr,
-                claim_of(original.clone(), ClaimKind::Provisional),
+                claim_of(original.clone(), ClaimKind::Verified),
                 false,
             )
             .await;
@@ -1262,7 +1352,13 @@ mod tests {
                 .moved()
         );
 
-        // A newer claimant takes `new_addr` before the restore runs.
+        // A newer claimant takes `new_addr` before the restore runs. Verified
+        // ownership cannot be displaced directly, so model the old session's
+        // release followed by the new session's verified claim.
+        owner
+            .release(new_addr, Some(original.clone()))
+            .await
+            .expect("original owner releases the migrated address");
         assert!(
             owner
                 .claim(
@@ -1299,7 +1395,7 @@ mod tests {
         owner
             .claim(
                 other_old,
-                claim_of(original.clone(), ClaimKind::Provisional),
+                claim_of(original.clone(), ClaimKind::Verified),
                 false,
             )
             .await;
@@ -1333,6 +1429,9 @@ mod tests {
 
         owner
             .claim(to, claim_of(node.clone(), ClaimKind::Verified), false)
+            .await;
+        owner
+            .claim(from, claim_of(node.clone(), ClaimKind::Verified), false)
             .await;
         owner
             .claim(from, claim_of(node.clone(), ClaimKind::Provisional), false)
