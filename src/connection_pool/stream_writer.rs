@@ -2,11 +2,45 @@
 /// read side. Ordinary tell/ask commands never use this slice machinery.
 const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 
-fn write_zero() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::WriteZero,
-        "streaming transport made no write progress",
-    )
+async fn write_vectored_all<S>(
+    stream: &mut S,
+    slices: &[std::io::IoSlice<'_>],
+) -> std::io::Result<usize>
+where
+    S: AsyncWrite + Unpin,
+{
+    let total_len: usize = slices.iter().map(|slice| slice.len()).sum();
+    if total_len == 0 {
+        return Ok(0);
+    }
+    if !stream.is_write_vectored() {
+        for slice in slices {
+            stream.write_all(slice.as_ref()).await?;
+        }
+        return Ok(total_len);
+    }
+
+    let written = stream.write_vectored(slices).await?;
+    if written == total_len {
+        return Ok(written);
+    }
+    let mut index = 0usize;
+    let mut offset = written;
+    while index < slices.len() && offset >= slices[index].len() {
+        offset -= slices[index].len();
+        index += 1;
+    }
+    if index < slices.len() {
+        if offset < slices[index].len() {
+            stream.write_all(&slices[index].as_ref()[offset..]).await?;
+            index += 1;
+        }
+        while index < slices.len() {
+            stream.write_all(slices[index].as_ref()).await?;
+            index += 1;
+        }
+    }
+    Ok(total_len)
 }
 
 async fn write_streaming_command_slice<S>(
@@ -23,7 +57,8 @@ where
                 return Ok((0, true));
             }
             let end = (offset + STREAM_WRITE_SLICE_BYTES).min(data.len());
-            (stream.write(&data[offset..end]).await?, data.len())
+            stream.write_all(&data[offset..end]).await?;
+            (end - offset, data.len())
         }
         StreamingCommand::Flush => {
             stream.flush().await?;
@@ -35,7 +70,8 @@ where
                 return Ok((0, true));
             }
             let end = (offset + STREAM_WRITE_SLICE_BYTES).min(header.len());
-            (stream.write(&header[offset..end]).await?, header.len())
+            stream.write_all(&header[offset..end]).await?;
+            (end - offset, header.len())
         }
         StreamingCommand::VectoredWrite(command) => {
             let header = command.header.as_slice();
@@ -44,31 +80,30 @@ where
                 return Ok((0, true));
             }
             let budget = STREAM_WRITE_SLICE_BYTES.min(total_len - offset);
+            let mut slices = [std::io::IoSlice::new(&[]), std::io::IoSlice::new(&[])];
+            let slice_count;
             if offset < header.len() {
                 let header_end = (offset + budget).min(header.len());
-                let header_slice = std::io::IoSlice::new(&header[offset..header_end]);
+                slices[0] = std::io::IoSlice::new(&header[offset..header_end]);
                 let header_bytes = header_end - offset;
-                if header_bytes < budget && stream.is_write_vectored() {
-                    let payload_slice =
+                if header_bytes < budget {
+                    slices[1] =
                         std::io::IoSlice::new(&command.payload[..budget - header_bytes]);
-                    (
-                        stream
-                            .write_vectored(&[header_slice, payload_slice])
-                            .await?,
-                        total_len,
-                    )
+                    slice_count = 2;
                 } else {
-                    (stream.write(header_slice.as_ref()).await?, total_len)
+                    slice_count = 1;
                 }
             } else {
                 let payload_offset = offset - header.len();
-                (
-                    stream
-                        .write(&command.payload[payload_offset..payload_offset + budget])
-                        .await?,
-                    total_len,
-                )
+                slices[0] = std::io::IoSlice::new(
+                    &command.payload[payload_offset..payload_offset + budget],
+                );
+                slice_count = 1;
             }
+            (
+                write_vectored_all(stream, &slices[..slice_count]).await?,
+                total_len,
+            )
         }
         StreamingCommand::OwnedChunks(chunks) => {
             let total_len: usize = chunks.iter().map(|chunk| chunk.len()).sum();
@@ -104,17 +139,10 @@ where
                     count,
                 )
             };
-            let written = if stream.is_write_vectored() {
-                stream.write_vectored(slices).await?
-            } else {
-                stream.write(slices[0].as_ref()).await?
-            };
+            let written = write_vectored_all(stream, slices).await?;
             (written, total_len)
         }
     };
-    if written == 0 {
-        return Err(write_zero());
-    }
     pending.offset += written;
     Ok((written, pending.offset == total_len))
 }
@@ -423,53 +451,6 @@ impl LockFreeStreamHandle {
     {
         // CRITICAL_PATH: owner-batched send queue + vectored TLS writes.
         use std::io::IoSlice;
-
-        async fn write_vectored_all<S>(
-            stream: &mut S,
-            slices: &[IoSlice<'_>],
-        ) -> std::io::Result<usize>
-        where
-            S: AsyncWrite + Unpin,
-        {
-            let total_len: usize = slices.iter().map(|s| s.len()).sum();
-            if total_len == 0 {
-                return Ok(0);
-            }
-
-            // If the underlying stream doesn't support vectored writes, preserve ordering by
-            // writing each slice sequentially.
-            if !stream.is_write_vectored() {
-                for s in slices {
-                    stream.write_all(s.as_ref()).await?;
-                }
-                return Ok(total_len);
-            }
-
-            let n = stream.write_vectored(slices).await?;
-            if n == total_len {
-                return Ok(n);
-            }
-
-            // Short write: complete the remainder sequentially without allocating a combined buffer.
-            let mut idx = 0usize;
-            let mut off = n;
-            while idx < slices.len() && off >= slices[idx].len() {
-                off -= slices[idx].len();
-                idx += 1;
-            }
-            if idx < slices.len() {
-                if off < slices[idx].len() {
-                    let b = &slices[idx].as_ref()[off..];
-                    stream.write_all(b).await?;
-                    idx += 1;
-                }
-                while idx < slices.len() {
-                    stream.write_all(slices[idx].as_ref()).await?;
-                    idx += 1;
-                }
-            }
-            Ok(total_len)
-        }
 
         async fn flush_inline32_batch<S>(
             stream: &mut S,
