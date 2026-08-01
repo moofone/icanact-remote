@@ -19358,6 +19358,72 @@ mod tests {
         );
     }
 
+    /// DNS is external input. Even when the resolved address passes the dial
+    /// security policy, it must never migrate a remote peer onto this
+    /// registry's own bind/advertised address. The owner actor is the final
+    /// authority for this decision, just as it is for ordinary claims.
+    #[tokio::test]
+    async fn dns_refresh_onto_local_address_moves_nothing() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5200".parse().unwrap();
+        let bind_addr = test_addr(20_142);
+        let config = GossipConfig {
+            // Keep the dial-policy gate open so the ownership-locality gate,
+            // rather than the generic loopback filter, is what rejects this.
+            allow_loopback_discovery: true,
+            ..test_config_with_seed("dns-refresh-local-destination")
+        };
+        let registry = GossipRegistry::<()>::new(bind_addr, config);
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![bind_addr])))
+            .await;
+
+        let mover = test_peer_id("dns-refresh-local-mover");
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    old_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: mover.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(old_addr);
+            peer.node_id = Some(mover.to_node_id());
+            peer.dns_name = Some("self.invalid:5200".to_string());
+            gossip_state.peers.insert(old_addr, peer);
+        }
+
+        assert_eq!(
+            registry.refresh_peer_dns(old_addr).await,
+            None,
+            "DNS must not migrate a remote peer onto this registry's local address"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(gossip_state.peers.contains_key(&old_addr));
+        assert!(!gossip_state.peers.contains_key(&bind_addr));
+        drop(gossip_state);
+        assert_eq!(registry.registry_owner.routes_to(&old_addr), Some(mover));
+        assert_eq!(registry.registry_owner.routes_to(&bind_addr), None);
+    }
+
     /// A DNS re-resolution resolves the identity to carry across BEFORE it
     /// asks the owner actor to move ownership. If that identity has been
     /// displaced on the source address in between, the move is refused and

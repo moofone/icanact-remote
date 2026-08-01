@@ -1144,6 +1144,41 @@ mod tests {
         assert!(reclaim.is_accepted());
     }
 
+    /// A disconnect/rejection callback belongs to the exact claim generation
+    /// it accepted, not merely to the peer identity. The same authenticated
+    /// peer can reconnect and refresh ownership before the old callback runs;
+    /// that stale callback must not withdraw the newer session's route.
+    #[tokio::test]
+    async fn stale_same_identity_release_cannot_clear_newer_claim_generation() {
+        let (owner, publisher) = owner_handle();
+        let node = peer("same-identity-reconnect");
+        let target = addr(30_035);
+
+        let old_claim = owner
+            .claim(target, claim_of(node.clone(), ClaimKind::Verified), false)
+            .await;
+        let old_generation = old_claim.commit_seq().expect("old claim commits");
+        let new_claim = owner
+            .claim(target, claim_of(node.clone(), ClaimKind::Verified), false)
+            .await;
+        let new_generation = new_claim.commit_seq().expect("new claim commits");
+        assert!(new_generation > old_generation);
+
+        let events_before_stale_release = publisher.events();
+        let stale_release = owner.release(target, Some(node.clone())).await;
+
+        assert_eq!(
+            stale_release, None,
+            "a release for the old claim generation must be refused after the same peer reclaims"
+        );
+        assert_eq!(owner.routes_to(&target), Some(node));
+        assert_eq!(
+            publisher.events(),
+            events_before_stale_release,
+            "a stale release must publish no route retraction"
+        );
+    }
+
     /// Address re-resolution moves ownership rather than stranding it.
     #[tokio::test]
     async fn migrate_moves_ownership_to_the_new_address() {
