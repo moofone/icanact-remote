@@ -117,6 +117,168 @@ where
     handle.join().expect("test thread panicked unexpectedly");
 }
 
+/// P0: the bidirectional IO task must keep reading while a large streamed
+/// frame is only partially writable. If each side awaits a whole ~1 MiB
+/// `VectoredWrite` before returning to its read loop, two simultaneous asks
+/// deadlock as soon as both 64 KiB duplex directions fill: neither writer can
+/// finish, and neither IO task reaches the reads that would drain its peer.
+///
+/// Keep the transport deliberately smaller than one stream chunk and make
+/// both requests and their echoed responses multi-MiB. Completion proves the
+/// writer yields at a bounded byte slice in both directions; payload equality
+/// proves that yielding does not change ordinary ask semantics.
+#[test]
+fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
+    run_multi_thread_test(async {
+        const DUPLEX_CAPACITY: usize = 64 * 1024;
+        const PAYLOAD_BYTES: usize = 3 * 1024 * 1024;
+        const COMPLETION_BOUND: Duration = Duration::from_secs(3);
+
+        let addr_a: std::net::SocketAddr = "127.0.0.1:40491".parse().unwrap();
+        let addr_b: std::net::SocketAddr = "127.0.0.1:40492".parse().unwrap();
+
+        let registry_a = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_a,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "stream_fairness_constrained_a",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_a
+            .set_actor_message_handler_sync(Arc::new(TestActor))
+            .await;
+        let registry_b = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_b,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "stream_fairness_constrained_b",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_b
+            .set_actor_message_handler_sync(Arc::new(TestActor))
+            .await;
+
+        let correlation_a = CorrelationTracker::new();
+        let correlation_b = CorrelationTracker::new();
+        let (io_a, io_b) = tokio::io::duplex(DUPLEX_CAPACITY);
+
+        let read_ctx_a = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_a),
+            peer_addr: addr_b,
+            session_source: addr_b,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_a.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_a.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_a.actor_message_handler_sync.load_full(),
+        };
+        let read_ctx_b = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_b),
+            peer_addr: addr_a,
+            session_source: addr_a,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_b.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_b.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_b.actor_message_handler_sync.load_full(),
+        };
+
+        let (writer_a, task_a, _) = LockFreeStreamHandle::new(
+            io_a,
+            addr_b,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_a),
+        );
+        let writer_a = Arc::new(writer_a);
+        let conn_a =
+            ConnectionHandle::<()>::new_stream(addr_b, Arc::clone(&writer_a), correlation_a);
+        let (writer_b, task_b, _) = LockFreeStreamHandle::new(
+            io_b,
+            addr_a,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_b),
+        );
+        let writer_b = Arc::new(writer_b);
+        let conn_b =
+            ConnectionHandle::<()>::new_stream(addr_a, Arc::clone(&writer_b), correlation_b);
+
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let start_a = Arc::clone(&start);
+        let ask_a = tokio::spawn(async move {
+            let payload = bytes::Bytes::from(vec![0xA5; PAYLOAD_BYTES]);
+            start_a.wait().await;
+            let response = conn_a
+                .ask_streaming_bytes(
+                    payload.clone(),
+                    0xA11C_0001,
+                    0xC0DE_BEEF,
+                    Duration::from_secs(30),
+                )
+                .await?;
+            crate::Result::Ok((response, payload))
+        });
+        let start_b = Arc::clone(&start);
+        let ask_b = tokio::spawn(async move {
+            let payload = bytes::Bytes::from(vec![0x5A; PAYLOAD_BYTES]);
+            start_b.wait().await;
+            let response = conn_b
+                .ask_streaming_bytes(
+                    payload.clone(),
+                    0xA11C_0001,
+                    0xC0DE_BEEF,
+                    Duration::from_secs(30),
+                )
+                .await?;
+            crate::Result::Ok((response, payload))
+        });
+
+        start.wait().await;
+        let ((response_a, payload_a), (response_b, payload_b)) =
+            tokio::time::timeout(COMPLETION_BOUND, async {
+                let a = ask_a.await.expect("node A ask task panicked")?;
+                let b = ask_b.await.expect("node B ask task panicked")?;
+                crate::Result::Ok((a, b))
+            })
+            .await
+            .expect(
+                "simultaneous streamed asks deadlocked: each IO task must return to reads after a bounded write slice",
+            )
+            .expect("simultaneous streamed ask failed");
+
+        assert_eq!(response_a, payload_a);
+        assert_eq!(response_b, payload_b);
+
+        writer_a.shutdown();
+        writer_b.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_a).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_b).await;
+    });
+}
+
 fn reset_io_perf() {
     let _ = IoPerfCounters::global().snapshot_and_reset();
 }
