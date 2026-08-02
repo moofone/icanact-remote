@@ -1304,6 +1304,35 @@ fn immediate_streaming_response_queue_rejects_byte_burst() {
     );
 }
 
+#[test]
+fn immediate_streaming_response_queue_admits_one_oversized_response() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP + 1
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one response may exceed the queue cap");
+    assert!(queue.is_full());
+    assert!(
+        queue
+            .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x"))])
+            .is_err()
+    );
+
+    while queue.pop_front().is_some() {}
+    assert!(
+        !queue.is_full(),
+        "admission reopens after the oversized response flushes"
+    );
+    queue
+        .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x"))])
+        .expect("a later response is admitted after the first one drains");
+}
+
 #[derive(Clone, Copy, Default)]
 struct ClosedWriter;
 
