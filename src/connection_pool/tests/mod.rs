@@ -1303,6 +1303,118 @@ fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission(
         .expect("overflow is retained in the deferred response slot");
 }
 
+/// A pooled response must retain its original allocation while it waits for
+/// the connection-owned writer. Materializing a `BytesMut` here doubles the
+/// peak resident payload and defeats the pooled encoder's bounded-memory
+/// contract.
+#[test]
+fn pooled_streaming_response_retains_owned_payload_without_materializing_bytes() {
+    let payload_len = STREAM_CHUNK_SIZE;
+    let prefix = Some([0xD3; 16]);
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(
+        payload_len - prefix.as_ref().map(|value| value.len()).unwrap_or(0),
+        |out| out.extend(std::iter::repeat_n(0xA7, payload_len - 16)),
+    )
+    .expect("pooled payload allocation");
+    let mut queue = LocalStreamingQueue::with_response_reserve(payload_len + 1024);
+
+    queue_streaming_response_pooled(
+        &mut queue,
+        0xC0DE,
+        payload,
+        prefix,
+        payload_len,
+        128 * 1024,
+        None,
+    )
+    .expect("pooled response should be admitted");
+
+    assert!(matches!(
+        queue.queue.front(),
+        Some(StreamingCommand::PooledResponse(_))
+    ));
+    assert!(matches!(queue.queue.get(1), Some(StreamingCommand::Flush)));
+}
+
+#[tokio::test]
+async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
+    let payload_len = 64;
+    let prefix = [0xD3; 16];
+    let payload_bytes = vec![0xA7; payload_len - prefix.len()];
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(payload_bytes.len(), |out| {
+        out.extend_from_slice(&payload_bytes)
+    })
+    .expect("pooled payload allocation");
+    // Keep the frame payload below the 16-byte prefix so the prefix itself
+    // crosses a frame boundary; the writer must treat it as part of the
+    // logical payload rather than assuming it fits in the start frame.
+    let max_message_size = 20;
+    let mut queue = LocalStreamingQueue::with_response_reserve(max_message_size);
+    queue_streaming_response_pooled(
+        &mut queue,
+        0xC0DE,
+        payload,
+        Some(prefix),
+        payload_len,
+        max_message_size,
+        None,
+    )
+    .expect("pooled response should be admitted");
+
+    let command = queue.pop_front().expect("pooled response command");
+    let (stream_id, chunk_size) = match &command {
+        StreamingCommand::PooledResponse(response) => (response.stream_id, response.chunk_size),
+        other => panic!("expected pooled response command, got {other:?}"),
+    };
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, recorded) = RecordingWriter::new();
+    loop {
+        let (written, complete) = write_streaming_command_slice(&mut writer, &mut pending)
+            .await
+            .expect("pooled response write");
+        assert!(written > 0);
+        if complete {
+            break;
+        }
+    }
+    let flush = queue.pop_front().expect("terminal flush");
+    let mut pending_flush = PendingStreamingCommand::local(flush);
+    let (_, complete) = write_streaming_command_slice(&mut writer, &mut pending_flush)
+        .await
+        .expect("pooled response flush");
+    assert!(complete);
+
+    let first_len = payload_len.min(chunk_size);
+    let mut logical_payload = Vec::with_capacity(payload_len);
+    logical_payload.extend_from_slice(&prefix);
+    logical_payload.extend_from_slice(&payload_bytes);
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&crate::framing::write_stream_response_start_header(
+        stream_id,
+        0xC0DE,
+        payload_len as u32,
+        first_len,
+    ));
+    expected.extend_from_slice(&logical_payload[..first_len]);
+    let mut wire_offset = first_len;
+    let mut chunk_index = 1u32;
+    while wire_offset < payload_len {
+        let frame_payload_start = wire_offset;
+        let frame_payload_end = (wire_offset + chunk_size).min(payload_len);
+        expected.extend_from_slice(&crate::framing::write_stream_data_header(
+            true,
+            stream_id,
+            chunk_index,
+            frame_payload_end - frame_payload_start,
+        ));
+        expected.extend_from_slice(&logical_payload[frame_payload_start..frame_payload_end]);
+        wire_offset = frame_payload_end;
+        chunk_index += 1;
+    }
+
+    assert_eq!(*recorded.lock().unwrap(), expected);
+}
+
 #[test]
 fn immediate_streaming_response_queue_defers_overflow_until_prior_response_drains() {
     let mut queue = LocalStreamingQueue::new();

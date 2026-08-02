@@ -71,6 +71,129 @@ where
     Ok(result)
 }
 
+/// Write one bounded slice of a pooled response without converting its
+/// payload into `Bytes`. The pooled allocation remains owned by the pending
+/// command until the terminal frame has been written.
+async fn write_pooled_streaming_command_slice<S>(
+    stream: &mut S,
+    pending_offset: &mut usize,
+    response: &mut PooledStreamingResponse,
+) -> std::io::Result<(usize, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    while response.frame_index < response.chunk_count {
+        let header = response.frame_header(response.frame_index);
+        let header_bytes = header.as_slice();
+        let frame_payload_len = response.frame_payload_len(response.frame_index);
+        let frame_total_len = header_bytes.len() + frame_payload_len;
+
+        if response.frame_offset >= frame_total_len {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+            continue;
+        }
+
+        let budget = STREAM_WRITE_SLICE_BYTES.min(frame_total_len - response.frame_offset);
+        let header_bytes_offered = if response.frame_offset < header_bytes.len() {
+            (header_bytes.len() - response.frame_offset).min(budget)
+        } else {
+            0
+        };
+        let data_budget = budget - header_bytes_offered;
+        let mut slices = [std::io::IoSlice::new(&[]); 3];
+        let mut slice_count = 0usize;
+
+        if header_bytes_offered > 0 {
+            let header_start = response.frame_offset;
+            slices[slice_count] = std::io::IoSlice::new(
+                &header_bytes[header_start..header_start + header_bytes_offered],
+            );
+            slice_count += 1;
+        }
+
+        if data_budget > 0 {
+            let mut remaining = data_budget;
+
+            if response.prefix_sent < response.prefix_len {
+                let prefix = response.prefix.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pooled response prefix state is inconsistent",
+                    )
+                })?;
+                let prefix_start = response.prefix_sent;
+                let prefix_available = response.prefix_len.saturating_sub(prefix_start);
+                let take = remaining.min(prefix_available);
+                if take > 0 {
+                    slices[slice_count] = std::io::IoSlice::new(
+                        &prefix[prefix_start..prefix_start + take],
+                    );
+                    slice_count += 1;
+                    remaining -= take;
+                }
+            }
+
+            if remaining > 0 {
+                if response.payload_remaining == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pooled response payload ended before the advertised length",
+                    ));
+                }
+                let chunk = response.payload.chunk();
+                let take = remaining
+                    .min(response.payload_remaining)
+                    .min(chunk.len());
+                if take == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pooled response returned an empty chunk while bytes remain",
+                    ));
+                }
+                slices[slice_count] = std::io::IoSlice::new(&chunk[..take]);
+                slice_count += 1;
+            }
+        }
+
+        let written = write_vectored_once(stream, &slices[..slice_count]).await?;
+        let data_written = written.saturating_sub(header_bytes_offered);
+        let prefix_written = data_written
+            .min(response.prefix_len.saturating_sub(response.prefix_sent));
+        response.prefix_sent = response.prefix_sent.saturating_add(prefix_written);
+        let payload_written = data_written.saturating_sub(prefix_written);
+        if payload_written > response.payload_remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pooled response wrote past its advertised payload length",
+            ));
+        }
+        if payload_written > 0 {
+            response.payload.advance(payload_written);
+            response.payload_remaining -= payload_written;
+        }
+
+        response.frame_offset += written;
+        *pending_offset += written;
+        if response.frame_offset >= frame_total_len {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+        }
+        let complete = response.frame_index >= response.chunk_count;
+        if complete
+            && (response.prefix_sent != response.prefix_len || response.payload_remaining != 0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pooled response stream completed before all payload bytes were written",
+            ));
+        }
+        return Ok((written, complete));
+    }
+
+    Ok((0, true))
+}
+
 async fn write_streaming_command_slice<S>(
     stream: &mut S,
     pending: &mut PendingStreamingCommand,
@@ -78,6 +201,15 @@ async fn write_streaming_command_slice<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    if let StreamingCommand::PooledResponse(response) = &mut pending.command {
+        return write_pooled_streaming_command_slice(
+            stream,
+            &mut pending.offset,
+            response,
+        )
+        .await;
+    }
+
     let offset = pending.offset;
     let (written, total_len) = match &pending.command {
         StreamingCommand::WriteBytes(data) => {
@@ -178,6 +310,9 @@ where
             let written = write_vectored_once(stream, slices).await?;
             (written, total_len)
         }
+        StreamingCommand::PooledResponse(_) => unreachable!(
+            "pooled responses are handled by write_pooled_streaming_command_slice"
+        ),
     };
     pending.offset += written;
     Ok((written, pending.offset == total_len))
