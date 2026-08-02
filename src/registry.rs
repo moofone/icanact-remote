@@ -3270,6 +3270,24 @@ impl<T: 'static> GossipRegistry<T> {
             && !persistent
             && let Some(receipt) = receipt
         {
+            // A same-peer reconnect refreshes the owner generation. Transfer
+            // that current generation to every still-live session receipt for
+            // this address before adding the new session. If the newer
+            // session closes first, the surviving older session must still
+            // hold a receipt that can release the generation once it is the
+            // last owner; leaving its old generation behind leaks the route.
+            let mut existing_keys = Vec::new();
+            self.connection_scoped_claims.iter_sync(|key, _| {
+                if key.0 == peer_id && key.2 == peer_addr {
+                    existing_keys.push(key.clone());
+                }
+                true
+            });
+            for key in existing_keys {
+                let _ = self
+                    .connection_scoped_claims
+                    .upsert_sync(key, receipt.generation());
+            }
             self.connection_scoped_claims.upsert_sync(
                 (peer_id, session_source, peer_addr),
                 receipt.generation(),
@@ -3314,6 +3332,16 @@ impl<T: 'static> GossipRegistry<T> {
     ) {
         let claims = self.take_connection_scoped_claims(peer_id, session_source);
         for (addr, generation) in claims {
+            // Configuration can race a transport teardown. Once the address
+            // is an operator-required pin, a stale connection receipt must
+            // never retract it.
+            if self
+                .connection_pool
+                .get_required_peer_addr(peer_id)
+                .is_some_and(|configured| configured == addr)
+            {
+                continue;
+            }
             let covered_by_other_session = {
                 let mut covered = false;
                 self.connection_scoped_claims.iter_sync(|key, _| {
@@ -3702,6 +3730,7 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Configure a peer by peer ID and its expected connection address
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
+        let previous_addr = self.connection_pool.get_required_peer_addr(&peer_id);
         // Operator configuration is verified ownership evidence. Reserve the
         // address in the single-owner authority before publishing the required
         // dial route, so an offline configured peer cannot be displaced by a
@@ -3720,6 +3749,27 @@ impl<T: 'static> GossipRegistry<T> {
                 "refusing configured peer route because the ownership authority rejected it"
             );
             return;
+        }
+
+        if let Some(previous_addr) = previous_addr.filter(|previous| *previous != connect_addr) {
+            if let Some(token) = self.registry_owner.ownership_token(&previous_addr)
+                && token.owner() == &peer_id
+                && let Some(release_seq) = self
+                    .registry_owner
+                    .release(previous_addr, peer_id.clone(), token.generation())
+                    .await
+            {
+                let mut state = self.gossip_state.lock().await;
+                state.tombstone_ownership_projection(previous_addr, release_seq);
+            } else {
+                // Older state may have a pool-only configured route without a
+                // corresponding owner-actor token. Remove only this peer's
+                // stale derived route; never disturb a replacement owner.
+                let _ = self
+                    .connection_pool
+                    .addr_to_peer_id
+                    .remove_if_sync(&previous_addr, |current| current == &peer_id);
+            }
         }
 
         let pool = &self.connection_pool;
@@ -4042,6 +4092,20 @@ impl<T: 'static> GossipRegistry<T> {
                 dns_name = %dns_name,
                 outcome = ?migrate_outcome,
                 "DNS refresh: address ownership no longer permits this move, aborting migration"
+            );
+            return None;
+        }
+        if !migrate_outcome.moved() {
+            // A DNS destination without a committed owner-actor migration is
+            // only an unverified hint. Do not publish a pool route for it:
+            // another verified claimant may win the address before the next
+            // phase, and `SourceUnowned` carries no token to revalidate.
+            debug!(
+                old_addr = %peer_addr,
+                new_addr = %new_addr,
+                dns_name = %dns_name,
+                outcome = ?migrate_outcome,
+                "DNS refresh: destination has no committed ownership, aborting route publication"
             );
             return None;
         }
@@ -19112,6 +19176,67 @@ mod tests {
             registry.registry_owner.routes_to(&pinned),
             Some(peer),
             "operator-configured ownership must not be released with a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_session_release_transfers_current_generation_to_survivor() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_027), test_config());
+        let peer = test_peer_id("connection-scoped-generation-transfer");
+        let observed = test_addr(20_028);
+        let session_a = test_addr(30_028);
+        let session_b = test_addr(30_029);
+
+        for session in [session_a, session_b] {
+            let (outcome, _) = registry
+                .add_connection_scoped_peer_claim(
+                    observed,
+                    peer.to_node_id(),
+                    crate::addr_ownership::ClaimKind::Verified,
+                    session,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        }
+
+        registry
+            .release_connection_scoped_claims(&peer, session_b)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            Some(peer.clone()),
+            "the surviving older session must retain ownership when the newer session closes"
+        );
+
+        registry
+            .release_connection_scoped_claims(&peer, session_a)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            None,
+            "the last session must release the current owner generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfiguring_peer_releases_previous_configured_address() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_029), test_config());
+        let peer = test_peer_id("configured-address-reconfigure");
+        let old_addr = test_addr(20_030);
+        let new_addr = test_addr(20_031);
+
+        registry.configure_peer(peer.clone(), old_addr).await;
+        registry.configure_peer(peer.clone(), new_addr).await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            None,
+            "reconfiguration must withdraw the previous verified pin"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&new_addr),
+            Some(peer),
+            "reconfiguration must retain the new verified pin"
         );
     }
 

@@ -660,7 +660,11 @@ async fn nat_inbound_full_sync_binds_identity_to_observed_transport() -> icanact
         .await
         .expect("FullSync actor must be applied");
     assert_eq!(location.peer_id, sender.registry.peer_id);
-    assert_eq!(location.address, observed_addr.to_string());
+    assert_eq!(
+        location.address,
+        sender_addr.to_string(),
+        "owned actor repair must preserve the advertised service port while anchoring the verified IP"
+    );
 
     sender.shutdown().await;
     observer.shutdown().await;
