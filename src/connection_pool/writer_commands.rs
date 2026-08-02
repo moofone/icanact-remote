@@ -239,6 +239,12 @@ struct LocalStreamingQueue {
     deferred_bytes: usize,
 }
 
+/// Keep one queue-cap-sized response plus one explicitly bounded in-flight or
+/// deferred response. This is the hard resident footprint for the local
+/// response path; a larger single response is admitted only within this bound.
+const STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP: usize =
+    STREAMING_RESPONSE_QUEUE_BYTE_CAP.saturating_mul(2);
+
 impl LocalStreamingQueue {
     #[cfg(test)]
     fn new() -> Self {
@@ -321,11 +327,9 @@ impl LocalStreamingQueue {
             .queued_bytes
             .saturating_add(self.in_flight_bytes);
         self.deferred.is_none()
-            && self.queued_bytes <= STREAMING_RESPONSE_QUEUE_BYTE_CAP
-            && self.in_flight_bytes <= STREAMING_RESPONSE_QUEUE_BYTE_CAP
-            && response_bytes <= STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && retained_without_deferred.saturating_add(response_bytes)
-                <= STREAMING_RESPONSE_QUEUE_BYTE_CAP.saturating_mul(2)
+                <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && command_count <= self.response_reserve_commands
             && self
                 .retained_commands()
@@ -349,6 +353,7 @@ impl LocalStreamingQueue {
             && self.deferred.is_none()
             && self.retained_bytes() == 0
             && response_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && command_count <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP;
         fits_queue
             || admit_single_oversize
@@ -356,10 +361,7 @@ impl LocalStreamingQueue {
     }
 
     fn is_full(&self) -> bool {
-        if self.deferred.is_some() {
-            return true;
-        }
-        if self.in_flight_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP {
+        if self.deferred.is_some() && !self.response_in_flight {
             return true;
         }
         if self.queue.is_empty() {
@@ -393,6 +395,7 @@ impl LocalStreamingQueue {
             && self.deferred.is_none()
             && self.retained_bytes() == 0
             && added_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && added_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && commands.len() <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP;
         let defer = !fits_queue
             && !admit_single_oversize

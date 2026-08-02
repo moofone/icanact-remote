@@ -439,6 +439,15 @@ fn should_flush_stream_output(
     bytes_since_flush > 0 && pending_stream_cmd.is_none() && yielded_stream_cmd.is_none()
 }
 
+#[inline]
+fn is_streaming_admission_backpressure(error: &crate::GossipError) -> bool {
+    matches!(
+        error,
+        crate::GossipError::Network(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
 /// Truly lock-free streaming handle with dedicated background writer
 #[derive(Clone)]
 pub struct LockFreeStreamHandle {
@@ -2071,7 +2080,7 @@ impl LockFreeStreamHandle {
                         if let Some(result) = read_result.result {
                             reads += 1;
                             read_batch_limit = read_batch_limit.max(read_batch_limit_for(&result));
-                            let Some(result) = try_handle_fast_io(
+                            let fast_result = match try_handle_fast_io(
                                 result,
                                 ctx,
                                 &mut stream,
@@ -2084,14 +2093,21 @@ impl LockFreeStreamHandle {
                                 perf,
                             )
                             .await
-                            .unwrap_or_else(|e| {
-                                warn!(
-                                    peer = %ctx.peer_addr,
-                                    error = %e,
-                                    "Failed to process fast IO message"
-                                );
-                                None
-                            }) else {
+                            {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to process fast IO message"
+                                    );
+                                    if is_streaming_admission_backpressure(&e) {
+                                        return;
+                                    }
+                                    None
+                                }
+                            };
+                            let Some(result) = fast_result else {
                                 continue;
                             };
                             if let Some(registry) = ctx.registry_weak.upgrade() {
@@ -2119,6 +2135,9 @@ impl LockFreeStreamHandle {
                                         error = %e,
                                         "Failed to process message on IO task"
                                     );
+                                    if is_streaming_admission_backpressure(&e) {
+                                        return;
+                                    }
                                 }
                             } else {
                                 warn!(
@@ -2229,7 +2248,7 @@ impl LockFreeStreamHandle {
                             }
 
                             if let Some(result) = read_result.result {
-                                if let Some(result) = try_handle_fast_io(
+                                let fast_result = match try_handle_fast_io(
                                     result,
                                     ctx,
                                     &mut stream,
@@ -2242,14 +2261,21 @@ impl LockFreeStreamHandle {
                                     perf,
                                 )
                                 .await
-                                .unwrap_or_else(|e| {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "Failed to process fast IO message"
-                                    );
-                                    None
-                                }) {
+                                {
+                                    Ok(result) => result,
+                                    Err(e) => {
+                                        warn!(
+                                            peer = %ctx.peer_addr,
+                                            error = %e,
+                                            "Failed to process fast IO message"
+                                        );
+                                        if is_streaming_admission_backpressure(&e) {
+                                            return;
+                                        }
+                                        None
+                                    }
+                                };
+                                if let Some(result) = fast_result {
                                     if let Some(registry) = ctx.registry_weak.upgrade() {
                                         if let Err(e) = process_read_result_io(
                                             result,
@@ -2275,6 +2301,9 @@ impl LockFreeStreamHandle {
                                                 error = %e,
                                                 "Failed to process message on IO task"
                                             );
+                                            if is_streaming_admission_backpressure(&e) {
+                                                return;
+                                            }
                                         }
                                     } else {
                                         warn!(
@@ -2362,7 +2391,7 @@ impl LockFreeStreamHandle {
                                     drained += 1;
                                     drain_batch_limit =
                                         drain_batch_limit.max(read_batch_limit_for(&result));
-                                    let Some(result) = try_handle_fast_io(
+                                    let fast_result = match try_handle_fast_io(
                                         result,
                                         ctx,
                                         &mut stream,
@@ -2375,14 +2404,21 @@ impl LockFreeStreamHandle {
                                         perf,
                                     )
                                     .await
-                                    .unwrap_or_else(|e| {
-                                        warn!(
-                                            peer = %ctx.peer_addr,
-                                            error = %e,
-                                            "Failed to process fast IO message"
-                                        );
-                                        None
-                                    }) else {
+                                    {
+                                        Ok(result) => result,
+                                        Err(e) => {
+                                            warn!(
+                                                peer = %ctx.peer_addr,
+                                                error = %e,
+                                                "Failed to process fast IO message"
+                                            );
+                                            if is_streaming_admission_backpressure(&e) {
+                                                return;
+                                            }
+                                            None
+                                        }
+                                    };
+                                    let Some(result) = fast_result else {
                                         continue;
                                     };
                                     if let Some(registry) = ctx.registry_weak.upgrade() {
@@ -2404,13 +2440,16 @@ impl LockFreeStreamHandle {
                                             perf,
                                         )
                                         .await
-                                        {
-                                            warn!(
-                                                peer = %ctx.peer_addr,
-                                                error = %e,
-                                                "Failed to process message on IO task"
-                                            );
-                                        }
+                                            {
+                                                warn!(
+                                                    peer = %ctx.peer_addr,
+                                                    error = %e,
+                                                    "Failed to process message on IO task"
+                                                );
+                                                if is_streaming_admission_backpressure(&e) {
+                                                    return;
+                                                }
+                                            }
                                     } else {
                                         warn!(
                                             peer = %ctx.peer_addr,

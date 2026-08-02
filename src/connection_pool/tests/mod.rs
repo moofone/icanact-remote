@@ -1318,7 +1318,7 @@ fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission(
 
 #[test]
 fn immediate_bytes_response_admission_stays_lazy_for_many_frames() {
-    let payload_len = STREAM_CHUNK_SIZE * 128;
+    let payload_len = STREAM_CHUNK_SIZE * 8;
     let mut queue = LocalStreamingQueue::with_response_reserve(payload_len);
     queue_streaming_response_bytes(
         &mut queue,
@@ -1362,7 +1362,7 @@ fn response_in_flight_with_only_flush_keeps_read_admission_open() {
 }
 
 #[test]
-fn oversized_response_in_flight_closes_read_admission() {
+fn oversized_response_in_flight_keeps_read_admission_open() {
     let mut queue = LocalStreamingQueue::new();
     queue
         .try_extend([
@@ -1376,9 +1376,37 @@ fn oversized_response_in_flight_closes_read_admission() {
     let response = queue.pop_front().expect("oversized response command");
     assert!(matches!(response, StreamingCommand::WriteBytes(_)));
     assert!(
-        queue.is_full(),
-        "an oversized in-flight response must apply read backpressure"
+        !queue.is_full(),
+        "bounded writes must keep the read side draining reciprocal traffic"
     );
+}
+
+#[test]
+fn oversized_in_flight_response_admits_one_bounded_deferred_response() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP + 1
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one oversized response is the explicit admission exception");
+    let response = queue.pop_front().expect("oversized response command");
+    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+
+    let deferred_bytes = RESPONSE_BATCH_BYTE_CAP - 1;
+    assert!(
+        queue.can_admit_response(2, deferred_bytes),
+        "the bounded deferred slot must preserve a valid response behind the in-flight one"
+    );
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; deferred_bytes])),
+            StreamingCommand::Flush,
+        ])
+        .expect("the bounded deferred response must not be dropped");
 }
 
 #[test]
@@ -1745,7 +1773,7 @@ fn immediate_streaming_response_queue_admits_one_oversized_response() {
             StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x")),
             StreamingCommand::Flush,
         ])
-        .expect_err("a second response must not bypass the oversized-response bound");
+        .expect("a bounded follow-up response fits the hard resident cap");
 
     while queue.pop_front().is_some() {}
     assert!(
