@@ -379,6 +379,34 @@ impl<T> ConnectionPool<T> {
         self.set_session_route_addr(peer_id, addr);
     }
 
+    /// Remove only the displaced identity's derived route for an address.
+    /// Required/operator configuration is retained; verified ownership cannot
+    /// be displaced by arbitration, while provisional learned state must not
+    /// survive a verified takeover.
+    pub(crate) fn clear_displaced_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        if let Some(session) = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| session.clone())
+        {
+            session.clear_route_addr_if(addr);
+        }
+        let _ = self
+            .peer_id_to_addr
+            .remove_if_sync(peer_id, |mapped| *mapped == addr);
+
+        let current = self
+            .connections_by_peer
+            .read_sync(peer_id, |_, connection| connection.clone());
+        let _ = self
+            .connections_by_addr
+            .remove_if_sync(&addr, |connection| {
+                connection.embedded_peer_id.as_ref() == Some(peer_id)
+                    || current
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(connection, current))
+            });
+    }
+
     pub(crate) fn is_required_peer(&self, peer_id: &crate::PeerId) -> bool {
         self.peer_sessions
             .read_sync(peer_id, |_, session| session.is_required_peer())
@@ -1754,51 +1782,21 @@ impl<T> ConnectionPool<T> {
             return;
         };
 
-        // Check if new_addr is already indexed
-        if let Some(existing_peer_id) = self.addr_to_peer_id.read_sync(&new_addr, |_, v| v.clone())
-        {
-            if existing_peer_id == *peer_id {
-                // Already indexed under the advertised address for this peer.
-                // Callers commonly upsert `addr_to_peer_id[new_addr]` themselves
-                // BEFORE calling this function (e.g. registry.rs's same-identity
-                // address-change path), so this branch fires on essentially
-                // every reindex. If we trusted the alias alone and returned, we
-                // could leave `connections_by_addr[new_addr]` missing or
-                // pointed at a stale/dead connection while
-                // `addr_to_peer_id[new_addr]` looks correct — a lookup/dial by
-                // the new address would then miss the live session and spin up
-                // a duplicate connection instead of reusing it. Always repair
-                // `connections_by_addr[new_addr]` to the current live
-                // connection so both maps stay consistent.
-                let _ = self
-                    .connections_by_addr
-                    .upsert_sync(new_addr, connection.clone());
-                // We still need to ensure the OLD (ephemeral) address is indexed too!
-                // Without this, lookups by ephemeral address fail after gossip rounds.
-                let old_addr = connection.addr;
-                if old_addr != new_addr && !self.connections_by_addr.contains_sync(&old_addr) {
-                    let _ = self
-                        .connections_by_addr
-                        .upsert_sync(old_addr, connection.clone());
-                    let _ = self.addr_to_peer_id.upsert_sync(old_addr, peer_id.clone());
-                    debug!(
-                        old_addr = %old_addr,
-                        new_addr = %new_addr,
-                        peer_id = %peer_id,
-                        "📍 Added missing ephemeral address mapping"
-                    );
-                }
-                return;
-            } else {
-                // Stale entry from different peer - remove it before reindexing
-                // This can happen if an old connection wasn't fully cleaned up
-                warn!(
-                    "CONNECTION POOL: Removing stale address mapping {} (was peer {}, now peer {})",
-                    new_addr, existing_peer_id, peer_id
-                );
-                let _ = self.connections_by_addr.remove_sync(&new_addr);
-                let _ = self.addr_to_peer_id.remove_sync(&new_addr);
-            }
+        // Reindexing is a derived connection projection, never an ownership
+        // decision.  The caller must have published the address route first
+        // (through the registry owner for gossip claims).  A delayed losing
+        // FullSync must not remove or overwrite the successor's route.
+        let published_owner = self
+            .addr_to_peer_id
+            .read_sync(&new_addr, |_, owner| owner.clone());
+        if published_owner.as_ref() != Some(peer_id) {
+            debug!(
+                peer_id = %peer_id,
+                new_addr = %new_addr,
+                published_owner = ?published_owner,
+                "skipping connection reindex for an address owned by another identity"
+            );
+            return;
         }
 
         let old_addr = connection.addr;
@@ -1812,7 +1810,6 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_addr
             .upsert_sync(new_addr, connection.clone());
-        let _ = self.addr_to_peer_id.upsert_sync(new_addr, peer_id.clone());
         // Also update peer_id_to_addr so disconnect uses the correct address
         self.set_discovered_peer_addr(peer_id, new_addr);
 
@@ -1821,10 +1818,21 @@ impl<T> ConnectionPool<T> {
         // so we need both addresses to point to the same connection.
         // The old entry is NOT removed - both addresses are valid for this peer.
         if old_addr != new_addr {
-            // Re-insert connection under old addr to ensure both addresses work
-            let _ = self.connections_by_addr.upsert_sync(old_addr, connection);
-            // Keep addr_to_peer_id for old_addr so lookups work
-            let _ = self.addr_to_peer_id.upsert_sync(old_addr, peer_id.clone());
+            // Preserve an already-published transport alias, but never steal
+            // an old socket address from another identity.
+            let old_addr_is_this_peer = self
+                .addr_to_peer_id
+                .read_sync(&old_addr, |_, owner| owner == peer_id)
+                .unwrap_or(false);
+            if old_addr_is_this_peer {
+                let _ = self.connections_by_addr.upsert_sync(old_addr, connection);
+                debug!(
+                    old_addr = %old_addr,
+                    new_addr = %new_addr,
+                    peer_id = %peer_id,
+                    "📍 Preserved authenticated transport address mapping"
+                );
+            }
         }
 
         info!(
@@ -4167,6 +4175,58 @@ async fn answer_inbound_clock_probe(
     }
 }
 
+/// Bind FullSync address-keyed state to evidence this process observed.
+/// A peer-authenticated `sender_bind_addr` is still only a self-report, so a
+/// rejected provisional advertisement falls back to the raw address of this
+/// authenticated transport. The fallback is verified and session-scoped by
+/// construction; an arbitrary advertised address never receives an exclusive
+/// route merely because it appeared in a frame.
+async fn claim_authenticated_gossip_addr(
+    registry: &GossipRegistry,
+    advertised_addr: SocketAddr,
+    observed_addr: SocketAddr,
+    peer_id: &crate::PeerId,
+    session_source: SocketAddr,
+) -> Option<(SocketAddr, crate::registry_owner::CommitSeq)> {
+    let claim_kind = if advertised_addr == observed_addr {
+        crate::addr_ownership::ClaimKind::Verified
+    } else {
+        crate::addr_ownership::ClaimKind::Provisional
+    };
+    let commit = registry
+        .add_connection_scoped_peer_claim(
+            advertised_addr,
+            peer_id.to_node_id(),
+            claim_kind,
+            session_source,
+        )
+        .await;
+    if let Some(receipt) = commit.1 {
+        return Some((advertised_addr, receipt.generation()));
+    }
+
+    if advertised_addr == observed_addr {
+        return None;
+    }
+
+    debug!(
+        peer = %peer_id,
+        advertised_addr = %advertised_addr,
+        observed_addr = %observed_addr,
+        "provisional gossip address was not admitted; binding frame to authenticated transport source"
+    );
+    registry
+        .add_connection_scoped_peer_claim(
+            observed_addr,
+            peer_id.to_node_id(),
+            crate::addr_ownership::ClaimKind::Verified,
+            session_source,
+        )
+        .await
+        .1
+        .map(|receipt| (observed_addr, receipt.generation()))
+}
+
 /// Handle an incoming message on a bidirectional connection
 pub(crate) fn handle_incoming_message(
     registry: Arc<GossipRegistry>,
@@ -4178,6 +4238,11 @@ pub(crate) fn handle_incoming_message(
     // Passed to `merge_full_sync_from` so the restart-sequence exemption is
     // scoped to the exact connection that armed it.
     session_source: SocketAddr,
+    // Identity bound to this transport by the authenticated handshake.  Wire
+    // payloads are not an authority for address ownership: FullSync claims
+    // below are constructed from this value after checking that the claimed
+    // sender agrees with it.
+    authenticated_peer_id: Option<crate::PeerId>,
     msg: RegistryMessage,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
@@ -4238,6 +4303,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_source: None,
                                 current_session_connection: None,
                                 current_session_epoch: 0,
+                                identity_verified: false,
                             });
                         }
                     }
@@ -4366,10 +4432,28 @@ pub(crate) fn handle_incoming_message(
                 wall_clock_time,
                 extensions,
             } => {
+                let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_sender = %sender_peer_id,
+                        "Ignoring FullSync without an authenticated transport identity"
+                    );
+                    return Ok(());
+                };
+                if authenticated_sender_peer_id != &sender_peer_id {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        authenticated_sender = %authenticated_sender_peer_id,
+                        claimed_sender = %sender_peer_id,
+                        "Ignoring FullSync whose claimed sender does not match the authenticated transport"
+                    );
+                    return Ok(());
+                }
+
                 // Use the peer's advertised listening address when it is dialable.
                 // Remote loopback binds are local-only and must not be rewritten into
                 // remote-ip:ephemeral-port peer entries.
-                let Some(sender_socket_addr) =
+                let Some(advertised_sender_addr) =
                     resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
                 else {
                     warn!(
@@ -4380,11 +4464,28 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
-                registry.record_inbound_gossip_extensions(
-                    sender_socket_addr,
-                    extensions,
-                    crate::current_timestamp_nanos(),
-                );
+
+                // Claim before ANY address-keyed mutation. A mismatched
+                // advertised bind is only a self-report; if it cannot create
+                // ownership, bind this frame to the authenticated transport's
+                // observed source instead.
+                let Some((sender_socket_addr, commit_seq)) = claim_authenticated_gossip_addr(
+                    &registry,
+                    advertised_sender_addr,
+                    _peer_addr,
+                    authenticated_sender_peer_id,
+                    session_source,
+                )
+                .await
+                else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        claimed_addr = %advertised_sender_addr,
+                        "Rejecting FullSync address claim: ownership conflict"
+                    );
+                    return Ok(());
+                };
 
                 // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
                 debug!(
@@ -4395,6 +4496,34 @@ pub(crate) fn handle_incoming_message(
                 // OPTIMIZATION: Do all peer management in one lock acquisition
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
+
+                    // The claim was accepted, but this handler resumes long
+                    // after the owner actor replied, and a newer claim can
+                    // have taken the address in between. Every mutation keyed
+                    // on `sender_socket_addr` below therefore runs in the same
+                    // critical section as the check that authorizes it — the
+                    // watermark lives inside `GossipState` precisely so the
+                    // two cannot be split. Extension/clock state is recorded
+                    // here, under the same guard, for the same reason: it is
+                    // address-keyed and would otherwise be attributed to the
+                    // losing claimant.
+                    if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                        drop(gossip_state);
+                        debug!(
+                            tcp_source = %_peer_addr,
+                            sender = %sender_peer_id,
+                            claimed_addr = %sender_socket_addr,
+                            commit_seq,
+                            "address ownership advanced past this FullSync claim; dropping it"
+                        );
+                        return Ok(());
+                    }
+
+                    registry.record_inbound_gossip_extensions(
+                        sender_socket_addr,
+                        extensions,
+                        crate::current_timestamp_nanos(),
+                    );
 
                     // FIX: If the resolved bind address differs from the TCP source address,
                     // migrate the PeerInfo from the ephemeral port entry to the bind address.
@@ -4443,6 +4572,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_source: None,
                                 current_session_connection: None,
                                 current_session_epoch: 0,
+                                identity_verified: false,
                             });
                         }
                     }
@@ -4458,7 +4588,6 @@ pub(crate) fn handle_incoming_message(
                     // Moved to after `merge_full_sync_from` below, gated on
                     // its return value (the same `from_current_session`
                     // verdict the actor/sequence state is already gated on).
-                    gossip_state.full_sync_exchanges += 1;
                 }
 
                 debug!(
@@ -4469,43 +4598,11 @@ pub(crate) fn handle_incoming_message(
                     "📨 INCOMING: Received full sync message on bidirectional connection"
                 );
 
-                // IMPORTANT: Register the incoming connection with the peer_id mapping
-                // This allows bidirectional communication to work properly
-                {
-                    let pool = &registry.connection_pool;
-
-                    // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
-                    // The reindex_connection_addr function preserves both addresses,
-                    // and disconnect_connection_by_peer_id needs both entries to clean up properly.
-
-                    let _ = pool
-                        .peer_id_to_addr
-                        .upsert_sync(sender_peer_id.clone(), sender_socket_addr);
-                    let _ = pool
-                        .addr_to_peer_id
-                        .upsert_sync(sender_socket_addr, sender_peer_id.clone());
-
-                    // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
-                    // Without this, get_connection(bind_addr) fails because the connection is
-                    // still indexed under the ephemeral port the peer connected FROM.
-                    // This allows messages to be sent back to the peer using their advertised address.
-                    // Note: reindex_connection_addr already has early-return if already indexed,
-                    // and logs internally when it actually does work.
-                    if sender_socket_addr != _peer_addr {
-                        pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
-                    }
-
-                    debug!(
-                        "BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}",
-                        sender_peer_id, sender_socket_addr
-                    );
-                }
-
                 // Only remaining async operation. Peer bookkeeping keys on
                 // the bind-derived address; address REPAIR anchors on the
                 // verified TCP source (§1.6).
                 let from_current_session = registry
-                    .merge_full_sync_from(
+                    .merge_full_sync_from_owned(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
@@ -4514,12 +4611,41 @@ pub(crate) fn handle_incoming_message(
                         Some(session_source),
                         sequence,
                         wall_clock_time,
+                        commit_seq,
                     )
                     .await;
 
                 if from_current_session {
                     let mut gossip_state = registry.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
+                    // Same guard, same check: peer/session bookkeeping is
+                    // address-keyed and must not be applied on behalf of a
+                    // claim the address has since moved past. Only the
+                    // bookkeeping is skipped here; the response below is
+                    // addressed to the sender's identity, not to the
+                    // contested address, and still goes out.
+                    let admitted =
+                        gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq);
+                    if admitted
+                        && registry.registry_owner.routes_to(&sender_socket_addr)
+                            == Some(sender_peer_id.clone())
+                    {
+                        let pool = &registry.connection_pool;
+                        let _ = pool
+                            .peer_id_to_addr
+                            .upsert_sync(sender_peer_id.clone(), sender_socket_addr);
+                        if sender_socket_addr != _peer_addr {
+                            pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
+                        }
+                        debug!(
+                            "BIDIRECTIONAL: Registered incoming connection - peer_id={} addr={}",
+                            sender_peer_id, sender_socket_addr
+                        );
+                    }
+                    if let Some(peer_info) = gossip_state
+                        .peers
+                        .get_mut(&sender_socket_addr)
+                        .filter(|_| admitted)
+                    {
                         let prev_failures = peer_info.failures;
                         if peer_info.failures > 0 {
                             info!(peer = %sender_socket_addr,
@@ -4534,6 +4660,9 @@ pub(crate) fn handle_incoming_message(
                         // full rationale.
                         peer_info.last_response_received_ms = crate::current_timestamp_millis();
                         peer_info.consecutive_deltas = 0;
+                    }
+                    if admitted {
+                        gossip_state.full_sync_exchanges += 1;
                     }
                 }
 
@@ -4797,7 +4926,25 @@ pub(crate) fn handle_incoming_message(
                 wall_clock_time,
                 extensions,
             } => {
-                let Some(sender_socket_addr) =
+                let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_sender = %sender_peer_id,
+                        "Ignoring FullSyncResponse without an authenticated transport identity"
+                    );
+                    return Ok(());
+                };
+                if authenticated_sender_peer_id != &sender_peer_id {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        authenticated_sender = %authenticated_sender_peer_id,
+                        claimed_sender = %sender_peer_id,
+                        "Ignoring FullSyncResponse whose claimed sender does not match the authenticated transport"
+                    );
+                    return Ok(());
+                }
+
+                let Some(advertised_sender_addr) =
                     resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
                 else {
                     warn!(
@@ -4808,11 +4955,49 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
-                registry.record_inbound_gossip_extensions(
-                    sender_socket_addr,
-                    extensions,
-                    crate::current_timestamp_nanos(),
-                );
+
+                let Some((sender_socket_addr, commit_seq)) = claim_authenticated_gossip_addr(
+                    &registry,
+                    advertised_sender_addr,
+                    _peer_addr,
+                    authenticated_sender_peer_id,
+                    session_source,
+                )
+                .await
+                else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        claimed_addr = %advertised_sender_addr,
+                        "Rejecting FullSyncResponse address claim: ownership conflict"
+                    );
+                    return Ok(());
+                };
+
+                {
+                    // Extension/clock state is address-keyed, so it is
+                    // admitted and written under the same `gossip_state`
+                    // guard, exactly like the FullSync arm: a claim the
+                    // address has already moved past must record nothing.
+                    let mut gossip_state = registry.gossip_state.lock().await;
+                    if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                        drop(gossip_state);
+                        debug!(
+                            tcp_source = %_peer_addr,
+                            sender = %sender_peer_id,
+                            claimed_addr = %sender_socket_addr,
+                            commit_seq,
+                            "address ownership advanced past this FullSyncResponse claim; \
+                             dropping it"
+                        );
+                        return Ok(());
+                    }
+                    registry.record_inbound_gossip_extensions(
+                        sender_socket_addr,
+                        extensions,
+                        crate::current_timestamp_nanos(),
+                    );
+                }
 
                 debug!(
                     sender = %sender_peer_id,
@@ -4824,7 +5009,7 @@ pub(crate) fn handle_incoming_message(
                 );
 
                 let from_current_session = registry
-                    .merge_full_sync_from(
+                    .merge_full_sync_from_owned(
                         local_actors.into_iter().collect(),
                         known_actors.into_iter().collect(),
                         sender_peer_id.clone(),
@@ -4833,41 +5018,44 @@ pub(crate) fn handle_incoming_message(
                         Some(session_source),
                         sequence,
                         wall_clock_time,
+                        commit_seq,
                     )
                     .await;
 
-                // FIX: Update peer_id mappings (mirror the FullSync handler logic)
-                // This prevents stale ephemeral addresses from being reintroduced via resolve_peer_state_addr
+                // Reset failure state when receiving response
+                let mut gossip_state = registry.gossip_state.lock().await;
+
+                // Same guard, same check: the peer-entry migration and the
+                // failure/health bookkeeping below are both keyed on the
+                // claimed address and must not be applied on behalf of a
+                // claim that has since been displaced.
+                if !gossip_state.admit_ownership_projection(sender_socket_addr, commit_seq) {
+                    drop(gossip_state);
+                    debug!(
+                        sender = %sender_peer_id,
+                        claimed_addr = %sender_socket_addr,
+                        commit_seq,
+                        "address ownership advanced past this FullSyncResponse claim; \
+                         skipping peer-state update"
+                    );
+                    return Ok(());
+                }
+
+                if registry.registry_owner.routes_to(&sender_socket_addr)
+                    == Some(sender_peer_id.clone())
                 {
                     let pool = &registry.connection_pool;
-
-                    // NOTE: Do NOT remove addr_to_peer_id for the ephemeral address here.
-                    // The reindex_connection_addr function preserves both addresses,
-                    // and disconnect_connection_by_peer_id needs both entries to clean up properly.
-
                     let _ = pool
                         .peer_id_to_addr
                         .upsert_sync(sender_peer_id.clone(), sender_socket_addr);
-                    let _ = pool
-                        .addr_to_peer_id
-                        .upsert_sync(sender_socket_addr, sender_peer_id.clone());
-
-                    // CRITICAL FIX: Reindex the connection from ephemeral TCP port to bind address
-                    // Mirror the FullSync handler fix - allows sending to advertised address
-                    // Note: reindex_connection_addr already has early-return if already indexed,
-                    // and logs internally when it actually does work.
                     if sender_socket_addr != _peer_addr {
                         pool.reindex_connection_addr(&sender_peer_id, sender_socket_addr);
                     }
-
                     debug!(
                         "BIDIRECTIONAL: Updated connection mapping from FullSyncResponse - peer_id={} addr={}",
                         sender_peer_id, sender_socket_addr
                     );
                 }
-
-                // Reset failure state when receiving response
-                let mut gossip_state = registry.gossip_state.lock().await;
 
                 // FIX: If the resolved bind address differs from the TCP source address,
                 // migrate the PeerInfo from the ephemeral port entry to the bind address.
@@ -4908,7 +5096,9 @@ pub(crate) fn handle_incoming_message(
                     }
                 }
 
-                gossip_state.full_sync_exchanges += 1;
+                if from_current_session {
+                    gossip_state.full_sync_exchanges += 1;
+                }
                 Ok(())
             }
             RegistryMessage::PeerListGossip {
@@ -4957,8 +5147,12 @@ pub(crate) fn handle_incoming_message(
                 let registry_clone = registry.clone();
                 let discovery_handle = tokio::spawn(async move {
                     for addr in candidates {
-                        let node_id = registry_clone.lookup_node_id(&addr).await;
-                        registry_clone.add_peer_with_node_id(addr, node_id).await;
+                        // PeerListGossip is only a discovery hint. Keep its
+                        // claimed identity in `known_peers` (where
+                        // `on_peer_list_gossip` put it), but create no
+                        // exclusive owner/route until a TLS dial or accept
+                        // verifies the address itself.
+                        registry_clone.add_peer(addr).await;
 
                         match registry_clone.get_connection(addr).await {
                             Ok(_) => {

@@ -66,14 +66,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Node A knows about Node B
     registry_a
         .registry
-        .add_peer_with_node_id(addr_b, Some(node_id_b))
+        .add_peer_with_node_id(
+            addr_b,
+            Some(node_id_b),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     info!("Node A added Node B as peer with GossipNodeId");
 
     // Node B knows about Node A
     registry_b
         .registry
-        .add_peer_with_node_id(addr_a, Some(node_id_a))
+        .add_peer_with_node_id(
+            addr_a,
+            Some(node_id_a),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     info!("Node B added Node A as peer with GossipNodeId");
 
@@ -138,7 +146,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Node A tries to connect to Node C but with wrong GossipNodeId (Node B's ID)
     registry_a
         .registry
-        .add_peer_with_node_id(addr_c, Some(node_id_b))
+        .add_peer_with_node_id(
+            addr_c,
+            Some(node_id_b),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     info!("Node A added Node C with WRONG GossipNodeId (using Node B's ID)");
 

@@ -56,7 +56,11 @@ async fn test_manual_peer_configuration_enables_lookup() -> Result<(), Box<dyn s
     // This calls configure_peer internally
     registry
         .registry
-        .add_peer_with_node_id(server_addr, Some(server_node_id))
+        .add_peer_with_node_id(
+            server_addr,
+            Some(server_node_id),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     // 4. Verification: Immediate lookup by address should work

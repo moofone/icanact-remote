@@ -12,7 +12,7 @@ use tokio::{
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
+    GossipConfig, GossipError, GossipNodeId, RegistrationPriority, RemoteActorLocation, Result,
     registry::{GossipRegistry, GossipResult, GossipTask, RegistryMessage, RegistryStats},
     transport::{RegistryTransportBootstrap, TransportWireKind},
 };
@@ -98,6 +98,70 @@ fn resolve_inbound_peer_state_addr(
         "ignoring non-dialable inbound advertised bind; using observed source address"
     );
     peer_addr
+}
+
+fn inbound_addr_claim_kind(
+    peer_state_addr: SocketAddr,
+    observed_addr: SocketAddr,
+    required_addr: Option<SocketAddr>,
+) -> crate::addr_ownership::ClaimKind {
+    if peer_state_addr == observed_addr || required_addr == Some(peer_state_addr) {
+        crate::addr_ownership::ClaimKind::Verified
+    } else {
+        crate::addr_ownership::ClaimKind::Provisional
+    }
+}
+
+/// Attach Hello capabilities only after address arbitration accepted an
+/// attribution for this authenticated connection. The observed-source entry
+/// is safe to associate when any claim succeeds, but a fully rejected
+/// handshake must not mutate the capability projections of an existing owner.
+async fn associate_inbound_capabilities_after_claim(
+    registry: &GossipRegistry,
+    observed_addr: SocketAddr,
+    node_id: GossipNodeId,
+    effective_addr: Option<SocketAddr>,
+) {
+    let Some(effective_addr) = effective_addr else {
+        return;
+    };
+    registry
+        .associate_peer_capabilities_with_node(observed_addr, node_id)
+        .await;
+    if effective_addr != observed_addr {
+        registry
+            .associate_peer_capabilities_with_node(effective_addr, node_id)
+            .await;
+    }
+}
+
+/// Undo ownership created solely for an inbound candidate that subsequently
+/// loses the connection tie-break. The owner actor's claim receipt proves
+/// that this exact command created ownership from an unowned address; the
+/// generation-pinned release cannot withdraw an incumbent or a later refresh.
+async fn rollback_rejected_inbound_claim(
+    registry: &GossipRegistry,
+    addr: SocketAddr,
+    peer_id: &crate::PeerId,
+    claim_generation: crate::registry_owner::CommitSeq,
+    prior_projection: crate::registry::InboundClaimProjectionSnapshot,
+) {
+    let Some(release_seq) = registry
+        .registry_owner
+        .release(addr, peer_id.clone(), claim_generation)
+        .await
+    else {
+        return;
+    };
+
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state.tombstone_ownership_projection(addr, release_seq);
+    }
+
+    let _ = registry
+        .restore_inbound_claim_projection(addr, peer_id, &prior_projection)
+        .await;
 }
 
 /// Main API for the gossip registry with vector clocks and separated locks
@@ -950,6 +1014,78 @@ mod tests {
     }
 
     #[test]
+    fn discovered_route_does_not_verify_reconnected_inbound_claim() {
+        let registry = GossipRegistry::<()>::new(
+            "127.0.0.1:39002".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(KeyPair::new_for_testing("discovered-route-local")),
+                ..Default::default()
+            },
+        );
+        let claimant = KeyPair::new_for_testing("discovered-route-claimant").peer_id();
+        let claimed: SocketAddr = "10.90.0.7:9400".parse().unwrap();
+        let observed: SocketAddr = "10.90.0.8:49002".parse().unwrap();
+        registry
+            .connection_pool
+            .set_discovered_peer_addr(&claimant, claimed);
+        let cached_route = registry.connection_pool.get_configured_peer_addr(&claimant);
+        assert_eq!(cached_route, Some(claimed));
+        let required_route = registry.connection_pool.get_required_peer_addr(&claimant);
+        assert_eq!(
+            required_route, None,
+            "precondition: the route was learned, not operator configured"
+        );
+
+        assert_eq!(
+            inbound_addr_claim_kind(claimed, observed, required_route),
+            crate::addr_ownership::ClaimKind::Provisional,
+            "a cached learned route must not upgrade the next self-report to Verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_inbound_claim_does_not_associate_hello_capabilities() {
+        let keypair = KeyPair::new_for_testing("rejected-capability-association-local");
+        let registry = GossipRegistry::<()>::new(
+            "127.0.0.1:39001".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(keypair),
+                ..Default::default()
+            },
+        );
+        let observed: SocketAddr = "127.0.0.1:49001".parse().unwrap();
+        let claimant = KeyPair::new_for_testing("rejected-capability-association-remote")
+            .peer_id()
+            .to_node_id();
+        let caps = crate::handshake::PeerCapabilities::from_hello_exchange(
+            &crate::handshake::Hello::new(),
+            &crate::handshake::Hello::new(),
+        );
+        registry.set_peer_capabilities(observed, caps);
+
+        associate_inbound_capabilities_after_claim(&registry, observed, claimant, None).await;
+
+        assert_eq!(
+            registry
+                .peer_capability_addr_to_node
+                .read_sync(&observed, |_, node| *node),
+            None,
+            "a fully rejected arbitration must not associate the losing identity with the address"
+        );
+        assert!(
+            !registry.peer_capabilities_by_node.contains_sync(&claimant),
+            "a fully rejected arbitration must not publish node-scoped capabilities"
+        );
+        assert_eq!(
+            registry
+                .peer_capabilities
+                .read_sync(&observed, |_, caps| *caps),
+            Some(caps),
+            "raw Hello capabilities remain available for the connection cleanup path"
+        );
+    }
+
+    #[test]
     fn gossip_deadline_reschedules_from_now_after_runtime_delay() {
         let old_tick = Instant::now() - Duration::from_secs(30);
         let delayed_now = Instant::now();
@@ -1151,6 +1287,148 @@ mod tests {
         Ok(())
     }
 
+    /// Two same-identity inbound candidates can both sample an unowned
+    /// address before either serialized claim runs. Only the command that
+    /// actually creates ownership may arm rollback; the later same-identity
+    /// refresh must not remove the creator's surviving route when it loses
+    /// the connection tie-break.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_same_identity_refresh_does_not_rollback_concurrent_creator()
+    -> crate::Result<()> {
+        let (local_keypair, remote_keypair) = ordered_keypairs(
+            "ownership-created-local-lower",
+            "ownership-created-remote-higher",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let remote_node_id = remote_peer_id.to_node_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            !handle
+                .registry
+                .should_keep_connection(&remote_peer_id, false),
+            "the lower local identity must reject the later inbound duplicate"
+        );
+
+        let shared_addr: SocketAddr = "127.0.0.1:42100".parse().unwrap();
+        handle
+            .registry
+            .connection_pool
+            .set_configured_peer_addr(&remote_peer_id, shared_addr);
+
+        let survivor_addr: SocketAddr = "127.0.0.1:42101".parse().unwrap();
+        let (survivor_io, _survivor_peer) = tokio::io::duplex(1024);
+        let (survivor_stream, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                survivor_io,
+                survivor_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut survivor = crate::connection_pool::LockFreeConnection::new(
+            survivor_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        survivor.stream_handle = Some(Arc::new(survivor_stream));
+        survivor.set_state(crate::connection_pool::ConnectionState::Connected);
+        let survivor = Arc::new(survivor);
+
+        let _guard = {
+            let registry = handle.registry.clone();
+            let peer_id = remote_peer_id.clone();
+            let survivor = survivor.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                let crate::TransportLifecycleEvent::InboundOwnershipSnapshotTaken { peer, addr } =
+                    event
+                else {
+                    return;
+                };
+                if peer != peer_id || addr != shared_addr {
+                    return;
+                }
+                crate::set_transport_lifecycle_recorder(None);
+                let registry = registry.clone();
+                let peer_id = peer_id.clone();
+                let survivor = survivor.clone();
+                tokio::task::block_in_place(move || {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        assert_eq!(
+                            registry
+                                .add_peer_with_node_id(
+                                    shared_addr,
+                                    Some(remote_node_id),
+                                    crate::addr_ownership::ClaimKind::Verified,
+                                )
+                                .await,
+                            crate::addr_ownership::AddrClaimOutcome::Accepted,
+                            "the concurrent candidate creates the shared ownership"
+                        );
+                        assert!(registry.connection_pool.add_connection_by_peer_id(
+                            peer_id,
+                            survivor_addr,
+                            survivor,
+                        ));
+                    });
+                });
+            }))
+        };
+
+        let rejected_addr: SocketAddr = "127.0.0.1:42102".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        write_initial_gossip(
+            &mut writer,
+            &crate::registry::RegistryMessage::FullSyncRequest {
+                sender_peer_id: remote_peer_id.clone(),
+                sender_bind_addr: Some(shared_addr.to_string()),
+                sequence: 1,
+                wall_clock_time: crate::current_timestamp(),
+            },
+        )
+        .await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            rejected_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_node_id),
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ConnectionCloseOutcome::DroppedByTieBreaker
+        ));
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_connection_by_peer_id(&remote_peer_id)
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &survivor)),
+            "the concurrent creator's connection must survive"
+        );
+        assert_eq!(
+            handle.registry.registry_owner.routes_to(&shared_addr),
+            Some(remote_peer_id),
+            "a rejected refresh must not rollback ownership created by the concurrent survivor"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     /// R-11: a duplicate inbound candidate that loses the tie-break must not
     /// strand the sequence-reset exemption on its own dropped ephemeral
     /// port, and must not disturb the surviving live connection's own
@@ -1234,7 +1512,11 @@ mod tests {
         // source, exactly like the real accept path does after this fix.
         handle
             .registry
-            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .add_peer_with_node_id(
+                bind_addr,
+                Some(remote_node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
         handle
             .registry
@@ -1401,7 +1683,11 @@ mod tests {
             .set_configured_peer_addr(&remote_peer_id, bind_addr);
         handle
             .registry
-            .add_peer_with_node_id(bind_addr, Some(remote_node_id))
+            .add_peer_with_node_id(
+                bind_addr,
+                Some(remote_node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         // The STALE inbound handler's own accepted connection: published
@@ -2271,6 +2557,14 @@ mod tests {
             attacker_addr, advertised_bind_addr,
             "test precondition: peer_addr and peer_state_addr must genuinely differ"
         );
+        // This test is about the post-verification two-alias indexing window,
+        // not about trusting a self-reported address. Reserve the advertised
+        // address as operator-owned so it remains Verified under the address
+        // ownership policy.
+        handle
+            .registry
+            .configure_peer(remote_peer_id.clone(), advertised_bind_addr)
+            .await;
 
         let _guard = {
             let pool = handle.registry.connection_pool.clone();
@@ -3588,44 +3882,160 @@ where
     // is rejected, preserve any configured stable address instead of letting an
     // ephemeral TCP source address replace the peer's dial target.
     let sender_bind_addr = sender_bind_addr_opt.as_deref();
-    let configured_addr = {
+    let (route_addr, required_addr) = {
         let pool = &registry.connection_pool;
-        pool.peer_id_to_addr
-            .read_sync(&peer_id, |_, v| *v)
-            .filter(|addr| addr.port() != 0 && !addr.ip().is_unspecified())
+        let is_valid = |addr: SocketAddr| addr.port() != 0 && !addr.ip().is_unspecified();
+        (
+            pool.get_configured_peer_addr(&peer_id)
+                .filter(|addr| is_valid(*addr)),
+            pool.get_required_peer_addr(&peer_id)
+                .filter(|addr| is_valid(*addr)),
+        )
     };
-    let peer_state_addr =
-        resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, configured_addr);
+    let mut peer_state_addr =
+        resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, route_addr);
+    let inbound_claim_projection = registry
+        .snapshot_inbound_claim_projection(peer_state_addr, peer_addr, &peer_id)
+        .await;
+    let observed_claim_projection = if peer_state_addr != peer_addr {
+        Some(
+            registry
+                .snapshot_inbound_claim_projection(peer_addr, peer_state_addr, &peer_id)
+                .await,
+        )
+    } else {
+        None
+    };
+    #[cfg(test)]
+    crate::lifecycle::record_transport_event(
+        crate::lifecycle::TransportLifecycleEvent::InboundOwnershipSnapshotTaken {
+            peer: peer_id.clone(),
+            addr: peer_state_addr,
+        },
+    );
+    let mut rollback_claim: Option<(
+        SocketAddr,
+        crate::registry_owner::CommitSeq,
+        crate::registry::InboundClaimProjectionSnapshot,
+    )> = None;
 
     if let Some(node_id) = node_id_opt {
-        registry
-            .add_peer_with_node_id(peer_state_addr, Some(node_id))
+        // TLS authenticates `node_id`, but that alone does not prove
+        // ownership of `peer_state_addr`: it usually comes straight from
+        // the peer's own self-reported `sender_bind_addr`, which the peer
+        // fully controls. Only treat the address claim itself as Verified
+        // when it is independently corroborated — it matches the raw
+        // observed TCP source of this connection, or it matches an address
+        // we ourselves configured for this peer. Otherwise the identity is
+        // authenticated but the address is merely self-reported:
+        // Provisional, and subject to displacement by a genuinely verified
+        // claim for the same address (see `addr_ownership::arbitrate`).
+        let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
+
+        let (claim_outcome, claim_receipt) = registry
+            .add_connection_scoped_peer_claim(
+                peer_state_addr,
+                node_id,
+                addr_claim_kind,
+                peer_addr,
+            )
             .await;
-        // Associate capabilities captured during the Hello handshake (stored under peer_addr).
-        registry
-            .associate_peer_capabilities_with_node(peer_addr, node_id)
-            .await;
-        if peer_state_addr != peer_addr {
-            registry
-                .associate_peer_capabilities_with_node(peer_state_addr, node_id)
-                .await;
+
+        // The address this connection is actually attributed to after
+        // arbitration. On rejection, fall back to the raw observed TCP
+        // source instead of abandoning bookkeeping outright: that claim is
+        // inherently Verified (it depends on nothing the peer can forge),
+        // so it is always safe to retry there.
+        let effective_claim = match claim_outcome {
+            crate::addr_ownership::AddrClaimOutcome::Accepted => {
+                claim_receipt.map(|receipt| (peer_state_addr, receipt))
+            }
+            crate::addr_ownership::AddrClaimOutcome::Rejected if peer_state_addr == peer_addr => {
+                // The observed source itself was rejected (a different,
+                // already-verified owner holds it) -- no safe address is
+                // left to attribute this connection to.
+                None
+            }
+            crate::addr_ownership::AddrClaimOutcome::Rejected => {
+                warn!(
+                    peer_addr = %peer_addr,
+                    peer_state_addr = %peer_state_addr,
+                    node_id = %node_id.fmt_short(),
+                    "rejecting claimed advertised address for inbound peer; falling back to observed source"
+                );
+                let (fallback_outcome, fallback_receipt) = registry
+                    .add_connection_scoped_peer_claim(
+                        peer_addr,
+                        node_id,
+                        crate::addr_ownership::ClaimKind::Verified,
+                        peer_addr,
+                    )
+                    .await;
+                match fallback_outcome {
+                    crate::addr_ownership::AddrClaimOutcome::Accepted => {
+                        fallback_receipt.map(|receipt| (peer_addr, receipt))
+                    }
+                    crate::addr_ownership::AddrClaimOutcome::Rejected => None,
+                }
+            }
+        };
+
+        let Some((effective_addr, claim_receipt)) = effective_claim else {
+            warn!(
+                peer_addr = %peer_addr,
+                peer_state_addr = %peer_state_addr,
+                node_id = %node_id.fmt_short(),
+                "no safe address attribution remains for inbound peer; dropping connection"
+            );
+            return ConnectionCloseOutcome::Normal {
+                node_id: Some(sender_node_id),
+            };
+        };
+        if claim_receipt.created_ownership() {
+            let rollback_projection = if effective_addr == peer_state_addr {
+                inbound_claim_projection.clone()
+            } else {
+                observed_claim_projection
+                    .clone()
+                    .expect("observed address projection captured when fallback is possible")
+            };
+            rollback_claim = Some((
+                effective_addr,
+                claim_receipt.generation(),
+                rollback_projection,
+            ));
         }
-        if peer_state_addr != peer_addr {
+        peer_state_addr = effective_addr;
+
+        associate_inbound_capabilities_after_claim(
+            &registry,
+            peer_addr,
+            node_id,
+            Some(effective_addr),
+        )
+        .await;
+
+        if effective_addr != peer_addr {
             let mut gossip_state = registry.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get_mut(&peer_state_addr) {
+            if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
                 peer_info.peer_address = Some(peer_addr);
             }
         }
 
         // Notify peer discovery that a connection is established (incoming)
-        registry.mark_peer_connected(peer_state_addr).await;
+        registry.mark_peer_connected(effective_addr).await;
+        // Attribute liveness to the address arbitration accepted and retain
+        // the raw TCP source in `PeerInfo::peer_address`. Creating a separate
+        // PeerInfo at the ephemeral source would let the first FullSync
+        // migration overwrite this identity-bearing entry.
         registry
-            .mark_inbound_connection_observed(peer_state_addr, peer_addr)
+            .mark_inbound_connection_observed(effective_addr, peer_addr)
             .await;
 
         debug!(
             peer_addr = %peer_addr,
             peer_state_addr = %peer_state_addr,
+            effective_addr = %effective_addr,
             "Updated gossip state with GossipNodeId for incoming TLS connection"
         );
     }
@@ -4019,6 +4429,16 @@ where
         if !keep_connection {
             if let Some(handle) = connection_arc.stream_handle.as_ref() {
                 handle.shutdown();
+            }
+            if let Some((claimed_addr, claim_generation, prior_projection)) = rollback_claim {
+                rollback_rejected_inbound_claim(
+                    &registry,
+                    claimed_addr,
+                    &peer_id,
+                    claim_generation,
+                    prior_projection,
+                )
+                .await;
             }
             return ConnectionCloseOutcome::DroppedByTieBreaker;
         }

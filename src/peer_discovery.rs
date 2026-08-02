@@ -529,6 +529,22 @@ impl PeerDiscovery {
         self.peer_states.get(addr)
     }
 
+    /// Restore the state captured before a speculative inbound claim.
+    ///
+    /// Address ownership arbitration happens before the connection tie-break;
+    /// a candidate that loses that later tie-break must put discovery back
+    /// exactly as it found it, including pending/failed retry state.
+    pub(crate) fn restore_peer_state(&mut self, addr: SocketAddr, state: Option<PeerState>) {
+        match state {
+            Some(state) => {
+                self.peer_states.insert(addr, state);
+            }
+            None => {
+                self.peer_states.remove(&addr);
+            }
+        }
+    }
+
     /// Expire pending/failed peers while retaining retry history.
     pub fn cleanup_expired(&mut self, now: u64) -> PeerDiscoveryCleanupStats {
         let mut stats = PeerDiscoveryCleanupStats::default();

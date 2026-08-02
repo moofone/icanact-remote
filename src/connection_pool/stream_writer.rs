@@ -435,6 +435,7 @@ impl LockFreeStreamHandle {
             registry_weak: Option<std::sync::Weak<GossipRegistry>>,
             peer_addr: Option<SocketAddr>,
             peer_id: Option<crate::PeerId>,
+            session_source: Option<SocketAddr>,
             instance_id: u64,
             known_superseded: Arc<AtomicBool>,
         }
@@ -469,6 +470,18 @@ impl LockFreeStreamHandle {
                     let peer_id_hint = self.peer_id.clone();
                     let pool = &registry.connection_pool;
                     let peer_id = peer_id_hint.or_else(|| pool.get_peer_id_by_addr(&peer_addr));
+
+                    if let (Some(peer_id), Some(session_source)) =
+                        (peer_id.as_ref(), self.session_source)
+                    {
+                        let registry = registry.clone();
+                        let peer_id = peer_id.clone();
+                        tokio::spawn(async move {
+                            registry
+                                .release_connection_scoped_claims(&peer_id, session_source)
+                                .await;
+                        });
+                    }
 
                     // Skip re-deriving supersession when `known_superseded`
                     // already settled it above: this inference reads pool
@@ -613,6 +626,7 @@ impl LockFreeStreamHandle {
             registry_weak: read_context.as_ref().map(|ctx| ctx.registry_weak.clone()),
             peer_addr: read_context.as_ref().map(|ctx| ctx.peer_addr),
             peer_id: read_context.as_ref().and_then(|ctx| ctx.peer_id.clone()),
+            session_source: read_context.as_ref().map(|ctx| ctx.session_source),
             instance_id,
             known_superseded,
         };

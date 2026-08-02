@@ -181,7 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     registry
         .registry
-        .add_peer_with_node_id(server_addr, Some(claimed_server_node_id))
+        .add_peer_with_node_id(
+            server_addr,
+            Some(claimed_server_node_id),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     if use_wrong_key {

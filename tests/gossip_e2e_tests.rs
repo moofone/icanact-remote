@@ -68,10 +68,18 @@ async fn connect_pair(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
     let addr_b = b.registry.bind_addr;
 
     a.registry
-        .add_peer_with_node_id(addr_b, Some(b.registry.peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            addr_b,
+            Some(b.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     b.registry
-        .add_peer_with_node_id(addr_a, Some(a.registry.peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            addr_a,
+            Some(a.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
 
     a.bootstrap_non_blocking(vec![addr_b]).await;

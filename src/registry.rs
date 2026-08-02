@@ -18,6 +18,8 @@ use rand::seq::SliceRandom;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tracing::{debug, info, trace, warn};
 
+use crate::registry_owner::CommitSeq;
+
 use crate::{
     GossipConfig, GossipError, GossipNodeId, PeerId, RegistrationPriority, RemoteActorLocation,
     Result,
@@ -330,6 +332,15 @@ fn resolve_remote_actor_addr(
         "owner-advertised address is unusable from this node; substituting the verified source IP"
     );
     resolved
+}
+
+/// Resolve an actor location reported by its authenticated owner. The
+/// transport source supplies only the trusted host/IP; the actor's concrete
+/// service port remains part of the actor contract and must never be replaced
+/// with the registry transport port.
+#[inline]
+fn resolve_owned_actor_addr(actor_addr: SocketAddr, repair_addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(repair_addr.ip(), actor_addr.port())
 }
 
 /// True when `addr` may be recorded as a learned dial route
@@ -1193,6 +1204,19 @@ pub struct PeerInfo {
     /// newer session has since been armed or the old one has expired, and
     /// the pending write must be dropped rather than applied.
     pub current_session_epoch: u64,
+    /// Whether `node_id`'s ownership of this address was established by a
+    /// `ClaimKind::Verified` claim (see `crate::addr_ownership`): an observed
+    /// connection (inbound accept, successful outbound dial) or an explicit
+    /// local `configure_peer`, as opposed to a peer's bare self-report or a
+    /// third-party gossip mention.
+    ///
+    /// Derived projection, not authority: the ownership table inside
+    /// `crate::registry_owner::PeerRegistryOwner` decides every claim, and
+    /// this field only mirrors the kind that actor resolved so address-keyed
+    /// consumers of `peers` can see it. Nothing reads it back to decide an
+    /// ownership question — doing so would reintroduce a second, unsynchronized
+    /// source of truth.
+    pub identity_verified: bool,
 }
 
 impl PeerInfo {
@@ -1220,6 +1244,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         }
     }
 
@@ -1255,6 +1280,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         }
     }
 
@@ -1311,6 +1337,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         })
     }
 }
@@ -1412,9 +1439,161 @@ pub struct GossipState {
     pub known_peers: LruCache<SocketAddr, PeerInfo>,
     /// Timestamp (in millis since start_time) when mesh formation completed
     pub mesh_formation_time_ms: Option<u64>,
+    /// Newest owner-actor commit whose outcome has already been applied to
+    /// the address-keyed state guarded by THIS struct's mutex
+    /// (`peers[].node_id`, `identity_verified`, and the connection indexing
+    /// performed alongside them).
+    ///
+    /// It lives inside `GossipState`, and is therefore only reachable through
+    /// the same guard as the state it protects, on purpose. The ownership
+    /// DECISION is serialized by the owner actor, but the PROJECTION of that
+    /// decision is not: a claimant awaits the reply and only then takes this
+    /// guard, so an arbitrary number of later commits can land in between.
+    /// Keeping the watermark in a separate, independently synchronized map
+    /// would let a claimant pass admission and then stall before acquiring
+    /// this mutex, allowing a newer claimant to project first and be
+    /// overwritten afterwards — the check would guard state in a different
+    /// synchronization domain from the one it is checked in, which is exactly
+    /// the class of race this whole design exists to remove. Read-compare-
+    /// write and the mutation it authorizes therefore happen in one critical
+    /// section, and callers never re-check outside it.
+    ownership_commit_seq: HashMap<SocketAddr, CommitSeq>,
+    /// Global rejection floor retained when old per-address tombstones are
+    /// compacted. Commit positions are process-global and monotonic, so a
+    /// delayed projection at or below this floor is necessarily older than
+    /// ownership state we have already retired. Rejecting it may defer a
+    /// still-current but extremely delayed projection until its next refresh;
+    /// admitting it could resurrect a released or migrated owner.
+    ownership_pruned_through: CommitSeq,
 }
 
+/// Soft bound on the number of retained ownership watermarks, including
+/// tombstones for addresses whose owner was released or migrated away. Sized
+/// well above any realistic live peer set so pruning is reached only under
+/// sustained address churn.
+const OWNERSHIP_WATERMARK_CAPACITY: usize = 8192;
+
+/// Size the watermark table is pruned back down to, so pruning is amortized
+/// over many insertions instead of running on every one.
+const OWNERSHIP_WATERMARK_TARGET: usize = 6144;
+
 impl GossipState {
+    fn ownership_projection_can_admit(&self, peer_addr: SocketAddr, commit_seq: CommitSeq) -> bool {
+        self.ownership_commit_seq
+            .get(&peer_addr)
+            .is_some_and(|newest| commit_seq >= *newest)
+            || (!self.ownership_commit_seq.contains_key(&peer_addr)
+                && commit_seq > self.ownership_pruned_through)
+    }
+
+    /// Admit an ownership projection for `peer_addr` only when the commit it
+    /// carries is at least as recent as the newest commit already applied to
+    /// this address, and record it as the newest when admitted.
+    ///
+    /// MUST be called with the mutation it authorizes in the same critical
+    /// section — see `ownership_commit_seq`.
+    ///
+    /// `>=` rather than `>` so the SAME commit may be admitted more than once
+    /// (one handler applies its outcome across several guarded steps);
+    /// commit positions are unique per mutation, so this can never re-admit a
+    /// different, older one.
+    pub(crate) fn admit_ownership_projection(
+        &mut self,
+        peer_addr: SocketAddr,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        if !self.ownership_projection_can_admit(peer_addr, commit_seq) {
+            return false;
+        }
+        self.ownership_commit_seq.insert(peer_addr, commit_seq);
+        self.prune_ownership_watermarks();
+        true
+    }
+
+    /// Atomically admit both endpoints of one owner-actor migration commit.
+    /// A newer projection at either endpoint makes the entire migration stale:
+    /// neither watermark is changed and the caller must move no address-keyed
+    /// state. When admitted, both endpoints retain the migration commit as a
+    /// floor so delayed pre-migration projections cannot rebuild either side.
+    pub(crate) fn admit_ownership_migration_projection(
+        &mut self,
+        from: SocketAddr,
+        to: SocketAddr,
+        commit_seq: CommitSeq,
+    ) -> bool {
+        if !self.ownership_projection_can_admit(from, commit_seq)
+            || !self.ownership_projection_can_admit(to, commit_seq)
+        {
+            return false;
+        }
+        self.ownership_commit_seq.insert(from, commit_seq);
+        self.ownership_commit_seq.insert(to, commit_seq);
+        self.prune_ownership_watermarks();
+        true
+    }
+
+    /// Record that ownership of `peer_addr` was retracted or moved away at
+    /// `commit_seq`, as a monotonic floor rather than a deletion.
+    ///
+    /// Deleting the entry would be unsafe: a claim that committed BEFORE the
+    /// release/migration can still be in flight, not yet holding this guard.
+    /// Against a missing entry it would pass admission and recreate peer and
+    /// connection state for an identity the address no longer belongs to.
+    /// Left as a tombstone, the same claim fails admission and is dropped,
+    /// which is the correct outcome — the address is not its claimant's any
+    /// more.
+    pub(crate) fn tombstone_ownership_projection(
+        &mut self,
+        peer_addr: SocketAddr,
+        commit_seq: CommitSeq,
+    ) {
+        let floor = self.ownership_commit_seq.entry(peer_addr).or_insert(0);
+        *floor = (*floor).max(commit_seq);
+        self.prune_ownership_watermarks();
+    }
+
+    /// Retention policy for the watermark table.
+    ///
+    /// Entries for addresses that still have a `peers` entry are never
+    /// dropped: they are the live projections' fences. Everything else is a
+    /// tombstone, kept until the table exceeds its soft bound, at which point
+    /// the numerically OLDEST tombstones are dropped first. Their maximum
+    /// commit position advances `ownership_pruned_through`, so a delayed
+    /// projection cannot pass merely because its address-specific tombstone
+    /// was compacted. The bound keeps address churn (ephemeral ports,
+    /// restarts) from growing this table without weakening the fence.
+    fn prune_ownership_watermarks(&mut self) {
+        if self.ownership_commit_seq.len() <= OWNERSHIP_WATERMARK_CAPACITY {
+            return;
+        }
+        let peers = &self.peers;
+        let mut tombstones: Vec<(SocketAddr, CommitSeq)> = self
+            .ownership_commit_seq
+            .iter()
+            .filter(|(addr, _)| !peers.contains_key(*addr))
+            .map(|(addr, seq)| (*addr, *seq))
+            .collect();
+        let excess = self
+            .ownership_commit_seq
+            .len()
+            .saturating_sub(OWNERSHIP_WATERMARK_TARGET);
+        if tombstones.len() > excess {
+            tombstones.select_nth_unstable_by_key(excess, |(_, seq)| *seq);
+            tombstones.truncate(excess);
+        }
+        for (addr, commit_seq) in tombstones {
+            self.ownership_commit_seq.remove(&addr);
+            self.ownership_pruned_through = self.ownership_pruned_through.max(commit_seq);
+        }
+    }
+
+    /// The newest ownership commit applied to `peer_addr`, if any. Lifecycle
+    /// cleanup captures this under the same guard as the peer entry it is
+    /// retiring, then presents it as the exact generation release fence.
+    pub(crate) fn ownership_watermark(&self, peer_addr: &SocketAddr) -> Option<CommitSeq> {
+        self.ownership_commit_seq.get(peer_addr).copied()
+    }
+
     fn actor_admission_count(&self, peer_id: &crate::PeerId) -> usize {
         self.actor_admissions_by_peer
             .get(peer_id)
@@ -1461,6 +1640,47 @@ impl GossipState {
     }
 }
 
+/// Address-keyed state captured before an inbound candidate asks the registry
+/// owner to create an address claim. The claim is speculative until the
+/// connection tie-break accepts the candidate; if it loses, every derived
+/// projection in this snapshot is restored as one cold-path rollback.
+#[derive(Clone)]
+struct InboundPoolProjectionSnapshot {
+    peer_id: PeerId,
+    peer_route: Option<SocketAddr>,
+    peer_connection: Option<Arc<crate::connection_pool::LockFreeConnection>>,
+    addr: SocketAddr,
+    addr_route: Option<PeerId>,
+    addr_connection: Option<Arc<crate::connection_pool::LockFreeConnection>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct InboundClaimProjectionSnapshot {
+    peer: Option<PeerInfo>,
+    peer_to_actors: Option<HashSet<String>>,
+    /// Admission entries for actor names already associated with this
+    /// address.  Keep this per-name rather than cloning the registry-wide
+    /// admission indexes: a rejected candidate must not roll back unrelated
+    /// peers that admitted/removed actors while the candidate was in flight.
+    actor_admission_peer_by_name: HashMap<String, Option<PeerId>>,
+    known_peer: Option<PeerInfo>,
+    discovery_state: Option<crate::peer_discovery::PeerState>,
+    known_actor_locations: Vec<(String, Option<RemoteActorLocation>)>,
+    peer_capabilities: Vec<(SocketAddr, Option<PeerCapabilities>)>,
+    capability_addr_to_node: Vec<(SocketAddr, Option<GossipNodeId>)>,
+    capabilities_by_node: Vec<(GossipNodeId, Option<PeerCapabilities>)>,
+    clock_probe_state: Vec<(SocketAddr, Option<PeerClockProbeState>)>,
+    pending_clock_echoes: Vec<(SocketAddr, Option<PendingClockEcho>)>,
+    peer_clock_snapshots: Vec<(SocketAddr, Option<PeerClockSnapshot>)>,
+    pool: Vec<InboundPoolProjectionSnapshot>,
+}
+
+/// Latest owner-actor generation claimed by one authenticated transport
+/// session. The session source is unique per physical connection, so a stale
+/// teardown can release only its own generation; a reconnect at the same
+/// address remains fenced by the newer owner commit.
+type ConnectionScopedClaimKey = (PeerId, SocketAddr, SocketAddr);
+
 /// Core gossip registry implementation with separated locks
 #[derive(Clone, Copy)]
 struct PeerLivenessStatus {
@@ -1485,6 +1705,17 @@ pub struct GossipRegistry<T = ()> {
     pub gossip_state: Arc<Mutex<GossipState>>,
     // Connection pool is internally lock-free (scc-based), no external locking needed
     pub connection_pool: Arc<ConnectionPool<T>>,
+    /// Sole authority for "who owns address A". Every address-ownership
+    /// decision and the routing publication that follows it happen inside one
+    /// serialized command in this actor's task, so the decision and the
+    /// commit cannot be split by a concurrent claimant. `peers[].node_id` /
+    /// `identity_verified` are derived projections of what this handle
+    /// returns, never inputs to the decision.
+    pub registry_owner: crate::registry_owner::RegistryOwnerHandle,
+    /// Cold-path ownership receipts held by live authenticated sessions.
+    /// Operator-configured routes are intentionally not inserted here and
+    /// therefore survive connection teardown.
+    connection_scoped_claims: Arc<SccHashMap<ConnectionScopedClaimKey, CommitSeq>>,
     pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
@@ -1686,6 +1917,13 @@ impl<T: 'static> GossipRegistry<T> {
             aligned_pool_size,
         );
         let peer_capabilities = Arc::new(SccHashMap::default());
+        let connection_pool = Arc::new(connection_pool);
+        // The owner actor publishes routing through the pool but must not
+        // keep it alive: the pool transitively owns this registry, so a
+        // strong reference would form a cycle.
+        let registry_owner =
+            crate::registry_owner::RegistryOwnerHandle::new(Arc::downgrade(&connection_pool)
+                as std::sync::Weak<dyn crate::registry_owner::RoutingPublisher>);
 
         Ok(Self {
             bind_addr,
@@ -1745,8 +1983,12 @@ impl<T: 'static> GossipRegistry<T> {
                         .unwrap_or(NonZeroUsize::new(10_000).unwrap()),
                 ),
                 mesh_formation_time_ms: None,
+                ownership_commit_seq: HashMap::new(),
+                ownership_pruned_through: 0,
             })),
-            connection_pool: Arc::new(connection_pool),
+            connection_pool,
+            registry_owner,
+            connection_scoped_claims: Arc::new(SccHashMap::default()),
             tls_config: None,
             peer_capabilities: peer_capabilities.clone(),
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
@@ -1793,6 +2035,391 @@ impl<T: 'static> GossipRegistry<T> {
             self.config.enable_peer_discovery,
         )?));
         Ok(())
+    }
+
+    /// Track negotiated peer capabilities for a peer connection
+    pub(crate) async fn snapshot_inbound_claim_projection(
+        &self,
+        addr: SocketAddr,
+        observed_addr: SocketAddr,
+        candidate: &PeerId,
+    ) -> InboundClaimProjectionSnapshot {
+        let mut addresses = vec![addr];
+        if observed_addr != addr {
+            addresses.push(observed_addr);
+        }
+
+        let (peer, peer_to_actors, known_peer, discovery_state, actor_names, admissions) = {
+            let state = self.gossip_state.lock().await;
+            let peer = state.peers.get(&addr).cloned();
+            let peer_to_actors = state.peer_to_actors.get(&addr).cloned();
+            let actor_names = peer_to_actors
+                .as_ref()
+                .map(|actors| actors.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let admissions = actor_names
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        state.actor_admission_peer_by_name.get(name).cloned(),
+                    )
+                })
+                .collect();
+            (
+                peer,
+                peer_to_actors,
+                state.known_peers.peek(&addr).cloned(),
+                state
+                    .peer_discovery
+                    .as_ref()
+                    .and_then(|discovery| discovery.get_peer_state(&addr).copied()),
+                actor_names,
+                admissions,
+            )
+        };
+
+        let known_actor_locations = actor_names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    self.actor_state
+                        .known_actors
+                        .read_sync(name, |_, location| location.clone()),
+                )
+            })
+            .collect();
+
+        let mut node_ids = vec![candidate.to_node_id()];
+        if let Some(node_id) = peer.as_ref().and_then(|peer| peer.node_id)
+            && !node_ids.contains(&node_id)
+        {
+            node_ids.push(node_id);
+        }
+
+        let peer_capabilities = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.peer_capabilities.read_sync(address, |_, caps| *caps),
+                )
+            })
+            .collect();
+        let capability_addr_to_node = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.peer_capability_addr_to_node
+                        .read_sync(address, |_, node_id| *node_id),
+                )
+            })
+            .collect();
+        let capabilities_by_node = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    *node_id,
+                    self.peer_capabilities_by_node
+                        .read_sync(node_id, |_, caps| *caps),
+                )
+            })
+            .collect();
+        let clock_probe_state = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.clock_probe_state.read_sync(address, |_, state| *state),
+                )
+            })
+            .collect();
+        let pending_clock_echoes = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.pending_clock_echoes.read_sync(address, |_, echo| *echo),
+                )
+            })
+            .collect();
+        let peer_clock_snapshots = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.peer_clock_snapshots
+                        .read_sync(address, |_, snapshot| *snapshot),
+                )
+            })
+            .collect();
+
+        let mut peer_ids = vec![candidate.clone()];
+        if let Some(node_id) = peer.as_ref().and_then(|peer| peer.node_id) {
+            let prior_peer_id = node_id.to_peer_id();
+            if !peer_ids.contains(&prior_peer_id) {
+                peer_ids.push(prior_peer_id);
+            }
+        }
+        let pool = peer_ids
+            .iter()
+            .flat_map(|peer_id| {
+                addresses.iter().map(move |address| InboundPoolProjectionSnapshot {
+                    peer_id: peer_id.clone(),
+                    peer_route: self.connection_pool.get_configured_peer_addr(peer_id),
+                    peer_connection: self
+                        .connection_pool
+                        .peer_current_connection_snapshot(peer_id),
+                    addr: *address,
+                    addr_route: self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .read_sync(address, |_, owner| owner.clone()),
+                    addr_connection: self
+                        .connection_pool
+                        .connections_by_addr
+                        .read_sync(address, |_, connection| connection.clone()),
+                })
+            })
+            .collect();
+
+        InboundClaimProjectionSnapshot {
+            peer,
+            peer_to_actors,
+            actor_admission_peer_by_name: admissions,
+            known_peer,
+            discovery_state,
+            known_actor_locations,
+            peer_capabilities,
+            capability_addr_to_node,
+            capabilities_by_node,
+            clock_probe_state,
+            pending_clock_echoes,
+            peer_clock_snapshots,
+            pool,
+        }
+    }
+
+    /// Restore every projection captured before a rejected inbound claim.
+    /// Returns whether the address still projected the speculative candidate;
+    /// a newer projection is left untouched rather than clobbered.
+    pub(crate) async fn restore_inbound_claim_projection(
+        &self,
+        addr: SocketAddr,
+        candidate: &PeerId,
+        snapshot: &InboundClaimProjectionSnapshot,
+    ) -> bool {
+        let still_candidate = {
+            let mut state = self.gossip_state.lock().await;
+            let still_candidate = state
+                .peers
+                .get(&addr)
+                .and_then(|peer| peer.node_id)
+                .is_some_and(|node_id| node_id == candidate.to_node_id());
+            if !still_candidate {
+                return false;
+            }
+
+            let current_admission_names = state
+                .peer_to_actors
+                .get(&addr)
+                .cloned()
+                .unwrap_or_default();
+
+            match snapshot.peer.clone() {
+                Some(peer) => {
+                    state.peers.insert(addr, peer);
+                }
+                None => {
+                    state.peers.remove(&addr);
+                }
+            }
+            match snapshot.peer_to_actors.clone() {
+                Some(actors) => {
+                    state.peer_to_actors.insert(addr, actors);
+                }
+                None => {
+                    state.peer_to_actors.remove(&addr);
+                }
+            }
+            // Restore only admission entries attributable to this candidate.
+            // A concurrent update for another peer (or a newer value for the
+            // same actor name) must survive the rejected-candidate rollback.
+            let mut admission_names: HashSet<String> = snapshot
+                .actor_admission_peer_by_name
+                .keys()
+                .cloned()
+                .collect();
+            admission_names.extend(current_admission_names);
+            for name in admission_names {
+                let current_owner = state.actor_admission_peer_by_name.get(&name).cloned();
+                let prior_owner = snapshot
+                    .actor_admission_peer_by_name
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or(None);
+                if current_owner != Some(candidate.clone()) {
+                    continue;
+                }
+
+                state.release_actor_admission(&name);
+                if let Some(prior_owner) = prior_owner {
+                    state.record_actor_admission(&prior_owner, &name);
+                }
+            }
+            match snapshot.known_peer.clone() {
+                Some(peer) => {
+                    state.known_peers.put(addr, peer);
+                }
+                None => {
+                    state.known_peers.pop(&addr);
+                }
+            }
+            if let Some(discovery) = state.peer_discovery.as_mut() {
+                discovery.restore_peer_state(addr, snapshot.discovery_state);
+            }
+            true
+        };
+
+        for (name, location) in &snapshot.known_actor_locations {
+            match location {
+                Some(location) => {
+                    let _ = self
+                        .actor_state
+                        .known_actors
+                        .upsert_sync(name.clone(), location.clone());
+                }
+                None => {
+                    let _ = self.actor_state.known_actors.remove_sync(name);
+                }
+            }
+        }
+
+        for (address, caps) in &snapshot.peer_capabilities {
+            match caps {
+                Some(caps) => {
+                    let _ = self.peer_capabilities.upsert_sync(*address, *caps);
+                }
+                None => {
+                    let _ = self.peer_capabilities.remove_sync(address);
+                }
+            }
+        }
+        for (address, node_id) in &snapshot.capability_addr_to_node {
+            match node_id {
+                Some(node_id) => {
+                    let _ = self
+                        .peer_capability_addr_to_node
+                        .upsert_sync(*address, *node_id);
+                }
+                None => {
+                    let _ = self.peer_capability_addr_to_node.remove_sync(address);
+                }
+            }
+        }
+        for (node_id, caps) in &snapshot.capabilities_by_node {
+            match caps {
+                Some(caps) => {
+                    let _ = self
+                        .peer_capabilities_by_node
+                        .upsert_sync(*node_id, *caps);
+                }
+                None => {
+                    let _ = self.peer_capabilities_by_node.remove_sync(node_id);
+                }
+            }
+        }
+        for (address, probe) in &snapshot.clock_probe_state {
+            match probe {
+                Some(probe) => {
+                    let _ = self.clock_probe_state.upsert_sync(*address, *probe);
+                }
+                None => {
+                    let _ = self.clock_probe_state.remove_sync(address);
+                }
+            }
+        }
+        for (address, echo) in &snapshot.pending_clock_echoes {
+            match echo {
+                Some(echo) => {
+                    let _ = self.pending_clock_echoes.upsert_sync(*address, *echo);
+                }
+                None => {
+                    let _ = self.pending_clock_echoes.remove_sync(address);
+                }
+            }
+        }
+        for (address, clock_snapshot) in &snapshot.peer_clock_snapshots {
+            match clock_snapshot {
+                Some(clock_snapshot) => {
+                    let _ = self
+                        .peer_clock_snapshots
+                        .upsert_sync(*address, *clock_snapshot);
+                }
+                None => {
+                    let _ = self.peer_clock_snapshots.remove_sync(address);
+                }
+            }
+        }
+
+        // Clear speculative candidate aliases first, then restore each prior
+        // peer/address projection using compare-by-identity removal where a
+        // prior value did not exist.
+        for projection in &snapshot.pool {
+            self.connection_pool
+                .clear_displaced_peer_addr(&projection.peer_id, projection.addr);
+            match &projection.peer_route {
+                Some(route) => self
+                    .connection_pool
+                    .set_discovered_peer_addr(&projection.peer_id, *route),
+                None => {
+                    let _ = self.connection_pool.peer_id_to_addr.remove_if_sync(
+                        &projection.peer_id,
+                        |current| *current == projection.addr,
+                    );
+                }
+            }
+            if let Some(connection) = &projection.peer_connection {
+                let _ = self
+                    .connection_pool
+                    .connections_by_peer
+                    .upsert_sync(projection.peer_id.clone(), connection.clone());
+            }
+            match &projection.addr_route {
+                Some(owner) => {
+                    let _ = self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .upsert_sync(projection.addr, owner.clone());
+                }
+                None => {
+                    let _ = self.connection_pool.addr_to_peer_id.remove_if_sync(
+                        &projection.addr,
+                        |owner| owner == &projection.peer_id,
+                    );
+                }
+            }
+            match &projection.addr_connection {
+                Some(connection) => {
+                    let _ = self
+                        .connection_pool
+                        .connections_by_addr
+                        .upsert_sync(projection.addr, connection.clone());
+                }
+                None => {
+                    let _ = self
+                        .connection_pool
+                        .connections_by_addr
+                        .remove_if_sync(&projection.addr, |connection| {
+                            connection.embedded_peer_id.as_ref() == Some(&projection.peer_id)
+                        });
+                }
+            }
+        }
+
+        still_candidate
     }
 
     /// Track negotiated peer capabilities for a peer connection
@@ -1843,6 +2470,36 @@ impl<T: 'static> GossipRegistry<T> {
             if !still_has_addr.load(Ordering::Relaxed) {
                 let _ = self.peer_capabilities_by_node.remove_sync(&node_id);
             }
+        }
+    }
+
+    /// Detach only capability state belonging to an identity displaced from
+    /// `addr`.  The address-keyed Hello capabilities are deliberately kept:
+    /// the winning connection can publish its Hello before its verified
+    /// identity claim is projected here, and deleting the whole address entry
+    /// would erase that newer owner's negotiation.
+    fn clear_displaced_peer_capability_identity(
+        &self,
+        addr: &SocketAddr,
+        displaced: &crate::PeerId,
+    ) {
+        let displaced_node_id = displaced.to_node_id();
+        let _ = self
+            .peer_capability_addr_to_node
+            .remove_if_sync(addr, |mapped| *mapped == displaced_node_id);
+
+        let still_has_addr = AtomicBool::new(false);
+        self.peer_capability_addr_to_node.iter_sync(|_, mapped| {
+            if *mapped == displaced_node_id {
+                still_has_addr.store(true, Ordering::Relaxed);
+                return false;
+            }
+            true
+        });
+        if !still_has_addr.load(Ordering::Relaxed) {
+            let _ = self
+                .peer_capabilities_by_node
+                .remove_sync(&displaced_node_id);
         }
     }
 
@@ -2057,6 +2714,14 @@ impl<T: 'static> GossipRegistry<T> {
         Some(extensions)
     }
 
+    /// Whether an inbound clock probe from `peer_addr` has been recorded and
+    /// is still awaiting an echo. Test-only observation point for the
+    /// address-keyed extension state a refused claim must not write.
+    #[cfg(test)]
+    pub(crate) fn has_pending_clock_echo(&self, peer_addr: &SocketAddr) -> bool {
+        self.pending_clock_echoes.contains_sync(peer_addr)
+    }
+
     pub fn record_inbound_gossip_extensions(
         &self,
         peer_addr: SocketAddr,
@@ -2167,6 +2832,7 @@ impl<T: 'static> GossipRegistry<T> {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -2437,7 +3103,15 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Add a new peer (called when receiving connections)
     pub async fn add_peer(&self, peer_addr: SocketAddr) {
-        self.add_peer_with_node_id(peer_addr, None).await;
+        // No identity is claimed here, so arbitration inside
+        // `add_peer_with_node_id` is a no-op regardless of `claim_kind`;
+        // `Provisional` documents that nothing is being verified.
+        self.add_peer_with_node_id(
+            peer_addr,
+            None,
+            crate::addr_ownership::ClaimKind::Provisional,
+        )
+        .await;
     }
 
     /// R-11: arm the one-shot lower-sequence acceptance for a peer whose
@@ -2558,14 +3232,163 @@ impl<T: 'static> GossipRegistry<T> {
         &self,
         peer_addr: SocketAddr,
         node_id: Option<crate::GossipNodeId>,
+        claim_kind: crate::addr_ownership::ClaimKind,
+    ) -> crate::addr_ownership::AddrClaimOutcome {
+        self.add_peer_with_node_id_generation(peer_addr, node_id, claim_kind)
+            .await
+            .0
+    }
+
+    /// Claim an address from evidence tied to one authenticated transport
+    /// session. The receipt is refreshed on every accepted FullSync claim and
+    /// released when that physical session exits. A required/operator route
+    /// is deliberately excluded: its ownership is persistent rather than
+    /// connection-scoped.
+    pub(crate) async fn add_connection_scoped_peer_claim(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: crate::GossipNodeId,
+        claim_kind: crate::addr_ownership::ClaimKind,
+        session_source: SocketAddr,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        Option<crate::registry_owner::ClaimReceipt>,
     ) {
+        let peer_id = crate::PeerId::from(node_id);
+        let persistent = self
+            .connection_pool
+            .get_required_peer_addr(&peer_id)
+            .is_some_and(|configured| configured == peer_addr);
+        let (outcome, receipt) = self
+            .add_peer_with_node_id_generation(
+                peer_addr,
+                Some(peer_id.to_node_id()),
+                claim_kind,
+            )
+            .await;
+        if outcome == crate::addr_ownership::AddrClaimOutcome::Accepted
+            && !persistent
+            && let Some(receipt) = receipt
+        {
+            // A same-peer reconnect refreshes the owner generation. Transfer
+            // that current generation to every still-live session receipt for
+            // this address before adding the new session. If the newer
+            // session closes first, the surviving older session must still
+            // hold a receipt that can release the generation once it is the
+            // last owner; leaving its old generation behind leaks the route.
+            let mut existing_keys = Vec::new();
+            self.connection_scoped_claims.iter_sync(|key, _| {
+                if key.0 == peer_id && key.2 == peer_addr {
+                    existing_keys.push(key.clone());
+                }
+                true
+            });
+            for key in existing_keys {
+                let _ = self
+                    .connection_scoped_claims
+                    .upsert_sync(key, receipt.generation());
+            }
+            self.connection_scoped_claims.upsert_sync(
+                (peer_id, session_source, peer_addr),
+                receipt.generation(),
+            );
+            return (outcome, Some(receipt));
+        }
+        (outcome, receipt)
+    }
+
+    fn take_connection_scoped_claims(
+        &self,
+        peer_id: &crate::PeerId,
+        session_source: SocketAddr,
+    ) -> Vec<(SocketAddr, CommitSeq)> {
+        let mut entries = Vec::new();
+        self.connection_scoped_claims.iter_sync(|key, generation| {
+            if &key.0 == peer_id && key.1 == session_source {
+                entries.push((key.clone(), *generation));
+            }
+            true
+        });
+        entries
+            .into_iter()
+            .filter_map(|(key, generation)| {
+                let removed = self
+                    .connection_scoped_claims
+                    .remove_if_sync(&key, |current| *current == generation)
+                    .is_some();
+                removed.then_some((key.2, generation))
+            })
+            .collect()
+    }
+
+    /// Release all non-persistent owner claims attributed to one physical
+    /// session. The map entries are removed before the first await so a
+    /// duplicate teardown is harmless and a reconnect cannot be released by
+    /// an older session's callback.
+    pub(crate) async fn release_connection_scoped_claims(
+        &self,
+        peer_id: &crate::PeerId,
+        session_source: SocketAddr,
+    ) {
+        let claims = self.take_connection_scoped_claims(peer_id, session_source);
+        for (addr, generation) in claims {
+            // Configuration can race a transport teardown. Once the address
+            // is an operator-required pin, a stale connection receipt must
+            // never retract it.
+            if self
+                .connection_pool
+                .get_required_peer_addr(peer_id)
+                .is_some_and(|configured| configured == addr)
+            {
+                continue;
+            }
+            let covered_by_other_session = {
+                let mut covered = false;
+                self.connection_scoped_claims.iter_sync(|key, _| {
+                    if &key.0 == peer_id && key.1 != session_source && key.2 == addr {
+                        covered = true;
+                        return false;
+                    }
+                    true
+                });
+                covered
+            };
+            if covered_by_other_session {
+                continue;
+            }
+            if let Some(release_seq) = self
+                .registry_owner
+                .release(addr, peer_id.clone(), generation)
+                .await
+            {
+                let mut state = self.gossip_state.lock().await;
+                state.tombstone_ownership_projection(addr, release_seq);
+            }
+        }
+    }
+
+    /// Add/project a peer and return the owner actor's receipt for this exact
+    /// claim. Connection lifecycle code arms rollback only when the receipt
+    /// says this command created ownership, and retains its generation so a
+    /// delayed callback cannot release a newer reconnect.
+    pub(crate) async fn add_peer_with_node_id_generation(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: Option<crate::GossipNodeId>,
+        claim_kind: crate::addr_ownership::ClaimKind,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        Option<crate::registry_owner::ClaimReceipt>,
+    ) {
+        use crate::addr_ownership::AddrClaimOutcome;
+
         debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
         if peer_addr.ip().is_unspecified() || peer_addr.port() == 0 {
             debug!(
                 peer = %peer_addr,
                 "refusing to add peer with unspecified address or zero port"
             );
-            return;
+            return (AddrClaimOutcome::Rejected, None);
         }
         // Identity self-filter (authoritative — address alone is not
         // sufficient when advertise_address != bind_addr; see
@@ -2575,120 +3398,383 @@ impl<T: 'static> GossipRegistry<T> {
                 peer = %peer_addr,
                 "refusing to add self as peer (node_id identifies this node)"
             );
-            return;
+            return (AddrClaimOutcome::Rejected, None);
         }
-        if peer_addr != self.bind_addr {
+        // Both the raw bind address and the (possibly different, e.g. NAT/
+        // Kubernetes) advertised address identify this node; a remote claim
+        // on either must be refused.
+        if peer_addr == self.bind_addr || peer_addr == self.advertised_addr() {
+            info!(peer = %peer_addr, "not adding peer - same as self");
+            return (AddrClaimOutcome::Rejected, None);
+        }
+
+        // Effective verification kind to persist on this address's PeerInfo
+        // when the claim is accepted, applying the never-downgrade rule for
+        // same-node refreshes. `None` when no identity is claimed at all
+        // (nothing to arbitrate; existing no-identity bookkeeping is
+        // unaffected).
+        let mut resolved_identity_verified: Option<bool> = None;
+        // Whether an existing peer's node_id is about to be REPLACED by a
+        // different one (a genuine ownership change, not a same-node
+        // refresh). Identity-scoped state — actor routes, sequence/session
+        // counters, capabilities, health — must not survive an ownership
+        // change: otherwise a legitimate owner that displaces a provisional
+        // squatter inherits that squatter's actor routes or a poisoned high
+        // sequence that stalls its own first sync.
+        let mut owner_changed = false;
+        let mut displaced_owner: Option<crate::PeerId> = None;
+        // Position in the owner actor's commit order of the claim this call
+        // is projecting, once it has one. Everything below runs after the
+        // reply, outside the actor, so a newer claim for the same address can
+        // commit AND be projected in the meantime; the position is what lets
+        // this call detect that and stand down.
+        let mut projected_claim: Option<crate::registry_owner::ClaimReceipt> = None;
+        if let Some(claimed_node_id) = node_id {
+            // Decide and publish through the single-owner actor, and do it
+            // BEFORE taking the `gossip_state` guard below. The decision, the
+            // ownership commit, and the `addr_to_peer_id` routing publish all
+            // happen inside one serialized command in the owner's task, so a
+            // second concurrent claimant can never observe pre-claim state
+            // between them. The guard must not be held across this await:
+            // every other registry path would queue behind a cross-task round
+            // trip, and no ownership input is read from `gossip_state` any
+            // more, so there is nothing to protect here.
+            let claim = crate::addr_ownership::Claim {
+                node_id: claimed_node_id.to_peer_id(),
+                kind: claim_kind,
+            };
+            let commit = self
+                .registry_owner
+                .claim(peer_addr, claim, /* is_local_addr */ false)
+                .await;
+            let receipt = commit.receipt();
+            let crate::registry_owner::ClaimCommit::Accepted {
+                kind, displaced, ..
+            } = commit
+            else {
+                debug!(
+                    peer = %peer_addr,
+                    claimant = %claimed_node_id.fmt_short(),
+                    "rejecting address claim: ownership conflict"
+                );
+                return (AddrClaimOutcome::Rejected, None);
+            };
+            owner_changed = displaced.is_some();
+            displaced_owner = displaced;
+            resolved_identity_verified = Some(kind == crate::addr_ownership::ClaimKind::Verified);
+            projected_claim = receipt;
+        }
+
+        // Everything below mirrors the committed decision into the state that
+        // is keyed by address but NOT authoritative for ownership. It runs
+        // under ONE `gossip_state` guard, taken once: the admission check and
+        // every mutation it authorizes — the `peers` projection AND the
+        // connection indexing that follows it — must be in the same critical
+        // section as the watermark they are checked against, or a claimant
+        // could pass the check and then be overtaken before applying.
+        let mut gossip_state = self.gossip_state.lock().await;
+
+        // A commit that has already been superseded for this address must not
+        // be mirrored anywhere: the newer owner's projection is already in
+        // place and re-applying this one would attribute the address to an
+        // identity the actor no longer routes it to. The ownership decision
+        // itself stands (it is the actor's, not ours); only the derived
+        // projection is dropped.
+        if let Some(commit_seq) = projected_claim.map(|claim| claim.generation())
+            && !gossip_state.admit_ownership_projection(peer_addr, commit_seq)
+        {
+            let authoritative_owner_unchanged = node_id.is_some_and(|node_id| {
+                self.registry_owner.routes_to(&peer_addr) == Some(node_id.to_peer_id())
+            });
+            drop(gossip_state);
+            debug!(
+                peer = %peer_addr,
+                commit_seq,
+                authoritative_owner_unchanged,
+                "address ownership advanced past this claim; skipping stale projection"
+            );
+            // A newer projection for the SAME identity is not an ownership
+            // conflict. Its state already won the watermark race, so this
+            // call must stand down without replaying anything but still tell
+            // connection/configuration callers that their claim is valid.
+            return if authoritative_owner_unchanged {
+                (AddrClaimOutcome::Accepted, projected_claim)
+            } else {
+                (AddrClaimOutcome::Rejected, projected_claim)
+            };
+        }
+
+        // Check if we already have this peer
+        // Captured only when this is a genuine owner change (below), so the
+        // displaced identity's actors can be released from `known_actors`
+        // and their admission budget freed AFTER the lock is dropped.
+        let mut displaced_owner_actors: Option<(
+            crate::GossipNodeId,
+            HashMap<String, RemoteActorLocation>,
+        )> = None;
+
+        if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
+            let old_node_id = existing_peer.node_id;
+            let old_connection_addr = existing_peer.peer_address;
+            // Discovery and pre-ownership versions can leave a non-
+            // authoritative identity hint in PeerInfo without an owner-actor
+            // entry. A newly verified first owner must still rekey that stale
+            // projection exactly like an actor-reported displacement; it must
+            // never inherit the hint's sequence, actors, admissions, or
+            // capabilities merely because the hint was deliberately excluded
+            // from exclusive ownership.
+            if !owner_changed
+                && let (Some(old_node_id), Some(new_node_id)) = (old_node_id, node_id)
+                && old_node_id != new_node_id
             {
-                let mut gossip_state = self.gossip_state.lock().await;
+                owner_changed = true;
+                displaced_owner = Some(old_node_id.to_peer_id());
+            }
+            // Derived projection: authoritative ownership lives in
+            // `PeerRegistryOwner`; `node_id`/`identity_verified` mirror the
+            // decision it just committed, for the gossip/discovery consumers
+            // that read peer entries by address. They are never read back as
+            // an input to an ownership decision.
+            if node_id.is_some() && existing_peer.node_id != node_id {
+                existing_peer.node_id = node_id;
+                debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
+            } else {
+                debug!(peer = %peer_addr, "peer already tracked");
+            }
+            if let Some(identity_verified) = resolved_identity_verified {
+                existing_peer.identity_verified = identity_verified;
+            }
+            if owner_changed {
+                let now = current_timestamp();
+                let now_ms = crate::current_timestamp_millis();
+                existing_peer.last_sequence = 0;
+                existing_peer.last_sent_sequence = 0;
+                existing_peer.consecutive_deltas = 0;
+                existing_peer.accept_lower_sequence_from = None;
+                existing_peer.current_session_source = None;
+                existing_peer.current_session_connection = None;
+                existing_peer.current_session_epoch = next_session_epoch();
+                existing_peer.failures = 0;
+                existing_peer.last_failure_time = None;
+                existing_peer.last_attempt = now;
+                existing_peer.last_success = now;
+                existing_peer.last_response_received_ms = now_ms;
 
-                // Check if we already have this peer
-                if let Some(existing_peer) = gossip_state.peers.get_mut(&peer_addr) {
-                    // Update GossipNodeId if provided and not already set
-                    if node_id.is_some() && existing_peer.node_id.is_none() {
-                        existing_peer.node_id = node_id;
-                        debug!(peer = %peer_addr, "updated existing peer with GossipNodeId");
-                    } else {
-                        debug!(peer = %peer_addr, "peer already tracked");
+                // Release the displaced identity's admission budget for the
+                // actors it had routed through this address, and free the
+                // side table itself, BEFORE dropping the old actor names.
+                let old_actors = gossip_state.peer_to_actors.remove(&peer_addr);
+                if let Some(actor_names) = &old_actors {
+                    for actor_name in actor_names {
+                        gossip_state.release_actor_admission(actor_name);
                     }
-                } else {
-                    // New peer
-                    // Check if we have a dns_name from known_peers (discovered via gossip)
-                    // Do this before the entry check to avoid borrow conflicts
-                    let dns_name = gossip_state
-                        .known_peers
-                        .peek(&peer_addr)
-                        .and_then(|p| p.dns_name.clone());
-
-                    let current_time = current_timestamp();
-                    let current_time_ms = crate::current_timestamp_millis();
-                    gossip_state.peers.insert(
-                        peer_addr,
-                        PeerInfo {
-                            address: peer_addr,
-                            peer_address: None,
-                            inbound_observed: false,
-                            outbound_dial_success: false,
-                            node_id,
-                            dns_name,
-                            failures: 0,
-                            last_attempt: current_time,
-                            last_success: current_time,
-                            last_sequence: 0,
-                            last_sent_sequence: 0,
-                            consecutive_deltas: 0,
-                            last_failure_time: None,
-                            last_dns_refresh_attempt: None,
-                            last_response_received_ms: current_time_ms,
-                            accept_lower_sequence_from: None,
-                            current_session_source: None,
-                            current_session_connection: None,
-                            current_session_epoch: 0,
-                        },
-                    );
-
-                    if let Some(node_id) = node_id {
-                        let _ = self
-                            .peer_capability_addr_to_node
-                            .upsert_sync(peer_addr, node_id);
-                        let caps = self.peer_capabilities.read_sync(&peer_addr, |_, v| *v);
-                        if let Some(caps) = caps {
-                            let _ = self.peer_capabilities_by_node.upsert_sync(node_id, caps);
+                }
+                if let Some(old_node_id) = old_node_id {
+                    let mut exact_locations = HashMap::new();
+                    for actor_name in old_actors.iter().flatten() {
+                        if let Some(location) = self
+                            .actor_state
+                            .known_actors
+                            .read_sync(actor_name.as_str(), |_, location| location.clone())
+                            && (location.node_id == old_node_id
+                                || location.peer_id.to_node_id() == old_node_id)
+                            && location.address.parse::<SocketAddr>().ok().is_some_and(
+                                |location_addr| {
+                                    location_addr == peer_addr
+                                        || Some(location_addr) == old_connection_addr
+                                },
+                            )
+                        {
+                            exact_locations.insert(actor_name.clone(), location);
                         }
                     }
-                    debug!(
-                        peer = %peer_addr,
-                        peers_count = gossip_state.peers.len(),
-                        has_node_id = node_id.is_some(),
-                        "📌 Added new peer (listening address)"
-                    );
+                    displaced_owner_actors = Some((old_node_id, exact_locations));
                 }
-            } // Lock dropped
-
-            // Safely update connection pool if we have a GossipNodeId
-            // This is critical for TLS connections to work (get_connection_to_peer needs this mapping)
-            if let Some(id) = node_id {
-                let peer_id = id.to_peer_id();
-
-                // A peer re-announced at a new address (e.g. a restart on a
-                // fresh ephemeral port) keeps the SAME verified identity, so its
-                // live session must not be torn down: identity, not socket
-                // address, owns the connection (PEER_ID_REFACTOR §1). Tearing
-                // the session down here on `old_addr != new_addr` was the
-                // address-keyed leak behind the single-node-restart reconnect
-                // thrash — a freshly-accepted preferred inbound got
-                // `disconnect_by_peer_id`'d the moment the peer's advertised
-                // address changed. We only reindex the address mapping; the old
-                // connection, if any, is retired by its own IO lifecycle when it
-                // actually dies, never by an address change alone.
-                if let Some(old_addr) = self.connection_pool.get_configured_peer_addr(&peer_id)
-                    && old_addr != peer_addr
-                {
-                    debug!(
-                        peer_id = %peer_id,
-                        old_addr = %old_addr,
-                        new_addr = %peer_addr,
-                        "peer advertised a new address; reindexing without disconnecting the live session"
-                    );
-                }
-
-                let pool = &self.connection_pool;
-                pool.set_discovered_peer_addr(&peer_id, peer_addr);
-                let _ = pool.addr_to_peer_id.upsert_sync(peer_addr, peer_id.clone());
-                pool.reindex_connection_addr(&peer_id, peer_addr);
+                debug!(
+                    peer = %peer_addr,
+                    "address ownership changed: rekeying actor routes, session/sequence, admission, and capabilities"
+                );
             }
         } else {
-            info!(peer = %peer_addr, "not adding peer - same as self");
+            // New peer
+            // Check if we have a dns_name from known_peers (discovered via gossip)
+            // Do this before the entry check to avoid borrow conflicts
+            let dns_name = gossip_state
+                .known_peers
+                .peek(&peer_addr)
+                .and_then(|p| p.dns_name.clone());
+
+            let current_time = current_timestamp();
+            let current_time_ms = crate::current_timestamp_millis();
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id,
+                    dns_name,
+                    failures: 0,
+                    last_attempt: current_time,
+                    last_success: current_time,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: None,
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: current_time_ms,
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    // Derived projection: authoritative ownership lives in
+                    // `PeerRegistryOwner`; this mirrors the kind it resolved
+                    // for the claim that was just committed.
+                    identity_verified: resolved_identity_verified.unwrap_or(false),
+                },
+            );
+
+            if let Some(node_id) = node_id {
+                let _ = self
+                    .peer_capability_addr_to_node
+                    .upsert_sync(peer_addr, node_id);
+                let caps = self.peer_capabilities.read_sync(&peer_addr, |_, v| *v);
+                if let Some(caps) = caps {
+                    let _ = self.peer_capabilities_by_node.upsert_sync(node_id, caps);
+                }
+            }
+            debug!(
+                peer = %peer_addr,
+                peers_count = gossip_state.peers.len(),
+                has_node_id = node_id.is_some(),
+                "📌 Added new peer (listening address)"
+            );
         }
+
+        // Owner-change side tables must be cleaned while the same ownership
+        // watermark guard that admitted this projection is still held.  A
+        // post-guard cleanup can race a newer winning claim and erase the new
+        // owner's capabilities or clock state.
+        if let Some(displaced) = displaced_owner.as_ref() {
+            self.clear_displaced_peer_capability_identity(&peer_addr, displaced);
+            self.remove_clock_state_for_addr(&peer_addr);
+            self.connection_pool
+                .clear_displaced_peer_addr(displaced, peer_addr);
+        }
+
+        // `addr_to_peer_id` was already published by the owner actor, in the
+        // same serialized command that committed the ownership decision, and
+        // a superseded claim returned long before reaching here. What remains
+        // is the connection-lifecycle indexing that follows an accepted
+        // claim: the dial-route hint and the address reindex of any live
+        // connection.
+        //
+        // Performed while STILL holding the `gossip_state` guard that admitted
+        // this commit, deliberately. Releasing it first and re-checking would
+        // put the check and the mutation it protects in different critical
+        // sections again, which is precisely how a claimant ends up indexing a
+        // connection under an address a newer owner has already taken. The
+        // pool indexes below are lock-free `scc` maps with no `.await` and no
+        // path back into `gossip_state`, so holding the guard across them adds
+        // no lock-order edge.
+        if let Some(id) = node_id {
+            let peer_id = id.to_peer_id();
+
+            // A peer re-announced at a new address (e.g. a restart on a
+            // fresh ephemeral port) keeps the SAME verified identity, so its
+            // live session must not be torn down: identity, not socket
+            // address, owns the connection (PEER_ID_REFACTOR §1). Tearing
+            // the session down here on `old_addr != new_addr` was the
+            // address-keyed leak behind the single-node-restart reconnect
+            // thrash — a freshly-accepted preferred inbound got
+            // `disconnect_by_peer_id`'d the moment the peer's advertised
+            // address changed. We only reindex the address mapping; the old
+            // connection, if any, is retired by its own IO lifecycle when it
+            // actually dies, never by an address change alone.
+            if let Some(old_addr) = self.connection_pool.get_configured_peer_addr(&peer_id)
+                && old_addr != peer_addr
+            {
+                debug!(
+                    peer_id = %peer_id,
+                    old_addr = %old_addr,
+                    new_addr = %peer_addr,
+                    "peer advertised a new address; reindexing without disconnecting the live session"
+                );
+            }
+
+            let pool = &self.connection_pool;
+            pool.set_discovered_peer_addr(&peer_id, peer_addr);
+            pool.reindex_connection_addr(&peer_id, peer_addr);
+        }
+        drop(gossip_state);
+
+        if let Some((_old_node_id, actor_locations)) = displaced_owner_actors {
+            // The displaced identity's admission budget was already
+            // released above; now drop its entries from `known_actors` too,
+            // so routing (`lookup_actor`) stops returning the squatter's
+            // actors once its address has been taken over by the genuine
+            // owner. Each removal atomically compares the exact location
+            // captured while the displacement guard was held; a concurrent
+            // refresh or transfer of the same actor name therefore survives.
+            for (actor_name, displaced_location) in &actor_locations {
+                let _ = self
+                    .actor_state
+                    .known_actors
+                    .remove_if_sync(actor_name.as_str(), |current| current == displaced_location);
+            }
+        }
+
+        (AddrClaimOutcome::Accepted, projected_claim)
     }
 
     /// Configure a peer by peer ID and its expected connection address
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
+        let previous_addr = self.connection_pool.get_required_peer_addr(&peer_id);
+        // Operator configuration is verified ownership evidence. Reserve the
+        // address in the single-owner authority before publishing the required
+        // dial route, so an offline configured peer cannot be displaced by a
+        // provisional remote self-report.
+        let outcome = self
+            .add_peer_with_node_id(
+                connect_addr,
+                Some(peer_id.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        if outcome == crate::addr_ownership::AddrClaimOutcome::Rejected {
+            warn!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                "refusing configured peer route because the ownership authority rejected it"
+            );
+            return;
+        }
+
+        if let Some(previous_addr) = previous_addr.filter(|previous| *previous != connect_addr) {
+            if let Some(token) = self.registry_owner.ownership_token(&previous_addr)
+                && token.owner() == &peer_id
+                && let Some(release_seq) = self
+                    .registry_owner
+                    .release(previous_addr, peer_id.clone(), token.generation())
+                    .await
+            {
+                let mut state = self.gossip_state.lock().await;
+                state.tombstone_ownership_projection(previous_addr, release_seq);
+            } else {
+                // Older state may have a pool-only configured route without a
+                // corresponding owner-actor token. Remove only this peer's
+                // stale derived route; never disturb a replacement owner.
+                let _ = self
+                    .connection_pool
+                    .addr_to_peer_id
+                    .remove_if_sync(&previous_addr, |current| current == &peer_id);
+            }
+        }
+
         let pool = &self.connection_pool;
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
         pool.set_configured_peer_addr(&peer_id, connect_addr);
-        let _ = pool
-            .addr_to_peer_id
-            .upsert_sync(connect_addr, peer_id.clone());
         pool.reindex_connection_addr(&peer_id, connect_addr);
         if let Some(cell) = self.peer_connect_handler.load_full() {
             cell.handler
@@ -2955,24 +4041,130 @@ impl<T: 'static> GossipRegistry<T> {
             }
         } // pool lock released
 
+        // Capture the exact authoritative source generation BEFORE moving it.
+        // A same-identity refresh is still a different lifecycle generation;
+        // identity alone cannot safely fence either the forward move or a
+        // compensating reverse move.
+        let migrating_ownership = self.registry_owner.ownership_token(&peer_addr);
+        let source_expectation = migrating_ownership
+            .clone()
+            .map(crate::registry_owner::SourceExpectation::Owned)
+            .unwrap_or(crate::registry_owner::SourceExpectation::Unowned);
+        // Preserve the pool hint for unowned configured seeds. Owned sources
+        // use the owner actor's identity, never an independently stale index.
+        let migrating_peer_id = migrating_ownership
+            .as_ref()
+            .map(|ownership| ownership.owner().clone())
+            .or_else(|| self.connection_pool.get_peer_id_by_addr(&peer_addr));
+
+        // Ownership moves FIRST, and every address-keyed mutation below is
+        // conditional on it. Only the owner actor can tell whether the
+        // destination address has meanwhile been claimed by a different
+        // identity; publishing the peer entry and the connection index onto a
+        // contested address first and asking afterwards would leave the peer
+        // half-moved, with the old address stranded and the new one
+        // attributed to someone else.
+        // The move is also pinned to the exact source generation resolved
+        // just above: that resolution and this command are not one step, so
+        // another claim or same-identity refresh could commit in between and
+        // PHASE 2 would otherwise re-key the wrong lifecycle generation.
+        let migrate_outcome = self
+            .registry_owner
+            .migrate(
+                peer_addr,
+                new_addr,
+                source_expectation,
+                new_addr == self.bind_addr || new_addr == self.advertised_addr(),
+            )
+            .await;
+        #[cfg(test)]
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::DnsOwnershipMigrationDecided {
+                from: peer_addr,
+                to: new_addr,
+                moved: migrate_outcome.moved(),
+            },
+        );
+        if migrate_outcome.is_blocked() {
+            warn!(
+                old_addr = %peer_addr,
+                new_addr = %new_addr,
+                dns_name = %dns_name,
+                outcome = ?migrate_outcome,
+                "DNS refresh: address ownership no longer permits this move, aborting migration"
+            );
+            return None;
+        }
+        if !migrate_outcome.moved() {
+            // A DNS destination without a committed owner-actor migration is
+            // only an unverified hint. Do not publish a pool route for it:
+            // another verified claimant may win the address before the next
+            // phase, and `SourceUnowned` carries no token to revalidate.
+            debug!(
+                old_addr = %peer_addr,
+                new_addr = %new_addr,
+                dns_name = %dns_name,
+                outcome = ?migrate_outcome,
+                "DNS refresh: destination has no committed ownership, aborting route publication"
+            );
+            return None;
+        }
+
         // PHASE 1: Check for gossip_state collisions and perform migration
         // Release lock before acquiring connection_pool to prevent deadlock
         let migration_result = {
             let mut gossip_state = self.gossip_state.lock().await;
 
+            // Fence both ends of the move at the position the move committed
+            // at, in the same critical section as the peer-entry move below.
+            // The vacated address is tombstoned rather than cleared: a claim
+            // that committed before the move can still be in flight, and
+            // against a cleared entry it would be admitted and would rebuild
+            // peer state at an address its claimant no longer holds. The
+            // destination is fenced for the same reason in the other
+            // direction — nothing older than this move may project onto it.
+            if let Some(commit_seq) = migrate_outcome.commit_seq()
+                && !gossip_state
+                    .admit_ownership_migration_projection(peer_addr, new_addr, commit_seq)
+            {
+                debug!(
+                    old_addr = %peer_addr,
+                    new_addr = %new_addr,
+                    commit_seq,
+                    "DNS refresh: ownership projection advanced past this migration; aborting stale move"
+                );
+                false
+            }
             // Check if the new address is already used by another peer in gossip_state
-            if gossip_state.peers.contains_key(&new_addr) {
+            else if gossip_state.peers.contains_key(&new_addr) {
                 warn!(
                     old_addr = %peer_addr,
                     new_addr = %new_addr,
                     dns_name = %dns_name,
                     "DNS re-resolution: new address already in use by another peer, skipping update"
                 );
-                return None;
+                false
             }
-
-            // Try to move the peer entry from old address to new address
-            if let Some(mut peer_info) = gossip_state.peers.remove(&peer_addr) {
+            // The source entry may have been replaced after the owner move
+            // committed but before this guard was acquired. Never carry a
+            // different authenticated identity along a stale DNS migration.
+            else if migrating_peer_id.as_ref().is_some_and(|expected| {
+                gossip_state
+                    .peers
+                    .get(&peer_addr)
+                    .and_then(|peer| peer.node_id)
+                    .is_none_or(|actual| actual != expected.to_node_id())
+            }) {
+                warn!(
+                    old_addr = %peer_addr,
+                    new_addr = %new_addr,
+                    expected_peer = ?migrating_peer_id,
+                    "DNS refresh: source PeerInfo no longer belongs to the migrating identity"
+                );
+                false
+            }
+            // Try to move the peer entry from old address to new address.
+            else if let Some(mut peer_info) = gossip_state.peers.remove(&peer_addr) {
                 peer_info.address = new_addr;
                 peer_info.failures = 0; // Reset failures on DNS change
                 peer_info.last_failure_time = None;
@@ -3000,6 +4192,46 @@ impl<T: 'static> GossipRegistry<T> {
         }; // gossip_state lock released here
 
         if !migration_result {
+            // If ownership actually moved, the failed peer-entry move needs a
+            // compensating restore. Pin that restore to the exact generation
+            // the forward migration created: a newer claim or same-identity
+            // refresh may already hold `new_addr`, and an unpinned restore
+            // would drag that lifecycle back onto the old address. A source
+            // that was originally unowned never runs a reverse migration.
+            if let (
+                crate::registry_owner::MigrateOutcome::Migrated { commit_seq },
+                Some(migrated_ownership),
+            ) = (migrate_outcome, migrating_ownership)
+            {
+                let restore = self
+                    .registry_owner
+                    .migrate(
+                        new_addr,
+                        peer_addr,
+                        crate::registry_owner::SourceExpectation::Owned(
+                            crate::registry_owner::OwnershipToken::new(
+                                migrated_ownership.owner().clone(),
+                                commit_seq,
+                            ),
+                        ),
+                        peer_addr == self.bind_addr || peer_addr == self.advertised_addr(),
+                    )
+                    .await;
+                if restore.is_blocked() {
+                    warn!(
+                        old_addr = %peer_addr,
+                        new_addr = %new_addr,
+                        outcome = ?restore,
+                        "DNS refresh: peer entry did not move and the exact migrated generation \
+                         can no longer be restored; leaving ownership with the current claimant"
+                    );
+                }
+                if let Some(commit_seq) = restore.commit_seq() {
+                    let mut gossip_state = self.gossip_state.lock().await;
+                    gossip_state.tombstone_ownership_projection(new_addr, commit_seq);
+                    gossip_state.tombstone_ownership_projection(peer_addr, commit_seq);
+                }
+            }
             return None;
         }
 
@@ -3020,8 +4252,30 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let pool = &self.connection_pool;
 
-            // Get peer_id for this address
-            if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
+            // Ownership publication and the derived pool re-key are separate
+            // lock-free structures. Revalidate the exact generation at the
+            // last possible point before publishing the route so a claimant
+            // that won the destination after PHASE 1 cannot be overwritten by
+            // this stale DNS refresh.
+            if let (Some(commit_seq), Some(peer_id)) =
+                (migrate_outcome.commit_seq(), migrating_peer_id.as_ref())
+                && !self
+                    .registry_owner
+                    .claim_is_current(&new_addr, peer_id, commit_seq)
+            {
+                warn!(
+                    old_addr = %peer_addr,
+                    new_addr = %new_addr,
+                    peer_id = %peer_id,
+                    commit_seq,
+                    "DNS refresh: ownership changed before pool publication, aborting stale route projection"
+                );
+                return None;
+            }
+
+            // Identity captured before the ownership move, which already
+            // retracted the old address's routing entry.
+            if let Some(peer_id) = migrating_peer_id {
                 // Update peer_id_to_addr mapping without making DNS-refreshed
                 // discovered routes required supervisor peers.
                 pool.set_discovered_peer_addr(&peer_id, new_addr);
@@ -4622,6 +5876,7 @@ impl<T: 'static> GossipRegistry<T> {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        identity_verified: false,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -5284,7 +6539,64 @@ impl<T: 'static> GossipRegistry<T> {
         verified_sender_addr: Option<SocketAddr>,
         session_source: Option<SocketAddr>,
         sequence: u64,
+        wall_clock_time: u64,
+    ) -> bool {
+        self.merge_full_sync_from_guarded(
+            remote_local,
+            remote_known,
+            sender_peer_id,
+            sender_addr,
+            verified_sender_addr,
+            session_source,
+            sequence,
+            wall_clock_time,
+            None,
+        )
+        .await
+    }
+
+    /// Merge a FullSync whose address claim was committed by the registry
+    /// owner.  The commit is revalidated in every state-mutation phase so a
+    /// newer claim cannot win between phases and leave partial projections.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn merge_full_sync_from_owned(
+        &self,
+        remote_local: HashMap<String, RemoteActorLocation>,
+        remote_known: HashMap<String, RemoteActorLocation>,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        verified_sender_addr: Option<SocketAddr>,
+        session_source: Option<SocketAddr>,
+        sequence: u64,
+        wall_clock_time: u64,
+        ownership_commit: CommitSeq,
+    ) -> bool {
+        self.merge_full_sync_from_guarded(
+            remote_local,
+            remote_known,
+            sender_peer_id,
+            sender_addr,
+            verified_sender_addr,
+            session_source,
+            sequence,
+            wall_clock_time,
+            Some(ownership_commit),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn merge_full_sync_from_guarded(
+        &self,
+        remote_local: HashMap<String, RemoteActorLocation>,
+        remote_known: HashMap<String, RemoteActorLocation>,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        verified_sender_addr: Option<SocketAddr>,
+        session_source: Option<SocketAddr>,
+        sequence: u64,
         _wall_clock_time: u64,
+        ownership_commit: Option<CommitSeq>,
     ) -> bool {
         let repair_addr = verified_sender_addr.unwrap_or(sender_addr);
         let session_source = session_source.or(verified_sender_addr);
@@ -5318,6 +6630,20 @@ impl<T: 'static> GossipRegistry<T> {
         // and drop the now-stale pending write instead of applying it.
         let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
+            if let Some(commit_seq) = ownership_commit
+                && (!self.registry_owner.claim_is_current(
+                    &sender_addr,
+                    &sender_peer_id,
+                    commit_seq,
+                ) || !gossip_state.admit_ownership_projection(sender_addr, commit_seq))
+            {
+                debug!(
+                    peer = %sender_addr,
+                    commit_seq,
+                    "dropping full-sync sequence projection after address ownership advanced"
+                );
+                return false;
+            }
             if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
                 // Once a session has been armed for this peer, only the
                 // connection that armed it is treated as authoritative for
@@ -5434,8 +6760,22 @@ impl<T: 'static> GossipRegistry<T> {
             // re-advertises the repaired route instead of the unusable one.
             let owner_is_sender = location.peer_id == sender_peer_id;
             let wire_addr = canonical_wire_addr(&name, &location.address);
-            let resolved =
-                resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender);
+            let resolved = if ownership_commit.is_some() && owner_is_sender {
+                // An authenticated identity still does not prove an arbitrary
+                // usable address carried in its FullSync. The owner actor has
+                // already selected `sender_addr` from verified evidence (or a
+                // previously verified same-owner route), so every actor the
+                // sender claims to host is anchored to that exact authority.
+                // A wildcard actor address is different: its port is the
+                // actor's service port rather than the registry transport
+                // port, so retain that port while anchoring only its IP to the
+                // observed source (the established §1.6 contract).
+                // Relayed third-party actors keep their own canonical address
+                // and never learn a route from this sender.
+                resolve_owned_actor_addr(wire_addr, repair_addr)
+            } else {
+                resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender)
+            };
             self.note_actor_addr_resolution(wire_addr, resolved, repair_addr, owner_is_sender);
             let mut location = location;
             location.address = resolved.to_string();
@@ -5456,8 +6796,11 @@ impl<T: 'static> GossipRegistry<T> {
             }
             let owner_is_sender = location.peer_id == sender_peer_id;
             let wire_addr = canonical_wire_addr(&name, &location.address);
-            let resolved =
-                resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender);
+            let resolved = if ownership_commit.is_some() && owner_is_sender {
+                resolve_owned_actor_addr(wire_addr, repair_addr)
+            } else {
+                resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender)
+            };
             self.note_actor_addr_resolution(wire_addr, resolved, repair_addr, owner_is_sender);
             let mut location = location;
             location.address = resolved.to_string();
@@ -5488,6 +6831,21 @@ impl<T: 'static> GossipRegistry<T> {
         );
         {
             let mut gossip_state = self.gossip_state.lock().await;
+
+            if let Some(commit_seq) = ownership_commit
+                && (!self.registry_owner.claim_is_current(
+                    &sender_addr,
+                    &sender_peer_id,
+                    commit_seq,
+                ) || !gossip_state.admit_ownership_projection(sender_addr, commit_seq))
+            {
+                debug!(
+                    peer = %sender_addr,
+                    commit_seq,
+                    "dropping full-sync actor projection after address ownership advanced"
+                );
+                return false;
+            }
 
             // Atomic generation recheck, immediately before any write in
             // this block: if a newer session has been armed (or the
@@ -5633,24 +6991,48 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
             }
+
+            // Apply learned routes before releasing the ownership watermark
+            // guard.  The address route itself is authoritative and may only
+            // be published by the registry owner; this phase records the
+            // reverse dial hint only when the owner snapshot still agrees.
+            for (name, peer_id, addr) in &routes_to_configure {
+                let ownership_agrees = self.registry_owner.routes_to(addr).as_ref()
+                    == Some(peer_id)
+                    || self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .read_sync(addr, |_, owner| owner == peer_id)
+                        .unwrap_or(false);
+                if ownership_commit.is_some() && !ownership_agrees {
+                    debug!(
+                        actor = %name,
+                        peer = %peer_id,
+                        peer_addr = %addr,
+                        "skipping learned direct route whose address ownership changed"
+                    );
+                    continue;
+                }
+                self.connection_pool
+                    .set_discovered_peer_addr(peer_id, *addr);
+                // Legacy/local callers of the unguarded merge API do not
+                // arrive through an ownership claim. Preserve that API's
+                // route-learning contract; authenticated wire handlers use
+                // the guarded path above and never publish ownership here.
+                if ownership_commit.is_none() {
+                    let _ = self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .upsert_sync(*addr, peer_id.clone());
+                }
+                debug!(
+                    actor = %name,
+                    peer_addr = %addr,
+                    "Recorded learned direct route for actor's host"
+                );
+            }
             // _gossip_state guard drops here.
             let _ = gossip_state;
-        }
-
-        // STEP 3: Record learned direct routes outside the lock (these
-        // invoke user handlers and may not be held under gossip_state).
-        for (name, peer_id, addr) in routes_to_configure {
-            self.connection_pool
-                .set_discovered_peer_addr(&peer_id, addr);
-            let _ = self
-                .connection_pool
-                .addr_to_peer_id
-                .upsert_sync(addr, peer_id.clone());
-            debug!(
-                actor = %name,
-                peer_addr = %addr,
-                "Recorded learned direct route for actor's host"
-            );
         }
 
         debug!(
@@ -6892,6 +8274,9 @@ impl<T: 'static> GossipRegistry<T> {
         // trim.
         let max_peers = self.config.max_peers.max(1);
         let mut evicted_addrs: Vec<SocketAddr> = Vec::new();
+        // Address plus the identity that held it at eviction time, so the
+        // ownership release below cannot evict a successor.
+        let mut evicted_owners: Vec<(SocketAddr, crate::PeerId, CommitSeq)> = Vec::new();
         if gossip_state.peers.len() > max_peers {
             let configured = self.connection_pool.list_configured_peers();
             let configured_peer_ids: std::collections::HashSet<crate::PeerId> = configured
@@ -6922,7 +8307,19 @@ impl<T: 'static> GossipRegistry<T> {
                 );
             }
             for addr in &evicted_addrs {
-                gossip_state.peers.remove(addr);
+                // The identity being evicted is captured from the entry as it
+                // is removed, still under this guard. Ownership is released
+                // after the guard is dropped, by which time a reconnecting
+                // peer may legitimately have re-claimed the address; the
+                // release is scoped to this identity so it can only ever
+                // retract the ownership this eviction actually invalidated.
+                let evicted_generation = gossip_state.ownership_watermark(addr);
+                let evicted = gossip_state.peers.remove(addr);
+                if let (Some(node_id), Some(generation)) =
+                    (evicted.and_then(|peer| peer.node_id), evicted_generation)
+                {
+                    evicted_owners.push((*addr, node_id.to_peer_id(), generation));
+                }
                 gossip_state.peer_to_actors.remove(addr);
 
                 if let Some(ref mut discovery) = gossip_state.peer_discovery {
@@ -6946,6 +8343,38 @@ impl<T: 'static> GossipRegistry<T> {
             for addr in &evicted_addrs {
                 self.clear_peer_capabilities(addr);
                 self.remove_clock_state_for_addr(addr);
+            }
+            // Ownership outlives `peers`, so an evicted address must be
+            // released explicitly or it stays permanently attributed to the
+            // evicted identity and no future claimant can take it. Scoped to
+            // the identity captured at eviction time: an unscoped release
+            // would also retract a claim that a peer reconnecting into this
+            // very window had already committed, silently breaking routing
+            // to a peer that is in fact live. Addresses whose entry carried
+            // no identity never had an ownership record to retract.
+            let mut released = Vec::new();
+            for (addr, evicted_id, generation) in evicted_owners {
+                if let Some(commit_seq) = self
+                    .registry_owner
+                    .release(addr, evicted_id, generation)
+                    .await
+                {
+                    released.push((addr, commit_seq));
+                }
+            }
+            // Fence each vacated address at the position its release
+            // committed at, instead of forgetting it. A claim that committed
+            // before the release can still be in flight; against a forgotten
+            // address it would be admitted and would recreate the evicted
+            // peer's entry and connection index at an address it no longer
+            // owns. The tombstone makes that claim fail admission, which is
+            // the correct outcome, and a genuine later re-claim commits at a
+            // higher position and is admitted normally.
+            if !released.is_empty() {
+                let mut gossip_state = self.gossip_state.lock().await;
+                for (addr, commit_seq) in released {
+                    gossip_state.tombstone_ownership_projection(addr, commit_seq);
+                }
             }
         }
     }
@@ -7878,6 +9307,7 @@ impl<T: 'static> GossipRegistry<T> {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
@@ -8166,7 +9596,6 @@ impl<T: 'static> GossipRegistry<T> {
 mod tests {
     use super::*;
     use crate::{KeyPair, PeerId};
-    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
@@ -8410,6 +9839,17 @@ mod tests {
             stored.address,
             SocketAddr::new(sender_addr.ip(), actor_addr.port()).to_string(),
             "rewritten actor location must use the sender's verified IP with the advertised port"
+        );
+    }
+
+    #[test]
+    fn owned_full_sync_repairs_concrete_actor_ip_without_losing_service_port() {
+        let actor_addr: SocketAddr = "192.0.2.99:12345".parse().unwrap();
+        let verified_source: SocketAddr = "127.0.0.1:49003".parse().unwrap();
+        assert_eq!(
+            resolve_owned_actor_addr(actor_addr, verified_source),
+            SocketAddr::new(verified_source.ip(), actor_addr.port()),
+            "address repair must anchor the IP to verified evidence while preserving the actor service port"
         );
     }
 
@@ -9137,7 +10577,12 @@ mod tests {
         let old_connection = test_addr(55001);
         let new_connection = test_addr(55002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync_from(
             &reg,
             &owner,
@@ -9220,7 +10665,12 @@ mod tests {
         let node_id = owner.to_node_id();
         let peer_addr = test_addr(9401);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
 
         // Pre-restart: B is at sequence 40 hosting X and Y.
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11/X", "qa_r11/Y"]).await;
@@ -9262,7 +10712,12 @@ mod tests {
         let node_id = owner.to_node_id();
         let peer_addr = test_addr(9402);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11r/X", "qa_r11r/Y"]).await;
 
         // No new session — a replayed old FullSync omitting Y must NOT prune Y.
@@ -9308,8 +10763,12 @@ mod tests {
             .to_node_id();
         let peer_addr = test_addr(9403);
 
-        reg.add_peer_with_node_id(peer_addr, Some(owner.to_node_id()))
-            .await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(owner.to_node_id()),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync(&reg, &owner, peer_addr, 40, &["qa_r11i/X", "qa_r11i/Y"]).await;
 
         // A different identity must not be able to arm the victim's reset.
@@ -9387,7 +10846,12 @@ mod tests {
         let old_connection = test_addr(57001);
         let new_connection = test_addr(57002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         // Pre-restart: peer is at sequence 40.
         qa_r11_full_sync_from(
             &reg,
@@ -9484,7 +10948,12 @@ mod tests {
         let old_connection = test_addr(58001);
         let new_connection = test_addr(58002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync_from(
             &reg,
             &owner,
@@ -9561,7 +11030,12 @@ mod tests {
         let old_local_session = test_addr(56001);
         let new_local_session = test_addr(56002);
 
-        reg.add_peer_with_node_id(peer_addr, Some(node_id)).await;
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(node_id),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
         qa_r11_full_sync_with_session_source(
             &reg,
             &owner,
@@ -10032,6 +11506,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -10314,6 +11789,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         }
     }
 
@@ -10414,6 +11890,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -11232,6 +12709,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -11256,6 +12734,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -13301,7 +14780,11 @@ mod tests {
 
         // Peer re-announced at a new address with the same identity.
         registry
-            .add_peer_with_node_id(new_addr, Some(node_id))
+            .add_peer_with_node_id(
+                new_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         let after = pool.get_connection_by_peer_id(&peer_id);
@@ -13354,7 +14837,11 @@ mod tests {
 
         // Peer re-announced at a new address with the same identity.
         registry
-            .add_peer_with_node_id(new_addr, Some(node_id))
+            .add_peer_with_node_id(
+                new_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
             .await;
 
         assert_eq!(
@@ -13758,6 +15245,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -13832,6 +15320,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -13902,6 +15391,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -13954,6 +15444,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -14048,6 +15539,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut seeded = HashSet::new();
@@ -14171,6 +15663,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -14359,6 +15852,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -14450,6 +15944,7 @@ mod tests {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        identity_verified: false,
                     },
                 );
             }
@@ -14541,6 +16036,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -14624,6 +16120,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -15412,6 +16909,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -15473,6 +16971,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -15524,6 +17023,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
 
         // Convert to gossip format
@@ -15917,6 +17417,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16380,6 +17881,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16523,6 +18025,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16568,6 +18071,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16613,6 +18117,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16671,6 +18176,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16736,6 +18242,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -16831,6 +18338,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            identity_verified: false,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -16891,6 +18399,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -16974,6 +18483,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -17044,6 +18554,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -17106,6 +18617,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    identity_verified: false,
                 },
             );
         }
@@ -17260,6 +18772,2145 @@ mod tests {
                 .read_sync(&required, |_, _| ())
                 .is_some(),
             "configured-peer liveness edge state must survive periodic pruning"
+        );
+    }
+
+    // ===================== addr_ownership wiring (Stage 1) =====================
+    //
+    // These exercise `add_peer_with_node_id`'s fail-closed early return via
+    // `crate::addr_ownership::arbitrate`. The check and the eventual
+    // gossip_state/addr_to_peer_id mutation are still two separate lock
+    // acquisitions here (Stage 2 will make that atomic via a single-owner
+    // actor); these tests only assert the decision itself is fail-closed and
+    // that a rejected claim mutates nothing.
+
+    /// A comparable snapshot of the fields `add_peer_with_node_id` could
+    /// possibly touch, used to assert "nothing mutated" byte-for-byte.
+    /// `current_session_connection` (a `Weak`) is intentionally omitted: it
+    /// is never written by `add_peer_with_node_id` and `Weak` has no
+    /// meaningful equality.
+    #[derive(Debug, PartialEq, Eq)]
+    struct PeerInfoSnapshot {
+        address: SocketAddr,
+        peer_address: Option<SocketAddr>,
+        inbound_observed: bool,
+        outbound_dial_success: bool,
+        node_id: Option<crate::GossipNodeId>,
+        dns_name: Option<String>,
+        failures: usize,
+        last_attempt: u64,
+        last_success: u64,
+        last_sequence: u64,
+        last_sent_sequence: u64,
+        consecutive_deltas: u64,
+        last_failure_time: Option<u64>,
+        last_dns_refresh_attempt: Option<u64>,
+        last_response_received_ms: u64,
+        accept_lower_sequence_from: Option<SocketAddr>,
+        current_session_source: Option<SocketAddr>,
+        current_session_epoch: u64,
+        identity_verified: bool,
+    }
+
+    impl From<&PeerInfo> for PeerInfoSnapshot {
+        fn from(p: &PeerInfo) -> Self {
+            Self {
+                address: p.address,
+                peer_address: p.peer_address,
+                inbound_observed: p.inbound_observed,
+                outbound_dial_success: p.outbound_dial_success,
+                node_id: p.node_id,
+                dns_name: p.dns_name.clone(),
+                failures: p.failures,
+                last_attempt: p.last_attempt,
+                last_success: p.last_success,
+                last_sequence: p.last_sequence,
+                last_sent_sequence: p.last_sent_sequence,
+                consecutive_deltas: p.consecutive_deltas,
+                last_failure_time: p.last_failure_time,
+                last_dns_refresh_attempt: p.last_dns_refresh_attempt,
+                last_response_received_ms: p.last_response_received_ms,
+                accept_lower_sequence_from: p.accept_lower_sequence_from,
+                current_session_source: p.current_session_source,
+                current_session_epoch: p.current_session_epoch,
+                identity_verified: p.identity_verified,
+            }
+        }
+    }
+
+    async fn snapshot_peer(registry: &GossipRegistry<()>, addr: SocketAddr) -> PeerInfoSnapshot {
+        let gossip_state = registry.gossip_state.lock().await;
+        PeerInfoSnapshot::from(
+            gossip_state
+                .peers
+                .get(&addr)
+                .expect("peer must exist for snapshot"),
+        )
+    }
+
+    /// Steady-state hijack blocked: an attacker claiming a verified peer's
+    /// address, even with a `Verified`-flavored claim, mutates NOTHING —
+    /// `peers`, `addr_to_peer_id`, `peer_to_actors`, and `last_sequence` are
+    /// all byte-for-byte (field-for-field) unchanged after the rejected claim.
+    #[tokio::test]
+    async fn addr_ownership_hijack_of_verified_owner_mutates_nothing() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_001), test_config());
+        let addr = test_addr(20_002);
+        let victim = test_peer_id("addr-ownership-victim").to_node_id();
+        let attacker = test_peer_id("addr-ownership-attacker").to_node_id();
+
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(victim),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        // Give the victim some actor/routing state so a hijack that DID
+        // mutate would show up here too.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert("victim_actor".to_string());
+            if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                peer_info.last_sequence = 42;
+            }
+        }
+
+        let before_snapshot = snapshot_peer(&registry, addr).await;
+        let before_addr_to_peer_id = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&addr, |_, v| v.clone());
+        let before_peer_to_actors = {
+            let gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peer_to_actors.get(&addr).cloned()
+        };
+
+        // Attacker claims the same address with a DIFFERENT node id, even as
+        // a Verified claim (the strongest kind) -- a verified owner must
+        // never be displaced.
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(attacker),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let after_snapshot = snapshot_peer(&registry, addr).await;
+        let after_addr_to_peer_id = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&addr, |_, v| v.clone());
+        let after_peer_to_actors = {
+            let gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peer_to_actors.get(&addr).cloned()
+        };
+
+        assert_eq!(
+            before_snapshot, after_snapshot,
+            "rejected hijack claim must not mutate the victim's PeerInfo"
+        );
+        assert_eq!(
+            before_addr_to_peer_id, after_addr_to_peer_id,
+            "rejected hijack claim must not touch addr_to_peer_id"
+        );
+        assert_eq!(
+            before_peer_to_actors, after_peer_to_actors,
+            "rejected hijack claim must not touch peer_to_actors"
+        );
+        assert_eq!(
+            after_snapshot.node_id,
+            Some(victim),
+            "victim must still own the address"
+        );
+    }
+
+    /// A provisional self-report publishes neither peer identity nor routing;
+    /// the later genuinely verified claimant becomes the first owner.
+    #[tokio::test]
+    async fn addr_ownership_provisional_alias_publishes_nothing() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_003), test_config());
+        let addr = test_addr(20_004);
+        let provisional_claimant = test_peer_id("addr-ownership-provisional").to_node_id();
+        let verified_claimant = test_peer_id("addr-ownership-verified").to_node_id();
+
+        let provisional_outcome = registry
+            .add_peer_with_node_id(
+                addr,
+                Some(provisional_claimant),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        assert_eq!(
+            provisional_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Rejected
+        );
+        assert!(registry.registry_owner.owner_of(&addr).is_none());
+        assert!(!registry.gossip_state.lock().await.peers.contains_key(&addr));
+        assert!(
+            registry
+                .connection_pool
+                .get_peer_id_by_addr(&addr)
+                .is_none(),
+            "an unverified address must not receive an exclusive route"
+        );
+
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(verified_claimant),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let final_snapshot = snapshot_peer(&registry, addr).await;
+        assert_eq!(
+            final_snapshot.node_id,
+            Some(verified_claimant),
+            "a genuinely verified claim must become the first owner"
+        );
+        assert!(
+            final_snapshot.identity_verified,
+            "the displacing claim's Verified kind must be persisted, not just its node_id"
+        );
+        let addr_to_peer_id_entry = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&addr, |_, v| v.clone());
+        assert_eq!(
+            addr_to_peer_id_entry,
+            Some(verified_claimant.to_peer_id()),
+            "connection pool routing must follow the newly verified owner"
+        );
+    }
+
+    /// Reproduces the `Verified`-laundering attack: an authenticated
+    /// attacker inbound-connects and advertises an unowned victim address
+    /// that is not its own TCP source (a Provisional claim). Even if
+    /// inbound-observation bookkeeping ends up recorded against that
+    /// address by some other code path, `ownership_owner` must not treat it
+    /// as `Verified` -- only the address-scoped `identity_verified` flag
+    /// `add_peer_with_node_id` persists from `arbitrate()` may do that.
+    /// Otherwise the attacker's merely-Provisional claim is laundered into
+    /// an undisplaceable `Verified` one, and the victim's later genuinely
+    /// verified claim is wrongly rejected -- permanent address squatting.
+    #[tokio::test]
+    async fn addr_ownership_inbound_observed_does_not_launder_provisional_to_verified() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_010), test_config());
+        let victim_addr = test_addr(20_011);
+        let attacker_source_addr = test_addr(20_012);
+        let attacker = test_peer_id("addr-ownership-launder-attacker").to_node_id();
+        let victim = test_peer_id("addr-ownership-launder-victim").to_node_id();
+
+        // Attacker's self-reported advertised address does not match its
+        // own TCP source, so this is a Provisional claim -- exactly like
+        // the corrected inbound-accept provenance rule in handle.rs.
+        let outcome = registry
+            .add_peer_with_node_id(
+                victim_addr,
+                Some(attacker),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Rejected);
+
+        // Some other code path records inbound observation for the
+        // attacker's connection. Even if it were ever mis-attributed to
+        // `victim_addr` -- exactly the bug this test guards against -- it
+        // must not upgrade the recorded ownership kind.
+        registry
+            .mark_inbound_connection_observed(victim_addr, attacker_source_addr)
+            .await;
+
+        // Authoritative ownership now lives in the owner actor, so assert
+        // against it rather than against the derived `peers` projection.
+        let owner_after_observation = registry.registry_owner.owner_of(&victim_addr);
+        assert_eq!(
+            owner_after_observation, None,
+            "inbound observation metadata must not turn a rejected self-report into ownership"
+        );
+        assert_eq!(
+            snapshot_peer(&registry, victim_addr).await.node_id,
+            None,
+            "liveness bookkeeping may create an address entry but no identity attribution"
+        );
+        assert!(
+            !snapshot_peer(&registry, victim_addr)
+                .await
+                .identity_verified,
+            "the derived PeerInfo projection must not launder inbound observation into \
+             verified address ownership"
+        );
+
+        // The victim's later genuinely verified claim must be ACCEPTED and
+        // displace the attacker's provisional squat.
+        let victim_outcome = registry
+            .add_peer_with_node_id(
+                victim_addr,
+                Some(victim),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(
+            victim_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+        assert_eq!(
+            snapshot_peer(&registry, victim_addr).await.node_id,
+            Some(victim),
+            "the victim's genuinely verified claim must displace the laundered attacker"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_offline_peer_reserves_address_in_owner_authority() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_013), test_config());
+        let configured_addr = test_addr(20_014);
+        let intended = test_peer_id("configured-address-intended");
+        let attacker = test_peer_id("configured-address-attacker");
+
+        registry
+            .configure_peer(intended.clone(), configured_addr)
+            .await;
+        let attacker_outcome = registry
+            .add_peer_with_node_id(
+                configured_addr,
+                Some(attacker.to_node_id()),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+
+        assert_eq!(
+            attacker_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Rejected,
+            "a provisional remote claim must not steal an offline operator-configured address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&configured_addr),
+            Some(intended.clone()),
+            "operator configuration must be registered in the ownership authority"
+        );
+        assert_eq!(
+            registry
+                .connection_pool
+                .addr_to_peer_id
+                .read_sync(&configured_addr, |_, peer| peer.clone()),
+            Some(intended),
+            "published address routing must agree with the owner authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_scoped_owner_releases_after_last_session_but_configured_pin_survives() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_015), test_config());
+        let peer = test_peer_id("connection-scoped-owner");
+        let observed = test_addr(20_016);
+        let session_a = test_addr(30_016);
+        let session_b = test_addr(30_017);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                observed,
+                peer.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_a,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        registry
+            .release_connection_scoped_claims(&peer, session_a)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            None,
+            "a raw connection-derived owner must be released when its session ends"
+        );
+
+        let session_c = test_addr(30_018);
+        let session_d = test_addr(30_019);
+        for session in [session_c, session_d] {
+            let (outcome, _) = registry
+                .add_connection_scoped_peer_claim(
+                    observed,
+                    peer.to_node_id(),
+                    crate::addr_ownership::ClaimKind::Verified,
+                    session,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        }
+        registry
+            .release_connection_scoped_claims(&peer, session_c)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            Some(peer.clone()),
+            "an older session must not release an owner still claimed by a reconnect"
+        );
+        registry
+            .release_connection_scoped_claims(&peer, session_d)
+            .await;
+        assert_eq!(registry.registry_owner.routes_to(&observed), None);
+
+        let pinned = test_addr(20_017);
+        registry.configure_peer(peer.clone(), pinned).await;
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                pinned,
+                peer.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_b,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        registry
+            .release_connection_scoped_claims(&peer, session_b)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&pinned),
+            Some(peer),
+            "operator-configured ownership must not be released with a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_session_release_transfers_current_generation_to_survivor() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_027), test_config());
+        let peer = test_peer_id("connection-scoped-generation-transfer");
+        let observed = test_addr(20_028);
+        let session_a = test_addr(30_028);
+        let session_b = test_addr(30_029);
+
+        for session in [session_a, session_b] {
+            let (outcome, _) = registry
+                .add_connection_scoped_peer_claim(
+                    observed,
+                    peer.to_node_id(),
+                    crate::addr_ownership::ClaimKind::Verified,
+                    session,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        }
+
+        registry
+            .release_connection_scoped_claims(&peer, session_b)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            Some(peer.clone()),
+            "the surviving older session must retain ownership when the newer session closes"
+        );
+
+        registry
+            .release_connection_scoped_claims(&peer, session_a)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            None,
+            "the last session must release the current owner generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfiguring_peer_releases_previous_configured_address() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_029), test_config());
+        let peer = test_peer_id("configured-address-reconfigure");
+        let old_addr = test_addr(20_030);
+        let new_addr = test_addr(20_031);
+
+        registry.configure_peer(peer.clone(), old_addr).await;
+        registry.configure_peer(peer.clone(), new_addr).await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            None,
+            "reconfiguration must withdraw the previous verified pin"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&new_addr),
+            Some(peer),
+            "reconfiguration must retain the new verified pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_inbound_rollback_preserves_unrelated_admission_updates() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_018), test_config());
+        let addr = test_addr(20_019);
+        let candidate = test_peer_id("rollback-admission-candidate");
+        let unrelated = test_peer_id("rollback-admission-unrelated");
+        let candidate_actor = "rollback/candidate".to_string();
+        let new_candidate_actor = "rollback/candidate-new".to_string();
+        let unrelated_actor = "rollback/unrelated".to_string();
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(addr);
+            peer.node_id = Some(candidate.to_node_id());
+            state.peers.insert(addr, peer);
+            state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(candidate_actor.clone());
+            state.record_actor_admission(&candidate, &candidate_actor);
+            state.record_actor_admission(&unrelated, &unrelated_actor);
+        }
+
+        let snapshot = registry
+            .snapshot_inbound_claim_projection(addr, addr, &candidate)
+            .await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(new_candidate_actor.clone());
+            state.record_actor_admission(&candidate, &new_candidate_actor);
+            state.record_actor_admission(&unrelated, "rollback/unrelated-new");
+        }
+
+        assert!(
+            registry
+                .restore_inbound_claim_projection(addr, &candidate, &snapshot)
+                .await
+        );
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            state
+                .actor_admissions_by_peer
+                .get(&unrelated)
+                .is_some_and(|names| {
+                    names.contains(&unrelated_actor)
+                        && names.contains("rollback/unrelated-new")
+                }),
+            "rollback must not replace another peer's concurrent admission updates"
+        );
+        assert!(
+            state
+                .actor_admissions_by_peer
+                .get(&candidate)
+                .is_some_and(|names| names.contains(&candidate_actor))
+        );
+        assert!(
+            !state
+                .actor_admissions_by_peer
+                .get(&candidate)
+                .is_some_and(|names| names.contains(&new_candidate_actor)),
+            "candidate-only admission added after the snapshot must be removed"
+        );
+    }
+
+    /// Owner-change rekey: when a verified claimant displaces a DIFFERENT
+    /// (provisional) owner, none of the old identity's actor routes or
+    /// session/sequence state survive onto the new owner.
+    #[tokio::test]
+    async fn addr_ownership_owner_change_rekeys_actor_routes_and_sequence_state() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_008), test_config());
+        let addr = test_addr(20_009);
+        let old_owner_peer_id = test_peer_id("addr-ownership-rekey-old");
+        let old_owner = old_owner_peer_id.to_node_id();
+        let new_owner = test_peer_id("addr-ownership-rekey-new").to_node_id();
+        let actor_name = "old_owner_actor".to_string();
+
+        // Seed the kind of non-authoritative identity hint older discovery
+        // state can contain. It is deliberately absent from RegistryOwner:
+        // provisional evidence may no longer publish exclusive ownership.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut old_peer = PeerInfo::local(addr);
+            old_peer.node_id = Some(old_owner);
+            old_peer.identity_verified = false;
+            gossip_state.peers.insert(addr, old_peer);
+
+            // Poison the hint's identity-scoped state: actor routes,
+            // admission budget, and a high sequence number that a legitimate
+            // verified first owner must not inherit.
+            gossip_state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(actor_name.clone());
+            gossip_state.record_actor_admission(&old_owner_peer_id, &actor_name);
+            if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                peer_info.last_sequence = 999_999;
+                peer_info.last_sent_sequence = 999_999;
+                peer_info.consecutive_deltas = 50;
+                peer_info.failures = 3;
+            }
+        }
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            actor_name.clone(),
+            RemoteActorLocation::new_with_peer(addr, old_owner_peer_id.clone()),
+        );
+        registry.set_peer_capabilities(addr, clock_caps());
+        registry
+            .associate_peer_capabilities_with_node(addr, old_owner)
+            .await;
+        assert!(
+            registry.peer_capabilities_by_node.contains_sync(&old_owner),
+            "capability fixture did not attach as expected"
+        );
+        assert_eq!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .actor_admission_count(&old_owner_peer_id),
+            1,
+            "admission fixture did not attach as expected"
+        );
+
+        // A genuinely verified first owner rekeys the different
+        // non-authoritative identity projection.
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(new_owner),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let after_snapshot = snapshot_peer(&registry, addr).await;
+        assert_eq!(after_snapshot.node_id, Some(new_owner));
+        assert_eq!(
+            after_snapshot.last_sequence, 0,
+            "the new owner must not inherit the old owner's sequence"
+        );
+        assert_eq!(after_snapshot.last_sent_sequence, 0);
+        assert_eq!(after_snapshot.consecutive_deltas, 0);
+        assert_eq!(after_snapshot.failures, 0);
+
+        let peer_to_actors_after = {
+            let gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peer_to_actors.get(&addr).cloned()
+        };
+        assert!(
+            peer_to_actors_after.is_none_or(|actors| actors.is_empty()),
+            "the new owner must not inherit the old owner's actor routes"
+        );
+        assert!(
+            !registry.peer_capabilities_by_node.contains_sync(&old_owner),
+            "the old owner's capabilities must not survive the ownership change"
+        );
+        assert_eq!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .actor_admission_count(&old_owner_peer_id),
+            0,
+            "the old owner's admission budget must be released on ownership change"
+        );
+        assert!(
+            registry
+                .actor_state
+                .known_actors
+                .read_sync(&actor_name, |_, _| ())
+                .is_none(),
+            "the old owner's actor must be gone from known_actors after ownership change"
+        );
+    }
+
+    /// A release/migration tombstone may be compacted out of the per-address
+    /// table, but a handler carrying an older accepted commit can still be
+    /// paused before its projection. Compaction must retain a global floor so
+    /// that handler fails closed instead of recreating released state.
+    #[tokio::test]
+    async fn addr_ownership_compaction_rejects_projection_older_than_pruned_tombstone() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_110), test_config());
+        let stale_addr = test_addr(20_111);
+        let stale_commit = 1;
+        let mut state = registry.gossip_state.lock().await;
+        state.tombstone_ownership_projection(stale_addr, stale_commit);
+
+        for index in 0..(OWNERSHIP_WATERMARK_CAPACITY + 1) {
+            let octet_hi = ((index >> 8) & 0xff) as u8;
+            let octet_lo = (index & 0xff) as u8;
+            let addr = SocketAddr::from(([10, octet_hi, octet_lo, 7], 31_000));
+            state.tombstone_ownership_projection(addr, (index as CommitSeq) + 2);
+        }
+
+        assert_eq!(
+            state.ownership_watermark(&stale_addr),
+            None,
+            "precondition: the oldest per-address tombstone was compacted"
+        );
+        assert!(
+            !state.admit_ownership_projection(stale_addr, stale_commit),
+            "a delayed projection older than the compacted tombstone must remain rejected"
+        );
+    }
+
+    /// A verified owner can displace a provisional identity after the new
+    /// TLS Hello has already published capabilities at the shared address.
+    /// Cleanup must remove only the displaced identity's capability record,
+    /// never the new handshake's address-keyed value.
+    #[tokio::test]
+    async fn addr_ownership_displacement_preserves_new_owner_hello_capabilities() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_112), test_config());
+        let addr = test_addr(20_113);
+        let old_owner = test_peer_id("addr-caps-old").to_node_id();
+        let new_owner = test_peer_id("addr-caps-new").to_node_id();
+        let old_caps = clock_caps();
+        let hello =
+            crate::handshake::Hello::with_features(vec![crate::handshake::Feature::PeerListGossip]);
+        let new_caps = crate::handshake::PeerCapabilities::from_hello_exchange(&hello, &hello);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut old_peer = PeerInfo::local(addr);
+            old_peer.node_id = Some(old_owner);
+            old_peer.identity_verified = false;
+            state.peers.insert(addr, old_peer);
+        }
+        registry.set_peer_capabilities(addr, old_caps);
+        registry
+            .associate_peer_capabilities_with_node(addr, old_owner)
+            .await;
+
+        // Real inbound order: Hello publishes the new address capabilities
+        // before the authenticated identity claim displaces the provisional
+        // owner. The addr->node association still names the old owner here.
+        registry.set_peer_capabilities(addr, new_caps);
+        registry
+            .add_peer_with_node_id(
+                addr,
+                Some(new_owner),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        registry
+            .associate_peer_capabilities_with_node(addr, new_owner)
+            .await;
+
+        assert_eq!(
+            registry.peer_capabilities.read_sync(&addr, |_, caps| *caps),
+            Some(new_caps),
+            "owner-change cleanup must preserve the new Hello capabilities at the address"
+        );
+        assert_eq!(
+            registry
+                .peer_capabilities_by_node
+                .read_sync(&new_owner, |_, caps| *caps),
+            Some(new_caps),
+            "the displacing owner must retain negotiated capabilities for this session"
+        );
+        assert!(
+            !registry.peer_capabilities_by_node.contains_sync(&old_owner),
+            "the displaced owner's identity-keyed capabilities must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_same_owner_projection_reports_accepted_when_authority_still_matches() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_114), test_config());
+        let addr = test_addr(20_115);
+        let owner = test_peer_id("same-owner-stale-projection").to_node_id();
+
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    addr,
+                    Some(owner),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .tombstone_ownership_projection(addr, CommitSeq::MAX);
+
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    addr,
+                    Some(owner),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Accepted,
+            "a superseded projection is still an accepted claim when the authoritative owner is unchanged"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(owner.to_peer_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn displacement_cleanup_preserves_same_identity_actor_refreshed_at_new_address() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_116), test_config());
+        let contested = test_addr(20_117);
+        let refreshed_addr = test_addr(20_118);
+        let displaced_peer = test_peer_id("displaced-actor-refresh-old");
+        let displaced_node = displaced_peer.to_node_id();
+        let successor = test_peer_id("displaced-actor-refresh-new").to_node_id();
+        let actor_name = "displaced/actor/refreshed".to_string();
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut displaced = PeerInfo::local(contested);
+            displaced.node_id = Some(displaced_node);
+            displaced.identity_verified = false;
+            state.peers.insert(contested, displaced);
+            state
+                .peer_to_actors
+                .entry(contested)
+                .or_default()
+                .insert(actor_name.clone());
+        }
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            actor_name.clone(),
+            RemoteActorLocation::new_with_peer(refreshed_addr, displaced_peer.clone()),
+        );
+
+        registry
+            .add_peer_with_node_id(
+                contested,
+                Some(successor),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let refreshed = registry
+            .actor_state
+            .known_actors
+            .read_sync(&actor_name, |_, location| location.clone());
+        assert_eq!(
+            refreshed.map(|location| location.address),
+            Some(refreshed_addr.to_string()),
+            "cleanup for the displaced address must not delete a fresh route for the same identity at another address"
+        );
+    }
+
+    /// A remote peer claiming this node's own bind/advertised address is
+    /// rejected outright, regardless of current ownership state.
+    #[tokio::test]
+    async fn addr_ownership_local_address_claim_is_rejected() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_005), test_config());
+        let attacker = test_peer_id("addr-ownership-local-attacker").to_node_id();
+
+        registry
+            .add_peer_with_node_id(
+                registry.bind_addr,
+                Some(attacker),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.peers.contains_key(&registry.bind_addr),
+            "a remote claim on this node's own bind address must never be adopted"
+        );
+        drop(gossip_state);
+        let addr_to_peer_id_entry = registry
+            .connection_pool
+            .addr_to_peer_id
+            .read_sync(&registry.bind_addr, |_, v| v.clone());
+        assert_eq!(
+            addr_to_peer_id_entry, None,
+            "the local address must never be routed to a remote claimant"
+        );
+    }
+
+    /// Regression: a legitimate same-owner refresh, and a first claim of a
+    /// brand-new address, both still succeed after the arbitration wiring.
+    #[tokio::test]
+    async fn addr_ownership_same_owner_refresh_and_new_address_claim_still_succeed() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_006), test_config());
+        let owner = test_peer_id("addr-ownership-legit-owner").to_node_id();
+
+        // First verified claim of a brand-new (unowned) address.
+        let new_addr = test_addr(20_007);
+        registry
+            .add_peer_with_node_id(
+                new_addr,
+                Some(owner),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(
+            snapshot_peer(&registry, new_addr).await.node_id,
+            Some(owner)
+        );
+
+        // Same-owner refresh, now with a Verified claim (kind upgrade path).
+        registry
+            .add_peer_with_node_id(
+                new_addr,
+                Some(owner),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(
+            snapshot_peer(&registry, new_addr).await.node_id,
+            Some(owner),
+            "a same-owner refresh must still succeed"
+        );
+    }
+
+    /// An ownership decision is atomic inside the owner actor, but the
+    /// projection of that decision into `peers` happens later, at the
+    /// claimant's own pace. This pins the ordering token that keeps a
+    /// claimant which arrives after a NEWER commit was already projected from
+    /// overwriting it with its own, older outcome.
+    #[tokio::test]
+    async fn stale_ownership_projection_never_overwrites_a_newer_commit() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_101),
+            test_config_with_seed("ownership-projection-order"),
+        );
+        let addr = test_addr(20_102);
+        let squatter = test_peer_id("projection-order-squatter");
+        let real = test_peer_id("projection-order-real");
+
+        // Claim A commits in the actor, but its caller has not projected it
+        // yet: it is still holding the outcome.
+        let a_commit = registry
+            .registry_owner
+            .claim(
+                addr,
+                crate::addr_ownership::Claim {
+                    node_id: squatter.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let a_seq = a_commit.commit_seq().expect("claim A must commit");
+
+        // Claim A's session releases authority, then claim B commits and DOES
+        // project all the way through while A's accepted projection remains
+        // stalled.
+        registry
+            .registry_owner
+            .release(addr, squatter.clone(), a_seq)
+            .await
+            .expect("claim A owner releases before claim B");
+        let b_outcome = registry
+            .add_peer_with_node_id(
+                addr,
+                Some(real.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(b_outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // The watermark is reachable ONLY through the `gossip_state` guard,
+        // so the check and the state it protects are read in one critical
+        // section here, exactly as the production path applies them.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let b_seq = gossip_state
+                .ownership_watermark(&addr)
+                .expect("claim B must have recorded a projection watermark");
+            assert!(
+                b_seq > a_seq,
+                "the displacing claim must commit after the claim it displaced"
+            );
+            assert_eq!(
+                gossip_state.peers.get(&addr).and_then(|peer| peer.node_id),
+                Some(real.to_node_id())
+            );
+
+            // Claim A's caller finally gets around to projecting. Its outcome
+            // is older than what is already applied for this address, so it
+            // is refused, and the refusal is observed against the very state
+            // it would have overwritten, under this same guard.
+            assert!(
+                !gossip_state.admit_ownership_projection(addr, a_seq),
+                "a projection older than the newest applied one must be refused"
+            );
+            assert_eq!(
+                gossip_state.peers.get(&addr).and_then(|peer| peer.node_id),
+                Some(real.to_node_id()),
+                "the newer owner's projection must survive the stale one"
+            );
+        }
+        assert_eq!(registry.registry_owner.routes_to(&addr), Some(real.clone()));
+
+        // The same rule end to end through the production path: a claim whose
+        // commit lands behind a projection that is already applied for the
+        // address mirrors nothing. Because no different authoritative owner
+        // was installed in this synthetic case, the claim itself remains
+        // accepted even though its stale projection is skipped.
+        let contended = test_addr(20_103);
+        let latecomer = test_peer_id("projection-order-latecomer");
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .tombstone_ownership_projection(contended, CommitSeq::MAX);
+
+        let late_outcome = registry
+            .add_peer_with_node_id(
+                contended,
+                Some(latecomer.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(
+            late_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted,
+            "a skipped projection is not an ownership conflict while authority still matches"
+        );
+        assert!(
+            !registry
+                .gossip_state
+                .lock()
+                .await
+                .peers
+                .contains_key(&contended),
+            "a superseded claim must not project a peer entry"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .get_configured_peer_addr(&latecomer)
+                .is_none(),
+            "a superseded claim must not run the follow-up connection indexing"
+        );
+    }
+
+    /// The admission check and the projection it authorizes must occupy ONE
+    /// critical section.
+    ///
+    /// A claimant is started while this test holds the `gossip_state` guard,
+    /// so it has already obtained its committed outcome from the owner actor
+    /// and is parked on the mutex. The address is then advanced past that
+    /// outcome and given a different owner INSIDE the held guard. Because the
+    /// claimant can only test its outcome after it acquires the same guard, it
+    /// necessarily observes the advance and stands down. Were the check made
+    /// in a separate structure before the guard — as a lock-free side map
+    /// would allow — it would have passed before the advance was applied and
+    /// the claimant would then have overwritten the newer owner's projection
+    /// on acquiring the mutex.
+    #[tokio::test]
+    async fn ownership_admission_and_projection_share_one_critical_section() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_111),
+            test_config_with_seed("ownership-single-section"),
+        );
+        let addr = test_addr(20_112);
+        let stalled = test_peer_id("single-section-stalled");
+        let winner = test_peer_id("single-section-winner");
+
+        let mut guard = registry.gossip_state.lock().await;
+
+        // The claimant runs concurrently: it reaches the owner actor (which
+        // never touches `gossip_state`) and then parks on this guard.
+        let claimant = tokio::spawn({
+            let registry = registry.clone();
+            let stalled = stalled.clone();
+            async move {
+                registry
+                    .add_peer_with_node_id(
+                        addr,
+                        Some(stalled.to_node_id()),
+                        crate::addr_ownership::ClaimKind::Verified,
+                    )
+                    .await
+            }
+        });
+
+        // Wait until the stalled task has committed in the owner actor and is
+        // genuinely parked only on this guard.
+        for _ in 0..100 {
+            if registry.registry_owner.routes_to(&addr) == Some(stalled.clone()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(stalled.clone()),
+            "stalled claimant must commit before the winner"
+        );
+        let stalled_generation = registry
+            .registry_owner
+            .claim_generation_for_test(addr)
+            .await
+            .expect("stalled claim generation must be authoritative");
+
+        // The stalled session releases authority and a newer verified commit
+        // takes the address. Its derived projection is applied entirely
+        // inside the critical section the claimant is waiting for.
+        registry
+            .registry_owner
+            .release(addr, stalled.clone(), stalled_generation)
+            .await
+            .expect("stalled owner releases before winner");
+        let winner_commit = registry
+            .registry_owner
+            .claim(
+                addr,
+                crate::addr_ownership::Claim {
+                    node_id: winner.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let winner_seq = winner_commit.commit_seq().expect("winner must commit");
+        guard.tombstone_ownership_projection(addr, winner_seq);
+        guard.peers.insert(
+            addr,
+            PeerInfo {
+                address: addr,
+                peer_address: None,
+                inbound_observed: false,
+                outbound_dial_success: false,
+                node_id: Some(winner.to_node_id()),
+                dns_name: None,
+                failures: 0,
+                last_attempt: current_timestamp(),
+                last_success: current_timestamp(),
+                last_sequence: 0,
+                last_sent_sequence: 0,
+                consecutive_deltas: 0,
+                last_failure_time: None,
+                last_dns_refresh_attempt: None,
+                last_response_received_ms: crate::current_timestamp_millis(),
+                accept_lower_sequence_from: None,
+                current_session_source: None,
+                current_session_connection: None,
+                current_session_epoch: 0,
+                identity_verified: true,
+            },
+        );
+        drop(guard);
+
+        let outcome = claimant.await.expect("claimant task must not panic");
+        assert_eq!(
+            outcome,
+            crate::addr_ownership::AddrClaimOutcome::Rejected,
+            "a claimant that can only test its outcome inside the guard must \
+             see the advance that happened there"
+        );
+        assert_eq!(
+            snapshot_peer(&registry, addr).await.node_id,
+            Some(winner.to_node_id()),
+            "the projection made inside the guard must survive the stalled claimant"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .get_configured_peer_addr(&stalled)
+                .is_none(),
+            "a refused claimant must not index its connection either"
+        );
+    }
+
+    /// A release does not clear the address's watermark, it advances it.
+    ///
+    /// Clearing would let a claim that committed BEFORE the release pass
+    /// admission against an absent entry and rebuild peer/connection state at
+    /// an address its claimant no longer owns.
+    #[tokio::test]
+    async fn release_tombstone_blocks_a_stalled_older_claim() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_121),
+            test_config_with_seed("ownership-release-tombstone"),
+        );
+        let addr = test_addr(20_122);
+        let leaver = test_peer_id("tombstone-leaver");
+
+        // The claim commits, and its caller stalls before projecting.
+        let commit = registry
+            .registry_owner
+            .claim(
+                addr,
+                crate::addr_ownership::Claim {
+                    node_id: leaver.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let stalled_seq = commit.commit_seq().expect("the claim must commit");
+
+        // The address is then released, at a strictly later position.
+        let release_seq = registry
+            .registry_owner
+            .release(addr, leaver.clone(), stalled_seq)
+            .await
+            .expect("the owner must release the address it holds");
+        assert!(release_seq > stalled_seq);
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .tombstone_ownership_projection(addr, release_seq);
+
+        // The stalled caller finally arrives: refused, and nothing projected.
+        let mut gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.admit_ownership_projection(addr, stalled_seq),
+            "a claim older than the release tombstone must be refused"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&addr),
+            "a refused claim must not recreate the released peer entry"
+        );
+        assert_eq!(
+            gossip_state.ownership_watermark(&addr),
+            Some(release_seq),
+            "the tombstone must remain as the floor, not be replaced by the stale claim"
+        );
+        drop(gossip_state);
+        assert!(registry.registry_owner.routes_to(&addr).is_none());
+    }
+
+    /// The owner actor publishes a release before cleanup can acquire
+    /// `gossip_state` to install its projection tombstone. A FullSync carrying
+    /// the released claim generation must consult that authoritative commit,
+    /// not admit itself merely because the derived watermark is still equal.
+    #[tokio::test]
+    async fn full_sync_is_fenced_by_committed_release_before_tombstone_projection() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_123),
+            test_config_with_seed("full-sync-release-before-tombstone"),
+        );
+        let addr = test_addr(20_124);
+        let peer = test_peer_id("full-sync-released-owner");
+        let actor_name = "released/full-sync/actor".to_string();
+
+        let (outcome, claim_receipt) = registry
+            .add_peer_with_node_id_generation(
+                addr,
+                Some(peer.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        let generation = claim_receipt
+            .expect("authenticated claim receipt")
+            .generation();
+        registry
+            .registry_owner
+            .release(addr, peer.clone(), generation)
+            .await
+            .expect("release commits in the owner actor");
+
+        assert_eq!(registry.registry_owner.routes_to(&addr), None);
+        assert_eq!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .ownership_watermark(&addr),
+            Some(generation),
+            "test precondition: cleanup has not projected the newer release tombstone"
+        );
+
+        let remote_local = HashMap::from([(
+            actor_name.clone(),
+            RemoteActorLocation::new_with_peer(addr, peer.clone()),
+        )]);
+        assert!(
+            !registry
+                .merge_full_sync_from_owned(
+                    remote_local,
+                    HashMap::new(),
+                    peer.clone(),
+                    addr,
+                    Some(addr),
+                    Some(addr),
+                    1,
+                    current_timestamp(),
+                    generation,
+                )
+                .await,
+            "a claim generation released by the owner actor must be rejected immediately"
+        );
+        assert!(registry.lookup_actor(&actor_name).await.is_none());
+        let state = registry.gossip_state.lock().await;
+        let projected_peer = state
+            .peers
+            .get(&addr)
+            .expect("stale peer projection remains");
+        assert_eq!(projected_peer.last_sequence, 0);
+        assert!(
+            state
+                .peer_to_actors
+                .get(&addr)
+                .is_none_or(|actors| !actors.contains(&actor_name))
+        );
+        assert_eq!(state.full_sync_exchanges, 0);
+    }
+
+    /// A migration tombstones the address it vacated for the same reason a
+    /// release does, and fences the destination it occupied.
+    #[tokio::test]
+    async fn migrate_tombstone_blocks_a_stalled_older_claim() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_131),
+            test_config_with_seed("ownership-migrate-tombstone"),
+        );
+        let from = test_addr(20_132);
+        let to = test_addr(20_133);
+        let mover = test_peer_id("tombstone-mover");
+
+        let commit = registry
+            .registry_owner
+            .claim(
+                from,
+                crate::addr_ownership::Claim {
+                    node_id: mover.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let stalled_seq = commit.commit_seq().expect("the claim must commit");
+
+        let move_seq = registry
+            .registry_owner
+            .migrate(
+                from,
+                to,
+                crate::registry_owner::SourceExpectation::Owned(
+                    registry
+                        .registry_owner
+                        .ownership_token(&from)
+                        .expect("the source ownership generation must be published"),
+                ),
+                false,
+            )
+            .await
+            .commit_seq()
+            .expect("an owned source must move onto a free destination");
+        assert!(move_seq > stalled_seq);
+
+        let mut gossip_state = registry.gossip_state.lock().await;
+        gossip_state.tombstone_ownership_projection(from, move_seq);
+        gossip_state.tombstone_ownership_projection(to, move_seq);
+
+        assert!(
+            !gossip_state.admit_ownership_projection(from, stalled_seq),
+            "a claim older than the migration must not project onto the vacated address"
+        );
+        assert!(
+            !gossip_state.admit_ownership_projection(to, stalled_seq),
+            "nor onto the address the migration moved to"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&from) && !gossip_state.peers.contains_key(&to),
+            "a refused claim must project no peer entry at either address"
+        );
+    }
+
+    /// A DNS move commits in the owner task before it can acquire the
+    /// address-keyed projection lock. If a newer claim projects onto the
+    /// vacated source in that gap, the stale move must not remove and carry
+    /// the newer claimant's PeerInfo to the destination.
+    #[tokio::test]
+    async fn dns_refresh_does_not_move_a_newer_source_projection() {
+        struct GatedResolver {
+            resolved: Vec<SocketAddr>,
+            entered: Arc<tokio::sync::Semaphore>,
+            release: Arc<tokio::sync::Barrier>,
+        }
+
+        impl crate::dns::DnsResolver for GatedResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move {
+                    self.entered.add_permits(1);
+                    self.release.wait().await;
+                    Ok(self.resolved.clone())
+                })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5150".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5150".parse().unwrap();
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            test_addr(20_150),
+            test_config_with_seed("dns-refresh-stale-projection"),
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        registry
+            .set_dns_resolver(Arc::new(GatedResolver {
+                resolved: vec![new_addr],
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .await;
+
+        let mover = test_peer_id("dns-refresh-stale-mover");
+        let successor = test_peer_id("dns-refresh-stale-successor");
+        let mover_commit = registry
+            .registry_owner
+            .claim(
+                old_addr,
+                crate::addr_ownership::Claim {
+                    node_id: mover.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await
+            .commit_seq()
+            .expect("mover claim");
+        {
+            let mut state = registry.gossip_state.lock().await;
+            assert!(state.admit_ownership_projection(old_addr, mover_commit));
+            let mut peer = PeerInfo::local(old_addr);
+            peer.node_id = Some(mover.to_node_id());
+            peer.identity_verified = true;
+            peer.dns_name = Some("stale-move.invalid:5150".to_string());
+            state.peers.insert(old_addr, peer);
+        }
+
+        let refresh_registry = registry.clone();
+        let refresh =
+            tokio::spawn(async move { refresh_registry.refresh_peer_dns(old_addr).await });
+
+        // The resolver gate is reached after refresh_peer_dns has sampled the
+        // old PeerInfo and dropped the guard. Hold that guard while releasing
+        // DNS so the owner migration can commit but its projection cannot.
+        entered.acquire().await.expect("resolver entered").forget();
+        let mut state = registry.gossip_state.lock().await;
+        release.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.registry_owner.routes_to(&new_addr) != Some(mover.clone()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner migration must commit while projection is stalled");
+
+        let successor_commit = registry
+            .registry_owner
+            .claim(
+                old_addr,
+                crate::addr_ownership::Claim {
+                    node_id: successor.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await
+            .commit_seq()
+            .expect("newer source claim");
+        assert!(state.admit_ownership_projection(old_addr, successor_commit));
+        let mut successor_peer = PeerInfo::local(old_addr);
+        successor_peer.node_id = Some(successor.to_node_id());
+        successor_peer.identity_verified = true;
+        state.peers.insert(old_addr, successor_peer);
+        drop(state);
+
+        assert_eq!(
+            refresh.await.expect("refresh task"),
+            None,
+            "a migration whose source projection is stale must abort"
+        );
+        let state = registry.gossip_state.lock().await;
+        assert_eq!(
+            state.peers.get(&old_addr).and_then(|peer| peer.node_id),
+            Some(successor.to_node_id()),
+            "the newer source claimant must remain at the source"
+        );
+        assert!(
+            !state.peers.contains_key(&new_addr),
+            "the stale migration must not carry the newer PeerInfo to its destination"
+        );
+        drop(state);
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            Some(successor)
+        );
+        assert_eq!(registry.registry_owner.routes_to(&new_addr), Some(mover));
+    }
+
+    /// A DNS re-resolution asks the owner actor to move ownership BEFORE it
+    /// publishes the new address anywhere else, so a destination that a
+    /// competing identity already owns leaves the peer entirely where it was
+    /// rather than half-moved.
+    #[tokio::test]
+    async fn dns_refresh_onto_a_contested_address_moves_nothing() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5000".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5000".parse().unwrap();
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_104),
+            test_config_with_seed("dns-refresh-contested"),
+        );
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![new_addr])))
+            .await;
+
+        let mover = test_peer_id("dns-refresh-mover");
+        let holder = test_peer_id("dns-refresh-holder");
+
+        // The peer that is about to be re-resolved owns its current address.
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    old_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: mover.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        // A DIFFERENT identity already owns the address DNS now resolves to.
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    new_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: holder.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        // The pool index is a publication of ownership, not the record of it.
+        // Drop the destination's entry so the pre-existing pool-collision
+        // pre-check cannot stand in for the ownership check under test.
+        let _ = registry
+            .connection_pool
+            .addr_to_peer_id
+            .remove_sync(&new_addr);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(old_addr);
+            peer.node_id = Some(mover.to_node_id());
+            peer.dns_name = Some("mover.invalid:5000".to_string());
+            gossip_state.peers.insert(old_addr, peer);
+        }
+
+        assert_eq!(
+            registry.refresh_peer_dns(old_addr).await,
+            None,
+            "a contested destination must report that no migration happened"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state.peers.contains_key(&old_addr),
+            "the peer entry must stay at its original address"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&new_addr),
+            "no peer entry may be published onto the contested address"
+        );
+        drop(gossip_state);
+        assert!(
+            registry
+                .connection_pool
+                .get_peer_id_by_addr(&new_addr)
+                .is_none(),
+            "the connection pool must not be re-keyed onto the contested address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            Some(mover),
+            "ownership of the original address must be intact"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&new_addr),
+            Some(holder),
+            "the contested address must still belong to its owner"
+        );
+    }
+
+    /// DNS is external input. Even when the resolved address passes the dial
+    /// security policy, it must never migrate a remote peer onto this
+    /// registry's own bind/advertised address. The owner actor is the final
+    /// authority for this decision, just as it is for ordinary claims.
+    #[tokio::test]
+    async fn dns_refresh_onto_local_address_moves_nothing() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5200".parse().unwrap();
+        let bind_addr = test_addr(20_142);
+        let config = GossipConfig {
+            // Keep the dial-policy gate open so the ownership-locality gate,
+            // rather than the generic loopback filter, is what rejects this.
+            allow_loopback_discovery: true,
+            ..test_config_with_seed("dns-refresh-local-destination")
+        };
+        let registry = GossipRegistry::<()>::new(bind_addr, config);
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![bind_addr])))
+            .await;
+
+        let mover = test_peer_id("dns-refresh-local-mover");
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    old_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: mover.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(old_addr);
+            peer.node_id = Some(mover.to_node_id());
+            peer.dns_name = Some("self.invalid:5200".to_string());
+            gossip_state.peers.insert(old_addr, peer);
+        }
+
+        assert_eq!(
+            registry.refresh_peer_dns(old_addr).await,
+            None,
+            "DNS must not migrate a remote peer onto this registry's local address"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(gossip_state.peers.contains_key(&old_addr));
+        assert!(!gossip_state.peers.contains_key(&bind_addr));
+        drop(gossip_state);
+        assert_eq!(registry.registry_owner.routes_to(&old_addr), Some(mover));
+        assert_eq!(registry.registry_owner.routes_to(&bind_addr), None);
+    }
+
+    /// A DNS re-resolution resolves the identity to carry across BEFORE it
+    /// asks the owner actor to move ownership. If that identity has been
+    /// displaced on the source address in between, the move is refused and
+    /// the connection-index re-key that would otherwise follow is not
+    /// performed for the wrong identity.
+    #[tokio::test]
+    async fn dns_refresh_aborts_when_the_source_owner_was_displaced() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5100".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5100".parse().unwrap();
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_140),
+            test_config_with_seed("dns-refresh-displaced-source"),
+        );
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![new_addr])))
+            .await;
+
+        let captured = test_peer_id("dns-refresh-captured");
+        let usurper = test_peer_id("dns-refresh-usurper");
+
+        // Ownership of the source address ends up with `usurper`.
+        let captured_claim = registry
+            .registry_owner
+            .claim(
+                old_addr,
+                crate::addr_ownership::Claim {
+                    node_id: captured.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let captured_generation = captured_claim
+            .commit_seq()
+            .expect("captured owner claim commits");
+        registry
+            .registry_owner
+            .release(old_addr, captured.clone(), captured_generation)
+            .await
+            .expect("captured owner releases before usurper");
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    old_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: usurper.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        // The pool index is what the refresh reads to resolve the identity to
+        // carry across. Pin it to the identity that has since been displaced,
+        // which is exactly the state a refresh that sampled it earlier holds.
+        let _ = registry
+            .connection_pool
+            .addr_to_peer_id
+            .upsert_sync(old_addr, captured.clone());
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(old_addr);
+            peer.node_id = Some(captured.to_node_id());
+            peer.dns_name = Some("displaced.invalid:5100".to_string());
+            gossip_state.peers.insert(old_addr, peer);
+        }
+
+        assert_eq!(
+            registry.refresh_peer_dns(old_addr).await,
+            None,
+            "a displaced source identity must report that no migration happened"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state.peers.contains_key(&old_addr),
+            "the peer entry must stay at its original address"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&new_addr),
+            "no peer entry may be published onto the new address"
+        );
+        drop(gossip_state);
+        assert!(
+            registry
+                .connection_pool
+                .get_peer_id_by_addr(&new_addr)
+                .is_none(),
+            "the connection index must not be re-keyed onto the new address"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .peer_id_to_addr
+                .read_sync(&captured, |_, addr| *addr)
+                .is_none_or(|addr| addr != new_addr),
+            "the displaced identity must not be re-keyed onto the new address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            Some(usurper),
+            "ownership of the source address must stay with the identity that holds it"
+        );
+        assert_eq!(
+            registry.registry_owner.owner_of(&new_addr),
+            None,
+            "and the destination must be left unowned"
+        );
+    }
+
+    /// An outbound dial whose cert-verified identity loses address
+    /// arbitration attributes nothing: the accepted owner's routing entry is
+    /// the one that survives. This is the state the outbound connect path
+    /// acts on when it refuses to continue to the finalize step, which would
+    /// otherwise republish the address for the losing identity.
+    #[tokio::test]
+    async fn a_rejected_address_claim_publishes_no_route_for_the_loser() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_141),
+            test_config_with_seed("rejected-claim-publishes-nothing"),
+        );
+        let contested: SocketAddr = "9.10.11.12:5200".parse().unwrap();
+        let accepted = test_peer_id("arbitration-winner");
+        let loser = test_peer_id("arbitration-loser");
+
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    contested,
+                    Some(accepted.to_node_id()),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+        assert_eq!(
+            registry.connection_pool.get_peer_id_by_addr(&contested),
+            Some(accepted.clone())
+        );
+
+        // The losing dial submits the very same claim the outbound connect
+        // path submits from a cert-verified identity.
+        assert_eq!(
+            registry
+                .add_peer_with_node_id(
+                    contested,
+                    Some(loser.to_node_id()),
+                    crate::addr_ownership::ClaimKind::Verified,
+                )
+                .await,
+            crate::addr_ownership::AddrClaimOutcome::Rejected
+        );
+
+        assert_eq!(
+            registry.connection_pool.get_peer_id_by_addr(&contested),
+            Some(accepted.clone()),
+            "the accepted owner's route must be untouched by a rejected claim"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&contested),
+            Some(accepted.clone()),
+            "and ownership must stay with the accepted owner"
+        );
+        assert!(
+            registry
+                .connection_pool
+                .peer_id_to_addr
+                .read_sync(&loser, |_, _| ())
+                .is_none(),
+            "the losing identity must have no address attributed to it"
+        );
+        let gossip_state = registry.gossip_state.lock().await;
+        assert_eq!(
+            gossip_state
+                .peers
+                .get(&contested)
+                .and_then(|peer| peer.node_id),
+            Some(accepted.to_node_id()),
+            "and the peer entry must not be re-attributed to the loser"
+        );
+    }
+
+    /// A seed configured by host name has no ownership record until it
+    /// completes a handshake, so its re-resolution starts from an UNOWNED
+    /// source. That must not license moving its peer entry and connection
+    /// index onto an address a different identity owns.
+    #[tokio::test]
+    async fn dns_refresh_from_an_unowned_source_cannot_take_a_foreign_address() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5100".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5100".parse().unwrap();
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_141),
+            test_config_with_seed("dns-refresh-unowned-source"),
+        );
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![new_addr])))
+            .await;
+
+        let holder = test_peer_id("dns-unowned-holder");
+        // Only the DESTINATION is owned; the source was never claimed.
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    new_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: holder.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        let _ = registry
+            .connection_pool
+            .addr_to_peer_id
+            .remove_sync(&new_addr);
+        assert!(registry.registry_owner.owner_of(&old_addr).is_none());
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(old_addr);
+            peer.dns_name = Some("seed.invalid:5100".to_string());
+            gossip_state.peers.insert(old_addr, peer);
+        }
+
+        assert_eq!(
+            registry.refresh_peer_dns(old_addr).await,
+            None,
+            "an unowned source must not be migrated onto another identity's address"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state.peers.contains_key(&old_addr),
+            "the seed entry must stay where it was"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&new_addr),
+            "no peer entry may be published onto the owned destination"
+        );
+        drop(gossip_state);
+        assert!(
+            registry
+                .connection_pool
+                .get_peer_id_by_addr(&new_addr)
+                .is_none(),
+            "the connection index must not be re-keyed onto the owned destination"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&new_addr),
+            Some(holder),
+            "the destination's owner keeps its routing"
+        );
+    }
+
+    /// A DNS seed whose source is unowned has no ownership move to undo. If a
+    /// claimant lands on the resolved address after that `SourceUnowned`
+    /// decision but before the derived peer-entry move fails, the failure path
+    /// must not reverse-migrate the unrelated claimant onto the seed's old
+    /// address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dns_source_unowned_failure_never_reverse_migrates_later_claimant() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5300".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5300".parse().unwrap();
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_143),
+            test_config_with_seed("dns-source-unowned-no-reverse"),
+        );
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![new_addr])))
+            .await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut seed = PeerInfo::local(old_addr);
+            seed.dns_name = Some("seed-race.invalid:5300".to_string());
+            state.peers.insert(old_addr, seed);
+        }
+
+        let claimant = test_peer_id("dns-later-destination-claimant");
+        let _guard = {
+            let registry = registry.clone();
+            let claimant = claimant.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                let crate::TransportLifecycleEvent::DnsOwnershipMigrationDecided {
+                    from,
+                    to,
+                    moved,
+                } = event
+                else {
+                    return;
+                };
+                if from != old_addr || to != new_addr {
+                    return;
+                }
+                assert!(!moved, "the unowned source must report no ownership move");
+                crate::set_transport_lifecycle_recorder(None);
+                let registry = registry.clone();
+                let claimant = claimant.clone();
+                tokio::task::block_in_place(move || {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        assert!(
+                            registry
+                                .registry_owner
+                                .claim(
+                                    new_addr,
+                                    crate::addr_ownership::Claim {
+                                        node_id: claimant.clone(),
+                                        kind: crate::addr_ownership::ClaimKind::Verified,
+                                    },
+                                    false,
+                                )
+                                .await
+                                .is_accepted()
+                        );
+                        let mut state = registry.gossip_state.lock().await;
+                        let mut collision = PeerInfo::local(new_addr);
+                        collision.node_id = Some(claimant.to_node_id());
+                        state.peers.insert(new_addr, collision);
+                    });
+                });
+            }))
+        };
+
+        assert_eq!(registry.refresh_peer_dns(old_addr).await, None);
+        assert_eq!(
+            registry.registry_owner.routes_to(&new_addr),
+            Some(claimant.clone()),
+            "the later claimant must stay on the resolved address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            None,
+            "SourceUnowned provides no authority to reverse-migrate anything"
+        );
+        let state = registry.gossip_state.lock().await;
+        assert!(state.peers.contains_key(&old_addr));
+        assert_eq!(
+            state.peers.get(&new_addr).and_then(|peer| peer.node_id),
+            Some(claimant.to_node_id())
+        );
+    }
+
+    /// Eviction releases ownership after the `peers` guard is gone, so a peer
+    /// that reconnected in that window may already own the address again. The
+    /// release is scoped to the identity that was actually evicted, so it can
+    /// only ever retract the ownership the eviction invalidated.
+    #[tokio::test]
+    async fn eviction_release_cannot_evict_a_successor_owner() {
+        let config = GossipConfig {
+            max_peers: 1,
+            ..test_config_with_seed("eviction-scoped-release")
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(20_105), config);
+        let victim_addr = test_addr(20_106);
+        let keeper_addr = test_addr(20_107);
+        let evicted = test_peer_id("eviction-evicted-owner");
+        let successor = test_peer_id("eviction-successor-owner");
+
+        // The evicted identity owned the address, and a successor then took
+        // it over -- the state a reconnect racing an eviction produces.
+        let evicted_claim = registry
+            .registry_owner
+            .claim(
+                victim_addr,
+                crate::addr_ownership::Claim {
+                    node_id: evicted.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let evicted_generation = evicted_claim
+            .commit_seq()
+            .expect("evicted owner claim commits");
+        registry
+            .registry_owner
+            .release(victim_addr, evicted.clone(), evicted_generation)
+            .await
+            .expect("evicted session releases before successor");
+        assert!(
+            registry
+                .registry_owner
+                .claim(
+                    victim_addr,
+                    crate::addr_ownership::Claim {
+                        node_id: successor.clone(),
+                        kind: crate::addr_ownership::ClaimKind::Verified,
+                    },
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut victim = PeerInfo::local(victim_addr);
+            victim.node_id = Some(evicted.to_node_id());
+            victim.last_success = 1;
+            gossip_state.peers.insert(victim_addr, victim);
+            assert!(gossip_state.admit_ownership_projection(victim_addr, evicted_generation));
+
+            let mut keeper = PeerInfo::local(keeper_addr);
+            keeper.last_success = 9_999;
+            gossip_state.peers.insert(keeper_addr, keeper);
+        }
+
+        registry.enforce_bounds().await;
+
+        assert!(
+            !registry
+                .gossip_state
+                .lock()
+                .await
+                .peers
+                .contains_key(&victim_addr),
+            "the eviction under test must actually have evicted the victim"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&victim_addr),
+            Some(successor),
+            "an eviction must not retract the ownership a successor committed"
+        );
+
+        // The same eviction path DOES release when the identity it evicted is
+        // still the owner at release time.
+        let uncontested_addr = test_addr(20_108);
+        let uncontested = test_peer_id("eviction-uncontested-owner");
+        let uncontested_claim = registry
+            .registry_owner
+            .claim(
+                uncontested_addr,
+                crate::addr_ownership::Claim {
+                    node_id: uncontested.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let uncontested_generation = uncontested_claim
+            .commit_seq()
+            .expect("uncontested owner claim commits");
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(uncontested_addr);
+            peer.node_id = Some(uncontested.to_node_id());
+            peer.last_success = 1;
+            gossip_state.peers.insert(uncontested_addr, peer);
+            assert!(
+                gossip_state.admit_ownership_projection(uncontested_addr, uncontested_generation)
+            );
+        }
+
+        registry.enforce_bounds().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&uncontested_addr),
+            None,
+            "an eviction must release the ownership it did invalidate"
         );
     }
 }

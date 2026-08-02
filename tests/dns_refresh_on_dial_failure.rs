@@ -115,7 +115,11 @@ async fn dial_failure_triggers_dns_refresh_and_reconnect_succeeds() -> icanact_r
 
     // Configure a peer using a stale address + a DNS name that resolves to the live address.
     a.registry
-        .add_peer_with_node_id(stale_addr, Some(b_peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            stale_addr,
+            Some(b_peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     a.registry
         .configure_peer(b_peer_id.clone(), stale_addr)
@@ -164,7 +168,11 @@ async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact
     a.registry.set_dns_resolver(resolver.clone()).await;
 
     a.registry
-        .add_peer_with_node_id(stale_addr, Some(b_peer_id.to_node_id()))
+        .add_peer_with_node_id(
+            stale_addr,
+            Some(b_peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
+        )
         .await;
     a.registry
         .configure_peer(b_peer_id.clone(), stale_addr)

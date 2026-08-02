@@ -114,6 +114,7 @@ async fn higher_id_supervisor_reconnect_completes_within_debounce_window() {
         .add_peer_with_node_id(
             low.registry.bind_addr,
             Some(low.registry.peer_id.to_node_id()),
+            icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
     high.registry
