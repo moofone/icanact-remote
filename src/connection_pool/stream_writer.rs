@@ -431,6 +431,15 @@ fn finish_streaming_command_slice(
     }
 }
 
+#[inline]
+fn should_flush_stream_output(
+    bytes_since_flush: usize,
+    pending_stream_cmd: Option<&PendingStreamingCommand>,
+    yielded_stream_cmd: Option<&PendingStreamingCommand>,
+) -> bool {
+    bytes_since_flush > 0 && pending_stream_cmd.is_none() && yielded_stream_cmd.is_none()
+}
+
 /// Truly lock-free streaming handle with dedicated background writer
 #[derive(Clone)]
 pub struct LockFreeStreamHandle {
@@ -1967,7 +1976,11 @@ impl LockFreeStreamHandle {
             }
 
             bytes_since_flush += total_bytes_written;
-            if bytes_since_flush > 0 {
+            if should_flush_stream_output(
+                bytes_since_flush,
+                pending_stream_cmd.as_ref(),
+                yielded_stream_cmd.as_ref(),
+            ) {
                 let _ = stream.flush().await;
                 bytes_since_flush = 0;
                 flush_pending.store(false, Ordering::Release);

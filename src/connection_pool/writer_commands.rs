@@ -214,9 +214,9 @@ struct LocalStreamingQueue {
     queue: std::collections::VecDeque<StreamingCommand>,
     queued_bytes: usize,
     /// A response command has been handed to the IO owner and has not yet
-    /// reached its terminal Flush. Keep admission closed while the queue is
-    /// empty too: the in-flight command is still retaining bytes that the
-    /// queue counters no longer include.
+    /// reached its terminal Flush. The retained command is not included in
+    /// `queued_bytes`, so response admission accounts for it separately while
+    /// the read side remains free to drain the peer.
     response_in_flight: bool,
     wire_blocked: bool,
     /// Reserve room for one maximum-sized response when reading another
@@ -296,13 +296,7 @@ impl LocalStreamingQueue {
     /// retained without copying it first. If the bounded queue cannot fit it,
     /// the single deferred-response slot is the admission path.
     fn can_admit_response(&self, command_count: usize, response_bytes: usize) -> bool {
-        if self.deferred.is_some()
-            || (self.response_in_flight
-                && self
-                    .queue
-                    .iter()
-                    .all(|command| matches!(command, StreamingCommand::Flush)))
-        {
+        if self.deferred.is_some() {
             return false;
         }
         let fits_queue = self.queue.len().saturating_add(command_count)
@@ -318,14 +312,6 @@ impl LocalStreamingQueue {
 
     fn is_full(&self) -> bool {
         if self.deferred.is_some() {
-            return true;
-        }
-        if self.response_in_flight
-            && self
-                .queue
-                .iter()
-                .all(|command| matches!(command, StreamingCommand::Flush))
-        {
             return true;
         }
         if self.queue.is_empty() {

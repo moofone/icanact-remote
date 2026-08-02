@@ -1337,7 +1337,7 @@ fn immediate_bytes_response_admission_stays_lazy_for_many_frames() {
 }
 
 #[test]
-fn response_in_flight_with_only_flush_closes_admission() {
+fn response_in_flight_with_only_flush_keeps_read_admission_open() {
     let mut queue = LocalStreamingQueue::new();
     queue
         .try_extend([
@@ -1349,9 +1349,28 @@ fn response_in_flight_with_only_flush_closes_admission() {
     let response = queue.pop_front().expect("response command");
     assert!(matches!(response, StreamingCommand::WriteBytes(_)));
     assert!(
-        queue.is_full(),
-        "the retained response remains in flight until its terminal flush"
+        !queue.is_full(),
+        "the in-flight response must not stop the read side from draining the peer"
     );
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"next-response")),
+            StreamingCommand::Flush,
+        ])
+        .expect("a bounded response may queue behind the in-flight terminal flush");
+    assert_eq!(queue.queue.len(), 3);
+}
+
+#[test]
+fn partial_streaming_output_defers_flush_until_terminal_flush() {
+    let pending = PendingStreamingCommand::local(StreamingCommand::WriteBytes(
+        bytes::Bytes::from_static(b"partial"),
+    ));
+
+    assert!(!should_flush_stream_output(1, Some(&pending), None));
+    assert!(!should_flush_stream_output(1, None, Some(&pending)));
+    assert!(should_flush_stream_output(1, None, None));
+    assert!(!should_flush_stream_output(0, None, None));
 }
 
 /// A pooled response must retain its original allocation while it waits for
