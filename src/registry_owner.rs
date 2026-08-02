@@ -47,6 +47,45 @@ use crate::addr_ownership::{
 /// decision.
 const OWNER_MAILBOX_CAPACITY: usize = 512;
 
+/// Exact authority held by one ownership generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipToken {
+    owner: PeerId,
+    generation: CommitSeq,
+}
+
+impl OwnershipToken {
+    /// Build a token for `owner` at `generation`.
+    pub fn new(owner: PeerId, generation: CommitSeq) -> Self {
+        Self { owner, generation }
+    }
+
+    /// Authenticated identity holding this generation.
+    pub fn owner(&self) -> &PeerId {
+        &self.owner
+    }
+
+    /// Owner-actor commit that created/refreshed this generation.
+    pub fn generation(&self) -> CommitSeq {
+        self.generation
+    }
+}
+
+/// Source state a migration is conditional on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceExpectation {
+    /// The source must still be unowned.
+    Unowned,
+    /// The source must still be held by this exact owner generation.
+    Owned(OwnershipToken),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedOwner {
+    owner: Owner,
+    generation: CommitSeq,
+}
+
 /// Immutable, lock-free-readable publication of the address ownership table.
 ///
 /// A mutation clones only one bounded shard (two for an address migration),
@@ -56,7 +95,7 @@ const OWNER_MAILBOX_CAPACITY: usize = 512;
 /// the owner mailbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingSnapshot {
-    owner_shards: [Arc<HashMap<SocketAddr, Owner>>; ROUTING_SNAPSHOT_SHARDS],
+    owner_shards: [Arc<HashMap<SocketAddr, PublishedOwner>>; ROUTING_SNAPSHOT_SHARDS],
 }
 
 const ROUTING_SNAPSHOT_SHARDS: usize = 64;
@@ -78,12 +117,37 @@ impl RoutingSnapshot {
 
     /// The recorded owner of `addr`, if any.
     pub fn owner(&self, addr: &SocketAddr) -> Option<&Owner> {
-        self.owner_shards[Self::shard_index(addr)].get(addr)
+        self.owner_shards[Self::shard_index(addr)]
+            .get(addr)
+            .map(|published| &published.owner)
     }
 
     /// The identity `addr` currently routes to, if any.
     pub fn peer_id(&self, addr: &SocketAddr) -> Option<&PeerId> {
         self.owner(addr).map(|owner| &owner.node_id)
+    }
+
+    /// Exact owner generation currently published for `addr`.
+    pub fn ownership_token(&self, addr: &SocketAddr) -> Option<OwnershipToken> {
+        self.owner_shards[Self::shard_index(addr)]
+            .get(addr)
+            .map(|published| {
+                OwnershipToken::new(published.owner.node_id.clone(), published.generation)
+            })
+    }
+
+    /// Whether `owner` and `generation` are still the authoritative claim.
+    pub fn claim_is_current(
+        &self,
+        addr: &SocketAddr,
+        owner: &PeerId,
+        generation: CommitSeq,
+    ) -> bool {
+        self.owner_shards[Self::shard_index(addr)]
+            .get(addr)
+            .is_some_and(|published| {
+                published.owner.node_id == *owner && published.generation == generation
+            })
     }
 
     /// Number of addresses with a recorded owner.
@@ -96,13 +160,13 @@ impl RoutingSnapshot {
         self.owner_shards.iter().all(|shard| shard.is_empty())
     }
 
-    fn with_owner(&self, addr: SocketAddr, owner: Option<Owner>) -> Self {
+    fn with_owner(&self, addr: SocketAddr, owner: Option<(Owner, CommitSeq)>) -> Self {
         let mut next = self.clone();
         let shard_index = Self::shard_index(&addr);
         let mut shard = (*next.owner_shards[shard_index]).clone();
         match owner {
-            Some(owner) => {
-                shard.insert(addr, owner);
+            Some((owner, generation)) => {
+                shard.insert(addr, PublishedOwner { owner, generation });
             }
             None => {
                 shard.remove(&addr);
@@ -129,6 +193,25 @@ pub enum ClaimRejection {
 /// not a timestamp: `a < b` means `a` was committed strictly before `b`.
 pub type CommitSeq = u64;
 
+/// Lifecycle receipt for one accepted claim command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimReceipt {
+    generation: CommitSeq,
+    created_ownership: bool,
+}
+
+impl ClaimReceipt {
+    /// Owner-actor generation accepted for this command.
+    pub fn generation(self) -> CommitSeq {
+        self.generation
+    }
+
+    /// Whether this command created ownership from an unowned address.
+    pub fn created_ownership(self) -> bool {
+        self.created_ownership
+    }
+}
+
 /// The committed result of a claim. An `Accepted` value is only ever produced
 /// after the ownership entry AND the routing publication have already been
 /// applied, so any state the caller derives from it cannot precede it.
@@ -142,6 +225,9 @@ pub enum ClaimCommit {
         /// the owner (a different node id). `None` for a first claim or a
         /// same-node refresh. Drives identity-scoped rekey at the caller.
         displaced: Option<PeerId>,
+        /// Whether this exact command created ownership from an unowned
+        /// address. A same-identity refresh is accepted but returns `false`.
+        created_ownership: bool,
         /// This claim's position in the owner task's commit order.
         ///
         /// The decision is atomic inside the task, but a caller then projects
@@ -174,6 +260,21 @@ impl ClaimCommit {
     pub fn commit_seq(&self) -> Option<CommitSeq> {
         match self {
             Self::Accepted { commit_seq, .. } => Some(*commit_seq),
+            Self::Rejected(_) => None,
+        }
+    }
+
+    /// Lifecycle receipt for a committed claim.
+    pub fn receipt(&self) -> Option<ClaimReceipt> {
+        match self {
+            Self::Accepted {
+                commit_seq,
+                created_ownership,
+                ..
+            } => Some(ClaimReceipt {
+                generation: *commit_seq,
+                created_ownership: *created_ownership,
+            }),
             Self::Rejected(_) => None,
         }
     }
@@ -326,11 +427,9 @@ enum OwnerCommand {
         /// Whether `to` names this registry itself. DNS is external input, so
         /// the serialized owner command must enforce this just like claims do.
         is_local_addr: bool,
-        /// When set, only move if this identity still owns `from`, so a
-        /// caller that resolved the moving identity before submitting the
-        /// command cannot re-key a different identity that displaced it in
-        /// the meantime.
-        expected_source: Option<PeerId>,
+        /// Exact source state observed by the caller before submitting the
+        /// command. Checked inside the serialized owner task.
+        expected_source: SourceExpectation,
         reply: oneshot::Sender<MigrateOutcome>,
     },
     #[cfg(test)]
@@ -405,6 +504,24 @@ impl RegistryOwnerHandle {
         self.shared.snapshot.load().peer_id(addr).cloned()
     }
 
+    /// Lock-free exact owner-generation lookup.
+    pub fn ownership_token(&self, addr: &SocketAddr) -> Option<OwnershipToken> {
+        self.shared.snapshot.load().ownership_token(addr)
+    }
+
+    /// Lock-free revalidation of one accepted claim generation.
+    pub fn claim_is_current(
+        &self,
+        addr: &SocketAddr,
+        owner: &PeerId,
+        generation: CommitSeq,
+    ) -> bool {
+        self.shared
+            .snapshot
+            .load()
+            .claim_is_current(addr, owner, generation)
+    }
+
     /// Submit an address claim and wait for the committed decision.
     ///
     /// CALLERS MUST NOT hold the `gossip_state` guard across this await: the
@@ -471,20 +588,15 @@ impl RegistryOwnerHandle {
     /// unreachable owner is reported as blocked: without a committed decision
     /// no address-keyed move may proceed.
     ///
-    /// `expected_source` pins the identity the caller believes owns `from`.
-    /// Any caller that resolved that identity separately — before submitting
-    /// this command — must pass it, because the resolution and the move are
-    /// not one atomic step and a competing claimant can displace the source's
-    /// owner in between; the move is then refused rather than silently
-    /// carrying a different identity onto the destination. `None` waives the
-    /// check and is correct only when the caller re-keys no identity-scoped
-    /// state, e.g. a seed configured by host name that has never been
-    /// claimed.
+    /// `expected_source` pins either exact owner+generation or exact unowned
+    /// state. A competing claim/refresh between the caller's observation and
+    /// this command therefore refuses the move rather than carrying the wrong
+    /// lifecycle generation onto the destination.
     pub async fn migrate(
         &self,
         from: SocketAddr,
         to: SocketAddr,
-        expected_source: Option<PeerId>,
+        expected_source: SourceExpectation,
         is_local_addr: bool,
     ) -> MigrateOutcome {
         self.ensure_started();
@@ -604,7 +716,7 @@ impl PeerRegistryOwner {
                 is_local_addr,
                 reply,
             } => {
-                let migrated = self.migrate(from, to, expected_source.as_ref(), is_local_addr);
+                let migrated = self.migrate(from, to, &expected_source, is_local_addr);
                 let _ = reply.send(migrated);
             }
             #[cfg(test)]
@@ -623,6 +735,7 @@ impl PeerRegistryOwner {
                 ClaimCommit::Rejected(ClaimRejection::Arbitration(reason))
             }
             Decision::Accept => {
+                let created_ownership = current.is_none();
                 let kind = resolved_kind(current.as_ref(), &claim);
                 let displaced = current
                     .as_ref()
@@ -641,8 +754,11 @@ impl PeerRegistryOwner {
                 // Every accepted refresh is a new lifecycle generation even
                 // when peer identity and claim kind are unchanged.
                 self.claim_generation.insert(addr, commit_seq);
+                // The lock-free snapshot is also the authoritative
+                // generation fence. Refresh it for every accepted command;
+                // route publication itself remains identity/kind-change only.
+                self.publish_owner_snapshot(addr, Some((next_owner, commit_seq)));
                 if ownership_changed {
-                    self.publish_owner_snapshot(addr, Some(next_owner));
                     if let Some(routing) = self.routing.upgrade() {
                         routing.publish_owner(addr, &node_id);
                     }
@@ -650,6 +766,7 @@ impl PeerRegistryOwner {
                 ClaimCommit::Accepted {
                     kind,
                     displaced,
+                    created_ownership,
                     commit_seq,
                 }
             }
@@ -692,15 +809,14 @@ impl PeerRegistryOwner {
     /// "Nothing to move" is therefore only reported once the destination is
     /// known to be free (or already held by the source's own identity).
     ///
-    /// `expected_source`, when set, additionally pins the identity the caller
-    /// resolved as the source's owner. It is checked here, inside the
-    /// serialized command, so the caller's separately-resolved identity and
-    /// the move are decided against the same ownership state.
+    /// `expected_source` pins the exact source state observed by the caller.
+    /// It is checked here, inside the serialized command, so a later owner or
+    /// same-identity generation cannot be carried by a stale migration.
     fn migrate(
         &mut self,
         from: SocketAddr,
         to: SocketAddr,
-        expected_source: Option<&PeerId>,
+        expected_source: &SourceExpectation,
         is_local_addr: bool,
     ) -> MigrateOutcome {
         if is_local_addr {
@@ -712,18 +828,21 @@ impl PeerRegistryOwner {
             return MigrateOutcome::TargetIsLocal;
         }
         let source = self.addr_ownership.get(&from).cloned();
-        if let Some(expected) = expected_source
-            && source
-                .as_ref()
-                .is_none_or(|owner| owner.node_id != *expected)
-        {
-            // Includes the source having become unowned: the caller resolved
-            // an identity to carry across, and it is no longer there to carry.
+        let source_matches = match expected_source {
+            SourceExpectation::Unowned => source.is_none(),
+            SourceExpectation::Owned(expected) => {
+                source
+                    .as_ref()
+                    .is_some_and(|owner| owner.node_id == *expected.owner())
+                    && self.claim_generation.get(&from) == Some(&expected.generation())
+            }
+        };
+        if !source_matches {
             trace!(
                 from = %from,
                 to = %to,
-                expected = %expected,
-                "address migration refused: the source's owner is not the expected identity"
+                expected = ?expected_source,
+                "address migration refused: source owner generation changed"
             );
             return MigrateOutcome::SourceOwnerMismatch;
         }
@@ -765,7 +884,7 @@ impl PeerRegistryOwner {
         let snapshot = self.snapshot.load_full();
         let snapshot = snapshot
             .with_owner(from, None)
-            .with_owner(to, Some(owner.clone()));
+            .with_owner(to, Some((owner.clone(), commit_seq)));
         self.snapshot.store(Arc::new(snapshot));
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(from, &owner.node_id);
@@ -783,7 +902,7 @@ impl PeerRegistryOwner {
 
     /// Publish one address update while structurally sharing every untouched
     /// shard with the previous immutable snapshot.
-    fn publish_owner_snapshot(&self, addr: SocketAddr, owner: Option<Owner>) {
+    fn publish_owner_snapshot(&self, addr: SocketAddr, owner: Option<(Owner, CommitSeq)>) {
         let snapshot = self.snapshot.load_full();
         self.snapshot
             .store(Arc::new(snapshot.with_owner(addr, owner)));
@@ -841,6 +960,13 @@ mod tests {
 
     fn claim_of(node_id: PeerId, kind: ClaimKind) -> Claim {
         Claim { node_id, kind }
+    }
+
+    fn current_source(owner: &RegistryOwnerHandle, addr: SocketAddr) -> SourceExpectation {
+        owner
+            .ownership_token(&addr)
+            .map(SourceExpectation::Owned)
+            .unwrap_or(SourceExpectation::Unowned)
     }
 
     /// Verified first, then a competing Provisional: the truth table's
@@ -908,6 +1034,7 @@ mod tests {
             ClaimCommit::Accepted {
                 kind: ClaimKind::Verified,
                 displaced: None,
+                created_ownership: true,
                 commit_seq: 1,
             }
         );
@@ -946,6 +1073,7 @@ mod tests {
             ClaimCommit::Accepted {
                 kind: ClaimKind::Verified,
                 displaced: None,
+                created_ownership: false,
                 commit_seq: 2,
             }
         );
@@ -955,11 +1083,10 @@ mod tests {
         );
     }
 
-    /// Routine FullSync refreshes advance the projection fence but do not
-    /// rebuild the whole immutable ownership table when neither identity nor
-    /// resolved claim kind changed.
+    /// Routine FullSync refreshes publish their new lifecycle generation but
+    /// do not republish an identical address route.
     #[tokio::test]
-    async fn unchanged_same_owner_refresh_reuses_snapshot_and_route_publication() {
+    async fn unchanged_same_owner_refresh_publishes_generation_not_route() {
         let (owner, publisher) = owner_handle();
         let node = peer("unchanged-refresh");
         let target = addr(30_023);
@@ -967,7 +1094,10 @@ mod tests {
         owner
             .claim(target, claim_of(node.clone(), ClaimKind::Verified), false)
             .await;
-        let snapshot = owner.snapshot();
+        let first_generation = owner
+            .ownership_token(&target)
+            .expect("first ownership token")
+            .generation();
         let published = publisher.events();
 
         let refresh = owner
@@ -979,10 +1109,15 @@ mod tests {
             Some(2),
             "the projection fence advances"
         );
-        assert!(
-            Arc::ptr_eq(&snapshot, &owner.snapshot()),
-            "an unchanged refresh must not clone and republish the full ownership map"
+        assert_eq!(
+            owner
+                .ownership_token(&target)
+                .expect("refreshed ownership token")
+                .generation(),
+            2,
+            "the lock-free authority snapshot must publish the refresh generation"
         );
+        assert!(first_generation < 2);
         assert_eq!(
             publisher.events(),
             published,
@@ -1268,8 +1403,9 @@ mod tests {
         owner
             .claim(from, claim_of(node.clone(), ClaimKind::Provisional), false)
             .await;
+        let source = current_source(&owner, from);
         assert!(
-            owner.migrate(from, to, None, false).await.moved(),
+            owner.migrate(from, to, source, false).await.moved(),
             "an owned source must move onto a free destination"
         );
         assert_eq!(owner.owner_of(&from), None);
@@ -1292,21 +1428,32 @@ mod tests {
             )
             .await;
         assert_eq!(
-            owner.migrate(to, contested, None, false).await,
+            owner
+                .migrate(to, contested, current_source(&owner, to), false)
+                .await,
             MigrateOutcome::TargetOwnedByOther
         );
         // An UNOWNED source moving onto an address someone else owns is
         // blocked too: "nothing to move" would invite the caller to re-key
         // its own state onto the other identity's address.
         assert_eq!(
-            owner.migrate(addr(30_012), contested, None, false).await,
+            owner
+                .migrate(addr(30_012), contested, SourceExpectation::Unowned, false,)
+                .await,
             MigrateOutcome::TargetOwnedByOther,
             "an unowned source must not be allowed onto another identity's address"
         );
         // With a free destination, an unclaimed source is still reported as
         // "nothing to move" — the non-blocking outcome.
         assert_eq!(
-            owner.migrate(addr(30_012), addr(30_013), None, false).await,
+            owner
+                .migrate(
+                    addr(30_012),
+                    addr(30_013),
+                    SourceExpectation::Unowned,
+                    false,
+                )
+                .await,
             MigrateOutcome::SourceUnowned,
             "an unclaimed source with a free destination has nothing to move"
         );
@@ -1328,7 +1475,9 @@ mod tests {
         let events_before = publisher.events();
 
         assert_eq!(
-            owner.migrate(unowned, held, None, false).await,
+            owner
+                .migrate(unowned, held, SourceExpectation::Unowned, false)
+                .await,
             MigrateOutcome::TargetOwnedByOther
         );
         assert_eq!(
@@ -1358,7 +1507,9 @@ mod tests {
         let events_before = publisher.events();
 
         assert_eq!(
-            owner.migrate(from, local, Some(node.clone()), true).await,
+            owner
+                .migrate(from, local, current_source(&owner, from), true)
+                .await,
             MigrateOutcome::TargetIsLocal
         );
         assert_eq!(owner.routes_to(&from), Some(node));
@@ -1404,15 +1555,26 @@ mod tests {
         let from = addr(30_030);
         let to = addr(30_031);
 
-        // The caller's resolution: `expected` owns `from`.
+        // The caller's resolution: `expected` owns `from` at one exact
+        // generation. Model that session ending before a verified successor
+        // claims the address; a stale migration receipt must not carry the
+        // successor.
         owner
-            .claim(
-                from,
-                claim_of(expected.clone(), ClaimKind::Provisional),
-                false,
-            )
+            .claim(from, claim_of(expected.clone(), ClaimKind::Verified), false)
             .await;
-        // ... and is displaced before the migrate command is processed.
+        let expected_source = current_source(&owner, from);
+        owner
+            .release(
+                from,
+                expected.clone(),
+                match &expected_source {
+                    SourceExpectation::Owned(token) => token.generation(),
+                    SourceExpectation::Unowned => unreachable!("verified claim owns source"),
+                },
+            )
+            .await
+            .expect("expected owner releases its generation");
+        // ... and is replaced before the migrate command is processed.
         assert!(
             owner
                 .claim(from, claim_of(usurper.clone(), ClaimKind::Verified), false)
@@ -1422,12 +1584,14 @@ mod tests {
         let events_before = publisher.events();
 
         assert_eq!(
-            owner.migrate(from, to, Some(expected.clone()), false).await,
+            owner
+                .migrate(from, to, expected_source.clone(), false)
+                .await,
             MigrateOutcome::SourceOwnerMismatch
         );
         assert!(
             owner
-                .migrate(from, to, Some(expected.clone()), false)
+                .migrate(from, to, expected_source.clone(), false)
                 .await
                 .is_blocked(),
             "a refused move must tell the caller to perform no address-keyed mutation"
@@ -1452,7 +1616,7 @@ mod tests {
         // identity the caller resolved is no longer there to carry across.
         let vacant = addr(30_032);
         assert_eq!(
-            owner.migrate(vacant, to, Some(expected), false).await,
+            owner.migrate(vacant, to, expected_source, false).await,
             MigrateOutcome::SourceOwnerMismatch
         );
         assert!(owner.owner_of(&to).is_none());
@@ -1478,9 +1642,8 @@ mod tests {
                 false,
             )
             .await;
-        let migration = owner
-            .migrate(old_addr, new_addr, Some(original.clone()), false)
-            .await;
+        let source = current_source(&owner, old_addr);
+        let migration = owner.migrate(old_addr, new_addr, source, false).await;
         let migrated_generation = migration
             .commit_seq()
             .expect("original ownership migrates to the new address");
@@ -1505,7 +1668,15 @@ mod tests {
 
         assert_eq!(
             owner
-                .migrate(new_addr, old_addr, Some(original.clone()), false)
+                .migrate(
+                    new_addr,
+                    old_addr,
+                    SourceExpectation::Owned(OwnershipToken::new(
+                        original.clone(),
+                        migrated_generation,
+                    )),
+                    false,
+                )
                 .await,
             MigrateOutcome::SourceOwnerMismatch,
             "the restore must not move an identity the caller never held"
@@ -1532,15 +1703,23 @@ mod tests {
                 false,
             )
             .await;
+        let other_source = current_source(&owner, other_old);
+        let other_generation = owner
+            .migrate(other_old, other_new, other_source, false)
+            .await
+            .commit_seq()
+            .expect("undisturbed ownership moves");
         assert!(
             owner
-                .migrate(other_old, other_new, Some(original.clone()), false)
-                .await
-                .moved()
-        );
-        assert!(
-            owner
-                .migrate(other_new, other_old, Some(original.clone()), false)
+                .migrate(
+                    other_new,
+                    other_old,
+                    SourceExpectation::Owned(OwnershipToken::new(
+                        original.clone(),
+                        other_generation,
+                    )),
+                    false,
+                )
                 .await
                 .moved(),
             "an undisturbed address must still be restorable"
@@ -1572,7 +1751,7 @@ mod tests {
 
         assert!(
             owner
-                .migrate(from, to, Some(node.clone()), false)
+                .migrate(from, to, current_source(&owner, from), false)
                 .await
                 .moved()
         );

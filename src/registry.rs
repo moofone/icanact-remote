@@ -2799,10 +2799,10 @@ impl<T: 'static> GossipRegistry<T> {
             .0
     }
 
-    /// Add/project a peer and return the exact owner-actor claim generation
-    /// accepted for this call. Connection lifecycle code retains that token
-    /// so a delayed callback cannot release a newer reconnect by the same
-    /// authenticated identity.
+    /// Add/project a peer and return the owner actor's receipt for this exact
+    /// claim. Connection lifecycle code arms rollback only when the receipt
+    /// says this command created ownership, and retains its generation so a
+    /// delayed callback cannot release a newer reconnect.
     pub(crate) async fn add_peer_with_node_id_generation(
         &self,
         peer_addr: SocketAddr,
@@ -2810,7 +2810,7 @@ impl<T: 'static> GossipRegistry<T> {
         claim_kind: crate::addr_ownership::ClaimKind,
     ) -> (
         crate::addr_ownership::AddrClaimOutcome,
-        Option<crate::registry_owner::CommitSeq>,
+        Option<crate::registry_owner::ClaimReceipt>,
     ) {
         use crate::addr_ownership::AddrClaimOutcome;
 
@@ -2860,7 +2860,7 @@ impl<T: 'static> GossipRegistry<T> {
         // reply, outside the actor, so a newer claim for the same address can
         // commit AND be projected in the meantime; the position is what lets
         // this call detect that and stand down.
-        let mut projected_commit_seq: Option<crate::registry_owner::CommitSeq> = None;
+        let mut projected_claim: Option<crate::registry_owner::ClaimReceipt> = None;
         if let Some(claimed_node_id) = node_id {
             // Decide and publish through the single-owner actor, and do it
             // BEFORE taking the `gossip_state` guard below. The decision, the
@@ -2879,10 +2879,9 @@ impl<T: 'static> GossipRegistry<T> {
                 .registry_owner
                 .claim(peer_addr, claim, /* is_local_addr */ false)
                 .await;
+            let receipt = commit.receipt();
             let crate::registry_owner::ClaimCommit::Accepted {
-                kind,
-                displaced,
-                commit_seq,
+                kind, displaced, ..
             } = commit
             else {
                 debug!(
@@ -2895,7 +2894,7 @@ impl<T: 'static> GossipRegistry<T> {
             owner_changed = displaced.is_some();
             displaced_owner = displaced;
             resolved_identity_verified = Some(kind == crate::addr_ownership::ClaimKind::Verified);
-            projected_commit_seq = Some(commit_seq);
+            projected_claim = receipt;
         }
 
         // Everything below mirrors the committed decision into the state that
@@ -2913,7 +2912,7 @@ impl<T: 'static> GossipRegistry<T> {
         // identity the actor no longer routes it to. The ownership decision
         // itself stands (it is the actor's, not ours); only the derived
         // projection is dropped.
-        if let Some(commit_seq) = projected_commit_seq
+        if let Some(commit_seq) = projected_claim.map(|claim| claim.generation())
             && !gossip_state.admit_ownership_projection(peer_addr, commit_seq)
         {
             let authoritative_owner_unchanged = node_id.is_some_and(|node_id| {
@@ -2931,9 +2930,9 @@ impl<T: 'static> GossipRegistry<T> {
             // call must stand down without replaying anything but still tell
             // connection/configuration callers that their claim is valid.
             return if authoritative_owner_unchanged {
-                (AddrClaimOutcome::Accepted, projected_commit_seq)
+                (AddrClaimOutcome::Accepted, projected_claim)
             } else {
-                (AddrClaimOutcome::Rejected, projected_commit_seq)
+                (AddrClaimOutcome::Rejected, projected_claim)
             };
         }
 
@@ -3158,7 +3157,7 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        (AddrClaimOutcome::Accepted, projected_commit_seq)
+        (AddrClaimOutcome::Accepted, projected_claim)
     }
 
     /// Configure a peer by peer ID and its expected connection address
@@ -3452,11 +3451,21 @@ impl<T: 'static> GossipRegistry<T> {
             }
         } // pool lock released
 
-        // The identity this address currently routes to, resolved BEFORE
-        // ownership moves: the move retracts the old address's routing entry,
-        // so the connection-index migration in PHASE 2 could no longer look
-        // the peer up through it.
-        let migrating_peer_id = self.connection_pool.get_peer_id_by_addr(&peer_addr);
+        // Capture the exact authoritative source generation BEFORE moving it.
+        // A same-identity refresh is still a different lifecycle generation;
+        // identity alone cannot safely fence either the forward move or a
+        // compensating reverse move.
+        let migrating_ownership = self.registry_owner.ownership_token(&peer_addr);
+        let source_expectation = migrating_ownership
+            .clone()
+            .map(crate::registry_owner::SourceExpectation::Owned)
+            .unwrap_or(crate::registry_owner::SourceExpectation::Unowned);
+        // Preserve the pool hint for unowned configured seeds. Owned sources
+        // use the owner actor's identity, never an independently stale index.
+        let migrating_peer_id = migrating_ownership
+            .as_ref()
+            .map(|ownership| ownership.owner().clone())
+            .or_else(|| self.connection_pool.get_peer_id_by_addr(&peer_addr));
 
         // Ownership moves FIRST, and every address-keyed mutation below is
         // conditional on it. Only the owner actor can tell whether the
@@ -3465,16 +3474,16 @@ impl<T: 'static> GossipRegistry<T> {
         // contested address first and asking afterwards would leave the peer
         // half-moved, with the old address stranded and the new one
         // attributed to someone else.
-        // The move is also pinned to the identity resolved just above: that
-        // resolution and this command are not one step, so another claimant
-        // could have taken `peer_addr` in between and PHASE 2 would then
-        // re-key the wrong identity onto `new_addr`.
+        // The move is also pinned to the exact source generation resolved
+        // just above: that resolution and this command are not one step, so
+        // another claim or same-identity refresh could commit in between and
+        // PHASE 2 would otherwise re-key the wrong lifecycle generation.
         let migrate_outcome = self
             .registry_owner
             .migrate(
                 peer_addr,
                 new_addr,
-                migrating_peer_id.clone(),
+                source_expectation,
                 new_addr == self.bind_addr || new_addr == self.advertised_addr(),
             )
             .await;
@@ -3579,36 +3588,45 @@ impl<T: 'static> GossipRegistry<T> {
         }; // gossip_state lock released here
 
         if !migration_result {
-            // The peer entry did not move, so ownership must not stay moved
-            // either. Put it back, pinned to the same identity that was moved
-            // out: a newer claimant may already hold `new_addr`, and an
-            // unpinned restore would drag THAT identity back onto the old
-            // address. Accept that the restore can therefore be refused, at
-            // either end — in that case the addresses genuinely belong to
-            // their current claimants and forcing the move would be the very
-            // overwrite this ordering exists to prevent.
-            let restore = self
-                .registry_owner
-                .migrate(
-                    new_addr,
-                    peer_addr,
-                    migrating_peer_id.clone(),
-                    peer_addr == self.bind_addr || peer_addr == self.advertised_addr(),
-                )
-                .await;
-            if restore.is_blocked() {
-                warn!(
-                    old_addr = %peer_addr,
-                    new_addr = %new_addr,
-                    outcome = ?restore,
-                    "DNS refresh: peer entry did not move and ownership can no longer be restored; \
-                     leaving ownership with the current claimant"
-                );
-            }
-            if let Some(commit_seq) = restore.commit_seq() {
-                let mut gossip_state = self.gossip_state.lock().await;
-                gossip_state.tombstone_ownership_projection(new_addr, commit_seq);
-                gossip_state.tombstone_ownership_projection(peer_addr, commit_seq);
+            // If ownership actually moved, the failed peer-entry move needs a
+            // compensating restore. Pin that restore to the exact generation
+            // the forward migration created: a newer claim or same-identity
+            // refresh may already hold `new_addr`, and an unpinned restore
+            // would drag that lifecycle back onto the old address. A source
+            // that was originally unowned never runs a reverse migration.
+            if let (
+                crate::registry_owner::MigrateOutcome::Migrated { commit_seq },
+                Some(migrated_ownership),
+            ) = (migrate_outcome, migrating_ownership)
+            {
+                let restore = self
+                    .registry_owner
+                    .migrate(
+                        new_addr,
+                        peer_addr,
+                        crate::registry_owner::SourceExpectation::Owned(
+                            crate::registry_owner::OwnershipToken::new(
+                                migrated_ownership.owner().clone(),
+                                commit_seq,
+                            ),
+                        ),
+                        peer_addr == self.bind_addr || peer_addr == self.advertised_addr(),
+                    )
+                    .await;
+                if restore.is_blocked() {
+                    warn!(
+                        old_addr = %peer_addr,
+                        new_addr = %new_addr,
+                        outcome = ?restore,
+                        "DNS refresh: peer entry did not move and the exact migrated generation \
+                         can no longer be restored; leaving ownership with the current claimant"
+                    );
+                }
+                if let Some(commit_seq) = restore.commit_seq() {
+                    let mut gossip_state = self.gossip_state.lock().await;
+                    gossip_state.tombstone_ownership_projection(new_addr, commit_seq);
+                    gossip_state.tombstone_ownership_projection(peer_addr, commit_seq);
+                }
             }
             return None;
         }
@@ -5988,7 +6006,11 @@ impl<T: 'static> GossipRegistry<T> {
         let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(commit_seq) = ownership_commit
-                && !gossip_state.admit_ownership_projection(sender_addr, commit_seq)
+                && (!self.registry_owner.claim_is_current(
+                    &sender_addr,
+                    &sender_peer_id,
+                    commit_seq,
+                ) || !gossip_state.admit_ownership_projection(sender_addr, commit_seq))
             {
                 debug!(
                     peer = %sender_addr,
@@ -6194,7 +6216,11 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
 
             if let Some(commit_seq) = ownership_commit
-                && !gossip_state.admit_ownership_projection(sender_addr, commit_seq)
+                && (!self.registry_owner.claim_is_current(
+                    &sender_addr,
+                    &sender_peer_id,
+                    commit_seq,
+                ) || !gossip_state.admit_ownership_projection(sender_addr, commit_seq))
             {
                 debug!(
                     peer = %sender_addr,
@@ -19131,7 +19157,7 @@ mod tests {
         let peer = test_peer_id("full-sync-released-owner");
         let actor_name = "released/full-sync/actor".to_string();
 
-        let (outcome, generation) = registry
+        let (outcome, claim_receipt) = registry
             .add_peer_with_node_id_generation(
                 addr,
                 Some(peer.to_node_id()),
@@ -19139,7 +19165,9 @@ mod tests {
             )
             .await;
         assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
-        let generation = generation.expect("authenticated claim generation");
+        let generation = claim_receipt
+            .expect("authenticated claim receipt")
+            .generation();
         registry
             .registry_owner
             .release(addr, peer.clone(), generation)
@@ -19220,7 +19248,17 @@ mod tests {
 
         let move_seq = registry
             .registry_owner
-            .migrate(from, to, None, false)
+            .migrate(
+                from,
+                to,
+                crate::registry_owner::SourceExpectation::Owned(
+                    registry
+                        .registry_owner
+                        .ownership_token(&from)
+                        .expect("the source ownership generation must be published"),
+                ),
+                false,
+            )
             .await
             .commit_seq()
             .expect("an owned source must move onto a free destination");

@@ -136,9 +136,9 @@ async fn associate_inbound_capabilities_after_claim(
 }
 
 /// Undo ownership created solely for an inbound candidate that subsequently
-/// loses the connection tie-break. The release is identity-scoped and only
-/// used when the address had no owner before this candidate, so an incumbent
-/// session's pre-existing ownership is never withdrawn.
+/// loses the connection tie-break. The owner actor's claim receipt proves
+/// that this exact command created ownership from an unowned address; the
+/// generation-pinned release cannot withdraw an incumbent or a later refresh.
 async fn rollback_rejected_inbound_claim(
     registry: &GossipRegistry,
     addr: SocketAddr,
@@ -3917,10 +3917,6 @@ where
     };
     let mut peer_state_addr =
         resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, route_addr);
-    let advertised_owner_before = registry.registry_owner.owner_of(&peer_state_addr);
-    let observed_owner_before = (peer_state_addr != peer_addr)
-        .then(|| registry.registry_owner.owner_of(&peer_addr))
-        .flatten();
     let (advertised_peer_before, observed_peer_before) = {
         let state = registry.gossip_state.lock().await;
         (
@@ -3956,7 +3952,7 @@ where
         // claim for the same address (see `addr_ownership::arbitrate`).
         let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
 
-        let (claim_outcome, claim_generation) = registry
+        let (claim_outcome, claim_receipt) = registry
             .add_peer_with_node_id_generation(peer_state_addr, Some(node_id), addr_claim_kind)
             .await;
 
@@ -3967,7 +3963,7 @@ where
         // so it is always safe to retry there.
         let effective_claim = match claim_outcome {
             crate::addr_ownership::AddrClaimOutcome::Accepted => {
-                claim_generation.map(|generation| (peer_state_addr, generation))
+                claim_receipt.map(|receipt| (peer_state_addr, receipt))
             }
             crate::addr_ownership::AddrClaimOutcome::Rejected if peer_state_addr == peer_addr => {
                 // The observed source itself was rejected (a different,
@@ -3982,7 +3978,7 @@ where
                     node_id = %node_id.fmt_short(),
                     "rejecting claimed advertised address for inbound peer; falling back to observed source"
                 );
-                let (fallback_outcome, fallback_generation) = registry
+                let (fallback_outcome, fallback_receipt) = registry
                     .add_peer_with_node_id_generation(
                         peer_addr,
                         Some(node_id),
@@ -3991,14 +3987,14 @@ where
                     .await;
                 match fallback_outcome {
                     crate::addr_ownership::AddrClaimOutcome::Accepted => {
-                        fallback_generation.map(|generation| (peer_addr, generation))
+                        fallback_receipt.map(|receipt| (peer_addr, receipt))
                     }
                     crate::addr_ownership::AddrClaimOutcome::Rejected => None,
                 }
             }
         };
 
-        let Some((effective_addr, claim_generation)) = effective_claim else {
+        let Some((effective_addr, claim_receipt)) = effective_claim else {
             warn!(
                 peer_addr = %peer_addr,
                 peer_state_addr = %peer_state_addr,
@@ -4009,13 +4005,13 @@ where
                 node_id: Some(sender_node_id),
             };
         };
-        let (owner_before, peer_before) = if effective_addr == peer_state_addr {
-            (advertised_owner_before.as_ref(), advertised_peer_before)
+        let peer_before = if effective_addr == peer_state_addr {
+            advertised_peer_before
         } else {
-            (observed_owner_before.as_ref(), observed_peer_before)
+            observed_peer_before
         };
-        if owner_before.is_none() {
-            rollback_claim = Some((effective_addr, claim_generation, peer_before));
+        if claim_receipt.created_ownership() {
+            rollback_claim = Some((effective_addr, claim_receipt.generation(), peer_before));
         }
         peer_state_addr = effective_addr;
 
