@@ -6549,11 +6549,11 @@ impl<T: 'static> GossipRegistry<T> {
                 // observed source (the established §1.6 contract).
                 // Relayed third-party actors keep their own canonical address
                 // and never learn a route from this sender.
-                if wire_addr.ip().is_unspecified() {
-                    SocketAddr::new(repair_addr.ip(), wire_addr.port())
-                } else {
-                    sender_addr
-                }
+                // `sender_addr` is the registry transport endpoint. A
+                // concrete actor location may expose a different service
+                // port on the same host; anchor only the IP to the verified
+                // source and preserve that service port.
+                SocketAddr::new(repair_addr.ip(), wire_addr.port())
             } else {
                 resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender)
             };
@@ -6578,11 +6578,7 @@ impl<T: 'static> GossipRegistry<T> {
             let owner_is_sender = location.peer_id == sender_peer_id;
             let wire_addr = canonical_wire_addr(&name, &location.address);
             let resolved = if ownership_commit.is_some() && owner_is_sender {
-                if wire_addr.ip().is_unspecified() {
-                    SocketAddr::new(repair_addr.ip(), wire_addr.port())
-                } else {
-                    sender_addr
-                }
+                SocketAddr::new(repair_addr.ip(), wire_addr.port())
             } else {
                 resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender)
             };

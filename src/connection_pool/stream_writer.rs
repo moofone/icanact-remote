@@ -815,6 +815,10 @@ impl LockFreeStreamHandle {
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_immediate_cmd: Option<WriteCommand> = None;
         let mut pending_stream_cmd: Option<PendingStreamingCommand> = None;
+        // Alternate local response frames with producer-owned shared stream
+        // frames whenever both are ready. This is state local to the IO owner
+        // and adds no synchronization to the messaging hot path.
+        let mut prefer_shared_streaming = true;
         let max_message_size = read_context
             .as_ref()
             .map(|ctx| ctx.max_message_size)
@@ -879,19 +883,41 @@ impl LockFreeStreamHandle {
             // Complete one bounded piece of the current frame before handling
             // normal writes and inbound reads. A partial frame stays ahead of
             // every other streaming command, preserving wire framing.
-            if let Some(mut pending) = pending_stream_cmd
-                .take()
-                .or_else(|| {
-                    local_streaming_queue
-                        .pop_front()
-                        .map(PendingStreamingCommand::local)
-                })
-                .or_else(|| {
-                    streaming_queue
-                        .pop()
-                        .map(PendingStreamingCommand::shared)
-                })
-            {
+            let next_stream = if let Some(pending) = pending_stream_cmd.take() {
+                Some(pending)
+            } else {
+                let source = choose_streaming_source(
+                    prefer_shared_streaming,
+                    local_streaming_queue.has_pending(),
+                    streaming_queue.has_pending(),
+                );
+                match source {
+                    Some(StreamingSource::Local) => {
+                        if let Some(command) = local_streaming_queue.pop_front() {
+                            prefer_shared_streaming = true;
+                            Some(PendingStreamingCommand::local(command))
+                        } else {
+                            streaming_queue.pop().map(|command| {
+                                prefer_shared_streaming = false;
+                                PendingStreamingCommand::shared(command)
+                            })
+                        }
+                    }
+                    Some(StreamingSource::Shared) => {
+                        if let Some(command) = streaming_queue.pop() {
+                            prefer_shared_streaming = false;
+                            Some(PendingStreamingCommand::shared(command))
+                        } else {
+                            local_streaming_queue.pop_front().map(|command| {
+                                prefer_shared_streaming = true;
+                                PendingStreamingCommand::local(command)
+                            })
+                        }
+                    }
+                    None => None,
+                }
+            };
+            if let Some(mut pending) = next_stream {
                 did_work = true;
                 let command_is_flush = matches!(&pending.command, StreamingCommand::Flush);
                 let (written, complete) =
@@ -1702,7 +1728,13 @@ impl LockFreeStreamHandle {
                 if did_work {
                     let mut reads = 0usize;
                     let mut read_batch_limit = READ_BATCH_LIMIT;
-                    while reads < read_batch_limit && !local_streaming_queue.is_full() {
+                    while reads < read_batch_limit
+                        && !local_streaming_queue.is_full()
+                        && (pending_stream_cmd.is_none()
+                            || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
+                                && direct_response_batch.total_bytes()
+                                    < RESPONSE_BATCH_BYTE_CAP))
+                    {
                         // R-I: cap per-turn byte accumulation independent of
                         // the frame-count cap above. Checked every iteration
                         // (covering both the normal and the fast-io `continue`
@@ -1991,7 +2023,13 @@ impl LockFreeStreamHandle {
                             // Drain additional frames non-blocking to batch handler + response writes.
                             let mut drained = 0usize;
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
-                            while drained < drain_batch_limit && !local_streaming_queue.is_full() {
+                            while drained < drain_batch_limit
+                                && !local_streaming_queue.is_full()
+                                && (pending_stream_cmd.is_none()
+                                    || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
+                                        && direct_response_batch.total_bytes()
+                                            < RESPONSE_BATCH_BYTE_CAP))
+                            {
                                 // R-I: same per-turn byte cap as the primary
                                 // drain loop above; see
                                 // `flush_response_batch_if_over_byte_cap`.
