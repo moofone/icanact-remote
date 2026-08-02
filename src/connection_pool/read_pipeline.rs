@@ -1473,7 +1473,7 @@ fn queue_streaming_response_bytes(
 fn queue_streaming_response_pooled(
     streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
-    mut payload: crate::typed::PooledPayload,
+    payload: crate::typed::PooledPayload,
     prefix: Option<[u8; 16]>,
     payload_len: usize,
     max_message_size: usize,
@@ -1518,7 +1518,11 @@ fn queue_streaming_response_pooled(
             .checked_div(chunk_size)
             .unwrap_or(usize::MAX)
     };
-    let command_count = chunk_count.saturating_add(1); // data frames + terminal Flush
+    // The pooled response is one connection-owned command plus its terminal
+    // Flush. The command generates individual frame headers lazily while it
+    // writes, so admission does not expand the response into one queue entry
+    // (or one copied `Bytes`) per chunk.
+    let command_count = 2;
     let first_len = payload_len.min(chunk_size);
     let start_header_len = crate::framing::write_stream_response_start_header(
         0,
@@ -1546,31 +1550,20 @@ fn queue_streaming_response_pooled(
         )));
     }
 
-    let mut bytes = bytes::BytesMut::with_capacity(payload_len);
-    if let Some(prefix) = prefix {
-        bytes.extend_from_slice(&prefix);
-    }
-    let mut remaining = expected_payload_bytes;
-    while remaining > 0 {
-        let chunk = payload.chunk();
-        if chunk.is_empty() {
-            return Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "pooled payload returned empty chunk while bytes remain",
-            )));
-        }
-        let take = remaining.min(chunk.len());
-        bytes.extend_from_slice(&chunk[..take]);
-        payload.advance(take);
-        remaining -= take;
-    }
-    queue_streaming_response_bytes(
-        streaming_responses,
+    let stream_id = allocate_direct_response_stream_id()?;
+    let response = PooledStreamingResponse::new(
+        stream_id,
         correlation_id,
-        bytes.freeze(),
-        max_message_size,
-        None,
-    )
+        payload_len,
+        chunk_size,
+        payload,
+        prefix,
+        expected_payload_bytes,
+    );
+    streaming_responses.try_extend([
+        StreamingCommand::PooledResponse(Box::new(response)),
+        StreamingCommand::Flush,
+    ])
 }
 
 async fn process_read_result_io<S>(
