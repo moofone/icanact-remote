@@ -1414,6 +1414,36 @@ fn oversized_in_flight_response_admits_one_bounded_deferred_response() {
 }
 
 #[test]
+fn in_flight_response_preserves_large_deferred_response() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"current")),
+            StreamingCommand::Flush,
+        ])
+        .expect("the current response should be admitted");
+    let response = queue.pop_front().expect("current response command");
+    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+
+    let deferred_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP + 1;
+    assert!(
+        queue.can_admit_response(2, deferred_bytes),
+        "a large response must be retained in the single deferred slot"
+    );
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; deferred_bytes])),
+            StreamingCommand::Flush,
+        ])
+        .expect("the consumed ask response must not be dropped");
+    assert!(queue.is_full());
+    assert!(
+        !queue.can_admit_response(2, 1),
+        "a third response must wait for the current and deferred commands"
+    );
+}
+
+#[test]
 fn partial_streaming_output_defers_flush_until_terminal_flush() {
     let pending = PendingStreamingCommand::local(StreamingCommand::WriteBytes(
         bytes::Bytes::from_static(b"partial"),

@@ -221,9 +221,9 @@ struct LocalStreamingQueue {
     in_flight_bytes: usize,
     wire_blocked: bool,
     /// Reserve room for one maximum-sized response when reading another
-    /// frame. A single response larger than the byte cap is admitted only
-    /// while the queue is otherwise empty; a second response is backpressured
-    /// until the first one drains.
+    /// frame. A response larger than the byte cap is admitted as the sole
+    /// queued command or in the one deferred slot; further responses are
+    /// backpressured until those commands drain.
     response_reserve_bytes: usize,
     /// Reserve command slots for the next maximum-sized response as well as
     /// bytes. The command cap is independent from the retained-payload cap,
@@ -239,9 +239,10 @@ struct LocalStreamingQueue {
     deferred_bytes: usize,
 }
 
-/// Keep one queue-cap-sized response plus one explicitly bounded in-flight or
-/// deferred response. This is the hard resident footprint for the local
-/// response path; a larger single response is admitted only within this bound.
+/// Keep the ordinary local response queue within one fixed byte cap. A
+/// response that cannot fit that cap is retained as one whole command (either
+/// as the sole queued response or in the single deferred slot) so framing can
+/// still make progress without expanding it into per-frame queue entries.
 const STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP: usize =
     STREAMING_RESPONSE_QUEUE_BYTE_CAP.saturating_mul(2);
 
@@ -329,18 +330,18 @@ impl LocalStreamingQueue {
         let bounded_footprint = response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && retained_without_deferred.saturating_add(response_bytes)
                 <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP;
-        // Once an oversized command owns the wire, keep one bounded deferred
-        // response so a valid pipelined ask is not discarded. The occupied
-        // deferred slot immediately closes further read admission.
-        let in_flight_oversize = self.in_flight_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP
-            && response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP;
+        // Once a response command owns the wire, keep one deferred response so
+        // a valid pipelined ask is not discarded. The occupied deferred slot
+        // immediately closes further read admission; no third response can be
+        // retained while the current and deferred commands drain.
+        let in_flight_response_deferred = self.response_in_flight;
         self.deferred.is_none()
             && command_count <= self.response_reserve_commands
             && self
                 .retained_commands()
                 .saturating_add(command_count)
                 <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
-            && (bounded_footprint || in_flight_oversize)
+            && (bounded_footprint || in_flight_response_deferred)
     }
 
     /// Return whether a response with this command/byte footprint can be
