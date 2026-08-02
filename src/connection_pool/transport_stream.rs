@@ -504,6 +504,10 @@ impl<T> ConnectionPool<T> {
                             )));
                         }
                     };
+                    // The outbound dial target is shared across reconnects;
+                    // use this socket's own local ephemeral port as the
+                    // connection-scoped ownership discriminator.
+                    let local_session_addr = tls_stream.get_ref().0.local_addr().unwrap_or(addr);
 
                     if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
                         if let Some(cert) = certs.first() {
@@ -530,12 +534,14 @@ impl<T> ConnectionPool<T> {
                                     crate::PeerId::from(&node_id) == registry_arc.peer_id;
                                 if !is_self_identity {
                                     let claim_outcome = registry_arc
-                                        .add_peer_with_node_id(
+                                        .add_connection_scoped_peer_claim(
                                             addr,
-                                            Some(node_id),
+                                            node_id,
                                             crate::addr_ownership::ClaimKind::Verified,
+                                            local_session_addr,
                                         )
-                                        .await;
+                                        .await
+                                        .0;
                                     if claim_outcome
                                         == crate::addr_ownership::AddrClaimOutcome::Rejected
                                     {
@@ -683,7 +689,6 @@ impl<T> ConnectionPool<T> {
                     // receive path compares against, so only a FullSync
                     // arriving on THIS socket can consume or extend the
                     // exemption.
-                    let local_session_addr = tls_stream.get_ref().0.local_addr().ok();
                     let fresh_session_node_id = outbound_session_authenticated_node_id(&tls_stream);
 
                     let finalize_started = Instant::now();
@@ -696,7 +701,7 @@ impl<T> ConnectionPool<T> {
                             // extracted from the peer's verified TLS cert when no
                             // GossipNodeId was pinned (bootstrap/placeholder-SNI dials).
                             discovered_node_id,
-                            local_session_addr.unwrap_or(addr),
+                            local_session_addr,
                             fresh_session_node_id,
                         )
                         .await;

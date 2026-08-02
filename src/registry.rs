@@ -334,6 +334,15 @@ fn resolve_remote_actor_addr(
     resolved
 }
 
+/// Resolve an actor location reported by its authenticated owner. The
+/// transport source supplies only the trusted host/IP; the actor's concrete
+/// service port remains part of the actor contract and must never be replaced
+/// with the registry transport port.
+#[inline]
+fn resolve_owned_actor_addr(actor_addr: SocketAddr, repair_addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(repair_addr.ip(), actor_addr.port())
+}
+
 /// True when `addr` may be recorded as a learned dial route
 /// (`set_discovered_peer_addr` / `addr_to_peer_id`). Storage in
 /// `known_actors` is unconditional (§1.5); dial-hint learning is not —
@@ -1649,8 +1658,11 @@ struct InboundPoolProjectionSnapshot {
 pub(crate) struct InboundClaimProjectionSnapshot {
     peer: Option<PeerInfo>,
     peer_to_actors: Option<HashSet<String>>,
-    actor_admissions_by_peer: HashMap<PeerId, HashSet<String>>,
-    actor_admission_peer_by_name: HashMap<String, PeerId>,
+    /// Admission entries for actor names already associated with this
+    /// address.  Keep this per-name rather than cloning the registry-wide
+    /// admission indexes: a rejected candidate must not roll back unrelated
+    /// peers that admitted/removed actors while the candidate was in flight.
+    actor_admission_peer_by_name: HashMap<String, Option<PeerId>>,
     known_peer: Option<PeerInfo>,
     discovery_state: Option<crate::peer_discovery::PeerState>,
     known_actor_locations: Vec<(String, Option<RemoteActorLocation>)>,
@@ -1662,6 +1674,12 @@ pub(crate) struct InboundClaimProjectionSnapshot {
     peer_clock_snapshots: Vec<(SocketAddr, Option<PeerClockSnapshot>)>,
     pool: Vec<InboundPoolProjectionSnapshot>,
 }
+
+/// Latest owner-actor generation claimed by one authenticated transport
+/// session. The session source is unique per physical connection, so a stale
+/// teardown can release only its own generation; a reconnect at the same
+/// address remains fenced by the newer owner commit.
+type ConnectionScopedClaimKey = (PeerId, SocketAddr, SocketAddr);
 
 /// Core gossip registry implementation with separated locks
 #[derive(Clone, Copy)]
@@ -1694,6 +1712,10 @@ pub struct GossipRegistry<T = ()> {
     /// `identity_verified` are derived projections of what this handle
     /// returns, never inputs to the decision.
     pub registry_owner: crate::registry_owner::RegistryOwnerHandle,
+    /// Cold-path ownership receipts held by live authenticated sessions.
+    /// Operator-configured routes are intentionally not inserted here and
+    /// therefore survive connection teardown.
+    connection_scoped_claims: Arc<SccHashMap<ConnectionScopedClaimKey, CommitSeq>>,
     pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
@@ -1966,6 +1988,7 @@ impl<T: 'static> GossipRegistry<T> {
             })),
             connection_pool,
             registry_owner,
+            connection_scoped_claims: Arc::new(SccHashMap::default()),
             tls_config: None,
             peer_capabilities: peer_capabilities.clone(),
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
@@ -2026,7 +2049,7 @@ impl<T: 'static> GossipRegistry<T> {
             addresses.push(observed_addr);
         }
 
-        let (peer, peer_to_actors, known_peer, discovery_state, actor_names, admissions, reverse) = {
+        let (peer, peer_to_actors, known_peer, discovery_state, actor_names, admissions) = {
             let state = self.gossip_state.lock().await;
             let peer = state.peers.get(&addr).cloned();
             let peer_to_actors = state.peer_to_actors.get(&addr).cloned();
@@ -2034,6 +2057,15 @@ impl<T: 'static> GossipRegistry<T> {
                 .as_ref()
                 .map(|actors| actors.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
+            let admissions = actor_names
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        state.actor_admission_peer_by_name.get(name).cloned(),
+                    )
+                })
+                .collect();
             (
                 peer,
                 peer_to_actors,
@@ -2043,8 +2075,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .as_ref()
                     .and_then(|discovery| discovery.get_peer_state(&addr).copied()),
                 actor_names,
-                state.actor_admissions_by_peer.clone(),
-                state.actor_admission_peer_by_name.clone(),
+                admissions,
             )
         };
 
@@ -2157,8 +2188,7 @@ impl<T: 'static> GossipRegistry<T> {
         InboundClaimProjectionSnapshot {
             peer,
             peer_to_actors,
-            actor_admissions_by_peer: admissions,
-            actor_admission_peer_by_name: reverse,
+            actor_admission_peer_by_name: admissions,
             known_peer,
             discovery_state,
             known_actor_locations,
@@ -2192,6 +2222,12 @@ impl<T: 'static> GossipRegistry<T> {
                 return false;
             }
 
+            let current_admission_names = state
+                .peer_to_actors
+                .get(&addr)
+                .cloned()
+                .unwrap_or_default();
+
             match snapshot.peer.clone() {
                 Some(peer) => {
                     state.peers.insert(addr, peer);
@@ -2208,8 +2244,31 @@ impl<T: 'static> GossipRegistry<T> {
                     state.peer_to_actors.remove(&addr);
                 }
             }
-            state.actor_admissions_by_peer = snapshot.actor_admissions_by_peer.clone();
-            state.actor_admission_peer_by_name = snapshot.actor_admission_peer_by_name.clone();
+            // Restore only admission entries attributable to this candidate.
+            // A concurrent update for another peer (or a newer value for the
+            // same actor name) must survive the rejected-candidate rollback.
+            let mut admission_names: HashSet<String> = snapshot
+                .actor_admission_peer_by_name
+                .keys()
+                .cloned()
+                .collect();
+            admission_names.extend(current_admission_names);
+            for name in admission_names {
+                let current_owner = state.actor_admission_peer_by_name.get(&name).cloned();
+                let prior_owner = snapshot
+                    .actor_admission_peer_by_name
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or(None);
+                if current_owner != Some(candidate.clone()) {
+                    continue;
+                }
+
+                state.release_actor_admission(&name);
+                if let Some(prior_owner) = prior_owner {
+                    state.record_actor_admission(&prior_owner, &name);
+                }
+            }
             match snapshot.known_peer.clone() {
                 Some(peer) => {
                     state.known_peers.put(addr, peer);
@@ -3178,6 +3237,106 @@ impl<T: 'static> GossipRegistry<T> {
         self.add_peer_with_node_id_generation(peer_addr, node_id, claim_kind)
             .await
             .0
+    }
+
+    /// Claim an address from evidence tied to one authenticated transport
+    /// session. The receipt is refreshed on every accepted FullSync claim and
+    /// released when that physical session exits. A required/operator route
+    /// is deliberately excluded: its ownership is persistent rather than
+    /// connection-scoped.
+    pub(crate) async fn add_connection_scoped_peer_claim(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: crate::GossipNodeId,
+        claim_kind: crate::addr_ownership::ClaimKind,
+        session_source: SocketAddr,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        Option<crate::registry_owner::ClaimReceipt>,
+    ) {
+        let peer_id = crate::PeerId::from(node_id);
+        let persistent = self
+            .connection_pool
+            .get_required_peer_addr(&peer_id)
+            .is_some_and(|configured| configured == peer_addr);
+        let (outcome, receipt) = self
+            .add_peer_with_node_id_generation(
+                peer_addr,
+                Some(peer_id.to_node_id()),
+                claim_kind,
+            )
+            .await;
+        if outcome == crate::addr_ownership::AddrClaimOutcome::Accepted
+            && !persistent
+            && let Some(receipt) = receipt
+        {
+            self.connection_scoped_claims.upsert_sync(
+                (peer_id, session_source, peer_addr),
+                receipt.generation(),
+            );
+            return (outcome, Some(receipt));
+        }
+        (outcome, receipt)
+    }
+
+    fn take_connection_scoped_claims(
+        &self,
+        peer_id: &crate::PeerId,
+        session_source: SocketAddr,
+    ) -> Vec<(SocketAddr, CommitSeq)> {
+        let mut entries = Vec::new();
+        self.connection_scoped_claims.iter_sync(|key, generation| {
+            if &key.0 == peer_id && key.1 == session_source {
+                entries.push((key.clone(), *generation));
+            }
+            true
+        });
+        entries
+            .into_iter()
+            .filter_map(|(key, generation)| {
+                let removed = self
+                    .connection_scoped_claims
+                    .remove_if_sync(&key, |current| *current == generation)
+                    .is_some();
+                removed.then_some((key.2, generation))
+            })
+            .collect()
+    }
+
+    /// Release all non-persistent owner claims attributed to one physical
+    /// session. The map entries are removed before the first await so a
+    /// duplicate teardown is harmless and a reconnect cannot be released by
+    /// an older session's callback.
+    pub(crate) async fn release_connection_scoped_claims(
+        &self,
+        peer_id: &crate::PeerId,
+        session_source: SocketAddr,
+    ) {
+        let claims = self.take_connection_scoped_claims(peer_id, session_source);
+        for (addr, generation) in claims {
+            let covered_by_other_session = {
+                let mut covered = false;
+                self.connection_scoped_claims.iter_sync(|key, _| {
+                    if &key.0 == peer_id && key.1 != session_source && key.2 == addr {
+                        covered = true;
+                        return false;
+                    }
+                    true
+                });
+                covered
+            };
+            if covered_by_other_session {
+                continue;
+            }
+            if let Some(release_seq) = self
+                .registry_owner
+                .release(addr, peer_id.clone(), generation)
+                .await
+            {
+                let mut state = self.gossip_state.lock().await;
+                state.tombstone_ownership_projection(addr, release_seq);
+            }
+        }
     }
 
     /// Add/project a peer and return the owner actor's receipt for this exact
@@ -6549,11 +6708,7 @@ impl<T: 'static> GossipRegistry<T> {
                 // observed source (the established §1.6 contract).
                 // Relayed third-party actors keep their own canonical address
                 // and never learn a route from this sender.
-                if wire_addr.ip().is_unspecified() {
-                    SocketAddr::new(repair_addr.ip(), wire_addr.port())
-                } else {
-                    sender_addr
-                }
+                resolve_owned_actor_addr(wire_addr, repair_addr)
             } else {
                 resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender)
             };
@@ -6578,11 +6733,7 @@ impl<T: 'static> GossipRegistry<T> {
             let owner_is_sender = location.peer_id == sender_peer_id;
             let wire_addr = canonical_wire_addr(&name, &location.address);
             let resolved = if ownership_commit.is_some() && owner_is_sender {
-                if wire_addr.ip().is_unspecified() {
-                    SocketAddr::new(repair_addr.ip(), wire_addr.port())
-                } else {
-                    sender_addr
-                }
+                resolve_owned_actor_addr(wire_addr, repair_addr)
             } else {
                 resolve_remote_actor_addr(&name, wire_addr, repair_addr, owner_is_sender)
             };
@@ -9624,6 +9775,17 @@ mod tests {
             stored.address,
             SocketAddr::new(sender_addr.ip(), actor_addr.port()).to_string(),
             "rewritten actor location must use the sender's verified IP with the advertised port"
+        );
+    }
+
+    #[test]
+    fn owned_full_sync_repairs_concrete_actor_ip_without_losing_service_port() {
+        let actor_addr: SocketAddr = "192.0.2.99:12345".parse().unwrap();
+        let verified_source: SocketAddr = "127.0.0.1:49003".parse().unwrap();
+        assert_eq!(
+            resolve_owned_actor_addr(actor_addr, verified_source),
+            SocketAddr::new(verified_source.ip(), actor_addr.port()),
+            "address repair must anchor the IP to verified evidence while preserving the actor service port"
         );
     }
 
@@ -18877,6 +19039,149 @@ mod tests {
                 .read_sync(&configured_addr, |_, peer| peer.clone()),
             Some(intended),
             "published address routing must agree with the owner authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_scoped_owner_releases_after_last_session_but_configured_pin_survives() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_015), test_config());
+        let peer = test_peer_id("connection-scoped-owner");
+        let observed = test_addr(20_016);
+        let session_a = test_addr(30_016);
+        let session_b = test_addr(30_017);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                observed,
+                peer.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_a,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        registry
+            .release_connection_scoped_claims(&peer, session_a)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            None,
+            "a raw connection-derived owner must be released when its session ends"
+        );
+
+        let session_c = test_addr(30_018);
+        let session_d = test_addr(30_019);
+        for session in [session_c, session_d] {
+            let (outcome, _) = registry
+                .add_connection_scoped_peer_claim(
+                    observed,
+                    peer.to_node_id(),
+                    crate::addr_ownership::ClaimKind::Verified,
+                    session,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        }
+        registry
+            .release_connection_scoped_claims(&peer, session_c)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            Some(peer.clone()),
+            "an older session must not release an owner still claimed by a reconnect"
+        );
+        registry
+            .release_connection_scoped_claims(&peer, session_d)
+            .await;
+        assert_eq!(registry.registry_owner.routes_to(&observed), None);
+
+        let pinned = test_addr(20_017);
+        registry.configure_peer(peer.clone(), pinned).await;
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                pinned,
+                peer.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_b,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        registry
+            .release_connection_scoped_claims(&peer, session_b)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&pinned),
+            Some(peer),
+            "operator-configured ownership must not be released with a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_inbound_rollback_preserves_unrelated_admission_updates() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_018), test_config());
+        let addr = test_addr(20_019);
+        let candidate = test_peer_id("rollback-admission-candidate");
+        let unrelated = test_peer_id("rollback-admission-unrelated");
+        let candidate_actor = "rollback/candidate".to_string();
+        let new_candidate_actor = "rollback/candidate-new".to_string();
+        let unrelated_actor = "rollback/unrelated".to_string();
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(addr);
+            peer.node_id = Some(candidate.to_node_id());
+            state.peers.insert(addr, peer);
+            state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(candidate_actor.clone());
+            state.record_actor_admission(&candidate, &candidate_actor);
+            state.record_actor_admission(&unrelated, &unrelated_actor);
+        }
+
+        let snapshot = registry
+            .snapshot_inbound_claim_projection(addr, addr, &candidate)
+            .await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(new_candidate_actor.clone());
+            state.record_actor_admission(&candidate, &new_candidate_actor);
+            state.record_actor_admission(&unrelated, "rollback/unrelated-new");
+        }
+
+        assert!(
+            registry
+                .restore_inbound_claim_projection(addr, &candidate, &snapshot)
+                .await
+        );
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            state
+                .actor_admissions_by_peer
+                .get(&unrelated)
+                .is_some_and(|names| {
+                    names.contains(&unrelated_actor)
+                        && names.contains("rollback/unrelated-new")
+                }),
+            "rollback must not replace another peer's concurrent admission updates"
+        );
+        assert!(
+            state
+                .actor_admissions_by_peer
+                .get(&candidate)
+                .is_some_and(|names| names.contains(&candidate_actor))
+        );
+        assert!(
+            !state
+                .actor_admissions_by_peer
+                .get(&candidate)
+                .is_some_and(|names| names.contains(&new_candidate_actor)),
+            "candidate-only admission added after the snapshot must be removed"
         );
     }
 

@@ -3933,7 +3933,12 @@ where
         let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
 
         let (claim_outcome, claim_receipt) = registry
-            .add_peer_with_node_id_generation(peer_state_addr, Some(node_id), addr_claim_kind)
+            .add_connection_scoped_peer_claim(
+                peer_state_addr,
+                node_id,
+                addr_claim_kind,
+                peer_addr,
+            )
             .await;
 
         // The address this connection is actually attributed to after
@@ -3959,10 +3964,11 @@ where
                     "rejecting claimed advertised address for inbound peer; falling back to observed source"
                 );
                 let (fallback_outcome, fallback_receipt) = registry
-                    .add_peer_with_node_id_generation(
+                    .add_connection_scoped_peer_claim(
                         peer_addr,
-                        Some(node_id),
+                        node_id,
                         crate::addr_ownership::ClaimKind::Verified,
+                        peer_addr,
                     )
                     .await;
                 match fallback_outcome {

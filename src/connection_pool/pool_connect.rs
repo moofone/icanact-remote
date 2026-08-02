@@ -4186,27 +4186,23 @@ async fn claim_authenticated_gossip_addr(
     advertised_addr: SocketAddr,
     observed_addr: SocketAddr,
     peer_id: &crate::PeerId,
+    session_source: SocketAddr,
 ) -> Option<(SocketAddr, crate::registry_owner::CommitSeq)> {
     let claim_kind = if advertised_addr == observed_addr {
         crate::addr_ownership::ClaimKind::Verified
     } else {
         crate::addr_ownership::ClaimKind::Provisional
     };
-    let is_local_addr =
-        advertised_addr == registry.bind_addr || advertised_addr == registry.advertised_addr();
     let commit = registry
-        .registry_owner
-        .claim(
+        .add_connection_scoped_peer_claim(
             advertised_addr,
-            crate::addr_ownership::Claim {
-                node_id: peer_id.clone(),
-                kind: claim_kind,
-            },
-            is_local_addr,
+            peer_id.to_node_id(),
+            claim_kind,
+            session_source,
         )
         .await;
-    if let Some(commit_seq) = commit.commit_seq() {
-        return Some((advertised_addr, commit_seq));
+    if let Some(receipt) = commit.1 {
+        return Some((advertised_addr, receipt.generation()));
     }
 
     if advertised_addr == observed_addr {
@@ -4219,21 +4215,16 @@ async fn claim_authenticated_gossip_addr(
         observed_addr = %observed_addr,
         "provisional gossip address was not admitted; binding frame to authenticated transport source"
     );
-    let observed_is_local =
-        observed_addr == registry.bind_addr || observed_addr == registry.advertised_addr();
     registry
-        .registry_owner
-        .claim(
+        .add_connection_scoped_peer_claim(
             observed_addr,
-            crate::addr_ownership::Claim {
-                node_id: peer_id.clone(),
-                kind: crate::addr_ownership::ClaimKind::Verified,
-            },
-            observed_is_local,
+            peer_id.to_node_id(),
+            crate::addr_ownership::ClaimKind::Verified,
+            session_source,
         )
         .await
-        .commit_seq()
-        .map(|commit_seq| (observed_addr, commit_seq))
+        .1
+        .map(|receipt| (observed_addr, receipt.generation()))
 }
 
 /// Handle an incoming message on a bidirectional connection
@@ -4483,6 +4474,7 @@ pub(crate) fn handle_incoming_message(
                     advertised_sender_addr,
                     _peer_addr,
                     authenticated_sender_peer_id,
+                    session_source,
                 )
                 .await
                 else {
@@ -4969,6 +4961,7 @@ pub(crate) fn handle_incoming_message(
                     advertised_sender_addr,
                     _peer_addr,
                     authenticated_sender_peer_id,
+                    session_source,
                 )
                 .await
                 else {
