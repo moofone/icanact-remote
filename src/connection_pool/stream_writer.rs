@@ -815,7 +815,12 @@ impl LockFreeStreamHandle {
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_immediate_cmd: Option<WriteCommand> = None;
         let mut pending_stream_cmd: Option<PendingStreamingCommand> = None;
-        let mut local_streaming_queue = LocalStreamingQueue::new();
+        let max_message_size = read_context
+            .as_ref()
+            .map(|ctx| ctx.max_message_size)
+            .unwrap_or(STREAM_CHUNK_SIZE);
+        let mut local_streaming_queue =
+            LocalStreamingQueue::with_response_reserve(max_message_size);
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
         let mut streaming_state = match read_context
             .as_ref()
@@ -862,8 +867,14 @@ impl LockFreeStreamHandle {
             let mut wrote_ask_payload = false;
             let mut wrote_actor_responses = false;
             let mut wrote_fast_responses = false;
-            response_batch.clear();
-            direct_response_batch.clear();
+            // A partial streaming frame owns the wire. Response batches
+            // accumulated while it is in flight must survive into the turn
+            // that completes that frame; clearing them here would silently
+            // drop responses that were intentionally deferred.
+            if pending_stream_cmd.is_none() {
+                response_batch.clear();
+                direct_response_batch.clear();
+            }
 
             // Complete one bounded piece of the current frame before handling
             // normal writes and inbound reads. A partial frame stays ahead of
@@ -904,6 +915,7 @@ impl LockFreeStreamHandle {
                     &mut pending_stream_cmd,
                 );
             }
+            local_streaming_queue.set_wire_blocked(pending_stream_cmd.is_some());
 
             // A partial streaming frame owns the wire until complete. Reads may
             // still run below, but no normal/response write can interleave and
@@ -1698,7 +1710,8 @@ impl LockFreeStreamHandle {
                         // max-size response frames cannot force unbounded
                         // memory growth before `read_batch_limit` frames are
                         // seen. See `flush_response_batch_if_over_byte_cap`.
-                        if let Err(e) = flush_response_batch_if_over_byte_cap(
+                        if pending_stream_cmd.is_none()
+                            && let Err(e) = flush_response_batch_if_over_byte_cap(
                             &mut stream,
                             &bytes_written_counter,
                             &mut bytes_since_flush,
@@ -1713,7 +1726,8 @@ impl LockFreeStreamHandle {
                             );
                             return;
                         }
-                        if let Err(e) = flush_direct_response_batch_if_over_byte_cap(
+                        if pending_stream_cmd.is_none()
+                            && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
                             &mut stream,
                             &bytes_written_counter,
                             &mut bytes_since_flush,
@@ -1815,7 +1829,7 @@ impl LockFreeStreamHandle {
                             break;
                         }
                     }
-                    if !response_batch.is_empty() {
+                    if pending_stream_cmd.is_none() && !response_batch.is_empty() {
                         if let Err(e) = write_response_batch(
                             &mut stream,
                             &bytes_written_counter,
@@ -1833,7 +1847,7 @@ impl LockFreeStreamHandle {
                         }
                         wrote_actor_responses = true;
                     }
-                    if !direct_response_batch.is_empty() {
+                    if pending_stream_cmd.is_none() && !direct_response_batch.is_empty() {
                         if let Err(e) = write_direct_response_batch(
                             &mut stream,
                             &bytes_written_counter,
@@ -1981,7 +1995,8 @@ impl LockFreeStreamHandle {
                                 // R-I: same per-turn byte cap as the primary
                                 // drain loop above; see
                                 // `flush_response_batch_if_over_byte_cap`.
-                                if let Err(e) = flush_response_batch_if_over_byte_cap(
+                                if pending_stream_cmd.is_none()
+                                    && let Err(e) = flush_response_batch_if_over_byte_cap(
                                     &mut stream,
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
@@ -1996,7 +2011,8 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
-                                if let Err(e) = flush_direct_response_batch_if_over_byte_cap(
+                                if pending_stream_cmd.is_none()
+                                    && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
                                     &mut stream,
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
@@ -2099,7 +2115,7 @@ impl LockFreeStreamHandle {
                                 }
                             }
 
-                            if !response_batch.is_empty() {
+                            if pending_stream_cmd.is_none() && !response_batch.is_empty() {
                                 if let Err(e) = write_response_batch(
                                     &mut stream,
                                     &bytes_written_counter,
@@ -2116,7 +2132,7 @@ impl LockFreeStreamHandle {
                                     return;
                                 }
                             }
-                            if !direct_response_batch.is_empty() {
+                            if pending_stream_cmd.is_none() && !direct_response_batch.is_empty() {
                                 if let Err(e) = write_direct_response_batch(
                                     &mut stream,
                                     &bytes_written_counter,

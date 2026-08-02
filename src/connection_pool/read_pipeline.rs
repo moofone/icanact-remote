@@ -1281,16 +1281,36 @@ where
                     }
                     *wrote_response_bytes = true;
                 } else {
-                    write_actor_response_direct(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
-                        correlation_id,
-                        other,
-                    )
-                    .await?;
+                    if streaming_responses.wire_blocked() {
+                        let crate::registry::ActorResponse::Pooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        } = other
+                        else {
+                            unreachable!("only pooled responses reach the direct branch")
+                        };
+                        queue_streaming_response_pooled(
+                            streaming_responses,
+                            correlation_id,
+                            payload,
+                            prefix,
+                            payload_len,
+                            ctx.max_message_size,
+                            schema_hash,
+                        )?;
+                    } else {
+                        write_actor_response_direct(
+                            stream,
+                            bytes_written_counter,
+                            bytes_since_flush,
+                            correlation_id,
+                            other,
+                        )
+                        .await?;
+                    }
                     *wrote_response_bytes = true;
-                    if flush_each_actor_response() {
+                    if !streaming_responses.wire_blocked() && flush_each_actor_response() {
                         stream.flush().await.map_err(GossipError::Network)?;
                         *bytes_since_flush = 0;
                     }
@@ -1350,20 +1370,32 @@ where
                 )?;
                 *wrote_response_bytes = true;
             } else {
-                write_actor_response_direct(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
-                    correlation_id,
-                    crate::registry::ActorResponse::Pooled {
+                if streaming_responses.wire_blocked() {
+                    queue_streaming_response_pooled(
+                        streaming_responses,
+                        correlation_id,
                         payload,
                         prefix,
                         payload_len,
-                    },
-                )
-                .await?;
+                        ctx.max_message_size,
+                        schema_hash,
+                    )?;
+                } else {
+                    write_actor_response_direct(
+                        stream,
+                        bytes_written_counter,
+                        bytes_since_flush,
+                        correlation_id,
+                        crate::registry::ActorResponse::Pooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        },
+                    )
+                    .await?;
+                }
                 *wrote_response_bytes = true;
-                if flush_each_actor_response() {
+                if !streaming_responses.wire_blocked() && flush_each_actor_response() {
                     stream.flush().await.map_err(GossipError::Network)?;
                     *bytes_since_flush = 0;
                 }

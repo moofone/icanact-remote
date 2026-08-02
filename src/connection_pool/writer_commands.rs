@@ -34,25 +34,69 @@ enum StreamingCommand {
 struct LocalStreamingQueue {
     queue: std::collections::VecDeque<StreamingCommand>,
     queued_bytes: usize,
+    /// A response command has been handed to the IO owner and has not yet
+    /// reached its terminal Flush. Keep admission closed while the queue is
+    /// empty too: the in-flight command is still retaining bytes that the
+    /// queue counters no longer include.
+    response_in_flight: bool,
+    wire_blocked: bool,
+    /// Reserve room for one maximum-sized response when reading another
+    /// frame. A single response larger than the byte cap is admitted only
+    /// while the queue is otherwise empty; a second response is backpressured
+    /// until the first one drains.
+    response_reserve_bytes: usize,
 }
 
 impl LocalStreamingQueue {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_response_reserve(STREAM_CHUNK_SIZE)
+    }
+
+    fn with_response_reserve(max_message_size: usize) -> Self {
+        let response_reserve_bytes = std::cmp::min(
+            max_message_size.max(STREAM_CHUNK_SIZE),
+            STREAMING_RESPONSE_QUEUE_BYTE_CAP,
+        );
         Self {
             queue: std::collections::VecDeque::new(),
             queued_bytes: 0,
+            response_in_flight: false,
+            response_reserve_bytes,
+            wire_blocked: false,
         }
     }
 
     fn pop_front(&mut self) -> Option<StreamingCommand> {
         let command = self.queue.pop_front()?;
-        self.queued_bytes = self.queued_bytes.saturating_sub(streaming_command_bytes(&command));
+        self.queued_bytes = self
+            .queued_bytes
+            .saturating_sub(streaming_command_bytes(&command));
+        self.response_in_flight = !matches!(&command, StreamingCommand::Flush);
         Some(command)
     }
 
+    fn set_wire_blocked(&mut self, blocked: bool) {
+        self.wire_blocked = blocked;
+    }
+
+    fn wire_blocked(&self) -> bool {
+        self.wire_blocked
+    }
+
     fn is_full(&self) -> bool {
+        if self.response_in_flight && self.queue.is_empty() {
+            return true;
+        }
+        if self.queue.is_empty() {
+            return false;
+        }
         self.queue.len() >= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             || self.queued_bytes >= STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            || self
+                .queued_bytes
+                .saturating_add(self.response_reserve_bytes)
+                > STREAMING_RESPONSE_QUEUE_BYTE_CAP
     }
 
     fn try_extend<I>(&mut self, commands: I) -> Result<()>
@@ -61,13 +105,19 @@ impl LocalStreamingQueue {
     {
         let commands: Vec<_> = commands.into_iter().collect();
         let added_bytes: usize = commands.iter().map(streaming_command_bytes).sum();
-        if self.queue.len().saturating_add(commands.len()) > STREAMING_RESPONSE_QUEUE_COMMAND_CAP
-            || self.queued_bytes.saturating_add(added_bytes) > STREAMING_RESPONSE_QUEUE_BYTE_CAP
-        {
+        let exceeds_cap = self.queue.len().saturating_add(commands.len())
+            > STREAMING_RESPONSE_QUEUE_COMMAND_CAP
+            || self.queued_bytes.saturating_add(added_bytes) > STREAMING_RESPONSE_QUEUE_BYTE_CAP;
+        let admit_single_oversize =
+            self.queue.is_empty() && !self.response_in_flight && exceeds_cap;
+        if exceeds_cap && !admit_single_oversize {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "immediate streaming response queue is full",
             )));
+        }
+        if admit_single_oversize {
+            self.response_in_flight = true;
         }
         self.queued_bytes = self.queued_bytes.saturating_add(added_bytes);
         self.queue.extend(commands);
