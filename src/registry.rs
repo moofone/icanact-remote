@@ -1631,6 +1631,38 @@ impl GossipState {
     }
 }
 
+/// Address-keyed state captured before an inbound candidate asks the registry
+/// owner to create an address claim. The claim is speculative until the
+/// connection tie-break accepts the candidate; if it loses, every derived
+/// projection in this snapshot is restored as one cold-path rollback.
+#[derive(Clone)]
+struct InboundPoolProjectionSnapshot {
+    peer_id: PeerId,
+    peer_route: Option<SocketAddr>,
+    peer_connection: Option<Arc<crate::connection_pool::LockFreeConnection>>,
+    addr: SocketAddr,
+    addr_route: Option<PeerId>,
+    addr_connection: Option<Arc<crate::connection_pool::LockFreeConnection>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct InboundClaimProjectionSnapshot {
+    peer: Option<PeerInfo>,
+    peer_to_actors: Option<HashSet<String>>,
+    actor_admissions_by_peer: HashMap<PeerId, HashSet<String>>,
+    actor_admission_peer_by_name: HashMap<String, PeerId>,
+    known_peer: Option<PeerInfo>,
+    discovery_state: Option<crate::peer_discovery::PeerState>,
+    known_actor_locations: Vec<(String, Option<RemoteActorLocation>)>,
+    peer_capabilities: Vec<(SocketAddr, Option<PeerCapabilities>)>,
+    capability_addr_to_node: Vec<(SocketAddr, Option<GossipNodeId>)>,
+    capabilities_by_node: Vec<(GossipNodeId, Option<PeerCapabilities>)>,
+    clock_probe_state: Vec<(SocketAddr, Option<PeerClockProbeState>)>,
+    pending_clock_echoes: Vec<(SocketAddr, Option<PendingClockEcho>)>,
+    peer_clock_snapshots: Vec<(SocketAddr, Option<PeerClockSnapshot>)>,
+    pool: Vec<InboundPoolProjectionSnapshot>,
+}
+
 /// Core gossip registry implementation with separated locks
 #[derive(Clone, Copy)]
 struct PeerLivenessStatus {
@@ -1980,6 +2012,355 @@ impl<T: 'static> GossipRegistry<T> {
             self.config.enable_peer_discovery,
         )?));
         Ok(())
+    }
+
+    /// Track negotiated peer capabilities for a peer connection
+    pub(crate) async fn snapshot_inbound_claim_projection(
+        &self,
+        addr: SocketAddr,
+        observed_addr: SocketAddr,
+        candidate: &PeerId,
+    ) -> InboundClaimProjectionSnapshot {
+        let mut addresses = vec![addr];
+        if observed_addr != addr {
+            addresses.push(observed_addr);
+        }
+
+        let (peer, peer_to_actors, known_peer, discovery_state, actor_names, admissions, reverse) = {
+            let state = self.gossip_state.lock().await;
+            let peer = state.peers.get(&addr).cloned();
+            let peer_to_actors = state.peer_to_actors.get(&addr).cloned();
+            let actor_names = peer_to_actors
+                .as_ref()
+                .map(|actors| actors.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            (
+                peer,
+                peer_to_actors,
+                state.known_peers.peek(&addr).cloned(),
+                state
+                    .peer_discovery
+                    .as_ref()
+                    .and_then(|discovery| discovery.get_peer_state(&addr).copied()),
+                actor_names,
+                state.actor_admissions_by_peer.clone(),
+                state.actor_admission_peer_by_name.clone(),
+            )
+        };
+
+        let known_actor_locations = actor_names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    self.actor_state
+                        .known_actors
+                        .read_sync(name, |_, location| location.clone()),
+                )
+            })
+            .collect();
+
+        let mut node_ids = vec![candidate.to_node_id()];
+        if let Some(node_id) = peer.as_ref().and_then(|peer| peer.node_id)
+            && !node_ids.contains(&node_id)
+        {
+            node_ids.push(node_id);
+        }
+
+        let peer_capabilities = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.peer_capabilities.read_sync(address, |_, caps| *caps),
+                )
+            })
+            .collect();
+        let capability_addr_to_node = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.peer_capability_addr_to_node
+                        .read_sync(address, |_, node_id| *node_id),
+                )
+            })
+            .collect();
+        let capabilities_by_node = node_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    *node_id,
+                    self.peer_capabilities_by_node
+                        .read_sync(node_id, |_, caps| *caps),
+                )
+            })
+            .collect();
+        let clock_probe_state = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.clock_probe_state.read_sync(address, |_, state| *state),
+                )
+            })
+            .collect();
+        let pending_clock_echoes = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.pending_clock_echoes.read_sync(address, |_, echo| *echo),
+                )
+            })
+            .collect();
+        let peer_clock_snapshots = addresses
+            .iter()
+            .map(|address| {
+                (
+                    *address,
+                    self.peer_clock_snapshots
+                        .read_sync(address, |_, snapshot| *snapshot),
+                )
+            })
+            .collect();
+
+        let mut peer_ids = vec![candidate.clone()];
+        if let Some(node_id) = peer.as_ref().and_then(|peer| peer.node_id) {
+            let prior_peer_id = node_id.to_peer_id();
+            if !peer_ids.contains(&prior_peer_id) {
+                peer_ids.push(prior_peer_id);
+            }
+        }
+        let pool = peer_ids
+            .iter()
+            .flat_map(|peer_id| {
+                addresses.iter().map(move |address| InboundPoolProjectionSnapshot {
+                    peer_id: peer_id.clone(),
+                    peer_route: self.connection_pool.get_configured_peer_addr(peer_id),
+                    peer_connection: self
+                        .connection_pool
+                        .peer_current_connection_snapshot(peer_id),
+                    addr: *address,
+                    addr_route: self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .read_sync(address, |_, owner| owner.clone()),
+                    addr_connection: self
+                        .connection_pool
+                        .connections_by_addr
+                        .read_sync(address, |_, connection| connection.clone()),
+                })
+            })
+            .collect();
+
+        InboundClaimProjectionSnapshot {
+            peer,
+            peer_to_actors,
+            actor_admissions_by_peer: admissions,
+            actor_admission_peer_by_name: reverse,
+            known_peer,
+            discovery_state,
+            known_actor_locations,
+            peer_capabilities,
+            capability_addr_to_node,
+            capabilities_by_node,
+            clock_probe_state,
+            pending_clock_echoes,
+            peer_clock_snapshots,
+            pool,
+        }
+    }
+
+    /// Restore every projection captured before a rejected inbound claim.
+    /// Returns whether the address still projected the speculative candidate;
+    /// a newer projection is left untouched rather than clobbered.
+    pub(crate) async fn restore_inbound_claim_projection(
+        &self,
+        addr: SocketAddr,
+        candidate: &PeerId,
+        snapshot: &InboundClaimProjectionSnapshot,
+    ) -> bool {
+        let still_candidate = {
+            let mut state = self.gossip_state.lock().await;
+            let still_candidate = state
+                .peers
+                .get(&addr)
+                .and_then(|peer| peer.node_id)
+                .is_some_and(|node_id| node_id == candidate.to_node_id());
+            if !still_candidate {
+                return false;
+            }
+
+            match snapshot.peer.clone() {
+                Some(peer) => {
+                    state.peers.insert(addr, peer);
+                }
+                None => {
+                    state.peers.remove(&addr);
+                }
+            }
+            match snapshot.peer_to_actors.clone() {
+                Some(actors) => {
+                    state.peer_to_actors.insert(addr, actors);
+                }
+                None => {
+                    state.peer_to_actors.remove(&addr);
+                }
+            }
+            state.actor_admissions_by_peer = snapshot.actor_admissions_by_peer.clone();
+            state.actor_admission_peer_by_name = snapshot.actor_admission_peer_by_name.clone();
+            match snapshot.known_peer.clone() {
+                Some(peer) => {
+                    state.known_peers.put(addr, peer);
+                }
+                None => {
+                    state.known_peers.pop(&addr);
+                }
+            }
+            if let Some(discovery) = state.peer_discovery.as_mut() {
+                discovery.restore_peer_state(addr, snapshot.discovery_state);
+            }
+            true
+        };
+
+        for (name, location) in &snapshot.known_actor_locations {
+            match location {
+                Some(location) => {
+                    let _ = self
+                        .actor_state
+                        .known_actors
+                        .upsert_sync(name.clone(), location.clone());
+                }
+                None => {
+                    let _ = self.actor_state.known_actors.remove_sync(name);
+                }
+            }
+        }
+
+        for (address, caps) in &snapshot.peer_capabilities {
+            match caps {
+                Some(caps) => {
+                    let _ = self.peer_capabilities.upsert_sync(*address, *caps);
+                }
+                None => {
+                    let _ = self.peer_capabilities.remove_sync(address);
+                }
+            }
+        }
+        for (address, node_id) in &snapshot.capability_addr_to_node {
+            match node_id {
+                Some(node_id) => {
+                    let _ = self
+                        .peer_capability_addr_to_node
+                        .upsert_sync(*address, *node_id);
+                }
+                None => {
+                    let _ = self.peer_capability_addr_to_node.remove_sync(address);
+                }
+            }
+        }
+        for (node_id, caps) in &snapshot.capabilities_by_node {
+            match caps {
+                Some(caps) => {
+                    let _ = self
+                        .peer_capabilities_by_node
+                        .upsert_sync(*node_id, *caps);
+                }
+                None => {
+                    let _ = self.peer_capabilities_by_node.remove_sync(node_id);
+                }
+            }
+        }
+        for (address, probe) in &snapshot.clock_probe_state {
+            match probe {
+                Some(probe) => {
+                    let _ = self.clock_probe_state.upsert_sync(*address, *probe);
+                }
+                None => {
+                    let _ = self.clock_probe_state.remove_sync(address);
+                }
+            }
+        }
+        for (address, echo) in &snapshot.pending_clock_echoes {
+            match echo {
+                Some(echo) => {
+                    let _ = self.pending_clock_echoes.upsert_sync(*address, *echo);
+                }
+                None => {
+                    let _ = self.pending_clock_echoes.remove_sync(address);
+                }
+            }
+        }
+        for (address, clock_snapshot) in &snapshot.peer_clock_snapshots {
+            match clock_snapshot {
+                Some(clock_snapshot) => {
+                    let _ = self
+                        .peer_clock_snapshots
+                        .upsert_sync(*address, *clock_snapshot);
+                }
+                None => {
+                    let _ = self.peer_clock_snapshots.remove_sync(address);
+                }
+            }
+        }
+
+        // Clear speculative candidate aliases first, then restore each prior
+        // peer/address projection using compare-by-identity removal where a
+        // prior value did not exist.
+        for projection in &snapshot.pool {
+            self.connection_pool
+                .clear_displaced_peer_addr(&projection.peer_id, projection.addr);
+            match &projection.peer_route {
+                Some(route) => self
+                    .connection_pool
+                    .set_discovered_peer_addr(&projection.peer_id, *route),
+                None => {
+                    let _ = self.connection_pool.peer_id_to_addr.remove_if_sync(
+                        &projection.peer_id,
+                        |current| *current == projection.addr,
+                    );
+                }
+            }
+            if let Some(connection) = &projection.peer_connection {
+                let _ = self
+                    .connection_pool
+                    .connections_by_peer
+                    .upsert_sync(projection.peer_id.clone(), connection.clone());
+            }
+            match &projection.addr_route {
+                Some(owner) => {
+                    let _ = self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .upsert_sync(projection.addr, owner.clone());
+                }
+                None => {
+                    let _ = self.connection_pool.addr_to_peer_id.remove_if_sync(
+                        &projection.addr,
+                        |owner| owner == &projection.peer_id,
+                    );
+                }
+            }
+            match &projection.addr_connection {
+                Some(connection) => {
+                    let _ = self
+                        .connection_pool
+                        .connections_by_addr
+                        .upsert_sync(projection.addr, connection.clone());
+                }
+                None => {
+                    let _ = self
+                        .connection_pool
+                        .connections_by_addr
+                        .remove_if_sync(&projection.addr, |connection| {
+                            connection.embedded_peer_id.as_ref() == Some(&projection.peer_id)
+                        });
+                }
+            }
+        }
+
+        still_candidate
     }
 
     /// Track negotiated peer capabilities for a peer connection
@@ -3647,6 +4028,27 @@ impl<T: 'static> GossipRegistry<T> {
 
         {
             let pool = &self.connection_pool;
+
+            // Ownership publication and the derived pool re-key are separate
+            // lock-free structures. Revalidate the exact generation at the
+            // last possible point before publishing the route so a claimant
+            // that won the destination after PHASE 1 cannot be overwritten by
+            // this stale DNS refresh.
+            if let (Some(commit_seq), Some(peer_id)) =
+                (migrate_outcome.commit_seq(), migrating_peer_id.as_ref())
+                && !self
+                    .registry_owner
+                    .claim_is_current(&new_addr, peer_id, commit_seq)
+            {
+                warn!(
+                    old_addr = %peer_addr,
+                    new_addr = %new_addr,
+                    peer_id = %peer_id,
+                    commit_seq,
+                    "DNS refresh: ownership changed before pool publication, aborting stale route projection"
+                );
+                return None;
+            }
 
             // Identity captured before the ownership move, which already
             // retracted the old address's routing entry.

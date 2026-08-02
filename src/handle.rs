@@ -144,7 +144,7 @@ async fn rollback_rejected_inbound_claim(
     addr: SocketAddr,
     peer_id: &crate::PeerId,
     claim_generation: crate::registry_owner::CommitSeq,
-    prior_peer: Option<crate::registry::PeerInfo>,
+    prior_projection: crate::registry::InboundClaimProjectionSnapshot,
 ) {
     let Some(release_seq) = registry
         .registry_owner
@@ -154,37 +154,14 @@ async fn rollback_rejected_inbound_claim(
         return;
     };
 
-    let mut state = registry.gossip_state.lock().await;
-    state.tombstone_ownership_projection(addr, release_seq);
-    let still_candidate = state
-        .peers
-        .get(&addr)
-        .and_then(|peer| peer.node_id)
-        .is_some_and(|node_id| node_id == peer_id.to_node_id());
-    let had_prior_peer = prior_peer.is_some();
-    if still_candidate {
-        match prior_peer {
-            Some(prior) => {
-                state.peers.insert(addr, prior);
-            }
-            None => {
-                state.peers.remove(&addr);
-                state.peer_to_actors.remove(&addr);
-                if let Some(discovery) = state.peer_discovery.as_mut() {
-                    discovery.on_peer_disconnected(addr);
-                }
-            }
-        }
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state.tombstone_ownership_projection(addr, release_seq);
     }
-    drop(state);
 
-    registry
-        .connection_pool
-        .clear_displaced_peer_addr(peer_id, addr);
-    if !had_prior_peer {
-        registry.clear_peer_capabilities(&addr);
-        registry.remove_clock_state_for_addr(&addr);
-    }
+    let _ = registry
+        .restore_inbound_claim_projection(addr, peer_id, &prior_projection)
+        .await;
 }
 
 /// Main API for the gossip registry with vector clocks and separated locks
@@ -3917,14 +3894,17 @@ where
     };
     let mut peer_state_addr =
         resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, route_addr);
-    let (advertised_peer_before, observed_peer_before) = {
-        let state = registry.gossip_state.lock().await;
-        (
-            state.peers.get(&peer_state_addr).cloned(),
-            (peer_state_addr != peer_addr)
-                .then(|| state.peers.get(&peer_addr).cloned())
-                .flatten(),
+    let inbound_claim_projection = registry
+        .snapshot_inbound_claim_projection(peer_state_addr, peer_addr, &peer_id)
+        .await;
+    let observed_claim_projection = if peer_state_addr != peer_addr {
+        Some(
+            registry
+                .snapshot_inbound_claim_projection(peer_addr, peer_state_addr, &peer_id)
+                .await,
         )
+    } else {
+        None
     };
     #[cfg(test)]
     crate::lifecycle::record_transport_event(
@@ -3936,7 +3916,7 @@ where
     let mut rollback_claim: Option<(
         SocketAddr,
         crate::registry_owner::CommitSeq,
-        Option<crate::registry::PeerInfo>,
+        crate::registry::InboundClaimProjectionSnapshot,
     )> = None;
 
     if let Some(node_id) = node_id_opt {
@@ -4005,13 +3985,19 @@ where
                 node_id: Some(sender_node_id),
             };
         };
-        let peer_before = if effective_addr == peer_state_addr {
-            advertised_peer_before
-        } else {
-            observed_peer_before
-        };
         if claim_receipt.created_ownership() {
-            rollback_claim = Some((effective_addr, claim_receipt.generation(), peer_before));
+            let rollback_projection = if effective_addr == peer_state_addr {
+                inbound_claim_projection.clone()
+            } else {
+                observed_claim_projection
+                    .clone()
+                    .expect("observed address projection captured when fallback is possible")
+            };
+            rollback_claim = Some((
+                effective_addr,
+                claim_receipt.generation(),
+                rollback_projection,
+            ));
         }
         peer_state_addr = effective_addr;
 
@@ -4438,13 +4424,13 @@ where
             if let Some(handle) = connection_arc.stream_handle.as_ref() {
                 handle.shutdown();
             }
-            if let Some((claimed_addr, claim_generation, prior_peer)) = rollback_claim {
+            if let Some((claimed_addr, claim_generation, prior_projection)) = rollback_claim {
                 rollback_rejected_inbound_claim(
                     &registry,
                     claimed_addr,
                     &peer_id,
                     claim_generation,
-                    prior_peer,
+                    prior_projection,
                 )
                 .await;
             }

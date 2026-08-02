@@ -505,65 +505,63 @@ impl<T> ConnectionPool<T> {
                         }
                     };
 
-                    if discovered_node_id.is_none() {
-                        if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
-                            if let Some(cert) = certs.first() {
-                                if let Ok(node_id) = crate::tls::extract_node_id_from_cert(cert) {
-                                    // We dialed `addr` ourselves and just completed a TLS
-                                    // handshake with it: the peer certificate's node id is
-                                    // backed by an outbound connection we initiated, not a
-                                    // self-report, so it is a verified claim. Submit it
-                                    // unconditionally (not just when nothing was known for
-                                    // `addr` yet) and let the single-owner registry actor
-                                    // decide -- this is exactly how a genuinely verified
-                                    // identity is meant to displace a provisional one gossip
-                                    // may have installed earlier. No lock is held here; the
-                                    // claim commits and publishes routing in one serialized
-                                    // command inside the owner task.
-                                    //
-                                    // A cert identity that turns out to be THIS node is not
-                                    // arbitrated at all: refusing a self-dial is the dedicated
-                                    // post-cert guard's job just below, and it reports the
-                                    // reason specifically. Claiming here would be refused by
-                                    // the registry's own identity self-filter and would mask
-                                    // that with a generic ownership refusal.
-                                    let is_self_identity =
-                                        crate::PeerId::from(&node_id) == registry_arc.peer_id;
-                                    if !is_self_identity {
-                                        let claim_outcome = registry_arc
-                                            .add_peer_with_node_id(
-                                                addr,
-                                                Some(node_id),
-                                                crate::addr_ownership::ClaimKind::Verified,
-                                            )
-                                            .await;
-                                        if claim_outcome
-                                            == crate::addr_ownership::AddrClaimOutcome::Rejected
-                                        {
-                                            // The address is not attributable to this identity.
-                                            // Everything downstream is address-keyed and would
-                                            // attribute it anyway -- `finalize_new_outbound_connection`
-                                            // publishes `addr_to_peer_id[addr]` unconditionally,
-                                            // which would overwrite the accepted owner's route
-                                            // with this one. A refused claim is therefore
-                                            // terminal for the dial, not advisory: return out of
-                                            // the connect future so the TLS stream is dropped and
-                                            // nothing address-keyed is ever published for it.
-                                            warn!(
-                                                target: "icanact_remote_lifecycle",
-                                                attempt_id,
-                                                addr = %addr,
-                                                node_id = %node_id.fmt_short(),
-                                                "outbound_connect_refused_address_arbitration_lost"
-                                            );
-                                            return Err(GossipError::Network(std::io::Error::new(
-                                                std::io::ErrorKind::AddrInUse,
-                                                "outbound dial identity lost address arbitration",
-                                            )));
-                                        }
+                    if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                        if let Some(cert) = certs.first() {
+                            if let Ok(node_id) = crate::tls::extract_node_id_from_cert(cert) {
+                                // We dialed `addr` ourselves and just completed a TLS
+                                // handshake with it: the peer certificate's node id is
+                                // backed by an outbound connection we initiated, not a
+                                // self-report, so it is a verified claim. Submit it
+                                // unconditionally (not just when nothing was known for
+                                // `addr` yet) and let the single-owner registry actor
+                                // decide -- this is exactly how a genuinely verified
+                                // identity is meant to displace a provisional one gossip
+                                // may have installed earlier. No lock is held here; the
+                                // claim commits and publishes routing in one serialized
+                                // command inside the owner task.
+                                //
+                                // A cert identity that turns out to be THIS node is not
+                                // arbitrated at all: refusing a self-dial is the dedicated
+                                // post-cert guard's job just below, and it reports the
+                                // reason specifically. Claiming here would be refused by
+                                // the registry's own identity self-filter and would mask
+                                // that with a generic ownership refusal.
+                                let is_self_identity =
+                                    crate::PeerId::from(&node_id) == registry_arc.peer_id;
+                                if !is_self_identity {
+                                    let claim_outcome = registry_arc
+                                        .add_peer_with_node_id(
+                                            addr,
+                                            Some(node_id),
+                                            crate::addr_ownership::ClaimKind::Verified,
+                                        )
+                                        .await;
+                                    if claim_outcome
+                                        == crate::addr_ownership::AddrClaimOutcome::Rejected
+                                    {
+                                        // The address is not attributable to this identity.
+                                        // Everything downstream is address-keyed and would
+                                        // attribute it anyway -- `finalize_new_outbound_connection`
+                                        // publishes `addr_to_peer_id[addr]` unconditionally,
+                                        // which would overwrite the accepted owner's route
+                                        // with this one. A refused claim is therefore
+                                        // terminal for the dial, not advisory: return out of
+                                        // the connect future so the TLS stream is dropped and
+                                        // nothing address-keyed is ever published for it.
+                                        warn!(
+                                            target: "icanact_remote_lifecycle",
+                                            attempt_id,
+                                            addr = %addr,
+                                            node_id = %node_id.fmt_short(),
+                                            "outbound_connect_refused_address_arbitration_lost"
+                                        );
+                                        return Err(GossipError::Network(std::io::Error::new(
+                                            std::io::ErrorKind::AddrInUse,
+                                            "outbound dial identity lost address arbitration",
+                                        )));
                                     }
-                                    discovered_node_id = Some(node_id);
                                 }
+                                discovered_node_id = Some(node_id);
                             }
                         }
                     }

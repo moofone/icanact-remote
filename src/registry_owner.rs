@@ -393,13 +393,9 @@ impl<T: 'static> RoutingPublisher for crate::connection_pool::ConnectionPool<T> 
     }
 
     fn retract_owner(&self, addr: SocketAddr, peer_id: &PeerId) {
-        let still_ours = self
+        let _ = self
             .addr_to_peer_id
-            .read_sync(&addr, |_, current| current == peer_id)
-            .unwrap_or(false);
-        if still_ours {
-            let _ = self.addr_to_peer_id.remove_sync(&addr);
-        }
+            .remove_if_sync(&addr, |current| current == peer_id);
     }
 }
 
@@ -967,6 +963,33 @@ mod tests {
             .ownership_token(&addr)
             .map(SourceExpectation::Owned)
             .unwrap_or(SourceExpectation::Unowned)
+    }
+
+    #[test]
+    fn routing_retract_is_conditional_on_the_current_owner() {
+        let pool = crate::connection_pool::ConnectionPool::<()>::new(8, Duration::from_secs(1));
+        let addr = addr(30_000);
+        let old_owner = peer("retract-old");
+        let current_owner = peer("retract-current");
+
+        let _ = pool
+            .addr_to_peer_id
+            .upsert_sync(addr, current_owner.clone());
+        <crate::connection_pool::ConnectionPool as RoutingPublisher>::retract_owner(
+            &pool, addr, &old_owner,
+        );
+        assert_eq!(
+            pool.addr_to_peer_id.read_sync(&addr, |_, owner| owner.clone()),
+            Some(current_owner.clone()),
+            "a stale retract must not remove a newer route"
+        );
+
+        <crate::connection_pool::ConnectionPool as RoutingPublisher>::retract_owner(
+            &pool,
+            addr,
+            &current_owner,
+        );
+        assert!(pool.addr_to_peer_id.read_sync(&addr, |_, _| ()).is_none());
     }
 
     /// Verified first, then a competing Provisional: the truth table's
