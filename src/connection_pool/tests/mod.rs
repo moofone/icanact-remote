@@ -1286,7 +1286,7 @@ async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
 }
 
 #[test]
-fn immediate_streaming_response_queue_rejects_byte_burst() {
+fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission() {
     let mut queue = LocalStreamingQueue::new();
     queue
         .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
@@ -1295,13 +1295,87 @@ fn immediate_streaming_response_queue_rejects_byte_burst() {
         ]))])
         .expect("the configured byte cap admits one bounded burst");
     assert!(queue.is_full());
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x")),
+            StreamingCommand::Flush,
+        ])
+        .expect("overflow is retained in the deferred response slot");
+}
+
+#[test]
+fn immediate_streaming_response_queue_defers_overflow_until_prior_response_drains() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; RESPONSE_BATCH_BYTE_CAP])),
+            StreamingCommand::Flush,
+        ])
+        .expect("the first response fits the bounded queue");
+
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"deferred")),
+            StreamingCommand::Flush,
+        ])
+        .expect("the next response is retained for deferred admission");
     assert!(
-        queue
-            .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(
-                b"x"
-            ))])
-            .is_err()
+        queue.is_full(),
+        "deferred response must close read admission"
     );
+
+    let mut drained = 0;
+    while queue.pop_front().is_some() {
+        drained += 1;
+    }
+    assert_eq!(
+        drained, 4,
+        "the deferred response must be promoted after flush"
+    );
+    assert!(
+        !queue.is_full(),
+        "admission reopens after both responses drain"
+    );
+}
+
+#[test]
+fn immediate_streaming_response_queue_reserves_command_slots() {
+    let mut queue = LocalStreamingQueue::with_response_reserve(STREAM_CHUNK_SIZE * 2);
+    let reserve = queue.response_reserve_commands;
+    for _ in 0..(STREAMING_RESPONSE_QUEUE_COMMAND_CAP - reserve) {
+        queue
+            .try_extend([StreamingCommand::Flush])
+            .expect("reserved queue slots still admit bounded commands");
+    }
+    assert!(!queue.is_full(), "the reserved response still fits exactly");
+    queue
+        .try_extend([StreamingCommand::Flush])
+        .expect("overflow is retained as a deferred response");
+    assert!(
+        queue.is_full(),
+        "the command reserve must close read admission"
+    );
+}
+
+#[test]
+fn streaming_scheduler_alternates_local_and_shared_sources() {
+    assert_eq!(
+        choose_streaming_source(true, true, true),
+        Some(StreamingSource::Shared)
+    );
+    assert_eq!(
+        choose_streaming_source(false, true, true),
+        Some(StreamingSource::Local)
+    );
+    assert_eq!(
+        choose_streaming_source(true, true, false),
+        Some(StreamingSource::Local)
+    );
+    assert_eq!(
+        choose_streaming_source(false, false, true),
+        Some(StreamingSource::Shared)
+    );
+    assert_eq!(choose_streaming_source(true, false, false), None);
 }
 
 #[test]
@@ -1317,11 +1391,12 @@ fn immediate_streaming_response_queue_admits_one_oversized_response() {
         ])
         .expect("one response may exceed the queue cap");
     assert!(queue.is_full());
-    assert!(
-        queue
-            .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x"))])
-            .is_err()
-    );
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x")),
+            StreamingCommand::Flush,
+        ])
+        .expect("overflow is retained in the deferred response slot");
 
     while queue.pop_front().is_some() {}
     assert!(
@@ -1329,7 +1404,9 @@ fn immediate_streaming_response_queue_admits_one_oversized_response() {
         "admission reopens after the oversized response flushes"
     );
     queue
-        .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x"))])
+        .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(
+            b"x",
+        ))])
         .expect("a later response is admitted after the first one drains");
 }
 

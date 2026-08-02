@@ -1024,6 +1024,11 @@ impl StreamingQueue {
         self.queue.pop()
     }
 
+    #[inline]
+    fn has_pending(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     fn notify_space(&self) {
         #[cfg(test)]
         self.space_notification_count.fetch_add(1, Ordering::Relaxed);

@@ -10,10 +10,8 @@ enum WriteCommand {
 }
 
 /// Commands for streaming operations.
-#[expect(
-    dead_code,
-    reason = "the direct write command remains part of the writer-owned transport command set"
-)]
+// The direct write command remains part of the writer-owned transport command set.
+#[allow(dead_code)]
 enum StreamingCommand {
     /// Direct write bytes for streaming.
     WriteBytes(bytes::Bytes),
@@ -45,6 +43,17 @@ struct LocalStreamingQueue {
     /// while the queue is otherwise empty; a second response is backpressured
     /// until the first one drains.
     response_reserve_bytes: usize,
+    /// Reserve command slots for the next maximum-sized response as well as
+    /// bytes. The command cap is independent from the retained-payload cap,
+    /// so byte-only admission can otherwise consume the last slots before a
+    /// response is expanded into its chunk frames.
+    #[cfg_attr(not(test), allow(dead_code))]
+    response_reserve_commands: usize,
+    /// One response that arrived after the bounded queue filled. Keeping the
+    /// complete command batch here preserves the consumed ask's response
+    /// without opening an unbounded side queue; `is_full` stops reads until
+    /// the current response drains and `pop_front` promotes this batch.
+    deferred: Option<Vec<StreamingCommand>>,
 }
 
 impl LocalStreamingQueue {
@@ -58,16 +67,30 @@ impl LocalStreamingQueue {
             max_message_size.max(STREAM_CHUNK_SIZE),
             STREAMING_RESPONSE_QUEUE_BYTE_CAP,
         );
+        let response_reserve_commands = max_message_size
+            .saturating_add(STREAM_CHUNK_SIZE.saturating_sub(1))
+            .checked_div(STREAM_CHUNK_SIZE)
+            .unwrap_or(1)
+            .saturating_add(2)
+            .min(STREAMING_RESPONSE_QUEUE_COMMAND_CAP);
         Self {
             queue: std::collections::VecDeque::new(),
             queued_bytes: 0,
             response_in_flight: false,
             response_reserve_bytes,
+            response_reserve_commands,
+            deferred: None,
             wire_blocked: false,
         }
     }
 
     fn pop_front(&mut self) -> Option<StreamingCommand> {
+        if self.queue.is_empty() && !self.response_in_flight {
+            if let Some(deferred) = self.deferred.take() {
+                self.queued_bytes = deferred.iter().map(streaming_command_bytes).sum();
+                self.queue.extend(deferred);
+            }
+        }
         let command = self.queue.pop_front()?;
         self.queued_bytes = self
             .queued_bytes
@@ -84,14 +107,42 @@ impl LocalStreamingQueue {
         self.wire_blocked
     }
 
+    fn has_pending(&self) -> bool {
+        !self.queue.is_empty() || self.deferred.is_some()
+    }
+
+    /// Return whether a response with this command/byte footprint can be
+    /// retained without copying it first. If the bounded queue cannot fit it,
+    /// the single deferred-response slot is the admission path.
+    fn can_admit_response(&self, command_count: usize, response_bytes: usize) -> bool {
+        if self.deferred.is_some() {
+            return false;
+        }
+        let fits_queue = self.queue.len().saturating_add(command_count)
+            <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
+            && self.queued_bytes.saturating_add(response_bytes)
+                <= STREAMING_RESPONSE_QUEUE_BYTE_CAP;
+        // The deferred slot is itself a valid admission result. Keep the
+        // footprint arguments in the predicate so this remains the single
+        // preflight point for pooled responses, even when the queue cannot
+        // fit the complete response in its bounded resident window.
+        fits_queue || self.deferred.is_none()
+    }
+
     fn is_full(&self) -> bool {
+        if self.deferred.is_some() {
+            return true;
+        }
         if self.response_in_flight && self.queue.is_empty() {
             return true;
         }
         if self.queue.is_empty() {
             return false;
         }
-        self.queue.len() >= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
+        self.queue
+            .len()
+            .saturating_add(self.response_reserve_commands)
+            > STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             || self.queued_bytes >= STREAMING_RESPONSE_QUEUE_BYTE_CAP
             || self
                 .queued_bytes
@@ -111,10 +162,14 @@ impl LocalStreamingQueue {
         let admit_single_oversize =
             self.queue.is_empty() && !self.response_in_flight && exceeds_cap;
         if exceeds_cap && !admit_single_oversize {
-            return Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "immediate streaming response queue is full",
-            )));
+            if self.deferred.is_some() {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "immediate streaming response queue deferred slot is full",
+                )));
+            }
+            self.deferred = Some(commands);
+            return Ok(());
         }
         if admit_single_oversize {
             self.response_in_flight = true;
@@ -132,6 +187,28 @@ fn streaming_command_bytes(command: &StreamingCommand) -> usize {
         StreamingCommand::VectoredWrite(item) => item.header.len() + item.payload.len(),
         StreamingCommand::OwnedChunks(chunks) => chunks.iter().map(bytes::Bytes::len).sum(),
         StreamingCommand::Abort { stream_id, reason } => crate::framing::write_stream_abort_header(*stream_id, *reason).len(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingSource {
+    Local,
+    Shared,
+}
+
+/// Pick the next streaming source without allowing a continuously replenished
+/// local response queue to starve producer-owned shared streams.
+fn choose_streaming_source(
+    prefer_shared: bool,
+    local_ready: bool,
+    shared_ready: bool,
+) -> Option<StreamingSource> {
+    match (local_ready, shared_ready, prefer_shared) {
+        (false, false, _) => None,
+        (true, false, _) => Some(StreamingSource::Local),
+        (false, true, _) => Some(StreamingSource::Shared),
+        (true, true, true) => Some(StreamingSource::Shared),
+        (true, true, false) => Some(StreamingSource::Local),
     }
 }
 

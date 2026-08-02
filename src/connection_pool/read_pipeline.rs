@@ -1493,6 +1493,58 @@ fn queue_streaming_response_pooled(
             "pooled response payload shorter than payload_len",
         )));
     }
+    if payload_len > u32::MAX as usize {
+        return Err(GossipError::MessageTooLarge {
+            size: payload_len,
+            max: u32::MAX as usize,
+        });
+    }
+
+    let max_chunk = max_message_size
+        .saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
+    if max_chunk == 0 {
+        return Err(GossipError::InvalidConfig(format!(
+            "max_message_size={} too small for streaming (overhead={})",
+            max_message_size,
+            crate::framing::STREAM_RESPONSE_START_HEADER_LEN
+        )));
+    }
+    let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
+    let chunk_count = if payload_len == 0 {
+        1
+    } else {
+        payload_len
+            .saturating_add(chunk_size.saturating_sub(1))
+            .checked_div(chunk_size)
+            .unwrap_or(usize::MAX)
+    };
+    let command_count = chunk_count.saturating_add(1); // data frames + terminal Flush
+    let first_len = payload_len.min(chunk_size);
+    let start_header_len = crate::framing::write_stream_response_start_header(
+        0,
+        correlation_id,
+        payload_len as u32,
+        first_len,
+    )
+    .len();
+    let data_header_len = crate::framing::write_stream_data_header(
+        true,
+        0,
+        1,
+        chunk_size,
+    )
+    .len();
+    let response_bytes = payload_len.saturating_add(start_header_len).saturating_add(
+        chunk_count
+            .saturating_sub(1)
+            .saturating_mul(data_header_len),
+    );
+    if !streaming_responses.can_admit_response(command_count, response_bytes) {
+        return Err(GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "immediate streaming response queue deferred slot is full",
+        )));
+    }
 
     let mut bytes = bytes::BytesMut::with_capacity(payload_len);
     if let Some(prefix) = prefix {
