@@ -17,6 +17,21 @@ pub enum SessionRemovalReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportLifecycleEvent {
+    /// Test-only seam after an inbound candidate has sampled pre-claim
+    /// ownership/peer state but before it submits its serialized claim.
+    #[cfg(test)]
+    InboundOwnershipSnapshotTaken {
+        peer: PeerId,
+        addr: SocketAddr,
+    },
+    /// Test-only seam after the owner actor has decided a DNS migration but
+    /// before the derived gossip-state move.
+    #[cfg(test)]
+    DnsOwnershipMigrationDecided {
+        from: SocketAddr,
+        to: SocketAddr,
+        moved: bool,
+    },
     OutboundStart {
         peer: Option<PeerId>,
         addr: SocketAddr,

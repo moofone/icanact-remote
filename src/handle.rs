@@ -1310,6 +1310,148 @@ mod tests {
         Ok(())
     }
 
+    /// Two same-identity inbound candidates can both sample an unowned
+    /// address before either serialized claim runs. Only the command that
+    /// actually creates ownership may arm rollback; the later same-identity
+    /// refresh must not remove the creator's surviving route when it loses
+    /// the connection tie-break.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_same_identity_refresh_does_not_rollback_concurrent_creator()
+    -> crate::Result<()> {
+        let (local_keypair, remote_keypair) = ordered_keypairs(
+            "ownership-created-local-lower",
+            "ownership-created-remote-higher",
+        );
+        let remote_peer_id = remote_keypair.peer_id();
+        let remote_node_id = remote_peer_id.to_node_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        assert!(
+            !handle
+                .registry
+                .should_keep_connection(&remote_peer_id, false),
+            "the lower local identity must reject the later inbound duplicate"
+        );
+
+        let shared_addr: SocketAddr = "127.0.0.1:42100".parse().unwrap();
+        handle
+            .registry
+            .connection_pool
+            .set_configured_peer_addr(&remote_peer_id, shared_addr);
+
+        let survivor_addr: SocketAddr = "127.0.0.1:42101".parse().unwrap();
+        let (survivor_io, _survivor_peer) = tokio::io::duplex(1024);
+        let (survivor_stream, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                survivor_io,
+                survivor_addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                handle.registry.config.schema_hash,
+                None,
+            );
+        let mut survivor = crate::connection_pool::LockFreeConnection::new(
+            survivor_addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        survivor.stream_handle = Some(Arc::new(survivor_stream));
+        survivor.set_state(crate::connection_pool::ConnectionState::Connected);
+        let survivor = Arc::new(survivor);
+
+        let _guard = {
+            let registry = handle.registry.clone();
+            let peer_id = remote_peer_id.clone();
+            let survivor = survivor.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                let crate::TransportLifecycleEvent::InboundOwnershipSnapshotTaken { peer, addr } =
+                    event
+                else {
+                    return;
+                };
+                if peer != peer_id || addr != shared_addr {
+                    return;
+                }
+                crate::set_transport_lifecycle_recorder(None);
+                let registry = registry.clone();
+                let peer_id = peer_id.clone();
+                let survivor = survivor.clone();
+                tokio::task::block_in_place(move || {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        assert_eq!(
+                            registry
+                                .add_peer_with_node_id(
+                                    shared_addr,
+                                    Some(remote_node_id),
+                                    crate::addr_ownership::ClaimKind::Verified,
+                                )
+                                .await,
+                            crate::addr_ownership::AddrClaimOutcome::Accepted,
+                            "the concurrent candidate creates the shared ownership"
+                        );
+                        assert!(registry.connection_pool.add_connection_by_peer_id(
+                            peer_id,
+                            survivor_addr,
+                            survivor,
+                        ));
+                    });
+                });
+            }))
+        };
+
+        let rejected_addr: SocketAddr = "127.0.0.1:42102".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        write_initial_gossip(
+            &mut writer,
+            &crate::registry::RegistryMessage::FullSyncRequest {
+                sender_peer_id: remote_peer_id.clone(),
+                sender_bind_addr: Some(shared_addr.to_string()),
+                sequence: 1,
+                wall_clock_time: crate::current_timestamp(),
+            },
+        )
+        .await;
+
+        let outcome = handle_incoming_connection_tls(
+            reader,
+            rejected_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_node_id),
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ConnectionCloseOutcome::DroppedByTieBreaker
+        ));
+        assert!(
+            handle
+                .registry
+                .connection_pool
+                .get_connection_by_peer_id(&remote_peer_id)
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &survivor)),
+            "the concurrent creator's connection must survive"
+        );
+        assert_eq!(
+            handle.registry.registry_owner.routes_to(&shared_addr),
+            Some(remote_peer_id),
+            "a rejected refresh must not rollback ownership created by the concurrent survivor"
+        );
+
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     /// R-11: a duplicate inbound candidate that loses the tie-break must not
     /// strand the sequence-reset exemption on its own dropped ephemeral
     /// port, and must not disturb the surviving live connection's own
@@ -3788,6 +3930,13 @@ where
                 .flatten(),
         )
     };
+    #[cfg(test)]
+    crate::lifecycle::record_transport_event(
+        crate::lifecycle::TransportLifecycleEvent::InboundOwnershipSnapshotTaken {
+            peer: peer_id.clone(),
+            addr: peer_state_addr,
+        },
+    );
     let mut rollback_claim: Option<(
         SocketAddr,
         crate::registry_owner::CommitSeq,

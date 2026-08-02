@@ -3478,6 +3478,14 @@ impl<T: 'static> GossipRegistry<T> {
                 new_addr == self.bind_addr || new_addr == self.advertised_addr(),
             )
             .await;
+        #[cfg(test)]
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::DnsOwnershipMigrationDecided {
+                from: peer_addr,
+                to: new_addr,
+                moved: migrate_outcome.moved(),
+            },
+        );
         if migrate_outcome.is_blocked() {
             warn!(
                 old_addr = %peer_addr,
@@ -19109,6 +19117,82 @@ mod tests {
         assert!(registry.registry_owner.routes_to(&addr).is_none());
     }
 
+    /// The owner actor publishes a release before cleanup can acquire
+    /// `gossip_state` to install its projection tombstone. A FullSync carrying
+    /// the released claim generation must consult that authoritative commit,
+    /// not admit itself merely because the derived watermark is still equal.
+    #[tokio::test]
+    async fn full_sync_is_fenced_by_committed_release_before_tombstone_projection() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_123),
+            test_config_with_seed("full-sync-release-before-tombstone"),
+        );
+        let addr = test_addr(20_124);
+        let peer = test_peer_id("full-sync-released-owner");
+        let actor_name = "released/full-sync/actor".to_string();
+
+        let (outcome, generation) = registry
+            .add_peer_with_node_id_generation(
+                addr,
+                Some(peer.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        let generation = generation.expect("authenticated claim generation");
+        registry
+            .registry_owner
+            .release(addr, peer.clone(), generation)
+            .await
+            .expect("release commits in the owner actor");
+
+        assert_eq!(registry.registry_owner.routes_to(&addr), None);
+        assert_eq!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .ownership_watermark(&addr),
+            Some(generation),
+            "test precondition: cleanup has not projected the newer release tombstone"
+        );
+
+        let remote_local = HashMap::from([(
+            actor_name.clone(),
+            RemoteActorLocation::new_with_peer(addr, peer.clone()),
+        )]);
+        assert!(
+            !registry
+                .merge_full_sync_from_owned(
+                    remote_local,
+                    HashMap::new(),
+                    peer.clone(),
+                    addr,
+                    Some(addr),
+                    Some(addr),
+                    1,
+                    current_timestamp(),
+                    generation,
+                )
+                .await,
+            "a claim generation released by the owner actor must be rejected immediately"
+        );
+        assert!(registry.lookup_actor(&actor_name).await.is_none());
+        let state = registry.gossip_state.lock().await;
+        let projected_peer = state
+            .peers
+            .get(&addr)
+            .expect("stale peer projection remains");
+        assert_eq!(projected_peer.last_sequence, 0);
+        assert!(
+            state
+                .peer_to_actors
+                .get(&addr)
+                .is_none_or(|actors| !actors.contains(&actor_name))
+        );
+        assert_eq!(state.full_sync_exchanges, 0);
+    }
+
     /// A migration tombstones the address it vacated for the same reason a
     /// release does, and fences the destination it occupied.
     #[tokio::test]
@@ -19740,6 +19824,103 @@ mod tests {
             registry.registry_owner.routes_to(&new_addr),
             Some(holder),
             "the destination's owner keeps its routing"
+        );
+    }
+
+    /// A DNS seed whose source is unowned has no ownership move to undo. If a
+    /// claimant lands on the resolved address after that `SourceUnowned`
+    /// decision but before the derived peer-entry move fails, the failure path
+    /// must not reverse-migrate the unrelated claimant onto the seed's old
+    /// address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dns_source_unowned_failure_never_reverse_migrates_later_claimant() {
+        struct StaticResolver(Vec<SocketAddr>);
+        impl crate::dns::DnsResolver for StaticResolver {
+            fn lookup<'a>(
+                &'a self,
+                _dns: &'a str,
+            ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let old_addr: SocketAddr = "5.6.7.8:5300".parse().unwrap();
+        let new_addr: SocketAddr = "9.10.11.12:5300".parse().unwrap();
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_143),
+            test_config_with_seed("dns-source-unowned-no-reverse"),
+        );
+        registry
+            .set_dns_resolver(Arc::new(StaticResolver(vec![new_addr])))
+            .await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut seed = PeerInfo::local(old_addr);
+            seed.dns_name = Some("seed-race.invalid:5300".to_string());
+            state.peers.insert(old_addr, seed);
+        }
+
+        let claimant = test_peer_id("dns-later-destination-claimant");
+        let _guard = {
+            let registry = registry.clone();
+            let claimant = claimant.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                let crate::TransportLifecycleEvent::DnsOwnershipMigrationDecided {
+                    from,
+                    to,
+                    moved,
+                } = event
+                else {
+                    return;
+                };
+                if from != old_addr || to != new_addr {
+                    return;
+                }
+                assert!(!moved, "the unowned source must report no ownership move");
+                crate::set_transport_lifecycle_recorder(None);
+                let registry = registry.clone();
+                let claimant = claimant.clone();
+                tokio::task::block_in_place(move || {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        assert!(
+                            registry
+                                .registry_owner
+                                .claim(
+                                    new_addr,
+                                    crate::addr_ownership::Claim {
+                                        node_id: claimant.clone(),
+                                        kind: crate::addr_ownership::ClaimKind::Verified,
+                                    },
+                                    false,
+                                )
+                                .await
+                                .is_accepted()
+                        );
+                        let mut state = registry.gossip_state.lock().await;
+                        let mut collision = PeerInfo::local(new_addr);
+                        collision.node_id = Some(claimant.to_node_id());
+                        state.peers.insert(new_addr, collision);
+                    });
+                });
+            }))
+        };
+
+        assert_eq!(registry.refresh_peer_dns(old_addr).await, None);
+        assert_eq!(
+            registry.registry_owner.routes_to(&new_addr),
+            Some(claimant.clone()),
+            "the later claimant must stay on the resolved address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&old_addr),
+            None,
+            "SourceUnowned provides no authority to reverse-migrate anything"
+        );
+        let state = registry.gossip_state.lock().await;
+        assert!(state.peers.contains_key(&old_addr));
+        assert_eq!(
+            state.peers.get(&new_addr).and_then(|peer| peer.node_id),
+            Some(claimant.to_node_id())
         );
     }
 
