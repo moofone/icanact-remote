@@ -1232,6 +1232,7 @@ impl AsyncWrite for RecordingWriter {
 async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
     let (mut writer, recorded) = RecordingWriter::new();
     let queue = StreamingQueue::new(1, "127.0.0.1:40493".parse().unwrap());
+    let mut yielded_slot = None;
     let header =
         crate::framing::write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17);
     let payload = bytes::Bytes::from(vec![0xA7; STREAM_WRITE_SLICE_BYTES + 17]);
@@ -1250,7 +1251,13 @@ async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
         assert!(written > 0);
         assert!(written <= STREAM_WRITE_SLICE_BYTES);
         turns += 1;
-        finish_streaming_command_slice(pending, complete, &queue, &mut pending_slot);
+        finish_streaming_command_slice(
+            pending,
+            complete,
+            &queue,
+            &mut yielded_slot,
+            &mut pending_slot,
+        );
         if complete {
             break;
         }
@@ -1273,7 +1280,13 @@ async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
     let (_, local_complete) = write_streaming_command_slice(&mut writer, &mut local)
         .await
         .unwrap();
-    finish_streaming_command_slice(local, local_complete, &queue, &mut pending_slot);
+    finish_streaming_command_slice(
+        local,
+        local_complete,
+        &queue,
+        &mut yielded_slot,
+        &mut pending_slot,
+    );
     assert_eq!(
         queue.space_notification_count(),
         1,
@@ -1301,6 +1314,44 @@ fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission(
             StreamingCommand::Flush,
         ])
         .expect("overflow is retained in the deferred response slot");
+}
+
+#[test]
+fn immediate_bytes_response_admission_stays_lazy_for_many_frames() {
+    let payload_len = STREAM_CHUNK_SIZE * 128;
+    let mut queue = LocalStreamingQueue::with_response_reserve(payload_len);
+    queue_streaming_response_bytes(
+        &mut queue,
+        0xC0DE,
+        bytes::Bytes::from(vec![0xA7; payload_len]),
+        payload_len,
+        None,
+    )
+    .expect("large bytes response should be admitted");
+
+    assert_eq!(
+        queue.queue.len(),
+        2,
+        "a large response must retain one lazy command plus its terminal flush"
+    );
+}
+
+#[test]
+fn response_in_flight_with_only_flush_closes_admission() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"response")),
+            StreamingCommand::Flush,
+        ])
+        .expect("response should be admitted");
+
+    let response = queue.pop_front().expect("response command");
+    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+    assert!(
+        queue.is_full(),
+        "the retained response remains in flight until its terminal flush"
+    );
 }
 
 /// A pooled response must retain its original allocation while it waits for
@@ -1409,6 +1460,119 @@ async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
         ));
         expected.extend_from_slice(&logical_payload[frame_payload_start..frame_payload_end]);
         wire_offset = frame_payload_end;
+        chunk_index += 1;
+    }
+
+    assert_eq!(*recorded.lock().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn pooled_streaming_response_yields_at_each_frame_boundary() {
+    let payload_len = 128;
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(payload_len, |out| {
+        out.extend(std::iter::repeat_n(0xA7, payload_len));
+    })
+    .expect("pooled payload allocation");
+    let mut local_queue = LocalStreamingQueue::with_response_reserve(64);
+    queue_streaming_response_pooled(
+        &mut local_queue,
+        0xC0DE,
+        payload,
+        None,
+        payload_len,
+        64,
+        None,
+    )
+    .expect("pooled response should be admitted");
+
+    let command = local_queue.pop_front().expect("pooled response command");
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, _) = RecordingWriter::new();
+    let mut complete = false;
+    let mut written = 0;
+    while !pending.yield_after_frame && !complete {
+        let (turn_written, turn_complete) =
+            write_streaming_command_slice(&mut writer, &mut pending)
+                .await
+                .expect("first pooled frame write");
+        written += turn_written;
+        complete = turn_complete;
+    }
+    assert!(written > 0);
+    assert!(!complete, "the response has more than one frame");
+    assert!(
+        pending.yield_after_frame,
+        "a completed frame must yield the local command to the scheduler"
+    );
+
+    let shared_queue = StreamingQueue::new(1, "127.0.0.1:40494".parse().unwrap());
+    let mut yielded_slot = None;
+    let mut pending_slot = None;
+    finish_streaming_command_slice(
+        pending,
+        complete,
+        &shared_queue,
+        &mut yielded_slot,
+        &mut pending_slot,
+    );
+    assert!(pending_slot.is_none());
+    assert!(matches!(
+        yielded_slot.as_ref().map(|pending| &pending.command),
+        Some(StreamingCommand::PooledResponse(_))
+    ));
+}
+
+#[tokio::test]
+async fn bytes_streaming_response_writes_frame_order() {
+    let payload_len = 128;
+    let payload_bytes = vec![0xA7; payload_len];
+    let mut local_queue = LocalStreamingQueue::with_response_reserve(64);
+    queue_streaming_response_bytes(
+        &mut local_queue,
+        0xC0DE,
+        bytes::Bytes::from(payload_bytes.clone()),
+        64,
+        None,
+    )
+    .expect("bytes response should be admitted");
+
+    let command = local_queue.pop_front().expect("bytes response command");
+    let stream_id = match &command {
+        StreamingCommand::BytesResponse(response) => response.stream_id,
+        other => panic!("expected bytes response command, got {other:?}"),
+    };
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, recorded) = RecordingWriter::new();
+    loop {
+        let (_, complete) = write_streaming_command_slice(&mut writer, &mut pending)
+            .await
+            .expect("bytes response write");
+        if complete {
+            break;
+        }
+    }
+
+    let chunk_size = 64 - crate::framing::STREAM_RESPONSE_START_HEADER_LEN;
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&crate::framing::write_stream_response_start_header(
+        stream_id,
+        0xC0DE,
+        payload_len as u32,
+        payload_len.min(chunk_size),
+    ));
+    expected.extend_from_slice(&payload_bytes[..payload_len.min(chunk_size)]);
+    let mut offset = payload_len.min(chunk_size);
+    let mut chunk_index = 1u32;
+    while offset < payload_len {
+        let end = (offset + chunk_size).min(payload_len);
+        expected.extend_from_slice(&crate::framing::write_stream_data_header(
+            true,
+            stream_id,
+            chunk_index,
+            end - offset,
+        ));
+        expected.extend_from_slice(&payload_bytes[offset..end]);
+        offset = end;
         chunk_index += 1;
     }
 

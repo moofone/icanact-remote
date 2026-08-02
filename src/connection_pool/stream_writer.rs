@@ -71,6 +71,87 @@ where
     Ok(result)
 }
 
+/// Write one bounded slice of a lazily framed `Bytes` response. Returning a
+/// frame-boundary yield lets the scheduler interleave another streaming source
+/// without materializing the remaining response into per-frame commands.
+async fn write_bytes_streaming_command_slice<S>(
+    stream: &mut S,
+    pending_offset: &mut usize,
+    response: &mut BytesStreamingResponse,
+) -> std::io::Result<(usize, bool, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    while response.frame_index < response.chunk_count {
+        let header = response.frame_header(response.frame_index);
+        let header_bytes = header.as_slice();
+        let frame_payload_len = response.frame_payload_len(response.frame_index);
+        let frame_total_len = header_bytes.len() + frame_payload_len;
+
+        if response.frame_offset >= frame_total_len {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+            continue;
+        }
+
+        let budget = STREAM_WRITE_SLICE_BYTES.min(frame_total_len - response.frame_offset);
+        let header_bytes_offered = if response.frame_offset < header_bytes.len() {
+            (header_bytes.len() - response.frame_offset).min(budget)
+        } else {
+            0
+        };
+        let data_budget = budget - header_bytes_offered;
+        let mut slices = [std::io::IoSlice::new(&[]); 2];
+        let mut slice_count = 0usize;
+
+        if header_bytes_offered > 0 {
+            let header_start = response.frame_offset;
+            slices[slice_count] = std::io::IoSlice::new(
+                &header_bytes[header_start..header_start + header_bytes_offered],
+            );
+            slice_count += 1;
+        }
+        if data_budget > 0 {
+            let frame_payload_start = if response.frame_index == 0 {
+                0
+            } else {
+                response
+                    .chunk_size
+                    .saturating_add(
+                        response
+                            .frame_index
+                            .saturating_sub(1)
+                            .saturating_mul(response.chunk_size),
+                    )
+            };
+            let payload_offset = frame_payload_start
+                .saturating_add(response.frame_offset.saturating_sub(header_bytes.len()));
+            slices[slice_count] = std::io::IoSlice::new(
+                &response.payload[payload_offset..payload_offset + data_budget],
+            );
+            slice_count += 1;
+        }
+
+        let written = write_vectored_once(stream, &slices[..slice_count]).await?;
+        response.frame_offset += written;
+        *pending_offset += written;
+        let frame_complete = response.frame_offset >= frame_total_len;
+        if frame_complete {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+        }
+        let complete = response.frame_index >= response.chunk_count;
+        // Keep the direct-Bytes response consumer-owned across frame
+        // boundaries. It still returns to the read side after every bounded
+        // socket write; handing this command to the source alternator here
+        // can deadlock reciprocal large ask/response streams on a constrained
+        // duplex transport. Pooled responses use the fairness yield below.
+        return Ok((written, complete, false));
+    }
+
+    Ok((0, true, false))
+}
+
 /// Write one bounded slice of a pooled response without converting its
 /// payload into `Bytes`. The pooled allocation remains owned by the pending
 /// command until the terminal frame has been written.
@@ -78,7 +159,7 @@ async fn write_pooled_streaming_command_slice<S>(
     stream: &mut S,
     pending_offset: &mut usize,
     response: &mut PooledStreamingResponse,
-) -> std::io::Result<(usize, bool)>
+) -> std::io::Result<(usize, bool, bool)>
 where
     S: AsyncWrite + Unpin,
 {
@@ -175,7 +256,8 @@ where
 
         response.frame_offset += written;
         *pending_offset += written;
-        if response.frame_offset >= frame_total_len {
+        let frame_complete = response.frame_offset >= frame_total_len;
+        if frame_complete {
             response.frame_index += 1;
             response.frame_offset = 0;
         }
@@ -188,10 +270,10 @@ where
                 "pooled response stream completed before all payload bytes were written",
             ));
         }
-        return Ok((written, complete));
+        return Ok((written, complete, frame_complete && !complete));
     }
 
-    Ok((0, true))
+    Ok((0, true, false))
 }
 
 async fn write_streaming_command_slice<S>(
@@ -201,13 +283,22 @@ async fn write_streaming_command_slice<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    pending.yield_after_frame = false;
+    if let StreamingCommand::BytesResponse(response) = &mut pending.command {
+        let (written, complete, yield_after_frame) =
+            write_bytes_streaming_command_slice(stream, &mut pending.offset, response).await?;
+        pending.yield_after_frame = yield_after_frame;
+        return Ok((written, complete));
+    }
     if let StreamingCommand::PooledResponse(response) = &mut pending.command {
-        return write_pooled_streaming_command_slice(
+        let (written, complete, yield_after_frame) = write_pooled_streaming_command_slice(
             stream,
             &mut pending.offset,
             response,
         )
-        .await;
+        .await?;
+        pending.yield_after_frame = yield_after_frame;
+        return Ok((written, complete));
     }
 
     let offset = pending.offset;
@@ -313,6 +404,9 @@ where
         StreamingCommand::PooledResponse(_) => unreachable!(
             "pooled responses are handled by write_pooled_streaming_command_slice"
         ),
+        StreamingCommand::BytesResponse(_) => unreachable!(
+            "bytes responses are handled by write_bytes_streaming_command_slice"
+        ),
     };
     pending.offset += written;
     Ok((written, pending.offset == total_len))
@@ -323,12 +417,15 @@ fn finish_streaming_command_slice(
     pending: PendingStreamingCommand,
     complete: bool,
     streaming_queue: &StreamingQueue,
+    yielded_slot: &mut Option<PendingStreamingCommand>,
     pending_slot: &mut Option<PendingStreamingCommand>,
 ) {
     if complete {
         if pending.from_shared_queue {
             streaming_queue.notify_space();
         }
+    } else if pending.yield_after_frame && !pending.from_shared_queue {
+        *yielded_slot = Some(pending);
     } else {
         *pending_slot = Some(pending);
     }
@@ -964,6 +1061,11 @@ impl LockFreeStreamHandle {
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_immediate_cmd: Option<WriteCommand> = None;
         let mut pending_stream_cmd: Option<PendingStreamingCommand> = None;
+        // A local response that just completed a frame yields here instead of
+        // being forced ahead of shared streaming work. Keeping the pending
+        // command out of `LocalStreamingQueue` preserves its in-flight byte
+        // accounting while allowing the source scheduler to alternate.
+        let mut yielded_stream_cmd: Option<PendingStreamingCommand> = None;
         // Alternate local response frames with producer-owned shared stream
         // frames whenever both are ready. This is state local to the IO owner
         // and adds no synchronization to the messaging hot path.
@@ -1037,12 +1139,15 @@ impl LockFreeStreamHandle {
             } else {
                 let source = choose_streaming_source(
                     prefer_shared_streaming,
-                    local_streaming_queue.has_pending(),
+                    local_streaming_queue.has_pending() || yielded_stream_cmd.is_some(),
                     streaming_queue.has_pending(),
                 );
                 match source {
                     Some(StreamingSource::Local) => {
-                        if let Some(command) = local_streaming_queue.pop_front() {
+                        if let Some(pending) = yielded_stream_cmd.take() {
+                            prefer_shared_streaming = true;
+                            Some(pending)
+                        } else if let Some(command) = local_streaming_queue.pop_front() {
                             prefer_shared_streaming = true;
                             Some(PendingStreamingCommand::local(command))
                         } else {
@@ -1056,6 +1161,9 @@ impl LockFreeStreamHandle {
                         if let Some(command) = streaming_queue.pop() {
                             prefer_shared_streaming = false;
                             Some(PendingStreamingCommand::shared(command))
+                        } else if let Some(pending) = yielded_stream_cmd.take() {
+                            prefer_shared_streaming = true;
+                            Some(pending)
                         } else {
                             local_streaming_queue.pop_front().map(|command| {
                                 prefer_shared_streaming = true;
@@ -1087,6 +1195,7 @@ impl LockFreeStreamHandle {
                     pending,
                     complete,
                     &streaming_queue,
+                    &mut yielded_stream_cmd,
                     &mut pending_stream_cmd,
                 );
             }

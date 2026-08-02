@@ -25,6 +25,10 @@ enum StreamingCommand {
     /// generates each frame header on demand, so admission never materializes
     /// a second contiguous payload allocation.
     PooledResponse(Box<PooledStreamingResponse>),
+    /// Bytes-backed streaming response. The command retains one ref-counted
+    /// payload and generates each frame header lazily instead of expanding a
+    /// large response into one queue command per frame.
+    BytesResponse(Box<BytesStreamingResponse>),
     /// Abort a partially transmitted stream. This stays on the streaming FIFO
     /// so it cannot overtake data chunks that were already accepted.
     Abort { stream_id: u32, reason: u32 },
@@ -50,6 +54,84 @@ struct PooledStreamingResponse {
     payload_remaining: usize,
     frame_index: usize,
     frame_offset: usize,
+}
+
+/// A lazily framed response backed by an already-owned `Bytes` payload.
+struct BytesStreamingResponse {
+    stream_id: u32,
+    correlation_id: u32,
+    payload: bytes::Bytes,
+    payload_len: usize,
+    chunk_size: usize,
+    chunk_count: usize,
+    frame_index: usize,
+    frame_offset: usize,
+}
+
+impl BytesStreamingResponse {
+    fn new(
+        stream_id: u32,
+        correlation_id: u32,
+        payload: bytes::Bytes,
+        chunk_size: usize,
+    ) -> Self {
+        let payload_len = payload.len();
+        let chunk_count = if payload_len == 0 {
+            1
+        } else {
+            payload_len
+                .saturating_add(chunk_size.saturating_sub(1))
+                .checked_div(chunk_size)
+                .unwrap_or(usize::MAX)
+        };
+        Self {
+            stream_id,
+            correlation_id,
+            payload,
+            payload_len,
+            chunk_size,
+            chunk_count,
+            frame_index: 0,
+            frame_offset: 0,
+        }
+    }
+
+    fn frame_payload_len(&self, frame_index: usize) -> usize {
+        if frame_index == 0 {
+            return self.payload_len.min(self.chunk_size);
+        }
+        let consumed = self
+            .chunk_size
+            .saturating_add(frame_index.saturating_sub(1).saturating_mul(self.chunk_size));
+        self.payload_len.saturating_sub(consumed).min(self.chunk_size)
+    }
+
+    fn frame_header(&self, frame_index: usize) -> InlineFrameHeader {
+        if frame_index == 0 {
+            InlineFrameHeader::from_array(crate::framing::write_stream_response_start_header(
+                self.stream_id,
+                self.correlation_id,
+                self.payload_len as u32,
+                self.frame_payload_len(frame_index),
+            ))
+        } else {
+            InlineFrameHeader::from_array(crate::framing::write_stream_data_header(
+                true,
+                self.stream_id,
+                frame_index as u32,
+                self.frame_payload_len(frame_index),
+            ))
+        }
+    }
+
+    fn wire_len(&self) -> usize {
+        crate::framing::STREAM_RESPONSE_START_FRAME_HEADER_LEN
+            + self.payload_len
+            + self
+                .chunk_count
+                .saturating_sub(1)
+                .saturating_mul(crate::framing::STREAM_DATA_FRAME_HEADER_LEN)
+    }
 }
 
 impl PooledStreamingResponse {
@@ -214,7 +296,13 @@ impl LocalStreamingQueue {
     /// retained without copying it first. If the bounded queue cannot fit it,
     /// the single deferred-response slot is the admission path.
     fn can_admit_response(&self, command_count: usize, response_bytes: usize) -> bool {
-        if self.deferred.is_some() {
+        if self.deferred.is_some()
+            || (self.response_in_flight
+                && self
+                    .queue
+                    .iter()
+                    .all(|command| matches!(command, StreamingCommand::Flush)))
+        {
             return false;
         }
         let fits_queue = self.queue.len().saturating_add(command_count)
@@ -232,7 +320,12 @@ impl LocalStreamingQueue {
         if self.deferred.is_some() {
             return true;
         }
-        if self.response_in_flight && self.queue.is_empty() {
+        if self.response_in_flight
+            && self
+                .queue
+                .iter()
+                .all(|command| matches!(command, StreamingCommand::Flush))
+        {
             return true;
         }
         if self.queue.is_empty() {
@@ -286,6 +379,7 @@ fn streaming_command_bytes(command: &StreamingCommand) -> usize {
         StreamingCommand::VectoredWrite(item) => item.header.len() + item.payload.len(),
         StreamingCommand::OwnedChunks(chunks) => chunks.iter().map(bytes::Bytes::len).sum(),
         StreamingCommand::PooledResponse(response) => response.wire_len(),
+        StreamingCommand::BytesResponse(response) => response.wire_len(),
         StreamingCommand::Abort { stream_id, reason } => crate::framing::write_stream_abort_header(*stream_id, *reason).len(),
     }
 }
@@ -321,6 +415,7 @@ struct PendingStreamingCommand {
     command: StreamingCommand,
     offset: usize,
     from_shared_queue: bool,
+    yield_after_frame: bool,
 }
 
 impl PendingStreamingCommand {
@@ -329,6 +424,7 @@ impl PendingStreamingCommand {
             command,
             offset: 0,
             from_shared_queue: true,
+            yield_after_frame: false,
         }
     }
 
@@ -337,6 +433,7 @@ impl PendingStreamingCommand {
             command,
             offset: 0,
             from_shared_queue: false,
+            yield_after_frame: false,
         }
     }
 }
@@ -360,6 +457,11 @@ impl std::fmt::Debug for StreamingCommand {
                 .finish(),
             StreamingCommand::PooledResponse(response) => f
                 .debug_struct("PooledResponse")
+                .field("payload_len", &response.payload_len)
+                .field("chunk_count", &response.chunk_count)
+                .finish(),
+            StreamingCommand::BytesResponse(response) => f
+                .debug_struct("BytesResponse")
                 .field("payload_len", &response.payload_len)
                 .field("chunk_count", &response.chunk_count)
                 .finish(),

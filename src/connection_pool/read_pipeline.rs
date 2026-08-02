@@ -1426,48 +1426,49 @@ fn queue_streaming_response_bytes(
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-    let stream_id = allocate_direct_response_stream_id()?;
     let total_len = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
         size: payload.len(),
         max: u32::MAX as usize,
     })?;
+    let chunk_count = if payload.is_empty() {
+        1
+    } else {
+        payload
+            .len()
+            .saturating_add(chunk_size.saturating_sub(1))
+            .checked_div(chunk_size)
+            .unwrap_or(usize::MAX)
+    };
     let first_len = payload.len().min(chunk_size);
-    let start_header = crate::framing::write_stream_response_start_header(
-        stream_id,
+    let start_header_len = crate::framing::write_stream_response_start_header(
+        0,
         correlation_id,
         total_len,
         first_len,
-    );
-    let mut commands = Vec::new();
-    commands.push(StreamingCommand::VectoredWrite(VectoredSendItem {
-        header: InlineFrameHeader::from_array(start_header),
-        payload: payload.slice(..first_len),
-    }));
-
-    let mut offset = first_len;
-    let mut chunk_index = 1u32;
-    while offset < payload.len() {
-        let end = (offset + chunk_size).min(payload.len());
-        let header = crate::framing::write_stream_data_header(
-            true,
-            stream_id,
-            chunk_index,
-            end - offset,
+    )
+    .len();
+    let data_header_len = crate::framing::write_stream_data_header(true, 0, 1, chunk_size).len();
+    let response_bytes = payload
+        .len()
+        .saturating_add(start_header_len)
+        .saturating_add(
+            chunk_count
+                .saturating_sub(1)
+                .saturating_mul(data_header_len),
         );
-        commands.push(StreamingCommand::VectoredWrite(VectoredSendItem {
-            header: InlineFrameHeader::from_array(header),
-            payload: payload.slice(offset..end),
-        }));
-        offset = end;
-        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
-            GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "streaming response chunk index exhausted",
-            ))
-        })?;
+    if !streaming_responses.can_admit_response(2, response_bytes) {
+        return Err(GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "immediate streaming response queue deferred slot is full",
+        )));
     }
-    commands.push(StreamingCommand::Flush);
-    streaming_responses.try_extend(commands)
+
+    let stream_id = allocate_direct_response_stream_id()?;
+    let response = BytesStreamingResponse::new(stream_id, correlation_id, payload, chunk_size);
+    streaming_responses.try_extend([
+        StreamingCommand::BytesResponse(Box::new(response)),
+        StreamingCommand::Flush,
+    ])
 }
 
 fn queue_streaming_response_pooled(
