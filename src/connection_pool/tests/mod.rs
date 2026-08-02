@@ -1362,6 +1362,26 @@ fn response_in_flight_with_only_flush_keeps_read_admission_open() {
 }
 
 #[test]
+fn oversized_response_in_flight_closes_read_admission() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP + 1
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one oversized response is the explicit admission exception");
+    let response = queue.pop_front().expect("oversized response command");
+    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+    assert!(
+        queue.is_full(),
+        "an oversized in-flight response must apply read backpressure"
+    );
+}
+
+#[test]
 fn partial_streaming_output_defers_flush_until_terminal_flush() {
     let pending = PendingStreamingCommand::local(StreamingCommand::WriteBytes(
         bytes::Bytes::from_static(b"partial"),
@@ -1596,6 +1616,40 @@ async fn bytes_streaming_response_writes_frame_order() {
     }
 
     assert_eq!(*recorded.lock().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn bytes_streaming_response_yields_at_each_frame_boundary() {
+    let payload_len = 128;
+    let mut local_queue = LocalStreamingQueue::with_response_reserve(64);
+    queue_streaming_response_bytes(
+        &mut local_queue,
+        0xC0DE,
+        bytes::Bytes::from(vec![0xA7; payload_len]),
+        64,
+        None,
+    )
+    .expect("bytes response should be admitted");
+
+    let command = local_queue.pop_front().expect("bytes response command");
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, _) = RecordingWriter::new();
+    let mut complete = false;
+    let mut written = 0;
+    while !pending.yield_after_frame && !complete {
+        let (turn_written, turn_complete) =
+            write_streaming_command_slice(&mut writer, &mut pending)
+                .await
+                .expect("bytes response write");
+        written += turn_written;
+        complete = turn_complete;
+    }
+    assert!(written > 0);
+    assert!(!complete, "the response has more than one frame");
+    assert!(
+        pending.yield_after_frame,
+        "a completed Bytes frame must yield the local command to the scheduler"
+    );
 }
 
 #[test]

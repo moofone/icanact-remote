@@ -141,12 +141,11 @@ where
             response.frame_offset = 0;
         }
         let complete = response.frame_index >= response.chunk_count;
-        // Keep the direct-Bytes response consumer-owned across frame
-        // boundaries. It still returns to the read side after every bounded
-        // socket write; handing this command to the source alternator here
-        // can deadlock reciprocal large ask/response streams on a constrained
-        // duplex transport. Pooled responses use the fairness yield below.
-        return Ok((written, complete, false));
+        // Keep each frame contiguous on the wire, then hand the remaining
+        // Bytes response back to the source alternator. This lets normal
+        // writes and inbound response batches make progress between frames
+        // without materializing the remaining response into queue commands.
+        return Ok((written, complete, frame_complete && !complete));
     }
 
     Ok((0, true, false))

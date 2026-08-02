@@ -359,6 +359,9 @@ impl LocalStreamingQueue {
         if self.deferred.is_some() {
             return true;
         }
+        if self.in_flight_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP {
+            return true;
+        }
         if self.queue.is_empty() {
             return false;
         }
