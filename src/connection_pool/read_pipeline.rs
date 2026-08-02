@@ -1191,7 +1191,7 @@ async fn write_ask_disposition_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
-    streaming_responses: &mut std::collections::VecDeque<StreamingCommand>,
+    streaming_responses: &mut LocalStreamingQueue,
     wrote_response_bytes: &mut bool,
     correlation_id: u32,
     disposition: crate::registry::AskDisposition,
@@ -1379,7 +1379,7 @@ where
 }
 
 fn queue_streaming_response_bytes(
-    streaming_responses: &mut std::collections::VecDeque<StreamingCommand>,
+    streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
     payload: bytes::Bytes,
     max_message_size: usize,
@@ -1406,7 +1406,8 @@ fn queue_streaming_response_bytes(
         total_len,
         first_len,
     );
-    streaming_responses.push_back(StreamingCommand::VectoredWrite(VectoredSendItem {
+    let mut commands = Vec::new();
+    commands.push(StreamingCommand::VectoredWrite(VectoredSendItem {
         header: InlineFrameHeader::from_array(start_header),
         payload: payload.slice(..first_len),
     }));
@@ -1421,7 +1422,7 @@ fn queue_streaming_response_bytes(
             chunk_index,
             end - offset,
         );
-        streaming_responses.push_back(StreamingCommand::VectoredWrite(VectoredSendItem {
+        commands.push(StreamingCommand::VectoredWrite(VectoredSendItem {
             header: InlineFrameHeader::from_array(header),
             payload: payload.slice(offset..end),
         }));
@@ -1433,13 +1434,12 @@ fn queue_streaming_response_bytes(
             ))
         })?;
     }
-    streaming_responses.push_back(StreamingCommand::Flush);
-
-    Ok(())
+    commands.push(StreamingCommand::Flush);
+    streaming_responses.try_extend(commands)
 }
 
 fn queue_streaming_response_pooled(
-    streaming_responses: &mut std::collections::VecDeque<StreamingCommand>,
+    streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
     mut payload: crate::typed::PooledPayload,
     prefix: Option<[u8; 16]>,
@@ -1508,7 +1508,7 @@ async fn process_read_result_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
-    streaming_responses: &mut std::collections::VecDeque<StreamingCommand>,
+    streaming_responses: &mut LocalStreamingQueue,
     direct_response_batch: &mut DirectResponseBatch,
     perf: Option<&IoPerfCounters>,
 ) -> Result<()>
@@ -1690,7 +1690,7 @@ async fn try_handle_fast_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
-    streaming_responses: &mut std::collections::VecDeque<StreamingCommand>,
+    streaming_responses: &mut LocalStreamingQueue,
     direct_response_batch: &mut DirectResponseBatch,
     wrote_response_bytes: &mut bool,
     perf: Option<&IoPerfCounters>,
@@ -1709,7 +1709,7 @@ where
         bytes_written_counter: &Arc<AtomicUsize>,
         bytes_since_flush: &mut usize,
         response_batch: &mut ResponseBatch,
-        streaming_responses: &mut std::collections::VecDeque<StreamingCommand>,
+        streaming_responses: &mut LocalStreamingQueue,
         wrote_response_bytes: &mut bool,
         perf: Option<&IoPerfCounters>,
     ) -> Result<()>

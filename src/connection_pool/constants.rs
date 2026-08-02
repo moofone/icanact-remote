@@ -28,6 +28,13 @@ pub const STREAMING_THRESHOLD: usize = MASTER_BUFFER_SIZE.saturating_sub(1024); 
 // single streaming chunk instead of thousands of them.
 pub const RESPONSE_BATCH_BYTE_CAP: usize = STREAMING_THRESHOLD.saturating_mul(8);
 
+/// Bound immediate streaming responses admitted by one connection's read
+/// pipeline. Each queued command retains its `Bytes` backing allocation until
+/// the frame is fully written, so both command count and retained wire bytes
+/// are capped independently of the peer's request burst.
+pub const STREAMING_RESPONSE_QUEUE_COMMAND_CAP: usize = 256;
+pub const STREAMING_RESPONSE_QUEUE_BYTE_CAP: usize = RESPONSE_BATCH_BYTE_CAP;
+
 struct IoPerfCounters {
     read_calls: AtomicU64,
     read_ns: AtomicU64,

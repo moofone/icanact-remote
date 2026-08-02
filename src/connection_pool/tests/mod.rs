@@ -1285,6 +1285,25 @@ async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
     );
 }
 
+#[test]
+fn immediate_streaming_response_queue_rejects_byte_burst() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+            0u8;
+            RESPONSE_BATCH_BYTE_CAP
+        ]))])
+        .expect("the configured byte cap admits one bounded burst");
+    assert!(queue.is_full());
+    assert!(
+        queue
+            .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(
+                b"x"
+            ))])
+            .is_err()
+    );
+}
+
 #[derive(Clone, Copy, Default)]
 struct ClosedWriter;
 

@@ -43,6 +43,34 @@ where
     Ok(total_len)
 }
 
+/// Perform at most one socket write for a streaming slice. A short write is
+/// returned to the caller, which retains the command offset for the next turn;
+/// this avoids awaiting the remainder of a large frame while the peer's read
+/// side is constrained.
+async fn write_vectored_once<S>(
+    stream: &mut S,
+    slices: &[std::io::IoSlice<'_>],
+) -> std::io::Result<usize>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(first) = slices.iter().find(|slice| !slice.is_empty()) else {
+        return Ok(0);
+    };
+    let result = if stream.is_write_vectored() {
+        stream.write_vectored(slices).await
+    } else {
+        std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_write(cx, first.as_ref())).await
+    }?;
+    if result == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "streaming write made no progress",
+        ));
+    }
+    Ok(result)
+}
+
 async fn write_streaming_command_slice<S>(
     stream: &mut S,
     pending: &mut PendingStreamingCommand,
@@ -57,8 +85,12 @@ where
                 return Ok((0, true));
             }
             let end = (offset + STREAM_WRITE_SLICE_BYTES).min(data.len());
-            stream.write_all(&data[offset..end]).await?;
-            (end - offset, data.len())
+            let written = write_vectored_once(
+                stream,
+                &[std::io::IoSlice::new(&data[offset..end])],
+            )
+            .await?;
+            (written, data.len())
         }
         StreamingCommand::Flush => {
             stream.flush().await?;
@@ -70,8 +102,12 @@ where
                 return Ok((0, true));
             }
             let end = (offset + STREAM_WRITE_SLICE_BYTES).min(header.len());
-            stream.write_all(&header[offset..end]).await?;
-            (end - offset, header.len())
+            let written = write_vectored_once(
+                stream,
+                &[std::io::IoSlice::new(&header[offset..end])],
+            )
+            .await?;
+            (written, header.len())
         }
         StreamingCommand::VectoredWrite(command) => {
             let header = command.header.as_slice();
@@ -101,7 +137,7 @@ where
                 slice_count = 1;
             }
             (
-                write_vectored_all(stream, &slices[..slice_count]).await?,
+                write_vectored_once(stream, &slices[..slice_count]).await?,
                 total_len,
             )
         }
@@ -139,7 +175,7 @@ where
                     count,
                 )
             };
-            let written = write_vectored_all(stream, slices).await?;
+            let written = write_vectored_once(stream, slices).await?;
             (written, total_len)
         }
     };
@@ -779,7 +815,7 @@ impl LockFreeStreamHandle {
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_immediate_cmd: Option<WriteCommand> = None;
         let mut pending_stream_cmd: Option<PendingStreamingCommand> = None;
-        let mut local_streaming_queue = std::collections::VecDeque::new();
+        let mut local_streaming_queue = LocalStreamingQueue::new();
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
         let mut streaming_state = match read_context
             .as_ref()
@@ -869,13 +905,14 @@ impl LockFreeStreamHandle {
                 );
             }
 
-            // ACTOR_REM_2 R8: always service the normal write queue — even while
-            // a stream is active — so latency-sensitive frames interleave rather
-            // than being starved for the stream's whole duration. The batch is
-            // kept small during active streaming so the stream stays dominant;
-            // when the queue is empty (the common case mid-stream) this is a
-            // cheap no-op.
-            {
+            // A partial streaming frame owns the wire until complete. Reads may
+            // still run below, but no normal/response write can interleave and
+            // corrupt the frame boundary.
+            if pending_stream_cmd.is_none() {
+                // ACTOR_REM_2 R8: service the normal write queue when no partial
+                // stream frame is outstanding. The batch remains bounded during
+                // active streaming so control traffic is not starved.
+                {
                 let normal_batch_limit = if streaming_active.load(Ordering::Acquire) {
                     STREAM_ACTIVE_WRITE_BATCH
                 } else {
@@ -1630,6 +1667,7 @@ impl LockFreeStreamHandle {
                     total_bytes_written += bytes_written;
                     write_chunks.clear();
                 }
+                }
             }
 
             bytes_since_flush += total_bytes_written;
@@ -1652,7 +1690,7 @@ impl LockFreeStreamHandle {
                 if did_work {
                     let mut reads = 0usize;
                     let mut read_batch_limit = READ_BATCH_LIMIT;
-                    while reads < read_batch_limit {
+                    while reads < read_batch_limit && !local_streaming_queue.is_full() {
                         // R-I: cap per-turn byte accumulation independent of
                         // the frame-count cap above. Checked every iteration
                         // (covering both the normal and the fast-io `continue`
@@ -1939,7 +1977,7 @@ impl LockFreeStreamHandle {
                             // Drain additional frames non-blocking to batch handler + response writes.
                             let mut drained = 0usize;
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
-                            while drained < drain_batch_limit {
+                            while drained < drain_batch_limit && !local_streaming_queue.is_full() {
                                 // R-I: same per-turn byte cap as the primary
                                 // drain loop above; see
                                 // `flush_response_batch_if_over_byte_cap`.
