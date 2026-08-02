@@ -1407,6 +1407,10 @@ fn oversized_in_flight_response_admits_one_bounded_deferred_response() {
             StreamingCommand::Flush,
         ])
         .expect("the bounded deferred response must not be dropped");
+    assert!(
+        queue.is_full(),
+        "the deferred slot must stop reads before a third response is consumed"
+    );
 }
 
 #[test]
@@ -1785,6 +1789,19 @@ fn immediate_streaming_response_queue_admits_one_oversized_response() {
             b"x",
         ))])
         .expect("a later response is admitted after the first one drains");
+}
+
+#[test]
+fn sole_response_above_hard_cap_remains_admissible() {
+    let mut queue = LocalStreamingQueue::new();
+    let payload_len = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP + 1;
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; payload_len])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one sole lazy response remains valid above the queue cap");
+    assert!(queue.is_full());
 }
 
 #[test]

@@ -2102,7 +2102,7 @@ impl LockFreeStreamHandle {
                                         "Failed to process fast IO message"
                                     );
                                     if is_streaming_admission_backpressure(&e) {
-                                        return;
+                                        break;
                                     }
                                     None
                                 }
@@ -2136,7 +2136,7 @@ impl LockFreeStreamHandle {
                                         "Failed to process message on IO task"
                                     );
                                     if is_streaming_admission_backpressure(&e) {
-                                        return;
+                                        break;
                                     }
                                 }
                             } else {
@@ -2270,7 +2270,7 @@ impl LockFreeStreamHandle {
                                             "Failed to process fast IO message"
                                         );
                                         if is_streaming_admission_backpressure(&e) {
-                                            return;
+                                            break;
                                         }
                                         None
                                     }
@@ -2302,7 +2302,7 @@ impl LockFreeStreamHandle {
                                                 "Failed to process message on IO task"
                                             );
                                             if is_streaming_admission_backpressure(&e) {
-                                                return;
+                                                break;
                                             }
                                         }
                                     } else {
@@ -2413,7 +2413,7 @@ impl LockFreeStreamHandle {
                                                 "Failed to process fast IO message"
                                             );
                                             if is_streaming_admission_backpressure(&e) {
-                                                return;
+                                                break;
                                             }
                                             None
                                         }
@@ -2447,7 +2447,7 @@ impl LockFreeStreamHandle {
                                                     "Failed to process message on IO task"
                                                 );
                                                 if is_streaming_admission_backpressure(&e) {
-                                                    return;
+                                                    break;
                                                 }
                                             }
                                     } else {
