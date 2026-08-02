@@ -1691,7 +1691,7 @@ fn immediate_streaming_response_queue_admits_one_oversized_response() {
             StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x")),
             StreamingCommand::Flush,
         ])
-        .expect("overflow is retained in the deferred response slot");
+        .expect_err("a second response must not bypass the oversized-response bound");
 
     while queue.pop_front().is_some() {}
     assert!(
@@ -1703,6 +1703,35 @@ fn immediate_streaming_response_queue_admits_one_oversized_response() {
             b"x",
         ))])
         .expect("a later response is admitted after the first one drains");
+}
+
+#[test]
+fn response_admission_rejects_oversized_deferred_footprints() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("the first bounded response fits");
+
+    let oversized = RESPONSE_BATCH_BYTE_CAP + 1;
+    assert!(
+        !queue.can_admit_response(2, oversized),
+        "a deferred response must not exceed the bounded deferred footprint"
+    );
+    assert!(
+        queue
+            .try_extend([
+                StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; oversized])),
+                StreamingCommand::Flush,
+            ])
+            .is_err(),
+        "an oversized deferred response must be rejected"
+    );
 }
 
 #[derive(Clone, Copy, Default)]

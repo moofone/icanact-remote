@@ -218,6 +218,7 @@ struct LocalStreamingQueue {
     /// `queued_bytes`, so response admission accounts for it separately while
     /// the read side remains free to drain the peer.
     response_in_flight: bool,
+    in_flight_bytes: usize,
     wire_blocked: bool,
     /// Reserve room for one maximum-sized response when reading another
     /// frame. A single response larger than the byte cap is admitted only
@@ -235,6 +236,7 @@ struct LocalStreamingQueue {
     /// without opening an unbounded side queue; `is_full` stops reads until
     /// the current response drains and `pop_front` promotes this batch.
     deferred: Option<Vec<StreamingCommand>>,
+    deferred_bytes: usize,
 }
 
 impl LocalStreamingQueue {
@@ -258,9 +260,11 @@ impl LocalStreamingQueue {
             queue: std::collections::VecDeque::new(),
             queued_bytes: 0,
             response_in_flight: false,
+            in_flight_bytes: 0,
             response_reserve_bytes,
             response_reserve_commands,
             deferred: None,
+            deferred_bytes: 0,
             wire_blocked: false,
         }
     }
@@ -269,14 +273,21 @@ impl LocalStreamingQueue {
         if self.queue.is_empty() && !self.response_in_flight {
             if let Some(deferred) = self.deferred.take() {
                 self.queued_bytes = deferred.iter().map(streaming_command_bytes).sum();
+                self.deferred_bytes = 0;
                 self.queue.extend(deferred);
             }
         }
         let command = self.queue.pop_front()?;
+        let command_bytes = streaming_command_bytes(&command);
         self.queued_bytes = self
             .queued_bytes
-            .saturating_sub(streaming_command_bytes(&command));
+            .saturating_sub(command_bytes);
         self.response_in_flight = !matches!(&command, StreamingCommand::Flush);
+        self.in_flight_bytes = if self.response_in_flight {
+            command_bytes
+        } else {
+            0
+        };
         Some(command)
     }
 
@@ -292,22 +303,56 @@ impl LocalStreamingQueue {
         !self.queue.is_empty() || self.deferred.is_some()
     }
 
+    fn retained_bytes(&self) -> usize {
+        self.queued_bytes
+            .saturating_add(self.in_flight_bytes)
+            .saturating_add(self.deferred_bytes)
+    }
+
+    fn retained_commands(&self) -> usize {
+        self.queue
+            .len()
+            .saturating_add(usize::from(self.response_in_flight))
+            .saturating_add(self.deferred.as_ref().map_or(0, Vec::len))
+    }
+
+    fn can_defer_response(&self, command_count: usize, response_bytes: usize) -> bool {
+        let retained_without_deferred = self
+            .queued_bytes
+            .saturating_add(self.in_flight_bytes);
+        self.deferred.is_none()
+            && self.queued_bytes <= STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && self.in_flight_bytes <= STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && response_bytes <= STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && retained_without_deferred.saturating_add(response_bytes)
+                <= STREAMING_RESPONSE_QUEUE_BYTE_CAP.saturating_mul(2)
+            && command_count <= self.response_reserve_commands
+            && self
+                .retained_commands()
+                .saturating_add(command_count)
+                <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
+    }
+
     /// Return whether a response with this command/byte footprint can be
     /// retained without copying it first. If the bounded queue cannot fit it,
-    /// the single deferred-response slot is the admission path.
+    /// one bounded deferred-response slot is the admission path. A response
+    /// larger than the queue cap is admitted only as the sole retained response.
     fn can_admit_response(&self, command_count: usize, response_bytes: usize) -> bool {
-        if self.deferred.is_some() {
-            return false;
-        }
-        let fits_queue = self.queue.len().saturating_add(command_count)
+        let fits_queue = self
+            .retained_commands()
+            .saturating_add(command_count)
             <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
-            && self.queued_bytes.saturating_add(response_bytes)
+            && self.retained_bytes().saturating_add(response_bytes)
                 <= STREAMING_RESPONSE_QUEUE_BYTE_CAP;
-        // The deferred slot is itself a valid admission result. Keep the
-        // footprint arguments in the predicate so this remains the single
-        // preflight point for pooled responses, even when the queue cannot
-        // fit the complete response in its bounded resident window.
-        fits_queue || self.deferred.is_none()
+        let admit_single_oversize = self.queue.is_empty()
+            && !self.response_in_flight
+            && self.deferred.is_none()
+            && self.retained_bytes() == 0
+            && response_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && command_count <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP;
+        fits_queue
+            || admit_single_oversize
+            || self.can_defer_response(command_count, response_bytes)
     }
 
     fn is_full(&self) -> bool {
@@ -334,23 +379,31 @@ impl LocalStreamingQueue {
     {
         let commands: Vec<_> = commands.into_iter().collect();
         let added_bytes: usize = commands.iter().map(streaming_command_bytes).sum();
-        let exceeds_cap = self.queue.len().saturating_add(commands.len())
-            > STREAMING_RESPONSE_QUEUE_COMMAND_CAP
-            || self.queued_bytes.saturating_add(added_bytes) > STREAMING_RESPONSE_QUEUE_BYTE_CAP;
-        let admit_single_oversize =
-            self.queue.is_empty() && !self.response_in_flight && exceeds_cap;
-        if exceeds_cap && !admit_single_oversize {
-            if self.deferred.is_some() {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "immediate streaming response queue deferred slot is full",
-                )));
-            }
-            self.deferred = Some(commands);
-            return Ok(());
+        let fits_queue = self
+            .retained_commands()
+            .saturating_add(commands.len())
+            <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
+            && self.retained_bytes().saturating_add(added_bytes)
+                <= STREAMING_RESPONSE_QUEUE_BYTE_CAP;
+        let admit_single_oversize = self.queue.is_empty()
+            && !self.response_in_flight
+            && self.deferred.is_none()
+            && self.retained_bytes() == 0
+            && added_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && commands.len() <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP;
+        let defer = !fits_queue
+            && !admit_single_oversize
+            && self.can_defer_response(commands.len(), added_bytes);
+        if !fits_queue && !admit_single_oversize && !defer {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "immediate streaming response queue footprint is full",
+            )));
         }
-        if admit_single_oversize {
-            self.response_in_flight = true;
+        if defer {
+            self.deferred = Some(commands);
+            self.deferred_bytes = added_bytes;
+            return Ok(());
         }
         self.queued_bytes = self.queued_bytes.saturating_add(added_bytes);
         self.queue.extend(commands);
