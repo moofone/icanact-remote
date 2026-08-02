@@ -215,15 +215,16 @@ struct LocalStreamingQueue {
     queued_bytes: usize,
     /// A response command has been handed to the IO owner and has not yet
     /// reached its terminal Flush. The retained command is not included in
-    /// `queued_bytes`, so response admission accounts for it separately while
-    /// the read side remains free to drain the peer.
+    /// `queued_bytes`, so response admission accounts for it separately. The
+    /// read gate reserves the remaining aggregate footprint before consuming
+    /// another ask; otherwise its handler could produce a response that cannot
+    /// be admitted after ownership has already moved here.
     response_in_flight: bool,
     in_flight_bytes: usize,
     wire_blocked: bool,
-    /// Reserve room for one maximum-sized response when reading another
-    /// frame. A response larger than the byte cap is admitted as the sole
-    /// queued command or in the one deferred slot; further responses are
-    /// backpressured until those commands drain.
+    /// Reserve normal queue room for one configured response frame when
+    /// reading another frame. The aggregate stream-sized reservation is
+    /// enforced separately by `is_full`.
     response_reserve_bytes: usize,
     /// Reserve command slots for the next maximum-sized response as well as
     /// bytes. The command cap is independent from the retained-payload cap,
@@ -233,18 +234,26 @@ struct LocalStreamingQueue {
     response_reserve_commands: usize,
     /// One response that arrived after the bounded queue filled. Keeping the
     /// complete command batch here preserves the consumed ask's response
-    /// without opening an unbounded side queue; `is_full` stops reads until
-    /// the current response drains and `pop_front` promotes this batch.
+    /// without opening an unbounded side queue; the aggregate hard cap and
+    /// `is_full` stop further reads until the current response drains and
+    /// `pop_front` promotes this batch.
     deferred: Option<Vec<StreamingCommand>>,
     deferred_bytes: usize,
 }
 
-/// Keep the ordinary local response queue within one fixed byte cap. A
-/// response that cannot fit that cap is retained as one whole command (either
-/// as the sole queued response or in the single deferred slot) so framing can
-/// still make progress without expanding it into per-frame queue entries.
+/// Keep the local response queue within the normal response-batch cap while
+/// allowing one protocol-sized stream to be retained behind an in-flight
+/// response. The hard cap is an aggregate resident bound; the normal queue
+/// cap still controls the hot-path burst size.
 const STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP: usize =
-    STREAMING_RESPONSE_QUEUE_BYTE_CAP.saturating_mul(2);
+    crate::MAX_INFLIGHT_STREAM_BYTES.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
+
+/// Reserve for the largest valid streamed response when deciding whether the
+/// read side may consume another ask. The extra queue-cap allowance covers
+/// frame headers and a bounded ordinary response retained alongside that
+/// stream.
+const MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES: usize =
+    crate::MAX_STREAM_SIZE.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
 impl LocalStreamingQueue {
     #[cfg(test)]
@@ -330,24 +339,21 @@ impl LocalStreamingQueue {
         let bounded_footprint = response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && retained_without_deferred.saturating_add(response_bytes)
                 <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP;
-        // Once a response command owns the wire, keep one deferred response so
-        // a valid pipelined ask is not discarded. The occupied deferred slot
-        // immediately closes further read admission; no third response can be
-        // retained while the current and deferred commands drain.
-        let in_flight_response_deferred = self.response_in_flight;
         self.deferred.is_none()
             && command_count <= self.response_reserve_commands
             && self
                 .retained_commands()
                 .saturating_add(command_count)
                 <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
-            && (bounded_footprint || in_flight_response_deferred)
+            && bounded_footprint
     }
 
     /// Return whether a response with this command/byte footprint can be
-    /// retained without copying it first. If the bounded queue cannot fit it,
-    /// one bounded deferred-response slot is the admission path. A response
-    /// larger than the queue cap is admitted only as the sole retained response.
+    /// retained without copying it first. If the normal queue cannot fit it,
+    /// one deferred-response slot is the admission path, bounded by the
+    /// aggregate protocol-sized resident cap. A response larger than the
+    /// normal queue cap is admitted without deferral only as the sole retained
+    /// response.
     fn can_admit_response(&self, command_count: usize, response_bytes: usize) -> bool {
         let fits_queue = self
             .retained_commands()
@@ -360,6 +366,7 @@ impl LocalStreamingQueue {
             && self.deferred.is_none()
             && self.retained_bytes() == 0
             && response_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && command_count <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP;
         fits_queue
             || admit_single_oversize
@@ -368,6 +375,18 @@ impl LocalStreamingQueue {
 
     fn is_full(&self) -> bool {
         if self.deferred.is_some() {
+            return true;
+        }
+        // Leave room for one complete protocol-sized response before
+        // consuming another ask. Admission is checked only after its handler
+        // returns and transfers ownership, so this aggregate guard prevents a
+        // valid large response from being dropped after the read cursor has
+        // advanced.
+        if self
+            .retained_bytes()
+            .saturating_add(MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES)
+            > STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
+        {
             return true;
         }
         if self.queue.is_empty() {
@@ -401,6 +420,7 @@ impl LocalStreamingQueue {
             && self.deferred.is_none()
             && self.retained_bytes() == 0
             && added_bytes > STREAMING_RESPONSE_QUEUE_BYTE_CAP
+            && added_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && commands.len() <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP;
         let defer = !fits_queue
             && !admit_single_oversize

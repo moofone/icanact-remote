@@ -1417,6 +1417,12 @@ fn queue_streaming_response_bytes(
     max_message_size: usize,
     _schema_hash: Option<u64>,
 ) -> Result<()> {
+    if payload.len() > crate::MAX_STREAM_SIZE {
+        return Err(GossipError::MessageTooLarge {
+            size: payload.len(),
+            max: crate::MAX_STREAM_SIZE,
+        });
+    }
     // A V5 data frame is [control:4][stream_id:4][chunk_index:4][payload].
     let max_chunk = max_message_size.saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
     if max_chunk == 0 {
@@ -1480,6 +1486,12 @@ fn queue_streaming_response_pooled(
     max_message_size: usize,
     _schema_hash: Option<u64>,
 ) -> Result<()> {
+    if payload_len > crate::MAX_STREAM_SIZE {
+        return Err(GossipError::MessageTooLarge {
+            size: payload_len,
+            max: crate::MAX_STREAM_SIZE,
+        });
+    }
     let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0);
     if prefix_len > payload_len {
         return Err(GossipError::Network(std::io::Error::new(

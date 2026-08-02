@@ -1350,7 +1350,7 @@ fn response_in_flight_with_only_flush_keeps_read_admission_open() {
     assert!(matches!(response, StreamingCommand::WriteBytes(_)));
     assert!(
         !queue.is_full(),
-        "the in-flight response must not stop the read side from draining the peer"
+        "a small in-flight response must not stop reciprocal reads"
     );
     queue
         .try_extend([
@@ -1377,7 +1377,7 @@ fn oversized_response_in_flight_keeps_read_admission_open() {
     assert!(matches!(response, StreamingCommand::WriteBytes(_)));
     assert!(
         !queue.is_full(),
-        "bounded writes must keep the read side draining reciprocal traffic"
+        "a bounded oversized response must keep reciprocal reads flowing"
     );
 }
 
@@ -1414,32 +1414,55 @@ fn oversized_in_flight_response_admits_one_bounded_deferred_response() {
 }
 
 #[test]
-fn in_flight_response_preserves_large_deferred_response() {
+fn near_hard_cap_in_flight_response_backpressures_large_deferred_response() {
     let mut queue = LocalStreamingQueue::new();
-    queue
-        .try_extend([
-            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"current")),
-            StreamingCommand::Flush,
-        ])
-        .expect("the current response should be admitted");
-    let response = queue.pop_front().expect("current response command");
-    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+    let current_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
+        .saturating_sub(MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES)
+        .saturating_add(1);
+    queue.response_in_flight = true;
+    queue.in_flight_bytes = current_bytes;
+    queue.queue.push_back(StreamingCommand::Flush);
 
-    let deferred_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP + 1;
+    let deferred_bytes = MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES;
     assert!(
-        queue.can_admit_response(2, deferred_bytes),
-        "a large response must be retained in the single deferred slot"
+        queue.is_full(),
+        "the read gate must close before the aggregate hard cap is exceeded"
     );
-    queue
-        .try_extend([
-            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; deferred_bytes])),
-            StreamingCommand::Flush,
-        ])
-        .expect("the consumed ask response must not be dropped");
-    assert!(queue.is_full());
     assert!(
-        !queue.can_admit_response(2, 1),
-        "a third response must wait for the current and deferred commands"
+        !queue.can_admit_response(2, deferred_bytes),
+        "a deferred response must stay within the aggregate hard retained-byte cap"
+    );
+}
+
+#[test]
+fn near_hard_cap_queued_response_closes_read_admission_before_followup() {
+    let mut queue = LocalStreamingQueue::new();
+    queue.queued_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
+        .saturating_sub(MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES)
+        .saturating_add(1);
+    queue.queue.push_back(StreamingCommand::Flush);
+
+    assert!(
+        queue.is_full(),
+        "the read gate must stop before a follow-up handler can exceed the hard cap"
+    );
+}
+
+#[test]
+fn queued_response_retains_large_followup_within_hard_cap() {
+    let mut queue = LocalStreamingQueue::new();
+    let queued_bytes = RESPONSE_BATCH_BYTE_CAP - STREAM_CHUNK_SIZE;
+    queue.queued_bytes = queued_bytes;
+    queue.queue.push_back(StreamingCommand::Flush);
+
+    let followup_bytes = MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES.saturating_sub(1);
+    assert!(
+        queue.can_admit_response(2, followup_bytes),
+        "a valid large follow-up must fit the single deferred slot"
+    );
+    assert!(
+        !queue.is_full(),
+        "read admission remains open while the aggregate hard cap has room"
     );
 }
 
@@ -1822,9 +1845,9 @@ fn immediate_streaming_response_queue_admits_one_oversized_response() {
 }
 
 #[test]
-fn sole_response_above_hard_cap_remains_admissible() {
+fn sole_response_above_normal_queue_cap_remains_admissible() {
     let mut queue = LocalStreamingQueue::new();
-    let payload_len = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP + 1;
+    let payload_len = STREAMING_RESPONSE_QUEUE_BYTE_CAP + 1;
     queue
         .try_extend([
             StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; payload_len])),
@@ -1835,7 +1858,7 @@ fn sole_response_above_hard_cap_remains_admissible() {
 }
 
 #[test]
-fn response_admission_rejects_oversized_deferred_footprints() {
+fn response_admission_rejects_beyond_hard_retained_footprints() {
     let mut queue = LocalStreamingQueue::new();
     queue
         .try_extend([
@@ -1847,19 +1870,10 @@ fn response_admission_rejects_oversized_deferred_footprints() {
         ])
         .expect("the first bounded response fits");
 
-    let oversized = RESPONSE_BATCH_BYTE_CAP + 1;
+    let oversized = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP + 1;
     assert!(
         !queue.can_admit_response(2, oversized),
-        "a deferred response must not exceed the bounded deferred footprint"
-    );
-    assert!(
-        queue
-            .try_extend([
-                StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; oversized])),
-                StreamingCommand::Flush,
-            ])
-            .is_err(),
-        "an oversized deferred response must be rejected"
+        "a deferred response must not exceed the aggregate hard footprint"
     );
 }
 
