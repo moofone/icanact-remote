@@ -1557,6 +1557,37 @@ fn pooled_streaming_response_retains_owned_payload_without_materializing_bytes()
     assert!(matches!(queue.queue.get(1), Some(StreamingCommand::Flush)));
 }
 
+#[test]
+fn pooled_streaming_admission_accounts_surplus_payload() {
+    let expected_payload_len = STREAM_CHUNK_SIZE / 4;
+    let retained_payload_len = expected_payload_len * 2;
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(
+        retained_payload_len,
+        |out| out.extend(std::iter::repeat_n(0xA7, retained_payload_len)),
+    )
+    .expect("pooled payload allocation");
+    let mut queue = LocalStreamingQueue::new();
+
+    queue_streaming_response_pooled(
+        &mut queue,
+        0xC0DE,
+        payload,
+        None,
+        expected_payload_len,
+        STREAM_CHUNK_SIZE,
+        None,
+    )
+    .expect("surplus pooled payload should remain bounded and be admitted");
+
+    let Some(StreamingCommand::PooledResponse(response)) = queue.queue.front() else {
+        panic!("expected a pooled response command");
+    };
+    assert_eq!(
+        response.retained_bytes, retained_payload_len,
+        "admission must charge all pooled bytes retained by the response command"
+    );
+}
+
 #[tokio::test]
 async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
     let payload_len = 64;

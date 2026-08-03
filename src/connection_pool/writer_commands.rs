@@ -45,6 +45,9 @@ struct PooledStreamingResponse {
     stream_id: u32,
     correlation_id: u32,
     payload_len: usize,
+    /// Bytes retained by the pooled payload, including any surplus bytes that
+    /// are not part of the advertised logical response.
+    retained_bytes: usize,
     chunk_size: usize,
     chunk_count: usize,
     prefix: Option<[u8; 16]>,
@@ -162,6 +165,7 @@ impl PooledStreamingResponse {
         stream_id: u32,
         correlation_id: u32,
         payload_len: usize,
+        retained_bytes: usize,
         chunk_size: usize,
         payload: crate::typed::PooledPayload,
         prefix: Option<[u8; 16]>,
@@ -180,6 +184,7 @@ impl PooledStreamingResponse {
             stream_id,
             correlation_id,
             payload_len,
+            retained_bytes: retained_bytes.max(payload_len),
             chunk_size,
             chunk_count,
             prefix,
@@ -221,7 +226,7 @@ impl PooledStreamingResponse {
     }
 
     fn retained_len(&self) -> usize {
-        self.payload_len
+        self.retained_bytes
     }
 }
 

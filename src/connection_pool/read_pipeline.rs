@@ -1505,7 +1505,8 @@ fn queue_streaming_response_pooled(
     // writes, so admission does not expand the response into one queue entry
     // (or one copied `Bytes`) per chunk.
     let command_count = 2;
-    if !streaming_responses.can_admit_response(command_count, payload_len) {
+    let retained_bytes = payload.remaining().saturating_add(prefix_len);
+    if !streaming_responses.can_admit_response(command_count, retained_bytes) {
         return Err(GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "immediate streaming response queue deferred slot is full",
@@ -1517,6 +1518,7 @@ fn queue_streaming_response_pooled(
         stream_id,
         correlation_id,
         payload_len,
+        retained_bytes,
         chunk_size,
         payload,
         prefix,
