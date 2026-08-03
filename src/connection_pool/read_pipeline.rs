@@ -1191,6 +1191,7 @@ async fn write_ask_disposition_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
+    streaming_responses: &mut LocalStreamingQueue,
     wrote_response_bytes: &mut bool,
     correlation_id: u32,
     disposition: crate::registry::AskDisposition,
@@ -1211,21 +1212,14 @@ where
                 let should_stream =
                     payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
                 if should_stream {
-                    write_streaming_response_direct(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
+                    queue_streaming_response_bytes(
+                        streaming_responses,
                         correlation_id,
                         payload,
                         ctx.max_message_size,
                         schema_hash,
-                    )
-                    .await?;
+                    )?;
                     *wrote_response_bytes = true;
-                    if flush_each_actor_response() {
-                        stream.flush().await.map_err(GossipError::Network)?;
-                        *bytes_since_flush = 0;
-                    }
                 } else {
                     response_batch.push_bytes(correlation_id, payload);
                     *wrote_response_bytes = true;
@@ -1235,21 +1229,14 @@ where
                 let len = payload.len();
                 let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
                 if should_stream {
-                    write_streaming_response_direct(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
+                    queue_streaming_response_bytes(
+                        streaming_responses,
                         correlation_id,
                         payload.into_bytes(),
                         ctx.max_message_size,
                         schema_hash,
-                    )
-                    .await?;
+                    )?;
                     *wrote_response_bytes = true;
-                    if flush_each_actor_response() {
-                        stream.flush().await.map_err(GossipError::Network)?;
-                        *bytes_since_flush = 0;
-                    }
                 } else {
                     response_batch.push_bytes(correlation_id, payload.into_bytes());
                     *wrote_response_bytes = true;
@@ -1269,51 +1256,61 @@ where
                         payload_len,
                     } = other
                     {
-                        write_streaming_response_direct_pooled(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
+                        queue_streaming_response_pooled(
+                            streaming_responses,
                             correlation_id,
                             payload,
                             prefix,
                             payload_len,
                             ctx.max_message_size,
                             schema_hash,
-                        )
-                        .await?;
+                        )?;
                     } else {
                         let bytes = match other {
                             crate::registry::ActorResponse::Bytes(b) => b,
                             crate::registry::ActorResponse::Aligned(b) => b.into_bytes(),
                             crate::registry::ActorResponse::Pooled { .. } => unreachable!(),
                         };
-                        write_streaming_response_direct(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
+                        queue_streaming_response_bytes(
+                            streaming_responses,
                             correlation_id,
                             bytes,
                             ctx.max_message_size,
                             schema_hash,
+                        )?;
+                    }
+                    *wrote_response_bytes = true;
+                } else {
+                    if streaming_responses.wire_blocked() {
+                        let crate::registry::ActorResponse::Pooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        } = other
+                        else {
+                            unreachable!("only pooled responses reach the direct branch")
+                        };
+                        queue_streaming_response_pooled(
+                            streaming_responses,
+                            correlation_id,
+                            payload,
+                            prefix,
+                            payload_len,
+                            ctx.max_message_size,
+                            schema_hash,
+                        )?;
+                    } else {
+                        write_actor_response_direct(
+                            stream,
+                            bytes_written_counter,
+                            bytes_since_flush,
+                            correlation_id,
+                            other,
                         )
                         .await?;
                     }
                     *wrote_response_bytes = true;
-                    if flush_each_actor_response() {
-                        stream.flush().await.map_err(GossipError::Network)?;
-                        *bytes_since_flush = 0;
-                    }
-                } else {
-                    write_actor_response_direct(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
-                        correlation_id,
-                        other,
-                    )
-                    .await?;
-                    *wrote_response_bytes = true;
-                    if flush_each_actor_response() {
+                    if !streaming_responses.wire_blocked() && flush_each_actor_response() {
                         stream.flush().await.map_err(GossipError::Network)?;
                         *bytes_since_flush = 0;
                     }
@@ -1324,21 +1321,14 @@ where
             let should_stream =
                 payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
             if should_stream {
-                write_streaming_response_direct(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
+                queue_streaming_response_bytes(
+                    streaming_responses,
                     correlation_id,
                     payload,
                     ctx.max_message_size,
                     schema_hash,
-                )
-                .await?;
+                )?;
                 *wrote_response_bytes = true;
-                if flush_each_actor_response() {
-                    stream.flush().await.map_err(GossipError::Network)?;
-                    *bytes_since_flush = 0;
-                }
             } else {
                 response_batch.push_bytes(correlation_id, payload);
                 *wrote_response_bytes = true;
@@ -1348,21 +1338,14 @@ where
             let len = payload.len();
             let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
             if should_stream {
-                write_streaming_response_direct(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
+                queue_streaming_response_bytes(
+                    streaming_responses,
                     correlation_id,
                     payload.into_bytes(),
                     ctx.max_message_size,
                     schema_hash,
-                )
-                .await?;
+                )?;
                 *wrote_response_bytes = true;
-                if flush_each_actor_response() {
-                    stream.flush().await.map_err(GossipError::Network)?;
-                    *bytes_since_flush = 0;
-                }
             } else {
                 response_batch.push_bytes(correlation_id, payload.into_bytes());
                 *wrote_response_bytes = true;
@@ -1376,38 +1359,43 @@ where
             let should_stream =
                 payload_len > inline_payload_limit || payload_len > STREAMING_THRESHOLD;
             if should_stream {
-                write_streaming_response_direct_pooled(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
+                queue_streaming_response_pooled(
+                    streaming_responses,
                     correlation_id,
                     payload,
                     prefix,
                     payload_len,
                     ctx.max_message_size,
                     schema_hash,
-                )
-                .await?;
+                )?;
                 *wrote_response_bytes = true;
-                if flush_each_actor_response() {
-                    stream.flush().await.map_err(GossipError::Network)?;
-                    *bytes_since_flush = 0;
-                }
             } else {
-                write_actor_response_direct(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
-                    correlation_id,
-                    crate::registry::ActorResponse::Pooled {
+                if streaming_responses.wire_blocked() {
+                    queue_streaming_response_pooled(
+                        streaming_responses,
+                        correlation_id,
                         payload,
                         prefix,
                         payload_len,
-                    },
-                )
-                .await?;
+                        ctx.max_message_size,
+                        schema_hash,
+                    )?;
+                } else {
+                    write_actor_response_direct(
+                        stream,
+                        bytes_written_counter,
+                        bytes_since_flush,
+                        correlation_id,
+                        crate::registry::ActorResponse::Pooled {
+                            payload,
+                            prefix,
+                            payload_len,
+                        },
+                    )
+                    .await?;
+                }
                 *wrote_response_bytes = true;
-                if flush_each_actor_response() {
+                if !streaming_responses.wire_blocked() && flush_each_actor_response() {
                     stream.flush().await.map_err(GossipError::Network)?;
                     *bytes_since_flush = 0;
                 }
@@ -1422,18 +1410,19 @@ where
     Ok(())
 }
 
-async fn write_streaming_response_direct<S>(
-    stream: &mut S,
-    bytes_written_counter: &Arc<AtomicUsize>,
-    bytes_since_flush: &mut usize,
+fn queue_streaming_response_bytes(
+    streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
     payload: bytes::Bytes,
     max_message_size: usize,
     _schema_hash: Option<u64>,
-) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
+) -> Result<()> {
+    if payload.len() > crate::MAX_STREAM_SIZE {
+        return Err(GossipError::MessageTooLarge {
+            size: payload.len(),
+            max: crate::MAX_STREAM_SIZE,
+        });
+    }
     // A V5 data frame is [control:4][stream_id:4][chunk_index:4][payload].
     let max_chunk = max_message_size.saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
     if max_chunk == 0 {
@@ -1443,78 +1432,43 @@ where
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-    let stream_id = allocate_direct_response_stream_id()?;
-    let total_len = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
-        size: payload.len(),
-        max: u32::MAX as usize,
-    })?;
-    let first_len = payload.len().min(chunk_size);
-    let start_header = crate::framing::write_stream_response_start_header(
-        stream_id,
-        correlation_id,
-        total_len,
-        first_len,
-    );
-    write_header_payload_vectored(
-        stream,
-        bytes_written_counter,
-        bytes_since_flush,
-        &start_header,
-        &payload[..first_len],
-    )
-    .await?;
-
-    for (idx, chunk_data) in payload[first_len..].chunks(chunk_size).enumerate() {
-        let chunk_index = u32::try_from(idx).map_err(|_| GossipError::MessageTooLarge {
-            size: idx + 1,
-            max: u32::MAX as usize,
-        })? + 1;
-        let header = crate::framing::write_stream_data_header(
-            true,
-            stream_id,
-            chunk_index,
-            chunk_data.len(),
-        );
-        write_header_payload_vectored(
-            stream,
-            bytes_written_counter,
-            bytes_since_flush,
-            &header,
-            chunk_data,
-        )
-        .await?;
+    let (payload, retained_bytes) = normalize_streaming_payload(payload);
+    if !streaming_responses.can_admit_response(2, retained_bytes) {
+        return Err(GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "immediate streaming response queue deferred slot is full",
+        )));
     }
 
-    stream.flush().await.map_err(GossipError::Network)?;
-    *bytes_since_flush = 0;
-
-    Ok(())
+    let stream_id = allocate_direct_response_stream_id()?;
+    let response = BytesStreamingResponse::new(
+        stream_id,
+        correlation_id,
+        payload,
+        retained_bytes,
+        chunk_size,
+    );
+    streaming_responses.try_extend([
+        StreamingCommand::BytesResponse(Box::new(response)),
+        StreamingCommand::Flush,
+    ])
 }
 
-async fn write_streaming_response_direct_pooled<S>(
-    stream: &mut S,
-    bytes_written_counter: &Arc<AtomicUsize>,
-    bytes_since_flush: &mut usize,
+fn queue_streaming_response_pooled(
+    streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
-    mut payload: crate::typed::PooledPayload,
+    payload: crate::typed::PooledPayload,
     prefix: Option<[u8; 16]>,
     payload_len: usize,
     max_message_size: usize,
     _schema_hash: Option<u64>,
-) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let max_chunk = max_message_size
-        .saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
-    if max_chunk == 0 {
-        return Err(GossipError::InvalidConfig(format!(
-            "max_message_size={} too small for streaming (overhead={})",
-            max_message_size, crate::framing::STREAM_RESPONSE_START_HEADER_LEN
-        )));
+) -> Result<()> {
+    if payload_len > crate::MAX_STREAM_SIZE {
+        return Err(GossipError::MessageTooLarge {
+            size: payload_len,
+            max: crate::MAX_STREAM_SIZE,
+        });
     }
-    let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-
     let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0);
     if prefix_len > payload_len {
         return Err(GossipError::Network(std::io::Error::new(
@@ -1529,92 +1483,51 @@ where
             "pooled response payload shorter than payload_len",
         )));
     }
-
-    let stream_id = allocate_direct_response_stream_id()?;
-    let total_len = u32::try_from(payload_len).map_err(|_| GossipError::MessageTooLarge {
-        size: payload_len,
-        max: u32::MAX as usize,
-    })?;
-    // StartData carries chunk zero; later frames carry only stream/index.
-    let mut prefix_pos = 0usize;
-    let prefix_bytes: Option<&[u8]> = prefix.as_ref().map(|p| p.as_slice());
-
-    let mut remaining_total = payload_len;
-    let mut idx = 0usize;
-    while remaining_total > 0 {
-        let this_chunk = std::cmp::min(chunk_size, remaining_total);
-
-        let mut header_bytes = [0u8; 16];
-        let header_len = if idx == 0 {
-            let header = crate::framing::write_stream_response_start_header(
-                stream_id,
-                correlation_id,
-                total_len,
-                this_chunk,
-            );
-            header_bytes.copy_from_slice(&header);
-            header.len()
-        } else {
-            let header = crate::framing::write_stream_data_header(
-                true,
-                stream_id,
-                u32::try_from(idx).map_err(|_| GossipError::MessageTooLarge { size: idx, max: u32::MAX as usize })?,
-                this_chunk,
-            );
-            header_bytes[..header.len()].copy_from_slice(&header);
-            header.len()
-        };
-
-        stream
-            .write_all(&header_bytes[..header_len])
-            .await
-            .map_err(GossipError::Network)?;
-        bytes_written_counter.fetch_add(header_len, Ordering::Relaxed);
-        *bytes_since_flush += header_len;
-
-        // Write chunk bytes from: prefix (if any) then pooled payload Buf.
-        let mut remaining_in_chunk = this_chunk;
-        if let Some(prefix) = prefix_bytes {
-            if prefix_pos < prefix.len() && remaining_in_chunk > 0 {
-                let take = std::cmp::min(remaining_in_chunk, prefix.len() - prefix_pos);
-                stream
-                    .write_all(&prefix[prefix_pos..prefix_pos + take])
-                    .await
-                    .map_err(GossipError::Network)?;
-                bytes_written_counter.fetch_add(take, Ordering::Relaxed);
-                *bytes_since_flush += take;
-                prefix_pos += take;
-                remaining_in_chunk -= take;
-            }
-        }
-
-        while remaining_in_chunk > 0 {
-            let chunk = payload.chunk();
-            if chunk.is_empty() {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "pooled payload returned empty chunk while bytes remain",
-                )));
-            }
-            let take = std::cmp::min(remaining_in_chunk, chunk.len());
-            stream
-                .write_all(&chunk[..take])
-                .await
-                .map_err(GossipError::Network)?;
-            bytes_written_counter.fetch_add(take, Ordering::Relaxed);
-            *bytes_since_flush += take;
-            payload.advance(take);
-            remaining_in_chunk -= take;
-        }
-
-        remaining_total -= this_chunk;
-        idx += 1;
+    if payload_len > u32::MAX as usize {
+        return Err(GossipError::MessageTooLarge {
+            size: payload_len,
+            max: u32::MAX as usize,
+        });
     }
 
-    stream.flush().await.map_err(GossipError::Network)?;
-    *bytes_since_flush = 0;
+    let max_chunk = max_message_size
+        .saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
+    if max_chunk == 0 {
+        return Err(GossipError::InvalidConfig(format!(
+            "max_message_size={} too small for streaming (overhead={})",
+            max_message_size,
+            crate::framing::STREAM_RESPONSE_START_HEADER_LEN
+        )));
+    }
+    let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
+    // The pooled response is one connection-owned command plus its terminal
+    // Flush. The command generates individual frame headers lazily while it
+    // writes, so admission does not expand the response into one queue entry
+    // (or one copied `Bytes`) per chunk.
+    let command_count = 2;
+    let retained_bytes = payload.remaining().saturating_add(prefix_len);
+    if !streaming_responses.can_admit_response(command_count, retained_bytes) {
+        return Err(GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "immediate streaming response queue deferred slot is full",
+        )));
+    }
 
-    Ok(())
+    let stream_id = allocate_direct_response_stream_id()?;
+    let response = PooledStreamingResponse::new(
+        stream_id,
+        correlation_id,
+        payload_len,
+        retained_bytes,
+        chunk_size,
+        payload,
+        prefix,
+        expected_payload_bytes,
+    );
+    streaming_responses.try_extend([
+        StreamingCommand::PooledResponse(Box::new(response)),
+        StreamingCommand::Flush,
+    ])
 }
 
 async fn process_read_result_io<S>(
@@ -1636,6 +1549,7 @@ async fn process_read_result_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
+    streaming_responses: &mut LocalStreamingQueue,
     direct_response_batch: &mut DirectResponseBatch,
     perf: Option<&IoPerfCounters>,
 ) -> Result<()>
@@ -1742,6 +1656,7 @@ where
                     bytes_written_counter,
                     bytes_since_flush,
                     response_batch,
+                    streaming_responses,
                     &mut wrote_response_bytes,
                     corr_id,
                     crate::registry::AskDisposition::Immediate(response),
@@ -1816,6 +1731,7 @@ async fn try_handle_fast_io<S>(
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
+    streaming_responses: &mut LocalStreamingQueue,
     direct_response_batch: &mut DirectResponseBatch,
     wrote_response_bytes: &mut bool,
     perf: Option<&IoPerfCounters>,
@@ -1834,6 +1750,7 @@ where
         bytes_written_counter: &Arc<AtomicUsize>,
         bytes_since_flush: &mut usize,
         response_batch: &mut ResponseBatch,
+        streaming_responses: &mut LocalStreamingQueue,
         wrote_response_bytes: &mut bool,
         perf: Option<&IoPerfCounters>,
     ) -> Result<()>
@@ -1861,6 +1778,7 @@ where
                     bytes_written_counter,
                     bytes_since_flush,
                     response_batch,
+                    streaming_responses,
                     wrote_response_bytes,
                     correlation_id,
                     crate::registry::AskDisposition::Immediate(response),
@@ -1918,6 +1836,7 @@ where
                     bytes_written_counter,
                     bytes_since_flush,
                     response_batch,
+                    streaming_responses,
                     wrote_response_bytes,
                     correlation_id,
                     disposition,
@@ -1942,6 +1861,7 @@ where
                     bytes_written_counter,
                     bytes_since_flush,
                     response_batch,
+                    streaming_responses,
                     wrote_response_bytes,
                     correlation_id,
                     disposition,
@@ -1972,6 +1892,7 @@ where
                 bytes_written_counter,
                 bytes_since_flush,
                 response_batch,
+                streaming_responses,
                 wrote_response_bytes,
                 correlation_id,
                 crate::registry::AskDisposition::Immediate(response),
@@ -2043,6 +1964,7 @@ where
                 bytes_written_counter,
                 bytes_since_flush,
                 response_batch,
+                streaming_responses,
                 wrote_response_bytes,
                 perf,
             )
@@ -2092,6 +2014,7 @@ where
                 bytes_written_counter,
                 bytes_since_flush,
                 response_batch,
+                streaming_responses,
                 wrote_response_bytes,
                 perf,
             )

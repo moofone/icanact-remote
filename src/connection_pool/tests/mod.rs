@@ -117,6 +117,168 @@ where
     handle.join().expect("test thread panicked unexpectedly");
 }
 
+/// P0: the bidirectional IO task must keep reading while a large streamed
+/// frame is only partially writable. If each side awaits a whole ~1 MiB
+/// `VectoredWrite` before returning to its read loop, two simultaneous asks
+/// deadlock as soon as both 64 KiB duplex directions fill: neither writer can
+/// finish, and neither IO task reaches the reads that would drain its peer.
+///
+/// Keep the transport deliberately smaller than one stream chunk and make
+/// both requests and their echoed responses multi-MiB. Completion proves the
+/// writer yields at a bounded byte slice in both directions; payload equality
+/// proves that yielding does not change ordinary ask semantics.
+#[test]
+fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
+    run_multi_thread_test(async {
+        const DUPLEX_CAPACITY: usize = 64 * 1024;
+        const PAYLOAD_BYTES: usize = 3 * 1024 * 1024;
+        const COMPLETION_BOUND: Duration = Duration::from_secs(3);
+
+        let addr_a: std::net::SocketAddr = "127.0.0.1:40491".parse().unwrap();
+        let addr_b: std::net::SocketAddr = "127.0.0.1:40492".parse().unwrap();
+
+        let registry_a = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_a,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "stream_fairness_constrained_a",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_a
+            .set_actor_message_handler_sync(Arc::new(TestActor))
+            .await;
+        let registry_b = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_b,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "stream_fairness_constrained_b",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_b
+            .set_actor_message_handler_sync(Arc::new(TestActor))
+            .await;
+
+        let correlation_a = CorrelationTracker::new();
+        let correlation_b = CorrelationTracker::new();
+        let (io_a, io_b) = tokio::io::duplex(DUPLEX_CAPACITY);
+
+        let read_ctx_a = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_a),
+            peer_addr: addr_b,
+            session_source: addr_b,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_a.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_a.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_a.actor_message_handler_sync.load_full(),
+        };
+        let read_ctx_b = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_b),
+            peer_addr: addr_a,
+            session_source: addr_a,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_b.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_b.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_b.actor_message_handler_sync.load_full(),
+        };
+
+        let (writer_a, task_a, _) = LockFreeStreamHandle::new(
+            io_a,
+            addr_b,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_a),
+        );
+        let writer_a = Arc::new(writer_a);
+        let conn_a =
+            ConnectionHandle::<()>::new_stream(addr_b, Arc::clone(&writer_a), correlation_a);
+        let (writer_b, task_b, _) = LockFreeStreamHandle::new(
+            io_b,
+            addr_a,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_b),
+        );
+        let writer_b = Arc::new(writer_b);
+        let conn_b =
+            ConnectionHandle::<()>::new_stream(addr_a, Arc::clone(&writer_b), correlation_b);
+
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let start_a = Arc::clone(&start);
+        let ask_a = tokio::spawn(async move {
+            let payload = bytes::Bytes::from(vec![0xA5; PAYLOAD_BYTES]);
+            start_a.wait().await;
+            let response = conn_a
+                .ask_streaming_bytes(
+                    payload.clone(),
+                    0xA11C_0001,
+                    0xC0DE_BEEF,
+                    Duration::from_secs(30),
+                )
+                .await?;
+            crate::Result::Ok((response, payload))
+        });
+        let start_b = Arc::clone(&start);
+        let ask_b = tokio::spawn(async move {
+            let payload = bytes::Bytes::from(vec![0x5A; PAYLOAD_BYTES]);
+            start_b.wait().await;
+            let response = conn_b
+                .ask_streaming_bytes(
+                    payload.clone(),
+                    0xA11C_0001,
+                    0xC0DE_BEEF,
+                    Duration::from_secs(30),
+                )
+                .await?;
+            crate::Result::Ok((response, payload))
+        });
+
+        start.wait().await;
+        let ((response_a, payload_a), (response_b, payload_b)) =
+            tokio::time::timeout(COMPLETION_BOUND, async {
+                let a = ask_a.await.expect("node A ask task panicked")?;
+                let b = ask_b.await.expect("node B ask task panicked")?;
+                crate::Result::Ok((a, b))
+            })
+            .await
+            .expect(
+                "simultaneous streamed asks deadlocked: each IO task must return to reads after a bounded write slice",
+            )
+            .expect("simultaneous streamed ask failed");
+
+        assert_eq!(response_a, payload_a);
+        assert_eq!(response_b, payload_b);
+
+        writer_a.shutdown();
+        writer_b.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_a).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_b).await;
+    });
+}
+
 fn reset_io_perf() {
     let _ = IoPerfCounters::global().snapshot_and_reset();
 }
@@ -1064,6 +1226,732 @@ impl AsyncWrite for RecordingWriter {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+}
+
+#[tokio::test]
+async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
+    let (mut writer, recorded) = RecordingWriter::new();
+    let queue = StreamingQueue::new(1, "127.0.0.1:40493".parse().unwrap());
+    let mut yielded_slot = None;
+    let header =
+        crate::framing::write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17);
+    let payload = bytes::Bytes::from(vec![0xA7; STREAM_WRITE_SLICE_BYTES + 17]);
+    let pending =
+        PendingStreamingCommand::shared(StreamingCommand::VectoredWrite(VectoredSendItem {
+            header: InlineFrameHeader::from_array(header),
+            payload,
+        }));
+    let mut pending_slot = Some(pending);
+    let mut turns = 0usize;
+    loop {
+        let mut pending = pending_slot.take().unwrap();
+        let (written, complete) = write_streaming_command_slice(&mut writer, &mut pending)
+            .await
+            .unwrap();
+        assert!(written > 0);
+        assert!(written <= STREAM_WRITE_SLICE_BYTES);
+        turns += 1;
+        finish_streaming_command_slice(
+            pending,
+            complete,
+            &queue,
+            &mut yielded_slot,
+            &mut pending_slot,
+        );
+        if complete {
+            break;
+        }
+        assert_eq!(
+            queue.space_notification_count(),
+            0,
+            "partial progress must not release shared queue capacity"
+        );
+    }
+
+    assert!(turns >= 2, "an oversized command must remain resumable");
+    assert!(pending_slot.is_none());
+    assert_eq!(
+        queue.space_notification_count(),
+        1,
+        "a shared queue slot is released once, after full command completion"
+    );
+
+    let mut local = PendingStreamingCommand::local(StreamingCommand::Flush);
+    let (_, local_complete) = write_streaming_command_slice(&mut writer, &mut local)
+        .await
+        .unwrap();
+    finish_streaming_command_slice(
+        local,
+        local_complete,
+        &queue,
+        &mut yielded_slot,
+        &mut pending_slot,
+    );
+    assert_eq!(
+        queue.space_notification_count(),
+        1,
+        "IO-owner-local responses must not fabricate shared queue capacity"
+    );
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        header.len() + STREAM_WRITE_SLICE_BYTES + 17
+    );
+}
+
+#[test]
+fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+            0u8;
+            RESPONSE_BATCH_BYTE_CAP
+        ]))])
+        .expect("the configured byte cap admits one bounded burst");
+    assert!(queue.is_full());
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x")),
+            StreamingCommand::Flush,
+        ])
+        .expect("overflow is retained in the deferred response slot");
+}
+
+#[test]
+fn immediate_bytes_response_admission_stays_lazy_for_many_frames() {
+    let payload_len = STREAM_CHUNK_SIZE * 8;
+    let mut queue = LocalStreamingQueue::with_response_reserve(payload_len);
+    queue_streaming_response_bytes(
+        &mut queue,
+        0xC0DE,
+        bytes::Bytes::from(vec![0xA7; payload_len]),
+        payload_len,
+        None,
+    )
+    .expect("large bytes response should be admitted");
+
+    assert_eq!(
+        queue.queue.len(),
+        2,
+        "a large response must retain one lazy command plus its terminal flush"
+    );
+}
+
+#[test]
+fn lazy_stream_admission_counts_owned_payload_not_generated_headers() {
+    let payload_len = STREAMING_RESPONSE_QUEUE_BYTE_CAP + 1;
+    let mut queue = LocalStreamingQueue::with_response_reserve(20);
+    queue_streaming_response_bytes(
+        &mut queue,
+        0xC0DE,
+        bytes::Bytes::from(vec![0xA7; payload_len]),
+        20,
+        None,
+    )
+    .expect("lazy framing headers must not consume the retained-byte budget");
+}
+
+#[test]
+fn sliced_bytes_stream_is_compacted_before_admission() {
+    let backing = bytes::Bytes::from(vec![0xA7; 4 * STREAM_CHUNK_SIZE]);
+    let payload = backing.slice(..STREAM_CHUNK_SIZE);
+    let mut queue = LocalStreamingQueue::new();
+
+    queue_streaming_response_bytes(&mut queue, 0xC0DE, payload, 20, None)
+        .expect("a sliced streaming payload should be admitted after compaction");
+
+    let Some(StreamingCommand::BytesResponse(response)) = queue.queue.front() else {
+        panic!("expected a lazy bytes response command");
+    };
+    assert_eq!(response.payload_len, STREAM_CHUNK_SIZE);
+    assert_eq!(
+        response.retained_bytes, STREAM_CHUNK_SIZE,
+        "queue accounting must charge the compacted payload, not the old backing allocation"
+    );
+}
+
+#[test]
+fn response_in_flight_with_only_flush_keeps_read_admission_open() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"response")),
+            StreamingCommand::Flush,
+        ])
+        .expect("response should be admitted");
+
+    let response = queue.pop_front().expect("response command");
+    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+    assert!(
+        !queue.is_full(),
+        "a small in-flight response must not stop reciprocal reads"
+    );
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"next-response")),
+            StreamingCommand::Flush,
+        ])
+        .expect("a bounded response may queue behind the in-flight terminal flush");
+    assert_eq!(queue.queue.len(), 3);
+}
+
+#[test]
+fn oversized_response_in_flight_keeps_read_admission_open() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP + 1
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one oversized response is the explicit admission exception");
+    let response = queue.pop_front().expect("oversized response command");
+    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+    assert!(
+        !queue.is_full(),
+        "a bounded oversized response must keep reciprocal reads flowing"
+    );
+}
+
+#[test]
+fn maximum_in_flight_response_keeps_reciprocal_reads_open() {
+    let mut queue = LocalStreamingQueue::new();
+    queue.response_in_flight = true;
+    queue.in_flight_bytes = crate::MAX_STREAM_SIZE;
+    queue.queue.push_back(StreamingCommand::Flush);
+
+    assert!(
+        !queue.is_full(),
+        "a maximum-size response must not deadlock the reciprocal read path"
+    );
+}
+
+#[test]
+fn oversized_in_flight_response_admits_one_bounded_deferred_response() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP + 1
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one oversized response is the explicit admission exception");
+    let response = queue.pop_front().expect("oversized response command");
+    assert!(matches!(response, StreamingCommand::WriteBytes(_)));
+
+    let deferred_bytes = RESPONSE_BATCH_BYTE_CAP - 1;
+    assert!(
+        queue.can_admit_response(2, deferred_bytes),
+        "the bounded deferred slot must preserve a valid response behind the in-flight one"
+    );
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; deferred_bytes])),
+            StreamingCommand::Flush,
+        ])
+        .expect("the bounded deferred response must not be dropped");
+    assert!(
+        queue.is_full(),
+        "the deferred slot must stop reads before a third response is consumed"
+    );
+}
+
+#[test]
+fn near_hard_cap_in_flight_response_backpressures_large_deferred_response() {
+    let mut queue = LocalStreamingQueue::new();
+    let current_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
+        .saturating_sub(MAX_STREAMING_RESPONSE_RETAINED_BYTES)
+        .saturating_add(1);
+    queue.response_in_flight = true;
+    queue.in_flight_bytes = current_bytes;
+    queue.queue.push_back(StreamingCommand::Flush);
+
+    let deferred_bytes = MAX_STREAMING_RESPONSE_RETAINED_BYTES;
+    assert!(
+        queue.is_full(),
+        "the read gate must close before the aggregate hard cap is exceeded"
+    );
+    assert!(
+        !queue.can_admit_response(2, deferred_bytes),
+        "a deferred response must stay within the aggregate hard retained-byte cap"
+    );
+}
+
+#[test]
+fn near_hard_cap_queued_response_closes_read_admission_before_followup() {
+    let mut queue = LocalStreamingQueue::new();
+    queue.queued_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
+        .saturating_sub(MAX_STREAMING_RESPONSE_RETAINED_BYTES)
+        .saturating_add(1);
+    queue.queue.push_back(StreamingCommand::Flush);
+
+    assert!(
+        queue.is_full(),
+        "the read gate must stop before a follow-up handler can exceed the hard cap"
+    );
+}
+
+#[test]
+fn queued_response_retains_large_followup_within_hard_cap() {
+    let mut queue = LocalStreamingQueue::new();
+    let queued_bytes = RESPONSE_BATCH_BYTE_CAP - STREAM_CHUNK_SIZE;
+    queue.queued_bytes = queued_bytes;
+    queue.queue.push_back(StreamingCommand::Flush);
+
+    let followup_bytes = MAX_STREAMING_RESPONSE_RETAINED_BYTES.saturating_sub(1);
+    assert!(
+        queue.can_admit_response(2, followup_bytes),
+        "a valid large follow-up must fit the single deferred slot"
+    );
+    assert!(
+        !queue.is_full(),
+        "read admission remains open while the aggregate hard cap has room"
+    );
+}
+
+#[test]
+fn partial_streaming_output_defers_flush_until_terminal_flush() {
+    let pending = PendingStreamingCommand::local(StreamingCommand::WriteBytes(
+        bytes::Bytes::from_static(b"partial"),
+    ));
+
+    assert!(!should_flush_stream_output(1, Some(&pending), None));
+    assert!(!should_flush_stream_output(1, None, Some(&pending)));
+    assert!(should_flush_stream_output(1, None, None));
+    assert!(!should_flush_stream_output(0, None, None));
+}
+
+/// A pooled response must retain its original allocation while it waits for
+/// the connection-owned writer. Materializing a `BytesMut` here doubles the
+/// peak resident payload and defeats the pooled encoder's bounded-memory
+/// contract.
+#[test]
+fn pooled_streaming_response_retains_owned_payload_without_materializing_bytes() {
+    let payload_len = STREAM_CHUNK_SIZE;
+    let prefix = Some([0xD3; 16]);
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(
+        payload_len - prefix.as_ref().map(|value| value.len()).unwrap_or(0),
+        |out| out.extend(std::iter::repeat_n(0xA7, payload_len - 16)),
+    )
+    .expect("pooled payload allocation");
+    let mut queue = LocalStreamingQueue::with_response_reserve(payload_len + 1024);
+
+    queue_streaming_response_pooled(
+        &mut queue,
+        0xC0DE,
+        payload,
+        prefix,
+        payload_len,
+        128 * 1024,
+        None,
+    )
+    .expect("pooled response should be admitted");
+
+    assert!(matches!(
+        queue.queue.front(),
+        Some(StreamingCommand::PooledResponse(_))
+    ));
+    assert!(matches!(queue.queue.get(1), Some(StreamingCommand::Flush)));
+}
+
+#[test]
+fn pooled_streaming_admission_accounts_surplus_payload() {
+    let expected_payload_len = STREAM_CHUNK_SIZE / 4;
+    let retained_payload_len = expected_payload_len * 2;
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(
+        retained_payload_len,
+        |out| out.extend(std::iter::repeat_n(0xA7, retained_payload_len)),
+    )
+    .expect("pooled payload allocation");
+    let mut queue = LocalStreamingQueue::new();
+
+    queue_streaming_response_pooled(
+        &mut queue,
+        0xC0DE,
+        payload,
+        None,
+        expected_payload_len,
+        STREAM_CHUNK_SIZE,
+        None,
+    )
+    .expect("surplus pooled payload should remain bounded and be admitted");
+
+    let Some(StreamingCommand::PooledResponse(response)) = queue.queue.front() else {
+        panic!("expected a pooled response command");
+    };
+    assert_eq!(
+        response.retained_bytes, retained_payload_len,
+        "admission must charge all pooled bytes retained by the response command"
+    );
+}
+
+#[tokio::test]
+async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
+    let payload_len = 64;
+    let prefix = [0xD3; 16];
+    let payload_bytes = vec![0xA7; payload_len - prefix.len()];
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(payload_bytes.len(), |out| {
+        out.extend_from_slice(&payload_bytes)
+    })
+    .expect("pooled payload allocation");
+    // Keep the frame payload below the 16-byte prefix so the prefix itself
+    // crosses a frame boundary; the writer must treat it as part of the
+    // logical payload rather than assuming it fits in the start frame.
+    let max_message_size = 20;
+    let mut queue = LocalStreamingQueue::with_response_reserve(max_message_size);
+    queue_streaming_response_pooled(
+        &mut queue,
+        0xC0DE,
+        payload,
+        Some(prefix),
+        payload_len,
+        max_message_size,
+        None,
+    )
+    .expect("pooled response should be admitted");
+
+    let command = queue.pop_front().expect("pooled response command");
+    let (stream_id, chunk_size) = match &command {
+        StreamingCommand::PooledResponse(response) => (response.stream_id, response.chunk_size),
+        other => panic!("expected pooled response command, got {other:?}"),
+    };
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, recorded) = RecordingWriter::new();
+    loop {
+        let (written, complete) = write_streaming_command_slice(&mut writer, &mut pending)
+            .await
+            .expect("pooled response write");
+        assert!(written > 0);
+        if complete {
+            break;
+        }
+    }
+    let flush = queue.pop_front().expect("terminal flush");
+    let mut pending_flush = PendingStreamingCommand::local(flush);
+    let (_, complete) = write_streaming_command_slice(&mut writer, &mut pending_flush)
+        .await
+        .expect("pooled response flush");
+    assert!(complete);
+
+    let first_len = payload_len.min(chunk_size);
+    let mut logical_payload = Vec::with_capacity(payload_len);
+    logical_payload.extend_from_slice(&prefix);
+    logical_payload.extend_from_slice(&payload_bytes);
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&crate::framing::write_stream_response_start_header(
+        stream_id,
+        0xC0DE,
+        payload_len as u32,
+        first_len,
+    ));
+    expected.extend_from_slice(&logical_payload[..first_len]);
+    let mut wire_offset = first_len;
+    let mut chunk_index = 1u32;
+    while wire_offset < payload_len {
+        let frame_payload_start = wire_offset;
+        let frame_payload_end = (wire_offset + chunk_size).min(payload_len);
+        expected.extend_from_slice(&crate::framing::write_stream_data_header(
+            true,
+            stream_id,
+            chunk_index,
+            frame_payload_end - frame_payload_start,
+        ));
+        expected.extend_from_slice(&logical_payload[frame_payload_start..frame_payload_end]);
+        wire_offset = frame_payload_end;
+        chunk_index += 1;
+    }
+
+    assert_eq!(*recorded.lock().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn pooled_streaming_response_yields_at_each_frame_boundary() {
+    let payload_len = 128;
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(payload_len, |out| {
+        out.extend(std::iter::repeat_n(0xA7, payload_len));
+    })
+    .expect("pooled payload allocation");
+    let mut local_queue = LocalStreamingQueue::with_response_reserve(64);
+    queue_streaming_response_pooled(
+        &mut local_queue,
+        0xC0DE,
+        payload,
+        None,
+        payload_len,
+        64,
+        None,
+    )
+    .expect("pooled response should be admitted");
+
+    let command = local_queue.pop_front().expect("pooled response command");
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, _) = RecordingWriter::new();
+    let mut complete = false;
+    let mut written = 0;
+    while !pending.yield_after_frame && !complete {
+        let (turn_written, turn_complete) =
+            write_streaming_command_slice(&mut writer, &mut pending)
+                .await
+                .expect("first pooled frame write");
+        written += turn_written;
+        complete = turn_complete;
+    }
+    assert!(written > 0);
+    assert!(!complete, "the response has more than one frame");
+    assert!(
+        pending.yield_after_frame,
+        "a completed frame must yield the local command to the scheduler"
+    );
+
+    let shared_queue = StreamingQueue::new(1, "127.0.0.1:40494".parse().unwrap());
+    let mut yielded_slot = None;
+    let mut pending_slot = None;
+    finish_streaming_command_slice(
+        pending,
+        complete,
+        &shared_queue,
+        &mut yielded_slot,
+        &mut pending_slot,
+    );
+    assert!(pending_slot.is_none());
+    assert!(matches!(
+        yielded_slot.as_ref().map(|pending| &pending.command),
+        Some(StreamingCommand::PooledResponse(_))
+    ));
+}
+
+#[tokio::test]
+async fn bytes_streaming_response_writes_frame_order() {
+    let payload_len = 128;
+    let payload_bytes = vec![0xA7; payload_len];
+    let mut local_queue = LocalStreamingQueue::with_response_reserve(64);
+    queue_streaming_response_bytes(
+        &mut local_queue,
+        0xC0DE,
+        bytes::Bytes::from(payload_bytes.clone()),
+        64,
+        None,
+    )
+    .expect("bytes response should be admitted");
+
+    let command = local_queue.pop_front().expect("bytes response command");
+    let stream_id = match &command {
+        StreamingCommand::BytesResponse(response) => response.stream_id,
+        other => panic!("expected bytes response command, got {other:?}"),
+    };
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, recorded) = RecordingWriter::new();
+    loop {
+        let (_, complete) = write_streaming_command_slice(&mut writer, &mut pending)
+            .await
+            .expect("bytes response write");
+        if complete {
+            break;
+        }
+    }
+
+    let chunk_size = 64 - crate::framing::STREAM_RESPONSE_START_HEADER_LEN;
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&crate::framing::write_stream_response_start_header(
+        stream_id,
+        0xC0DE,
+        payload_len as u32,
+        payload_len.min(chunk_size),
+    ));
+    expected.extend_from_slice(&payload_bytes[..payload_len.min(chunk_size)]);
+    let mut offset = payload_len.min(chunk_size);
+    let mut chunk_index = 1u32;
+    while offset < payload_len {
+        let end = (offset + chunk_size).min(payload_len);
+        expected.extend_from_slice(&crate::framing::write_stream_data_header(
+            true,
+            stream_id,
+            chunk_index,
+            end - offset,
+        ));
+        expected.extend_from_slice(&payload_bytes[offset..end]);
+        offset = end;
+        chunk_index += 1;
+    }
+
+    assert_eq!(*recorded.lock().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn bytes_streaming_response_yields_at_each_frame_boundary() {
+    let payload_len = 128;
+    let mut local_queue = LocalStreamingQueue::with_response_reserve(64);
+    queue_streaming_response_bytes(
+        &mut local_queue,
+        0xC0DE,
+        bytes::Bytes::from(vec![0xA7; payload_len]),
+        64,
+        None,
+    )
+    .expect("bytes response should be admitted");
+
+    let command = local_queue.pop_front().expect("bytes response command");
+    let mut pending = PendingStreamingCommand::local(command);
+    let (mut writer, _) = RecordingWriter::new();
+    let mut complete = false;
+    let mut written = 0;
+    while !pending.yield_after_frame && !complete {
+        let (turn_written, turn_complete) =
+            write_streaming_command_slice(&mut writer, &mut pending)
+                .await
+                .expect("bytes response write");
+        written += turn_written;
+        complete = turn_complete;
+    }
+    assert!(written > 0);
+    assert!(!complete, "the response has more than one frame");
+    assert!(
+        pending.yield_after_frame,
+        "a completed Bytes frame must yield the local command to the scheduler"
+    );
+}
+
+#[test]
+fn immediate_streaming_response_queue_defers_overflow_until_prior_response_drains() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; RESPONSE_BATCH_BYTE_CAP])),
+            StreamingCommand::Flush,
+        ])
+        .expect("the first response fits the bounded queue");
+
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"deferred")),
+            StreamingCommand::Flush,
+        ])
+        .expect("the next response is retained for deferred admission");
+    assert!(
+        queue.is_full(),
+        "deferred response must close read admission"
+    );
+
+    let mut drained = 0;
+    while queue.pop_front().is_some() {
+        drained += 1;
+    }
+    assert_eq!(
+        drained, 4,
+        "the deferred response must be promoted after flush"
+    );
+    assert!(
+        !queue.is_full(),
+        "admission reopens after both responses drain"
+    );
+}
+
+#[test]
+fn immediate_streaming_response_queue_reserves_command_slots() {
+    let mut queue = LocalStreamingQueue::with_response_reserve(STREAM_CHUNK_SIZE * 2);
+    let reserve = queue.response_reserve_commands;
+    for _ in 0..(STREAMING_RESPONSE_QUEUE_COMMAND_CAP - reserve) {
+        queue
+            .try_extend([StreamingCommand::Flush])
+            .expect("reserved queue slots still admit bounded commands");
+    }
+    assert!(!queue.is_full(), "the reserved response still fits exactly");
+    queue
+        .try_extend([StreamingCommand::Flush])
+        .expect("overflow is retained as a deferred response");
+    assert!(
+        queue.is_full(),
+        "the command reserve must close read admission"
+    );
+}
+
+#[test]
+fn streaming_scheduler_alternates_local_and_shared_sources() {
+    assert_eq!(
+        choose_streaming_source(true, true, true),
+        Some(StreamingSource::Shared)
+    );
+    assert_eq!(
+        choose_streaming_source(false, true, true),
+        Some(StreamingSource::Local)
+    );
+    assert_eq!(
+        choose_streaming_source(true, true, false),
+        Some(StreamingSource::Local)
+    );
+    assert_eq!(
+        choose_streaming_source(false, false, true),
+        Some(StreamingSource::Shared)
+    );
+    assert_eq!(choose_streaming_source(true, false, false), None);
+}
+
+#[test]
+fn immediate_streaming_response_queue_admits_one_oversized_response() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP + 1
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one response may exceed the queue cap");
+    assert!(queue.is_full());
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"x")),
+            StreamingCommand::Flush,
+        ])
+        .expect("a bounded follow-up response fits the hard resident cap");
+
+    while queue.pop_front().is_some() {}
+    assert!(
+        !queue.is_full(),
+        "admission reopens after the oversized response flushes"
+    );
+    queue
+        .try_extend([StreamingCommand::WriteBytes(bytes::Bytes::from_static(
+            b"x",
+        ))])
+        .expect("a later response is admitted after the first one drains");
+}
+
+#[test]
+fn sole_response_above_normal_queue_cap_remains_admissible() {
+    let mut queue = LocalStreamingQueue::new();
+    let payload_len = STREAMING_RESPONSE_QUEUE_BYTE_CAP + 1;
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; payload_len])),
+            StreamingCommand::Flush,
+        ])
+        .expect("one sole lazy response remains valid above the queue cap");
+    assert!(queue.is_full());
+}
+
+#[test]
+fn response_admission_rejects_beyond_hard_retained_footprints() {
+    let mut queue = LocalStreamingQueue::new();
+    queue
+        .try_extend([
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
+                0u8;
+                RESPONSE_BATCH_BYTE_CAP
+            ])),
+            StreamingCommand::Flush,
+        ])
+        .expect("the first bounded response fits");
+
+    let oversized = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP + 1;
+    assert!(
+        !queue.can_admit_response(2, oversized),
+        "a deferred response must not exceed the aggregate hard footprint"
+    );
 }
 
 #[derive(Clone, Copy, Default)]

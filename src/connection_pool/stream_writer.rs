@@ -1,3 +1,453 @@
+/// Maximum streaming bytes offered before the connection owner returns to its
+/// read side. Ordinary tell/ask commands never use this slice machinery.
+const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
+
+async fn write_vectored_all<S>(
+    stream: &mut S,
+    slices: &[std::io::IoSlice<'_>],
+) -> std::io::Result<usize>
+where
+    S: AsyncWrite + Unpin,
+{
+    let total_len: usize = slices.iter().map(|slice| slice.len()).sum();
+    if total_len == 0 {
+        return Ok(0);
+    }
+    if !stream.is_write_vectored() {
+        for slice in slices {
+            stream.write_all(slice.as_ref()).await?;
+        }
+        return Ok(total_len);
+    }
+
+    let written = stream.write_vectored(slices).await?;
+    if written == total_len {
+        return Ok(written);
+    }
+    let mut index = 0usize;
+    let mut offset = written;
+    while index < slices.len() && offset >= slices[index].len() {
+        offset -= slices[index].len();
+        index += 1;
+    }
+    if index < slices.len() {
+        if offset < slices[index].len() {
+            stream.write_all(&slices[index].as_ref()[offset..]).await?;
+            index += 1;
+        }
+        while index < slices.len() {
+            stream.write_all(slices[index].as_ref()).await?;
+            index += 1;
+        }
+    }
+    Ok(total_len)
+}
+
+/// Perform at most one socket write for a streaming slice. A short write is
+/// returned to the caller, which retains the command offset for the next turn;
+/// this avoids awaiting the remainder of a large frame while the peer's read
+/// side is constrained.
+async fn write_vectored_once<S>(
+    stream: &mut S,
+    slices: &[std::io::IoSlice<'_>],
+) -> std::io::Result<usize>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(first) = slices.iter().find(|slice| !slice.is_empty()) else {
+        return Ok(0);
+    };
+    let result = if stream.is_write_vectored() {
+        stream.write_vectored(slices).await
+    } else {
+        std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_write(cx, first.as_ref())).await
+    }?;
+    if result == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "streaming write made no progress",
+        ));
+    }
+    Ok(result)
+}
+
+/// Write one bounded slice of a lazily framed `Bytes` response. Returning a
+/// frame-boundary yield lets the scheduler interleave another streaming source
+/// without materializing the remaining response into per-frame commands.
+async fn write_bytes_streaming_command_slice<S>(
+    stream: &mut S,
+    pending_offset: &mut usize,
+    response: &mut BytesStreamingResponse,
+) -> std::io::Result<(usize, bool, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    while response.frame_index < response.chunk_count {
+        let header = response.frame_header(response.frame_index);
+        let header_bytes = header.as_slice();
+        let frame_payload_len = response.frame_payload_len(response.frame_index);
+        let frame_total_len = header_bytes.len() + frame_payload_len;
+
+        if response.frame_offset >= frame_total_len {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+            continue;
+        }
+
+        let budget = STREAM_WRITE_SLICE_BYTES.min(frame_total_len - response.frame_offset);
+        let header_bytes_offered = if response.frame_offset < header_bytes.len() {
+            (header_bytes.len() - response.frame_offset).min(budget)
+        } else {
+            0
+        };
+        let data_budget = budget - header_bytes_offered;
+        let mut slices = [std::io::IoSlice::new(&[]); 2];
+        let mut slice_count = 0usize;
+
+        if header_bytes_offered > 0 {
+            let header_start = response.frame_offset;
+            slices[slice_count] = std::io::IoSlice::new(
+                &header_bytes[header_start..header_start + header_bytes_offered],
+            );
+            slice_count += 1;
+        }
+        if data_budget > 0 {
+            let frame_payload_start = if response.frame_index == 0 {
+                0
+            } else {
+                response
+                    .chunk_size
+                    .saturating_add(
+                        response
+                            .frame_index
+                            .saturating_sub(1)
+                            .saturating_mul(response.chunk_size),
+                    )
+            };
+            let payload_offset = frame_payload_start
+                .saturating_add(response.frame_offset.saturating_sub(header_bytes.len()));
+            slices[slice_count] = std::io::IoSlice::new(
+                &response.payload[payload_offset..payload_offset + data_budget],
+            );
+            slice_count += 1;
+        }
+
+        let written = write_vectored_once(stream, &slices[..slice_count]).await?;
+        response.frame_offset += written;
+        *pending_offset += written;
+        let frame_complete = response.frame_offset >= frame_total_len;
+        if frame_complete {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+        }
+        let complete = response.frame_index >= response.chunk_count;
+        // Keep each frame contiguous on the wire, then hand the remaining
+        // Bytes response back to the source alternator. This lets normal
+        // writes and inbound response batches make progress between frames
+        // without materializing the remaining response into queue commands.
+        return Ok((written, complete, frame_complete && !complete));
+    }
+
+    Ok((0, true, false))
+}
+
+/// Write one bounded slice of a pooled response without converting its
+/// payload into `Bytes`. The pooled allocation remains owned by the pending
+/// command until the terminal frame has been written.
+async fn write_pooled_streaming_command_slice<S>(
+    stream: &mut S,
+    pending_offset: &mut usize,
+    response: &mut PooledStreamingResponse,
+) -> std::io::Result<(usize, bool, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    while response.frame_index < response.chunk_count {
+        let header = response.frame_header(response.frame_index);
+        let header_bytes = header.as_slice();
+        let frame_payload_len = response.frame_payload_len(response.frame_index);
+        let frame_total_len = header_bytes.len() + frame_payload_len;
+
+        if response.frame_offset >= frame_total_len {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+            continue;
+        }
+
+        let budget = STREAM_WRITE_SLICE_BYTES.min(frame_total_len - response.frame_offset);
+        let header_bytes_offered = if response.frame_offset < header_bytes.len() {
+            (header_bytes.len() - response.frame_offset).min(budget)
+        } else {
+            0
+        };
+        let data_budget = budget - header_bytes_offered;
+        let mut slices = [std::io::IoSlice::new(&[]); 3];
+        let mut slice_count = 0usize;
+
+        if header_bytes_offered > 0 {
+            let header_start = response.frame_offset;
+            slices[slice_count] = std::io::IoSlice::new(
+                &header_bytes[header_start..header_start + header_bytes_offered],
+            );
+            slice_count += 1;
+        }
+
+        if data_budget > 0 {
+            let mut remaining = data_budget;
+
+            if response.prefix_sent < response.prefix_len {
+                let prefix = response.prefix.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pooled response prefix state is inconsistent",
+                    )
+                })?;
+                let prefix_start = response.prefix_sent;
+                let prefix_available = response.prefix_len.saturating_sub(prefix_start);
+                let take = remaining.min(prefix_available);
+                if take > 0 {
+                    slices[slice_count] = std::io::IoSlice::new(
+                        &prefix[prefix_start..prefix_start + take],
+                    );
+                    slice_count += 1;
+                    remaining -= take;
+                }
+            }
+
+            if remaining > 0 {
+                if response.payload_remaining == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pooled response payload ended before the advertised length",
+                    ));
+                }
+                let chunk = response.payload.chunk();
+                let take = remaining
+                    .min(response.payload_remaining)
+                    .min(chunk.len());
+                if take == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pooled response returned an empty chunk while bytes remain",
+                    ));
+                }
+                slices[slice_count] = std::io::IoSlice::new(&chunk[..take]);
+                slice_count += 1;
+            }
+        }
+
+        let written = write_vectored_once(stream, &slices[..slice_count]).await?;
+        let data_written = written.saturating_sub(header_bytes_offered);
+        let prefix_written = data_written
+            .min(response.prefix_len.saturating_sub(response.prefix_sent));
+        response.prefix_sent = response.prefix_sent.saturating_add(prefix_written);
+        let payload_written = data_written.saturating_sub(prefix_written);
+        if payload_written > response.payload_remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pooled response wrote past its advertised payload length",
+            ));
+        }
+        if payload_written > 0 {
+            response.payload.advance(payload_written);
+            response.payload_remaining -= payload_written;
+        }
+
+        response.frame_offset += written;
+        *pending_offset += written;
+        let frame_complete = response.frame_offset >= frame_total_len;
+        if frame_complete {
+            response.frame_index += 1;
+            response.frame_offset = 0;
+        }
+        let complete = response.frame_index >= response.chunk_count;
+        if complete
+            && (response.prefix_sent != response.prefix_len || response.payload_remaining != 0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pooled response stream completed before all payload bytes were written",
+            ));
+        }
+        return Ok((written, complete, frame_complete && !complete));
+    }
+
+    Ok((0, true, false))
+}
+
+async fn write_streaming_command_slice<S>(
+    stream: &mut S,
+    pending: &mut PendingStreamingCommand,
+) -> std::io::Result<(usize, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    pending.yield_after_frame = false;
+    if let StreamingCommand::BytesResponse(response) = &mut pending.command {
+        let (written, complete, yield_after_frame) =
+            write_bytes_streaming_command_slice(stream, &mut pending.offset, response).await?;
+        pending.yield_after_frame = yield_after_frame;
+        return Ok((written, complete));
+    }
+    if let StreamingCommand::PooledResponse(response) = &mut pending.command {
+        let (written, complete, yield_after_frame) = write_pooled_streaming_command_slice(
+            stream,
+            &mut pending.offset,
+            response,
+        )
+        .await?;
+        pending.yield_after_frame = yield_after_frame;
+        return Ok((written, complete));
+    }
+
+    let offset = pending.offset;
+    let (written, total_len) = match &pending.command {
+        StreamingCommand::WriteBytes(data) => {
+            if offset >= data.len() {
+                return Ok((0, true));
+            }
+            let end = (offset + STREAM_WRITE_SLICE_BYTES).min(data.len());
+            let written = write_vectored_once(
+                stream,
+                &[std::io::IoSlice::new(&data[offset..end])],
+            )
+            .await?;
+            (written, data.len())
+        }
+        StreamingCommand::Flush => {
+            stream.flush().await?;
+            return Ok((0, true));
+        }
+        StreamingCommand::Abort { stream_id, reason } => {
+            let header = crate::framing::write_stream_abort_header(*stream_id, *reason);
+            if offset >= header.len() {
+                return Ok((0, true));
+            }
+            let end = (offset + STREAM_WRITE_SLICE_BYTES).min(header.len());
+            let written = write_vectored_once(
+                stream,
+                &[std::io::IoSlice::new(&header[offset..end])],
+            )
+            .await?;
+            (written, header.len())
+        }
+        StreamingCommand::VectoredWrite(command) => {
+            let header = command.header.as_slice();
+            let total_len = header.len() + command.payload.len();
+            if offset >= total_len {
+                return Ok((0, true));
+            }
+            let budget = STREAM_WRITE_SLICE_BYTES.min(total_len - offset);
+            let mut slices = [std::io::IoSlice::new(&[]), std::io::IoSlice::new(&[])];
+            let slice_count;
+            if offset < header.len() {
+                let header_end = (offset + budget).min(header.len());
+                slices[0] = std::io::IoSlice::new(&header[offset..header_end]);
+                let header_bytes = header_end - offset;
+                if header_bytes < budget {
+                    slices[1] =
+                        std::io::IoSlice::new(&command.payload[..budget - header_bytes]);
+                    slice_count = 2;
+                } else {
+                    slice_count = 1;
+                }
+            } else {
+                let payload_offset = offset - header.len();
+                slices[0] = std::io::IoSlice::new(
+                    &command.payload[payload_offset..payload_offset + budget],
+                );
+                slice_count = 1;
+            }
+            (
+                write_vectored_once(stream, &slices[..slice_count]).await?,
+                total_len,
+            )
+        }
+        StreamingCommand::OwnedChunks(chunks) => {
+            let total_len: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+            if offset >= total_len {
+                return Ok((0, true));
+            }
+            let mut skip = offset;
+            let mut remaining = STREAM_WRITE_SLICE_BYTES.min(total_len - offset);
+            const MAX_IOV: usize = 64;
+            let mut storage: [MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV] = unsafe {
+                MaybeUninit::<[MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV]>::uninit()
+                    .assume_init()
+            };
+            let mut count = 0usize;
+            for chunk in chunks {
+                if skip >= chunk.len() {
+                    skip -= chunk.len();
+                    continue;
+                }
+                let start = skip;
+                skip = 0;
+                let take = remaining.min(chunk.len() - start);
+                storage[count].write(std::io::IoSlice::new(&chunk[start..start + take]));
+                count += 1;
+                remaining -= take;
+                if remaining == 0 || count == MAX_IOV {
+                    break;
+                }
+            }
+            let slices = unsafe {
+                std::slice::from_raw_parts(
+                    storage.as_ptr() as *const std::io::IoSlice<'_>,
+                    count,
+                )
+            };
+            let written = write_vectored_once(stream, slices).await?;
+            (written, total_len)
+        }
+        StreamingCommand::PooledResponse(_) => unreachable!(
+            "pooled responses are handled by write_pooled_streaming_command_slice"
+        ),
+        StreamingCommand::BytesResponse(_) => unreachable!(
+            "bytes responses are handled by write_bytes_streaming_command_slice"
+        ),
+    };
+    pending.offset += written;
+    Ok((written, pending.offset == total_len))
+}
+
+#[inline]
+fn finish_streaming_command_slice(
+    pending: PendingStreamingCommand,
+    complete: bool,
+    streaming_queue: &StreamingQueue,
+    yielded_slot: &mut Option<PendingStreamingCommand>,
+    pending_slot: &mut Option<PendingStreamingCommand>,
+) {
+    if complete {
+        if pending.from_shared_queue {
+            streaming_queue.notify_space();
+        }
+    } else if pending.yield_after_frame && !pending.from_shared_queue {
+        *yielded_slot = Some(pending);
+    } else {
+        *pending_slot = Some(pending);
+    }
+}
+
+#[inline]
+fn should_flush_stream_output(
+    bytes_since_flush: usize,
+    pending_stream_cmd: Option<&PendingStreamingCommand>,
+    yielded_stream_cmd: Option<&PendingStreamingCommand>,
+) -> bool {
+    bytes_since_flush > 0 && pending_stream_cmd.is_none() && yielded_stream_cmd.is_none()
+}
+
+#[inline]
+fn is_streaming_admission_backpressure(error: &crate::GossipError) -> bool {
+    matches!(
+        error,
+        crate::GossipError::Network(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
 /// Truly lock-free streaming handle with dedicated background writer
 #[derive(Clone)]
 pub struct LockFreeStreamHandle {
@@ -286,53 +736,6 @@ impl LockFreeStreamHandle {
     {
         // CRITICAL_PATH: owner-batched send queue + vectored TLS writes.
         use std::io::IoSlice;
-
-        async fn write_vectored_all<S>(
-            stream: &mut S,
-            slices: &[IoSlice<'_>],
-        ) -> std::io::Result<usize>
-        where
-            S: AsyncWrite + Unpin,
-        {
-            let total_len: usize = slices.iter().map(|s| s.len()).sum();
-            if total_len == 0 {
-                return Ok(0);
-            }
-
-            // If the underlying stream doesn't support vectored writes, preserve ordering by
-            // writing each slice sequentially.
-            if !stream.is_write_vectored() {
-                for s in slices {
-                    stream.write_all(s.as_ref()).await?;
-                }
-                return Ok(total_len);
-            }
-
-            let n = stream.write_vectored(slices).await?;
-            if n == total_len {
-                return Ok(n);
-            }
-
-            // Short write: complete the remainder sequentially without allocating a combined buffer.
-            let mut idx = 0usize;
-            let mut off = n;
-            while idx < slices.len() && off >= slices[idx].len() {
-                off -= slices[idx].len();
-                idx += 1;
-            }
-            if idx < slices.len() {
-                if off < slices[idx].len() {
-                    let b = &slices[idx].as_ref()[off..];
-                    stream.write_all(b).await?;
-                    idx += 1;
-                }
-                while idx < slices.len() {
-                    stream.write_all(slices[idx].as_ref()).await?;
-                    idx += 1;
-                }
-            }
-            Ok(total_len)
-        }
 
         async fn flush_inline32_batch<S>(
             stream: &mut S,
@@ -654,13 +1057,7 @@ impl LockFreeStreamHandle {
         const OWNER_BATCH_SIZE: usize = 64;
         const READ_BATCH_LIMIT: usize = 2048;
         const ASK_READ_BATCH_LIMIT: usize = 8192;
-        // ACTOR_REM_2 R8: while a large stream is in flight, service the normal
-        // write queue after every ~256 KiB of stream data rather than draining
-        // the whole stream first, so latency-sensitive tell/ask/control frames
-        // are not starved behind a long stream (head-of-line blocking). The
-        // per-turn control-frame batch is kept small during active streaming so
-        // stream throughput stays dominant.
-        const STREAM_INTERLEAVE_BYTES: usize = 256 * 1024;
+        // Large stream slices yield to the normal queue and socket read side.
         const STREAM_ACTIVE_WRITE_BATCH: usize = 16;
         // Drain a bounded priority burst before regular traffic. Admission is
         // reserved by `immediate_write_queue`; this budget preserves regular
@@ -680,7 +1077,22 @@ impl LockFreeStreamHandle {
         let mut direct_response_batch = DirectResponseBatch::new(READ_BATCH_LIMIT);
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_immediate_cmd: Option<WriteCommand> = None;
-        let mut pending_stream_cmd: Option<StreamingCommand> = None;
+        let mut pending_stream_cmd: Option<PendingStreamingCommand> = None;
+        // A local response that just completed a frame yields here instead of
+        // being forced ahead of shared streaming work. Keeping the pending
+        // command out of `LocalStreamingQueue` preserves its in-flight byte
+        // accounting while allowing the source scheduler to alternate.
+        let mut yielded_stream_cmd: Option<PendingStreamingCommand> = None;
+        // Alternate local response frames with producer-owned shared stream
+        // frames whenever both are ready. This is state local to the IO owner
+        // and adds no synchronization to the messaging hot path.
+        let mut prefer_shared_streaming = true;
+        let max_message_size = read_context
+            .as_ref()
+            .map(|ctx| ctx.max_message_size)
+            .unwrap_or(STREAM_CHUNK_SIZE);
+        let mut local_streaming_queue =
+            LocalStreamingQueue::with_response_reserve(max_message_size);
         let mut read_state = read_context.as_ref().map(|_| ReadState::new());
         let mut streaming_state = match read_context
             .as_ref()
@@ -727,177 +1139,93 @@ impl LockFreeStreamHandle {
             let mut wrote_ask_payload = false;
             let mut wrote_actor_responses = false;
             let mut wrote_fast_responses = false;
-            response_batch.clear();
-            direct_response_batch.clear();
-
-            // ACTOR_REM_2 R8: bound the stream chunks written per turn so the
-            // normal write queue below is serviced periodically instead of only
-            // after the whole stream drains.
-            let stream_turn_start = total_bytes_written;
-            while let Some(cmd) = pending_stream_cmd.take().or_else(|| streaming_queue.pop()) {
-                did_work = true;
-                match cmd {
-                    StreamingCommand::WriteBytes(data) => match stream.write_all(&data).await {
-                        Ok(_) => {
-                            bytes_written_counter.fetch_add(data.len(), Ordering::Relaxed);
-                            total_bytes_written += data.len();
-                        }
-                        Err(e) => {
-                            error!("Streaming write error: {}", e);
-                            return;
-                        }
-                    },
-                    StreamingCommand::Flush => {
-                        let _ = stream.flush().await;
-                        flush_pending.store(false, Ordering::Release);
-                        bytes_since_flush = 0;
-                    }
-                    StreamingCommand::Abort { stream_id, reason } => {
-                        let header = crate::framing::write_stream_abort_header(stream_id, reason);
-                        if let Err(error) = stream.write_all(&header).await {
-                            warn!(stream_id, reason, %error, "failed to write stream abort");
-                            return;
-                        }
-                        bytes_written_counter.fetch_add(header.len(), Ordering::Relaxed);
-                        total_bytes_written += header.len();
-                    }
-                    StreamingCommand::VectoredWrite(cmd) => {
-                        // Handle short writes by falling back to sequential write_all
-                        // TCP can return partial writes under backpressure
-                        let total_len = cmd.header.len() + cmd.payload.len();
-                        let header_slice = std::io::IoSlice::new(cmd.header.as_slice());
-                        let payload_slice = std::io::IoSlice::new(&cmd.payload);
-                        let bufs = &[header_slice, payload_slice];
-
-                        match write_vectored_all(&mut stream, bufs).await {
-                            Ok(n) if n == total_len => {
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                            }
-                            Ok(n) => {
-                                // Short write - write remaining bytes sequentially using stack buffer
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                                let _remaining = total_len - n;
-                                let mut offset = n;
-                                // Write header portion if needed
-                                if offset < cmd.header.len() {
-                                    let h_rem = cmd.header.len() - offset;
-                                    if let Err(_) = stream.write_all(&cmd.header.as_slice()[offset..]).await {
-                                        return;
-                                    }
-                                    bytes_written_counter.fetch_add(h_rem, Ordering::Relaxed);
-                                    total_bytes_written += h_rem;
-                                    offset = 0;
-                                } else {
-                                    offset -= cmd.header.len();
-                                }
-                                // Write payload portion
-                                if let Err(_) = stream.write_all(&cmd.payload[offset..]).await {
-                                    return;
-                                }
-                                bytes_written_counter
-                                    .fetch_add(cmd.payload.len() - offset, Ordering::Relaxed);
-                                total_bytes_written += cmd.payload.len() - offset;
-                            }
-                            Err(e) => {
-                                error!("Vectored write error: {}", e);
-                                return;
-                            }
-                        }
-                    }
-                    StreamingCommand::OwnedChunks(chunks) => {
-                        // Handle short writes for owned chunks
-                        let total_len: usize = chunks.iter().map(|c| c.len()).sum();
-                        const MAX_IOV: usize = 64;
-                        let mut slice_storage: [MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV] = unsafe {
-                            MaybeUninit::<[MaybeUninit<std::io::IoSlice<'_>>; MAX_IOV]>::uninit()
-                                .assume_init()
-                        };
-                        let chunk_count = chunks.len().min(MAX_IOV);
-                        for (idx, chunk) in chunks.iter().take(MAX_IOV).enumerate() {
-                            slice_storage[idx].write(std::io::IoSlice::new(&chunk));
-                        }
-                        let slices = unsafe {
-                            std::slice::from_raw_parts(
-                                slice_storage.as_ptr() as *const std::io::IoSlice<'_>,
-                                chunk_count,
-                            )
-                        };
-
-                        match write_vectored_all(&mut stream, slices).await {
-                            Ok(n) if n == total_len => {
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                            }
-                            Ok(n) => {
-                                // Short write - write remaining bytes sequentially
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                total_bytes_written += n;
-                                let mut remaining = total_len - n;
-                                let mut chunk_idx = 0;
-                                let mut offset_in_chunk = n;
-                                // Find which chunk we left off in
-                                while chunk_idx < chunks.len()
-                                    && offset_in_chunk >= chunks[chunk_idx].len()
-                                {
-                                    offset_in_chunk -= chunks[chunk_idx].len();
-                                    chunk_idx += 1;
-                                }
-                                // Continue writing from current position. Use `write_all`
-                                // (not a raw `write()`) so a legal `Ok(0)` reply from
-                                // `poll_write` — distinct from `Pending`, meaning the
-                                // transport is no longer accepting bytes (e.g. a
-                                // half-closed write side) — is folded into
-                                // `ErrorKind::WriteZero` exactly like every other write
-                                // path in this file (`write_all`/`write_vectored_all`).
-                                // A raw `write()` here previously left `remaining`/
-                                // `offset_in_chunk` unchanged on `Ok(0)`, spinning the
-                                // writer task forever with no progress and no yield
-                                // point (R4 livelock).
-                                while chunk_idx < chunks.len() && remaining > 0 {
-                                    let chunk_remaining =
-                                        chunks[chunk_idx].len() - offset_in_chunk;
-                                    if let Err(e) = stream
-                                        .write_all(&chunks[chunk_idx][offset_in_chunk..])
-                                        .await
-                                    {
-                                        error!("Chunk batch write completion error: {}", e);
-                                        return;
-                                    }
-                                    bytes_written_counter
-                                        .fetch_add(chunk_remaining, Ordering::Relaxed);
-                                    total_bytes_written += chunk_remaining;
-                                    remaining -= chunk_remaining;
-                                    chunk_idx += 1;
-                                    offset_in_chunk = 0;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Chunk batch write error: {}", e);
-                                return;
-                            }
-                        }
-                    }
-                }
-                streaming_queue.notify_space();
-                if total_bytes_written.saturating_sub(stream_turn_start)
-                    >= STREAM_INTERLEAVE_BYTES
-                {
-                    // Yield to the normal write queue before writing more of the
-                    // stream (ACTOR_REM_2 R8). `did_work` stays true, so the
-                    // outer loop re-enters and resumes the stream next turn.
-                    break;
-                }
+            // A partial streaming frame owns the wire. Response batches
+            // accumulated while it is in flight must survive into the turn
+            // that completes that frame; clearing them here would silently
+            // drop responses that were intentionally deferred.
+            if pending_stream_cmd.is_none() {
+                response_batch.clear();
+                direct_response_batch.clear();
             }
 
-            // ACTOR_REM_2 R8: always service the normal write queue — even while
-            // a stream is active — so latency-sensitive frames interleave rather
-            // than being starved for the stream's whole duration. The batch is
-            // kept small during active streaming so the stream stays dominant;
-            // when the queue is empty (the common case mid-stream) this is a
-            // cheap no-op.
-            {
+            // Complete one bounded piece of the current frame before handling
+            // normal writes and inbound reads. A partial frame stays ahead of
+            // every other streaming command, preserving wire framing.
+            let next_stream = if let Some(pending) = pending_stream_cmd.take() {
+                Some(pending)
+            } else {
+                let source = choose_streaming_source(
+                    prefer_shared_streaming,
+                    local_streaming_queue.has_pending() || yielded_stream_cmd.is_some(),
+                    streaming_queue.has_pending(),
+                );
+                match source {
+                    Some(StreamingSource::Local) => {
+                        if let Some(pending) = yielded_stream_cmd.take() {
+                            prefer_shared_streaming = true;
+                            Some(pending)
+                        } else if let Some(command) = local_streaming_queue.pop_front() {
+                            prefer_shared_streaming = true;
+                            Some(PendingStreamingCommand::local(command))
+                        } else {
+                            streaming_queue.pop().map(|command| {
+                                prefer_shared_streaming = false;
+                                PendingStreamingCommand::shared(command)
+                            })
+                        }
+                    }
+                    Some(StreamingSource::Shared) => {
+                        if let Some(command) = streaming_queue.pop() {
+                            prefer_shared_streaming = false;
+                            Some(PendingStreamingCommand::shared(command))
+                        } else if let Some(pending) = yielded_stream_cmd.take() {
+                            prefer_shared_streaming = true;
+                            Some(pending)
+                        } else {
+                            local_streaming_queue.pop_front().map(|command| {
+                                prefer_shared_streaming = true;
+                                PendingStreamingCommand::local(command)
+                            })
+                        }
+                    }
+                    None => None,
+                }
+            };
+            if let Some(mut pending) = next_stream {
+                did_work = true;
+                let command_is_flush = matches!(&pending.command, StreamingCommand::Flush);
+                let (written, complete) =
+                    match write_streaming_command_slice(&mut stream, &mut pending).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            error!(%error, "streaming write error");
+                            return;
+                        }
+                    };
+                bytes_written_counter.fetch_add(written, Ordering::Relaxed);
+                total_bytes_written += written;
+                if command_is_flush {
+                    flush_pending.store(false, Ordering::Release);
+                    bytes_since_flush = 0;
+                }
+                finish_streaming_command_slice(
+                    pending,
+                    complete,
+                    &streaming_queue,
+                    &mut yielded_stream_cmd,
+                    &mut pending_stream_cmd,
+                );
+            }
+            local_streaming_queue.set_wire_blocked(pending_stream_cmd.is_some());
+
+            // A partial streaming frame owns the wire until complete. Reads may
+            // still run below, but no normal/response write can interleave and
+            // corrupt the frame boundary.
+            if pending_stream_cmd.is_none() {
+                // ACTOR_REM_2 R8: service the normal write queue when no partial
+                // stream frame is outstanding. The batch remains bounded during
+                // active streaming so control traffic is not starved.
+                {
                 let normal_batch_limit = if streaming_active.load(Ordering::Acquire) {
                     STREAM_ACTIVE_WRITE_BATCH
                 } else {
@@ -1652,10 +1980,15 @@ impl LockFreeStreamHandle {
                     total_bytes_written += bytes_written;
                     write_chunks.clear();
                 }
+                }
             }
 
             bytes_since_flush += total_bytes_written;
-            if bytes_since_flush > 0 {
+            if should_flush_stream_output(
+                bytes_since_flush,
+                pending_stream_cmd.as_ref(),
+                yielded_stream_cmd.as_ref(),
+            ) {
                 let _ = stream.flush().await;
                 bytes_since_flush = 0;
                 flush_pending.store(false, Ordering::Release);
@@ -1674,7 +2007,13 @@ impl LockFreeStreamHandle {
                 if did_work {
                     let mut reads = 0usize;
                     let mut read_batch_limit = READ_BATCH_LIMIT;
-                    while reads < read_batch_limit {
+                    while reads < read_batch_limit
+                        && !local_streaming_queue.is_full()
+                        && (pending_stream_cmd.is_none()
+                            || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
+                                && direct_response_batch.total_bytes()
+                                    < RESPONSE_BATCH_BYTE_CAP))
+                    {
                         // R-I: cap per-turn byte accumulation independent of
                         // the frame-count cap above. Checked every iteration
                         // (covering both the normal and the fast-io `continue`
@@ -1682,7 +2021,8 @@ impl LockFreeStreamHandle {
                         // max-size response frames cannot force unbounded
                         // memory growth before `read_batch_limit` frames are
                         // seen. See `flush_response_batch_if_over_byte_cap`.
-                        if let Err(e) = flush_response_batch_if_over_byte_cap(
+                        if pending_stream_cmd.is_none()
+                            && let Err(e) = flush_response_batch_if_over_byte_cap(
                             &mut stream,
                             &bytes_written_counter,
                             &mut bytes_since_flush,
@@ -1697,7 +2037,8 @@ impl LockFreeStreamHandle {
                             );
                             return;
                         }
-                        if let Err(e) = flush_direct_response_batch_if_over_byte_cap(
+                        if pending_stream_cmd.is_none()
+                            && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
                             &mut stream,
                             &bytes_written_counter,
                             &mut bytes_since_flush,
@@ -1739,26 +2080,34 @@ impl LockFreeStreamHandle {
                         if let Some(result) = read_result.result {
                             reads += 1;
                             read_batch_limit = read_batch_limit.max(read_batch_limit_for(&result));
-                            let Some(result) = try_handle_fast_io(
+                            let fast_result = match try_handle_fast_io(
                                 result,
                                 ctx,
                                 &mut stream,
                                 &bytes_written_counter,
                                 &mut bytes_since_flush,
                                 &mut response_batch,
+                                &mut local_streaming_queue,
                                 &mut direct_response_batch,
                                 &mut wrote_fast_responses,
                                 perf,
                             )
                             .await
-                            .unwrap_or_else(|e| {
-                                warn!(
-                                    peer = %ctx.peer_addr,
-                                    error = %e,
-                                    "Failed to process fast IO message"
-                                );
-                                None
-                            }) else {
+                            {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to process fast IO message"
+                                    );
+                                    if is_streaming_admission_backpressure(&e) {
+                                        break;
+                                    }
+                                    None
+                                }
+                            };
+                            let Some(result) = fast_result else {
                                 continue;
                             };
                             if let Some(registry) = ctx.registry_weak.upgrade() {
@@ -1775,6 +2124,7 @@ impl LockFreeStreamHandle {
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
                                     &mut response_batch,
+                                    &mut local_streaming_queue,
                                     &mut direct_response_batch,
                                     perf,
                                 )
@@ -1785,6 +2135,9 @@ impl LockFreeStreamHandle {
                                         error = %e,
                                         "Failed to process message on IO task"
                                     );
+                                    if is_streaming_admission_backpressure(&e) {
+                                        break;
+                                    }
                                 }
                             } else {
                                 warn!(
@@ -1797,7 +2150,7 @@ impl LockFreeStreamHandle {
                             break;
                         }
                     }
-                    if !response_batch.is_empty() {
+                    if pending_stream_cmd.is_none() && !response_batch.is_empty() {
                         if let Err(e) = write_response_batch(
                             &mut stream,
                             &bytes_written_counter,
@@ -1815,7 +2168,7 @@ impl LockFreeStreamHandle {
                         }
                         wrote_actor_responses = true;
                     }
-                    if !direct_response_batch.is_empty() {
+                    if pending_stream_cmd.is_none() && !direct_response_batch.is_empty() {
                         if let Err(e) = write_direct_response_batch(
                             &mut stream,
                             &bytes_written_counter,
@@ -1865,7 +2218,7 @@ impl LockFreeStreamHandle {
                         continue;
                     }
                     if let Some(cmd) = streaming_queue.prepare_park() {
-                        pending_stream_cmd = Some(cmd);
+                        pending_stream_cmd = Some(PendingStreamingCommand::shared(cmd));
                         continue;
                     }
                     tokio::select! {
@@ -1895,26 +2248,40 @@ impl LockFreeStreamHandle {
                             }
 
                             if let Some(result) = read_result.result {
-                                if let Some(result) = try_handle_fast_io(
+                                let fast_result = match try_handle_fast_io(
                                     result,
                                     ctx,
                                     &mut stream,
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
                                     &mut response_batch,
+                                    &mut local_streaming_queue,
                                     &mut direct_response_batch,
                                     &mut wrote_fast_responses,
                                     perf,
                                 )
                                 .await
-                                .unwrap_or_else(|e| {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "Failed to process fast IO message"
-                                    );
-                                    None
-                                }) {
+                                {
+                                    Ok(result) => result,
+                                    Err(e) => {
+                                        warn!(
+                                            peer = %ctx.peer_addr,
+                                            error = %e,
+                                            "Failed to process fast IO message"
+                                        );
+                                        if is_streaming_admission_backpressure(&e) {
+                                            // The idle select arm has no inner
+                                            // drain loop, so `continue` returns
+                                            // to the writer loop and lets the
+                                            // queued response drain. A bare
+                                            // `break` would tear down the
+                                            // connection on transient pressure.
+                                            continue;
+                                        }
+                                        None
+                                    }
+                                };
+                                if let Some(result) = fast_result {
                                     if let Some(registry) = ctx.registry_weak.upgrade() {
                                         if let Err(e) = process_read_result_io(
                                             result,
@@ -1929,6 +2296,7 @@ impl LockFreeStreamHandle {
                                             &bytes_written_counter,
                                             &mut bytes_since_flush,
                                             &mut response_batch,
+                                            &mut local_streaming_queue,
                                             &mut direct_response_batch,
                                             perf,
                                         )
@@ -1939,6 +2307,9 @@ impl LockFreeStreamHandle {
                                                 error = %e,
                                                 "Failed to process message on IO task"
                                             );
+                                            if is_streaming_admission_backpressure(&e) {
+                                                continue;
+                                            }
                                         }
                                     } else {
                                         warn!(
@@ -1957,11 +2328,18 @@ impl LockFreeStreamHandle {
                             // Drain additional frames non-blocking to batch handler + response writes.
                             let mut drained = 0usize;
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
-                            while drained < drain_batch_limit {
+                            while drained < drain_batch_limit
+                                && !local_streaming_queue.is_full()
+                                && (pending_stream_cmd.is_none()
+                                    || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
+                                        && direct_response_batch.total_bytes()
+                                            < RESPONSE_BATCH_BYTE_CAP))
+                            {
                                 // R-I: same per-turn byte cap as the primary
                                 // drain loop above; see
                                 // `flush_response_batch_if_over_byte_cap`.
-                                if let Err(e) = flush_response_batch_if_over_byte_cap(
+                                if pending_stream_cmd.is_none()
+                                    && let Err(e) = flush_response_batch_if_over_byte_cap(
                                     &mut stream,
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
@@ -1976,7 +2354,8 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
-                                if let Err(e) = flush_direct_response_batch_if_over_byte_cap(
+                                if pending_stream_cmd.is_none()
+                                    && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
                                     &mut stream,
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
@@ -2018,26 +2397,34 @@ impl LockFreeStreamHandle {
                                     drained += 1;
                                     drain_batch_limit =
                                         drain_batch_limit.max(read_batch_limit_for(&result));
-                                    let Some(result) = try_handle_fast_io(
+                                    let fast_result = match try_handle_fast_io(
                                         result,
                                         ctx,
                                         &mut stream,
                                         &bytes_written_counter,
                                         &mut bytes_since_flush,
                                         &mut response_batch,
+                                        &mut local_streaming_queue,
                                         &mut direct_response_batch,
                                         &mut wrote_fast_responses,
                                         perf,
                                     )
                                     .await
-                                    .unwrap_or_else(|e| {
-                                        warn!(
-                                            peer = %ctx.peer_addr,
-                                            error = %e,
-                                            "Failed to process fast IO message"
-                                        );
-                                        None
-                                    }) else {
+                                    {
+                                        Ok(result) => result,
+                                        Err(e) => {
+                                            warn!(
+                                                peer = %ctx.peer_addr,
+                                                error = %e,
+                                                "Failed to process fast IO message"
+                                            );
+                                            if is_streaming_admission_backpressure(&e) {
+                                                break;
+                                            }
+                                            None
+                                        }
+                                    };
+                                    let Some(result) = fast_result else {
                                         continue;
                                     };
                                     if let Some(registry) = ctx.registry_weak.upgrade() {
@@ -2054,17 +2441,21 @@ impl LockFreeStreamHandle {
                                             &bytes_written_counter,
                                             &mut bytes_since_flush,
                                             &mut response_batch,
+                                            &mut local_streaming_queue,
                                             &mut direct_response_batch,
                                             perf,
                                         )
                                         .await
-                                        {
-                                            warn!(
-                                                peer = %ctx.peer_addr,
-                                                error = %e,
-                                                "Failed to process message on IO task"
-                                            );
-                                        }
+                                            {
+                                                warn!(
+                                                    peer = %ctx.peer_addr,
+                                                    error = %e,
+                                                    "Failed to process message on IO task"
+                                                );
+                                                if is_streaming_admission_backpressure(&e) {
+                                                    break;
+                                                }
+                                            }
                                     } else {
                                         warn!(
                                             peer = %ctx.peer_addr,
@@ -2077,7 +2468,7 @@ impl LockFreeStreamHandle {
                                 }
                             }
 
-                            if !response_batch.is_empty() {
+                            if pending_stream_cmd.is_none() && !response_batch.is_empty() {
                                 if let Err(e) = write_response_batch(
                                     &mut stream,
                                     &bytes_written_counter,
@@ -2094,7 +2485,7 @@ impl LockFreeStreamHandle {
                                     return;
                                 }
                             }
-                            if !direct_response_batch.is_empty() {
+                            if pending_stream_cmd.is_none() && !direct_response_batch.is_empty() {
                                 if let Err(e) = write_direct_response_batch(
                                     &mut stream,
                                     &bytes_written_counter,
@@ -2150,7 +2541,7 @@ impl LockFreeStreamHandle {
                         continue;
                     }
                     if let Some(cmd) = streaming_queue.prepare_park() {
-                        pending_stream_cmd = Some(cmd);
+                        pending_stream_cmd = Some(PendingStreamingCommand::shared(cmd));
                         continue;
                     }
                     tokio::select! {

@@ -28,6 +28,13 @@ pub const STREAMING_THRESHOLD: usize = MASTER_BUFFER_SIZE.saturating_sub(1024); 
 // single streaming chunk instead of thousands of them.
 pub const RESPONSE_BATCH_BYTE_CAP: usize = STREAMING_THRESHOLD.saturating_mul(8);
 
+/// Bound immediate streaming responses admitted by one connection's read
+/// pipeline. Each queued command retains its `Bytes` backing allocation until
+/// the frame is fully written, so both command count and retained wire bytes
+/// are capped independently of the peer's request burst.
+pub const STREAMING_RESPONSE_QUEUE_COMMAND_CAP: usize = 256;
+pub const STREAMING_RESPONSE_QUEUE_BYTE_CAP: usize = RESPONSE_BATCH_BYTE_CAP;
+
 struct IoPerfCounters {
     read_calls: AtomicU64,
     read_ns: AtomicU64,
@@ -883,6 +890,8 @@ struct StreamingQueue {
     try_push_state: AtomicUsize,
     /// Peer address used to construct the `ConnectionClosed` error on teardown.
     addr: SocketAddr,
+    #[cfg(test)]
+    space_notification_count: AtomicUsize,
 }
 
 const STREAMING_QUEUE_CLOSED: usize = 1usize << (usize::BITS - 1);
@@ -908,6 +917,8 @@ impl StreamingQueue {
             closed: AtomicBool::new(false),
             try_push_state: AtomicUsize::new(0),
             addr,
+            #[cfg(test)]
+            space_notification_count: AtomicUsize::new(0),
         })
     }
 
@@ -1013,8 +1024,20 @@ impl StreamingQueue {
         self.queue.pop()
     }
 
+    #[inline]
+    fn has_pending(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     fn notify_space(&self) {
+        #[cfg(test)]
+        self.space_notification_count.fetch_add(1, Ordering::Relaxed);
         self.space_notify.notify_one();
+    }
+
+    #[cfg(test)]
+    fn space_notification_count(&self) -> usize {
+        self.space_notification_count.load(Ordering::Relaxed)
     }
 }
 
