@@ -2270,7 +2270,13 @@ impl LockFreeStreamHandle {
                                             "Failed to process fast IO message"
                                         );
                                         if is_streaming_admission_backpressure(&e) {
-                                            break;
+                                            // The idle select arm has no inner
+                                            // drain loop, so `continue` returns
+                                            // to the writer loop and lets the
+                                            // queued response drain. A bare
+                                            // `break` would tear down the
+                                            // connection on transient pressure.
+                                            continue;
                                         }
                                         None
                                     }
@@ -2302,7 +2308,7 @@ impl LockFreeStreamHandle {
                                                 "Failed to process message on IO task"
                                             );
                                             if is_streaming_admission_backpressure(&e) {
-                                                break;
+                                                continue;
                                             }
                                         }
                                     } else {
