@@ -1337,6 +1337,20 @@ fn immediate_bytes_response_admission_stays_lazy_for_many_frames() {
 }
 
 #[test]
+fn lazy_stream_admission_counts_owned_payload_not_generated_headers() {
+    let payload_len = STREAMING_RESPONSE_QUEUE_BYTE_CAP + 1;
+    let mut queue = LocalStreamingQueue::with_response_reserve(20);
+    queue_streaming_response_bytes(
+        &mut queue,
+        0xC0DE,
+        bytes::Bytes::from(vec![0xA7; payload_len]),
+        20,
+        None,
+    )
+    .expect("lazy framing headers must not consume the retained-byte budget");
+}
+
+#[test]
 fn response_in_flight_with_only_flush_keeps_read_admission_open() {
     let mut queue = LocalStreamingQueue::new();
     queue
@@ -1382,6 +1396,19 @@ fn oversized_response_in_flight_keeps_read_admission_open() {
 }
 
 #[test]
+fn maximum_in_flight_response_keeps_reciprocal_reads_open() {
+    let mut queue = LocalStreamingQueue::new();
+    queue.response_in_flight = true;
+    queue.in_flight_bytes = crate::MAX_STREAM_SIZE;
+    queue.queue.push_back(StreamingCommand::Flush);
+
+    assert!(
+        !queue.is_full(),
+        "a maximum-size response must not deadlock the reciprocal read path"
+    );
+}
+
+#[test]
 fn oversized_in_flight_response_admits_one_bounded_deferred_response() {
     let mut queue = LocalStreamingQueue::new();
     queue
@@ -1417,13 +1444,13 @@ fn oversized_in_flight_response_admits_one_bounded_deferred_response() {
 fn near_hard_cap_in_flight_response_backpressures_large_deferred_response() {
     let mut queue = LocalStreamingQueue::new();
     let current_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
-        .saturating_sub(MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES)
+        .saturating_sub(MAX_STREAMING_RESPONSE_RETAINED_BYTES)
         .saturating_add(1);
     queue.response_in_flight = true;
     queue.in_flight_bytes = current_bytes;
     queue.queue.push_back(StreamingCommand::Flush);
 
-    let deferred_bytes = MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES;
+    let deferred_bytes = MAX_STREAMING_RESPONSE_RETAINED_BYTES;
     assert!(
         queue.is_full(),
         "the read gate must close before the aggregate hard cap is exceeded"
@@ -1438,7 +1465,7 @@ fn near_hard_cap_in_flight_response_backpressures_large_deferred_response() {
 fn near_hard_cap_queued_response_closes_read_admission_before_followup() {
     let mut queue = LocalStreamingQueue::new();
     queue.queued_bytes = STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
-        .saturating_sub(MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES)
+        .saturating_sub(MAX_STREAMING_RESPONSE_RETAINED_BYTES)
         .saturating_add(1);
     queue.queue.push_back(StreamingCommand::Flush);
 
@@ -1455,7 +1482,7 @@ fn queued_response_retains_large_followup_within_hard_cap() {
     queue.queued_bytes = queued_bytes;
     queue.queue.push_back(StreamingCommand::Flush);
 
-    let followup_bytes = MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES.saturating_sub(1);
+    let followup_bytes = MAX_STREAMING_RESPONSE_RETAINED_BYTES.saturating_sub(1);
     assert!(
         queue.can_admit_response(2, followup_bytes),
         "a valid large follow-up must fit the single deferred slot"

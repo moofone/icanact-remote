@@ -1432,37 +1432,7 @@ fn queue_streaming_response_bytes(
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-    let total_len = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
-        size: payload.len(),
-        max: u32::MAX as usize,
-    })?;
-    let chunk_count = if payload.is_empty() {
-        1
-    } else {
-        payload
-            .len()
-            .saturating_add(chunk_size.saturating_sub(1))
-            .checked_div(chunk_size)
-            .unwrap_or(usize::MAX)
-    };
-    let first_len = payload.len().min(chunk_size);
-    let start_header_len = crate::framing::write_stream_response_start_header(
-        0,
-        correlation_id,
-        total_len,
-        first_len,
-    )
-    .len();
-    let data_header_len = crate::framing::write_stream_data_header(true, 0, 1, chunk_size).len();
-    let response_bytes = payload
-        .len()
-        .saturating_add(start_header_len)
-        .saturating_add(
-            chunk_count
-                .saturating_sub(1)
-                .saturating_mul(data_header_len),
-        );
-    if !streaming_responses.can_admit_response(2, response_bytes) {
+    if !streaming_responses.can_admit_response(2, payload.len()) {
         return Err(GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "immediate streaming response queue deferred slot is full",
@@ -1523,40 +1493,12 @@ fn queue_streaming_response_pooled(
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-    let chunk_count = if payload_len == 0 {
-        1
-    } else {
-        payload_len
-            .saturating_add(chunk_size.saturating_sub(1))
-            .checked_div(chunk_size)
-            .unwrap_or(usize::MAX)
-    };
     // The pooled response is one connection-owned command plus its terminal
     // Flush. The command generates individual frame headers lazily while it
     // writes, so admission does not expand the response into one queue entry
     // (or one copied `Bytes`) per chunk.
     let command_count = 2;
-    let first_len = payload_len.min(chunk_size);
-    let start_header_len = crate::framing::write_stream_response_start_header(
-        0,
-        correlation_id,
-        payload_len as u32,
-        first_len,
-    )
-    .len();
-    let data_header_len = crate::framing::write_stream_data_header(
-        true,
-        0,
-        1,
-        chunk_size,
-    )
-    .len();
-    let response_bytes = payload_len.saturating_add(start_header_len).saturating_add(
-        chunk_count
-            .saturating_sub(1)
-            .saturating_mul(data_header_len),
-    );
-    if !streaming_responses.can_admit_response(command_count, response_bytes) {
+    if !streaming_responses.can_admit_response(command_count, payload_len) {
         return Err(GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "immediate streaming response queue deferred slot is full",

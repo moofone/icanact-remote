@@ -124,13 +124,8 @@ impl BytesStreamingResponse {
         }
     }
 
-    fn wire_len(&self) -> usize {
-        crate::framing::STREAM_RESPONSE_START_FRAME_HEADER_LEN
-            + self.payload_len
-            + self
-                .chunk_count
-                .saturating_sub(1)
-                .saturating_mul(crate::framing::STREAM_DATA_FRAME_HEADER_LEN)
+    fn retained_len(&self) -> usize {
+        self.payload_len
     }
 }
 
@@ -197,13 +192,8 @@ impl PooledStreamingResponse {
         }
     }
 
-    fn wire_len(&self) -> usize {
-        crate::framing::STREAM_RESPONSE_START_FRAME_HEADER_LEN
-            + self.payload_len
-            + self
-                .chunk_count
-                .saturating_sub(1)
-                .saturating_mul(crate::framing::STREAM_DATA_FRAME_HEADER_LEN)
+    fn retained_len(&self) -> usize {
+        self.payload_len
     }
 }
 
@@ -248,11 +238,10 @@ struct LocalStreamingQueue {
 const STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP: usize =
     crate::MAX_INFLIGHT_STREAM_BYTES.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
-/// Reserve for the largest valid streamed response when deciding whether the
-/// read side may consume another ask. The extra queue-cap allowance covers
-/// frame headers and a bounded ordinary response retained alongside that
-/// stream.
-const MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES: usize =
+/// Reserve for the largest valid streamed payload when deciding whether the
+/// read side may consume another ask. Stream frame headers are generated on
+/// demand and are not retained by the queue, so only owned payload bytes count.
+const MAX_STREAMING_RESPONSE_RETAINED_BYTES: usize =
     crate::MAX_STREAM_SIZE.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
 impl LocalStreamingQueue {
@@ -384,7 +373,7 @@ impl LocalStreamingQueue {
         // advanced.
         if self
             .retained_bytes()
-            .saturating_add(MAX_STREAMING_RESPONSE_WIRE_RESERVE_BYTES)
+            .saturating_add(MAX_STREAMING_RESPONSE_RETAINED_BYTES)
             > STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
         {
             return true;
@@ -448,8 +437,8 @@ fn streaming_command_bytes(command: &StreamingCommand) -> usize {
         StreamingCommand::Flush => 0,
         StreamingCommand::VectoredWrite(item) => item.header.len() + item.payload.len(),
         StreamingCommand::OwnedChunks(chunks) => chunks.iter().map(bytes::Bytes::len).sum(),
-        StreamingCommand::PooledResponse(response) => response.wire_len(),
-        StreamingCommand::BytesResponse(response) => response.wire_len(),
+        StreamingCommand::PooledResponse(response) => response.retained_len(),
+        StreamingCommand::BytesResponse(response) => response.retained_len(),
         StreamingCommand::Abort { stream_id, reason } => crate::framing::write_stream_abort_header(*stream_id, *reason).len(),
     }
 }
