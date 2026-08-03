@@ -62,6 +62,9 @@ struct BytesStreamingResponse {
     correlation_id: u32,
     payload: bytes::Bytes,
     payload_len: usize,
+    /// Bytes retained by the backing allocation, which can exceed the visible
+    /// slice length when a handler returns a sub-slice of a larger `Bytes`.
+    retained_bytes: usize,
     chunk_size: usize,
     chunk_count: usize,
     frame_index: usize,
@@ -73,6 +76,7 @@ impl BytesStreamingResponse {
         stream_id: u32,
         correlation_id: u32,
         payload: bytes::Bytes,
+        retained_bytes: usize,
         chunk_size: usize,
     ) -> Self {
         let payload_len = payload.len();
@@ -89,6 +93,7 @@ impl BytesStreamingResponse {
             correlation_id,
             payload,
             payload_len,
+            retained_bytes: retained_bytes.max(payload_len),
             chunk_size,
             chunk_count,
             frame_index: 0,
@@ -125,7 +130,30 @@ impl BytesStreamingResponse {
     }
 
     fn retained_len(&self) -> usize {
-        self.payload_len
+        self.retained_bytes
+    }
+}
+
+/// Return a streaming payload together with the allocation footprint retained
+/// by the response command.
+///
+/// `Bytes::len()` describes only the visible slice. A sliced value can keep a
+/// much larger allocation alive, so a streaming queue that accounts only for
+/// `len()` can retain unbounded memory behind its byte cap. Unique `Bytes`
+/// values can expose their existing capacity without a copy; shared or
+/// owner-backed values are compacted once on this streaming-only path. The
+/// ordinary actor-message queue and its hot path are unchanged.
+fn normalize_streaming_payload(payload: bytes::Bytes) -> (bytes::Bytes, usize) {
+    let payload_len = payload.len();
+    match payload.try_into_mut() {
+        Ok(buffer) => {
+            let retained_bytes = buffer.capacity().max(payload_len);
+            (buffer.freeze(), retained_bytes)
+        }
+        Err(payload) => {
+            let compact = bytes::Bytes::copy_from_slice(&payload);
+            (compact, payload_len)
+        }
     }
 }
 

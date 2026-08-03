@@ -1351,6 +1351,25 @@ fn lazy_stream_admission_counts_owned_payload_not_generated_headers() {
 }
 
 #[test]
+fn sliced_bytes_stream_is_compacted_before_admission() {
+    let backing = bytes::Bytes::from(vec![0xA7; 4 * STREAM_CHUNK_SIZE]);
+    let payload = backing.slice(..STREAM_CHUNK_SIZE);
+    let mut queue = LocalStreamingQueue::new();
+
+    queue_streaming_response_bytes(&mut queue, 0xC0DE, payload, 20, None)
+        .expect("a sliced streaming payload should be admitted after compaction");
+
+    let Some(StreamingCommand::BytesResponse(response)) = queue.queue.front() else {
+        panic!("expected a lazy bytes response command");
+    };
+    assert_eq!(response.payload_len, STREAM_CHUNK_SIZE);
+    assert_eq!(
+        response.retained_bytes, STREAM_CHUNK_SIZE,
+        "queue accounting must charge the compacted payload, not the old backing allocation"
+    );
+}
+
+#[test]
 fn response_in_flight_with_only_flush_keeps_read_admission_open() {
     let mut queue = LocalStreamingQueue::new();
     queue

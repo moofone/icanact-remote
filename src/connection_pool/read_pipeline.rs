@@ -1432,7 +1432,8 @@ fn queue_streaming_response_bytes(
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-    if !streaming_responses.can_admit_response(2, payload.len()) {
+    let (payload, retained_bytes) = normalize_streaming_payload(payload);
+    if !streaming_responses.can_admit_response(2, retained_bytes) {
         return Err(GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "immediate streaming response queue deferred slot is full",
@@ -1440,7 +1441,13 @@ fn queue_streaming_response_bytes(
     }
 
     let stream_id = allocate_direct_response_stream_id()?;
-    let response = BytesStreamingResponse::new(stream_id, correlation_id, payload, chunk_size);
+    let response = BytesStreamingResponse::new(
+        stream_id,
+        correlation_id,
+        payload,
+        retained_bytes,
+        chunk_size,
+    );
     streaming_responses.try_extend([
         StreamingCommand::BytesResponse(Box::new(response)),
         StreamingCommand::Flush,
