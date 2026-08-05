@@ -8842,19 +8842,47 @@ impl<T: 'static> GossipRegistry<T> {
         // Get active peers to gossip to, deduplicated by stable identity
         // (see `PeerDispatchKey`) so a physical peer tracked under
         // multiple SocketAddr aliases does not burn more than one slot of
-        // the `max_peer_gossip_targets` budget.
+        // the `max_peer_gossip_targets` budget. `gossip_state.peers` is a
+        // `HashMap`, whose iteration order is effectively arbitrary, so
+        // picking "whichever alias is seen first" can just as easily keep
+        // a stale-but-under-threshold alias and drop the address this
+        // node is actually connected to right now, silently skipping that
+        // peer's gossip for the round. Track the best alias seen so far
+        // per identity instead: a live connection always wins over a
+        // non-live one, and among equally (non-)live aliases fewer
+        // failures wins -- both checked while iterating, so the result is
+        // independent of visitation order.
         let targets: Vec<SocketAddr> = {
             let gossip_state = self.gossip_state.lock().await;
-            let mut seen: std::collections::HashSet<PeerDispatchKey> =
-                std::collections::HashSet::new();
-            let mut active_peers: Vec<SocketAddr> = Vec::new();
+            let mut best_by_identity: std::collections::HashMap<
+                PeerDispatchKey,
+                (SocketAddr, bool, usize),
+            > = std::collections::HashMap::new();
             for (addr, info) in gossip_state.peers.iter() {
-                if info.failures < self.config.max_peer_failures
-                    && seen.insert(PeerDispatchKey::for_entry(*addr, info))
-                {
-                    active_peers.push(*addr);
+                if info.failures >= self.config.max_peer_failures {
+                    continue;
                 }
+                let is_live = self.peer_has_live_connection(info);
+                best_by_identity
+                    .entry(PeerDispatchKey::for_entry(*addr, info))
+                    .and_modify(|(best_addr, best_is_live, best_failures)| {
+                        let better = match (is_live, *best_is_live) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => info.failures < *best_failures,
+                        };
+                        if better {
+                            *best_addr = *addr;
+                            *best_is_live = is_live;
+                            *best_failures = info.failures;
+                        }
+                    })
+                    .or_insert((*addr, is_live, info.failures));
             }
+            let mut active_peers: Vec<SocketAddr> = best_by_identity
+                .into_values()
+                .map(|(addr, _, _)| addr)
+                .collect();
 
             // Shuffle and take max_peer_gossip_targets
             active_peers.shuffle(&mut rand::rng());
@@ -12216,6 +12244,72 @@ mod tests {
             discovery.remaining_slots(),
             1,
             "the discovery slot budget must remain untouched by a transport-source-keyed entry"
+        );
+    }
+
+    /// Gossip target selection must not retain an arbitrary alias for a
+    /// shared identity. `gossip_state.peers` is a `HashMap`, whose
+    /// iteration order is effectively arbitrary (re-seeded per instance),
+    /// so "keep whichever alias iteration visits first" can just as
+    /// easily retain a stale-but-under-threshold alias as the one this
+    /// node is actually connected to right now -- silently skipping that
+    /// physical peer's peer-list gossip for the round. The LIVE alias
+    /// must always win, deterministically, regardless of iteration order
+    /// (this test constructs both aliases explicitly rather than relying
+    /// on ordering luck to surface the bug).
+    #[tokio::test]
+    async fn gossip_peer_list_target_selection_prefers_live_alias_over_stale() {
+        let mut config = test_config_with_seed("gossip-target-prefers-live-alias");
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(20_180), config);
+
+        let shared_node_id = test_peer_id("gossip-target-shared").to_node_id();
+        let live_addr = test_addr(20_181);
+        let stale_addr = test_addr(20_182);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut live_info = peer_info_with_node_id(live_addr, shared_node_id);
+            live_info.identity_verified = true;
+            let mut stale_info = peer_info_with_node_id(stale_addr, shared_node_id);
+            stale_info.identity_verified = true;
+            state.peers.insert(live_addr, live_info);
+            state.peers.insert(stale_addr, stale_info);
+        }
+
+        // Give `live_addr` an actual live connection in the pool; `stale_addr`
+        // has none, even though both are equally under the failure threshold.
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            live_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(live_addr, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.set_state(ConnectionState::Connected);
+        registry
+            .connection_pool
+            .index_connection_by_addr(live_addr, Arc::new(conn));
+
+        let tasks = registry.gossip_peer_list_immediate().await;
+        let targeted: Vec<SocketAddr> = tasks.iter().map(|t| t.peer_addr).collect();
+        assert_eq!(
+            targeted.iter().filter(|a| **a == live_addr || **a == stale_addr).count(),
+            1,
+            "the shared identity must receive exactly one peer-list gossip task: {targeted:?}"
+        );
+        assert!(
+            targeted.contains(&live_addr),
+            "the LIVE alias must be the one selected, not whichever HashMap iteration \
+             visits first: {targeted:?}"
         );
     }
 
