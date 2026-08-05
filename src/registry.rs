@@ -1377,6 +1377,16 @@ impl PeerInfo {
 /// yet known (`node_id: None`) fall back to address keying rather than a
 /// shared "unknown" bucket, so two pre-handshake peers -- which have no
 /// identity to compare -- are never merged with each other.
+///
+/// Keying on `node_id` alone is not safe: `PeerInfo::from_gossip` and
+/// discovery-created entries deliberately carry an UNVERIFIED identity
+/// hint (`identity_verified: false`) -- a self-report or third-party
+/// gossip mention, never independently corroborated for that specific
+/// address (see `crate::addr_ownership`). A remote peer could otherwise
+/// claim someone else's `node_id` at an address it does not own and have
+/// dedup silently fold the two together. Only a verified identity may
+/// collapse aliases; an unverified hint falls back to address keying,
+/// exactly like `node_id: None`.
 #[derive(Hash, Eq, PartialEq)]
 enum PeerDispatchKey {
     Node(crate::GossipNodeId),
@@ -1385,7 +1395,10 @@ enum PeerDispatchKey {
 
 impl PeerDispatchKey {
     fn for_entry(addr: SocketAddr, peer: &PeerInfo) -> Self {
-        peer.node_id.map(Self::Node).unwrap_or(Self::Addr(addr))
+        match (peer.node_id, peer.identity_verified) {
+            (Some(node_id), true) => Self::Node(node_id),
+            _ => Self::Addr(addr),
+        }
     }
 }
 
@@ -11847,6 +11860,11 @@ mod tests {
     /// Used by the duplicate-broadcast regression tests to manufacture the
     /// "two SocketAddr aliases for the same physical peer" state that the
     /// devnet stratum trace surfaced for sender `f4061522…`.
+    ///
+    /// `identity_verified: true` -- dedup (`PeerDispatchKey`) only ever
+    /// collapses aliases for a VERIFIED identity match; callers modeling an
+    /// unverified self-report/gossip hint (which must NOT be deduped) set
+    /// `identity_verified = false` explicitly after calling this.
     fn peer_info_with_node_id(addr: SocketAddr, node_id: crate::GossipNodeId) -> PeerInfo {
         let now = crate::current_timestamp();
         let now_ms = crate::current_timestamp_millis();
@@ -11870,7 +11888,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
-            identity_verified: false,
+            identity_verified: true,
             transport_source_keyed: false,
         }
     }
@@ -12082,6 +12100,42 @@ mod tests {
             stats.active_peers, 3,
             "expected 1 for the shared-identity alias pair plus 2 for the distinct \
              pre-handshake (node_id: None) peers, got {}",
+            stats.active_peers
+        );
+    }
+
+    /// `PeerDispatchKey` must not collapse two addresses merely because
+    /// they share a self-reported/third-party-gossiped `node_id` that was
+    /// never independently verified for either address
+    /// (`identity_verified: false`, as `PeerInfo::from_gossip` and
+    /// discovery-created entries deliberately leave it). Otherwise a
+    /// remote peer could claim someone else's `node_id` at an unrelated
+    /// address it does not own and have dedup silently fold the two
+    /// together -- undercounting `active_peers` and, more seriously,
+    /// dropping a legitimate peer from gossip target selection.
+    #[tokio::test]
+    async fn get_stats_active_peers_does_not_dedupe_unverified_identity_hints() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_130), test_config());
+
+        let claimed_node_id = test_peer_id("unverified-dedup-claim").to_node_id();
+        let addr_a = test_addr(20_131);
+        let addr_b = test_addr(20_132);
+        let mut info_a = peer_info_with_node_id(addr_a, claimed_node_id);
+        info_a.identity_verified = false;
+        let mut info_b = peer_info_with_node_id(addr_b, claimed_node_id);
+        info_b.identity_verified = false;
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(addr_a, info_a);
+            state.peers.insert(addr_b, info_b);
+        }
+
+        let stats = registry.get_stats().await;
+        assert_eq!(
+            stats.active_peers, 2,
+            "two entries claiming the same UNVERIFIED node_id at different addresses \
+             must count as two distinct peers, not be folded into one, got {}",
             stats.active_peers
         );
     }
