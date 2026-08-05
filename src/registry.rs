@@ -3604,6 +3604,18 @@ impl<T: 'static> GossipRegistry<T> {
             }
             if let Some(identity_verified) = resolved_identity_verified {
                 existing_peer.identity_verified = identity_verified;
+                if identity_verified {
+                    // Independently verified evidence for this exact
+                    // address -- it matches the connection's observed TCP
+                    // source, an operator-configured required address, or
+                    // a same-node Verified refresh -- proves the address
+                    // is genuinely dialable regardless of how any earlier
+                    // entry here was attributed. A stale
+                    // `transport_source_keyed` left over from an
+                    // inbound-accept fallback must not keep excluding it
+                    // from gossip/discovery forever.
+                    existing_peer.transport_source_keyed = false;
+                }
             }
             if owner_changed {
                 let now = current_timestamp();
@@ -4442,6 +4454,10 @@ impl<T: 'static> GossipRegistry<T> {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
                         peer_info.outbound_dial_success = true;
+                        // We just independently proved this exact address is
+                        // dialable; a stale fallback attribution no longer
+                        // applies (see PeerInfo::transport_source_keyed).
+                        peer_info.transport_source_keyed = false;
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
                         peer_info.last_failure_time = None;
@@ -4451,6 +4467,7 @@ impl<T: 'static> GossipRegistry<T> {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
                         peer_info.outbound_dial_success = true;
+                        peer_info.transport_source_keyed = false;
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
                         peer_info.last_failure_time = None;
@@ -12310,6 +12327,110 @@ mod tests {
             targeted.contains(&live_addr),
             "the LIVE alias must be the one selected, not whichever HashMap iteration \
              visits first: {targeted:?}"
+        );
+    }
+
+    /// `transport_source_keyed` must not survive an operator explicitly
+    /// configuring the exact same address for the exact same peer:
+    /// `configure_peer` is authoritative dialable evidence (it always
+    /// claims `ClaimKind::Verified`), so a stale fallback attribution left
+    /// over from an earlier inbound-accept must be cleared, or the address
+    /// stays excluded from gossip/discovery forever even after becoming a
+    /// genuinely operator-vouched route.
+    #[tokio::test]
+    async fn configuring_a_peer_clears_transport_source_keyed() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_190), test_config());
+        let addr = test_addr(20_191);
+        let peer_id = test_peer_id("transport-source-keyed-configure-clear");
+
+        registry.configure_peer(peer_id.clone(), addr).await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let peer = state
+                .peers
+                .get_mut(&addr)
+                .expect("configure_peer must create a peers entry");
+            assert!(
+                peer.identity_verified,
+                "sanity: configure_peer claims Verified"
+            );
+            // Simulate a stale fallback attribution left over from an
+            // earlier inbound-accept at this same address.
+            peer.transport_source_keyed = true;
+        }
+
+        // A second configure_peer call for the SAME address/peer is a
+        // same-node Verified refresh; it must clear the injected stale flag.
+        registry.configure_peer(peer_id.clone(), addr).await;
+
+        let state = registry.gossip_state.lock().await;
+        let peer = state.peers.get(&addr).expect("peer must still exist");
+        assert!(
+            !peer.transport_source_keyed,
+            "configuring a peer is authoritative dialable evidence and must clear a \
+             stale transport_source_keyed flag"
+        );
+    }
+
+    /// A successful outbound dial is definitive, independent proof that
+    /// this exact address is genuinely dialable -- it must clear a stale
+    /// `transport_source_keyed` flag inherited from an earlier
+    /// inbound-accept fallback, or the address stays hidden from
+    /// gossip/discovery forever even after this node starts dialing it
+    /// directly.
+    #[tokio::test]
+    async fn successful_outbound_dial_clears_transport_source_keyed() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(20_200), test_config());
+        let peer_id = test_peer_id("outbound-dial-clears-transport-source-keyed");
+        let addr = test_addr(20_201);
+
+        registry.configure_peer(peer_id.clone(), addr).await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&addr)
+                .expect("configure_peer must create a peers entry")
+                .transport_source_keyed = true;
+        }
+
+        // Fake an already-established connection so `connect_to_peer` takes
+        // the "already have a usable stream" branch instead of attempting a
+        // real dial.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id.clone(), addr, conn.clone());
+
+        registry
+            .connect_to_peer(&peer_id)
+            .await
+            .expect("fake connection must resolve without a real dial");
+
+        let state = registry.gossip_state.lock().await;
+        let peer = state.peers.get(&addr).expect("peer must exist");
+        assert!(peer.outbound_dial_success);
+        assert!(
+            !peer.transport_source_keyed,
+            "a successful outbound dial must clear a stale transport_source_keyed flag"
         );
     }
 
