@@ -1217,6 +1217,29 @@ pub struct PeerInfo {
     /// ownership question — doing so would reintroduce a second, unsynchronized
     /// source of truth.
     pub identity_verified: bool,
+    /// True when `address` (this entry's key) is the raw TCP source of an
+    /// inbound connection rather than a dialable address the peer
+    /// advertised, an operator configured, or that we ourselves dialed.
+    ///
+    /// Address-claim arbitration (`crate::addr_ownership::arbitrate`) never
+    /// grants first ownership of an address from a bare self-report, so a
+    /// first-contact inbound connection whose advertised bind address
+    /// cannot be independently corroborated falls back to attributing the
+    /// connection's ephemeral TCP source instead (see the inbound-accept
+    /// path in `handle.rs`). That source is real liveness evidence for THIS
+    /// session, but the ephemeral port is not something any other node
+    /// could ever dial, is unique per connection/restart, and does not
+    /// represent a discovery candidate. Consumers that gossip dialable
+    /// addresses or admit peer-discovery slots must treat an entry with
+    /// this flag set as a non-authoritative liveness record, not a routable
+    /// peer.
+    ///
+    /// Set only by the inbound-accept fallback that knows it took this
+    /// path; never inferred from `address` incidentally matching the
+    /// connection's observed source, since a peer legitimately dialing out
+    /// from its own listen port satisfies that too and must not be
+    /// misclassified.
+    pub transport_source_keyed: bool,
 }
 
 impl PeerInfo {
@@ -1245,6 +1268,7 @@ impl PeerInfo {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         }
     }
 
@@ -1281,6 +1305,7 @@ impl PeerInfo {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         }
     }
 
@@ -1338,6 +1363,7 @@ impl PeerInfo {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         })
     }
 }
@@ -2833,6 +2859,7 @@ impl<T: 'static> GossipRegistry<T> {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -3632,6 +3659,7 @@ impl<T: 'static> GossipRegistry<T> {
                     // `PeerRegistryOwner`; this mirrors the kind it resolved
                     // for the claim that was just committed.
                     identity_verified: resolved_identity_verified.unwrap_or(false),
+                    transport_source_keyed: false,
                 },
             );
 
@@ -5877,6 +5905,7 @@ impl<T: 'static> GossipRegistry<T> {
                         current_session_connection: None,
                         current_session_epoch: 0,
                         identity_verified: false,
+                        transport_source_keyed: false,
                     });
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
@@ -9279,10 +9308,18 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Record that this peer was observed on an inbound connection accepted by this node.
+    ///
+    /// `transport_source_keyed` mirrors `PeerInfo::transport_source_keyed`:
+    /// pass `true` only when the caller knows `peer_addr` is the raw
+    /// observed TCP source used as a fallback key (address-claim
+    /// arbitration rejected the peer's advertised address), never inferred
+    /// here from `source == peer_addr` -- a peer legitimately dialing out
+    /// from its own listen port satisfies that too.
     pub async fn mark_inbound_connection_observed(
         &self,
         peer_addr: SocketAddr,
         source: SocketAddr,
+        transport_source_keyed: bool,
     ) {
         let now = current_timestamp();
         let now_ms = crate::current_timestamp_millis();
@@ -9308,11 +9345,13 @@ impl<T: 'static> GossipRegistry<T> {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         });
         peer.inbound_observed = true;
         if source != peer_addr {
             peer.peer_address = Some(source);
         }
+        peer.transport_source_keyed = transport_source_keyed;
         peer.last_success = peer.last_success.max(now);
         // Inbound payload is real liveness evidence — the framing layer
         // has decoded and dispatched at least one valid message on this
@@ -11507,6 +11546,7 @@ mod tests {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         };
 
         assert_eq!(peer.address, test_addr(8080));
@@ -11790,6 +11830,7 @@ mod tests {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         }
     }
 
@@ -11891,6 +11932,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -11953,6 +11995,132 @@ mod tests {
             "expected exactly one immediate-gossip target for shared GossipNodeId across \
              aliases {alias_a},{alias_b},{alias_c}, got {aliases_selected} (selected: {:?})",
             selected
+        );
+    }
+
+    /// `get_stats().active_peers` must count distinct physical peers, not
+    /// distinct `SocketAddr` entries: two aliases sharing one
+    /// `GossipNodeId` (one reached by outbound dial, one only ever
+    /// inbound-observed) are the same peer and must count once, mirroring
+    /// the dedup already applied to gossip fanout (see `PeerDispatchKey`).
+    /// Two peers with no identity yet (`node_id: None`) at different
+    /// addresses have nothing to compare and must still count as two, or
+    /// two genuinely distinct pre-handshake peers would wrongly collapse
+    /// into one.
+    #[tokio::test]
+    async fn get_stats_active_peers_deduplicates_by_node_id() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_100), test_config());
+
+        let shared_node_id = test_peer_id("active-peers-dedup-shared").to_node_id();
+        let alias_a = test_addr(20_101);
+        let alias_b = test_addr(20_102);
+        let mut alias_a_info = peer_info_with_node_id(alias_a, shared_node_id);
+        alias_a_info.outbound_dial_success = true;
+        alias_a_info.inbound_observed = false;
+        let mut alias_b_info = peer_info_with_node_id(alias_b, shared_node_id);
+        alias_b_info.outbound_dial_success = false;
+        alias_b_info.inbound_observed = true;
+
+        let unknown_a = test_addr(20_103);
+        let unknown_b = test_addr(20_104);
+        let mut unknown_a_info = peer_info_with_node_id(unknown_a, shared_node_id);
+        unknown_a_info.node_id = None;
+        let mut unknown_b_info = peer_info_with_node_id(unknown_b, shared_node_id);
+        unknown_b_info.node_id = None;
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(alias_a, alias_a_info);
+            state.peers.insert(alias_b, alias_b_info);
+            state.peers.insert(unknown_a, unknown_a_info);
+            state.peers.insert(unknown_b, unknown_b_info);
+        }
+
+        let stats = registry.get_stats().await;
+        assert_eq!(
+            stats.active_peers, 3,
+            "expected 1 for the shared-identity alias pair plus 2 for the distinct \
+             pre-handshake (node_id: None) peers, got {}",
+            stats.active_peers
+        );
+    }
+
+    /// `peers_snapshot` must not advertise a transport-source-keyed entry:
+    /// its address is the ephemeral TCP source of one inbound connection,
+    /// not a dialable route any other node could use. A normally-addressed
+    /// entry in the same table must still be included.
+    #[tokio::test]
+    async fn peers_snapshot_omits_transport_source_keyed_entries() {
+        let config = GossipConfig {
+            allow_loopback_discovery: true, // test addresses are loopback
+            ..test_config()
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(20_110), config);
+
+        let dialable_addr = test_addr(20_111);
+        let dialable_node_id = test_peer_id("snapshot-dialable").to_node_id();
+        let dialable_info = peer_info_with_node_id(dialable_addr, dialable_node_id);
+
+        let ephemeral_addr = test_addr(20_112);
+        let ephemeral_node_id = test_peer_id("snapshot-ephemeral").to_node_id();
+        let mut ephemeral_info = peer_info_with_node_id(ephemeral_addr, ephemeral_node_id);
+        ephemeral_info.transport_source_keyed = true;
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(dialable_addr, dialable_info);
+            state.peers.insert(ephemeral_addr, ephemeral_info);
+        }
+
+        let snapshot = registry.peers_snapshot().await;
+        let addrs: Vec<&str> = snapshot.iter().map(|p| p.address.as_str()).collect();
+        let dialable_str = dialable_addr.to_string();
+        let ephemeral_str = ephemeral_addr.to_string();
+        assert!(
+            addrs.contains(&dialable_str.as_str()),
+            "a normal advertised entry must still be gossiped: {addrs:?}"
+        );
+        assert!(
+            !addrs.contains(&ephemeral_str.as_str()),
+            "a transport-source-keyed entry must never be advertised as a dialable \
+             peer: {addrs:?}"
+        );
+    }
+
+    /// A transport-source-keyed entry must not occupy a `PeerDiscovery`
+    /// slot: its key is one connection's ephemeral TCP source, not a
+    /// dialable candidate, so admitting it would let repeated
+    /// inbound-fallback sessions for ONE physical peer exhaust
+    /// `max_peers` worth of discovery slots on their own.
+    #[tokio::test]
+    async fn transport_source_keyed_entry_does_not_occupy_discovery_slot() {
+        let mut config = test_config_with_seed("transport-source-keyed-discovery-slot");
+        config.enable_peer_discovery = true;
+        config.max_peers = 1;
+        let registry = GossipRegistry::<()>::new(test_addr(20_120), config);
+        let ephemeral_addr = test_addr(20_121);
+        let node_id = test_peer_id("discovery-slot-peer").to_node_id();
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut info = peer_info_with_node_id(ephemeral_addr, node_id);
+            info.transport_source_keyed = true;
+            state.peers.insert(ephemeral_addr, info);
+        }
+
+        registry.mark_peer_connected(ephemeral_addr).await;
+
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.connected_peer_count(),
+            0,
+            "a transport-source-keyed entry must not consume a PeerDiscovery Connected slot"
+        );
+        assert_eq!(
+            discovery.remaining_slots(),
+            1,
+            "the discovery slot budget must remain untouched by a transport-source-keyed entry"
         );
     }
 
@@ -12278,7 +12446,7 @@ mod tests {
             .unwrap();
         registry.add_peer(test_addr(8081)).await;
         registry
-            .mark_inbound_connection_observed(test_addr(8081), test_addr(8081))
+            .mark_inbound_connection_observed(test_addr(8081), test_addr(8081), false)
             .await;
 
         let stats = registry.get_stats().await;
@@ -12710,6 +12878,7 @@ mod tests {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         };
         assert!(!registry.should_use_delta_state(&gossip_state, &new_peer));
 
@@ -12735,6 +12904,7 @@ mod tests {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         };
         // Add some peers to make it not a small cluster
         drop(gossip_state);
@@ -15246,6 +15416,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -15321,6 +15492,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -15392,6 +15564,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -15445,6 +15618,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -15540,6 +15714,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
             let mut seeded = HashSet::new();
@@ -15664,6 +15839,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
             // Seed peer_to_actors as if a previous gossip cycle from
@@ -15853,6 +16029,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -15945,6 +16122,7 @@ mod tests {
                         current_session_connection: None,
                         current_session_epoch: 0,
                         identity_verified: false,
+                        transport_source_keyed: false,
                     },
                 );
             }
@@ -16037,6 +16215,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -16121,6 +16300,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
             let mut actors = HashSet::new();
@@ -16910,6 +17090,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -16972,6 +17153,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -17024,6 +17206,7 @@ mod tests {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         };
 
         // Convert to gossip format
@@ -17418,6 +17601,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -17882,6 +18066,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18026,6 +18211,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18072,6 +18258,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18118,6 +18305,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18177,6 +18365,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18243,6 +18432,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 };
                 if peer.inbound_observed && !peer.outbound_dial_success && idx < 10 {
                     suppressed.insert(addr);
@@ -18339,6 +18529,7 @@ mod tests {
             current_session_connection: None,
             current_session_epoch: 0,
             identity_verified: false,
+            transport_source_keyed: false,
         };
         {
             let mut off_state = reg_off.gossip_state.lock().await;
@@ -18400,6 +18591,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18484,6 +18676,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18555,6 +18748,7 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
@@ -18618,11 +18812,12 @@ mod tests {
                     current_session_connection: None,
                     current_session_epoch: 0,
                     identity_verified: false,
+                    transport_source_keyed: false,
                 },
             );
         }
 
-        reg.mark_inbound_connection_observed(peer_addr, source_addr)
+        reg.mark_inbound_connection_observed(peer_addr, source_addr, false)
             .await;
 
         let state = reg.gossip_state.lock().await;
@@ -18810,6 +19005,7 @@ mod tests {
         current_session_source: Option<SocketAddr>,
         current_session_epoch: u64,
         identity_verified: bool,
+        transport_source_keyed: bool,
     }
 
     impl From<&PeerInfo> for PeerInfoSnapshot {
@@ -18834,6 +19030,7 @@ mod tests {
                 current_session_source: p.current_session_source,
                 current_session_epoch: p.current_session_epoch,
                 identity_verified: p.identity_verified,
+                transport_source_keyed: p.transport_source_keyed,
             }
         }
     }
@@ -19025,7 +19222,7 @@ mod tests {
         // `victim_addr` -- exactly the bug this test guards against -- it
         // must not upgrade the recorded ownership kind.
         registry
-            .mark_inbound_connection_observed(victim_addr, attacker_source_addr)
+            .mark_inbound_connection_observed(victim_addr, attacker_source_addr, false)
             .await;
 
         // Authoritative ownership now lives in the owner actor, so assert
@@ -19890,6 +20087,7 @@ mod tests {
                 current_session_connection: None,
                 current_session_epoch: 0,
                 identity_verified: true,
+                transport_source_keyed: false,
             },
         );
         drop(guard);

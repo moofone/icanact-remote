@@ -4304,6 +4304,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_connection: None,
                                 current_session_epoch: 0,
                                 identity_verified: false,
+                                transport_source_keyed: false,
                             });
                         }
                     }
@@ -4573,6 +4574,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_connection: None,
                                 current_session_epoch: 0,
                                 identity_verified: false,
+                                transport_source_keyed: false,
                             });
                         }
                     }
