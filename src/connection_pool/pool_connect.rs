@@ -4174,14 +4174,14 @@ async fn answer_inbound_clock_probe(
             peer = %peer_addr,
             size = payload.len(),
             max = registry.config.max_message_size,
-            "R16i: inline clock-echo response too large to frame"
+            "inline clock-echo response too large to frame"
         );
         return;
     }
     let header = match framing::write_gossip_frame_prefix(payload.len()) {
         Ok(header) => bytes::Bytes::copy_from_slice(&header),
         Err(e) => {
-            debug!(peer = %peer_addr, error = %e, "R16i: clock-echo response too large to frame");
+            debug!(peer = %peer_addr, error = %e, "clock-echo response too large to frame");
             return;
         }
     };
