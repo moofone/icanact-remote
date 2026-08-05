@@ -655,6 +655,15 @@ enum OwnerCommand {
         session_source: SocketAddr,
         reply: oneshot::Sender<Vec<(SocketAddr, CommitSeq)>>,
     },
+    /// Release everything a peer that has been dead longer than the
+    /// dead-peer timeout still holds at `addr`: every connection-scoped
+    /// receipt recorded for `peer_id` at `addr` under any session, and the
+    /// address ownership itself when it is not operator-pinned.
+    ReleaseDeadPeer {
+        peer_id: PeerId,
+        addr: SocketAddr,
+        reply: oneshot::Sender<Option<CommitSeq>>,
+    },
     /// Atomically checks the causal fence a dead-peer reap also checks
     /// (does `addr` have DIRECT evidence of a live owner causally NEWER
     /// than `evidence_before`?) AND revalidates the full identity selection
@@ -987,6 +996,27 @@ impl RegistryOwnerHandle {
             return Vec::new();
         }
         response.await.unwrap_or_default()
+    }
+
+    /// Release all ownership and connection-scoped receipts that remain for
+    /// `peer_id` at `addr` after a dead-peer sweep. Operator-pinned addresses
+    /// are retained by the owner and therefore return `None`.
+    pub async fn release_dead_peer(
+        &self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+    ) -> Option<CommitSeq> {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::ReleaseDeadPeer {
+            peer_id,
+            addr,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return None;
+        }
+        response.await.unwrap_or(None)
     }
 
     /// See `OwnerCommand::ReserveForReap`'s doc comment for the causal
@@ -1651,6 +1681,14 @@ impl PeerRegistryOwner {
                 let candidates = self.release_session(&peer_id, session_source);
                 let _ = reply.send(candidates);
             }
+            OwnerCommand::ReleaseDeadPeer {
+                peer_id,
+                addr,
+                reply,
+            } => {
+                let released = self.release_dead_peer(&peer_id, addr);
+                let _ = reply.send(released);
+            }
             OwnerCommand::ReserveForReap {
                 addr,
                 evidence_before,
@@ -1930,6 +1968,29 @@ impl PeerRegistryOwner {
             }
         }
         released
+    }
+
+    /// Release everything `peer_id` still holds at `addr`: every
+    /// connection-scoped receipt recorded for it there under any session
+    /// (including a teardown that never ran), and the ownership record itself
+    /// if this peer still owns the address and it is not operator-pinned.
+    /// This is deliberately one owner-task operation so a stale peer reap
+    /// cannot race a reconnect between receipt cleanup and ownership release.
+    fn release_dead_peer(&mut self, peer_id: &PeerId, addr: SocketAddr) -> Option<CommitSeq> {
+        self.connection_scoped_claims
+            .retain(|key, _| !(&key.0 == peer_id && key.2 == addr));
+        if self.operator_pinned.contains_key(&addr) {
+            return None;
+        }
+        let still_owned = self
+            .addr_ownership
+            .get(&addr)
+            .is_some_and(|owner| owner.node_id == *peer_id);
+        if !still_owned {
+            return None;
+        }
+        let owner = self.addr_ownership.remove(&addr)?;
+        Some(self.retract_owner(addr, owner))
     }
 
     /// Invalidate a currently-held, NOT YET CONSUMED reap reservation for
