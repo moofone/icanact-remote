@@ -12,14 +12,17 @@ use crate::{
     registry::{ActorResponse, GossipRegistry, RegistryMessage},
 };
 
-/// How long an in-progress stream may go without genuine byte progress
-/// before it is reaped. This is the ONLY lifetime bound applied to a
-/// stream: it is measured from the last time bytes actually advanced --
-/// never from stream start, and never merely from the last time the reader
-/// was polled -- so a slow-but-honest transfer that keeps advancing runs to
-/// completion no matter how long it takes, while a peer that stops
-/// advancing (including one that never sends a single byte after
-/// `StreamStart`) loses its slot and reserved bytes within this window.
+/// How long an in-progress stream may go with ZERO byte progress before it
+/// is reaped. Measured from the last time bytes actually advanced -- never
+/// from stream start, and never merely from the last time the reader was
+/// polled -- so a stream that is genuinely still receiving data is never
+/// reaped by this check alone. A peer that stops advancing entirely
+/// (including one that never sends a single byte after `StreamStart`) loses
+/// its slot and reserved bytes within this window.
+///
+/// This bound alone is not sufficient to keep a slot from being pinned
+/// indefinitely: see `MIN_SUSTAINED_RATE_WINDOW` / `MIN_SUSTAINED_BYTES_PER_WINDOW`
+/// for the bound that catches a peer trickling just enough to dodge this one.
 ///
 /// Also doubles as the base tombstone TTL for a reaped/rejected stream id
 /// (see `reject_stream` / `tombstone_reaped_stream`): a tombstone hit
@@ -27,6 +30,36 @@ use crate::{
 /// sender still trickling into a dead id keeps being silently discarded
 /// instead of eventually falling through to a fatal "unknown stream_id".
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Width of the tumbling window over which a minimum sustained transfer
+/// rate is enforced (see `MIN_SUSTAINED_BYTES_PER_WINDOW`). Deliberately
+/// much wider than `STREAM_IDLE_TIMEOUT`: this check exists to catch a
+/// pattern the idle check cannot -- nonzero progress on every poll, just
+/// under the idle bound -- so it must tolerate the bursty-then-quiet
+/// delivery pattern of a real, honest, low-bandwidth link without
+/// mistaking a lull for starvation.
+const MIN_SUSTAINED_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The minimum number of bytes a stream must receive within any one
+/// `MIN_SUSTAINED_RATE_WINDOW` to avoid being reaped for insufficient
+/// throughput.
+///
+/// This is the bound that keeps "any progress at all resets the clock"
+/// from being exploitable: without it, a peer that sends a single byte just
+/// under `STREAM_IDLE_TIMEOUT` forever holds its stream slot and its share
+/// of `MAX_INFLIGHT_STREAM_BYTES` for free, which is exactly the slow-drip
+/// resource pin an absolute lifetime cap used to prevent. 8 KiB per 5
+/// minutes (~27 B/s sustained) is far below any real network transfer --
+/// including a link too slow to be worth transferring over at all -- while
+/// being thousands of times more than a peer can get away with sending
+/// merely to keep the idle timer from firing. A peer that wants to hold a
+/// slot open now has to pay for it in real, continuous bandwidth rather
+/// than one byte a minute; that does not bound the worst case to a fixed
+/// wall-clock ceiling the way the old absolute cap did, but it converts an
+/// unbounded *free* resource pin into a bounded-cost one, on top of the
+/// existing per-connection `max_concurrent_streams` / `MAX_INFLIGHT_STREAM_BYTES`
+/// budgets that already limit the blast radius of any single connection.
+const MIN_SUSTAINED_BYTES_PER_WINDOW: usize = 8 * 1024;
 
 /// Per-connection streaming state for managing partial streams
 #[derive(Debug)]
@@ -98,10 +131,19 @@ struct InProgressStream {
     expected_chunks: Option<usize>,
     /// Count of chunk indices seen more than once, for diagnostics.
     duplicate_chunks: u32,
-    /// Timestamp when stream started (bounds total lifetime).
+    /// Timestamp when stream started. Kept for diagnostics only -- neither
+    /// reap check is measured from this; see `last_activity` and
+    /// `rate_window_started_at`.
     started_at: std::time::Instant,
-    /// Timestamp of the most recent chunk (drives idle reaping).
+    /// Timestamp of the most recent genuine byte progress (drives the
+    /// zero-progress idle reap).
     last_activity: std::time::Instant,
+    /// Start of the current minimum-sustained-rate tumbling window.
+    rate_window_started_at: std::time::Instant,
+    /// `received_size` as of `rate_window_started_at`, so the reaper can
+    /// tell how many bytes landed during the current window without a
+    /// separate running counter.
+    bytes_at_window_start: usize,
 }
 
 impl InProgressStream {
@@ -251,6 +293,8 @@ impl StreamingState {
             duplicate_chunks: 0,
             started_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
+            rate_window_started_at: std::time::Instant::now(),
+            bytes_at_window_start: 0,
         };
         self.active_streams.insert(header.stream_id, stream);
         Ok(())
@@ -743,19 +787,39 @@ impl StreamingState {
     }
 
     /// Clean up in-progress streams that have stopped making genuine byte
-    /// progress. A stream is never reaped merely for its total age: as long
-    /// as bytes keep landing, however slowly, it survives, so a large or
-    /// slow-but-healthy transfer is never evicted mid-flight. The idle bound
-    /// alone is what keeps a stalled peer -- one that stops advancing bytes,
-    /// including one that never sends any after `StreamStart` -- from
-    /// pinning a slot and its reserved bytes indefinitely.
+    /// progress, or that are not sustaining a minimum transfer rate. A
+    /// stream is never reaped merely for its total age: as long as it keeps
+    /// clearing both checks below, it survives no matter how long the
+    /// transfer takes, so a large or slow-but-healthy transfer is never
+    /// evicted mid-flight. Two independent bounds are enforced, because
+    /// neither alone is sufficient:
+    ///
+    /// - Zero progress for `STREAM_IDLE_TIMEOUT`: catches a peer that stops
+    ///   advancing bytes entirely, including one that never sends any after
+    ///   `StreamStart`.
+    /// - Fewer than `MIN_SUSTAINED_BYTES_PER_WINDOW` bytes across a
+    ///   `MIN_SUSTAINED_RATE_WINDOW`-wide tumbling window: catches a peer
+    ///   that keeps sending just enough to dodge the idle check (e.g. one
+    ///   byte every `STREAM_IDLE_TIMEOUT` minus a second) without ever
+    ///   sustaining a real transfer rate. Without this, "any progress
+    ///   resets the idle clock" lets that peer pin a slot and its share of
+    ///   `MAX_INFLIGHT_STREAM_BYTES` for free, forever.
     pub fn cleanup_stale(&mut self) {
-        self.cleanup_stale_with(STREAM_IDLE_TIMEOUT);
+        self.cleanup_stale_with(
+            STREAM_IDLE_TIMEOUT,
+            MIN_SUSTAINED_RATE_WINDOW,
+            MIN_SUSTAINED_BYTES_PER_WINDOW,
+        );
     }
 
-    /// `cleanup_stale` with an explicit bound, so tests do not have to wait
-    /// out the production timeout.
-    pub(crate) fn cleanup_stale_with(&mut self, idle_timeout: std::time::Duration) {
+    /// `cleanup_stale` with explicit bounds, so tests do not have to wait
+    /// out the production timeouts.
+    pub(crate) fn cleanup_stale_with(
+        &mut self,
+        idle_timeout: std::time::Duration,
+        rate_window: std::time::Duration,
+        min_bytes_per_window: usize,
+    ) {
         let before_count = self.active_streams.len();
         self.rejected_streams
             .retain(|_, at| at.elapsed() <= idle_timeout);
@@ -780,6 +844,36 @@ impl StreamingState {
                 );
                 reaped_ids.push(*stream_id);
                 return false;
+            }
+
+            // Tumbling minimum-rate window: only evaluated once a full
+            // window has elapsed since it last opened, so a stream still
+            // inside its first window is judged by the idle check alone.
+            let window_elapsed = stream.rate_window_started_at.elapsed();
+            if window_elapsed >= rate_window {
+                let bytes_this_window = stream
+                    .received_size
+                    .saturating_sub(stream.bytes_at_window_start);
+                if bytes_this_window < min_bytes_per_window {
+                    warn!(
+                        stream_id = stream_id,
+                        bytes_this_window,
+                        min_bytes_per_window,
+                        window_secs = window_elapsed.as_secs(),
+                        received_size = stream.received_size,
+                        expected_size = stream.total_size,
+                        "Cleaning up stream that is not sustaining the minimum transfer rate"
+                    );
+                    reaped_ids.push(*stream_id);
+                    return false;
+                }
+                // The window is cleared: slide it forward rather than
+                // letting it grow unbounded, so the check keeps measuring a
+                // *recent* rate rather than a lifetime average (a transfer
+                // that starts slow and speeds up must not be penalized
+                // forever for its opening window).
+                stream.rate_window_started_at = std::time::Instant::now();
+                stream.bytes_at_window_start = stream.received_size;
             }
 
             true
@@ -1837,6 +1931,9 @@ mod tests {
         use std::time::Duration;
 
         let idle_timeout = Duration::from_millis(40);
+        // Wide enough that this test's ~60ms run never crosses it: this test
+        // is about the idle check alone, not the rate floor.
+        let rate_window = Duration::from_secs(3600);
 
         let mut state = StreamingState::new();
         let total = (STRIDE * 4) as u64;
@@ -1848,7 +1945,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
             let payload = [0x5Au8; STRIDE];
             let _ = chunk(&mut state, 10, total, idx, &payload);
-            state.cleanup_stale_with(idle_timeout);
+            state.cleanup_stale_with(idle_timeout, rate_window, 1);
             if idx < 3 {
                 assert_eq!(
                     state.active_stream_count(),
@@ -1860,47 +1957,87 @@ mod tests {
         }
     }
 
-    /// There is no separate wall-clock cap on a stream's total age: as long
-    /// as bytes keep landing, a transfer survives no matter how long the
-    /// whole stream has been open or how many reaper ticks pass in the
-    /// meantime. This used to be capped at a fixed `MAX_STREAM_LIFETIME`
-    /// measured from stream start, which reaped a still-progressing stream
-    /// (and, via the live-reservation race, its whole connection) purely
-    /// for being old -- exercised here by letting many reaper ticks elapse,
-    /// each individually well past what that old cap allowed relative to
-    /// this test's timescale, while the stream keeps receiving chunks.
+    /// A stream that sustains at least the minimum required rate survives
+    /// across many tumbling rate windows, no matter how many reaper ticks
+    /// land while it is transferring. This is the positive side of the
+    /// minimum-sustained-rate check: a slow-but-adequate transfer is never
+    /// mistaken for the drip attack `stream_below_the_rate_floor_is_reaped_despite_dodging_the_idle_check`
+    /// guards against below.
     #[test]
-    fn stream_making_progress_is_never_reaped_for_its_total_age() {
+    fn stream_meeting_the_rate_floor_survives_across_many_windows() {
         use chunk_integrity::{STRIDE, chunk, start};
         use std::time::Duration;
 
-        let idle_timeout = Duration::from_millis(20);
-        let old_cap_stand_in = Duration::from_millis(60);
+        let idle_timeout = Duration::from_secs(3600); // not under test here
+        let rate_window = Duration::from_millis(30);
+        let min_bytes_per_window = 1; // any chunk at all clears it
 
         let mut state = StreamingState::new();
-        // Declares one more chunk than the loop ever sends, so the stream
-        // never completes mid-test and vanishing from `active_streams`
-        // (delivered, not reaped) can't be confused with the reap this test
-        // is guarding against.
-        let total = (STRIDE * 9) as u64;
-        start(&mut state, 13, total);
+        // Declares far more chunks than the loop sends, so the stream never
+        // completes mid-test.
+        let total = (STRIDE * 1000) as u64;
+        start(&mut state, 14, total);
 
-        let mut total_elapsed = Duration::ZERO;
-        for idx in 0..8u32 {
+        for idx in 0..12u32 {
             std::thread::sleep(Duration::from_millis(10));
-            total_elapsed += Duration::from_millis(10);
             let payload = [0x5Au8; STRIDE];
-            let _ = chunk(&mut state, 13, total, idx, &payload);
-            state.cleanup_stale_with(idle_timeout);
+            let _ = chunk(&mut state, 14, total, idx, &payload);
+            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
             assert_eq!(
                 state.active_stream_count(),
                 1,
-                "a progressing stream must not be reaped for its total age"
+                "a stream clearing the minimum rate every window must not be reaped"
             );
         }
+    }
+
+    /// The bound that keeps "any progress resets the clock" from being
+    /// exploitable: a stream that sends real, nonzero progress on every
+    /// single reaper tick -- so the zero-progress idle check alone never
+    /// fires -- must still be reaped once it fails to sustain
+    /// `min_bytes_per_window` across a full rate window. Without this
+    /// check, a peer trickling one chunk just under the idle timeout could
+    /// hold its slot and inflight-byte reservation forever for the cost of
+    /// a few bytes a tick.
+    ///
+    /// This test genuinely fails if the rate-floor check is removed, or
+    /// inverted to require only nonzero (rather than sufficient) progress
+    /// per window: with either of those, this stream would never be
+    /// reaped and the loop would exhaust its iterations still active.
+    #[test]
+    fn stream_below_the_rate_floor_is_reaped_despite_dodging_the_idle_check() {
+        use chunk_integrity::{STRIDE, chunk, start};
+        use std::time::Duration;
+
+        let idle_timeout = Duration::from_millis(50); // never crossed: a chunk lands every tick
+        let rate_window = Duration::from_millis(30);
+        // One STRIDE-sized chunk per tick delivers STRIDE bytes per window at
+        // best; demanding far more than that per window makes the floor
+        // unmeetable by this drip, regardless of exact tick timing.
+        let min_bytes_per_window = STRIDE * 100;
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 1000) as u64;
+        start(&mut state, 15, total);
+
+        let mut reaped = false;
+        for idx in 0..40u32 {
+            std::thread::sleep(Duration::from_millis(5));
+            let payload = [0x5Au8; STRIDE];
+            // The drip keeps making real, nonzero progress every tick, which
+            // is enough to defeat a zero-progress-only idle check.
+            let _ = chunk(&mut state, 15, total, idx, &payload);
+            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            if state.active_stream_count() == 0 {
+                reaped = true;
+                break;
+            }
+        }
         assert!(
-            total_elapsed > old_cap_stand_in,
-            "test must actually run past the old absolute-cap stand-in to be meaningful"
+            reaped,
+            "a stream making only trickle progress every tick must eventually be reaped \
+             for failing to sustain the minimum transfer rate, even though it never goes \
+             idle long enough to trip the zero-progress check alone"
         );
     }
 
@@ -1951,7 +2088,7 @@ mod tests {
         );
 
         std::thread::sleep(Duration::from_millis(30));
-        state.cleanup_stale_with(Duration::from_millis(10));
+        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
 
         assert_eq!(
             state.active_stream_count(),
@@ -2216,7 +2353,7 @@ mod tests {
             target[..8].copy_from_slice(&[0xAB; 8]);
             read += 8;
             state.record_v5_chunk_progress(reservation);
-            state.cleanup_stale_with(idle_timeout);
+            state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
             assert_eq!(
                 state.active_stream_count(),
                 1,
@@ -2258,7 +2395,7 @@ mod tests {
                 .expect("reservation is still live");
         }
 
-        state.cleanup_stale_with(Duration::from_millis(10));
+        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -2292,7 +2429,7 @@ mod tests {
 
         // Idle out with nothing further arriving for this stream, then reap.
         std::thread::sleep(Duration::from_millis(20));
-        state.cleanup_stale_with(Duration::from_millis(5));
+        state.cleanup_stale_with(Duration::from_millis(5), Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -2338,7 +2475,7 @@ mod tests {
             .expect("start stream and reserve its first chunk");
 
         std::thread::sleep(ttl + Duration::from_millis(10));
-        state.cleanup_stale_with(ttl);
+        state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -2350,7 +2487,8 @@ mod tests {
         // back out, so the tombstone must never actually lapse.
         for _ in 0..4 {
             std::thread::sleep(ttl / 2);
-            state.cleanup_stale_with(ttl); // prunes any tombstone that truly expired
+            // prunes any tombstone that truly expired
+            state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
             let result = state
                 .reserve_v5_chunk_or_discard(301, 1, 8)
                 .expect("a trickling late chunk must never be a fatal protocol error");
