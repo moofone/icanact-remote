@@ -75,7 +75,8 @@ async fn send_fullsync<S: tokio::io::AsyncWrite + Unpin>(
     };
 
     let data = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).expect("serialize fullsync");
-    let header = icanact_remote::framing::write_gossip_frame_prefix(data.len());
+    let header =
+        icanact_remote::framing::write_gossip_frame_prefix(data.len()).expect("gossip header");
     stream
         .write_all(&header)
         .await
@@ -149,7 +150,8 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
 
     let correlation_id: u32 = 0x1_0000;
     let payload = b"hello-bad-client".to_vec();
-    let header = icanact_remote::framing::write_direct_ask_header(correlation_id, payload.len());
+    let header = icanact_remote::framing::write_direct_ask_header(correlation_id, payload.len())
+        .expect("direct ask header");
 
     // Send 1 byte at a time to force heavy fragmentation.
     for b in header {
@@ -195,7 +197,8 @@ async fn truncated_frame_does_not_crash_server() {
         let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
         send_fullsync(&mut tls, client_peer_id).await;
         let correlation_id: u32 = 7;
-        let header = icanact_remote::framing::write_direct_ask_header(correlation_id, 32);
+        let header = icanact_remote::framing::write_direct_ask_header(correlation_id, 32)
+            .expect("direct ask header");
         tls.write_all(&header).await.expect("write header");
         tls.write_all(b"x").await.expect("write partial payload");
         // Drop TLS stream abruptly: server should handle EOF without panicking.

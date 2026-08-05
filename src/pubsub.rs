@@ -1841,7 +1841,7 @@ fn encode_fast_pubsub_datagram_pooled(
     payload: &[u8],
 ) -> Option<crate::typed::PooledPayload> {
     let payload_len = fast_frame_len(destination_peers, payload);
-    let header = crate::framing::write_pubsub_frame_prefix(payload_len);
+    let header = crate::framing::write_pubsub_frame_prefix(payload_len).ok()?;
     let datagram_len = header.len().saturating_add(payload_len);
     if datagram_len > UDP_MAX_DATAGRAM_SIZE {
         return None;

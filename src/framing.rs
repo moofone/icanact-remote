@@ -1,4 +1,4 @@
-use crate::MessageType;
+use crate::{GossipError, MessageType, Result};
 
 /// Every V5 frame begins with one big-endian control word: kind:5 | body_len:27.
 /// body_len counts all bytes after the word.
@@ -133,22 +133,35 @@ pub struct Control {
     pub body_len: usize,
 }
 
+/// Sum a fixed header length with a caller-supplied payload length, bounded
+/// to the V5 27-bit body-length field. `payload_len` on the writers below
+/// always ultimately comes from a `Bytes`/`PooledPayload` a caller handed in
+/// (tell, ask, gossip, pubsub, direct) -- an ordinary, un-chunked send with
+/// no upper bound of its own before this call -- so this must return a
+/// recoverable error instead of the `.expect()` it used to panic with: a
+/// local caller whose payload is too large gets `MessageTooLarge` back, not
+/// a panicked sending task (and, via `ExitGuard`, a torn-down connection).
 #[inline]
-pub fn checked_body_len(fixed_len: usize, payload_len: usize) -> usize {
+pub fn checked_body_len(fixed_len: usize, payload_len: usize) -> Result<usize> {
     fixed_len
         .checked_add(payload_len)
         .filter(|len| *len <= CONTROL_BODY_LEN_MASK as usize)
-        .expect("frame body length exceeds V5 27-bit limit")
+        .ok_or_else(|| GossipError::MessageTooLarge {
+            size: fixed_len.saturating_add(payload_len),
+            max: CONTROL_BODY_LEN_MASK as usize,
+        })
 }
 
 #[inline]
-pub fn encode_control(kind: WireKind, body_len: usize) -> [u8; LENGTH_PREFIX_LEN] {
-    assert!(
-        body_len <= CONTROL_BODY_LEN_MASK as usize,
-        "frame body length exceeds V5 27-bit limit"
-    );
+pub fn encode_control(kind: WireKind, body_len: usize) -> Result<[u8; LENGTH_PREFIX_LEN]> {
+    if body_len > CONTROL_BODY_LEN_MASK as usize {
+        return Err(GossipError::MessageTooLarge {
+            size: body_len,
+            max: CONTROL_BODY_LEN_MASK as usize,
+        });
+    }
     let word = ((kind as u32) << CONTROL_BODY_LEN_BITS) | body_len as u32;
-    word.to_be_bytes()
+    Ok(word.to_be_bytes())
 }
 
 #[inline]
@@ -162,10 +175,10 @@ pub fn decode_control(bytes: [u8; LENGTH_PREFIX_LEN]) -> Option<Control> {
 }
 
 #[inline]
-fn init_header<const N: usize>(kind: WireKind, body_len: usize) -> [u8; N] {
+fn init_header<const N: usize>(kind: WireKind, body_len: usize) -> Result<[u8; N]> {
     let mut header = [0u8; N];
-    header[..LENGTH_PREFIX_LEN].copy_from_slice(&encode_control(kind, body_len));
-    header
+    header[..LENGTH_PREFIX_LEN].copy_from_slice(&encode_control(kind, body_len)?);
+    Ok(header)
 }
 
 /// V5 actor tell header. Payload begins at offset 16 for every inline size.
@@ -173,12 +186,12 @@ pub fn write_actor_tell_header(
     actor_id: u64,
     type_hash: u32,
     payload_len: usize,
-) -> [u8; ACTOR_TELL_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(ACTOR_TELL_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::ActorTell, body_len);
+) -> Result<[u8; ACTOR_TELL_FRAME_HEADER_LEN]> {
+    let body_len = checked_body_len(ACTOR_TELL_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ACTOR_TELL_FRAME_HEADER_LEN] = init_header(WireKind::ActorTell, body_len)?;
     header[4..12].copy_from_slice(&actor_id.to_be_bytes());
     header[12..16].copy_from_slice(&type_hash.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// V5 actor ask header. The trailing pad preserves a 16-byte payload offset.
@@ -187,13 +200,13 @@ pub fn write_actor_ask_header(
     actor_id: u64,
     type_hash: u32,
     payload_len: usize,
-) -> [u8; ACTOR_ASK_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(ACTOR_ASK_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::ActorAsk, body_len);
+) -> Result<[u8; ACTOR_ASK_FRAME_HEADER_LEN]> {
+    let body_len = checked_body_len(ACTOR_ASK_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ACTOR_ASK_FRAME_HEADER_LEN] = init_header(WireKind::ActorAsk, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
     header[8..16].copy_from_slice(&actor_id.to_be_bytes());
     header[16..20].copy_from_slice(&type_hash.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// V5 compact ask after its route was bound on this connection.
@@ -201,23 +214,29 @@ pub fn write_routed_actor_ask_header(
     correlation_id: u32,
     route_slot: u32,
     payload_len: usize,
-) -> [u8; ROUTED_ACTOR_ASK_FRAME_HEADER_LEN] {
-    let mut header = init_header(
-        WireKind::RoutedActorAsk,
-        checked_body_len(ROUTED_ACTOR_ASK_HEADER_LEN, payload_len),
-    );
+) -> Result<[u8; ROUTED_ACTOR_ASK_FRAME_HEADER_LEN]> {
+    let body_len = checked_body_len(ROUTED_ACTOR_ASK_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ROUTED_ACTOR_ASK_FRAME_HEADER_LEN] =
+        init_header(WireKind::RoutedActorAsk, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
     header[8..12].copy_from_slice(&route_slot.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// Establishes a connection-scoped slot before a routed ask uses it.
+///
+/// `ROUTE_BIND_HEADER_LEN` is a fixed 20-byte constant, not a caller-supplied
+/// payload length -- it is always far under the V5 27-bit body-length limit,
+/// so this can never fail and stays infallible rather than pushing `?`
+/// through every one of its call sites for a case that cannot occur.
 pub fn write_route_bind_header(
     route_slot: u32,
     actor_id: u64,
     type_hash: u32,
 ) -> [u8; ROUTE_BIND_FRAME_HEADER_LEN] {
-    let mut header = init_header(WireKind::RouteBind, ROUTE_BIND_HEADER_LEN);
+    let mut header: [u8; ROUTE_BIND_FRAME_HEADER_LEN] =
+        init_header(WireKind::RouteBind, ROUTE_BIND_HEADER_LEN)
+            .expect("ROUTE_BIND_HEADER_LEN is a fixed constant within the V5 27-bit limit");
     header[4..8].copy_from_slice(&route_slot.to_be_bytes());
     header[8..16].copy_from_slice(&actor_id.to_be_bytes());
     header[16..20].copy_from_slice(&type_hash.to_be_bytes());
@@ -228,51 +247,61 @@ pub fn write_ask_response_header(
     msg_type: MessageType,
     correlation_id: u32,
     payload_len: usize,
-) -> [u8; ASK_RESPONSE_FRAME_HEADER_LEN] {
+) -> Result<[u8; ASK_RESPONSE_FRAME_HEADER_LEN]> {
     let kind = match msg_type {
         MessageType::Ask => WireKind::Ask,
         MessageType::Response => WireKind::Response,
         _ => panic!("ask/response header requires Ask or Response"),
     };
-    let body_len = checked_body_len(ASK_RESPONSE_HEADER_LEN, payload_len);
-    let mut header = init_header(kind, body_len);
+    let body_len = checked_body_len(ASK_RESPONSE_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ASK_RESPONSE_FRAME_HEADER_LEN] = init_header(kind, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
-    header
+    Ok(header)
 }
 
-pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER_LEN] {
+pub fn write_gossip_frame_prefix(payload_len: usize) -> Result<[u8; GOSSIP_FRAME_HEADER_LEN]> {
     init_header(
         WireKind::Gossip,
-        checked_body_len(GOSSIP_HEADER_LEN, payload_len),
+        checked_body_len(GOSSIP_HEADER_LEN, payload_len)?,
     )
 }
 
-pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER_LEN] {
+pub fn write_pubsub_frame_prefix(payload_len: usize) -> Result<[u8; PUBSUB_FRAME_HEADER_LEN]> {
     init_header(
         WireKind::PubSub,
-        checked_body_len(PUBSUB_HEADER_LEN, payload_len),
+        checked_body_len(PUBSUB_HEADER_LEN, payload_len)?,
     )
 }
 
 pub fn write_direct_ask_header(
     correlation_id: u32,
     payload_len: usize,
-) -> [u8; DIRECT_ASK_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(DIRECT_ASK_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::DirectAsk, body_len);
+) -> Result<[u8; DIRECT_ASK_FRAME_HEADER_LEN]> {
+    let body_len = checked_body_len(DIRECT_ASK_HEADER_LEN, payload_len)?;
+    let mut header: [u8; DIRECT_ASK_FRAME_HEADER_LEN] = init_header(WireKind::DirectAsk, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
-    header
+    Ok(header)
 }
 
 pub fn write_direct_response_header(
     correlation_id: u32,
     payload_len: usize,
-) -> [u8; DIRECT_RESPONSE_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(DIRECT_RESPONSE_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::DirectResponse, body_len);
+) -> Result<[u8; DIRECT_RESPONSE_FRAME_HEADER_LEN]> {
+    let body_len = checked_body_len(DIRECT_RESPONSE_HEADER_LEN, payload_len)?;
+    let mut header: [u8; DIRECT_RESPONSE_FRAME_HEADER_LEN] =
+        init_header(WireKind::DirectResponse, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
-    header
+    Ok(header)
 }
+
+/// Stream chunk headers stay infallible: `first_chunk_len`/`payload_len` here
+/// are never the caller's raw, unbounded payload length -- the streaming
+/// writer always clamps every chunk to `max_stream_chunk_size()` first
+/// (itself derived from `max_message_size`, which config validation already
+/// bounds to the V5 27-bit limit), so `checked_body_len` can never observe an
+/// oversize value on this path.
+const STREAM_CHUNK_INVARIANT: &str =
+    "stream chunk length is bounded by max_stream_chunk_size, always within the V5 27-bit limit";
 
 pub fn write_stream_request_start_header(
     stream_id: u32,
@@ -282,10 +311,10 @@ pub fn write_stream_request_start_header(
     type_hash: u32,
     first_chunk_len: usize,
 ) -> [u8; STREAM_REQUEST_START_FRAME_HEADER_LEN] {
-    let mut header = init_header(
-        WireKind::StreamStart,
-        checked_body_len(STREAM_REQUEST_START_HEADER_LEN, first_chunk_len),
-    );
+    let body_len = checked_body_len(STREAM_REQUEST_START_HEADER_LEN, first_chunk_len)
+        .expect(STREAM_CHUNK_INVARIANT);
+    let mut header: [u8; STREAM_REQUEST_START_FRAME_HEADER_LEN] =
+        init_header(WireKind::StreamStart, body_len).expect(STREAM_CHUNK_INVARIANT);
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&correlation_id.to_be_bytes());
     header[12..16].copy_from_slice(&total_size.to_be_bytes());
@@ -300,10 +329,10 @@ pub fn write_stream_response_start_header(
     total_size: u32,
     first_chunk_len: usize,
 ) -> [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] {
-    let mut header = init_header(
-        WireKind::StreamResponseStart,
-        checked_body_len(STREAM_RESPONSE_START_HEADER_LEN, first_chunk_len),
-    );
+    let body_len = checked_body_len(STREAM_RESPONSE_START_HEADER_LEN, first_chunk_len)
+        .expect(STREAM_CHUNK_INVARIANT);
+    let mut header: [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] =
+        init_header(WireKind::StreamResponseStart, body_len).expect(STREAM_CHUNK_INVARIANT);
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&correlation_id.to_be_bytes());
     header[12..16].copy_from_slice(&total_size.to_be_bytes());
@@ -321,17 +350,23 @@ pub fn write_stream_data_header(
     } else {
         WireKind::StreamData
     };
-    let mut header = init_header(kind, checked_body_len(STREAM_DATA_HEADER_LEN, payload_len));
+    let body_len =
+        checked_body_len(STREAM_DATA_HEADER_LEN, payload_len).expect(STREAM_CHUNK_INVARIANT);
+    let mut header: [u8; STREAM_DATA_FRAME_HEADER_LEN] =
+        init_header(kind, body_len).expect(STREAM_CHUNK_INVARIANT);
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&chunk_index.to_be_bytes());
     header
 }
 
+/// `STREAM_DATA_HEADER_LEN` is a fixed 8-byte constant -- this can never fail.
 pub fn write_stream_abort_header(
     stream_id: u32,
     reason: u32,
 ) -> [u8; STREAM_DATA_FRAME_HEADER_LEN] {
-    let mut header = init_header(WireKind::StreamAbort, STREAM_DATA_HEADER_LEN);
+    let mut header: [u8; STREAM_DATA_FRAME_HEADER_LEN] =
+        init_header(WireKind::StreamAbort, STREAM_DATA_HEADER_LEN)
+            .expect("STREAM_DATA_HEADER_LEN is a fixed constant within the V5 27-bit limit");
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&reason.to_be_bytes());
     header
@@ -343,7 +378,7 @@ mod tests {
 
     #[test]
     fn control_round_trip_and_rejects_unknown_kind() {
-        let bytes = encode_control(WireKind::ActorTell, 123);
+        let bytes = encode_control(WireKind::ActorTell, 123).unwrap();
         assert_eq!(
             decode_control(bytes),
             Some(Control {
@@ -374,7 +409,7 @@ mod tests {
             WireKind::RoutedActorAsk,
         ];
         for (expected_value, kind) in kinds.into_iter().enumerate() {
-            let bytes = encode_control(kind, 17);
+            let bytes = encode_control(kind, 17).unwrap();
             assert_eq!(
                 u32::from_be_bytes(bytes) >> CONTROL_BODY_LEN_BITS,
                 expected_value as u32
@@ -389,7 +424,7 @@ mod tests {
         for raw_kind in 0..=WireKind::StreamAbort as u8 {
             let kind = WireKind::from_u8(raw_kind).expect("dense V5 kind");
             for body_len in lengths {
-                let encoded = encode_control(kind, body_len);
+                let encoded = encode_control(kind, body_len).unwrap();
                 assert_eq!(decode_control(encoded), Some(Control { kind, body_len }));
             }
         }
@@ -405,7 +440,8 @@ mod tests {
             10 * 1024 * 1024,
             CONTROL_BODY_LEN_MASK as usize - ACTOR_TELL_HEADER_LEN,
         ] {
-            let header = write_actor_tell_header(0x0102_0304_0506_0708, 0x1122_3344, payload_len);
+            let header =
+                write_actor_tell_header(0x0102_0304_0506_0708, 0x1122_3344, payload_len).unwrap();
             assert_eq!(header.len(), 16);
             assert_eq!(
                 u64::from_be_bytes(header[4..12].try_into().unwrap()),
@@ -441,7 +477,7 @@ mod tests {
 
     #[test]
     fn direct_frames_do_not_encode_redundant_payload_length() {
-        let header = write_direct_ask_header(0x1234_5678, 9);
+        let header = write_direct_ask_header(0x1234_5678, 9).unwrap();
         let control = decode_control(header[..4].try_into().unwrap()).unwrap();
         assert_eq!(control.kind, WireKind::DirectAsk);
         assert_eq!(control.body_len, DIRECT_ASK_HEADER_LEN + 9);
@@ -454,7 +490,7 @@ mod tests {
 
     #[test]
     fn routed_ask_is_sixteen_bytes_and_route_bind_is_exact() {
-        let ask = write_routed_actor_ask_header(7, 11, 99);
+        let ask = write_routed_actor_ask_header(7, 11, 99).unwrap();
         assert_eq!(ask.len(), 16);
         assert_eq!(
             decode_control(ask[..4].try_into().unwrap()).unwrap().kind,
@@ -471,14 +507,72 @@ mod tests {
         assert_eq!(u32::from_be_bytes(bind[4..8].try_into().unwrap()), 11);
     }
 
+    /// A body length at exactly the V5 27-bit limit is still representable;
+    /// one byte past it must be rejected, not silently truncated.
     #[test]
-    fn oversize_body_panics() {
-        assert!(
-            std::panic::catch_unwind(|| {
-                write_actor_tell_header(0, 0, CONTROL_BODY_LEN_MASK as usize)
-            })
-            .is_err()
-        );
+    fn checked_body_len_boundary_at_and_above_27_bits() {
+        let max = CONTROL_BODY_LEN_MASK as usize;
+        assert_eq!(checked_body_len(0, max).unwrap(), max);
+        assert_eq!(checked_body_len(1, max - 1).unwrap(), max);
+        assert!(checked_body_len(0, max + 1).is_err());
+        assert!(checked_body_len(1, max).is_err());
+    }
+
+    /// Same boundary, exercised through `encode_control` directly (the other
+    /// former panic site): the error must carry the offending size and the
+    /// limit, not just a message.
+    #[test]
+    fn encode_control_boundary_at_and_above_27_bits() {
+        let max = CONTROL_BODY_LEN_MASK as usize;
+        assert!(encode_control(WireKind::Gossip, max).is_ok());
+        match encode_control(WireKind::Gossip, max + 1) {
+            Err(GossipError::MessageTooLarge { size, max: reported }) => {
+                assert_eq!(size, max + 1);
+                assert_eq!(reported, max);
+            }
+            other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+    }
+
+    /// Every writer whose body length is a direct function of a
+    /// caller-supplied payload must return `MessageTooLarge` at and above the
+    /// 27-bit limit instead of panicking `checked_body_len`'s old `.expect`
+    /// or `encode_control`'s old `assert!`.
+    #[test]
+    fn oversize_body_returns_message_too_large_not_panic() {
+        let oversized = CONTROL_BODY_LEN_MASK as usize + 1;
+        assert!(matches!(
+            write_actor_tell_header(0, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            write_actor_ask_header(0, 0, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            write_routed_actor_ask_header(0, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            write_ask_response_header(MessageType::Ask, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            write_gossip_frame_prefix(oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            write_pubsub_frame_prefix(oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            write_direct_ask_header(0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            write_direct_response_header(0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
     }
 
     #[test]

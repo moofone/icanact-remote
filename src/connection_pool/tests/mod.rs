@@ -2587,7 +2587,8 @@ fn stream_direct_ask_throughput_bench() {
                     let payload = &msg[crate::framing::DIRECT_ASK_HEADER_LEN
                         ..crate::framing::DIRECT_ASK_HEADER_LEN + payload_len];
                     let header =
-                        crate::framing::write_direct_response_header(correlation_id, payload_len);
+                        crate::framing::write_direct_response_header(correlation_id, payload_len)
+                            .unwrap();
                     tokio::io::AsyncWriteExt::write_all(&mut server_io, &header)
                         .await
                         .unwrap();
@@ -2605,7 +2606,8 @@ fn stream_direct_ask_throughput_bench() {
                         crate::MessageType::Response,
                         correlation_id,
                         payload_len,
-                    );
+                    )
+                    .unwrap();
                     tokio::io::AsyncWriteExt::write_all(&mut server_io, &header)
                         .await
                         .unwrap();

@@ -1394,7 +1394,7 @@ where
                 crate::MessageType::Response,
                 correlation_id,
                 bytes.len(),
-            );
+            )?;
             write_header_payload_vectored(
                 stream,
                 bytes_written_counter,
@@ -1409,7 +1409,7 @@ where
                 crate::MessageType::Response,
                 correlation_id,
                 bytes.len(),
-            );
+            )?;
             write_header_payload_vectored(
                 stream,
                 bytes_written_counter,
@@ -1428,7 +1428,7 @@ where
                 crate::MessageType::Response,
                 correlation_id,
                 payload_len,
-            );
+            )?;
             stream
                 .write_all(&header)
                 .await

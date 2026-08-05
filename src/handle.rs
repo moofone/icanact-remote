@@ -1126,7 +1126,8 @@ mod tests {
         msg: &crate::registry::RegistryMessage,
     ) {
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(msg).expect("serialize gossip");
-        let header = crate::framing::write_gossip_frame_prefix(data.len());
+        let header =
+            crate::framing::write_gossip_frame_prefix(data.len()).expect("gossip header");
         tokio::io::AsyncWriteExt::write_all(writer, &header)
             .await
             .expect("write gossip header");
@@ -4686,11 +4687,17 @@ pub(crate) async fn handle_raw_ask_request(
 
         if let Some(conn) = conn {
             if let Some(ref stream_handle) = conn.stream_handle {
-                let header = crate::framing::write_ask_response_header(
+                let header = match crate::framing::write_ask_response_header(
                     crate::MessageType::Response,
                     correlation_id,
                     response.len(),
-                );
+                ) {
+                    Ok(header) => header,
+                    Err(e) => {
+                        warn!(peer = %peer_addr, error = %e, "Ask response too large to frame");
+                        return;
+                    }
+                };
 
                 if let Err(e) = stream_handle
                     .write_header_and_payload_control(
@@ -5378,7 +5385,8 @@ mod framing_tests {
     #[tokio::test]
     async fn ask_raw_parses_with_padded_header() {
         let payload_bytes = b"hello";
-        let header = framing::write_ask_response_header(MessageType::Ask, 42, payload_bytes.len());
+        let header =
+            framing::write_ask_response_header(MessageType::Ask, 42, payload_bytes.len()).unwrap();
         let mut frame = Vec::with_capacity(header.len() + payload_bytes.len());
         frame.extend_from_slice(&header);
         frame.extend_from_slice(payload_bytes);
@@ -5399,7 +5407,8 @@ mod framing_tests {
     async fn response_parses_with_padded_header() {
         let payload_bytes = b"world";
         let header =
-            framing::write_ask_response_header(MessageType::Response, 7, payload_bytes.len());
+            framing::write_ask_response_header(MessageType::Response, 7, payload_bytes.len())
+                .unwrap();
         let mut frame = Vec::with_capacity(header.len() + payload_bytes.len());
         frame.extend_from_slice(&header);
         frame.extend_from_slice(payload_bytes);
@@ -5441,7 +5450,7 @@ mod framing_tests {
         ));
 
         let payload = b"routed payload";
-        let header = framing::write_routed_actor_ask_header(7, route_slot, payload.len());
+        let header = framing::write_routed_actor_ask_header(7, route_slot, payload.len()).unwrap();
         let mut frame = header.to_vec();
         frame.extend_from_slice(payload);
         match parse_with_routes(&frame, &routes).unwrap() {
@@ -5493,7 +5502,7 @@ mod framing_tests {
                 type_hash: 9
             }
         ));
-        let mut ask = framing::write_routed_actor_ask_header(5, 3, 0);
+        let mut ask = framing::write_routed_actor_ask_header(5, 3, 0).unwrap();
         ask[12] = 1;
         assert!(parse_with_routes(&ask, &routes).is_err());
     }
@@ -5504,7 +5513,8 @@ mod framing_tests {
         let actor_id = 0x0102030405060708u64;
         let type_hash = 0x11223344u32;
 
-        let header = framing::write_actor_tell_header(actor_id, type_hash, payload_bytes.len());
+        let header =
+            framing::write_actor_tell_header(actor_id, type_hash, payload_bytes.len()).unwrap();
         let mut frame = Vec::with_capacity(header.len() + payload_bytes.len());
         frame.extend_from_slice(&header);
         frame.extend_from_slice(payload_bytes);
@@ -5537,7 +5547,7 @@ mod framing_tests {
             sender_addr: "127.0.0.1:9200".to_string(),
         };
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&message).unwrap();
-        let header = framing::write_gossip_frame_prefix(payload.len());
+        let header = framing::write_gossip_frame_prefix(payload.len()).unwrap();
         let mut frame = Vec::with_capacity(header.len() + payload.len());
         frame.extend_from_slice(&header);
         frame.extend_from_slice(&payload);

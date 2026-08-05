@@ -2690,6 +2690,18 @@ impl LockFreeStreamHandle {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
+        // Reject locally before anything else: an inline ask over
+        // `max_message_size` gets a fatal `MessageTooLarge` read error from
+        // the receiver, tearing the whole connection down for every other
+        // actor sharing it. Checked first so an oversized ask never waits on
+        // identification or takes the route-bind gate for nothing.
+        if payload.len() > self.max_message_size {
+            return Err(GossipError::MessageTooLarge {
+                size: payload.len(),
+                max: self.max_message_size,
+            });
+        }
+
         // A brand-new outbound connection gates this behind its own
         // identifying FullSync (see `begin_identify_gate`/`mark_identified`
         // in `finalize_new_outbound_connection`): a `RouteBind` must never
@@ -2723,7 +2735,7 @@ impl LockFreeStreamHandle {
             // all, so this ask (and every later one on this connection) still
             // succeeds rather than the connection being torn down.
             let header =
-                crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
+                crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len())?;
             return self
                 .write_header_and_payload_ask_inline32(header, payload)
                 .await;
@@ -2753,7 +2765,7 @@ impl LockFreeStreamHandle {
             correlation_id,
             route_slot,
             payload.len(),
-        );
+        )?;
         self.write_header_and_payload_ask_inline(header, 16, payload)
             .await
     }
@@ -3152,6 +3164,14 @@ impl LockFreeStreamHandle {
         self.buffer_config.streaming_threshold()
     }
 
+    /// The peer's configured frame-body-length ceiling (see the `max_message_size`
+    /// field doc). Inline (non-streaming) sends must stay at or under this before
+    /// a header is even built: the receiver hard-rejects anything larger as a
+    /// fatal read error and tears the whole connection down.
+    pub(crate) fn max_message_size(&self) -> usize {
+        self.max_message_size
+    }
+
     pub fn schema_hash(&self) -> Option<u64> {
         self.schema_hash
     }
@@ -3362,7 +3382,7 @@ impl LockFreeStreamHandle {
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
-        );
+        )?;
         self.write_header_and_payload_control_inline(header, 16, payload)
             .await
     }

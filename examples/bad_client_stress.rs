@@ -176,7 +176,8 @@ fn build_actor_ask_frame(
         actor_id,
         type_hash,
         payload.len(),
-    );
+    )
+    .expect("actor ask header");
     let mut frame = Vec::with_capacity(header.len() + payload.len());
     frame.extend_from_slice(&header);
     frame.extend_from_slice(payload);
@@ -225,7 +226,8 @@ async fn connect_tls(
     };
     let serialized =
         rkyv::to_bytes::<rkyv::rancor::Error>(&full_sync).expect("serialize full sync");
-    let header = icanact_remote::framing::write_gossip_frame_prefix(serialized.len());
+    let header = icanact_remote::framing::write_gossip_frame_prefix(serialized.len())
+        .expect("gossip header");
     tls_stream
         .write_all(&header)
         .await

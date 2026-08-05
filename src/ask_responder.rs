@@ -60,7 +60,7 @@ async fn send_pooled_via_stream_handle(
         crate::MessageType::Response,
         correlation_id,
         payload_len,
-    );
+    )?;
     let prefix_len = prefix.as_ref().map(|bytes| bytes.len()).unwrap_or(0) as u8;
     stream_handle
         .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
@@ -146,7 +146,7 @@ impl AskResponseSink {
                     crate::MessageType::Response,
                     correlation_id,
                     payload.len(),
-                );
+                )?;
                 stream_handle
                     .write_header_and_payload_control_inline_nonblocking(header, 16, payload)
             }
@@ -162,7 +162,7 @@ impl AskResponseSink {
                     crate::MessageType::Response,
                     correlation_id,
                     payload.len(),
-                );
+                )?;
                 stream_handle.write_header_and_payload_control_inline_immediate_nonblocking(
                     header, 16, payload,
                 )
@@ -551,7 +551,7 @@ impl ResponseWriter {
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
-        );
+        )?;
         stream_handle.write_header_and_payload_control_inline_nonblocking(header, 16, payload)
     }
 
@@ -562,7 +562,7 @@ impl ResponseWriter {
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
-        );
+        )?;
         stream_handle
             .write_header_and_payload_control_inline_immediate_nonblocking(header, 16, payload)
     }

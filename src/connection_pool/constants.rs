@@ -295,7 +295,7 @@ where
             crate::MessageType::Response,
             batch.correlation_ids[0],
             batch.payloads[0].len(),
-        );
+        )?;
         let n = write_header_payload_all(stream, &header, batch.payloads[0].as_ref())
             .await
             .map_err(GossipError::Network)?;
@@ -335,7 +335,7 @@ where
                     crate::MessageType::Response,
                     batch.correlation_ids[resp_idx],
                     batch.payloads[resp_idx].len(),
-                );
+                )?;
                 // Use raw pointers so the borrow checker understands per-index disjointness.
                 let hdr_slot = unsafe { scratch_headers.as_mut_ptr().add(iov_len) };
                 unsafe {
@@ -472,7 +472,7 @@ where
         let header = crate::framing::write_direct_response_header(
             batch.correlation_ids[0],
             batch.payloads[0].len(),
-        );
+        )?;
         let n = write_header_payload_all(stream, &header, batch.payloads[0].as_ref())
             .await
             .map_err(GossipError::Network)?;
@@ -504,7 +504,7 @@ where
                 let header = crate::framing::write_direct_response_header(
                     batch.correlation_ids[resp_idx],
                     batch.payloads[resp_idx].len(),
-                );
+                )?;
                 let hdr_slot = unsafe { scratch_headers.as_mut_ptr().add(iov_len) };
                 unsafe {
                     (*hdr_slot).write(header);
