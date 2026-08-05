@@ -12319,7 +12319,10 @@ mod tests {
         let tasks = registry.gossip_peer_list_immediate().await;
         let targeted: Vec<SocketAddr> = tasks.iter().map(|t| t.peer_addr).collect();
         assert_eq!(
-            targeted.iter().filter(|a| **a == live_addr || **a == stale_addr).count(),
+            targeted
+                .iter()
+                .filter(|a| **a == live_addr || **a == stale_addr)
+                .count(),
             1,
             "the shared identity must receive exactly one peer-list gossip task: {targeted:?}"
         );
