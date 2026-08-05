@@ -1877,6 +1877,119 @@ mod tests {
         );
     }
 
+    /// TARGET BEHAVIOR (currently fails): a stream must never be reaped
+    /// purely for its total age while it keeps making genuine progress.
+    /// `cleanup_stale_with`'s absolute `max_lifetime` bound currently reaps
+    /// it anyway, which -- worse -- races a live V5 chunk reservation and
+    /// turns into a fatal connection teardown, not just a lost stream.
+    #[test]
+    fn progressing_stream_must_not_be_reaped_for_its_total_age() {
+        use chunk_integrity::{STRIDE, chunk, start};
+        use std::time::Duration;
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 4) as u64;
+        start(&mut state, 20, total);
+
+        std::thread::sleep(Duration::from_millis(20));
+        let payload = [0x5Au8; STRIDE];
+        let _ = chunk(&mut state, 20, total, 0, &payload);
+
+        // The chunk just arrived, so the stream is not idle. An absolute
+        // lifetime bound must not exist at all: this stream must survive
+        // regardless of how short a "max lifetime" is configured.
+        state.cleanup_stale_with(Duration::from_secs(60), Duration::from_millis(10));
+
+        assert_eq!(
+            state.active_stream_count(),
+            1,
+            "a stream that just made progress must not be reaped for its total age"
+        );
+    }
+
+    /// TARGET BEHAVIOR (currently fails): asking for the next write target
+    /// must not itself count as progress. `v5_chunk_target` currently
+    /// refreshes `last_activity` on every call, including polls where the
+    /// socket had nothing to give, so a peer that opens a reservation and
+    /// then stalls forever never gets reaped.
+    #[test]
+    fn polling_the_chunk_target_without_reading_bytes_must_not_refresh_activity() {
+        use std::time::Duration;
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 210,
+            total_size: 64,
+            chunk_size: 64,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let reservation = state
+            .begin_v5_stream(header, 1, pool, false, 64)
+            .expect("reserve the chunk");
+
+        std::thread::sleep(Duration::from_millis(15));
+        // The reader is polled repeatedly (e.g. the socket is not yet
+        // readable) but no byte is ever transferred.
+        for _ in 0..5 {
+            let _ = state
+                .v5_chunk_target(reservation, 0)
+                .expect("reservation is still live");
+        }
+
+        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(60));
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "polling for a write target without transferring bytes must not block idle reaping"
+        );
+    }
+
+    /// TARGET BEHAVIOR (currently fails): a sender that keeps trickling
+    /// chunks into a reaped id well past the tombstone's original TTL must
+    /// keep getting them silently discarded. `reserve_v5_chunk_or_discard`
+    /// currently only checks whether the id is tombstoned; it never
+    /// refreshes the tombstone's timer, so it eventually ages out and a
+    /// still-trickling sender falls through to a fatal "unknown stream_id".
+    #[test]
+    fn tombstone_must_be_refreshed_by_repeated_late_chunks_past_its_original_ttl() {
+        use std::time::Duration;
+
+        let ttl = Duration::from_millis(30);
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 301,
+            total_size: 8,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let _ = state
+            .begin_v5_stream(header, 1, pool, false, 8)
+            .expect("start stream and reserve its first chunk");
+
+        std::thread::sleep(ttl + Duration::from_millis(10));
+        state.cleanup_stale_with(ttl, Duration::from_secs(60));
+        assert_eq!(state.active_stream_count(), 0, "stream must be reaped first");
+
+        for _ in 0..4 {
+            std::thread::sleep(ttl / 2);
+            state.cleanup_stale_with(ttl, Duration::from_secs(60));
+            let result = state
+                .reserve_v5_chunk_or_discard(301, 1, 8)
+                .expect("a trickling late chunk must never be a fatal protocol error");
+            assert!(
+                result.is_none(),
+                "a trickling late chunk must keep being discarded, not accepted as fresh"
+            );
+        }
+    }
+
     /// The existing zero-length stream contract must keep working.
     #[test]
     fn empty_stream_finalizes_without_chunks() {
