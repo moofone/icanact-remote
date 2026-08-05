@@ -162,6 +162,248 @@ mod read_pipeline_tests {
         }
         super::NEXT_DIRECT_RESPONSE_STREAM_ID.store(previous, Ordering::SeqCst);
     }
+
+    /// Drives `read_message_step` until it yields a complete frame, without
+    /// hard-coding how many internal state-machine steps that takes (a
+    /// discard transition consumes zero bytes on the step that starts it, so
+    /// callers should not assume a fixed step count per frame).
+    async fn read_next_frame<S>(
+        stream: &mut S,
+        state: &mut super::ReadState,
+        ctx: &super::ReadContext,
+        streams: &mut crate::protocol::StreamingState,
+    ) -> crate::Result<crate::handle::MessageReadResult>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        for _ in 0..16 {
+            if let Some(result) = super::read_message_step(stream, state, ctx, streams).await? {
+                return Ok(result);
+            }
+        }
+        panic!("read_next_frame: no complete frame after 16 steps");
+    }
+
+    fn test_read_context(port: u16) -> super::ReadContext {
+        super::ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size: 4096,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    /// End-to-end: a stream that keeps making progress runs straight through
+    /// reaper ticks that -- under the old age-since-start cap -- would have
+    /// killed it mid-flight, assembles byte-exact, and the connection keeps
+    /// working immediately afterward (a following frame reads cleanly).
+    #[tokio::test]
+    async fn slow_progressing_stream_survives_reaper_ticks_and_connection_keeps_working() {
+        const STRIDE: usize = 8;
+        const CHUNKS: u32 = 4;
+        let stream_id = 41u32;
+        let total_size = STRIDE as u32 * CHUNKS;
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let ctx = test_read_context(9100);
+        let mut state = super::ReadState::new();
+        let mut streams = crate::protocol::StreamingState::new();
+
+        // A modest idle bound is enough: every chunk in this test lands
+        // within microseconds of the previous one (no real sleeping), so
+        // `record_v5_chunk_progress` keeps `last_activity` far inside this
+        // window on every tick -- the assertion below is meaningful because
+        // the old policy reaped on total age regardless of that fact, not
+        // because this bound is unrealistically generous.
+        let idle_timeout = std::time::Duration::from_millis(20);
+
+        let start_header = crate::framing::write_stream_request_start_header(
+            stream_id, 0, total_size, 7, 3, STRIDE,
+        );
+        writer.write_all(&start_header).await.unwrap();
+        writer.write_all(&[0xA0u8; STRIDE]).await.unwrap();
+
+        // ReadLen -> ReadStreamMeta -> ReadStreamPayload (reserve + first chunk).
+        assert!(
+            super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first_result = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+            .await
+            .unwrap();
+        assert!(first_result.is_none(), "a 1-of-4 chunk stream is not complete");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0xA0u8; STRIDE]);
+
+        let mut final_result = None;
+        for idx in 1..CHUNKS {
+            // Simulate a reaper tick landing between every chunk. Real bytes
+            // just landed (the previous chunk's commit and this loop's own
+            // progress), so `record_v5_chunk_progress` keeps the stream out
+            // of reach of even this maximally aggressive idle bound.
+            streams.cleanup_stale_with(idle_timeout);
+            assert_eq!(
+                streams.active_stream_count(),
+                1,
+                "a stream that is still progressing must survive a reaper tick"
+            );
+
+            let payload = [0xA0u8 + idx as u8; STRIDE];
+            let data_header = crate::framing::write_stream_data_header(false, stream_id, idx, STRIDE);
+            writer.write_all(&data_header).await.unwrap();
+            writer.write_all(&payload).await.unwrap();
+            expected.extend_from_slice(&payload);
+
+            assert!(
+                super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            final_result = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                .await
+                .unwrap();
+        }
+
+        let result = final_result.expect("the last chunk must complete the stream");
+        match result {
+            crate::handle::MessageReadResult::Actor { payload, actor_id, type_hash, .. } => {
+                assert_eq!(payload.as_ref(), expected.as_slice());
+                assert_eq!(actor_id, 7);
+                assert_eq!(type_hash, 3);
+            }
+            other => panic!("expected an assembled Actor message, got {other:?}"),
+        }
+
+        // The connection must still work: a completely unrelated frame reads
+        // cleanly right after.
+        let abort = crate::framing::write_stream_abort_header(999, 4);
+        writer.write_all(&abort).await.unwrap();
+        let _ = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+            .await
+            .unwrap();
+        let abort_result = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+            .await
+            .unwrap()
+            .expect("a frame following a completed stream must still parse");
+        assert!(matches!(
+            abort_result,
+            crate::handle::MessageReadResult::StreamAbort { stream_id: 999, reason: 4 }
+        ));
+    }
+
+    /// If a stream genuinely must be reaped while its chunk reservation is
+    /// still live mid-read, that must discard only the one in-flight chunk,
+    /// never tear the connection down. This is the exact race #151/ffebf77
+    /// established the pattern for: drain the frame's remaining bytes into
+    /// scratch instead of surfacing a fatal "stream vanished" error.
+    #[tokio::test]
+    async fn stream_reaped_mid_read_discards_the_chunk_without_a_connection_teardown() {
+        let stream_id = 51u32;
+        let total_size = 16u32;
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let ctx = test_read_context(9101);
+        let mut state = super::ReadState::new();
+        let mut streams = crate::protocol::StreamingState::new();
+
+        let start_header = crate::framing::write_stream_request_start_header(
+            stream_id,
+            0,
+            total_size,
+            1,
+            2,
+            total_size as usize,
+        );
+        writer.write_all(&start_header).await.unwrap();
+        // Only part of the single declared chunk arrives; the rest trickles
+        // in later, after the stream has already been reaped out from under
+        // the live reservation.
+        writer.write_all(&[0xEEu8; 4]).await.unwrap();
+
+        assert!(
+            super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Partial read: 4 of 16 bytes land, leaving the reservation live and
+        // the read state parked mid-chunk.
+        assert!(
+            super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(streams.active_stream_count(), 1);
+
+        // Force the reap: any elapsed time at all exceeds a zero idle bound,
+        // deterministically reaping the stream without a real sleep.
+        streams.cleanup_stale_with(std::time::Duration::from_millis(0));
+        assert_eq!(
+            streams.active_stream_count(),
+            0,
+            "the stream must have been reaped out from under the live reservation"
+        );
+
+        // The remainder of the chunk arrives, unaware the stream is gone.
+        // The very next step only transitions ReadStreamPayload into the
+        // discard state (it consumes zero bytes doing so), so this step
+        // alone must not error and must not yet produce a frame.
+        writer.write_all(&[0xEEu8; 12]).await.unwrap();
+        let result = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams).await;
+        assert!(
+            result.is_ok(),
+            "a reap racing a live reservation must not be a fatal connection error: {result:?}"
+        );
+        assert!(result.unwrap().is_none());
+        assert!(matches!(state, super::ReadState::DiscardStreamPayload { .. }));
+
+        // The discard must consume exactly the remaining bytes, restoring
+        // frame sync: a following, unrelated frame still reads cleanly.
+        let abort = crate::framing::write_stream_abort_header(777, 2);
+        writer.write_all(&abort).await.unwrap();
+        let abort_result = read_next_frame(&mut reader, &mut state, &ctx, &mut streams)
+            .await
+            .expect("connection must keep working after a discarded chunk");
+        assert!(matches!(
+            abort_result,
+            crate::handle::MessageReadResult::StreamAbort { stream_id: 777, reason: 2 }
+        ));
+    }
 }
 
 enum ReadState {
@@ -320,6 +562,23 @@ fn stream_payload_state(
     }
 }
 
+/// Builds the state to drain the unread remainder of a chunk whose owning
+/// stream was reaped while its reservation was still live (see
+/// `crate::protocol::is_stream_reaped_error`). The stream's backing buffer
+/// is already gone once reaped, so the remaining bytes are read into scratch
+/// and thrown away, exactly like a resource-pressure rejection -- this keeps
+/// the connection's framing intact without resurrecting or writing into
+/// freed stream state.
+fn discard_remainder_of_reservation(
+    reservation: crate::protocol::StreamChunkReservation,
+    read: usize,
+) -> ReadState {
+    ReadState::DiscardStreamPayload {
+        remaining: reservation.len() - read,
+        scratch: Box::new([0; 8192]),
+    }
+}
+
 #[inline]
 fn reject_zero_length_frame() -> GossipError {
     GossipError::Network(std::io::Error::new(
@@ -458,7 +717,14 @@ where
             Ok(None)
         }
         ReadState::ReadStreamPayload { reservation, read } => {
-            let target = streaming_state.v5_chunk_target(*reservation, *read)?;
+            let target = match streaming_state.v5_chunk_target(*reservation, *read) {
+                Ok(target) => target,
+                Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
+                    *state = discard_remainder_of_reservation(*reservation, *read);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
             let n = stream.read(target).await?;
             if n == 0 {
                 return Err(GossipError::Network(std::io::Error::new(
@@ -467,6 +733,7 @@ where
                 )));
             }
             *read += n;
+            streaming_state.record_v5_chunk_progress(*reservation);
             if *read < reservation.len() {
                 return Ok(None);
             }
@@ -742,7 +1009,14 @@ where
             }
         }
         ReadState::ReadStreamPayload { reservation, read } => {
-            let target = streaming_state.v5_chunk_target(*reservation, *read)?;
+            let target = match streaming_state.v5_chunk_target(*reservation, *read) {
+                Ok(target) => target,
+                Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
+                    *state = discard_remainder_of_reservation(*reservation, *read);
+                    return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            };
             match poll_read_once(stream, cx, target) {
                 Poll::Pending if block_on_pending => Poll::Pending,
                 Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
@@ -751,6 +1025,7 @@ where
                 )))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
+                    streaming_state.record_v5_chunk_progress(*reservation);
                     if *read < reservation.len() {
                         return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
                     }
@@ -974,7 +1249,14 @@ where
             }
         }
         ReadState::ReadStreamPayload { reservation, read } => {
-            let target = streaming_state.v5_chunk_target(*reservation, *read)?;
+            let target = match streaming_state.v5_chunk_target(*reservation, *read) {
+                Ok(target) => target,
+                Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
+                    *state = discard_remainder_of_reservation(*reservation, *read);
+                    return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            };
             match poll_read_once(stream, cx, target) {
                 Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
                 Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
@@ -982,6 +1264,7 @@ where
                 )))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
+                    streaming_state.record_v5_chunk_progress(*reservation);
                     if *read < reservation.len() {
                         return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
                     }
