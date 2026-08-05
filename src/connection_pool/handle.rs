@@ -1349,3 +1349,222 @@ mod pubsub_lane_tests {
         );
     }
 }
+
+/// Oversized INLINE sends (tell/ask/pubsub) were unguarded: a payload above
+/// the peer's `max_message_size` built a valid frame that the receiver then
+/// hard-rejected as `MessageTooLarge`, tearing the whole connection down for
+/// every other actor sharing it; a payload at/above the V5 27-bit
+/// body-length limit panicked `framing::checked_body_len`'s old `.expect()`.
+/// `reject_oversize_inline` (and the framing.rs `Result` fix) close both --
+/// every family below must fail locally instead, and the connection must
+/// still carry a normal-size message afterward.
+#[cfg(test)]
+mod oversized_inline_send_gate_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, PartialEq)]
+    struct GateTestMsg {
+        data: Vec<u8>,
+    }
+    crate::wire_type!(
+        GateTestMsg,
+        "connection_pool::handle::oversized_inline_send_gate_tests::GateTestMsg"
+    );
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:29998".parse().expect("valid test addr")
+    }
+
+    /// `max_message_size` defaults to `MASTER_BUFFER_SIZE` (1 MiB) when no
+    /// `ReadContext` is supplied (see `LockFreeStreamHandle::new`) -- small
+    /// enough that "one byte over the limit" tests allocate ~1 MiB, not
+    /// hundreds of MiB, and still exercise the exact gate a real connection
+    /// (configured with `GossipConfig::max_message_size`) would apply.
+    fn make_handle() -> (
+        ConnectionHandle,
+        Arc<LockFreeStreamHandle>,
+        JoinHandle<()>,
+        tokio::io::DuplexStream,
+    ) {
+        let (client, peer) = tokio::io::duplex(4 * 1024 * 1024);
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            test_addr(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream_handle = Arc::new(stream_handle);
+        let correlation = CorrelationTracker::new();
+        let conn = ConnectionHandle::new_stream(test_addr(), stream_handle.clone(), correlation);
+        (conn, stream_handle, task, peer)
+    }
+
+    /// One byte over the default `max_message_size` (`MASTER_BUFFER_SIZE`).
+    const OVERSIZED: usize = MASTER_BUFFER_SIZE + 1;
+
+    /// After an oversized send was rejected, a normal-size send on the same
+    /// connection must still go through and decode as a clean V5 frame --
+    /// proving the gate rejected the oversized payload locally instead of
+    /// desyncing or tearing down the connection.
+    async fn assert_connection_still_carries_a_normal_message(
+        conn: &ConnectionHandle,
+        peer: &mut tokio::io::DuplexStream,
+    ) {
+        conn.tell_bytes(bytes::Bytes::from_static(b"still-alive"))
+            .await
+            .expect("connection must still accept a normal-size send");
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        peer.read_exact(&mut ctrl)
+            .await
+            .expect("connection must still deliver bytes to the peer");
+        let control = crate::framing::decode_control(ctrl)
+            .expect("subsequent frame must decode as a valid V5 control word");
+        assert_eq!(control.kind, crate::framing::WireKind::Gossip);
+        assert_eq!(control.body_len, b"still-alive".len());
+    }
+
+    #[tokio::test]
+    async fn raw_tell_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let err = conn
+            .tell_bytes(bytes::Bytes::from(vec![0u8; OVERSIZED]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn try_raw_tell_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let err = conn
+            .try_tell_bytes(bytes::Bytes::from(vec![0u8; OVERSIZED]))
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn actor_frame_tell_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let err = conn
+            .tell_actor_frame(7, 9, bytes::Bytes::from(vec![0u8; OVERSIZED]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn try_actor_frame_tell_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let err = conn
+            .try_tell_actor_frame(7, 9, bytes::Bytes::from(vec![0u8; OVERSIZED]))
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn typed_tell_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let big = GateTestMsg {
+            data: vec![0u8; OVERSIZED],
+        };
+        let err = conn.tell_typed(&big).await.unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn bytes_ask_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let err = conn
+            .ask_with_timeout_bytes(bytes::Bytes::from(vec![0u8; OVERSIZED]), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn typed_ask_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let big = GateTestMsg {
+            data: vec![0u8; OVERSIZED],
+        };
+        let err = conn
+            .ask_typed::<GateTestMsg, GateTestMsg>(&big)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    /// `ask_actor_frame` -> `ask_actor_frame_aligned` -> `write_routed_actor_ask`
+    /// (`stream_writer.rs`), the routed-ask family sharing a connection-local
+    /// route slot cache.
+    #[tokio::test]
+    async fn routed_actor_ask_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let err = conn
+            .ask_actor_frame(
+                7,
+                9,
+                bytes::Bytes::from(vec![0u8; OVERSIZED]),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn pubsub_publish_over_max_message_size_errors_and_connection_survives() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let err = conn
+            .try_send_pubsub_payload(bytes::Bytes::from(vec![0u8; OVERSIZED]))
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    /// The V5 27-bit body-length limit (2^27) is a hard wire ceiling below
+    /// `MASTER_BUFFER_SIZE`'s reach in production configs, but this proves
+    /// the entry point itself returns an error instead of panicking
+    /// `framing::checked_body_len`'s old `.expect()` -- not just that
+    /// `reject_oversize_inline` happens to catch it first.
+    #[tokio::test]
+    async fn actor_frame_tell_at_2_27_bytes_errors_not_panics() {
+        let (conn, _stream_handle, _task, _peer) = make_handle();
+        let huge = bytes::Bytes::from(vec![0u8; (1usize << 27) + 4096]);
+        let err = conn.tell_actor_frame(1, 1, huge).await.unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+    }
+
+    /// The raw-tell header (`try_tell_bytes`) is a bare length with no
+    /// `WireKind` bits of its own (see the module note on
+    /// `reject_oversize_inline`): before this fix, a length at/above 2^27
+    /// would bleed into what `decode_control` reads back as the kind,
+    /// desyncing the peer's parser with no local diagnostic. Proving nothing
+    /// was ever enqueued is the strongest form of "no corrupted frame":
+    /// there is no frame at all.
+    #[tokio::test]
+    async fn raw_tell_oversize_never_enqueues_a_corrupted_frame() {
+        let (conn, _stream_handle, _task, _peer) = make_handle();
+        let before = conn.sequence_number();
+        let err = conn
+            .try_tell_bytes(bytes::Bytes::from(vec![0u8; (1usize << 27) + 4096]))
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_eq!(
+            conn.sequence_number(),
+            before,
+            "an oversized raw tell must be rejected before anything is queued"
+        );
+    }
+}
