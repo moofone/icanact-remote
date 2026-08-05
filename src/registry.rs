@@ -19728,6 +19728,320 @@ mod tests {
         );
     }
 
+    /// PR #178's connection-scoped receipts lived in a plain map mutated by
+    /// each caller after its own claim round-trip to the owner actor
+    /// returned, with no coordination between two concurrent callers. Two
+    /// genuinely concurrent claims for the same peer+address from different
+    /// sessions could each finish their own read-modify-write of that map in
+    /// an order that did not match the owner's actual commit order, leaving
+    /// a still-live session's receipt pinned to a generation the owner no
+    /// longer recognized as current -- so a later, perfectly legitimate
+    /// release of that session was refused forever and the address leaked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_peer_claims_keep_every_live_receipt_at_the_owners_current_generation()
+     {
+        for round in 0..2000u16 {
+            let registry = Arc::new(GossipRegistry::<()>::new(
+                test_addr(20_000 + round),
+                test_config(),
+            ));
+            let peer = test_peer_id("concurrent-receipt-transfer");
+            let node_id = peer.to_node_id();
+            let observed = test_addr(24_000 + round);
+            let session_a = test_addr(28_000 + round);
+            let session_b = test_addr(32_000 + round);
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let reg_a = registry.clone();
+            let barrier_a = barrier.clone();
+            let task_a = tokio::spawn(async move {
+                barrier_a.wait().await;
+                reg_a
+                    .add_connection_scoped_peer_claim(
+                        observed,
+                        node_id,
+                        crate::addr_ownership::ClaimKind::Verified,
+                        session_a,
+                    )
+                    .await
+            });
+
+            let reg_b = registry.clone();
+            let barrier_b = barrier.clone();
+            let task_b = tokio::spawn(async move {
+                barrier_b.wait().await;
+                reg_b
+                    .add_connection_scoped_peer_claim(
+                        observed,
+                        node_id,
+                        crate::addr_ownership::ClaimKind::Verified,
+                        session_b,
+                    )
+                    .await
+            });
+
+            let (result_a, result_b) = tokio::join!(task_a, task_b);
+            let (outcome_a, _) = result_a.expect("task a panicked");
+            let (outcome_b, _) = result_b.expect("task b panicked");
+            assert_eq!(outcome_a, crate::addr_ownership::AddrClaimOutcome::Accepted);
+            assert_eq!(outcome_b, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+            // Both sessions are live. Releasing either one alone must never
+            // drop ownership: the other session's receipt must still be
+            // recognized as covering the address, no matter which of the two
+            // commands the owner actually committed last.
+            registry
+                .release_connection_scoped_claims(&peer, session_a)
+                .await;
+            assert_eq!(
+                registry.registry_owner.routes_to(&observed),
+                Some(peer.clone()),
+                "round {round}: session_b is still live and must keep the address owned"
+            );
+
+            registry
+                .release_connection_scoped_claims(&peer, session_b)
+                .await;
+            assert_eq!(
+                registry.registry_owner.routes_to(&observed),
+                None,
+                "round {round}: the last live session must release ownership"
+            );
+        }
+    }
+
+    /// The second interleaving PR #178 could hit: a session's exit racing a
+    /// brand-new claim for the very same peer+address. Under the unsynced
+    /// map, the exit's take-then-compare-and-remove could lose to the
+    /// concurrent claim's generation bump and leave a receipt behind for a
+    /// session that no longer exists -- a ghost that made the map believe
+    /// the address was forever "covered by another session" and refused
+    /// every future release for it, including the survivor's own eventual,
+    /// entirely legitimate exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_exit_racing_a_fresh_claim_never_strands_a_ghost_receipt() {
+        for round in 0..200u16 {
+            let registry = Arc::new(GossipRegistry::<()>::new(
+                test_addr(42_000 + round),
+                test_config(),
+            ));
+            let peer = test_peer_id("exit-races-fresh-claim");
+            let node_id = peer.to_node_id();
+            let observed = test_addr(42_500 + round);
+            let session_old = test_addr(43_000 + round);
+            let session_new = test_addr(43_500 + round);
+
+            let (outcome, _) = registry
+                .add_connection_scoped_peer_claim(
+                    observed,
+                    node_id,
+                    crate::addr_ownership::ClaimKind::Verified,
+                    session_old,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let reg_release = registry.clone();
+            let peer_release = peer.clone();
+            let barrier_release = barrier.clone();
+            let release_task = tokio::spawn(async move {
+                barrier_release.wait().await;
+                reg_release
+                    .release_connection_scoped_claims(&peer_release, session_old)
+                    .await;
+            });
+
+            let reg_claim = registry.clone();
+            let barrier_claim = barrier.clone();
+            let claim_task = tokio::spawn(async move {
+                barrier_claim.wait().await;
+                reg_claim
+                    .add_connection_scoped_peer_claim(
+                        observed,
+                        node_id,
+                        crate::addr_ownership::ClaimKind::Verified,
+                        session_new,
+                    )
+                    .await
+            });
+
+            let (release_result, claim_result) = tokio::join!(release_task, claim_task);
+            release_result.expect("release task panicked");
+            let (claim_outcome, _) = claim_result.expect("claim task panicked");
+            assert_eq!(claim_outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+            // Whichever order the owner actually serialized these two
+            // commands in, `session_new` ends up the address's sole live
+            // session. Its own exit must therefore release the address -- if
+            // a ghost receipt were left behind for `session_old`, this would
+            // wrongly find the address "covered" forever.
+            registry
+                .release_connection_scoped_claims(&peer, session_new)
+                .await;
+            assert_eq!(
+                registry.registry_owner.routes_to(&observed),
+                None,
+                "round {round}: no ghost receipt may survive to block session_new's own release"
+            );
+        }
+    }
+
+    /// A dead peer reaped by `cleanup_dead_peers` keeps its `peers` entry
+    /// (so a genuine reconnect is still recognized), but everything that
+    /// made it reachable at its old address must be released -- otherwise an
+    /// address whose actual occupant has been gone longer than the
+    /// dead-peer timeout is locked out for every other identity forever.
+    #[tokio::test]
+    async fn cleanup_dead_peers_releases_address_ownership() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_000), config);
+        let peer_addr = test_addr(44_001);
+        let peer_id = test_peer_id("dead-peer-ownership-release");
+        let session_source = test_addr(44_002);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id.clone())
+        );
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: true,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            None,
+            "a dead peer reaped by cleanup_dead_peers must not keep its address \
+             ownership forever"
+        );
+        assert!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .peers
+                .contains_key(&peer_addr),
+            "cleanup_dead_peers must retain the peer entry itself for reconnection"
+        );
+
+        // A DIFFERENT identity can now legitimately claim the address.
+        let other = test_peer_id("dead-peer-ownership-release-claimant");
+        let (reclaim_outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                other.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                test_addr(44_003),
+            )
+            .await;
+        assert_eq!(
+            reclaim_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted,
+            "the address must be reclaimable once the dead peer's ownership is released"
+        );
+    }
+
+    /// Companion to `cleanup_dead_peers_releases_address_ownership`: an
+    /// operator-configured reservation must outlive the peer being offline,
+    /// exactly as it already outlives a single session's teardown (see
+    /// `connection_scoped_owner_releases_after_last_session_but_configured_pin_survives`).
+    #[tokio::test]
+    async fn cleanup_dead_peers_does_not_release_an_operator_configured_pin() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_010), config);
+        let peer_addr = test_addr(44_011);
+        let peer_id = test_peer_id("dead-peer-configured-pin");
+
+        registry.configure_peer(peer_id.clone(), peer_addr).await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id.clone())
+        );
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id),
+            "an operator-configured address reservation must outlive the peer being \
+             offline, exactly as it outlives a single session's teardown"
+        );
+    }
+
     #[tokio::test]
     async fn reconfiguring_peer_releases_previous_configured_address() {
         let registry = GossipRegistry::<()>::new(test_addr(20_029), test_config());

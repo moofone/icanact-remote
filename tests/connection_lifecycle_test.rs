@@ -362,3 +362,106 @@ fn test_reconnect_cleanup() {
         handle_b2.shutdown().await;
     });
 }
+
+/// A clean session teardown must release its address ownership promptly --
+/// not merely "eventually, once someone else times it out". This exercises
+/// the exact production path that arms and releases a connection-scoped
+/// claim (the outbound dial's `add_connection_scoped_peer_claim` in
+/// `transport_stream.rs`, and the IO task's `ExitGuard::drop` in
+/// `stream_writer.rs`, which is the sole production constructor of that
+/// guard and is what threads `peer_id`/`session_source` through to
+/// `release_connection_scoped_claims`), end to end over a real TLS
+/// connection. If any of those hops ever dropped `peer_id` or
+/// `session_source`, this test would hang the same way
+/// `test_reconnect_cleanup` did before the fix -- just with a much shorter,
+/// deliberately tight wait instead of a multi-second workaround.
+#[test]
+fn test_clean_disconnect_releases_ownership_promptly() {
+    run_async_test("connection-lifecycle-prompt-release", async {
+        maybe_init_tracing("info");
+
+        let addr_a: SocketAddr = "127.0.0.1:7940".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:7941".parse().unwrap();
+
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("prompt_release_node_a", "prompt_release_node_b");
+
+        let peer_id_b = key_pair_b.peer_id();
+
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300), // Long interval - we control timing
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let peer_b = handle_a.add_peer(&peer_id_b).await;
+        peer_b.connect(&addr_b).await.unwrap();
+
+        sleep(Duration::from_millis(200)).await;
+
+        handle_a
+            .lookup_address(addr_b)
+            .await
+            .expect("Initial connection should work");
+        info!("Initial connection established");
+
+        info!("Shutting down node B to force a clean disconnect");
+        handle_b.shutdown().await;
+
+        // Deliberately short: a clean teardown must release its claim
+        // promptly, not merely within `test_reconnect_cleanup`'s much
+        // longer 2s workaround wait.
+        sleep(Duration::from_millis(500)).await;
+
+        info!("Starting a DIFFERENT identity on B's old address");
+        let key_pair_c = key_pair_greater_than("prompt_release_node_c", &key_pair_a);
+        let peer_id_c = key_pair_c.peer_id();
+        let handle_c = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_c.to_secret_key(),
+            Some(GossipConfig {
+                gossip_interval: Duration::from_secs(300),
+                ..Default::default()
+            }),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let peer_c = handle_a.add_peer(&peer_id_c).await;
+        peer_c
+            .connect(&addr_b)
+            .await
+            .expect("a different identity must be able to claim the address promptly \
+                     after the previous owner's clean disconnect");
+
+        sleep(Duration::from_millis(500)).await;
+
+        handle_a
+            .lookup_address(addr_b)
+            .await
+            .expect("Reconnection should work - ownership released promptly");
+
+        info!("Prompt reclaim successful");
+
+        handle_a.shutdown().await;
+        handle_c.shutdown().await;
+    });
+}
