@@ -25459,6 +25459,163 @@ mod tests {
         }
     }
 
+    /// A dead peer reaped by `cleanup_dead_peers` keeps its `peers` entry
+    /// (so a genuine reconnect is still recognized), but everything that
+    /// made it reachable at its old address must be released -- otherwise an
+    /// address whose actual occupant has been gone longer than the dead-peer
+    /// timeout is locked out for every other identity forever.
+    #[tokio::test]
+    async fn cleanup_dead_peers_releases_address_ownership() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_000), config);
+        let peer_addr = test_addr(44_001);
+        let peer_id = test_peer_id("dead-peer-ownership-release");
+        let session_source = test_addr(44_002);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id.clone())
+        );
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: true,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(
+                        std::time::Instant::now() - Duration::from_secs(10),
+                    ),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            None,
+            "a dead peer reaped by cleanup_dead_peers must not keep its address ownership forever"
+        );
+        assert!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .peers
+                .contains_key(&peer_addr),
+            "cleanup_dead_peers must retain the peer entry itself for reconnection"
+        );
+
+        // A DIFFERENT identity can now legitimately claim the address.
+        let other = test_peer_id("dead-peer-ownership-release-claimant");
+        let (reclaim_outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                other.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                test_addr(44_003),
+            )
+            .await;
+        assert_eq!(
+            reclaim_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted,
+            "the address must be reclaimable once the dead peer's ownership is released"
+        );
+    }
+
+    /// Companion to `cleanup_dead_peers_releases_address_ownership`: an
+    /// operator-configured reservation must outlive the peer being offline,
+    /// exactly as it already outlives a single session's teardown (see
+    /// `connection_scoped_owner_releases_after_last_session_but_configured_pin_survives`).
+    #[tokio::test]
+    async fn cleanup_dead_peers_does_not_release_an_operator_configured_pin() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_010), config);
+        let peer_addr = test_addr(44_011);
+        let peer_id = test_peer_id("dead-peer-configured-pin");
+
+        registry.configure_peer(peer_id.clone(), peer_addr).await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id.clone())
+        );
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(
+                        std::time::Instant::now() - Duration::from_secs(10),
+                    ),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id),
+            "an operator-configured address reservation must outlive the peer being offline, exactly as it outlives a single session's teardown"
+        );
+    }
+
 
 
 
