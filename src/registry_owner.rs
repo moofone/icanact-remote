@@ -428,6 +428,49 @@ enum OwnerCommand {
         expected_source: SourceExpectation,
         reply: oneshot::Sender<MigrateOutcome>,
     },
+    /// A claim tied to one authenticated transport session. Identical to
+    /// `Claim` except the receipt bookkeeping for `session_source` -- transfer
+    /// of every other still-live session's receipt for this peer+address to
+    /// the new generation, then recording this session's own receipt -- is
+    /// performed in the SAME synchronous step as the ownership commit, so it
+    /// can never be observed or produced half-applied by a concurrent claim
+    /// or a concurrent session teardown.
+    ClaimConnectionScoped {
+        addr: SocketAddr,
+        claim: Claim,
+        session_source: SocketAddr,
+        reply: oneshot::Sender<ClaimCommit>,
+    },
+    /// Atomically take every connection-scoped receipt `peer_id` holds for
+    /// `session_source`, and report back only the addresses no OTHER live
+    /// session still covers -- those are release candidates. Deciding
+    /// "covered by another session" in this same step, against the map as it
+    /// exists after this session's own entries are removed, is what makes a
+    /// session exit racing a fresh claim for the same peer+address resolve
+    /// consistently rather than stranding a receipt for the exiting session.
+    ReleaseSession {
+        peer_id: PeerId,
+        session_source: SocketAddr,
+        reply: oneshot::Sender<Vec<(SocketAddr, CommitSeq)>>,
+    },
+    /// Release everything a peer that has been dead longer than the
+    /// dead-peer timeout still holds at `addr`: every connection-scoped
+    /// receipt recorded for `peer_id` at `addr` under any session (a missed
+    /// or still-in-flight teardown must not leave a ghost behind for a peer
+    /// that is never coming back), and the address ownership itself if
+    /// `peer_id` still holds it and `addr` is not operator-pinned.
+    ReleaseDeadPeer {
+        peer_id: PeerId,
+        addr: SocketAddr,
+        reply: oneshot::Sender<Option<CommitSeq>>,
+    },
+    /// Set (`Some`) or clear (`None`) the operator pin on `addr`. See
+    /// `PeerRegistryOwner::set_pin`.
+    SetPin {
+        addr: SocketAddr,
+        peer_id: Option<PeerId>,
+        reply: oneshot::Sender<()>,
+    },
     #[cfg(test)]
     InspectGeneration {
         addr: SocketAddr,
@@ -548,6 +591,104 @@ impl RegistryOwnerHandle {
         }
     }
 
+    /// Submit a connection-scoped address claim and wait for the committed
+    /// decision. Identical contract to [`Self::claim`], except the receipt
+    /// bookkeeping for `session_source` commits atomically with the
+    /// ownership decision -- see `OwnerCommand::ClaimConnectionScoped`.
+    pub async fn claim_connection_scoped(
+        &self,
+        addr: SocketAddr,
+        claim: Claim,
+        session_source: SocketAddr,
+    ) -> ClaimCommit {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::ClaimConnectionScoped {
+            addr,
+            claim,
+            session_source,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            warn!(addr = %addr, "registry owner unavailable; failing address claim closed");
+            return ClaimCommit::Rejected(ClaimRejection::OwnerUnavailable);
+        }
+        match response.await {
+            Ok(commit) => commit,
+            Err(_) => {
+                warn!(addr = %addr, "registry owner dropped an in-flight claim; failing closed");
+                ClaimCommit::Rejected(ClaimRejection::OwnerUnavailable)
+            }
+        }
+    }
+
+    /// Atomically release every connection-scoped receipt `peer_id` holds for
+    /// `session_source`, returning the addresses whose ownership no other
+    /// live session still covers -- see `OwnerCommand::ReleaseSession`. An
+    /// unreachable owner reports nothing to release: fail closed, the same as
+    /// every other command here.
+    pub async fn release_session(
+        &self,
+        peer_id: PeerId,
+        session_source: SocketAddr,
+    ) -> Vec<(SocketAddr, CommitSeq)> {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::ReleaseSession {
+            peer_id,
+            session_source,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return Vec::new();
+        }
+        response.await.unwrap_or_default()
+    }
+
+    /// Release everything `peer_id` still holds at `addr` -- every
+    /// connection-scoped receipt recorded for it under any session, and the
+    /// address ownership itself if `peer_id` still holds it and `addr` is not
+    /// operator-pinned. See `OwnerCommand::ReleaseDeadPeer`.
+    pub async fn release_dead_peer(&self, peer_id: PeerId, addr: SocketAddr) -> Option<CommitSeq> {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::ReleaseDeadPeer {
+            peer_id,
+            addr,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return None;
+        }
+        response.await.unwrap_or(None)
+    }
+
+    /// Reserve `addr` for `peer_id` independently of any connection. Called
+    /// only from `GossipRegistry::configure_peer`.
+    pub async fn pin(&self, addr: SocketAddr, peer_id: PeerId) {
+        self.set_pin(addr, Some(peer_id)).await;
+    }
+
+    /// Clear a previously set pin on `addr`, e.g. when `configure_peer`
+    /// moves a peer's reservation to a new address.
+    pub async fn unpin(&self, addr: SocketAddr) {
+        self.set_pin(addr, None).await;
+    }
+
+    async fn set_pin(&self, addr: SocketAddr, peer_id: Option<PeerId>) {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::SetPin {
+            addr,
+            peer_id,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return;
+        }
+        let _ = response.await;
+    }
+
     /// Drop the recorded ownership of `addr` only when both `expected_owner`
     /// and `expected_generation` still match its latest accepted claim.
     ///
@@ -619,6 +760,8 @@ impl RegistryOwnerHandle {
             let owner = PeerRegistryOwner {
                 addr_ownership: HashMap::new(),
                 claim_generation: HashMap::new(),
+                connection_scoped_claims: HashMap::new(),
+                operator_pinned: HashMap::new(),
                 snapshot: Arc::clone(&self.shared.snapshot),
                 routing,
                 commit_seq: 0,
@@ -657,6 +800,34 @@ struct PeerRegistryOwner {
     /// Latest accepted claim generation for each owned address. This is
     /// lifecycle fencing metadata, not part of the arbitration truth table.
     claim_generation: HashMap<SocketAddr, CommitSeq>,
+    /// Connection-scoped ownership receipts: which live authenticated
+    /// sessions currently back a peer's claim on an address, and at what
+    /// owner generation. Keyed by `(peer, session_source, addr)` --
+    /// `session_source` is this exact physical connection's own
+    /// discriminator (unique per connection; see `ReadContext::session_source`),
+    /// so a stale session's teardown can only ever remove its own entry.
+    ///
+    /// Lives here, alongside `claim_generation`, rather than in a
+    /// separately-synchronized map the way PR #178 first shipped it: every
+    /// mutation below happens from `&mut self` in the same synchronous
+    /// command as the ownership commit or release it corresponds to, so a
+    /// receipt can never be observed (or left behind) at a generation the
+    /// owner authority does not simultaneously agree is current.
+    connection_scoped_claims: HashMap<(PeerId, SocketAddr, SocketAddr), CommitSeq>,
+    /// Addresses reserved by an explicit `GossipRegistry::configure_peer`
+    /// call, independent of any connection. A pinned address is invisible to
+    /// `claim_connection_scoped`'s receipt bookkeeping (no receipt is ever
+    /// recorded for it) and refused by `release`/`release_dead_peer`
+    /// (checked directly, not merely inferred from the absence of a
+    /// receipt): a session that happens to authenticate the same identity
+    /// at a pinned address must not be able to make the reservation
+    /// releasable merely by connecting and later disconnecting. Distinct
+    /// from `ConnectionPool`'s `required_addr` (the supervisor's
+    /// keep-retrying-this-dial-target bookkeeping, set by every `.connect()`
+    /// call, configured or not): conflating the two was what let an
+    /// ordinary, non-configured dial's address become permanently
+    /// undisplaceable once its peer's session ended.
+    operator_pinned: HashMap<SocketAddr, PeerId>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     routing: Weak<dyn RoutingPublisher>,
     /// Position of the last committed mutation. A plain `u64` rather than an
@@ -715,6 +886,39 @@ impl PeerRegistryOwner {
                 let migrated = self.migrate(from, to, &expected_source, is_local_addr);
                 let _ = reply.send(migrated);
             }
+            OwnerCommand::ClaimConnectionScoped {
+                addr,
+                claim,
+                session_source,
+                reply,
+            } => {
+                let commit = self.claim_connection_scoped(addr, claim, session_source);
+                let _ = reply.send(commit);
+            }
+            OwnerCommand::ReleaseSession {
+                peer_id,
+                session_source,
+                reply,
+            } => {
+                let candidates = self.release_session(&peer_id, session_source);
+                let _ = reply.send(candidates);
+            }
+            OwnerCommand::ReleaseDeadPeer {
+                peer_id,
+                addr,
+                reply,
+            } => {
+                let released = self.release_dead_peer(&peer_id, addr);
+                let _ = reply.send(released);
+            }
+            OwnerCommand::SetPin {
+                addr,
+                peer_id,
+                reply,
+            } => {
+                self.set_pin(addr, peer_id);
+                let _ = reply.send(());
+            }
             #[cfg(test)]
             OwnerCommand::InspectGeneration { addr, reply } => {
                 let _ = reply.send(self.claim_generation.get(&addr).copied());
@@ -769,12 +973,74 @@ impl PeerRegistryOwner {
         }
     }
 
+    /// `claim`, plus the connection-scoped receipt bookkeeping for
+    /// `session_source`, committed in the same synchronous step.
+    ///
+    /// This is the structural fix for two races PR #178's separately
+    /// synchronized receipt map could hit: with the transfer folded into the
+    /// same `&mut self` call as the commit itself, no second command can ever
+    /// be handled in between, so
+    /// - two concurrent claims for the same peer+address can no longer
+    ///   finish their receipt transfer out of commit order (whichever claim
+    ///   this method processes SECOND always sees the first one's receipts
+    ///   already installed, and transfers them again to its own, later,
+    ///   generation), and
+    /// - a session exit racing a fresh claim for the same peer+address can no
+    ///   longer strand a ghost receipt for the exiting session (`release_session`
+    ///   either runs first and removes it before this transfer would touch
+    ///   it, or this transfer runs first and carries it forward to the new
+    ///   generation like any other still-live receipt, for `release_session`
+    ///   to remove correctly afterward).
+    fn claim_connection_scoped(
+        &mut self,
+        addr: SocketAddr,
+        claim: Claim,
+        session_source: SocketAddr,
+    ) -> ClaimCommit {
+        let peer_id = claim.node_id.clone();
+        let commit = self.claim(addr, claim, /* is_local_addr */ false);
+        // An operator-pinned address (`pin`, set only by `configure_peer`) is
+        // a reservation that exists independently of any one connection: no
+        // receipt is recorded for it, so nothing here can later mistake a
+        // stale session teardown for permission to retract the pin.
+        if self.operator_pinned.get(&addr) == Some(&peer_id) {
+            return commit;
+        }
+        if let ClaimCommit::Accepted { commit_seq, .. } = &commit {
+            let commit_seq = *commit_seq;
+            // A same-peer reconnect refreshes the owner generation. Transfer
+            // that current generation to every still-live session receipt for
+            // this address before adding the new session. If the newer
+            // session closes first, the surviving older session must still
+            // hold a receipt that can release the generation once it is the
+            // last owner; leaving its old generation behind would leak the
+            // route exactly as PR #178's unsynchronized version could.
+            for (key, generation) in self.connection_scoped_claims.iter_mut() {
+                if key.0 == peer_id && key.2 == addr {
+                    *generation = commit_seq;
+                }
+            }
+            self.connection_scoped_claims
+                .insert((peer_id, session_source, addr), commit_seq);
+        }
+        commit
+    }
+
     fn release(
         &mut self,
         addr: SocketAddr,
         expected_owner: &PeerId,
         expected_generation: CommitSeq,
     ) -> Option<CommitSeq> {
+        // A pinned address can only ever be retracted through `set_pin`
+        // clearing the pin first (see `configure_peer`'s reconfigure path,
+        // the sole legitimate mover of a pin) -- never through this generic
+        // path, which every connection-scoped and dead-peer release routes
+        // through and which a stale/racing caller cannot be trusted to have
+        // already unpinned.
+        if self.operator_pinned.contains_key(&addr) {
+            return None;
+        }
         let matches_expectation = self
             .addr_ownership
             .get(&addr)
@@ -784,13 +1050,96 @@ impl PeerRegistryOwner {
             return None;
         }
         let owner = self.addr_ownership.remove(&addr)?;
+        Some(self.retract_owner(addr, owner))
+    }
+
+    /// Atomically release every connection-scoped receipt `peer_id` holds for
+    /// `session_source`. An address is only reported back as a release
+    /// candidate when NO other live session still holds a receipt for the
+    /// same peer+address at this exact moment -- checked against the map
+    /// after this session's own entries are already removed, in the same
+    /// synchronous step, so a concurrent claim or a concurrent second
+    /// session's own exit can never be interleaved into the middle of this
+    /// decision.
+    fn release_session(
+        &mut self,
+        peer_id: &PeerId,
+        session_source: SocketAddr,
+    ) -> Vec<(SocketAddr, CommitSeq)> {
+        let mut own_entries = Vec::new();
+        self.connection_scoped_claims.retain(|key, generation| {
+            if &key.0 == peer_id && key.1 == session_source {
+                own_entries.push((key.2, *generation));
+                false
+            } else {
+                true
+            }
+        });
+        own_entries
+            .into_iter()
+            .filter(|(addr, _)| {
+                !self
+                    .connection_scoped_claims
+                    .keys()
+                    .any(|key| &key.0 == peer_id && key.2 == *addr)
+            })
+            .collect()
+    }
+
+    /// Release everything `peer_id` still holds at `addr`: every
+    /// connection-scoped receipt recorded for it there under any session
+    /// (ghost cleanup for a teardown that never ran), and the ownership
+    /// record itself if `peer_id` is still its owner and `addr` is not
+    /// operator-pinned.
+    fn release_dead_peer(&mut self, peer_id: &PeerId, addr: SocketAddr) -> Option<CommitSeq> {
+        self.connection_scoped_claims
+            .retain(|key, _| !(&key.0 == peer_id && key.2 == addr));
+        if self.operator_pinned.contains_key(&addr) {
+            return None;
+        }
+        let still_owned = self
+            .addr_ownership
+            .get(&addr)
+            .is_some_and(|owner| owner.node_id == *peer_id);
+        if !still_owned {
+            return None;
+        }
+        let owner = self.addr_ownership.remove(&addr)?;
+        Some(self.retract_owner(addr, owner))
+    }
+
+    /// Set or clear the operator pin on `addr`. Called only from
+    /// `GossipRegistry::configure_peer`, never from a connection lifecycle
+    /// path: a pin marks a reservation that exists independently of any
+    /// connection, and only the operator-configuration call site is trusted
+    /// to know when that reservation should move or lapse. Reconfiguring a
+    /// peer to a new address clears the previous one's pin (`peer_id: None`)
+    /// before releasing it, so the generic `release` path never has to trust
+    /// a caller's claim that a pin no longer applies.
+    fn set_pin(&mut self, addr: SocketAddr, peer_id: Option<PeerId>) {
+        match peer_id {
+            Some(peer_id) => {
+                self.operator_pinned.insert(addr, peer_id);
+            }
+            None => {
+                self.operator_pinned.remove(&addr);
+            }
+        }
+    }
+
+    /// Shared tail of every path that drops a recorded owner: clear its
+    /// generation, advance the commit order, publish the vacancy, and
+    /// retract the routing publication. Callers are responsible for removing
+    /// `owner` from `addr_ownership` (and for whatever ownership-match check
+    /// justified doing so) before calling this.
+    fn retract_owner(&mut self, addr: SocketAddr, owner: Owner) -> CommitSeq {
         self.claim_generation.remove(&addr);
         let commit_seq = self.advance();
         self.publish_owner_snapshot(addr, None);
         if let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(addr, &owner.node_id);
         }
-        Some(commit_seq)
+        commit_seq
     }
 
     /// Move ownership of `from` onto `to`.
@@ -874,6 +1223,13 @@ impl PeerRegistryOwner {
         };
         self.addr_ownership.remove(&from);
         self.addr_ownership.insert(to, owner.clone());
+        // An operator pin travels with its address's re-resolution rather
+        // than being silently dropped: an offline configured peer whose DNS
+        // entry moves must stay protected at its new address, not become
+        // momentarily displaceable until the operator reconfigures it again.
+        if let Some(pinned_peer) = self.operator_pinned.remove(&from) {
+            self.operator_pinned.insert(to, pinned_peer);
+        }
         let commit_seq = self.advance();
         self.claim_generation.remove(&from);
         self.claim_generation.insert(to, commit_seq);

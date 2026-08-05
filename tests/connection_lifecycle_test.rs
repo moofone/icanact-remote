@@ -446,11 +446,10 @@ fn test_clean_disconnect_releases_ownership_promptly() {
         .unwrap();
 
         let peer_c = handle_a.add_peer(&peer_id_c).await;
-        peer_c
-            .connect(&addr_b)
-            .await
-            .expect("a different identity must be able to claim the address promptly \
-                     after the previous owner's clean disconnect");
+        peer_c.connect(&addr_b).await.expect(
+            "a different identity must be able to claim the address promptly \
+                     after the previous owner's clean disconnect",
+        );
 
         sleep(Duration::from_millis(500)).await;
 

@@ -1735,12 +1735,6 @@ pub(crate) struct InboundClaimProjectionSnapshot {
     pool: Vec<InboundPoolProjectionSnapshot>,
 }
 
-/// Latest owner-actor generation claimed by one authenticated transport
-/// session. The session source is unique per physical connection, so a stale
-/// teardown can release only its own generation; a reconnect at the same
-/// address remains fenced by the newer owner commit.
-type ConnectionScopedClaimKey = (PeerId, SocketAddr, SocketAddr);
-
 /// Core gossip registry implementation with separated locks
 #[derive(Clone, Copy)]
 struct PeerLivenessStatus {
@@ -1772,10 +1766,6 @@ pub struct GossipRegistry<T = ()> {
     /// `identity_verified` are derived projections of what this handle
     /// returns, never inputs to the decision.
     pub registry_owner: crate::registry_owner::RegistryOwnerHandle,
-    /// Cold-path ownership receipts held by live authenticated sessions.
-    /// Operator-configured routes are intentionally not inserted here and
-    /// therefore survive connection teardown.
-    connection_scoped_claims: Arc<SccHashMap<ConnectionScopedClaimKey, CommitSeq>>,
     pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
@@ -2048,7 +2038,6 @@ impl<T: 'static> GossipRegistry<T> {
             })),
             connection_pool,
             registry_owner,
-            connection_scoped_claims: Arc::new(SccHashMap::default()),
             tls_config: None,
             peer_capabilities: peer_capabilities.clone(),
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
@@ -3305,6 +3294,14 @@ impl<T: 'static> GossipRegistry<T> {
     /// released when that physical session exits. A required/operator route
     /// is deliberately excluded: its ownership is persistent rather than
     /// connection-scoped.
+    ///
+    /// The receipt bookkeeping (which live sessions currently back this
+    /// address for this peer, and at what owner generation) lives inside the
+    /// owner actor itself and is committed in the SAME serialized step as the
+    /// ownership decision -- see `PeerRegistryOwner::claim_connection_scoped`.
+    /// Nothing here mutates that bookkeeping directly, so two concurrent
+    /// calls for the same peer+address can never observe or leave behind an
+    /// inconsistent intermediate state.
     pub(crate) async fn add_connection_scoped_peer_claim(
         &self,
         peer_addr: SocketAddr,
@@ -3315,108 +3312,35 @@ impl<T: 'static> GossipRegistry<T> {
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
     ) {
-        let peer_id = crate::PeerId::from(node_id);
-        let persistent = self
-            .connection_pool
-            .get_required_peer_addr(&peer_id)
-            .is_some_and(|configured| configured == peer_addr);
-        let (outcome, receipt) = self
-            .add_peer_with_node_id_generation(
-                peer_addr,
-                Some(peer_id.to_node_id()),
-                claim_kind,
-            )
-            .await;
-        if outcome == crate::addr_ownership::AddrClaimOutcome::Accepted
-            && !persistent
-            && let Some(receipt) = receipt
-        {
-            // A same-peer reconnect refreshes the owner generation. Transfer
-            // that current generation to every still-live session receipt for
-            // this address before adding the new session. If the newer
-            // session closes first, the surviving older session must still
-            // hold a receipt that can release the generation once it is the
-            // last owner; leaving its old generation behind leaks the route.
-            let mut existing_keys = Vec::new();
-            self.connection_scoped_claims.iter_sync(|key, _| {
-                if key.0 == peer_id && key.2 == peer_addr {
-                    existing_keys.push(key.clone());
-                }
-                true
-            });
-            for key in existing_keys {
-                let _ = self
-                    .connection_scoped_claims
-                    .upsert_sync(key, receipt.generation());
-            }
-            self.connection_scoped_claims.upsert_sync(
-                (peer_id, session_source, peer_addr),
-                receipt.generation(),
-            );
-            return (outcome, Some(receipt));
-        }
-        (outcome, receipt)
+        self.add_peer_with_node_id_generation_inner(
+            peer_addr,
+            Some(node_id),
+            claim_kind,
+            Some(session_source),
+        )
+        .await
     }
 
-    fn take_connection_scoped_claims(
-        &self,
-        peer_id: &crate::PeerId,
-        session_source: SocketAddr,
-    ) -> Vec<(SocketAddr, CommitSeq)> {
-        let mut entries = Vec::new();
-        self.connection_scoped_claims.iter_sync(|key, generation| {
-            if &key.0 == peer_id && key.1 == session_source {
-                entries.push((key.clone(), *generation));
-            }
-            true
-        });
-        entries
-            .into_iter()
-            .filter_map(|(key, generation)| {
-                let removed = self
-                    .connection_scoped_claims
-                    .remove_if_sync(&key, |current| *current == generation)
-                    .is_some();
-                removed.then_some((key.2, generation))
-            })
-            .collect()
-    }
-
-    /// Release all non-persistent owner claims attributed to one physical
-    /// session. The map entries are removed before the first await so a
-    /// duplicate teardown is harmless and a reconnect cannot be released by
-    /// an older session's callback.
+    /// Release all owner claims attributed to one physical session.
+    /// `RegistryOwnerHandle::release_session` atomically finds every receipt
+    /// this session holds, removes it, and decides -- in that same
+    /// owner-task step -- whether each address is still covered by another
+    /// live session; only the addresses it hands back here are actually
+    /// unowned by any surviving session and are candidates for release. An
+    /// operator-pinned address (`GossipRegistry::configure_peer`) never has a
+    /// receipt to hand back in the first place, and `release` itself refuses
+    /// a pinned address regardless, so a stale connection receipt racing a
+    /// concurrent `configure_peer` can never retract a pin out from under it.
     pub(crate) async fn release_connection_scoped_claims(
         &self,
         peer_id: &crate::PeerId,
         session_source: SocketAddr,
     ) {
-        let claims = self.take_connection_scoped_claims(peer_id, session_source);
+        let claims = self
+            .registry_owner
+            .release_session(peer_id.clone(), session_source)
+            .await;
         for (addr, generation) in claims {
-            // Configuration can race a transport teardown. Once the address
-            // is an operator-required pin, a stale connection receipt must
-            // never retract it.
-            if self
-                .connection_pool
-                .get_required_peer_addr(peer_id)
-                .is_some_and(|configured| configured == addr)
-            {
-                continue;
-            }
-            let covered_by_other_session = {
-                let mut covered = false;
-                self.connection_scoped_claims.iter_sync(|key, _| {
-                    if &key.0 == peer_id && key.1 != session_source && key.2 == addr {
-                        covered = true;
-                        return false;
-                    }
-                    true
-                });
-                covered
-            };
-            if covered_by_other_session {
-                continue;
-            }
             if let Some(release_seq) = self
                 .registry_owner
                 .release(addr, peer_id.clone(), generation)
@@ -3425,6 +3349,26 @@ impl<T: 'static> GossipRegistry<T> {
                 let mut state = self.gossip_state.lock().await;
                 state.tombstone_ownership_projection(addr, release_seq);
             }
+        }
+    }
+
+    /// Release a dead peer's address ownership, including any
+    /// connection-scoped receipts still recorded for it under ANY session --
+    /// not just the one, if any, whose own teardown already ran. Called from
+    /// `cleanup_dead_peers` once a peer has been gone longer than the
+    /// dead-peer timeout, so a missed or still-in-flight session teardown
+    /// (see `ExitGuard`) cannot leave the address permanently unreachable to
+    /// every other identity. An operator-pinned reservation is exempt: it
+    /// must outlive the peer being offline exactly as it already outlives a
+    /// single session's teardown.
+    async fn release_dead_peer_ownership(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        if let Some(release_seq) = self
+            .registry_owner
+            .release_dead_peer(peer_id.clone(), addr)
+            .await
+        {
+            let mut state = self.gossip_state.lock().await;
+            state.tombstone_ownership_projection(addr, release_seq);
         }
     }
 
@@ -3437,6 +3381,27 @@ impl<T: 'static> GossipRegistry<T> {
         peer_addr: SocketAddr,
         node_id: Option<crate::GossipNodeId>,
         claim_kind: crate::addr_ownership::ClaimKind,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        Option<crate::registry_owner::ClaimReceipt>,
+    ) {
+        self.add_peer_with_node_id_generation_inner(peer_addr, node_id, claim_kind, None)
+            .await
+    }
+
+    /// Shared implementation behind `add_peer_with_node_id_generation` (no
+    /// receipt bookkeeping -- gossip/discovery-derived and
+    /// operator-configured routes are not tied to any one physical
+    /// connection) and `add_connection_scoped_peer_claim`
+    /// (`connection_scoped_session = Some(session_source)`, which routes the
+    /// claim through the owner's connection-scoped command so the receipt
+    /// transfer/insert commits atomically with the ownership decision).
+    async fn add_peer_with_node_id_generation_inner(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: Option<crate::GossipNodeId>,
+        claim_kind: crate::addr_ownership::ClaimKind,
+        connection_scoped_session: Option<SocketAddr>,
     ) -> (
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
@@ -3504,10 +3469,18 @@ impl<T: 'static> GossipRegistry<T> {
                 node_id: claimed_node_id.to_peer_id(),
                 kind: claim_kind,
             };
-            let commit = self
-                .registry_owner
-                .claim(peer_addr, claim, /* is_local_addr */ false)
-                .await;
+            let commit = match connection_scoped_session {
+                Some(session_source) => {
+                    self.registry_owner
+                        .claim_connection_scoped(peer_addr, claim, session_source)
+                        .await
+                }
+                None => {
+                    self.registry_owner
+                        .claim(peer_addr, claim, /* is_local_addr */ false)
+                        .await
+                }
+            };
             let receipt = commit.receipt();
             let crate::registry_owner::ClaimCommit::Accepted {
                 kind, displaced, ..
@@ -3826,6 +3799,12 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         if let Some(previous_addr) = previous_addr.filter(|previous| *previous != connect_addr) {
+            // This reservation is moving to a new address: clear the old
+            // pin FIRST so `release` -- which unconditionally refuses a
+            // still-pinned address, since it cannot otherwise tell this
+            // deliberate move apart from a stale connection receipt racing
+            // a teardown -- is free to retract it below.
+            self.registry_owner.unpin(previous_addr).await;
             if let Some(token) = self.registry_owner.ownership_token(&previous_addr)
                 && token.owner() == &peer_id
                 && let Some(release_seq) = self
@@ -3845,6 +3824,11 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_if_sync(&previous_addr, |current| current == &peer_id);
             }
         }
+        // Operator configuration is a reservation independent of any
+        // connection: pin it so a connection-scoped claim/release for this
+        // exact peer+address (this peer dialing in or being dialed) never
+        // records or retracts it as if it were merely session-scoped.
+        self.registry_owner.pin(connect_addr, peer_id.clone()).await;
 
         let pool = &self.connection_pool;
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
@@ -7263,7 +7247,7 @@ impl<T: 'static> GossipRegistry<T> {
         let current_time = current_timestamp();
         let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
 
-        let peers_to_cleanup: Vec<SocketAddr> = {
+        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>)> = {
             let gossip_state = self.gossip_state.lock().await;
             gossip_state
                 .peers
@@ -7275,7 +7259,7 @@ impl<T: 'static> GossipRegistry<T> {
                             current_time.saturating_sub(failure_time) > dead_peer_timeout_secs
                         })
                 })
-                .map(|(addr, _)| *addr)
+                .map(|(addr, info)| (*addr, info.node_id.map(|node_id| node_id.to_peer_id())))
                 .collect()
         };
 
@@ -7286,7 +7270,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Order: actor_state before gossip_state
             let mut gossip_state = self.gossip_state.lock().await;
 
-            for peer_addr in &peers_to_cleanup {
+            for (peer_addr, _) in &peers_to_cleanup {
                 // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
                 // This allows us to reconnect when the peer comes back online
 
@@ -7373,9 +7357,18 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
-            for peer_addr in &peers_to_cleanup {
+            for (peer_addr, node_id) in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
                 self.remove_clock_state_for_addr(peer_addr);
+                // A peer this stale has been gone longer than the dead-peer
+                // timeout, but its address ownership -- and any lingering
+                // connection-scoped receipts a missed teardown left behind --
+                // otherwise outlive it forever, permanently locking every
+                // other identity out of the address. `peers` itself is left
+                // untouched above so a genuine reconnect is still recognized.
+                if let Some(peer_id) = node_id {
+                    self.release_dead_peer_ownership(peer_id, *peer_addr).await;
+                }
             }
 
             // Trigger immediate gossip (outside the gossip_state lock —
@@ -19616,6 +19609,71 @@ mod tests {
         );
     }
 
+    /// R-16: `ConnectionPool::required_addr` is set by every plain
+    /// `Peer::connect()` call (the supervisor's "keep redialing this
+    /// target" bookkeeping), not only by `GossipRegistry::configure_peer`
+    /// (a genuine operator reservation). Before the owner tracked its own
+    /// `operator_pinned` set, `add_connection_scoped_peer_claim` treated
+    /// `required_addr` alone as proof of a permanent reservation, so an
+    /// ordinary peer reached only via `.connect()` never got a
+    /// connection-scoped receipt at all -- its address ownership survived
+    /// every session teardown by accident, with no `cleanup_dead_peers`
+    /// timeout short enough to ever reclaim it. This is the exact defect
+    /// `test_reconnect_cleanup` and `test_clean_disconnect_releases_ownership_promptly`
+    /// (`tests/connection_lifecycle_test.rs`) exercise end to end over real
+    /// TLS connections; this is the fast, unit-level pin of the same fix.
+    #[tokio::test]
+    async fn connection_scoped_claim_releases_even_when_required_addr_is_set_without_configure_peer()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_040), test_config());
+        let peer = test_peer_id("required-addr-without-configure-peer");
+        let observed = test_addr(20_041);
+        let session = test_addr(30_041);
+
+        // Exactly what `Peer::connect()` does before dialing -- NOT
+        // `configure_peer`, which additionally pins the address in the
+        // owner authority.
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer, observed);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                observed,
+                peer.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        registry
+            .release_connection_scoped_claims(&peer, session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            None,
+            "an ordinary peer's address must release on session end even though \
+             `required_addr` (set by every `.connect()` call) is present -- only an \
+             explicit `configure_peer` pin may exempt an address from release"
+        );
+
+        // A genuinely different identity can now claim the address.
+        let other = test_peer_id("required-addr-without-configure-peer-claimant");
+        let (reclaim_outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                observed,
+                other.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                test_addr(30_042),
+            )
+            .await;
+        assert_eq!(
+            reclaim_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+    }
+
     #[tokio::test]
     async fn connection_scoped_owner_releases_after_last_session_but_configured_pin_survives() {
         let registry = GossipRegistry::<()>::new(test_addr(20_015), test_config());
@@ -19739,7 +19797,7 @@ mod tests {
     /// release of that session was refused forever and the address leaked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_same_peer_claims_keep_every_live_receipt_at_the_owners_current_generation()
-     {
+    {
         for round in 0..2000u16 {
             let registry = Arc::new(GossipRegistry::<()>::new(
                 test_addr(20_000 + round),
@@ -19871,7 +19929,10 @@ mod tests {
             let (release_result, claim_result) = tokio::join!(release_task, claim_task);
             release_result.expect("release task panicked");
             let (claim_outcome, _) = claim_result.expect("claim task panicked");
-            assert_eq!(claim_outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+            assert_eq!(
+                claim_outcome,
+                crate::addr_ownership::AddrClaimOutcome::Accepted
+            );
 
             // Whichever order the owner actually serialized these two
             // commands in, `session_new` ends up the address's sole live
