@@ -3604,18 +3604,20 @@ impl<T: 'static> GossipRegistry<T> {
             }
             if let Some(identity_verified) = resolved_identity_verified {
                 existing_peer.identity_verified = identity_verified;
-                if identity_verified {
-                    // Independently verified evidence for this exact
-                    // address -- it matches the connection's observed TCP
-                    // source, an operator-configured required address, or
-                    // a same-node Verified refresh -- proves the address
-                    // is genuinely dialable regardless of how any earlier
-                    // entry here was attributed. A stale
-                    // `transport_source_keyed` left over from an
-                    // inbound-accept fallback must not keep excluding it
-                    // from gossip/discovery forever.
-                    existing_peer.transport_source_keyed = false;
-                }
+                // NOTE: `transport_source_keyed` is deliberately NOT
+                // cleared here just because this claim resolved Verified.
+                // `identity_verified` answers "do we know who is on the
+                // other end of this session?" -- it says nothing about
+                // whether THIS address is reachable by anyone else. The
+                // inbound-accept fallback itself claims the raw observed
+                // TCP source with `ClaimKind::Verified` (trivially
+                // corroborated: it IS the session's own source), so a
+                // same-node Verified refresh fires on every reconnect of
+                // exactly the entry this flag exists to mark. Only actual
+                // dialability evidence may clear it: a successful outbound
+                // dial (`connect_to_peer`, the post-dial reset in
+                // `connection_pool::pool_connect`) or explicit operator
+                // configuration (`configure_peer`).
             }
             if owner_changed {
                 let now = current_timestamp();
@@ -3823,6 +3825,22 @@ impl<T: 'static> GossipRegistry<T> {
                 "refusing configured peer route because the ownership authority rejected it"
             );
             return;
+        }
+
+        // Operator configuration is itself dialability evidence for
+        // `connect_addr`, independent of identity verification (see
+        // `add_peer_with_node_id_generation`, which deliberately does NOT
+        // clear this flag from a Verified claim alone -- the
+        // inbound-accept fallback also claims Verified for the raw
+        // observed TCP source, and that must stay excluded). An operator
+        // explicitly vouching for this exact address as a dial target
+        // means any stale `transport_source_keyed` inherited from an
+        // earlier inbound-accept fallback here no longer applies.
+        {
+            let mut gossip_state = self.gossip_state.lock().await;
+            if let Some(peer_info) = gossip_state.peers.get_mut(&connect_addr) {
+                peer_info.transport_source_keyed = false;
+            }
         }
 
         if let Some(previous_addr) = previous_addr.filter(|previous| *previous != connect_addr) {
@@ -5651,6 +5669,30 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(node_id) = peer.node_id {
             let peer_id = node_id.to_peer_id();
             return self.connection_pool.has_connection_by_peer_id(&peer_id);
+        }
+        false
+    }
+
+    /// Whether THIS specific alias entry (`addr`, plus its own recorded
+    /// actual connection address if different, e.g. NAT) has a live
+    /// pooled connection right now.
+    ///
+    /// Deliberately narrower than `peer_has_live_connection`: it does NOT
+    /// fall back to `has_connection_by_peer_id`, which matches ANY
+    /// connection for the identity regardless of address. That fallback
+    /// is correct for eviction exemption (protecting every alias of a
+    /// live peer from being trimmed), but wrong for ranking WHICH alias
+    /// to pick as a gossip target -- it would make every alias of a
+    /// multi-address peer look equally live the moment any one of them
+    /// is connected, so a stale alias could still win the tie-break and
+    /// become the address the receiver dials.
+    #[inline]
+    fn addr_has_live_connection(&self, addr: SocketAddr, peer: &PeerInfo) -> bool {
+        if self.connection_pool.has_connection(&addr) {
+            return true;
+        }
+        if let Some(peer_addr) = peer.peer_address {
+            return self.connection_pool.has_connection(&peer_addr);
         }
         false
     }
@@ -8879,7 +8921,7 @@ impl<T: 'static> GossipRegistry<T> {
                 if info.failures >= self.config.max_peer_failures {
                     continue;
                 }
-                let is_live = self.peer_has_live_connection(info);
+                let is_live = self.addr_has_live_connection(*addr, info);
                 best_by_identity
                     .entry(PeerDispatchKey::for_entry(*addr, info))
                     .and_modify(|(best_addr, best_is_live, best_failures)| {
@@ -12274,13 +12316,24 @@ mod tests {
     /// must always win, deterministically, regardless of iteration order
     /// (this test constructs both aliases explicitly rather than relying
     /// on ordering luck to surface the bug).
+    ///
+    /// The fake connection is published BOTH by address and by peer ID
+    /// (`add_connection_by_peer_id`), so the identity as a whole looks
+    /// "peer-id live" while only `live_addr` is genuinely live by
+    /// address. A ranking helper that falls back to
+    /// `has_connection_by_peer_id` (correct for eviction exemption, wrong
+    /// here) would see `stale_addr` as equally live and the tie could
+    /// still resolve to it arbitrarily -- this is what actually
+    /// distinguishes the fix from the bug, not merely "a connection
+    /// exists somewhere for this identity".
     #[tokio::test]
     async fn gossip_peer_list_target_selection_prefers_live_alias_over_stale() {
         let mut config = test_config_with_seed("gossip-target-prefers-live-alias");
         config.enable_peer_discovery = true;
         let registry = GossipRegistry::<()>::new(test_addr(20_180), config);
 
-        let shared_node_id = test_peer_id("gossip-target-shared").to_node_id();
+        let shared_peer_id = test_peer_id("gossip-target-shared");
+        let shared_node_id = shared_peer_id.to_node_id();
         let live_addr = test_addr(20_181);
         let stale_addr = test_addr(20_182);
 
@@ -12294,8 +12347,10 @@ mod tests {
             state.peers.insert(stale_addr, stale_info);
         }
 
-        // Give `live_addr` an actual live connection in the pool; `stale_addr`
-        // has none, even though both are equally under the failure threshold.
+        // Give `live_addr` an actual live connection in the pool, published
+        // by BOTH address and peer ID -- `stale_addr` has none, even though
+        // both are equally under the failure threshold and the identity as
+        // a whole now has a peer-id-indexed connection.
         use crate::connection_pool::{
             BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
             LockFreeStreamHandle,
@@ -12311,10 +12366,14 @@ mod tests {
         );
         let mut conn = LockFreeConnection::new(live_addr, ConnectionDirection::Outbound);
         conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(shared_peer_id.clone());
         conn.set_state(ConnectionState::Connected);
-        registry
-            .connection_pool
-            .index_connection_by_addr(live_addr, Arc::new(conn));
+        let conn = Arc::new(conn);
+        registry.connection_pool.add_connection_by_peer_id(
+            shared_peer_id.clone(),
+            live_addr,
+            conn.clone(),
+        );
 
         let tasks = registry.gossip_peer_list_immediate().await;
         let targeted: Vec<SocketAddr> = tasks.iter().map(|t| t.peer_addr).collect();
@@ -12328,8 +12387,10 @@ mod tests {
         );
         assert!(
             targeted.contains(&live_addr),
-            "the LIVE alias must be the one selected, not whichever HashMap iteration \
-             visits first: {targeted:?}"
+            "the address-specific LIVE alias must be the one selected, not \
+             whichever HashMap iteration visits first, and not merely \
+             whichever alias the peer-id-wide connection fallback would also \
+             match: {targeted:?}"
         );
     }
 
@@ -12434,6 +12495,96 @@ mod tests {
         assert!(
             !peer.transport_source_keyed,
             "a successful outbound dial must clear a stale transport_source_keyed flag"
+        );
+    }
+
+    /// The inbound-accept fallback itself claims the raw observed TCP
+    /// source with `ClaimKind::Verified` -- correctly, since owning the
+    /// observed session source is trivially self-corroborating evidence.
+    /// A same-node Verified re-claim of that SAME ephemeral source (as
+    /// happens on every subsequent FullSync from a peer whose advertised
+    /// address still cannot be independently corroborated) must NOT clear
+    /// `transport_source_keyed`: `identity_verified` answers "do we know
+    /// who is on the other end of this session?", not "is this address
+    /// reachable by anyone else?". Only actual dialability evidence
+    /// (a successful outbound dial or operator configuration) may clear
+    /// it -- see `add_peer_with_node_id_generation` and `configure_peer`.
+    #[tokio::test]
+    async fn reclaiming_ephemeral_source_as_verified_does_not_clear_transport_source_keyed() {
+        let config = GossipConfig {
+            allow_loopback_discovery: true,
+            enable_peer_discovery: true,
+            ..test_config()
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(20_210), config);
+        let ephemeral_addr = test_addr(20_211);
+        let node_id = test_peer_id("ephemeral-reclaim-still-excluded").to_node_id();
+
+        // Initial inbound-accept fallback: claims the unowned raw observed
+        // source as Verified, then handle.rs marks the resulting entry
+        // transport-source-keyed because it knows this was the fallback.
+        let outcome = registry
+            .add_peer_with_node_id(
+                ephemeral_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&ephemeral_addr)
+                .expect("claim must have created the entry")
+                .transport_source_keyed = true;
+        }
+
+        // A subsequent FullSync from the SAME peer, whose advertised
+        // address still cannot be independently corroborated, re-runs the
+        // fallback: same node, same ephemeral source, Verified again (a
+        // same-node refresh in addr_ownership terms).
+        let reclaim_outcome = registry
+            .add_peer_with_node_id(
+                ephemeral_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        assert_eq!(
+            reclaim_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+
+        {
+            let state = registry.gossip_state.lock().await;
+            let peer = state
+                .peers
+                .get(&ephemeral_addr)
+                .expect("peer must still exist");
+            assert!(
+                peer.transport_source_keyed,
+                "re-claiming the SAME ephemeral source as Verified must NOT clear \
+                 transport_source_keyed"
+            );
+        }
+
+        let snapshot = registry.peers_snapshot().await;
+        assert!(
+            !snapshot
+                .iter()
+                .any(|p| p.address == ephemeral_addr.to_string()),
+            "the re-claimed ephemeral-source entry must still be excluded from \
+             peers_snapshot: {snapshot:?}"
+        );
+
+        registry.mark_peer_connected(ephemeral_addr).await;
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.connected_peer_count(),
+            0,
+            "the re-claimed ephemeral-source entry must still hold no PeerDiscovery slot"
         );
     }
 
