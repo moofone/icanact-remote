@@ -2690,17 +2690,21 @@ impl LockFreeStreamHandle {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
-        // Reject locally before anything else: an inline ask over
-        // `max_message_size` gets a fatal `MessageTooLarge` read error from
-        // the receiver, tearing the whole connection down for every other
-        // actor sharing it. Checked first so an oversized ask never waits on
-        // identification or takes the route-bind gate for nothing.
-        if payload.len() > self.max_message_size {
-            return Err(GossipError::MessageTooLarge {
-                size: payload.len(),
-                max: self.max_message_size,
-            });
-        }
+        // Fast pre-check before anything else, using the smaller of the two
+        // possible header overheads below (`ROUTED_ACTOR_ASK_HEADER_LEN`):
+        // an inline ask over `max_message_size` gets a fatal `MessageTooLarge`
+        // read error from the receiver, tearing the whole connection down for
+        // every other actor sharing it. This cannot false-reject -- neither
+        // branch below ever needs less than this overhead -- so a clearly
+        // oversized ask never waits on identification or takes the
+        // route-bind gate for nothing. It is not sufficient on its own: the
+        // unbound-route fallback below adds the larger `ACTOR_ASK_HEADER_LEN`
+        // instead, and is re-checked precisely at that point.
+        crate::framing::reject_oversize_for_inline_send(
+            crate::framing::ROUTED_ACTOR_ASK_HEADER_LEN,
+            payload.len(),
+            self.max_message_size,
+        )?;
 
         // A brand-new outbound connection gates this behind its own
         // identifying FullSync (see `begin_identify_gate`/`mark_identified`
@@ -2734,6 +2738,17 @@ impl LockFreeStreamHandle {
             // and type_hash directly and needs no connection-local slot at
             // all, so this ask (and every later one on this connection) still
             // succeeds rather than the connection being torn down.
+            //
+            // This frame's header is `ACTOR_ASK_HEADER_LEN` (28 bytes), wider
+            // than the `ROUTED_ACTOR_ASK_HEADER_LEN` (12 bytes) the pre-check
+            // above allowed for -- re-check precisely against this branch's
+            // real overhead before spending a header build on a payload that
+            // would still exceed `max_message_size` once framed.
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::ACTOR_ASK_HEADER_LEN,
+                payload.len(),
+                self.max_message_size,
+            )?;
             let header =
                 crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len())?;
             return self

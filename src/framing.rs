@@ -164,6 +164,35 @@ pub fn encode_control(kind: WireKind, body_len: usize) -> Result<[u8; LENGTH_PRE
     Ok(word.to_be_bytes())
 }
 
+/// Local pre-send admission check for an inline (non-streaming) frame: the
+/// peer's configured `max_message_size` is a ceiling on the *encoded* frame
+/// body (this `WireKind`'s fixed header length plus the caller's payload),
+/// not on the payload alone. Comparing payload length by itself under-counts
+/// every structured frame kind by its header size and lets a payload through
+/// this gate that the receiver still hard-rejects as `MessageTooLarge` once
+/// the header is added, tearing the connection down -- exactly what this
+/// check exists to prevent.
+///
+/// `fixed_header_len` must be the same constant (e.g. `ACTOR_TELL_HEADER_LEN`)
+/// the caller's `write_*_header` will add to the payload length. Pass `0` for
+/// the raw-tell/typed-tell paths: their bare-length control word has no
+/// separate structured header, so body_len == payload_len exactly.
+#[inline]
+pub fn reject_oversize_for_inline_send(
+    fixed_header_len: usize,
+    payload_len: usize,
+    max_message_size: usize,
+) -> Result<()> {
+    let body_len = fixed_header_len.saturating_add(payload_len);
+    if body_len > max_message_size {
+        return Err(GossipError::MessageTooLarge {
+            size: body_len,
+            max: max_message_size,
+        });
+    }
+    Ok(())
+}
+
 #[inline]
 pub fn decode_control(bytes: [u8; LENGTH_PREFIX_LEN]) -> Option<Control> {
     let word = u32::from_be_bytes(bytes);
@@ -532,6 +561,21 @@ mod tests {
             }
             other => panic!("expected MessageTooLarge, got {other:?}"),
         }
+    }
+
+    /// `max_message_size` bounds the encoded body (fixed header + payload),
+    /// not the payload alone: a payload that fits under the limit by itself
+    /// must still be rejected once its frame's fixed header pushes the
+    /// encoded body over it, and accepted when the same total fits.
+    #[test]
+    fn reject_oversize_for_inline_send_accounts_for_fixed_header_overhead() {
+        let max = 100;
+        assert!(reject_oversize_for_inline_send(12, 90, max).is_err());
+        assert!(reject_oversize_for_inline_send(12, 88, max).is_ok());
+        assert!(reject_oversize_for_inline_send(12, 89, max).is_err());
+        // The raw-tell/typed-tell paths pass 0: body_len == payload_len.
+        assert!(reject_oversize_for_inline_send(0, max, max).is_ok());
+        assert!(reject_oversize_for_inline_send(0, max + 1, max).is_err());
     }
 
     /// Every writer whose body length is a direct function of a
