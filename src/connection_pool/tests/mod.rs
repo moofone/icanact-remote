@@ -3796,6 +3796,138 @@ fn stream_protocol_tell_throughput_bench() {
     });
 }
 
+/// R-6: the accept path's first-frame `StreamingState` must be inherited by
+/// the connection's IO task via `streaming_state_handoff`, not discarded for
+/// a fresh one. This reproduces that handoff directly: a `StreamingState` is
+/// built exactly the way `process_read_result`'s `MessageReadResult::Streaming`
+/// arm builds it when the connection's very first frame is a multi-chunk
+/// `StreamStart` (the accept path processes that frame before the IO task,
+/// and its own read loop, ever starts), with the first of two chunks already
+/// applied. That state is placed in the handoff cell and the IO task is
+/// spawned exactly as the real accept path spawns it. Only the second chunk
+/// is then written to the wire.
+///
+/// If the IO task started from a fresh `StreamingState` instead of inheriting
+/// this one, that second chunk would have no matching `active_streams` entry:
+/// `reserve_v5_chunk_or_discard` would fall through to `reserve_v5_chunk`'s
+/// fatal "unknown stream_id" (not a tombstoned id, so not a discard), tearing
+/// the connection down before the tell is ever delivered.
+#[test]
+fn accept_path_streaming_state_handoff_completes_a_stream_split_across_the_first_frame() {
+    run_multi_thread_test(async {
+        const STRIDE: usize = 8;
+        let server_addr: std::net::SocketAddr = "127.0.0.1:44101".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:44102".parse().unwrap();
+        let delivered = Arc::new(AtomicU64::new(0));
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("r6_handoff_server")),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        server_registry
+            .set_actor_message_handler_sync(Arc::new(TestActorCounter {
+                delivered: Arc::clone(&delivered),
+            }))
+            .await;
+
+        // Build the "already processed the first frame" StreamingState the
+        // same way the accept path does: start the stream and apply its
+        // inline first chunk via the legacy correlation-based API, before
+        // the IO task (and its V5 direct-read reservation machinery) exists.
+        let stream_id = 4_242u64;
+        let total_size = (STRIDE * 2) as u64;
+        let start_header = crate::StreamHeader {
+            stream_id,
+            total_size,
+            chunk_size: STRIDE as u32,
+            chunk_index: 0,
+            type_hash: TEST_TELL_HASH,
+            actor_id: TEST_TELL_ACTOR_ID,
+        };
+        let mut inherited = crate::protocol::StreamingState::new();
+        inherited
+            .start_stream_with_correlation_and_kind(
+                start_header,
+                0,
+                server_registry.connection_pool.aligned_bytes_pool(),
+                None,
+                false,
+            )
+            .expect("accept path starts the stream");
+        assert!(
+            inherited
+                .add_chunk_with_correlation(
+                    start_header,
+                    bytes::Bytes::from_static(&[0xAAu8; STRIDE]),
+                    None,
+                )
+                .expect("first chunk is accepted")
+                .is_none(),
+            "a 1-of-2 chunk stream must not be complete yet"
+        );
+
+        let handoff = Arc::new(StreamingStateHandoff {
+            cell: std::sync::Mutex::new(Some(inherited)),
+            ready: tokio::sync::Notify::new(),
+        });
+        handoff.ready.notify_one();
+
+        let (mut client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+        let server_read_ctx = ReadContext {
+            streaming_state_handoff: Some(Arc::clone(&handoff)),
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr: client_addr,
+            session_source: client_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: server_registry.actor_message_handler_sync.load_full(),
+        };
+        let (_server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            client_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+
+        // The peer, unaware the accept path already consumed the first
+        // frame, sends only the second (and final) chunk.
+        let second_header =
+            crate::framing::write_stream_data_header(false, stream_id as u32, 1, STRIDE);
+        tokio::io::AsyncWriteExt::write_all(&mut client_io, &second_header)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client_io, &[0xBBu8; STRIDE])
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while delivered.load(Ordering::Acquire) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the inherited stream's second chunk was never delivered -- the accept \
+                 path's StreamingState was not inherited by the IO task"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(delivered.load(Ordering::Acquire), 1);
+    });
+}
+
 #[test]
 #[ignore = "benchmark-only; run explicitly when profiling"]
 fn correlation_tracker_throughput_bench() {
