@@ -3933,12 +3933,7 @@ where
         let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
 
         let (claim_outcome, claim_receipt) = registry
-            .add_connection_scoped_peer_claim(
-                peer_state_addr,
-                node_id,
-                addr_claim_kind,
-                peer_addr,
-            )
+            .add_connection_scoped_peer_claim(peer_state_addr, node_id, addr_claim_kind, peer_addr)
             .await;
 
         // The address this connection is actually attributed to after
@@ -3946,6 +3941,15 @@ where
         // source instead of abandoning bookkeeping outright: that claim is
         // inherently Verified (it depends on nothing the peer can forge),
         // so it is always safe to retry there.
+        //
+        // `fell_back_to_observed_source` records that this specific claim
+        // took that fallback, so the resulting entry can be marked
+        // `PeerInfo::transport_source_keyed` further down. It must not be
+        // reconstructed later from `effective_addr == peer_addr`: a peer
+        // that legitimately dials out from its own listen port also
+        // satisfies that equality via the `Accepted` arm below, and must
+        // not be misclassified as a fallback attribution.
+        let mut fell_back_to_observed_source = false;
         let effective_claim = match claim_outcome {
             crate::addr_ownership::AddrClaimOutcome::Accepted => {
                 claim_receipt.map(|receipt| (peer_state_addr, receipt))
@@ -3963,6 +3967,7 @@ where
                     node_id = %node_id.fmt_short(),
                     "rejecting claimed advertised address for inbound peer; falling back to observed source"
                 );
+                fell_back_to_observed_source = true;
                 let (fallback_outcome, fallback_receipt) = registry
                     .add_connection_scoped_peer_claim(
                         peer_addr,
@@ -4020,6 +4025,17 @@ where
             if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
                 peer_info.peer_address = Some(peer_addr);
             }
+        } else if fell_back_to_observed_source {
+            // Set BEFORE `mark_peer_connected` below: that call's discovery
+            // notification (`record_peer_discovery_connected`) reads this
+            // flag off the existing entry to decide whether to admit a
+            // `PeerDiscovery` slot, so the flag must already be in place
+            // the first time discovery is notified, not only after the
+            // second, idempotent post-publish re-mark.
+            let mut gossip_state = registry.gossip_state.lock().await;
+            if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
+                peer_info.transport_source_keyed = true;
+            }
         }
 
         // Notify peer discovery that a connection is established (incoming)
@@ -4029,7 +4045,11 @@ where
         // PeerInfo at the ephemeral source would let the first FullSync
         // migration overwrite this identity-bearing entry.
         registry
-            .mark_inbound_connection_observed(effective_addr, peer_addr)
+            .mark_inbound_connection_observed(
+                effective_addr,
+                peer_addr,
+                fell_back_to_observed_source,
+            )
             .await;
 
         debug!(
