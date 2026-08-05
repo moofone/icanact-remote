@@ -1368,6 +1368,27 @@ impl PeerInfo {
     }
 }
 
+/// Stable dedup key for a `peers` entry, keyed by verified identity where
+/// known. A physical peer that ends up tracked under more than one
+/// `SocketAddr` -- an ephemeral TCP-source entry still present alongside
+/// its migrated bind address, dual-stack IPv4/IPv6 aliases, a DNS name
+/// resolving to several addresses -- must still be counted, gossiped to,
+/// and fanned out to exactly once per round. Entries whose identity is not
+/// yet known (`node_id: None`) fall back to address keying rather than a
+/// shared "unknown" bucket, so two pre-handshake peers -- which have no
+/// identity to compare -- are never merged with each other.
+#[derive(Hash, Eq, PartialEq)]
+enum PeerDispatchKey {
+    Node(crate::GossipNodeId),
+    Addr(SocketAddr),
+}
+
+impl PeerDispatchKey {
+    fn for_entry(addr: SocketAddr, peer: &PeerInfo) -> Self {
+        peer.node_id.map(Self::Node).unwrap_or(Self::Addr(addr))
+    }
+}
+
 /// Peer information for gossip (rkyv-serializable version)
 /// Uses String instead of SocketAddr for rkyv serialization
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
@@ -4755,15 +4776,27 @@ impl<T: 'static> GossipRegistry<T> {
             mesh_formation_time_ms,
         ) = {
             let gossip_state = self.gossip_state.lock().await;
-            let active_peers = gossip_state
-                .peers
-                .values()
-                .filter(|p| {
-                    p.failures < self.config.max_peer_failures
-                        && (p.outbound_dial_success || p.inbound_observed)
-                })
-                .count();
-            let failed_peers = gossip_state.peers.len() - active_peers;
+            // Deduplicate by stable identity (see `PeerDispatchKey`) before
+            // counting: a physical peer tracked under multiple SocketAddr
+            // keys -- an inbound-fallback ephemeral TCP-source entry
+            // alongside its migrated bind address, dual-stack IPv4/IPv6
+            // aliases -- must be reported as one active peer, not one per
+            // alias. `failed_peers` stays entry-granular (it mirrors
+            // per-address retry/backoff bookkeeping, which genuinely can
+            // differ across aliases of the same identity).
+            let mut seen_active: std::collections::HashSet<PeerDispatchKey> =
+                std::collections::HashSet::new();
+            let mut raw_active_count = 0usize;
+            for (addr, peer) in gossip_state.peers.iter() {
+                if peer.failures < self.config.max_peer_failures
+                    && (peer.outbound_dial_success || peer.inbound_observed)
+                {
+                    raw_active_count += 1;
+                    seen_active.insert(PeerDispatchKey::for_entry(*addr, peer));
+                }
+            }
+            let active_peers = seen_active.len();
+            let failed_peers = gossip_state.peers.len() - raw_active_count;
 
             // Peer discovery metrics (Phase 5)
             let discovered_peers = gossip_state.known_peers.len();
@@ -5786,12 +5819,8 @@ impl<T: 'static> GossipRegistry<T> {
             // IPv4/IPv6 aliases, DNS-resolved hostnames — receives one
             // delivery per round. Peers whose GossipNodeId is not yet known
             // continue to be keyed by SocketAddr.
-            #[derive(Hash, Eq, PartialEq)]
-            enum DispatchKey {
-                Node(crate::GossipNodeId),
-                Addr(SocketAddr),
-            }
-            let mut seen: std::collections::HashSet<DispatchKey> = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<PeerDispatchKey> =
+                std::collections::HashSet::new();
             let mut available_peers: Vec<SocketAddr> = Vec::new();
             for (peer_addr, peer) in gossip_state.peers.iter() {
                 let retry_window_open = peer.failures < self.config.max_peer_failures
@@ -5810,11 +5839,7 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                     continue;
                 }
-                let key = peer
-                    .node_id
-                    .map(DispatchKey::Node)
-                    .unwrap_or(DispatchKey::Addr(*peer_addr));
-                if seen.insert(key) {
+                if seen.insert(PeerDispatchKey::for_entry(*peer_addr, peer)) {
                     available_peers.push(*peer_addr);
                 }
             }
@@ -8422,23 +8447,13 @@ impl<T: 'static> GossipRegistry<T> {
         max_peer_failures: usize,
         fanout: usize,
     ) -> Vec<SocketAddr> {
-        #[derive(Hash, Eq, PartialEq)]
-        enum DispatchKey {
-            Node(crate::GossipNodeId),
-            Addr(SocketAddr),
-        }
-
-        let mut seen: std::collections::HashSet<DispatchKey> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<PeerDispatchKey> = std::collections::HashSet::new();
         let mut selected: Vec<SocketAddr> = Vec::new();
         for (addr, peer) in peers.iter() {
             if peer.failures >= max_peer_failures {
                 continue;
             }
-            let key = peer
-                .node_id
-                .map(DispatchKey::Node)
-                .unwrap_or(DispatchKey::Addr(*addr));
-            if seen.insert(key) {
+            if seen.insert(PeerDispatchKey::for_entry(*addr, peer)) {
                 selected.push(*addr);
                 if selected.len() >= fanout {
                     break;
@@ -8722,6 +8737,12 @@ impl<T: 'static> GossipRegistry<T> {
             .peers
             .values()
             .filter(|p| p.failures < self.config.max_peer_failures)
+            // A transport-source-keyed entry's address is the ephemeral
+            // TCP source of one inbound connection, not something any
+            // other node could ever dial -- advertising it mints a bogus,
+            // per-session address that recipients then waste a dial
+            // attempt (and a discovery slot) on.
+            .filter(|p| !p.transport_source_keyed)
             .filter(|p| {
                 crate::net_security::is_safe_to_dial(
                     &p.address,
@@ -8805,15 +8826,22 @@ impl<T: 'static> GossipRegistry<T> {
             return Vec::new();
         }
 
-        // Get active peers to gossip to
+        // Get active peers to gossip to, deduplicated by stable identity
+        // (see `PeerDispatchKey`) so a physical peer tracked under
+        // multiple SocketAddr aliases does not burn more than one slot of
+        // the `max_peer_gossip_targets` budget.
         let targets: Vec<SocketAddr> = {
             let gossip_state = self.gossip_state.lock().await;
-            let mut active_peers: Vec<SocketAddr> = gossip_state
-                .peers
-                .iter()
-                .filter(|(_, info)| info.failures < self.config.max_peer_failures)
-                .map(|(addr, _)| *addr)
-                .collect();
+            let mut seen: std::collections::HashSet<PeerDispatchKey> =
+                std::collections::HashSet::new();
+            let mut active_peers: Vec<SocketAddr> = Vec::new();
+            for (addr, info) in gossip_state.peers.iter() {
+                if info.failures < self.config.max_peer_failures
+                    && seen.insert(PeerDispatchKey::for_entry(*addr, info))
+                {
+                    active_peers.push(*addr);
+                }
+            }
 
             // Shuffle and take max_peer_gossip_targets
             active_peers.shuffle(&mut rand::rng());
@@ -9386,6 +9414,19 @@ impl<T: 'static> GossipRegistry<T> {
     /// connection for it, so the liveness clear can never race a real,
     /// already-published replacement out of existence.
     fn record_peer_discovery_connected(&self, gossip_state: &mut GossipState, addr: SocketAddr) {
+        // A transport-source-keyed entry's key is one connection's
+        // ephemeral TCP source, not a dialable discovery candidate --
+        // admitting it here consumes a `PeerDiscovery` slot per fallback
+        // session instead of per physical peer, so `at_soft_cap` trips at
+        // a fraction of the configured `max_peers`.
+        if gossip_state
+            .peers
+            .get(&addr)
+            .is_some_and(|peer| peer.transport_source_keyed)
+        {
+            return;
+        }
+
         let should_track_mesh_time =
             self.config.mesh_formation_target > 0 && gossip_state.mesh_formation_time_ms.is_none();
 
