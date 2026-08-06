@@ -3732,6 +3732,17 @@ where
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
         }
+        Ok(MessageReadResult::AskNack { .. }) => {
+            if let Some(node_id) = known_node_id {
+                (node_id.to_peer_id().to_hex(), None, None)
+            } else {
+                warn!(
+                    peer_addr = %peer_addr,
+                    "AskNack arrived before peer GossipNodeId is known"
+                );
+                return ConnectionCloseOutcome::Normal { node_id: None };
+            }
+        }
         Ok(MessageReadResult::DirectAsk { correlation_id, .. }) => {
             if let Some(node_id) = known_node_id {
                 (node_id.to_peer_id().to_hex(), Some(*correlation_id), None)
@@ -4629,6 +4640,13 @@ pub(crate) enum MessageReadResult {
         correlation_id: u32,
         payload: AlignedBytes,
     },
+    /// A peer explicitly declined to answer an ask (see
+    /// `framing::ask_nack_reason`). Delivered to the waiter's correlation
+    /// slot as an immediate typed error instead of a payload.
+    AskNack {
+        correlation_id: u32,
+        reason: crate::framing::AskNackReason,
+    },
     Raw(bytes::Bytes),
     PubSub {
         payload: AlignedBytes,
@@ -4880,6 +4898,42 @@ pub(crate) async fn handle_response_message(
     }
 }
 
+/// Deliver an ask NACK to whichever correlation tracker is waiting on
+/// `correlation_id`. Mirrors `handle_response_message`'s three-tier lookup
+/// (connection-scoped tracker, then the connection's embedded tracker, then
+/// the shared-by-peer-id fallback) exactly, but completes the slot with
+/// `complete_nack` so the waiter resolves to `Err(GossipError::AskNacked)`
+/// immediately instead of the response payload path.
+pub(crate) async fn handle_response_nack_message(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u32,
+    reason: crate::framing::AskNackReason,
+    response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
+) {
+    if let Some(correlation) = response_correlation {
+        if correlation.complete_nack(correlation_id, reason) {
+            return;
+        }
+    }
+
+    let pool = &registry.connection_pool;
+
+    if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
+        if let Some(ref correlation) = conn.correlation {
+            if correlation.complete_nack(correlation_id, reason) {
+                return;
+            }
+        }
+    }
+
+    if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
+        if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
+            let _ = correlation.complete_nack(correlation_id, reason);
+        }
+    }
+}
+
 /// Parse a complete V5 frame. The control word owns kind and body length, so
 /// every inline payload offset is fixed by its kind rather than a type byte.
 pub(crate) fn parse_message_from_pooled_buffer(
@@ -5031,8 +5085,15 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
             if body.len() < crate::framing::ASK_RESPONSE_HEADER_LEN {
                 return Err(invalid_v5_frame("truncated response"));
             }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            if let Some(reason) = crate::framing::ask_nack_reason(body) {
+                return Ok(MessageReadResult::AskNack {
+                    correlation_id,
+                    reason,
+                });
+            }
             Ok(MessageReadResult::Response {
-                correlation_id: u32::from_be_bytes(body[..4].try_into().unwrap()),
+                correlation_id,
                 payload: aligned(
                     buffer,
                     crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN,
@@ -5413,6 +5474,22 @@ mod framing_tests {
                 assert_eq!(body.as_ref(), payload_bytes);
             }
             _ => panic!("unexpected result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_nack_header_parses_as_a_distinct_result_not_a_zero_length_response() {
+        let header = framing::write_ask_nack_header(99, framing::AskNackReason::UnknownActor);
+
+        match read_frame(header.to_vec()).await {
+            MessageReadResult::AskNack {
+                correlation_id,
+                reason,
+            } => {
+                assert_eq!(correlation_id, 99);
+                assert_eq!(reason, framing::AskNackReason::UnknownActor);
+            }
+            other => panic!("expected AskNack, got {other:?}"),
         }
     }
 

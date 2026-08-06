@@ -1077,6 +1077,19 @@ pub(crate) async fn process_read_result(
             )
             .await;
         }
+        MessageReadResult::AskNack {
+            correlation_id,
+            reason,
+        } => {
+            crate::handle::handle_response_nack_message(
+                registry,
+                peer_addr,
+                correlation_id,
+                reason,
+                response_correlation,
+            )
+            .await;
+        }
         MessageReadResult::PubSub { payload } => {
             let authenticated_peer_id = authenticated_peer_id
                 .or_else(|| response_connection.and_then(|conn| conn.embedded_peer_id.as_ref()));
