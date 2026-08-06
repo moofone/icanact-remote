@@ -4822,6 +4822,35 @@ pub(crate) async fn send_inline_response(
     }
 }
 
+/// Send an ask NACK back to the peer: the ask could not be answered with
+/// data (see `crate::framing::AskNackReason`). Same connection lookup as
+/// `send_inline_response`, so a NACK is delivered on whatever connection a
+/// real response would have used.
+pub(crate) async fn send_ask_nack(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u32,
+    reason: crate::framing::AskNackReason,
+) {
+    let pool = &registry.connection_pool;
+    if let Some(conn) = pool.get_existing_connection(peer_addr) {
+        if let Err(e) = conn.send_ask_nack(correlation_id, reason).await {
+            warn!(
+                peer = %peer_addr,
+                error = %e,
+                correlation_id = correlation_id,
+                "Failed to send ask NACK"
+            );
+        }
+    } else {
+        warn!(
+            peer = %peer_addr,
+            correlation_id = correlation_id,
+            "No connection found for ask NACK"
+        );
+    }
+}
+
 /// Send a response back to the peer for a non-streaming ask request using aligned bytes.
 pub(crate) async fn send_inline_response_aligned(
     registry: &Arc<GossipRegistry>,

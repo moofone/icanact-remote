@@ -1441,24 +1441,27 @@ async fn handle_assembled_message(
     } else if let Some(cell) = registry.actor_ask_immediate_handler_sync.load_full() {
         if cell.can_handle(actor_id, type_hash) {
             cell.handle(actor_id, type_hash, complete_data)
-                .map(|disposition| match disposition {
-                    crate::registry::AskDisposition::Immediate(response) => Some(response),
+                .and_then(|disposition| match disposition {
+                    crate::registry::AskDisposition::Immediate(response) => Ok(Some(response)),
                     crate::registry::AskDisposition::ImmediateBytes(response) => {
-                        Some(ActorResponse::Bytes(response))
+                        Ok(Some(ActorResponse::Bytes(response)))
                     }
                     crate::registry::AskDisposition::ImmediateAligned(response) => {
-                        Some(ActorResponse::Aligned(response))
+                        Ok(Some(ActorResponse::Aligned(response)))
                     }
                     crate::registry::AskDisposition::ImmediatePooled {
                         payload,
                         prefix,
                         payload_len,
-                    } => Some(ActorResponse::Pooled {
+                    } => Ok(Some(ActorResponse::Pooled {
                         payload,
                         prefix,
                         payload_len,
-                    }),
-                    crate::registry::AskDisposition::Deferred => None,
+                    })),
+                    crate::registry::AskDisposition::Deferred => Ok(None),
+                    crate::registry::AskDisposition::Nack(reason) => {
+                        Err(GossipError::AskNacked(reason))
+                    }
                 })
         } else if let Some(cell) = registry.actor_ask_handler_sync.load_full() {
             if let Some(stream_handle) =
@@ -1470,24 +1473,27 @@ async fn handle_assembled_message(
                     authenticated_peer_id,
                 );
                 cell.handle(actor_id, type_hash, complete_data, context)
-                    .map(|disposition| match disposition {
-                        crate::registry::AskDisposition::Immediate(response) => Some(response),
+                    .and_then(|disposition| match disposition {
+                        crate::registry::AskDisposition::Immediate(response) => Ok(Some(response)),
                         crate::registry::AskDisposition::ImmediateBytes(response) => {
-                            Some(ActorResponse::Bytes(response))
+                            Ok(Some(ActorResponse::Bytes(response)))
                         }
                         crate::registry::AskDisposition::ImmediateAligned(response) => {
-                            Some(ActorResponse::Aligned(response))
+                            Ok(Some(ActorResponse::Aligned(response)))
                         }
                         crate::registry::AskDisposition::ImmediatePooled {
                             payload,
                             prefix,
                             payload_len,
-                        } => Some(ActorResponse::Pooled {
+                        } => Ok(Some(ActorResponse::Pooled {
                             payload,
                             prefix,
                             payload_len,
-                        }),
-                        crate::registry::AskDisposition::Deferred => None,
+                        })),
+                        crate::registry::AskDisposition::Deferred => Ok(None),
+                        crate::registry::AskDisposition::Nack(reason) => {
+                            Err(GossipError::AskNacked(reason))
+                        }
                     })
             } else {
                 registry
@@ -1509,24 +1515,27 @@ async fn handle_assembled_message(
                 authenticated_peer_id,
             );
             cell.handle(actor_id, type_hash, complete_data, context)
-                .map(|disposition| match disposition {
-                    crate::registry::AskDisposition::Immediate(response) => Some(response),
+                .and_then(|disposition| match disposition {
+                    crate::registry::AskDisposition::Immediate(response) => Ok(Some(response)),
                     crate::registry::AskDisposition::ImmediateBytes(response) => {
-                        Some(ActorResponse::Bytes(response))
+                        Ok(Some(ActorResponse::Bytes(response)))
                     }
                     crate::registry::AskDisposition::ImmediateAligned(response) => {
-                        Some(ActorResponse::Aligned(response))
+                        Ok(Some(ActorResponse::Aligned(response)))
                     }
                     crate::registry::AskDisposition::ImmediatePooled {
                         payload,
                         prefix,
                         payload_len,
-                    } => Some(ActorResponse::Pooled {
+                    } => Ok(Some(ActorResponse::Pooled {
                         payload,
                         prefix,
                         payload_len,
-                    }),
-                    crate::registry::AskDisposition::Deferred => None,
+                    })),
+                    crate::registry::AskDisposition::Deferred => Ok(None),
+                    crate::registry::AskDisposition::Nack(reason) => {
+                        Err(GossipError::AskNacked(reason))
+                    }
                 })
         } else {
             registry
@@ -1539,7 +1548,8 @@ async fn handle_assembled_message(
             .await
     };
 
-    if let Ok(Some(response)) = response {
+    match response {
+        Ok(Some(response)) => {
         // Only send response for asks (non-zero correlation_id)
         if corr_id != 0 {
             match response {
@@ -1610,6 +1620,15 @@ async fn handle_assembled_message(
                         .await;
                     }
                 }
+            }
+        }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Only NACK asks (non-zero correlation_id); a tell has no waiter.
+            if corr_id != 0 {
+                crate::handle::send_ask_nack(registry, peer_addr, corr_id, e.ask_nack_reason())
+                    .await;
             }
         }
     }

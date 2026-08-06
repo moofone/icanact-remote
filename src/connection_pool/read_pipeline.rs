@@ -1378,6 +1378,24 @@ where
     }
 }
 
+/// Write an ask NACK directly to the stream, bypassing `response_batch`. A
+/// NACK is a rare/exceptional path (an unanswerable ask), so it does not
+/// need the batched-write optimization the normal response path uses.
+async fn write_ask_nack_direct<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    correlation_id: u32,
+    reason: crate::framing::AskNackReason,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let header = crate::framing::write_ask_nack_header(correlation_id, reason);
+    write_header_payload_vectored(stream, bytes_written_counter, bytes_since_flush, &header, &[])
+        .await
+}
+
 async fn write_actor_response_direct<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
@@ -1496,6 +1514,17 @@ where
     let schema_hash = ctx.expected_schema_hash;
     match disposition {
         crate::registry::AskDisposition::Deferred => {}
+        crate::registry::AskDisposition::Nack(reason) => {
+            write_ask_nack_direct(
+                stream,
+                bytes_written_counter,
+                bytes_since_flush,
+                correlation_id,
+                reason,
+            )
+            .await?;
+            *wrote_response_bytes = true;
+        }
         crate::registry::AskDisposition::Immediate(response) => match response {
             crate::registry::ActorResponse::Bytes(payload) => {
                 let should_stream =
@@ -1917,41 +1946,46 @@ where
                 perf.actor_handle_ns
                     .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            if let Ok(Some(response)) = response
-                && corr_id != 0
-            {
-                let temp_ctx = ReadContext {
-                    streaming_state_handoff: None,
-                    registry_weak: Arc::downgrade(registry),
-                    peer_addr,
-                    session_source: peer_addr,
-                    peer_id: None,
-                    max_message_size: registry.config.max_message_size,
-                    expected_schema_hash: registry.config.schema_hash,
-                    aligned_pool: registry.connection_pool.aligned_bytes_pool(),
-                    inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
-                    response_correlation: None,
-                    response_writer: None,
-                    tell_handler_sync: None,
-            tell_handler_sync_context: None,
-                    ask_immediate_handler_sync: None,
-                    ask_handler_sync: None,
-                    sync_actor_handler: None,
+            if corr_id != 0 {
+                let disposition = match response {
+                    Ok(Some(response)) => Some(crate::registry::AskDisposition::Immediate(response)),
+                    Ok(None) => None,
+                    Err(e) => Some(crate::registry::AskDisposition::Nack(e.ask_nack_reason())),
                 };
-                let mut wrote_response_bytes = false;
-                write_ask_disposition_io(
-                    &temp_ctx,
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
-                    response_batch,
-                    streaming_responses,
-                    &mut wrote_response_bytes,
-                    corr_id,
-                    crate::registry::AskDisposition::Immediate(response),
-                    perf,
-                )
-                .await?;
+                if let Some(disposition) = disposition {
+                    let temp_ctx = ReadContext {
+                        streaming_state_handoff: None,
+                        registry_weak: Arc::downgrade(registry),
+                        peer_addr,
+                        session_source: peer_addr,
+                        peer_id: None,
+                        max_message_size: registry.config.max_message_size,
+                        expected_schema_hash: registry.config.schema_hash,
+                        aligned_pool: registry.connection_pool.aligned_bytes_pool(),
+                        inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+                        response_correlation: None,
+                        response_writer: None,
+                        tell_handler_sync: None,
+                tell_handler_sync_context: None,
+                        ask_immediate_handler_sync: None,
+                        ask_handler_sync: None,
+                        sync_actor_handler: None,
+                    };
+                    let mut wrote_response_bytes = false;
+                    write_ask_disposition_io(
+                        &temp_ctx,
+                        stream,
+                        bytes_written_counter,
+                        bytes_since_flush,
+                        response_batch,
+                        streaming_responses,
+                        &mut wrote_response_bytes,
+                        corr_id,
+                        disposition,
+                        perf,
+                    )
+                    .await?;
+                }
             }
             Ok(())
         }
@@ -2058,22 +2092,27 @@ where
                 perf.actor_handle_ns
                     .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            if let Some(correlation_id) = correlation_id
-                && let Ok(Some(response)) = response
-            {
-                write_ask_disposition_io(
-                    ctx,
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
-                    response_batch,
-                    streaming_responses,
-                    wrote_response_bytes,
-                    correlation_id,
-                    crate::registry::AskDisposition::Immediate(response),
-                    perf,
-                )
-                .await?;
+            if let Some(correlation_id) = correlation_id {
+                let disposition = match response {
+                    Ok(Some(response)) => Some(crate::registry::AskDisposition::Immediate(response)),
+                    Ok(None) => None,
+                    Err(e) => Some(crate::registry::AskDisposition::Nack(e.ask_nack_reason())),
+                };
+                if let Some(disposition) = disposition {
+                    write_ask_disposition_io(
+                        ctx,
+                        stream,
+                        bytes_written_counter,
+                        bytes_since_flush,
+                        response_batch,
+                        streaming_responses,
+                        wrote_response_bytes,
+                        correlation_id,
+                        disposition,
+                        perf,
+                    )
+                    .await?;
+                }
             }
             return Ok(());
         }
@@ -2162,6 +2201,19 @@ where
         }
 
         let Some(cell) = ctx.sync_actor_handler.as_ref() else {
+            // Nothing is wired up to answer this ask at all: fail closed with
+            // an immediate NACK instead of leaving the caller to time out.
+            if let Some(correlation_id) = correlation_id {
+                write_ask_nack_direct(
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    correlation_id,
+                    crate::framing::AskNackReason::UnknownActor,
+                )
+                .await?;
+                *wrote_response_bytes = true;
+            }
             return Ok(());
         };
         let handle_start = perf.map(|_| Instant::now());
@@ -2172,22 +2224,27 @@ where
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
-        if let Some(correlation_id) = correlation_id
-            && let Ok(Some(response)) = response
-        {
-            write_ask_disposition_io(
-                ctx,
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
-                response_batch,
-                streaming_responses,
-                wrote_response_bytes,
-                correlation_id,
-                crate::registry::AskDisposition::Immediate(response),
-                perf,
-            )
-            .await?;
+        if let Some(correlation_id) = correlation_id {
+            let disposition = match response {
+                Ok(Some(response)) => Some(crate::registry::AskDisposition::Immediate(response)),
+                Ok(None) => None,
+                Err(e) => Some(crate::registry::AskDisposition::Nack(e.ask_nack_reason())),
+            };
+            if let Some(disposition) = disposition {
+                write_ask_disposition_io(
+                    ctx,
+                    stream,
+                    bytes_written_counter,
+                    bytes_since_flush,
+                    response_batch,
+                    streaming_responses,
+                    wrote_response_bytes,
+                    correlation_id,
+                    disposition,
+                    perf,
+                )
+                .await?;
+            }
         }
 
         Ok(())
