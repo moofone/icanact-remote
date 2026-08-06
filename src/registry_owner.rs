@@ -662,7 +662,7 @@ enum OwnerCommand {
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
-        expected_generation: Option<CommitSeq>,
+        dead_peer_timeout: std::time::Duration,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
     /// Atomically checks the causal fence a dead-peer reap also checks
@@ -1006,14 +1006,14 @@ impl RegistryOwnerHandle {
         &self,
         peer_id: PeerId,
         addr: SocketAddr,
-        expected_generation: Option<CommitSeq>,
+        dead_peer_timeout: std::time::Duration,
     ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReleaseDeadPeer {
             peer_id,
             addr,
-            expected_generation,
+            dead_peer_timeout,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -1687,10 +1687,10 @@ impl PeerRegistryOwner {
             OwnerCommand::ReleaseDeadPeer {
                 peer_id,
                 addr,
-                expected_generation,
+                dead_peer_timeout,
                 reply,
             } => {
-                let released = self.release_dead_peer(&peer_id, addr, expected_generation);
+                let released = self.release_dead_peer(&peer_id, addr, dead_peer_timeout);
                 let _ = reply.send(released);
             }
             OwnerCommand::ReserveForReap {
@@ -1984,13 +1984,17 @@ impl PeerRegistryOwner {
         &mut self,
         peer_id: &PeerId,
         addr: SocketAddr,
-        expected_generation: Option<CommitSeq>,
+        dead_peer_timeout: std::time::Duration,
     ) -> Option<CommitSeq> {
-        if self.claim_generation.get(&addr).copied() != expected_generation {
+        if self
+            .claim_committed_at
+            .get(&addr)
+            .is_some_and(|committed_at| committed_at.elapsed() < dead_peer_timeout)
+        {
             trace!(
                 addr = %addr,
                 peer = %peer_id,
-                "dead-peer release refused: ownership generation advanced past this sweep's selection"
+                "dead-peer release refused: address claimed more recently than the dead-peer timeout"
             );
             return None;
         }
