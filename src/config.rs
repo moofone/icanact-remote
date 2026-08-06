@@ -21,8 +21,19 @@ pub const DEFAULT_ASK_WINDOW: usize = 128;
 
 /// Stable v3 actor/stream frame schema guard. Every default transport writes
 /// and requires this value, making layout drift a fail-closed wire reject.
+///
+/// Bumped to v2 by the wire-protocol batch (ask NACK, unconditional typed
+/// type-hash prefix, wire-kind capability gating, stable direct-ask
+/// request_id): every one of those changes the bytes on the wire, so a peer
+/// running the old code and a peer running this code must never be allowed
+/// to interoperate on it. Because this is checked for exact equality during
+/// the Hello handshake (`handshake::perform_hello_handshake`), a mixed
+/// fleet fails closed at connection time -- old and new peers simply refuse
+/// each other with a clean "schema hash mismatch" rejection -- rather than
+/// half-speaking two incompatible dialects of the same frame kinds. This is
+/// a flag-day cutover: every node in the fleet must upgrade together.
 pub const DEFAULT_SCHEMA_HASH: u64 =
-    crate::typed::fnv1a_hash("icanact-remote/v3/actor-stream-frame-schema/v1");
+    crate::typed::fnv1a_hash("icanact-remote/v3/actor-stream-frame-schema/v2");
 
 /// Default cap on simultaneous in-flight (post-accept, pre-identified) inbound
 /// handshakes. Bounds half-open inbound tasks.
