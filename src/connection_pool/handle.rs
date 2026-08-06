@@ -248,6 +248,19 @@ impl<T> ConnectionHandle<T> {
             .await
     }
 
+    /// Send an ask NACK: same frame kind and header shape as a normal
+    /// response (`send_response_bytes`), zero-length payload, reason packed
+    /// into the header's reserved bytes (`framing::write_ask_nack_header`).
+    pub async fn send_ask_nack(
+        &self,
+        correlation_id: u32,
+        reason: crate::framing::AskNackReason,
+    ) -> Result<()> {
+        let header = framing::write_ask_nack_header(correlation_id, reason);
+        self.write_header_and_payload_control_inline(header, 16, bytes::Bytes::new())
+            .await
+    }
+
     /// Send a gossip payload with framing, without copying the payload.
     pub async fn send_gossip_payload(&self, payload: bytes::Bytes) -> Result<()> {
         let header = framing::write_gossip_frame_prefix(payload.len());
@@ -1194,6 +1207,51 @@ impl<T> ConnectionHandle<T> {
                 format!("connection {} has no writer path", self.addr),
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_nack_send_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:19998".parse().expect("valid test addr")
+    }
+
+    #[tokio::test]
+    async fn send_ask_nack_writes_the_wire_nack_frame() {
+        let (io, mut peer) = tokio::io::duplex(256);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            test_addr(),
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream_handle = Arc::new(stream_handle);
+        let correlation = CorrelationTracker::new();
+        let conn: ConnectionHandle =
+            ConnectionHandle::new_stream(test_addr(), stream_handle, correlation);
+
+        conn.send_ask_nack(77, crate::framing::AskNackReason::HandlerError)
+            .await
+            .expect("send_ask_nack must succeed");
+
+        let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        peer.read_exact(&mut frame)
+            .await
+            .expect("peer must receive the NACK frame");
+
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
+            .expect("valid control word");
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(u32::from_be_bytes(frame[4..8].try_into().unwrap()), 77);
+        assert_eq!(
+            crate::framing::ask_nack_reason(&frame[4..]),
+            Some(crate::framing::AskNackReason::HandlerError)
+        );
     }
 }
 
