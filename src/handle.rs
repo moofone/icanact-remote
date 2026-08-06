@@ -4674,6 +4674,15 @@ pub(crate) enum MessageReadResult {
     /// Fast-path direct ask (bypasses actor message handler)
     DirectAsk {
         correlation_id: u32,
+        /// Stable, caller-controlled, guaranteed-nonzero identity (see
+        /// `framing::write_direct_ask_header`), independent of
+        /// `correlation_id` (which is a connection-local slot recycled on
+        /// every reconnect). Not yet consumed downstream -- there is no
+        /// application dispatcher for DirectAsk today (every request is
+        /// NACKed, see `protocol::process_read_result`) -- but it is on the
+        /// wire, parsed, and fail-closed validated so it's available once
+        /// one exists.
+        request_id: u64,
         payload: AlignedBytes,
     },
     /// Fast-path direct response
@@ -5157,9 +5166,30 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
                 )?,
             })
         }
-        crate::framing::WireKind::DirectAsk | crate::framing::WireKind::DirectResponse => {
+        crate::framing::WireKind::DirectAsk => {
             if body.len() < crate::framing::DIRECT_ASK_HEADER_LEN {
-                return Err(invalid_v5_frame("truncated direct frame"));
+                return Err(invalid_v5_frame("truncated direct ask"));
+            }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            // Fail-closed: a DirectAsk without a stable, nonzero request_id
+            // is rejected rather than silently accepted -- see
+            // `framing::write_direct_ask_header`.
+            let request_id = crate::framing::direct_ask_request_id(body)
+                .ok_or_else(|| invalid_v5_frame("direct ask missing a nonzero request_id"))?;
+            let payload = aligned(
+                buffer,
+                crate::framing::DIRECT_ASK_FRAME_HEADER_LEN,
+                body_len - crate::framing::DIRECT_ASK_HEADER_LEN,
+            )?;
+            Ok(MessageReadResult::DirectAsk {
+                correlation_id,
+                request_id,
+                payload,
+            })
+        }
+        crate::framing::WireKind::DirectResponse => {
+            if body.len() < crate::framing::DIRECT_ASK_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated direct response"));
             }
             let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
             let payload = aligned(
@@ -5167,17 +5197,10 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
                 crate::framing::DIRECT_ASK_FRAME_HEADER_LEN,
                 body_len - crate::framing::DIRECT_ASK_HEADER_LEN,
             )?;
-            if control.kind == crate::framing::WireKind::DirectAsk {
-                Ok(MessageReadResult::DirectAsk {
-                    correlation_id,
-                    payload,
-                })
-            } else {
-                Ok(MessageReadResult::DirectResponse {
-                    correlation_id,
-                    payload,
-                })
-            }
+            Ok(MessageReadResult::DirectResponse {
+                correlation_id,
+                payload,
+            })
         }
         crate::framing::WireKind::PubSub => {
             if body.len() < crate::framing::PUBSUB_HEADER_LEN {
@@ -5605,6 +5628,48 @@ mod framing_tests {
             crate::framing::ask_nack_reason(&frame[4..]),
             Some(crate::framing::AskNackReason::NoDispatcher)
         );
+    }
+
+    /// Item 4, fail-closed: a DirectAsk frame with request_id == 0 (the
+    /// wire's reserved "absent" sentinel -- see
+    /// `framing::write_direct_ask_header`) must be rejected, not silently
+    /// accepted with an ambiguous identity.
+    #[test]
+    fn direct_ask_with_zero_request_id_is_rejected() {
+        let payload = b"PING";
+        let header = framing::write_direct_ask_header(1, 0, payload.len());
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(payload);
+
+        let routes = crate::route_interning::RouteTable::new();
+        assert!(
+            parse_with_routes(&frame, &routes).is_err(),
+            "a DirectAsk with request_id == 0 must be rejected, not parsed"
+        );
+    }
+
+    /// Item 4: a well-formed, nonzero request_id round-trips through the
+    /// shared frame parser (not just the standalone framing::write/read
+    /// helpers tested in framing.rs).
+    #[tokio::test]
+    async fn direct_ask_carries_its_request_id_through_the_frame_parser() {
+        let payload = b"PING";
+        let header = framing::write_direct_ask_header(7, 0xabad_1dea, payload.len());
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(payload);
+
+        match read_frame(frame).await {
+            MessageReadResult::DirectAsk {
+                correlation_id,
+                request_id,
+                payload: body,
+            } => {
+                assert_eq!(correlation_id, 7);
+                assert_eq!(request_id, 0xabad_1dea);
+                assert_eq!(body.as_ref(), payload);
+            }
+            other => panic!("expected DirectAsk, got {other:?}"),
+        }
     }
 
     #[tokio::test]

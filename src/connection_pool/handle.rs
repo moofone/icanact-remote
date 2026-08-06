@@ -932,6 +932,15 @@ impl<T> ConnectionHandle<T> {
     /// the server can generate responses directly without spawning actor tasks.
     ///
     /// Wire format: [length:4][type:1][correlation_id:4][payload_len:4][payload:N]
+    ///
+    /// Uses the connection-local `correlation_id` as the frame's stable
+    /// `request_id` too (it's already guaranteed nonzero by
+    /// `CorrelationTracker::allocate`, which never hands out 0). That's
+    /// stable enough for this method's own contract (no timeout/retry
+    /// wrapping happens here), but it does NOT survive a transport reset --
+    /// a caller that needs an id stable across reconnects/retries (e.g. to
+    /// dedupe a retried ask server-side) must supply its own via
+    /// `ask_direct_with_id`.
     pub async fn ask_direct(
         &self,
         request: bytes::Bytes,
@@ -939,9 +948,43 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<bytes::Bytes> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
+        self.ask_direct_on_slot(correlation_id, u64::from(correlation_id), request, timeout, slot)
+            .await
+    }
 
-        // Build DirectAsk header
-        let header = framing::write_direct_ask_header(correlation_id, request.len());
+    /// Like `ask_direct`, but the caller supplies a stable `request_id` that
+    /// survives across a transport reset/retry (unlike the connection-local
+    /// `correlation_id`, which is recycled on every reconnect). Fail-closed:
+    /// `request_id` must be nonzero -- 0 is the wire's reserved "absent"
+    /// sentinel (see `framing::write_direct_ask_header`) and is rejected
+    /// before anything is sent, rather than silently accepted as a
+    /// valid-looking id that could collide across independent asks.
+    pub async fn ask_direct_with_id(
+        &self,
+        request_id: u64,
+        request: bytes::Bytes,
+        timeout: Duration,
+    ) -> Result<bytes::Bytes> {
+        if request_id == 0 {
+            return Err(GossipError::InvalidConfig(
+                "ask_direct_with_id: request_id must be nonzero".to_string(),
+            ));
+        }
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
+        self.ask_direct_on_slot(correlation_id, request_id, request, timeout, slot)
+            .await
+    }
+
+    async fn ask_direct_on_slot(
+        &self,
+        correlation_id: u32,
+        request_id: u64,
+        request: bytes::Bytes,
+        timeout: Duration,
+        slot: SlotGuard<'_>,
+    ) -> Result<bytes::Bytes> {
+        let header = framing::write_direct_ask_header(correlation_id, request_id, request.len());
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {
@@ -960,12 +1003,16 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// Fast-path direct ask without timeout allocation (benchmarking/hot path).
+    ///
+    /// See `ask_direct`'s doc for why `correlation_id` doubles as
+    /// `request_id` here.
     pub async fn ask_direct_no_timeout(&self, request: bytes::Bytes) -> Result<bytes::Bytes> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
 
         // Build DirectAsk header
-        let header = framing::write_direct_ask_header(correlation_id, request.len());
+        let header =
+            framing::write_direct_ask_header(correlation_id, u64::from(correlation_id), request.len());
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {

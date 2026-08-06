@@ -99,7 +99,13 @@ async fn read_length_prefixed_frame<S: tokio::io::AsyncRead + Unpin>(
     (control, buf)
 }
 
-async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
+/// Wait for the ask-NACK `Response` frame for `correlation_id`. A DirectAsk
+/// has no registered application handler in any build mode (see
+/// `protocol::process_read_result`), so the server always answers with a
+/// NACK, never a `DirectResponse` -- receiving the right NACK, for the right
+/// correlation id, is what proves the server actually reassembled the
+/// fragmented frame correctly rather than choking on it silently.
+async fn read_until_ask_nack<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
     correlation_id: u32,
 ) -> Vec<u8> {
@@ -107,15 +113,17 @@ async fn read_until_direct_response<S: tokio::io::AsyncRead + Unpin>(
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            panic!("timed out waiting for DirectResponse");
+            panic!("timed out waiting for the ask NACK");
         }
         let remaining = deadline - now;
         let (control, frame) = tokio::time::timeout(remaining, read_length_prefixed_frame(stream))
             .await
             .expect("timeout");
-        if control.kind == icanact_remote::framing::WireKind::DirectResponse {
+        if control.kind == icanact_remote::framing::WireKind::Response {
             let got_corr = u32::from_be_bytes(frame[..4].try_into().expect("correlation id"));
-            if got_corr == correlation_id {
+            if got_corr == correlation_id
+                && icanact_remote::framing::ask_nack_reason(&frame).is_some()
+            {
                 return frame;
             }
         }
@@ -148,8 +156,10 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
     send_fullsync(&mut tls, client_peer_id).await;
 
     let correlation_id: u32 = 0x1_0000;
+    let request_id: u64 = 0xfeed_face_1234_5678;
     let payload = b"hello-bad-client".to_vec();
-    let header = icanact_remote::framing::write_direct_ask_header(correlation_id, payload.len());
+    let header =
+        icanact_remote::framing::write_direct_ask_header(correlation_id, request_id, payload.len());
 
     // Send 1 byte at a time to force heavy fragmentation.
     for b in header {
@@ -160,12 +170,14 @@ async fn direct_ask_roundtrip_with_tcp_fragmentation() {
     }
     tls.flush().await.expect("flush");
 
-    let frame = read_until_direct_response(&mut tls, correlation_id).await;
+    let frame = read_until_ask_nack(&mut tls, correlation_id).await;
     let got_corr = u32::from_be_bytes(frame[..4].try_into().expect("correlation id"));
     assert_eq!(got_corr, correlation_id);
-    let got_payload = &frame[icanact_remote::framing::DIRECT_RESPONSE_FRAME_HEADER_LEN
-        - icanact_remote::framing::LENGTH_PREFIX_LEN..];
-    assert_eq!(got_payload, payload.as_slice());
+    assert_eq!(
+        icanact_remote::framing::ask_nack_reason(&frame),
+        Some(icanact_remote::framing::AskNackReason::NoDispatcher),
+        "a fragmented-but-well-formed DirectAsk must still be reassembled and NACKed correctly"
+    );
     handle.shutdown().await;
 }
 
@@ -195,7 +207,7 @@ async fn truncated_frame_does_not_crash_server() {
         let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
         send_fullsync(&mut tls, client_peer_id).await;
         let correlation_id: u32 = 7;
-        let header = icanact_remote::framing::write_direct_ask_header(correlation_id, 32);
+        let header = icanact_remote::framing::write_direct_ask_header(correlation_id, 1, 32);
         tls.write_all(&header).await.expect("write header");
         tls.write_all(b"x").await.expect("write partial payload");
         // Drop TLS stream abruptly: server should handle EOF without panicking.

@@ -1991,12 +1991,15 @@ where
         }
         crate::handle::MessageReadResult::DirectAsk {
             correlation_id,
+            request_id,
             payload,
         } => {
             // DirectAsk has no registered application handler in any build
             // mode: never fabricate a response from the request bytes,
-            // identically in test/test-helpers/debug/release.
-            let _ = payload;
+            // identically in test/test-helpers/debug/release. request_id
+            // isn't consumed yet (no dispatcher exists to hand it to), but
+            // it was already fail-closed validated (nonzero) by the parser.
+            let _ = (payload, request_id);
             let _ = &direct_response_batch;
             let write_start = perf.map(|_| Instant::now());
             write_ask_nack_direct(
@@ -2363,12 +2366,15 @@ where
         }
         ReadIoResult::Generic(crate::handle::MessageReadResult::DirectAsk {
             correlation_id,
+            request_id,
             payload,
         }) => {
             // DirectAsk has no registered application handler in any build
             // mode: never fabricate a response from the request bytes,
-            // identically in test/test-helpers/debug/release.
-            let _ = payload;
+            // identically in test/test-helpers/debug/release. request_id
+            // isn't consumed yet (no dispatcher exists to hand it to), but
+            // it was already fail-closed validated (nonzero) by the parser.
+            let _ = (payload, request_id);
             let _ = &direct_response_batch;
             let write_start = perf.map(|_| Instant::now());
             write_ask_nack_direct(

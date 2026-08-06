@@ -1318,6 +1318,7 @@ pub(crate) async fn process_read_result(
         }
         MessageReadResult::DirectAsk {
             correlation_id,
+            request_id,
             payload,
         } => {
             // Fast-path DirectAsk bypasses the handler and RegistryMessage
@@ -1328,7 +1329,11 @@ pub(crate) async fn process_read_result(
             // "test-helpers", debug_assertions)) and only NACK in release,
             // so a debug binary and a release binary answered a DirectAsk
             // differently. Every build mode now NACKs identically.
-            let _ = payload;
+            //
+            // request_id isn't consumed yet -- no dispatcher exists for
+            // DirectAsk to hand it to -- but it was already fail-closed
+            // validated (nonzero) by the parser.
+            let _ = (payload, request_id);
             send_ask_nack(
                 registry,
                 peer_addr,
@@ -1667,6 +1672,7 @@ mod tests {
         process_read_result(
             MessageReadResult::DirectAsk {
                 correlation_id: 4242,
+                request_id: 99,
                 payload: crate::AlignedBytes::from_pooled_slice(request_payload, pool),
             },
             &mut streaming_state,

@@ -354,14 +354,40 @@ pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER
     )
 }
 
+/// Build a DirectAsk frame header. `request_id` is a stable identifier the
+/// caller controls (unlike `correlation_id`, which is a connection-local
+/// slot index that gets recycled on every reconnect): it is what lets a
+/// receiver recognize "this is the same logical ask retried after a
+/// transport reset" via the `(peer_id, request_id)` identity, rather than
+/// treating a retry as a brand-new request and risking double execution.
+/// Occupies bytes the frame has always reserved and zeroed after
+/// `correlation_id`, so it costs no extra frame. Fail-closed: `request_id`
+/// must be nonzero (see `direct_ask_request_id` on the read side); 0 is
+/// reserved to mean "absent" and is rejected rather than silently accepted
+/// as a valid-looking id that could collide across independent asks.
 pub fn write_direct_ask_header(
     correlation_id: u32,
+    request_id: u64,
     payload_len: usize,
 ) -> [u8; DIRECT_ASK_FRAME_HEADER_LEN] {
     let body_len = checked_body_len(DIRECT_ASK_HEADER_LEN, payload_len);
     let mut header = init_header(WireKind::DirectAsk, body_len);
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    header[8..16].copy_from_slice(&request_id.to_be_bytes());
     header
+}
+
+/// Read back the stable request id `write_direct_ask_header` wrote, from a
+/// DirectAsk frame's body (the bytes after the control word, starting at the
+/// correlation id). Fail-closed: `None` both for a truncated body and for
+/// the reserved-zero sentinel (`request_id == 0`), so a caller can't
+/// mistake "absent" for a valid id.
+pub fn direct_ask_request_id(body: &[u8]) -> Option<u64> {
+    if body.len() < DIRECT_ASK_HEADER_LEN {
+        return None;
+    }
+    let request_id = u64::from_be_bytes(body[4..12].try_into().unwrap());
+    if request_id == 0 { None } else { Some(request_id) }
 }
 
 pub fn write_direct_response_header(
@@ -526,7 +552,7 @@ mod tests {
 
     #[test]
     fn direct_frames_do_not_encode_redundant_payload_length() {
-        let header = write_direct_ask_header(0x1234_5678, 9);
+        let header = write_direct_ask_header(0x1234_5678, 0xdead_beef_cafe_1234, 9);
         let control = decode_control(header[..4].try_into().unwrap()).unwrap();
         assert_eq!(control.kind, WireKind::DirectAsk);
         assert_eq!(control.body_len, DIRECT_ASK_HEADER_LEN + 9);
@@ -534,7 +560,24 @@ mod tests {
             u32::from_be_bytes(header[4..8].try_into().unwrap()),
             0x1234_5678
         );
-        assert_eq!(&header[8..], &[0; 8]);
+        assert_eq!(
+            u64::from_be_bytes(header[8..16].try_into().unwrap()),
+            0xdead_beef_cafe_1234
+        );
+    }
+
+    /// The stable request id occupies bytes the frame has always reserved
+    /// (and zeroed) after the connection-local correlation id, so it costs
+    /// no extra frame -- same trick as the ask-NACK marker in the Response
+    /// header.
+    #[test]
+    fn direct_ask_request_id_round_trips_through_the_headers_reserved_bytes() {
+        let header = write_direct_ask_header(1, 42, 0);
+        assert_eq!(
+            u64::from_be_bytes(header[8..16].try_into().unwrap()),
+            42,
+            "request_id must occupy the frame's previously-zeroed trailing bytes"
+        );
     }
 
     #[test]
