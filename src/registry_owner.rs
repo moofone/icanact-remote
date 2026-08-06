@@ -459,17 +459,26 @@ enum OwnerCommand {
     /// or still-in-flight teardown must not leave a ghost behind for a peer
     /// that is never coming back), and the address ownership itself if
     /// `peer_id` still holds it and `addr` is not operator-pinned.
+    ///
+    /// `expected_generation` fences this against a reconnect that commits a
+    /// fresh claim between the caller's dead-peer selection and this command
+    /// actually running: refused entirely (no receipts touched, no ownership
+    /// cleared) unless it still matches the address's current generation.
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
+        expected_generation: Option<CommitSeq>,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
-    /// Set (`Some`) or clear (`None`) the operator pin on `addr`. See
-    /// `PeerRegistryOwner::set_pin`.
-    SetPin {
+    /// Atomically install `peer_id`'s operator pin at `addr`, replacing
+    /// whatever address (if any) the owner's own peer -> address reverse
+    /// map currently shows this peer pinned at -- not merely the address a
+    /// caller last observed in `ConnectionPool`, which can be stale by the
+    /// time this command runs. See `PeerRegistryOwner::pin`.
+    Pin {
         addr: SocketAddr,
-        peer_id: Option<PeerId>,
-        reply: oneshot::Sender<()>,
+        peer_id: PeerId,
+        reply: oneshot::Sender<Option<SocketAddr>>,
     },
     #[cfg(test)]
     InspectGeneration {
@@ -648,13 +657,21 @@ impl RegistryOwnerHandle {
     /// Release everything `peer_id` still holds at `addr` -- every
     /// connection-scoped receipt recorded for it under any session, and the
     /// address ownership itself if `peer_id` still holds it and `addr` is not
-    /// operator-pinned. See `OwnerCommand::ReleaseDeadPeer`.
-    pub async fn release_dead_peer(&self, peer_id: PeerId, addr: SocketAddr) -> Option<CommitSeq> {
+    /// operator-pinned -- but ONLY if `expected_generation` still matches the
+    /// address's current generation; otherwise a no-op. See
+    /// `OwnerCommand::ReleaseDeadPeer`.
+    pub async fn release_dead_peer(
+        &self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+        expected_generation: Option<CommitSeq>,
+    ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReleaseDeadPeer {
             peer_id,
             addr,
+            expected_generation,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -663,30 +680,35 @@ impl RegistryOwnerHandle {
         response.await.unwrap_or(None)
     }
 
-    /// Reserve `addr` for `peer_id` independently of any connection. Called
-    /// only from `GossipRegistry::configure_peer`.
-    pub async fn pin(&self, addr: SocketAddr, peer_id: PeerId) {
-        self.set_pin(addr, Some(peer_id)).await;
-    }
-
-    /// Clear a previously set pin on `addr`, e.g. when `configure_peer`
-    /// moves a peer's reservation to a new address.
-    pub async fn unpin(&self, addr: SocketAddr) {
-        self.set_pin(addr, None).await;
-    }
-
-    async fn set_pin(&self, addr: SocketAddr, peer_id: Option<PeerId>) {
+    /// Reserve `addr` for `peer_id` independently of any connection,
+    /// atomically replacing any address this peer was previously pinned at.
+    /// Called only from `GossipRegistry::configure_peer`. Returns the
+    /// evicted address, if this peer held a DIFFERENT pin beforehand --
+    /// the caller's cue to also release that address's ownership.
+    ///
+    /// Two concurrent `configure_peer` calls for the same peer can each
+    /// observe the same stale "previous address" from `ConnectionPool`
+    /// before either has applied its own change; if each then independently
+    /// pinned its own target, both addresses would end up pinned for one
+    /// peer, and since a pinned address can never be reclaimed by `release`/
+    /// `release_dead_peer`, the loser would stay reserved forever. Routing
+    /// the replacement through the owner's own reverse map instead --
+    /// looked up here, at the moment this command actually runs, rather
+    /// than trusted from the caller -- means whichever `pin` call the owner
+    /// serializes LAST always wins outright, and there is never a window in
+    /// which two addresses are simultaneously pinned for the same peer.
+    pub async fn pin(&self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
-        let command = OwnerCommand::SetPin {
+        let command = OwnerCommand::Pin {
             addr,
             peer_id,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
-            return;
+            return None;
         }
-        let _ = response.await;
+        response.await.unwrap_or(None)
     }
 
     /// Drop the recorded ownership of `addr` only when both `expected_owner`
@@ -762,6 +784,7 @@ impl RegistryOwnerHandle {
                 claim_generation: HashMap::new(),
                 connection_scoped_claims: HashMap::new(),
                 operator_pinned: HashMap::new(),
+                pinned_by_peer: HashMap::new(),
                 snapshot: Arc::clone(&self.shared.snapshot),
                 routing,
                 commit_seq: 0,
@@ -828,6 +851,15 @@ struct PeerRegistryOwner {
     /// ordinary, non-configured dial's address become permanently
     /// undisplaceable once its peer's session ended.
     operator_pinned: HashMap<SocketAddr, PeerId>,
+    /// Reverse index of `operator_pinned`: the address (if any) each peer is
+    /// currently pinned at. `pin` looks a peer up here -- never trusts a
+    /// caller-supplied "previous address" -- so installing a new pin always
+    /// atomically replaces whatever this SAME peer was pinned at a moment
+    /// ago, even if that address was itself the product of a different,
+    /// concurrently-running `configure_peer`/`migrate` command this task
+    /// already serialized ahead of this one. This is what keeps "at most one
+    /// pinned address per peer" true at every instant, not merely eventually.
+    pinned_by_peer: HashMap<PeerId, SocketAddr>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     routing: Weak<dyn RoutingPublisher>,
     /// Position of the last committed mutation. A plain `u64` rather than an
@@ -906,18 +938,19 @@ impl PeerRegistryOwner {
             OwnerCommand::ReleaseDeadPeer {
                 peer_id,
                 addr,
+                expected_generation,
                 reply,
             } => {
-                let released = self.release_dead_peer(&peer_id, addr);
+                let released = self.release_dead_peer(&peer_id, addr, expected_generation);
                 let _ = reply.send(released);
             }
-            OwnerCommand::SetPin {
+            OwnerCommand::Pin {
                 addr,
                 peer_id,
                 reply,
             } => {
-                self.set_pin(addr, peer_id);
-                let _ = reply.send(());
+                let evicted = self.pin(addr, peer_id);
+                let _ = reply.send(evicted);
             }
             #[cfg(test)]
             OwnerCommand::InspectGeneration { addr, reply } => {
@@ -1091,7 +1124,29 @@ impl PeerRegistryOwner {
     /// (ghost cleanup for a teardown that never ran), and the ownership
     /// record itself if `peer_id` is still its owner and `addr` is not
     /// operator-pinned.
-    fn release_dead_peer(&mut self, peer_id: &PeerId, addr: SocketAddr) -> Option<CommitSeq> {
+    ///
+    /// `expected_generation` is the caller's stale-decision fence: a dead-peer
+    /// sweep can select this exact (peer, addr) pair, then the SAME peer can
+    /// reconnect and commit a fresh connection-scoped claim -- a new
+    /// generation, a live receipt for its new session -- before this command
+    /// actually runs. Refusing outright the moment the generation no longer
+    /// matches, before either the receipt cleanup or the ownership check
+    /// below, is what stops a stale sweep from wiping a live reconnect's
+    /// receipt or retracting its just-committed route.
+    fn release_dead_peer(
+        &mut self,
+        peer_id: &PeerId,
+        addr: SocketAddr,
+        expected_generation: Option<CommitSeq>,
+    ) -> Option<CommitSeq> {
+        if self.claim_generation.get(&addr).copied() != expected_generation {
+            trace!(
+                addr = %addr,
+                peer = %peer_id,
+                "dead-peer release refused: ownership generation advanced past this sweep's selection"
+            );
+            return None;
+        }
         self.connection_scoped_claims
             .retain(|key, _| !(&key.0 == peer_id && key.2 == addr));
         if self.operator_pinned.contains_key(&addr) {
@@ -1108,23 +1163,34 @@ impl PeerRegistryOwner {
         Some(self.retract_owner(addr, owner))
     }
 
-    /// Set or clear the operator pin on `addr`. Called only from
+    /// Atomically install `peer_id`'s operator pin at `addr`, evicting
+    /// whatever address `pinned_by_peer` shows this SAME peer pinned at
+    /// beforehand (if different). Called only from
     /// `GossipRegistry::configure_peer`, never from a connection lifecycle
     /// path: a pin marks a reservation that exists independently of any
     /// connection, and only the operator-configuration call site is trusted
-    /// to know when that reservation should move or lapse. Reconfiguring a
-    /// peer to a new address clears the previous one's pin (`peer_id: None`)
-    /// before releasing it, so the generic `release` path never has to trust
-    /// a caller's claim that a pin no longer applies.
-    fn set_pin(&mut self, addr: SocketAddr, peer_id: Option<PeerId>) {
-        match peer_id {
-            Some(peer_id) => {
-                self.operator_pinned.insert(addr, peer_id);
-            }
-            None => {
-                self.operator_pinned.remove(&addr);
-            }
+    /// to know when one should move.
+    ///
+    /// The eviction is keyed off `pinned_by_peer`, not off any address the
+    /// caller believes was previously configured: that belief can be stale
+    /// by the time this command runs (read from `ConnectionPool` before a
+    /// concurrent `configure_peer`/`migrate` command for the same peer was
+    /// serialized ahead of this one here). Consulting the owner's own
+    /// authoritative reverse map instead is what guarantees at most one
+    /// pinned address per peer at every instant, regardless of how many
+    /// `pin` calls for that peer are in flight or in what order the owner
+    /// task actually processes them.
+    ///
+    /// Returns the evicted address, if any and if different from `addr` --
+    /// the caller's cue to also release that address's ownership.
+    fn pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
+        let previous = self.pinned_by_peer.insert(peer_id.clone(), addr);
+        let evicted = previous.filter(|previous_addr| *previous_addr != addr);
+        if let Some(evicted_addr) = evicted {
+            self.operator_pinned.remove(&evicted_addr);
         }
+        self.operator_pinned.insert(addr, peer_id);
+        evicted
     }
 
     /// Shared tail of every path that drops a recorded owner: clear its
@@ -1227,8 +1293,14 @@ impl PeerRegistryOwner {
         // than being silently dropped: an offline configured peer whose DNS
         // entry moves must stay protected at its new address, not become
         // momentarily displaceable until the operator reconfigures it again.
+        // `pinned_by_peer` is updated in the same step so a concurrent `pin`
+        // command for this same peer -- whichever side of this migrate the
+        // owner task happens to serialize it on -- always evicts from
+        // wherever the pin ACTUALLY is, never leaving two addresses pinned
+        // for one peer (see `pin`'s doc comment).
         if let Some(pinned_peer) = self.operator_pinned.remove(&from) {
-            self.operator_pinned.insert(to, pinned_peer);
+            self.operator_pinned.insert(to, pinned_peer.clone());
+            self.pinned_by_peer.insert(pinned_peer, to);
         }
         let commit_seq = self.advance();
         self.claim_generation.remove(&from);
@@ -2156,5 +2228,176 @@ mod tests {
             ))
         );
         assert_eq!(owner.routes_to(&to), Some(node));
+    }
+
+    /// P2 regression: two concurrent `configure_peer` calls for the SAME
+    /// peer, each targeting a different new address, each read the same
+    /// "previous address" from `ConnectionPool` before either applied its
+    /// own change. If `pin` trusted that caller-supplied address instead of
+    /// its own reverse map, both addresses could end up pinned at once --
+    /// and since a pinned address can never be reclaimed by `release`, the
+    /// loser would stay reserved forever. `pin` must instead evict whatever
+    /// this peer is ACTUALLY pinned at right now, so exactly one of the two
+    /// concurrent calls reports an eviction and the other address is left
+    /// ordinarily reclaimable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pins_for_the_same_peer_never_leave_two_addresses_pinned() {
+        for round in 0..200u16 {
+            let (owner, _publisher) = owner_handle();
+            let node = peer("concurrent-pin");
+            let addr_a = addr(50_000 + round);
+            let addr_b = addr(51_000 + round);
+
+            // Mirrors `configure_peer`'s own claim-before-pin sequencing.
+            owner
+                .claim(addr_a, claim_of(node.clone(), ClaimKind::Verified), false)
+                .await;
+            owner
+                .claim(addr_b, claim_of(node.clone(), ClaimKind::Verified), false)
+                .await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let owner_a = owner.clone();
+            let node_a = node.clone();
+            let barrier_a = barrier.clone();
+            let task_a = tokio::spawn(async move {
+                barrier_a.wait().await;
+                owner_a.pin(addr_a, node_a).await
+            });
+
+            let owner_b = owner.clone();
+            let node_b = node.clone();
+            let barrier_b = barrier.clone();
+            let task_b = tokio::spawn(async move {
+                barrier_b.wait().await;
+                owner_b.pin(addr_b, node_b).await
+            });
+
+            let (evicted_a, evicted_b) = tokio::join!(task_a, task_b);
+            let evicted_a = evicted_a.expect("task a panicked");
+            let evicted_b = evicted_b.expect("task b panicked");
+
+            // Whichever `pin` command the owner processes FIRST evicts
+            // nothing (no prior pin exists yet); whichever it processes
+            // SECOND evicts the first one's address. Exactly one of the two
+            // must report an eviction, regardless of which order the owner
+            // actually serialized them in.
+            assert_ne!(
+                evicted_a.is_some(),
+                evicted_b.is_some(),
+                "round {round}: exactly one concurrent pin command must report evicting \
+                 the other's address"
+            );
+
+            // Whichever call reported an eviction ran LAST and won: its own
+            // target address is the one left pinned, and the address it
+            // evicted (the other call's target) is now reclaimable.
+            let (still_pinned, now_reclaimable) = if let Some(evicted) = evicted_a {
+                (addr_a, evicted)
+            } else {
+                (
+                    addr_b,
+                    evicted_b.expect("exactly one of the two must evict"),
+                )
+            };
+
+            let token = owner
+                .ownership_token(&now_reclaimable)
+                .expect("still owned");
+            assert!(
+                owner
+                    .release(now_reclaimable, node.clone(), token.generation())
+                    .await
+                    .is_some(),
+                "round {round}: the address the losing pin evicted must be ordinarily \
+                 reclaimable, not stuck forever"
+            );
+
+            let token = owner.ownership_token(&still_pinned).expect("still owned");
+            assert!(
+                owner
+                    .release(still_pinned, node.clone(), token.generation())
+                    .await
+                    .is_none(),
+                "round {round}: the address that won the race must still refuse release \
+                 while pinned"
+            );
+        }
+    }
+
+    /// P2 companion: a DNS-triggered `migrate` (which carries a pin from its
+    /// source to its destination) racing a concurrent `configure_peer`
+    /// `pin` for the SAME peer must not leave two pins standing either --
+    /// `migrate`'s pin-carry updates the same `pinned_by_peer` reverse map
+    /// `pin` consults, so whichever of the two the owner serializes LAST
+    /// still sees an accurate "where is this peer pinned right now".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_migrate_and_pin_never_leave_two_pins_for_one_peer() {
+        for round in 0..200u16 {
+            let (owner, _publisher) = owner_handle();
+            let node = peer("migrate-vs-pin");
+            let addr_a = addr(52_000 + round);
+            let addr_b = addr(53_000 + round);
+            let addr_c = addr(54_000 + round);
+
+            owner
+                .claim(addr_a, claim_of(node.clone(), ClaimKind::Verified), false)
+                .await;
+            owner.pin(addr_a, node.clone()).await;
+            let expected_source = current_source(&owner, addr_a);
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let owner_m = owner.clone();
+            let barrier_m = barrier.clone();
+            let task_migrate = tokio::spawn(async move {
+                barrier_m.wait().await;
+                owner_m
+                    .migrate(addr_a, addr_b, expected_source, false)
+                    .await
+            });
+
+            let owner_p = owner.clone();
+            let node_p = node.clone();
+            let barrier_p = barrier.clone();
+            let task_pin = tokio::spawn(async move {
+                barrier_p.wait().await;
+                // Mirrors `configure_peer`'s own claim-before-pin ordering.
+                owner_p
+                    .claim(addr_c, claim_of(node_p.clone(), ClaimKind::Verified), false)
+                    .await;
+                owner_p.pin(addr_c, node_p).await
+            });
+
+            let (migrate_result, pin_result) = tokio::join!(task_migrate, task_pin);
+            let migrate_result = migrate_result.expect("migrate task panicked");
+            pin_result.expect("pin task panicked");
+            assert!(
+                migrate_result.moved(),
+                "round {round}: migrate must succeed regardless of the concurrent pin \
+                 racing it -- neither touches the other's ownership decision"
+            );
+
+            // Across every address this peer still owns after the race, at
+            // most one may remain pinned.
+            let mut pinned_count = 0;
+            for candidate in [addr_a, addr_b, addr_c] {
+                if let Some(token) = owner.ownership_token(&candidate)
+                    && token.owner() == &node
+                    && owner
+                        .release(candidate, node.clone(), token.generation())
+                        .await
+                        .is_none()
+                {
+                    pinned_count += 1;
+                }
+            }
+            assert_eq!(
+                pinned_count, 1,
+                "round {round}: exactly one address may remain pinned for this peer \
+                 after a migrate races a concurrent pin"
+            );
+        }
     }
 }

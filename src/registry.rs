@@ -3361,10 +3361,26 @@ impl<T: 'static> GossipRegistry<T> {
     /// every other identity. An operator-pinned reservation is exempt: it
     /// must outlive the peer being offline exactly as it already outlives a
     /// single session's teardown.
-    async fn release_dead_peer_ownership(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+    ///
+    /// `expected_generation` is the ownership generation `cleanup_dead_peers`
+    /// observed when it selected this peer for reaping, taken before
+    /// `gossip_state` was dropped and this call's own await. That selection
+    /// can go stale: the same peer can reconnect and commit a fresh
+    /// connection-scoped claim in the gap. `RegistryOwnerHandle::release_dead_peer`
+    /// re-checks this generation is still current inside the owner's single
+    /// serialized command before touching anything, so a stale reaping
+    /// decision can never clear a live reconnect's receipts or route --
+    /// mirroring the generation fence `release` already applies to a plain
+    /// session teardown.
+    async fn release_dead_peer_ownership(
+        &self,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+        expected_generation: Option<CommitSeq>,
+    ) {
         if let Some(release_seq) = self
             .registry_owner
-            .release_dead_peer(peer_id.clone(), addr)
+            .release_dead_peer(peer_id.clone(), addr, expected_generation)
             .await
         {
             let mut state = self.gossip_state.lock().await;
@@ -3775,6 +3791,36 @@ impl<T: 'static> GossipRegistry<T> {
         (AddrClaimOutcome::Accepted, projected_claim)
     }
 
+    /// Best-effort release of an address `peer_id` no longer occupies once
+    /// `configure_peer` has moved its pin elsewhere. Safe to call for a
+    /// stale, already-released, or never-owned address: `release` is owner-
+    /// and generation-pinned, so this is a no-op unless `peer_id` still
+    /// genuinely owns `addr`.
+    async fn release_configure_peer_stale_address(
+        &self,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+    ) {
+        if let Some(token) = self.registry_owner.ownership_token(&addr)
+            && token.owner() == peer_id
+            && let Some(release_seq) = self
+                .registry_owner
+                .release(addr, peer_id.clone(), token.generation())
+                .await
+        {
+            let mut state = self.gossip_state.lock().await;
+            state.tombstone_ownership_projection(addr, release_seq);
+        } else {
+            // Older state may have a pool-only configured route without a
+            // corresponding owner-actor token. Remove only this peer's
+            // stale derived route; never disturb a replacement owner.
+            let _ = self
+                .connection_pool
+                .addr_to_peer_id
+                .remove_if_sync(&addr, |current| current == peer_id);
+        }
+    }
+
     /// Configure a peer by peer ID and its expected connection address
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
         let previous_addr = self.connection_pool.get_required_peer_addr(&peer_id);
@@ -3798,37 +3844,33 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         }
 
-        if let Some(previous_addr) = previous_addr.filter(|previous| *previous != connect_addr) {
-            // This reservation is moving to a new address: clear the old
-            // pin FIRST so `release` -- which unconditionally refuses a
-            // still-pinned address, since it cannot otherwise tell this
-            // deliberate move apart from a stale connection receipt racing
-            // a teardown -- is free to retract it below.
-            self.registry_owner.unpin(previous_addr).await;
-            if let Some(token) = self.registry_owner.ownership_token(&previous_addr)
-                && token.owner() == &peer_id
-                && let Some(release_seq) = self
-                    .registry_owner
-                    .release(previous_addr, peer_id.clone(), token.generation())
-                    .await
-            {
-                let mut state = self.gossip_state.lock().await;
-                state.tombstone_ownership_projection(previous_addr, release_seq);
-            } else {
-                // Older state may have a pool-only configured route without a
-                // corresponding owner-actor token. Remove only this peer's
-                // stale derived route; never disturb a replacement owner.
-                let _ = self
-                    .connection_pool
-                    .addr_to_peer_id
-                    .remove_if_sync(&previous_addr, |current| current == &peer_id);
-            }
-        }
         // Operator configuration is a reservation independent of any
         // connection: pin it so a connection-scoped claim/release for this
         // exact peer+address (this peer dialing in or being dialed) never
         // records or retracts it as if it were merely session-scoped.
-        self.registry_owner.pin(connect_addr, peer_id.clone()).await;
+        //
+        // Installed BEFORE the release below, and via the owner's own
+        // peer -> address reverse map rather than `previous_addr` (read
+        // above, before the `.await`s this function has already made, and
+        // therefore possibly stale under a concurrent `configure_peer` or
+        // `migrate` for the same peer): whichever address `pin` reports as
+        // evicted is the owner's OWN authoritative answer to "where was
+        // this peer actually pinned a moment ago", not this caller's
+        // possibly-outdated belief. Two concurrent `configure_peer` calls
+        // for the same peer can therefore no longer each install a pin for
+        // a different address and leak the loser forever -- see `pin`'s doc
+        // comment for why the reverse map makes this atomic regardless of
+        // which order the owner task serializes the two commands in.
+        let evicted_pin = self.registry_owner.pin(connect_addr, peer_id.clone()).await;
+
+        let mut stale_addrs: Vec<SocketAddr> =
+            previous_addr.into_iter().chain(evicted_pin).collect();
+        stale_addrs.retain(|addr| *addr != connect_addr);
+        stale_addrs.dedup();
+        for stale_addr in stale_addrs {
+            self.release_configure_peer_stale_address(&peer_id, stale_addr)
+                .await;
+        }
 
         let pool = &self.connection_pool;
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
@@ -7247,7 +7289,20 @@ impl<T: 'static> GossipRegistry<T> {
         let current_time = current_timestamp();
         let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
 
-        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>)> = {
+        // Alongside each dead peer's address and identity, snapshot the
+        // owner authority's CURRENT ownership generation for that address
+        // (a lock-free read; does not touch `gossip_state`). This is the
+        // decision this whole pass is based on -- and it can go stale: nothing
+        // stops the very same peer from reconnecting and committing a fresh
+        // connection-scoped claim in the window between this snapshot and
+        // the release running, further down, after `gossip_state` is
+        // dropped. `release_dead_peer_ownership` re-validates this
+        // generation still matches inside the owner's single serialized
+        // command before clearing anything, so a stale selection can never
+        // wipe a live reconnect's receipts or route out from under it --
+        // the same fencing `disconnect_connection_by_peer_id` requires of
+        // every caller acting on a decision computed earlier.
+        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>, Option<CommitSeq>)> = {
             let gossip_state = self.gossip_state.lock().await;
             gossip_state
                 .peers
@@ -7259,7 +7314,17 @@ impl<T: 'static> GossipRegistry<T> {
                             current_time.saturating_sub(failure_time) > dead_peer_timeout_secs
                         })
                 })
-                .map(|(addr, info)| (*addr, info.node_id.map(|node_id| node_id.to_peer_id())))
+                .map(|(addr, info)| {
+                    let expected_generation = self
+                        .registry_owner
+                        .ownership_token(addr)
+                        .map(|token| token.generation());
+                    (
+                        *addr,
+                        info.node_id.map(|node_id| node_id.to_peer_id()),
+                        expected_generation,
+                    )
+                })
                 .collect()
         };
 
@@ -7270,7 +7335,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Order: actor_state before gossip_state
             let mut gossip_state = self.gossip_state.lock().await;
 
-            for (peer_addr, _) in &peers_to_cleanup {
+            for (peer_addr, _, _) in &peers_to_cleanup {
                 // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
                 // This allows us to reconnect when the peer comes back online
 
@@ -7357,7 +7422,7 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
-            for (peer_addr, node_id) in &peers_to_cleanup {
+            for (peer_addr, node_id, expected_generation) in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
                 self.remove_clock_state_for_addr(peer_addr);
                 // A peer this stale has been gone longer than the dead-peer
@@ -7367,7 +7432,8 @@ impl<T: 'static> GossipRegistry<T> {
                 // other identity out of the address. `peers` itself is left
                 // untouched above so a genuine reconnect is still recognized.
                 if let Some(peer_id) = node_id {
-                    self.release_dead_peer_ownership(peer_id, *peer_addr).await;
+                    self.release_dead_peer_ownership(peer_id, *peer_addr, *expected_generation)
+                        .await;
                 }
             }
 
@@ -20041,6 +20107,101 @@ mod tests {
             reclaim_outcome,
             crate::addr_ownership::AddrClaimOutcome::Accepted,
             "the address must be reclaimable once the dead peer's ownership is released"
+        );
+    }
+
+    /// P1 regression: `cleanup_dead_peers` selects `(addr, peer_id,
+    /// generation)` under `gossip_state`, then releases after the lock is
+    /// dropped. If the SAME peer reconnects and commits a fresh
+    /// connection-scoped claim in that window, the generation captured at
+    /// selection time is stale by the time the release actually runs, and
+    /// must not be allowed to wipe the new claim's receipt or retract the
+    /// route it just committed.
+    #[tokio::test]
+    async fn cleanup_dead_peer_release_is_fenced_against_a_concurrent_reconnect() {
+        let registry = GossipRegistry::<()>::new(test_addr(44_020), test_config());
+        let peer_id = test_peer_id("dead-peer-reconnect-race");
+        let addr = test_addr(44_021);
+        let old_session = test_addr(44_022);
+        let new_session = test_addr(44_023);
+
+        // The dead session's original claim -- what a dead-peer sweep would
+        // have found when it selected this peer for reaping.
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                old_session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // Exactly what `cleanup_dead_peers` snapshots at selection time.
+        let stale_expected_generation = registry
+            .registry_owner
+            .ownership_token(&addr)
+            .map(|token| token.generation());
+
+        // The peer reconnects and commits a fresh claim BEFORE the release
+        // below runs -- the race window opened by dropping `gossip_state`
+        // between selection and release in production.
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                new_session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        let fresh_generation = registry
+            .registry_owner
+            .ownership_token(&addr)
+            .map(|token| token.generation());
+        assert_ne!(
+            stale_expected_generation, fresh_generation,
+            "sanity: the reconnect must actually advance the generation"
+        );
+
+        // The (now stale) dead-peer release runs with the generation
+        // captured BEFORE the reconnect.
+        registry
+            .release_dead_peer_ownership(&peer_id, addr, stale_expected_generation)
+            .await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(peer_id.clone()),
+            "a stale dead-peer release must not clear a route a concurrent reconnect \
+             just committed"
+        );
+
+        // `old_session`'s own (belated) teardown must still find its
+        // receipt -- proving the stale sweep's ghost-receipt cleanup did
+        // NOT wipe it -- and correctly treat the address as still covered
+        // by the live `new_session`.
+        registry
+            .release_connection_scoped_claims(&peer_id, old_session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(peer_id.clone()),
+            "old_session's receipt must have survived the stale sweep too, and \
+             correctly find the address still covered by the live new_session"
+        );
+
+        // `new_session`'s own later, legitimate teardown must still release
+        // the address -- proving ITS receipt was not wiped either, and that
+        // it is now recognized as the address's sole remaining session.
+        registry
+            .release_connection_scoped_claims(&peer_id, new_session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            None,
+            "the fresh session's own receipt must have survived the stale dead-peer \
+             sweep, so its later teardown still releases the address"
         );
     }
 
