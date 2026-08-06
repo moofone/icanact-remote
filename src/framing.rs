@@ -240,6 +240,68 @@ pub fn write_ask_response_header(
     header
 }
 
+/// Machine-readable reason an ask could not be answered with data. Carried in
+/// a Response frame's `ASK_RESPONSE_HEADER_LEN` fixed region, which has
+/// always been zero-padded past the correlation id (no application payload
+/// has ever been placed there), so a NACK costs no extra frame or round trip.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskNackReason {
+    /// No actor/handler is wired up to answer this ask at all.
+    UnknownActor = 1,
+    /// A handler was invoked and returned an application error.
+    HandlerError = 2,
+    /// This connection/build has no dispatcher for the ask's wire path
+    /// (e.g. a raw or direct ask with no registered handler concept).
+    NoDispatcher = 3,
+}
+
+impl AskNackReason {
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::UnknownActor),
+            2 => Some(Self::HandlerError),
+            3 => Some(Self::NoDispatcher),
+            _ => None,
+        }
+    }
+}
+
+/// Byte offset, within the Response frame's fixed region (i.e. relative to
+/// `body[0]`, right after the control word), of the NACK marker. Offset 0..4
+/// is the correlation id; this is the first previously-unused padding byte.
+const ASK_NACK_FLAG_BODY_OFFSET: usize = 4;
+const ASK_NACK_REASON_BODY_OFFSET: usize = 5;
+const ASK_NACK_FLAG_SET: u8 = 1;
+
+/// Build a Response frame that NACKs an ask instead of answering it: same
+/// kind and header shape as a normal response, zero-length payload, with the
+/// reason packed into the header's reserved bytes.
+pub fn write_ask_nack_header(
+    correlation_id: u32,
+    reason: AskNackReason,
+) -> [u8; ASK_RESPONSE_FRAME_HEADER_LEN] {
+    let mut header = init_header(WireKind::Response, ASK_RESPONSE_HEADER_LEN);
+    header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    header[LENGTH_PREFIX_LEN + ASK_NACK_FLAG_BODY_OFFSET] = ASK_NACK_FLAG_SET;
+    header[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = reason as u8;
+    header
+}
+
+/// Inspect a Response frame's body (the bytes after the control word,
+/// starting at the correlation id) for the NACK marker. Returns `None` for
+/// an ordinary response, including every response written before this
+/// marker existed (that padding was always zeroed).
+pub fn ask_nack_reason(response_fixed_region: &[u8]) -> Option<AskNackReason> {
+    if response_fixed_region.len() < ASK_RESPONSE_HEADER_LEN {
+        return None;
+    }
+    if response_fixed_region[ASK_NACK_FLAG_BODY_OFFSET] != ASK_NACK_FLAG_SET {
+        return None;
+    }
+    AskNackReason::from_u8(response_fixed_region[ASK_NACK_REASON_BODY_OFFSET])
+}
+
 pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER_LEN] {
     init_header(
         WireKind::Gossip,
@@ -479,6 +541,32 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn ask_nack_round_trips_through_the_response_headers_reserved_bytes() {
+        // The NACK marker rides in bytes the wire has always reserved (and
+        // zeroed) after the correlation id in a Response frame, so it costs
+        // no extra frame and old-shaped Response parsing that never looked
+        // past the correlation id keeps working.
+        let header = write_ask_nack_header(0x0102_0304, AskNackReason::UnknownActor);
+        let control = decode_control(header[..4].try_into().unwrap()).unwrap();
+        assert_eq!(control.kind, WireKind::Response);
+        assert_eq!(control.body_len, ASK_RESPONSE_HEADER_LEN);
+        assert_eq!(
+            u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            0x0102_0304
+        );
+        assert_eq!(
+            ask_nack_reason(&header[4..]),
+            Some(AskNackReason::UnknownActor)
+        );
+    }
+
+    #[test]
+    fn a_normal_response_header_never_parses_as_a_nack() {
+        let header = write_ask_response_header(MessageType::Response, 7, 5);
+        assert_eq!(ask_nack_reason(&header[4..]), None);
     }
 
     #[test]
