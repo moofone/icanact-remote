@@ -4689,7 +4689,13 @@ pub(crate) async fn handle_raw_ask_request(
     correlation_id: u32,
     payload: &[u8],
 ) {
-    #[cfg(any(test, feature = "test-helpers", debug_assertions))]
+    // A raw (unaddressed) Ask has no application handler concept -- there is
+    // no actor_id/type_hash to dispatch on, only opaque bytes. The mock echo
+    // below exists purely so tests/benchmarks can exercise the raw ask wire
+    // path without standing up a real responder; it must never run outside
+    // that infrastructure; `debug_assertions` is deliberately not part of
+    // this gate (see the standing-P0 note on the release branch below).
+    #[cfg(any(test, feature = "test-helpers"))]
     {
         let response = if std::env::var("ICANACT_REMOTE_TYPED_ECHO").is_ok() && payload.len() >= 8 {
             payload.to_vec()
@@ -4728,16 +4734,37 @@ pub(crate) async fn handle_raw_ask_request(
             warn!(peer = %peer_addr, "No connection found for Ask response");
         }
     }
-    #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
+    // Standing P0 (fixed): every build outside test/test-helpers used to log
+    // a warning and send nothing here, so every raw ask (RemoteActorRef::ask,
+    // ask_with_timeout, ask_deferred, ask_typed*) burned its full timeout in
+    // a release build -- the no-timeout variants hung until the connection
+    // dropped. There is genuinely no dispatcher for a raw ask outside test
+    // infrastructure, so fail closed with an immediate NACK instead.
+    #[cfg(not(any(test, feature = "test-helpers")))]
     {
-        let _ = registry;
         let _ = payload;
-        warn!(
-            peer = %peer_addr,
-            correlation_id = correlation_id,
-            "Received raw Ask request - not supported"
-        );
+        handle_raw_ask_no_dispatcher(registry, peer_addr, correlation_id).await;
     }
+}
+
+/// The unconditionally-compiled body of the release-build branch above,
+/// split out so it can be exercised directly by a test: `cargo test` always
+/// runs in the dev profile with `cfg(test)` active, so the
+/// `#[cfg(not(any(test, feature = "test-helpers")))]` branch itself can
+/// never execute under `cargo test` (see
+/// `raw_ask_with_no_dispatcher_nacks_instead_of_silence`).
+pub(crate) async fn handle_raw_ask_no_dispatcher(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u32,
+) {
+    send_ask_nack(
+        registry,
+        peer_addr,
+        correlation_id,
+        crate::framing::AskNackReason::NoDispatcher,
+    )
+    .await;
 }
 
 /// Send a response back to the peer for a streaming ask request.
@@ -5309,12 +5336,13 @@ where
 #[cfg(test)]
 mod framing_tests {
     use super::{
-        MessageReadResult, parse_message_from_pooled_buffer_with_routes,
+        MessageReadResult, handle_raw_ask_no_dispatcher, parse_message_from_pooled_buffer_with_routes,
         read_message_from_tls_reader,
     };
     use crate::{MessageType, framing, registry::RegistryMessage};
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn read_frame(frame: Vec<u8>) -> MessageReadResult {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
@@ -5520,6 +5548,63 @@ mod framing_tests {
             }
             other => panic!("expected AskNack, got {other:?}"),
         }
+    }
+
+    /// Item 2 (standing P0): a raw (unaddressed) `Ask` has no real dispatcher
+    /// outside test infrastructure -- `cargo test` always runs with
+    /// `cfg(test)` active, so it can never itself exercise the
+    /// `#[cfg(not(any(test, feature = "test-helpers")))]` branch of
+    /// `handle_raw_ask_request`. This calls the unconditionally-compiled
+    /// `handle_raw_ask_no_dispatcher` that branch delegates to directly,
+    /// emulating what a release build does, and proves it sends a real NACK
+    /// (not silence) rather than merely asserting cfg-gate wiring. It does
+    /// NOT prove the release binary compiles/links this path; only
+    /// `cargo build --release` (in the report's verification output) does.
+    #[tokio::test]
+    async fn raw_ask_with_no_dispatcher_nacks_instead_of_silence() {
+        let addr: SocketAddr = "127.0.0.1:19997".parse().unwrap();
+        let config = crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("raw-ask-no-dispatcher-self")),
+            ..Default::default()
+        };
+        let registry = crate::registry::GossipRegistry::<()>::new(addr, config);
+
+        let (io, mut peer_io) = tokio::io::duplex(256);
+        let (stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                io,
+                addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut conn =
+            crate::connection_pool::LockFreeConnection::new(addr, crate::connection_pool::ConnectionDirection::Inbound);
+        conn.stream_handle = Some(std::sync::Arc::new(stream_handle));
+        conn.set_state(crate::connection_pool::ConnectionState::Connected);
+        let peer_id = crate::KeyPair::new_for_testing("raw-ask-no-dispatcher-peer").peer_id();
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id, addr, std::sync::Arc::new(conn));
+
+        let registry = std::sync::Arc::new(registry);
+        handle_raw_ask_no_dispatcher(&registry, addr, 555).await;
+
+        let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer_io.read_exact(&mut frame))
+            .await
+            .expect("a NACK must be sent immediately, not left to a timeout")
+            .expect("peer must receive the NACK frame");
+
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
+            .expect("valid control word");
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(u32::from_be_bytes(frame[4..8].try_into().unwrap()), 555);
+        assert_eq!(
+            crate::framing::ask_nack_reason(&frame[4..]),
+            Some(crate::framing::AskNackReason::NoDispatcher)
+        );
     }
 
     #[tokio::test]

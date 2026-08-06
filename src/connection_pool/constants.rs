@@ -1041,7 +1041,7 @@ impl StreamingQueue {
     }
 }
 
-#[cfg(any(test, feature = "test-helpers", debug_assertions))]
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn process_mock_request(request: &str) -> Vec<u8> {
     if let Some(payload) = request.strip_prefix("ECHO:") {
         return format!("ECHOED:{}", payload).into_bytes();
@@ -1063,7 +1063,7 @@ pub(crate) fn process_mock_request(request: &str) -> Vec<u8> {
     format!("RECEIVED:{} bytes, content: '{}'", request.len(), request).into_bytes()
 }
 
-#[cfg(any(test, feature = "test-helpers", debug_assertions))]
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn process_mock_request_payload(payload: &[u8]) -> Vec<u8> {
     if payload.len() == 4 {
         let value = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
