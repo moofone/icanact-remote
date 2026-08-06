@@ -6,8 +6,9 @@ use tracing::{info, warn};
 use crate::{
     GossipError, PeerId, Result,
     handle::{
-        MessageReadResult, handle_raw_ask_request, handle_response_message, send_inline_response,
-        send_inline_response_aligned, send_pooled_response, send_streaming_response,
+        MessageReadResult, handle_raw_ask_request, handle_response_message, send_ask_nack,
+        send_inline_response, send_inline_response_aligned, send_pooled_response,
+        send_streaming_response,
     },
     registry::{ActorResponse, GossipRegistry, RegistryMessage},
 };
@@ -1319,38 +1320,22 @@ pub(crate) async fn process_read_result(
             correlation_id,
             payload,
         } => {
-            // Fast-path DirectAsk - bypasses handler and RegistryMessage overhead.
-            // The payload contains only the direct frame body. There is no
-            // registered application handler for DirectAsk, so in production
-            // builds we must not fabricate a response from the request bytes.
-            #[cfg(any(test, feature = "test-helpers", debug_assertions))]
-            {
-                let header =
-                    crate::framing::write_direct_response_header(correlation_id, payload.len());
-
-                // Send DirectResponse using connection pool
-                let pool = &registry.connection_pool;
-                if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
-                    if let Some(ref stream_handle) = conn.stream_handle {
-                        let payload_bytes: bytes::Bytes = payload.into();
-                        if let Err(e) = stream_handle
-                            .write_direct_response_inline(header, payload_bytes)
-                            .await
-                        {
-                            warn!(peer = %peer_addr, error = %e, correlation_id, "Failed to send DirectResponse");
-                        }
-                    }
-                }
-            }
-            #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
-            {
-                let _ = payload;
-                warn!(
-                    peer = %peer_addr,
-                    correlation_id,
-                    "Received DirectAsk request - no handler registered, dropping"
-                );
-            }
+            // Fast-path DirectAsk bypasses the handler and RegistryMessage
+            // overhead entirely -- there is no registered application
+            // handler for it in any build mode, so it must never fabricate
+            // a response from the caller's own request bytes. This used to
+            // echo the request back under cfg(any(test, feature =
+            // "test-helpers", debug_assertions)) and only NACK in release,
+            // so a debug binary and a release binary answered a DirectAsk
+            // differently. Every build mode now NACKs identically.
+            let _ = payload;
+            send_ask_nack(
+                registry,
+                peer_addr,
+                correlation_id,
+                crate::framing::AskNackReason::NoDispatcher,
+            )
+            .await;
         }
         MessageReadResult::DirectResponse {
             correlation_id,
@@ -1638,6 +1623,80 @@ async fn handle_assembled_message(
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
+
+    /// Item 2: a DirectAsk has no registered application handler in any
+    /// build mode. Before this fix, test/test-helpers/debug builds echoed
+    /// the request bytes back as a fabricated DirectResponse, so a debug
+    /// binary and a release binary answered the same request differently.
+    /// Now every build mode NACKs identically -- no fabricated reply, ever.
+    #[tokio::test]
+    async fn direct_ask_never_echoes_and_always_nacks() {
+        let addr: SocketAddr = "127.0.0.1:19996".parse().unwrap();
+        let config = crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("direct-ask-never-echoes-self")),
+            ..Default::default()
+        };
+        let registry = crate::registry::GossipRegistry::<()>::new(addr, config);
+
+        let (io, mut peer_io) = tokio::io::duplex(256);
+        let (stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                io,
+                addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut conn = crate::connection_pool::LockFreeConnection::new(
+            addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.set_state(crate::connection_pool::ConnectionState::Connected);
+        let peer_id = crate::KeyPair::new_for_testing("direct-ask-never-echoes-peer").peer_id();
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id, addr, Arc::new(conn));
+
+        let registry = Arc::new(registry);
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let request_payload = b"do-not-echo-me-back";
+        let mut streaming_state = StreamingState::new();
+        process_read_result(
+            MessageReadResult::DirectAsk {
+                correlation_id: 4242,
+                payload: crate::AlignedBytes::from_pooled_slice(request_payload, pool),
+            },
+            &mut streaming_state,
+            &registry,
+            addr,
+            addr,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer_io.read_exact(&mut frame))
+            .await
+            .expect("a NACK must be sent immediately, not left to a timeout")
+            .expect("peer must receive the NACK frame");
+
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
+            .expect("valid control word");
+        // Never a DirectResponse (which would carry the echoed bytes as its
+        // payload): always the NACK-flagged Response frame.
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(u32::from_be_bytes(frame[4..8].try_into().unwrap()), 4242);
+        assert_eq!(
+            crate::framing::ask_nack_reason(&frame[4..]),
+            Some(crate::framing::AskNackReason::NoDispatcher)
+        );
+    }
 
     #[test]
     fn streaming_rejects_oversize() {

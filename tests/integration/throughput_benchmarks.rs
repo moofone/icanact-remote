@@ -4165,18 +4165,17 @@ async fn test_ask_direct_throughput() {
     receiver.shutdown().await;
 }
 
-/// In a production build (no `debug_assertions`, no `test-helpers`), an
-/// inbound `DirectAsk` with no registered handler must never fabricate a
-/// response from the caller's own request bytes. Integration test binaries
-/// link the library with `test = false`, so the library's echo gate
-/// (`cfg(any(test, feature = "test-helpers", debug_assertions))`) reduces to
-/// `any(feature = "test-helpers", debug_assertions)` here. This test must
-/// only compile in the complementary (echo-off) configuration, or it would
-/// spuriously fail whenever `--features test-helpers` is set alongside
-/// `--release`.
-#[cfg(not(any(feature = "test-helpers", debug_assertions)))]
+/// An inbound `DirectAsk` with no registered handler must never fabricate a
+/// response from the caller's own request bytes, in ANY build mode. This
+/// used to be conditional (a debug/test-helpers build echoed the payload
+/// back; only a release build failed to), so this test used to have to
+/// compile only in the complementary (echo-off) configuration -- see git
+/// history. The echo path no longer exists in any build mode: the caller
+/// now gets an immediate, deterministic NACK
+/// (GossipError::AskNacked(AskNackReason::NoDispatcher)) instead of either
+/// a fabricated reply or a bare timeout.
 #[tokio::test]
-async fn direct_ask_production_build_does_not_echo_request_payload() {
+async fn direct_ask_never_echoes_and_always_nacks() {
     let config = GossipConfig {
         gossip_interval: Duration::from_millis(100),
         ask_window: 65_536,
@@ -4200,17 +4199,17 @@ async fn direct_ask_production_build_does_not_echo_request_payload() {
         .await;
 
     match result {
-        Ok(reply) => {
-            assert_ne!(
-                reply, payload,
-                "production DirectAsk path must not echo the request payload back as a response"
+        Ok(reply) => panic!(
+            "DirectAsk with no registered handler must NACK, not answer with data: got {reply:?}"
+        ),
+        Err(icanact_remote::GossipError::AskNacked(reason)) => {
+            assert_eq!(
+                reason,
+                icanact_remote::framing::AskNackReason::NoDispatcher,
+                "expected NoDispatcher, got {reason:?}"
             );
         }
-        Err(icanact_remote::GossipError::Timeout) => {
-            // Expected: no handler is registered, so the request goes
-            // unanswered and the caller times out.
-        }
-        Err(other) => panic!("unexpected error from ask_direct: {other:?}"),
+        Err(other) => panic!("expected AskNacked(NoDispatcher), got a different error: {other}"),
     }
 
     sender.shutdown().await;
