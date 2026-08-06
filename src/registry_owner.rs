@@ -662,6 +662,7 @@ enum OwnerCommand {
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
+        expected_generation: Option<CommitSeq>,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
     /// Atomically checks the causal fence a dead-peer reap also checks
@@ -1005,12 +1006,14 @@ impl RegistryOwnerHandle {
         &self,
         peer_id: PeerId,
         addr: SocketAddr,
+        expected_generation: Option<CommitSeq>,
     ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReleaseDeadPeer {
             peer_id,
             addr,
+            expected_generation,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -1684,9 +1687,10 @@ impl PeerRegistryOwner {
             OwnerCommand::ReleaseDeadPeer {
                 peer_id,
                 addr,
+                expected_generation,
                 reply,
             } => {
-                let released = self.release_dead_peer(&peer_id, addr);
+                let released = self.release_dead_peer(&peer_id, addr, expected_generation);
                 let _ = reply.send(released);
             }
             OwnerCommand::ReserveForReap {
@@ -1976,7 +1980,20 @@ impl PeerRegistryOwner {
     /// if this peer still owns the address and it is not operator-pinned.
     /// This is deliberately one owner-task operation so a stale peer reap
     /// cannot race a reconnect between receipt cleanup and ownership release.
-    fn release_dead_peer(&mut self, peer_id: &PeerId, addr: SocketAddr) -> Option<CommitSeq> {
+    fn release_dead_peer(
+        &mut self,
+        peer_id: &PeerId,
+        addr: SocketAddr,
+        expected_generation: Option<CommitSeq>,
+    ) -> Option<CommitSeq> {
+        if self.claim_generation.get(&addr).copied() != expected_generation {
+            trace!(
+                addr = %addr,
+                peer = %peer_id,
+                "dead-peer release refused: ownership generation advanced past this sweep's selection"
+            );
+            return None;
+        }
         self.connection_scoped_claims
             .retain(|key, _| !(&key.0 == peer_id && key.2 == addr));
         if self.operator_pinned.contains_key(&addr) {
