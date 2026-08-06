@@ -10222,7 +10222,7 @@ fn connection_pool_has_no_unwrapped_raw_async_write_calls() {
     let is_allowed = |trimmed: &str| -> bool {
         trimmed.contains("IoSlice::new(")
             || trimmed == "(*hdr_slot).write(header);"
-            || trimmed == "(*slot_ref.response.get()).write(response);"
+            || trimmed == "(*slot_ref.response.get()).write(outcome);"
             || trimmed == ".write()"
     };
 
