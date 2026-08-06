@@ -525,8 +525,7 @@ impl StreamingState {
     ) {
         if let Some(stream) = self.active_streams.get_mut(&reservation.stream_id) {
             stream.last_activity = std::time::Instant::now();
-            stream.total_bytes_progressed =
-                stream.total_bytes_progressed.saturating_add(new_bytes);
+            stream.total_bytes_progressed = stream.total_bytes_progressed.saturating_add(new_bytes);
         }
     }
 
