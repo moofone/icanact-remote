@@ -267,6 +267,17 @@ impl AskNackReason {
     }
 }
 
+impl std::fmt::Display for AskNackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::UnknownActor => "unknown actor",
+            Self::HandlerError => "handler error",
+            Self::NoDispatcher => "no dispatcher for this ask path",
+        };
+        f.write_str(text)
+    }
+}
+
 /// Byte offset, within the Response frame's fixed region (i.e. relative to
 /// `body[0]`, right after the control word), of the NACK marker. Offset 0..4
 /// is the correlation id; this is the first previously-unused padding byte.
