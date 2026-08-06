@@ -385,6 +385,19 @@ pub trait RoutingPublisher: Send + Sync + 'static {
     fn publish_owner(&self, addr: SocketAddr, peer_id: &PeerId);
     /// Withdraw `addr`'s route, but only if it still points at `peer_id`.
     fn retract_owner(&self, addr: SocketAddr, peer_id: &PeerId);
+    /// Record `addr` as `peer_id`'s configured/required dial target.
+    ///
+    /// Called synchronously from `PeerRegistryOwner::pin`, in the SAME
+    /// serialized command as the operator-pin decision, so the two can
+    /// never be observed disagreeing: without this, `configure_peer` would
+    /// have to make this `ConnectionPool` write itself, afterward and
+    /// outside the owner, and two concurrent `configure_peer` calls for the
+    /// same peer could then have their pin decided in one order by the
+    /// owner but this write land in the other order on `ConnectionPool` --
+    /// two independently-atomic operations that are not atomic WITH each
+    /// other. Bringing the write inside the same command the pin is
+    /// decided in removes the second ordering domain entirely.
+    fn set_configured_peer_addr(&self, addr: SocketAddr, peer_id: &PeerId);
 }
 
 impl<T: 'static> RoutingPublisher for crate::connection_pool::ConnectionPool<T> {
@@ -396,6 +409,10 @@ impl<T: 'static> RoutingPublisher for crate::connection_pool::ConnectionPool<T> 
         let _ = self
             .addr_to_peer_id
             .remove_if_sync(&addr, |current| current == peer_id);
+    }
+
+    fn set_configured_peer_addr(&self, addr: SocketAddr, peer_id: &PeerId) {
+        crate::connection_pool::ConnectionPool::set_configured_peer_addr(self, peer_id, addr);
     }
 }
 
@@ -460,14 +477,23 @@ enum OwnerCommand {
     /// that is never coming back), and the address ownership itself if
     /// `peer_id` still holds it and `addr` is not operator-pinned.
     ///
-    /// `expected_generation` fences this against a reconnect that commits a
-    /// fresh claim between the caller's dead-peer selection and this command
-    /// actually running: refused entirely (no receipts touched, no ownership
-    /// cleared) unless it still matches the address's current generation.
+    /// Refused entirely (no receipts touched, no ownership cleared) if
+    /// `addr`'s ownership was committed or refreshed more recently than
+    /// `dead_peer_timeout` ago -- checked against the owner's OWN
+    /// `claim_committed_at` record, not any liveness snapshot the caller
+    /// took. A caller's own dead-peer selection reads `gossip_state`, a
+    /// separate synchronized domain that a reconnect updates only AFTER
+    /// this owner already committed the fresh claim that proves the peer is
+    /// alive; a snapshot taken from that domain can therefore look "dead"
+    /// even after the owner itself already has fresher information. Making
+    /// the owner re-derive its own answer from data it exclusively writes,
+    /// rather than trust a value the caller computed earlier from a
+    /// different domain, is what closes that gap regardless of which side
+    /// of the caller's own snapshot the reconnect's commit landed on.
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
-        expected_generation: Option<CommitSeq>,
+        dead_peer_timeout: std::time::Duration,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
     /// Atomically install `peer_id`'s operator pin at `addr`, replacing
@@ -657,21 +683,21 @@ impl RegistryOwnerHandle {
     /// Release everything `peer_id` still holds at `addr` -- every
     /// connection-scoped receipt recorded for it under any session, and the
     /// address ownership itself if `peer_id` still holds it and `addr` is not
-    /// operator-pinned -- but ONLY if `expected_generation` still matches the
-    /// address's current generation; otherwise a no-op. See
-    /// `OwnerCommand::ReleaseDeadPeer`.
+    /// operator-pinned -- but ONLY if `addr`'s ownership hasn't been
+    /// committed or refreshed within the last `dead_peer_timeout`; otherwise
+    /// a no-op. See `OwnerCommand::ReleaseDeadPeer`.
     pub async fn release_dead_peer(
         &self,
         peer_id: PeerId,
         addr: SocketAddr,
-        expected_generation: Option<CommitSeq>,
+        dead_peer_timeout: std::time::Duration,
     ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReleaseDeadPeer {
             peer_id,
             addr,
-            expected_generation,
+            dead_peer_timeout,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -782,6 +808,7 @@ impl RegistryOwnerHandle {
             let owner = PeerRegistryOwner {
                 addr_ownership: HashMap::new(),
                 claim_generation: HashMap::new(),
+                claim_committed_at: HashMap::new(),
                 connection_scoped_claims: HashMap::new(),
                 operator_pinned: HashMap::new(),
                 pinned_by_peer: HashMap::new(),
@@ -823,6 +850,17 @@ struct PeerRegistryOwner {
     /// Latest accepted claim generation for each owned address. This is
     /// lifecycle fencing metadata, not part of the arbitration truth table.
     claim_generation: HashMap<SocketAddr, CommitSeq>,
+    /// When each owned address's claim was last committed or refreshed.
+    /// This is the owner's OWN, self-contained notion of "how recently was
+    /// this address touched", independent of `GossipState`'s `failures`/
+    /// `last_failure_time` bookkeeping -- which a reconnect only updates
+    /// AFTER the owner has already committed the fresh claim that proves
+    /// the peer alive, and which lives behind a different lock entirely.
+    /// `release_dead_peer` checks this instead of trusting any liveness
+    /// snapshot a caller took from that other domain, so it can never be
+    /// fooled by a reconnect whose claim commit and whose `GossipState`
+    /// update straddle the caller's own observation in either order.
+    claim_committed_at: HashMap<SocketAddr, std::time::Instant>,
     /// Connection-scoped ownership receipts: which live authenticated
     /// sessions currently back a peer's claim on an address, and at what
     /// owner generation. Keyed by `(peer, session_source, addr)` --
@@ -938,10 +976,10 @@ impl PeerRegistryOwner {
             OwnerCommand::ReleaseDeadPeer {
                 peer_id,
                 addr,
-                expected_generation,
+                dead_peer_timeout,
                 reply,
             } => {
-                let released = self.release_dead_peer(&peer_id, addr, expected_generation);
+                let released = self.release_dead_peer(&peer_id, addr, dead_peer_timeout);
                 let _ = reply.send(released);
             }
             OwnerCommand::Pin {
@@ -987,6 +1025,11 @@ impl PeerRegistryOwner {
                 // Every accepted refresh is a new lifecycle generation even
                 // when peer identity and claim kind are unchanged.
                 self.claim_generation.insert(addr, commit_seq);
+                // Every accepted claim -- including a same-identity refresh
+                // that changes nothing else -- proves this address had a
+                // live claimant just now. `release_dead_peer` checks this.
+                self.claim_committed_at
+                    .insert(addr, std::time::Instant::now());
                 // The lock-free snapshot is also the authoritative
                 // generation fence. Refresh it for every accepted command;
                 // route publication itself remains identity/kind-change only.
@@ -1125,25 +1168,33 @@ impl PeerRegistryOwner {
     /// record itself if `peer_id` is still its owner and `addr` is not
     /// operator-pinned.
     ///
-    /// `expected_generation` is the caller's stale-decision fence: a dead-peer
-    /// sweep can select this exact (peer, addr) pair, then the SAME peer can
-    /// reconnect and commit a fresh connection-scoped claim -- a new
-    /// generation, a live receipt for its new session -- before this command
-    /// actually runs. Refusing outright the moment the generation no longer
-    /// matches, before either the receipt cleanup or the ownership check
-    /// below, is what stops a stale sweep from wiping a live reconnect's
-    /// receipt or retracting its just-committed route.
+    /// `dead_peer_timeout` is the stale-decision fence, checked against
+    /// `claim_committed_at` -- owner-internal, exclusively owner-written
+    /// state -- rather than against anything the caller observed. A
+    /// dead-peer sweep's own liveness read comes from `GossipState`, which a
+    /// reconnect updates only AFTER this owner already committed the fresh
+    /// claim proving the peer alive; that ordering means a sweep's liveness
+    /// snapshot can be stale relative to the owner's OWN state regardless of
+    /// whether the reconnect's claim landed before, during, or after the
+    /// sweep took its snapshot. Re-deriving the answer here, from data nothing
+    /// but this task ever writes, is what closes the gap in every one of
+    /// those orderings rather than just the ones a caller-supplied token
+    /// happens to fence.
     fn release_dead_peer(
         &mut self,
         peer_id: &PeerId,
         addr: SocketAddr,
-        expected_generation: Option<CommitSeq>,
+        dead_peer_timeout: std::time::Duration,
     ) -> Option<CommitSeq> {
-        if self.claim_generation.get(&addr).copied() != expected_generation {
+        if self
+            .claim_committed_at
+            .get(&addr)
+            .is_some_and(|committed_at| committed_at.elapsed() < dead_peer_timeout)
+        {
             trace!(
                 addr = %addr,
                 peer = %peer_id,
-                "dead-peer release refused: ownership generation advanced past this sweep's selection"
+                "dead-peer release refused: address claimed more recently than the dead-peer timeout"
             );
             return None;
         }
@@ -1183,11 +1234,23 @@ impl PeerRegistryOwner {
     ///
     /// Returns the evicted address, if any and if different from `addr` --
     /// the caller's cue to also release that address's ownership.
+    ///
+    /// Also publishes `addr` as `peer_id`'s configured/required
+    /// `ConnectionPool` dial target, in this SAME step, via
+    /// `RoutingPublisher::set_configured_peer_addr` -- so the pin decision
+    /// and the connection-pool route caller code elsewhere reads
+    /// (`get_required_peer_addr`) can never disagree about which address is
+    /// current for this peer, the way two independently-atomic writes
+    /// (owner pin, then a separate later `ConnectionPool` write) could
+    /// under two concurrent `configure_peer` calls for the same peer.
     fn pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
         let previous = self.pinned_by_peer.insert(peer_id.clone(), addr);
         let evicted = previous.filter(|previous_addr| *previous_addr != addr);
         if let Some(evicted_addr) = evicted {
             self.operator_pinned.remove(&evicted_addr);
+        }
+        if let Some(routing) = self.routing.upgrade() {
+            routing.set_configured_peer_addr(addr, &peer_id);
         }
         self.operator_pinned.insert(addr, peer_id);
         evicted
@@ -1200,6 +1263,7 @@ impl PeerRegistryOwner {
     /// justified doing so) before calling this.
     fn retract_owner(&mut self, addr: SocketAddr, owner: Owner) -> CommitSeq {
         self.claim_generation.remove(&addr);
+        self.claim_committed_at.remove(&addr);
         let commit_seq = self.advance();
         self.publish_owner_snapshot(addr, None);
         if let Some(routing) = self.routing.upgrade() {
@@ -1305,6 +1369,9 @@ impl PeerRegistryOwner {
         let commit_seq = self.advance();
         self.claim_generation.remove(&from);
         self.claim_generation.insert(to, commit_seq);
+        self.claim_committed_at.remove(&from);
+        self.claim_committed_at
+            .insert(to, std::time::Instant::now());
         let snapshot = self.snapshot.load_full();
         let snapshot = snapshot
             .with_owner(from, None)
@@ -1365,6 +1432,13 @@ mod tests {
                 .lock()
                 .expect("publisher mutex")
                 .push((addr, None));
+        }
+
+        fn set_configured_peer_addr(&self, _addr: SocketAddr, _peer_id: &PeerId) {
+            // Not exercised by these owner-only tests: `pin`'s interaction
+            // with `ConnectionPool`'s configured-route bookkeeping is
+            // covered end to end in `registry.rs` against the real
+            // `ConnectionPool`.
         }
     }
 
