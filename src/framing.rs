@@ -68,6 +68,33 @@ pub enum WireKind {
 }
 
 impl WireKind {
+    /// Every dense V5 kind, in discriminant order. Single source of truth so
+    /// tests that must cover "every `WireKind`" (control-encoding coverage,
+    /// the capability-gating guard in `handshake.rs`) can't drift from each
+    /// other by editing one list and forgetting another.
+    ///
+    /// Only referenced from `#[cfg(test)]` code today (no production call
+    /// site iterates every kind), which a non-test `cargo clippy` build
+    /// reports as dead code.
+    #[allow(dead_code)]
+    pub(crate) const ALL: [WireKind; 15] = [
+        Self::Gossip,
+        Self::Ask,
+        Self::Response,
+        Self::ActorTell,
+        Self::ActorAsk,
+        Self::StreamStart,
+        Self::StreamData,
+        Self::StreamResponseStart,
+        Self::StreamResponseData,
+        Self::DirectAsk,
+        Self::DirectResponse,
+        Self::PubSub,
+        Self::StreamAbort,
+        Self::RouteBind,
+        Self::RoutedActorAsk,
+    ];
+
     pub const fn from_message_type(msg_type: MessageType) -> Option<Self> {
         match msg_type {
             MessageType::Gossip => Some(Self::Gossip),
@@ -429,24 +456,7 @@ mod tests {
 
     #[test]
     fn every_v5_wire_kind_has_a_pinned_dense_control_encoding() {
-        let kinds = [
-            WireKind::Gossip,
-            WireKind::Ask,
-            WireKind::Response,
-            WireKind::ActorTell,
-            WireKind::ActorAsk,
-            WireKind::StreamStart,
-            WireKind::StreamData,
-            WireKind::StreamResponseStart,
-            WireKind::StreamResponseData,
-            WireKind::DirectAsk,
-            WireKind::DirectResponse,
-            WireKind::PubSub,
-            WireKind::StreamAbort,
-            WireKind::RouteBind,
-            WireKind::RoutedActorAsk,
-        ];
-        for (expected_value, kind) in kinds.into_iter().enumerate() {
+        for (expected_value, kind) in WireKind::ALL.into_iter().enumerate() {
             let bytes = encode_control(kind, 17);
             assert_eq!(
                 u32::from_be_bytes(bytes) >> CONTROL_BODY_LEN_BITS,
@@ -458,9 +468,11 @@ mod tests {
 
     #[test]
     fn control_codec_preserves_boundary_lengths_for_every_kind() {
+        // Was `0..=WireKind::StreamAbort as u8`, silently excluding
+        // RouteBind/RoutedActorAsk (13, 14) from coverage. WireKind::ALL is
+        // the single source of truth so this can't drift again.
         let lengths = [0, 1, 15, 16, 17, CONTROL_BODY_LEN_MASK as usize];
-        for raw_kind in 0..=WireKind::StreamAbort as u8 {
-            let kind = WireKind::from_u8(raw_kind).expect("dense V5 kind");
+        for kind in WireKind::ALL {
             for body_len in lengths {
                 let encoded = encode_control(kind, body_len);
                 assert_eq!(decode_control(encoded), Some(Control { kind, body_len }));
