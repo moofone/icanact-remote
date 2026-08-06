@@ -4472,10 +4472,18 @@ impl<T: 'static> GossipRegistry<T> {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
                         peer_info.outbound_dial_success = true;
-                        // We just independently proved this exact address is
-                        // dialable; a stale fallback attribution no longer
-                        // applies (see PeerInfo::transport_source_keyed).
-                        peer_info.transport_source_keyed = false;
+                        // We just independently proved `conn.addr` is
+                        // dialable -- nothing here corroborates
+                        // dialability for `configured_addr` too, when it
+                        // differs (the connection can resolve to an
+                        // address other than the one requested, e.g. an
+                        // inbound accept published under its own
+                        // address). Scope the clear to exactly the
+                        // address that was actually resolved to a live
+                        // connection (see PeerInfo::transport_source_keyed).
+                        if *peer_addr == conn.addr {
+                            peer_info.transport_source_keyed = false;
+                        }
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
                         peer_info.last_failure_time = None;
@@ -4485,7 +4493,9 @@ impl<T: 'static> GossipRegistry<T> {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
                         peer_info.outbound_dial_success = true;
-                        peer_info.transport_source_keyed = false;
+                        if *peer_addr == conn.addr {
+                            peer_info.transport_source_keyed = false;
+                        }
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
                         peer_info.last_failure_time = None;
@@ -9524,6 +9534,16 @@ impl<T: 'static> GossipRegistry<T> {
             .get(&addr)
             .is_some_and(|peer| peer.transport_source_keyed)
         {
+            // The flag can become known AFTER this address was already
+            // admitted here (e.g. this call raced the inbound-accept
+            // bookkeeping that learns the fallback was taken, or a later
+            // claim revealed it). Declining to (re-)admit is not enough on
+            // its own -- retract any slot already held, or an address the
+            // code has since decided must never occupy one stays admitted
+            // forever.
+            if let Some(ref mut discovery) = gossip_state.peer_discovery {
+                discovery.on_peer_disconnected(addr);
+            }
             return;
         }
 
@@ -12586,6 +12606,147 @@ mod tests {
             0,
             "the re-claimed ephemeral-source entry must still hold no PeerDiscovery slot"
         );
+    }
+
+    /// A successful outbound dial proves dialability only for the exact
+    /// address that was dialed -- `connect_to_peer` can end up resolving a
+    /// connection at a DIFFERENT address than the one it was asked to
+    /// reach (e.g. a peer configured at one address whose live session was
+    /// actually published under a different address, such as an inbound
+    /// accept). Clearing `transport_source_keyed` for every address merely
+    /// associated with the peer would clear it on the strength of evidence
+    /// that says nothing about that other address's dialability -- exactly
+    /// the P1 principle already fixed for `add_peer_with_node_id_generation`.
+    #[tokio::test]
+    async fn successful_dial_does_not_clear_transport_source_keyed_on_other_address() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(20_220), test_config());
+        let peer_id = test_peer_id("dial-scoped-clear");
+        let configured_addr = test_addr(20_221);
+        let live_addr = test_addr(20_222);
+
+        registry
+            .configure_peer(peer_id.clone(), configured_addr)
+            .await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&configured_addr)
+                .expect("configure_peer must create an entry")
+                .transport_source_keyed = true;
+            let mut live_info = peer_info_with_node_id(live_addr, peer_id.to_node_id());
+            live_info.transport_source_keyed = true;
+            state.peers.insert(live_addr, live_info);
+        }
+
+        // An existing published connection for this peer ID, but at a
+        // DIFFERENT address than `configured_addr` -- e.g. an inbound
+        // accept published the live session under its own address rather
+        // than the operator-configured one.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            live_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(live_addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            live_addr,
+            conn.clone(),
+        );
+
+        registry
+            .connect_to_peer(&peer_id)
+            .await
+            .expect("existing connection must resolve without a real dial");
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            !state
+                .peers
+                .get(&live_addr)
+                .expect("peer must exist")
+                .transport_source_keyed,
+            "the address actually resolved to a live connection must have its flag cleared"
+        );
+        assert!(
+            state
+                .peers
+                .get(&configured_addr)
+                .expect("peer must exist")
+                .transport_source_keyed,
+            "an address merely associated with the peer, but not the one actually \
+             dialed, must keep its flag"
+        );
+    }
+
+    /// `record_peer_discovery_connected`'s early return for a
+    /// transport-source-keyed entry must not just decline to (re-)admit a
+    /// slot -- it must retract one already admitted before the flag was
+    /// known (e.g. `mark_peer_connected` ran before handle.rs learned this
+    /// connection was the inbound-accept fallback). Otherwise a stale
+    /// discovery slot for an address the code has since decided must never
+    /// occupy one stays occupied forever.
+    #[tokio::test]
+    async fn marking_transport_source_keyed_after_discovery_admission_clears_the_slot() {
+        let mut config = test_config_with_seed("transport-source-keyed-late-mark-clears-slot");
+        config.enable_peer_discovery = true;
+        config.max_peers = 1;
+        let registry = GossipRegistry::<()>::new(test_addr(20_240), config);
+        let addr = test_addr(20_241);
+        let node_id = test_peer_id("late-mark-peer").to_node_id();
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peers
+                .insert(addr, peer_info_with_node_id(addr, node_id));
+        }
+
+        // Admitted to discovery BEFORE the flag is known.
+        registry.mark_peer_connected(addr).await;
+        {
+            let state = registry.gossip_state.lock().await;
+            let discovery = state.peer_discovery.as_ref().unwrap();
+            assert_eq!(
+                discovery.connected_peer_count(),
+                1,
+                "sanity: the address must be admitted before the flag is set"
+            );
+        }
+
+        // The flag arrives later.
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.get_mut(&addr).unwrap().transport_source_keyed = true;
+        }
+
+        // The next discovery-notifying call must retract the stale
+        // admission, not just decline to admit again.
+        registry.mark_peer_connected(addr).await;
+
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.connected_peer_count(),
+            0,
+            "a transport-source-keyed entry must lose its discovery slot once the flag is \
+             known, even if it was admitted before the flag was set"
+        );
+        assert_eq!(discovery.remaining_slots(), 1);
     }
 
     #[tokio::test]
