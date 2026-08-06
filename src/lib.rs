@@ -1324,6 +1324,13 @@ pub enum GossipError {
 
     #[error("correlation tracker exhausted: all slots in use (slot leak suspected)")]
     CorrelationTrackerExhausted,
+
+    /// The peer answered an ask with an explicit NACK instead of data: it
+    /// received the request but could not or would not produce a response.
+    /// Delivered to the waiter immediately through the correlation tracker,
+    /// so an unanswerable ask fails fast instead of burning its timeout.
+    #[error("ask was not answered: {0}")]
+    AskNacked(crate::framing::AskNackReason),
 }
 
 impl From<crate::connection_pool::NoFreeSlots> for GossipError {
@@ -1457,6 +1464,9 @@ mod tests {
 
         let err = GossipError::ActorAlreadyExists("test_actor".to_string());
         assert_eq!(err.to_string(), "actor 'test_actor' already exists");
+
+        let err = GossipError::AskNacked(crate::framing::AskNackReason::UnknownActor);
+        assert_eq!(err.to_string(), "ask was not answered: unknown actor");
     }
 
     #[test]
