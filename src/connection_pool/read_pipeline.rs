@@ -739,7 +739,7 @@ where
                 )));
             }
             *read += n;
-            streaming_state.record_v5_chunk_progress(*reservation);
+            streaming_state.record_v5_chunk_progress(*reservation, n);
             if *read < reservation.len() {
                 return Ok(None);
             }
@@ -1031,7 +1031,7 @@ where
                 )))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
-                    streaming_state.record_v5_chunk_progress(*reservation);
+                    streaming_state.record_v5_chunk_progress(*reservation, n);
                     if *read < reservation.len() {
                         return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
                     }
@@ -1270,7 +1270,7 @@ where
                 )))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
-                    streaming_state.record_v5_chunk_progress(*reservation);
+                    streaming_state.record_v5_chunk_progress(*reservation, n);
                     if *read < reservation.len() {
                         return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
                     }

@@ -138,12 +138,26 @@ struct InProgressStream {
     /// Timestamp of the most recent genuine byte progress (drives the
     /// zero-progress idle reap).
     last_activity: std::time::Instant,
+    /// Total bytes physically read for this stream so far, including bytes
+    /// already read into a chunk reservation that has not committed yet.
+    ///
+    /// Deliberately separate from `received_size`, which only advances on a
+    /// full chunk commit: crediting the rate window off `received_size`
+    /// alone means a single large chunk that is genuinely, steadily
+    /// progressing looks like zero progress until it fully commits, and
+    /// gets reaped mid-transfer for insufficient rate -- reintroducing,
+    /// through the rate bound, the exact failure this whole change exists
+    /// to fix. This field is bumped by the exact number of new bytes a real
+    /// socket read returns, so it can only advance at the cost of the peer
+    /// actually sending that many bytes; there is no path that credits it
+    /// without a matching read.
+    total_bytes_progressed: usize,
     /// Start of the current minimum-sustained-rate tumbling window.
     rate_window_started_at: std::time::Instant,
-    /// `received_size` as of `rate_window_started_at`, so the reaper can
-    /// tell how many bytes landed during the current window without a
-    /// separate running counter.
-    bytes_at_window_start: usize,
+    /// `total_bytes_progressed` as of `rate_window_started_at`, so the
+    /// reaper can tell how many bytes landed during the current window
+    /// without a separate running counter.
+    progressed_bytes_at_window_start: usize,
 }
 
 impl InProgressStream {
@@ -293,8 +307,9 @@ impl StreamingState {
             duplicate_chunks: 0,
             started_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
+            total_bytes_progressed: 0,
             rate_window_started_at: std::time::Instant::now(),
-            bytes_at_window_start: 0,
+            progressed_bytes_at_window_start: 0,
         };
         self.active_streams.insert(header.stream_id, stream);
         Ok(())
@@ -493,14 +508,25 @@ impl StreamingState {
         Ok(&mut stream.buffer.as_mut_slice()[start..end])
     }
 
-    /// Records that bytes actually landed in `reservation`'s target range,
-    /// keeping the owning stream out of the idle reaper. Must only be
-    /// called after a read that returned at least one byte -- crediting
-    /// progress for a poll that transferred nothing is exactly what let a
-    /// stalled peer's live reservation pin a slot indefinitely.
-    pub(crate) fn record_v5_chunk_progress(&mut self, reservation: StreamChunkReservation) {
+    /// Records that `new_bytes` actually landed in `reservation`'s target
+    /// range, keeping the owning stream out of the idle reaper AND crediting
+    /// it toward the minimum-sustained-rate window -- even though the chunk
+    /// this reservation belongs to has not committed yet. Must only be
+    /// called after a read that returned at least one byte, with exactly
+    /// the number of bytes that read returned: crediting progress for a
+    /// poll that transferred nothing is exactly what let a stalled peer's
+    /// live reservation pin a slot indefinitely, and crediting more than
+    /// was actually read would let a peer buy rate-window credit it never
+    /// paid bandwidth for.
+    pub(crate) fn record_v5_chunk_progress(
+        &mut self,
+        reservation: StreamChunkReservation,
+        new_bytes: usize,
+    ) {
         if let Some(stream) = self.active_streams.get_mut(&reservation.stream_id) {
             stream.last_activity = std::time::Instant::now();
+            stream.total_bytes_progressed =
+                stream.total_bytes_progressed.saturating_add(new_bytes);
         }
     }
 
@@ -675,8 +701,15 @@ impl StreamingState {
         // CRITICAL_PATH: write chunk directly into final buffer.
         stream.buffer.as_mut_slice()[offset..end].copy_from_slice(&chunk_data);
         stream.received_size += chunk_data.len();
-        // Progress, so the idle reaper must not treat this stream as stalled.
+        // Progress, so the idle reaper must not treat this stream as stalled,
+        // and so the minimum-sustained-rate window credits it (this path
+        // delivers a whole chunk at once rather than incrementally, so
+        // unlike the V5 direct-read path there is no separate partial-read
+        // credit to double-count against).
         stream.last_activity = std::time::Instant::now();
+        stream.total_bytes_progressed = stream
+            .total_bytes_progressed
+            .saturating_add(chunk_data.len());
 
         if stream.all_chunks_received() {
             self.assemble_complete_message_with_correlation(header.stream_id)
@@ -849,11 +882,19 @@ impl StreamingState {
             // Tumbling minimum-rate window: only evaluated once a full
             // window has elapsed since it last opened, so a stream still
             // inside its first window is judged by the idle check alone.
+            //
+            // Credited off `total_bytes_progressed`, not `received_size`:
+            // the latter only advances on a full chunk commit, so a single
+            // large chunk that is genuinely, steadily progressing would
+            // look like zero progress -- and get reaped for insufficient
+            // rate -- for as long as it takes to fill. `total_bytes_progressed`
+            // advances on every real byte read, committed or not, so it
+            // agrees with `last_activity` about what counts as progress.
             let window_elapsed = stream.rate_window_started_at.elapsed();
             if window_elapsed >= rate_window {
                 let bytes_this_window = stream
-                    .received_size
-                    .saturating_sub(stream.bytes_at_window_start);
+                    .total_bytes_progressed
+                    .saturating_sub(stream.progressed_bytes_at_window_start);
                 if bytes_this_window < min_bytes_per_window {
                     warn!(
                         stream_id = stream_id,
@@ -873,7 +914,7 @@ impl StreamingState {
                 // that starts slow and speeds up must not be penalized
                 // forever for its opening window).
                 stream.rate_window_started_at = std::time::Instant::now();
-                stream.bytes_at_window_start = stream.received_size;
+                stream.progressed_bytes_at_window_start = stream.total_bytes_progressed;
             }
 
             true
@@ -2352,12 +2393,71 @@ mod tests {
                 .expect("reservation is still live");
             target[..8].copy_from_slice(&[0xAB; 8]);
             read += 8;
-            state.record_v5_chunk_progress(reservation);
+            state.record_v5_chunk_progress(reservation, 8);
             state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
             assert_eq!(
                 state.active_stream_count(),
                 1,
                 "a stream receiving partial-chunk byte progress must not be reaped mid-read"
+            );
+        }
+    }
+
+    /// The minimum-sustained-rate window must be credited by bytes actually
+    /// read, not just bytes committed. A single large chunk that never
+    /// fully commits during this test still trickles in real, steady
+    /// partial progress every tick; the rate window must see that progress
+    /// and let the stream survive across several windows, exactly like
+    /// `partial_v5_chunk_progress_keeps_stream_alive_past_idle_timeout`
+    /// proves for the idle check.
+    ///
+    /// This fails against a `cleanup_stale_with` that credits the rate
+    /// window off `received_size` alone: `received_size` stays 0 for the
+    /// whole test (the chunk never commits), so the very first rate window
+    /// to elapse would see zero bytes and reap the stream mid-transfer --
+    /// reintroducing, through the rate bound, the mid-chunk reap this whole
+    /// change exists to prevent.
+    #[test]
+    fn steady_partial_progress_through_one_large_chunk_survives_several_rate_windows() {
+        use std::time::Duration;
+
+        let idle_timeout = Duration::from_secs(3600); // not under test here
+        let rate_window = Duration::from_millis(15);
+        let min_bytes_per_window = 4;
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 220,
+            // Large enough that 8 ticks of 8 bytes each (64 bytes total)
+            // never completes it, so `received_size` never advances at all
+            // during this test -- any survival here is entirely down to
+            // crediting the in-flight partial read.
+            total_size: 128,
+            chunk_size: 128,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let reservation = state
+            .begin_v5_stream(header, 1, pool, false, 128)
+            .expect("reserve the single large chunk");
+
+        let mut read = 0usize;
+        for tick in 0..8 {
+            std::thread::sleep(Duration::from_millis(5));
+            let target = state
+                .v5_chunk_target(reservation, read)
+                .expect("reservation is still live");
+            target[..8].copy_from_slice(&[0xCDu8; 8]);
+            read += 8;
+            state.record_v5_chunk_progress(reservation, 8);
+            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            assert_eq!(
+                state.active_stream_count(),
+                1,
+                "tick {tick}: steady partial progress through an uncommitted chunk must survive \
+                 the rate-window check"
             );
         }
     }
