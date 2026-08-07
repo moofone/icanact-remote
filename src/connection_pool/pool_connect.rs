@@ -4169,13 +4169,15 @@ async fn answer_inbound_clock_probe(
     // Locally generated, not gated by any caller: reject here rather than
     // let `framing` panic (>= 2^27 bytes) or hand the peer a frame it will
     // hard-reject as MessageTooLarge, tearing the whole connection down.
-    if payload.len() > registry.config.max_message_size {
-        debug!(
-            peer = %peer_addr,
-            size = payload.len(),
-            max = registry.config.max_message_size,
-            "inline clock-echo response too large to frame"
-        );
+    // Goes through the same helper every other inline-send gate uses so the
+    // admission check and `write_gossip_frame_prefix`'s own
+    // `GOSSIP_HEADER_LEN` overhead can't drift apart.
+    if let Err(e) = framing::reject_oversize_for_inline_send(
+        framing::GOSSIP_HEADER_LEN,
+        payload.len(),
+        registry.config.max_message_size,
+    ) {
+        debug!(peer = %peer_addr, error = %e, "inline clock-echo response too large to frame");
         return;
     }
     let header = match framing::write_gossip_frame_prefix(payload.len()) {
@@ -4757,13 +4759,16 @@ pub(crate) fn handle_incoming_message(
                         // here rather than let `framing` panic (>= 2^27
                         // bytes) or hand the peer a frame it will
                         // hard-reject as MessageTooLarge, tearing the whole
-                        // connection down.
-                        if payload.len() > registry.config.max_message_size {
-                            warn!(
-                                size = payload.len(),
-                                max = registry.config.max_message_size,
-                                "FullSync response too large to frame"
-                            );
+                        // connection down. Goes through the same helper every
+                        // other inline-send gate uses so the admission check
+                        // and `write_gossip_frame_prefix`'s own
+                        // `GOSSIP_HEADER_LEN` overhead can't drift apart.
+                        if let Err(e) = framing::reject_oversize_for_inline_send(
+                            framing::GOSSIP_HEADER_LEN,
+                            payload.len(),
+                            registry.config.max_message_size,
+                        ) {
+                            warn!(error = %e, "FullSync response too large to frame");
                             return Ok(());
                         }
                         let header = bytes::Bytes::copy_from_slice(

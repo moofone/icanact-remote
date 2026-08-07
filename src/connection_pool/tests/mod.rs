@@ -4325,6 +4325,155 @@ async fn full_sync_response_with_remote_loopback_bind_does_not_reindex_connectio
     );
 }
 
+/// `handle_incoming_message`'s FullSync-response arm gates its outbound send
+/// through `framing::reject_oversize_for_inline_send(GOSSIP_HEADER_LEN, ...)`
+/// (the same helper `ConnectionHandle::reject_oversize_inline` uses), not a
+/// hand-rolled `payload.len() > max_message_size` comparison. This measures
+/// the real, current response size with an effectively unbounded
+/// `max_message_size`, then reconfigures a second registry with
+/// `max_message_size` set to exactly that measured payload length -- a
+/// payload-only check would admit it (`payload.len() == max`), but the
+/// encoded body (`GOSSIP_HEADER_LEN` + payload) exceeds it by exactly the
+/// header size, and must still be rejected locally instead of reaching the
+/// peer and being fatally rejected there.
+#[tokio::test]
+async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_rejected() {
+    async fn registry_with_connection(
+        bind_addr: SocketAddr,
+        key_seed: &str,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        max_message_size: usize,
+    ) -> (Arc<crate::registry::GossipRegistry>, tokio::io::DuplexStream) {
+        let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            bind_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(key_seed)),
+                max_message_size,
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let (io, peer_io) = tokio::io::duplex(8 * 1024 * 1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            sender_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut connection = LockFreeConnection::new(sender_addr, ConnectionDirection::Inbound);
+        connection.stream_handle = Some(Arc::new(stream_handle));
+        connection.set_state(ConnectionState::Connected);
+        let connection = Arc::new(connection);
+        assert!(registry.connection_pool.add_connection_by_peer_id(
+            sender_peer_id,
+            sender_addr,
+            connection
+        ));
+        (registry, peer_io)
+    }
+
+    fn full_sync_msg(sender_peer_id: crate::PeerId) -> crate::registry::RegistryMessage {
+        // Enough known_actors that the response the registry echoes back is
+        // comfortably larger than a handful of bytes -- the exact size does
+        // not matter, only that it is reproducible across both passes below.
+        let known_actors: Vec<(String, crate::RemoteActorLocation)> = (0..200)
+            .map(|i| {
+                (
+                    format!("full-sync-body-len-boundary-actor-{i:04}"),
+                    crate::RemoteActorLocation::new_with_peer(
+                        "10.0.0.1:9999".parse().unwrap(),
+                        sender_peer_id.clone(),
+                    ),
+                )
+            })
+            .collect();
+        crate::registry::RegistryMessage::FullSync {
+            local_actors: Vec::new(),
+            known_actors,
+            sender_peer_id,
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+            extensions: None,
+        }
+    }
+
+    async fn read_gossip_frame(
+        peer_io: &mut tokio::io::DuplexStream,
+    ) -> Option<crate::framing::Control> {
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::io::AsyncReadExt::read_exact(peer_io, &mut ctrl),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        crate::framing::decode_control(ctrl)
+    }
+
+    let sender_keypair =
+        crate::KeyPair::new_for_testing("full-sync-body-len-boundary-remote");
+    let sender_peer_id = sender_keypair.peer_id();
+    let sender_addr: SocketAddr = "10.90.0.9:9401".parse().unwrap();
+
+    // Pass 1: max_message_size effectively unbounded (still within the V5
+    // 27-bit limit), so the response always gets built and sent. Read its
+    // real, current encoded body length off the wire.
+    let (registry_a, mut peer_a) = registry_with_connection(
+        "10.90.0.9:9501".parse().unwrap(),
+        "full-sync-body-len-boundary-local-a",
+        sender_peer_id.clone(),
+        sender_addr,
+        crate::framing::CONTROL_BODY_LEN_MASK as usize,
+    )
+    .await;
+    super::handle_incoming_message(
+        registry_a.clone(),
+        sender_addr,
+        sender_addr,
+        Some(sender_peer_id.clone()),
+        full_sync_msg(sender_peer_id.clone()),
+    )
+    .await
+    .expect("FullSync handling must not error");
+    let control = read_gossip_frame(&mut peer_a)
+        .await
+        .expect("an unbounded max_message_size must let the FullSync response through");
+    assert_eq!(control.kind, crate::framing::WireKind::Gossip);
+    let payload_len = control.body_len - crate::framing::GOSSIP_HEADER_LEN;
+
+    // Pass 2: same message, but max_message_size set to exactly the
+    // measured payload length. A payload-only check (`payload.len() >
+    // max_message_size`) would admit this -- they are equal -- but the
+    // encoded body is `GOSSIP_HEADER_LEN` bytes larger than the limit, so
+    // the response must be rejected locally: nothing reaches the wire.
+    let (registry_b, mut peer_b) = registry_with_connection(
+        "10.90.0.10:9501".parse().unwrap(),
+        "full-sync-body-len-boundary-local-b",
+        sender_peer_id.clone(),
+        sender_addr,
+        payload_len,
+    )
+    .await;
+    super::handle_incoming_message(
+        registry_b.clone(),
+        sender_addr,
+        sender_addr,
+        Some(sender_peer_id.clone()),
+        full_sync_msg(sender_peer_id.clone()),
+    )
+    .await
+    .expect("rejecting an oversize response locally must not surface as an error");
+    assert!(
+        read_gossip_frame(&mut peer_b).await.is_none(),
+        "a FullSync response whose encoded body exceeds max_message_size by \
+         exactly GOSSIP_HEADER_LEN must be rejected locally, not sent"
+    );
+}
+
 // Regression test for the FullSyncResponse / DeltaGossip / FullSync inbound
 // reset paths in `handle_incoming_message`. These paths previously reset
 // `failures` and `last_success` when a peer sent us a message over the
