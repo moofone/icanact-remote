@@ -1388,6 +1388,29 @@ impl PeerInfo {
     pub(crate) fn mark_dialability_confirmed(&mut self) {
         self.transport_source_keyed = false;
     }
+
+    /// Record that this entry's address was attributed via the
+    /// inbound-accept fallback to the raw observed TCP source (see
+    /// `handle.rs`'s `fell_back_to_observed_source` branch), rather than a
+    /// claim corroborated by an outbound dial or operator configuration.
+    ///
+    /// Declines to set the flag when this exact address already carries
+    /// independent dialability evidence (`outbound_dial_success`): a peer
+    /// that legitimately dials out from its own listen port can also be
+    /// the address a LATER inbound advertised-address claim falls back to
+    /// observing, and that fallback must not erase the earlier, still-true
+    /// evidence that this address is in fact dialable by other nodes.
+    ///
+    /// Symmetric to `mark_dialability_confirmed` above: that one only ever
+    /// clears the flag (never sets it), this one only ever sets it (never
+    /// clears it), and each declines to act when the accumulated evidence
+    /// for this specific address already contradicts the claim it was
+    /// asked to record.
+    pub(crate) fn mark_transport_source_keyed_fallback(&mut self) {
+        if !self.outbound_dial_success {
+            self.transport_source_keyed = true;
+        }
+    }
 }
 
 /// Stable dedup key for a `peers` entry, keyed by verified identity where
@@ -12079,6 +12102,45 @@ mod tests {
             identity_verified: true,
             transport_source_keyed: false,
         }
+    }
+
+    /// `mark_transport_source_keyed_fallback` is the mirror image of
+    /// `mark_dialability_confirmed`: earlier bugs cleared the flag on
+    /// evidence that never proved dialability (inbound acceptance,
+    /// source-equality, reusing an existing connection). This is the
+    /// opposite mistake -- SETTING the flag despite evidence that already
+    /// proves dialability. A peer can legitimately dial out from its own
+    /// listen port (`outbound_dial_success = true` for that exact
+    /// address); if a LATER inbound advertised-address claim is rejected
+    /// and falls back to observing that same source, the fallback must not
+    /// erase the earlier, still-true classification.
+    #[test]
+    fn mark_transport_source_keyed_fallback_declines_when_outbound_dial_already_proved_it() {
+        let node_id = test_peer_id("fallback-declines-with-dial-evidence").to_node_id();
+        let addr = test_addr(20_280);
+
+        // No prior dialability evidence: the fallback is the only
+        // information we have, so it must set the flag.
+        let mut undialed = peer_info_with_node_id(addr, node_id);
+        undialed.outbound_dial_success = false;
+        undialed.mark_transport_source_keyed_fallback();
+        assert!(
+            undialed.transport_source_keyed,
+            "the fallback must set the flag when there is no contradicting evidence"
+        );
+
+        // Prior successful outbound dial to this EXACT address: that is
+        // independent dialability evidence a later inbound-fallback claim
+        // for the same source must not erase.
+        let mut dialed = peer_info_with_node_id(addr, node_id);
+        dialed.outbound_dial_success = true;
+        dialed.transport_source_keyed = false;
+        dialed.mark_transport_source_keyed_fallback();
+        assert!(
+            !dialed.transport_source_keyed,
+            "the fallback must NOT set the flag when this address already has \
+             independent outbound-dial evidence of dialability"
+        );
     }
 
     /// Regression for the devnet f4061522 trace: when the same physical peer

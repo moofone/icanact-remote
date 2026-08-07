@@ -4032,9 +4032,16 @@ where
             // `PeerDiscovery` slot, so the flag must already be in place
             // the first time discovery is notified, not only after the
             // second, idempotent post-publish re-mark.
+            //
+            // Goes through `mark_transport_source_keyed_fallback` rather
+            // than a direct assignment: a peer that legitimately dials out
+            // from its own listen port can also be the address a LATER
+            // claim falls back to observing here, and this specific claim
+            // taking the fallback is not evidence that contradicts the
+            // address's already-established dialability.
             let mut gossip_state = registry.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
-                peer_info.transport_source_keyed = true;
+                peer_info.mark_transport_source_keyed_fallback();
             }
         }
 
