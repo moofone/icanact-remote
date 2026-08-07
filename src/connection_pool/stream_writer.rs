@@ -3470,23 +3470,53 @@ impl LockFreeStreamHandle {
     /// previous unconditional `Ok(())` that discarded every per-chunk
     /// result -- a discarded `MessageTooLarge`, queue-full, or
     /// connection-closed error here meant the caller was told a write
-    /// succeeded when part or all of it never reached the wire. If a later
-    /// chunk fails after earlier chunks were already enqueued, those
-    /// earlier bytes are already queued for (or already on) the wire: the
-    /// peer has received, or will receive, part of a frame it will never
-    /// get the rest of. That is not a state a caller can recover from by
-    /// retrying this call -- an error here must be treated as fatal to the
-    /// connection, the same as any other mid-stream write failure.
+    /// succeeded when part or all of it never reached the wire.
+    ///
+    /// PR #183 review, round 9: if a later chunk fails after earlier chunks
+    /// were already enqueued, those earlier bytes are already queued for
+    /// (or already on) the wire -- the peer has received, or will receive,
+    /// part of a frame it will never get the rest of. Saying "the caller
+    /// must treat this as fatal" in a doc comment does not make it true: a
+    /// caller that merely propagates the error and keeps using this handle
+    /// would let its next write get appended right where this frame's
+    /// missing tail should have been, desyncing the peer's parser exactly
+    /// the way this whole review cycle has been closing off. So this
+    /// enforces it instead of documenting it -- once at least one chunk has
+    /// been enqueued, any later failure calls `shutdown()` before
+    /// returning the error. Every `enqueue_*` method checks
+    /// `shutdown_signal` before doing anything else, so no further write on
+    /// this handle can succeed after that -- the connection is poisoned,
+    /// not merely reported as failed, and the writer task tears it down
+    /// once it observes the signal.
+    ///
+    /// This is the "poison the connection" resolution, not "reserve
+    /// capacity up front": `WriteQueue` (`crossbeam_queue::ArrayQueue`) has
+    /// no reservation primitive, and building one that is actually correct
+    /// against concurrent producers would mean changing the admission
+    /// protocol every `enqueue_*` method shares -- a materially larger,
+    /// riskier change than this call site (which nothing in this crate
+    /// currently calls) justifies. A failure on the very first chunk is
+    /// still a clean pre-write rejection with nothing poisoned, since
+    /// nothing has been enqueued yet.
     pub fn write_chunked_nonblocking(&self, data: &[u8], chunk_size: usize) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
         self.reject_oversize_single(data)?;
 
+        let mut enqueued_any = false;
         for chunk in data.chunks(chunk_size) {
-            self.enqueue_write_nonblocking(WritePayload::TrustedFrame(
+            match self.enqueue_write_nonblocking(WritePayload::TrustedFrame(
                 bytes::Bytes::copy_from_slice(chunk), /* ALLOW_COPY */
-            ))?;
+            )) {
+                Ok(()) => enqueued_any = true,
+                Err(err) => {
+                    if enqueued_any {
+                        self.shutdown();
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         Ok(())
@@ -5218,6 +5248,103 @@ mod write_chunked_nonblocking_tests {
             "exactly two chunks must have been successfully enqueued before \
              the failure -- proving this is a *later* chunk failing, not the \
              first"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 9: a `WriteQueueFull` on a later chunk after
+    /// earlier chunks already succeeded is exactly the "recoverable-looking
+    /// error" the coordinator warned about -- unlike `ConnectionClosed`, a
+    /// caller could reasonably read `WriteQueueFull` as "try again later"
+    /// and keep using this handle, letting its next write land right where
+    /// this frame's missing tail should have been. The connection must
+    /// instead come out of this call already poisoned: a subsequent write
+    /// must fail too, not silently succeed onto a torn stream.
+    ///
+    /// Forces genuine backpressure (not a synthetic flag) by directly
+    /// filling the write queue to exactly one slot short of capacity
+    /// before calling `write_chunked_nonblocking`, on a single-threaded
+    /// test runtime with no `.await` between the fill and the call -- the
+    /// background writer task cannot drain anything in between, so the
+    /// first chunk takes the last slot and the second genuinely finds the
+    /// queue full.
+    #[tokio::test]
+    async fn write_chunked_nonblocking_poisons_the_connection_after_a_later_chunk_fails() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 4096;
+        let addr: SocketAddr = "127.0.0.1:9964".parse().unwrap();
+        let buffer_config = BufferConfig::default().with_write_queue_capacity(128);
+        let write_queue_capacity = buffer_config.write_queue_capacity();
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            addr,
+            ChannelId::TellAsk,
+            buffer_config,
+            None,
+            Some(small_message_read_context(9964, max_message_size)),
+        );
+
+        // Leave exactly one free slot: the first chunk below takes it, the
+        // second finds the queue genuinely full.
+        for _ in 0..write_queue_capacity - 1 {
+            writer
+                .write_queue
+                .try_push(WriteCommand::Payload(WritePayload::TrustedFrame(
+                    bytes::Bytes::from_static(b"filler"),
+                )))
+                .expect("test setup: queue has capacity for the filler");
+        }
+
+        // Unframed opaque bytes (no valid V5 control word), so the
+        // up-front `reject_oversize_single` check takes the bare-length
+        // fallback and passes trivially -- this test isolates the
+        // per-chunk enqueue failure, not the size gate.
+        let data = vec![0xCDu8; 20];
+        assert!(
+            crate::framing::decode_control(data[..4].try_into().unwrap()).is_none(),
+            "test setup: the leading bytes must not decode as a valid control word"
+        );
+        let chunk_size = 10;
+        let result = writer.write_chunked_nonblocking(&data, chunk_size);
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GossipError::WriteQueueFull),
+            "expected the second chunk to genuinely find the queue full, \
+             got {err:?}"
+        );
+
+        // Drain the queue before checking the follow-up write: without
+        // this, `next` below would fail merely because the queue is still
+        // literally full (a coincidence of this test's setup), not because
+        // the connection was poisoned -- that would pass whether or not
+        // `write_chunked_nonblocking` poisons anything, proving nothing.
+        // Draining leaves room to accept a write, so a subsequent failure
+        // can only be explained by the poison, not by backpressure.
+        while writer.write_queue.pop().is_some() {}
+
+        // The connection must be poisoned, not merely reported as failed:
+        // any further write on this handle must also fail, so nothing can
+        // ever be appended after the torn frame that was already queued.
+        let next = writer.write_bytes_nonblocking(bytes::Bytes::from_static(b"next"));
+        assert!(
+            next.is_err(),
+            "a later write must not succeed onto a connection that already \
+             had a torn frame queued on it, even with queue space free"
+        );
+        assert!(
+            matches!(next.unwrap_err(), GossipError::Shutdown),
+            "the later write must fail specifically because the connection \
+             was poisoned (shutdown_signal), not because of unrelated \
+             backpressure"
+        );
+        assert!(
+            writer.shutdown_signal.load(Ordering::Acquire),
+            "write_chunked_nonblocking must have poisoned the connection by \
+             signaling shutdown once a later chunk failed after earlier \
+             chunks were already enqueued"
         );
 
         writer.shutdown();
