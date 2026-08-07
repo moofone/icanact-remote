@@ -3031,11 +3031,11 @@ fn test_connection_handle_send_data() {
             CorrelationTracker::new(),
         );
 
-        // Leading byte 0xFF puts the top 5 bits (the V5 control word's
-        // `kind`) at 31, past every valid `WireKind` (0-14) -- guarantees
-        // this opaque test payload can never be mistaken for the start of
-        // an (incomplete) V5 frame by `reject_oversize_single`.
-        let data = vec![0xFF, 2, 3, 4];
+        // PR #183 review, round 11: `send_data` is the opaque lane
+        // (`WritePayload::Single`) -- content is never inspected, so a
+        // plain literal that happens to decode as a valid-but-incomplete
+        // V5 control word if it were parsed is unaffected.
+        let data = vec![1, 2, 3, 4];
         handle.send_data(data.clone()).await.unwrap();
 
         // Allow the background writer to drain the queue
@@ -3060,17 +3060,14 @@ fn test_writer_owner_batch_preserves_order() {
             None,
         );
 
-        // "three"'s leading bytes happen to decode as a valid V5 control
-        // word declaring a body far larger than these 5 bytes supply --
-        // `reject_oversize_single` now refuses a `Single` write that
-        // begins a frame it doesn't complete, so a 0xFF prefix here
-        // guarantees the leading byte's top 5 bits (the `kind`) fall past
-        // every valid `WireKind` (0-14), keeping this purely-plumbing
-        // ordering test unrelated to V5 framing semantics.
+        // PR #183 review, round 11: `write_bytes_nonblocking` is the opaque
+        // lane -- content is never inspected, so "three" (whose leading
+        // bytes happen to decode as a valid-but-far-too-large V5 control
+        // word if parsed) is unaffected.
         let payloads = [
             bytes::Bytes::from_static(b"one"),
             bytes::Bytes::from_static(b"two"),
-            bytes::Bytes::from_static(b"\xffthree"),
+            bytes::Bytes::from_static(b"three"),
         ];
 
         for payload in &payloads {
@@ -3102,13 +3099,14 @@ fn test_writer_vectored_sequence_header_payload() {
             None,
         );
 
-        // 0xFF-prefixed for the same reason as `payloads` in
-        // `test_writer_owner_batch_preserves_order` above: "first" and
-        // "second"'s own leading bytes happen to decode as valid-but-far-
-        // too-large V5 control words, which `reject_oversize_single` now
-        // refuses outright as an incomplete `Single` frame.
-        let first = bytes::Bytes::from_static(b"\xfffirst");
-        let second = bytes::Bytes::from_static(b"\xffsecond");
+        // PR #183 review, round 11: same reasoning as `payloads` in
+        // `test_writer_owner_batch_preserves_order` above -- the opaque
+        // `write_bytes_nonblocking` lane never inspects content, so
+        // "first"/"second" (whose leading bytes happen to decode as
+        // valid-but-far-too-large V5 control words if parsed) are
+        // unaffected.
+        let first = bytes::Bytes::from_static(b"first");
+        let second = bytes::Bytes::from_static(b"second");
         let payload = bytes::Bytes::from_static(b"PAYLOAD");
         // A real V5 control word declaring `payload`'s exact length: the
         // gate in `enqueue_write_nonblocking` decodes `body_len` from the
@@ -3339,13 +3337,13 @@ async fn test_ask_backpressure_no_write_buffer_full() {
         let handle = handle.clone();
         tasks.push(tokio::spawn(async move {
             for _ in 0..10 {
-                // 0xFF-prefixed: "ping"'s own leading bytes happen to
-                // decode as a valid-but-far-too-large V5 control word,
-                // which `reject_oversize_single` now refuses outright as
-                // an incomplete `Single` frame. See the note in
-                // `test_writer_owner_batch_preserves_order` above.
+                // PR #183 review, round 11: `write_bytes_ask` is the opaque
+                // lane -- content is never inspected, so "ping" (whose
+                // leading bytes happen to decode as a valid-but-far-too-
+                // large V5 control word if parsed) is unaffected. See the
+                // note in `test_writer_owner_batch_preserves_order` above.
                 handle
-                    .write_bytes_ask(bytes::Bytes::from_static(b"\xffping"))
+                    .write_bytes_ask(bytes::Bytes::from_static(b"ping"))
                     .await?;
             }
             Ok::<(), crate::GossipError>(())
