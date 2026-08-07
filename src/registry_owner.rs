@@ -663,6 +663,7 @@ enum OwnerCommand {
         peer_id: PeerId,
         addr: SocketAddr,
         dead_peer_timeout: std::time::Duration,
+        expected_generation: Option<CommitSeq>,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
     /// Atomically checks the causal fence a dead-peer reap also checks
@@ -1007,6 +1008,7 @@ impl RegistryOwnerHandle {
         peer_id: PeerId,
         addr: SocketAddr,
         dead_peer_timeout: std::time::Duration,
+        expected_generation: Option<CommitSeq>,
     ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
@@ -1014,6 +1016,7 @@ impl RegistryOwnerHandle {
             peer_id,
             addr,
             dead_peer_timeout,
+            expected_generation,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -1688,9 +1691,15 @@ impl PeerRegistryOwner {
                 peer_id,
                 addr,
                 dead_peer_timeout,
+                expected_generation,
                 reply,
             } => {
-                let released = self.release_dead_peer(&peer_id, addr, dead_peer_timeout);
+                let released = self.release_dead_peer(
+                    &peer_id,
+                    addr,
+                    dead_peer_timeout,
+                    expected_generation,
+                );
                 let _ = reply.send(released);
             }
             OwnerCommand::ReserveForReap {
@@ -1985,7 +1994,16 @@ impl PeerRegistryOwner {
         peer_id: &PeerId,
         addr: SocketAddr,
         dead_peer_timeout: std::time::Duration,
+        expected_generation: Option<CommitSeq>,
     ) -> Option<CommitSeq> {
+        if self.claim_generation.get(&addr).copied() != expected_generation {
+            trace!(
+                addr = %addr,
+                peer = %peer_id,
+                "dead-peer release refused: ownership generation advanced past this sweep's selection"
+            );
+            return None;
+        }
         if self
             .claim_committed_at
             .get(&addr)
