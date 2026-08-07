@@ -20823,6 +20823,19 @@ mod tests {
                 .registry_owner
                 .ownership_token(&configured)
                 .unwrap_or_else(|| panic!("round {round}: still owned"));
+            // The stronger, root-cause property (claim and pin are now one
+            // atomic owner transaction): the pinned/configured address must
+            // actually be OWNED by this exact peer, not merely pinned with
+            // no matching claim behind it -- `release`'s own pin check
+            // alone (below) would return `None` for a pin regardless of who
+            // owns the address, so this checks the ownership token's
+            // identity directly rather than only inferring it indirectly.
+            assert_eq!(
+                token.owner(),
+                &peer_id,
+                "round {round}: the configured/pinned address must be owned by the peer \
+                 it is configured for, not merely pinned independent of any claim"
+            );
             assert!(
                 registry
                     .registry_owner
