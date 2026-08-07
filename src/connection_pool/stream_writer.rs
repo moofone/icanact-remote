@@ -1037,6 +1037,23 @@ impl LockFreeStreamHandle {
             }
         }
 
+        /// True for an `ActorAsk`-shaped read result: dispatching it calls an
+        /// ask handler whose response, depending on its size, may need
+        /// `local_streaming_queue` admission (`write_ask_disposition_io` ->
+        /// `queue_streaming_response_bytes`/`_pooled`). `DirectAsk` is
+        /// excluded: it answers through `direct_response_batch`, never
+        /// through the streaming queue, so it has nothing to gate here.
+        fn is_actor_ask_dispatch(result: &ReadIoResult) -> bool {
+            match result {
+                ReadIoResult::ActorAsk { .. } => true,
+                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+                    msg_type,
+                    ..
+                }) => *msg_type == crate::MessageType::ActorAsk as u8,
+                _ => false,
+            }
+        }
+
         struct ExitGuard {
             flag: Arc<AtomicBool>,
             notify: Arc<Notify>,
@@ -2378,6 +2395,31 @@ impl LockFreeStreamHandle {
                         if let Some(result) = read_result.result {
                             reads += 1;
                             read_batch_limit = read_batch_limit.max(read_batch_limit_for(&result));
+                            // Read (drain) the ask regardless -- that is what
+                            // keeps the peer able to make progress. But do not
+                            // dispatch it to a handler while the local
+                            // streaming-response queue has no room left for
+                            // even one more protocol-sized response
+                            // (`is_full`): the handler's response size is
+                            // unknown until it runs, so once this is true a
+                            // large response is guaranteed to be rejected by
+                            // `can_admit_response` on the way out, and running
+                            // the handler first would compute an answer this
+                            // connection cannot currently deliver and then
+                            // discard it (the drop this PR documents at
+                            // `queue_streaming_response_bytes`/`_pooled`).
+                            // Skipping dispatch avoids wasting that
+                            // computation; it does not avoid the peer timing
+                            // out instead of getting an immediate failure --
+                            // that still needs a wire-level ask NACK (open,
+                            // unmerged PR #185), not invented here. This is
+                            // deliberately conservative: it also skips asks
+                            // whose response would have been small enough to
+                            // never need streaming admission at all, since
+                            // that is not knowable before the handler runs.
+                            if is_actor_ask_dispatch(&result) && local_streaming_queue.is_full() {
+                                continue;
+                            }
                             let fast_result = match try_handle_fast_io(
                                 result,
                                 ctx,
@@ -2546,6 +2588,15 @@ impl LockFreeStreamHandle {
                             }
 
                             if let Some(result) = read_result.result {
+                                // See the matching comment on the primary
+                                // drain loop: do not dispatch an ActorAsk
+                                // while the streaming queue has no room for
+                                // even one more protocol-sized response.
+                                if is_actor_ask_dispatch(&result)
+                                    && local_streaming_queue.is_full()
+                                {
+                                    continue;
+                                }
                                 let fast_result = match try_handle_fast_io(
                                     result,
                                     ctx,
@@ -2700,6 +2751,16 @@ impl LockFreeStreamHandle {
                                     drained += 1;
                                     drain_batch_limit =
                                         drain_batch_limit.max(read_batch_limit_for(&result));
+                                    // See the matching comment on the primary
+                                    // drain loop: do not dispatch an ActorAsk
+                                    // while the streaming queue has no room
+                                    // for even one more protocol-sized
+                                    // response.
+                                    if is_actor_ask_dispatch(&result)
+                                        && local_streaming_queue.is_full()
+                                    {
+                                        continue;
+                                    }
                                     let fast_result = match try_handle_fast_io(
                                         result,
                                         ctx,
