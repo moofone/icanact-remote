@@ -23792,6 +23792,176 @@ mod tests {
         );
     }
 
+    /// Anti-replay guard: the SAME reset-clock-below-tombstone shape as
+    /// above must NOT be admitted when there is no authenticated-current-
+    /// session evidence backing it (`apply_delta`'s `None, None` session
+    /// context -- exactly what an unauthenticated or non-current-session
+    /// sender would produce). Otherwise the restart exemption becomes a
+    /// general replay hole: anyone able to get a low-clock `ActorAdded`
+    /// accepted at all could use it to resurrect any tombstoned actor.
+    #[tokio::test]
+    async fn apply_delta_unauthenticated_reset_clock_does_not_bypass_tombstone() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7901),
+            test_config_with_seed("restart-tombstone-replay"),
+        );
+        let actor = "actor.delta.replayed-reset-clock";
+        let owner = test_peer_id("restart-tombstone-replay-peer");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let peer_addr = test_addr(9911);
+
+        let pre_crash_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            pre_crash_clock.increment(owner_node);
+        }
+        pre_crash_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new(pre_crash_clock),
+        );
+
+        // No peer added, no session ever armed: this is the "no session
+        // context to validate against" path -- the same shape a forged or
+        // replayed low-clock claim would take.
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: loc,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: owner,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "a reset-looking clock below the tombstone must stay rejected without \
+             authenticated-current-session evidence of a genuine restart"
+        );
+        assert!(
+            reg.actor_state.removed_actors.contains_sync(actor),
+            "the tombstone itself must survive an unauthenticated replay attempt"
+        );
+    }
+
+    /// An intentional `unregister_actor` removal must NEVER be undone by a
+    /// restart, even with the exact same genuine-restart evidence
+    /// (`session_restart_confirmed`) that legitimately recovers a
+    /// peer-death tombstone in the test above. Only
+    /// `TombstoneKind::PeerDeath` may be bypassed by the restart exemption.
+    #[tokio::test]
+    async fn apply_delta_restarted_owner_does_not_recover_through_explicit_unregister_tombstone() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7909),
+            test_config_with_seed("rt-explicit-unreg"),
+        );
+        let actor = "actor.delta.explicit-unregister";
+        let owner = test_peer_id("rt-explicit-unreg-owner");
+        let owner_node = owner.to_node_id();
+        let peer_addr = test_addr(9919);
+        let session_source = test_addr(55111);
+
+        // The owner itself explicitly removed this actor before crashing --
+        // NOT an observer's peer-death inference.
+        let removal_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            removal_clock.increment(owner_node);
+        }
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new_explicit_unregister(removal_clock),
+        );
+
+        // The owner restarts and this is confirmed as a genuine restart --
+        // the exact same evidence that recovers a peer-death tombstone.
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(owner_node),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            40,
+            current_timestamp(),
+        )
+        .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            session_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(session_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(session_source),
+            None,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let captured_epoch = {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                peer_info.session_restart_confirmed,
+                "sanity: the low-sequence FullSync above must have confirmed the restart"
+            );
+            peer_info.current_session_epoch
+        };
+
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            Some(session_source),
+            Some((peer_addr, captured_epoch)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "an intentional unregister must never be undone by a restart, no matter how \
+             genuine the restart evidence"
+        );
+        assert!(
+            reg.actor_state.removed_actors.contains_sync(actor),
+            "the explicit-unregister tombstone itself must survive the restarted owner's \
+             re-registration attempt"
+        );
+    }
+
     #[tokio::test]
     async fn test_merge_full_sync_ignores_stale_sequence() {
         let reg = GossipRegistry::<()>::new(test_addr(7005), test_config());
