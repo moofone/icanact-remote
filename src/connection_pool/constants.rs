@@ -1041,7 +1041,13 @@ impl StreamingQueue {
     }
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
+/// The reference command processor for a raw (unaddressed) `Ask`
+/// (`handle::handle_raw_ask_request`). A raw ask carries opaque bytes with no
+/// actor_id/type_hash, so there is no per-actor handler to route to; this is
+/// the real, unconditional answer for it in every build mode, not a
+/// test-only fabrication -- it recognizes a small set of ECHO:/REVERSE:/
+/// COUNT:/HASH: commands and otherwise acknowledges the byte count and raw
+/// content.
 pub(crate) fn process_mock_request(request: &str) -> Vec<u8> {
     if let Some(payload) = request.strip_prefix("ECHO:") {
         return format!("ECHOED:{}", payload).into_bytes();
@@ -1063,7 +1069,10 @@ pub(crate) fn process_mock_request(request: &str) -> Vec<u8> {
     format!("RECEIVED:{} bytes, content: '{}'", request.len(), request).into_bytes()
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
+/// Byte-oriented entry point for `process_mock_request`: a 4-byte payload is
+/// treated as a little protocol of its own (increment-and-echo, used by the
+/// realistic correlation benchmark), anything else is treated as UTF-8 and
+/// handed to `process_mock_request`.
 pub(crate) fn process_mock_request_payload(payload: &[u8]) -> Vec<u8> {
     if payload.len() == 4 {
         let value = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
