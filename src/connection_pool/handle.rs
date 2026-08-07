@@ -1070,7 +1070,7 @@ impl<T> ConnectionHandle<T> {
             actor_id,
             type_hash,
             first_len,
-        );
+        )?;
         stream_handle.write_bytes_vectored(
             first_header,
             payload.slice(..first_len),
@@ -1087,7 +1087,7 @@ impl<T> ConnectionHandle<T> {
                 stream_id,
                 index,
                 end - offset,
-            );
+            )?;
             if let Err(error) = stream_handle.write_bytes_vectored(
                 header,
                 payload.slice(offset..end),

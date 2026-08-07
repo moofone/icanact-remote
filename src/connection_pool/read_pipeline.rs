@@ -231,7 +231,8 @@ mod read_pipeline_tests {
 
         let start_header = crate::framing::write_stream_request_start_header(
             stream_id, 0, total_size, 7, 3, STRIDE,
-        );
+        )
+        .unwrap();
         writer.write_all(&start_header).await.unwrap();
         writer.write_all(&[0xA0u8; STRIDE]).await.unwrap();
 
@@ -272,7 +273,8 @@ mod read_pipeline_tests {
             );
 
             let payload = [0xA0u8 + idx as u8; STRIDE];
-            let data_header = crate::framing::write_stream_data_header(false, stream_id, idx, STRIDE);
+            let data_header =
+                crate::framing::write_stream_data_header(false, stream_id, idx, STRIDE).unwrap();
             writer.write_all(&data_header).await.unwrap();
             writer.write_all(&payload).await.unwrap();
             expected.extend_from_slice(&payload);
@@ -343,7 +345,8 @@ mod read_pipeline_tests {
             1,
             2,
             total_size as usize,
-        );
+        )
+        .unwrap();
         writer.write_all(&start_header).await.unwrap();
         // Only part of the single declared chunk arrives; the rest trickles
         // in later, after the stream has already been reaped out from under

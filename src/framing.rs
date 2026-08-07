@@ -323,101 +323,78 @@ pub fn write_direct_response_header(
     Ok(header)
 }
 
-/// Stream chunk headers stay infallible: `first_chunk_len`/`payload_len` here
-/// are never the caller's raw, unbounded payload length -- the streaming
-/// writer always clamps every chunk to `max_stream_chunk_size()` first
-/// (itself derived from `max_message_size`, which config validation already
-/// bounds to the V5 27-bit limit), so `checked_body_len` can never observe an
-/// oversize value on this path.
+/// In every current caller (the streaming writer in `connection_pool`),
+/// `first_chunk_len`/`payload_len` here are never the caller's raw,
+/// unbounded payload length -- the streaming writer always clamps every
+/// chunk to `max_stream_chunk_size()` first (itself derived from
+/// `max_message_size`, which config validation already bounds to the V5
+/// 27-bit limit), so `checked_body_len` cannot observe an oversize value on
+/// that path in practice. That evidence hasn't changed.
 ///
-/// That invariant depends on nothing outside the streaming writer ever
-/// calling these with an unclamped length, so it is enforced at the API
-/// boundary, not just by convention: all three are `pub(crate)`, not `pub`.
-/// A caller elsewhere in this crate can still reach them (the streaming
-/// writer lives in `connection_pool`, a sibling module), but nothing outside
-/// the crate can construct an oversize `first_chunk_len`/`payload_len` here
-/// in the first place -- there is no visibility-checked runtime bound to
-/// bypass. Unlike the writers converted to `Result` elsewhere in this file,
-/// there is no legitimate external caller to support: building a valid V5
-/// stream requires allocating a `stream_id` with the crate's own
-/// odd/even-partitioned counters and sequencing chunks against
-/// `max_stream_chunk_size()`, neither of which is exposed, so a `pub` header
-/// builder alone was never a usable standalone API.
-const STREAM_CHUNK_INVARIANT: &str =
-    "stream chunk length is bounded by max_stream_chunk_size, always within the V5 27-bit limit";
-
-/// `pub(crate)`: see the note on `STREAM_CHUNK_INVARIANT` above. Verified
-/// unreachable from outside the crate -- this must fail to compile:
-///
-/// ```compile_fail
-/// let _ = icanact_remote::framing::write_stream_request_start_header(0, 0, 0, 0, 0, 0);
-/// ```
-pub(crate) fn write_stream_request_start_header(
+/// These three were `pub(crate)` for exactly that reason -- the invariant
+/// held at the only call site this crate has, and a `pub` header builder
+/// alone was never a usable standalone API without the crate's own
+/// `stream_id` allocator and `max_stream_chunk_size()`, neither of which is
+/// exposed. codex raised the source-compatibility objection to that
+/// restriction three times across review rounds; rather than keep
+/// re-litigating it, they're `pub` again here and, like every other header
+/// builder in this file, return `Result` instead of trusting the internal
+/// invariant with `.expect()`. That closes the objection outright (no
+/// compile-time break for a hypothetical downstream caller, ever) at zero
+/// cost to the one real caller, which already handles `Result` from every
+/// sibling `write_*_header` function.
+pub fn write_stream_request_start_header(
     stream_id: u32,
     correlation_id: u32,
     total_size: u32,
     actor_id: u64,
     type_hash: u32,
     first_chunk_len: usize,
-) -> [u8; STREAM_REQUEST_START_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(STREAM_REQUEST_START_HEADER_LEN, first_chunk_len)
-        .expect(STREAM_CHUNK_INVARIANT);
+) -> Result<[u8; STREAM_REQUEST_START_FRAME_HEADER_LEN]> {
+    let body_len = checked_body_len(STREAM_REQUEST_START_HEADER_LEN, first_chunk_len)?;
     let mut header: [u8; STREAM_REQUEST_START_FRAME_HEADER_LEN] =
-        init_header(WireKind::StreamStart, body_len).expect(STREAM_CHUNK_INVARIANT);
+        init_header(WireKind::StreamStart, body_len)?;
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&correlation_id.to_be_bytes());
     header[12..16].copy_from_slice(&total_size.to_be_bytes());
     header[16..24].copy_from_slice(&actor_id.to_be_bytes());
     header[24..28].copy_from_slice(&type_hash.to_be_bytes());
-    header
+    Ok(header)
 }
 
-/// `pub(crate)`: see the note on `STREAM_CHUNK_INVARIANT` above. Verified
-/// unreachable from outside the crate -- this must fail to compile:
-///
-/// ```compile_fail
-/// let _ = icanact_remote::framing::write_stream_response_start_header(0, 0, 0, 0);
-/// ```
-pub(crate) fn write_stream_response_start_header(
+/// See the note on `write_stream_request_start_header` above.
+pub fn write_stream_response_start_header(
     stream_id: u32,
     correlation_id: u32,
     total_size: u32,
     first_chunk_len: usize,
-) -> [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(STREAM_RESPONSE_START_HEADER_LEN, first_chunk_len)
-        .expect(STREAM_CHUNK_INVARIANT);
+) -> Result<[u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN]> {
+    let body_len = checked_body_len(STREAM_RESPONSE_START_HEADER_LEN, first_chunk_len)?;
     let mut header: [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] =
-        init_header(WireKind::StreamResponseStart, body_len).expect(STREAM_CHUNK_INVARIANT);
+        init_header(WireKind::StreamResponseStart, body_len)?;
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&correlation_id.to_be_bytes());
     header[12..16].copy_from_slice(&total_size.to_be_bytes());
-    header
+    Ok(header)
 }
 
-/// `pub(crate)`: see the note on `STREAM_CHUNK_INVARIANT` above. Verified
-/// unreachable from outside the crate -- this must fail to compile:
-///
-/// ```compile_fail
-/// let _ = icanact_remote::framing::write_stream_data_header(false, 0, 0, 0);
-/// ```
-pub(crate) fn write_stream_data_header(
+/// See the note on `write_stream_request_start_header` above.
+pub fn write_stream_data_header(
     response: bool,
     stream_id: u32,
     chunk_index: u32,
     payload_len: usize,
-) -> [u8; STREAM_DATA_FRAME_HEADER_LEN] {
+) -> Result<[u8; STREAM_DATA_FRAME_HEADER_LEN]> {
     let kind = if response {
         WireKind::StreamResponseData
     } else {
         WireKind::StreamData
     };
-    let body_len =
-        checked_body_len(STREAM_DATA_HEADER_LEN, payload_len).expect(STREAM_CHUNK_INVARIANT);
-    let mut header: [u8; STREAM_DATA_FRAME_HEADER_LEN] =
-        init_header(kind, body_len).expect(STREAM_CHUNK_INVARIANT);
+    let body_len = checked_body_len(STREAM_DATA_HEADER_LEN, payload_len)?;
+    let mut header: [u8; STREAM_DATA_FRAME_HEADER_LEN] = init_header(kind, body_len)?;
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&chunk_index.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// `STREAM_DATA_HEADER_LEN` is a fixed 8-byte constant -- this can never fail.
