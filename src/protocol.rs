@@ -271,6 +271,14 @@ impl StreamChunkReservation {
     pub(crate) fn is_empty(self) -> bool {
         self.len == 0
     }
+
+    pub(crate) fn stream_id(self) -> u64 {
+        self.stream_id
+    }
+
+    pub(crate) fn chunk_index(self) -> usize {
+        self.chunk_index
+    }
 }
 
 /// Completed direct-read V5 stream. Its payload owns the same pooled aligned
@@ -692,6 +700,29 @@ impl StreamingState {
             .map(Some)
     }
 
+    /// Marks `chunk_index` received for `stream_id`'s tombstone, if one
+    /// exists, removing the tombstone if this was its last outstanding
+    /// chunk. The completion counterpart for a chunk that was already
+    /// *reserved* (mid-read, via `ReadStreamPayload`) when its owning
+    /// stream was reaped out from under it: that chunk's `StreamData`
+    /// header was already parsed and its reservation already established
+    /// before the reap happened, so it can never re-enter through
+    /// `reserve_v5_chunk_or_discard`'s own "already tombstoned" lookup --
+    /// there is no second frame for the same chunk coming. Completion has
+    /// to be recorded here instead, once the read side (see
+    /// `connection_pool::read_pipeline::discard_remainder_of_reservation`)
+    /// finishes draining the chunk's remaining bytes off the wire. A no-op
+    /// if no tombstone exists for `stream_id` (e.g. already superseded by
+    /// a retry).
+    pub(crate) fn mark_reap_discarded_chunk_received(&mut self, stream_id: u64, chunk_index: usize) {
+        if let Some(tombstone) = self.rejected_streams.get_mut(&stream_id) {
+            tombstone.mark_chunk_received(chunk_index);
+            if tombstone.is_complete() {
+                self.remove_tombstone(stream_id);
+            }
+        }
+    }
+
     /// Tombstones a resource-pressure-rejected `StreamStart`. Never evicts
     /// an existing tombstone to make room -- that is exactly the bug this
     /// table's redesign removed, since any existing entry might still have
@@ -1099,9 +1130,11 @@ impl StreamingState {
     }
 
     /// Number of tombstoned (rejected or reaped) stream ids currently
-    /// quarantined. Exposed for tests that verify the table stays bounded.
+    /// quarantined. Exposed for tests (including `connection_pool`'s, which
+    /// drive `read_message_step` directly) that verify the table stays
+    /// bounded or that a tombstone is cleaned up.
     #[cfg(test)]
-    fn rejected_stream_count(&self) -> usize {
+    pub(crate) fn rejected_stream_count(&self) -> usize {
         self.rejected_streams.len()
     }
 
