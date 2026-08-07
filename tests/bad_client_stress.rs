@@ -266,3 +266,66 @@ async fn unknown_message_type_is_ignored_and_server_continues() {
     send_fullsync(&mut tls, client_peer_id).await;
     handle.shutdown().await;
 }
+
+/// Direct evidence that a raw (unaddressed) `Ask` NACKs in production,
+/// rather than answering with a transformation of the caller's own request
+/// bytes (the test/benchmark-only ECHO:/REVERSE:/COUNT:/HASH: command
+/// processor, gated on `cfg(any(test, feature = "test-helpers"))` --
+/// `handle::handle_raw_ask_request`).
+///
+/// This file is NOT gated behind `feature = "test-helpers"`, and this test
+/// is run explicitly under `cargo test --release` with no extra features
+/// (see the PR verification output) specifically so it exercises the exact
+/// build configuration under dispute: a real release binary, not `cargo
+/// test`'s dev profile, and not an emulation via a direct function call
+/// like `handle::tests::raw_ask_with_no_dispatcher_nacks_instead_of_silence`.
+#[tokio::test(flavor = "current_thread")]
+async fn raw_ask_nacks_in_a_true_release_build() {
+    let _guard = BAD_CLIENT_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    icanact_remote::tls::ensure_crypto_provider();
+
+    let server_secret = SecretKey::generate();
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        server_secret.clone(),
+        None,
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .expect("start server");
+    let server_addr = handle.registry.bind_addr;
+    let server_node_id = server_secret.public();
+    let schema_hash = handle.registry.config.schema_hash;
+
+    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
+    send_fullsync(&mut tls, client_peer_id).await;
+
+    // A command the test/benchmark-only mock command processor DOES
+    // recognize (ECHO:) -- if production were still fabricating a reply
+    // instead of NACKing, this would come back as "ECHOED:release-should-nack",
+    // not a NACK.
+    let correlation_id: u32 = 0x2_a5c1;
+    let payload = b"ECHO:release-should-nack".to_vec();
+    let header = icanact_remote::framing::write_ask_response_header(
+        icanact_remote::MessageType::Ask,
+        correlation_id,
+        payload.len(),
+    );
+    tls.write_all(&header).await.expect("write ask header");
+    tls.write_all(&payload).await.expect("write ask payload");
+    tls.flush().await.expect("flush");
+
+    let frame = read_until_ask_nack(&mut tls, correlation_id).await;
+    let got_corr = u32::from_be_bytes(frame[..4].try_into().expect("correlation id"));
+    assert_eq!(got_corr, correlation_id);
+    assert_eq!(
+        icanact_remote::framing::ask_nack_reason(&frame),
+        Some(icanact_remote::framing::AskNackReason::NoDispatcher),
+        "a raw ask must NACK in production, never fabricate a reply from the request bytes"
+    );
+
+    handle.shutdown().await;
+}
