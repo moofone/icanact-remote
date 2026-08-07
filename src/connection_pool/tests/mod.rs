@@ -690,7 +690,8 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
 /// both already full is consumed, its response computed, admission fails,
 /// and the answer is thrown away -- the exact silent drop documented at
 /// `queue_streaming_response_bytes`/`_pooled`, now happening systematically
-/// instead of only at a tight byte-cap race.
+/// instead of only at a tight byte-cap race. The fix answers with an
+/// `AskNackReason::Backpressure` NACK instead of dropping silently.
 ///
 /// Fill the connection's own retained streaming-response backlog past
 /// `is_full()` (same construction as the test above: one response at exactly
@@ -700,6 +701,18 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
 /// answer vanished". A plain tell sent immediately after must still be
 /// dispatched (`delivered` reaches 3), proving the connection did not fall
 /// back to blocking all reads to get there.
+///
+/// This connection's write side (`WriteWedgedStream`) never completes any
+/// write, which is exactly what keeps `is_full()` true for the whole test
+/// (see the wedged-write test above) -- but it also means the NACK this test
+/// exists to prove out is, on this specific transport, physically
+/// undeliverable: not one byte can reach the peer. `ask3` can therefore only
+/// be observed to fail, not to fail with `AskNacked(Backpressure)`
+/// specifically; the wire-level content of the NACK is covered separately by
+/// `try_write_ask_backpressure_nack_writes_a_decodable_nack_on_a_healthy_stream`,
+/// against a real, non-wedged transport. What this test adds beyond the "not
+/// consumed" property above is that attempting the NACK does not itself park
+/// the IO task: if it did, the tell right after would never arrive either.
 #[test]
 fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
     run_multi_thread_test(async {
@@ -802,8 +815,16 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
         // ask3: another large ask (its response, if computed, would need
         // streaming admission) arriving while the queue has zero room. Must
         // not be dispatched: `delivered` must not advance past 2 for this.
+        // The IO task now attempts an `AskNackReason::Backpressure` NACK
+        // instead of silently dropping it -- but on this specific transport
+        // (`WriteWedgedStream`, never completes any write) not one byte of
+        // that NACK can physically reach the peer, so the strongest honest
+        // assertion here is that ask3 never resolves to a fabricated
+        // success. The wire content of the NACK itself is proven on a real
+        // transport by
+        // `try_write_ask_backpressure_nack_writes_a_decodable_nack_on_a_healthy_stream`.
         let ask_three_payload = bytes::Bytes::from(vec![0x33u8; STREAMING_THRESHOLD + 4096]);
-        let _ = tokio::time::timeout(
+        let ask_three_result = tokio::time::timeout(
             Duration::from_secs(3),
             conn_peer.ask_streaming_bytes(
                 ask_three_payload,
@@ -813,6 +834,10 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
             ),
         )
         .await;
+        assert!(
+            !matches!(ask_three_result, Ok(Ok(_))),
+            "ask3 must never resolve to a fabricated success: {ask_three_result:?}"
+        );
 
         // A plain tell right behind it must still be dispatched: reads (and
         // dispatch of messages that need no streaming admission) must keep
@@ -854,6 +879,15 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
         let _ = tokio::time::timeout(Duration::from_secs(1), task_wedged).await;
     });
 }
+
+// `try_write_ask_backpressure_nack`'s own wire-content unit test
+// (`try_write_ask_backpressure_nack_writes_a_decodable_nack_on_a_healthy_stream`)
+// now lives alongside the function's definition on
+// `feat/wire-batch-nack-and-capabilities` (#185), which this branch is
+// stacked on -- see that PR for the function and its test.
+// `ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room`
+// above still proves this branch's own property: the pre-dispatch gate
+// answers with that NACK instead of consuming and dropping the ask.
 
 fn reset_io_perf() {
     let _ = IoPerfCounters::global().snapshot_and_reset();
