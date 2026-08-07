@@ -394,13 +394,21 @@ impl StreamingState {
         if self.active_streams.contains_key(&header.stream_id) {
             return Ok(());
         }
-        if self.active_streams.len() >= self.max_concurrent_streams {
-            return Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::ResourceBusy,
-                "Too many concurrent streams",
-            )));
-        }
 
+        // Malformed metadata is validated *before* the capacity check below,
+        // deliberately -- not merely for tidiness. `begin_v5_stream_or_discard`
+        // reclassifies a `ResourceBusy` from this function into a clean,
+        // stream-local discard and builds a `RejectedStreamTombstone` from
+        // the *same* `total_size`/`first_chunk_len` this call received. If
+        // an out-of-range `total_size` could reach that path unvalidated
+        // (which it could, when capacity happened to be full first), a peer
+        // could pair a one-byte first chunk with an enormous declared size
+        // and have the tombstone's chunk-completion bitmap attempt an
+        // allocation sized off that declared value -- a discard path is
+        // exactly the wrong place to trust unvalidated attacker input for an
+        // allocation size. Validating here first means capacity pressure can
+        // never mask a malformed declaration: it is always the fatal
+        // `InvalidData` a bogus `total_size` deserves, never `ResourceBusy`.
         let total_size = usize::try_from(header.total_size).map_err(|_| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -416,6 +424,13 @@ impl StreamingState {
                     total_size,
                     crate::MAX_STREAM_SIZE
                 ),
+            )));
+        }
+
+        if self.active_streams.len() >= self.max_concurrent_streams {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "Too many concurrent streams",
             )));
         }
 
@@ -2726,6 +2741,63 @@ mod tests {
         assert!(
             trailing.unwrap().is_none(),
             "the first rejected stream's trailing chunk must be discarded, not accepted as fresh"
+        );
+    }
+
+    /// Review finding: `begin_v5_stream_or_discard` reclassified
+    /// `start_stream_with_correlation_and_kind`'s `ResourceBusy` into a
+    /// clean, stream-local discard -- and built a `RejectedStreamTombstone`
+    /// from the request's own declared `total_size`/`first_chunk_len` --
+    /// *before* that function had validated `total_size` at all, since the
+    /// capacity check ran first. A peer could pair a tiny first chunk with a
+    /// declared size many times over `MAX_STREAM_SIZE` and have the
+    /// resulting tombstone's completion bitmap sized directly off that
+    /// unvalidated value. Uses a size well past `MAX_STREAM_SIZE` (8x) --
+    /// large enough to prove the bug (the old code actually performs a
+    /// multi-ten-megabyte allocation for it) without needing to attempt an
+    /// astronomical allocation in the test process itself to make the point.
+    #[test]
+    fn oversized_declared_size_is_fatal_even_when_capacity_pressure_would_otherwise_discard_it() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+
+        // Fill max_concurrent_streams (16) so the next start hits the
+        // resource-pressure path.
+        for stream_id in 0..16u64 {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size: 8,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8)
+                .expect("connection has room for the first 16 streams")
+                .expect("must be admitted, not discarded");
+        }
+
+        // Capacity is now full, so this would ordinarily hit the
+        // resource-pressure discard path -- except its declared size is 8x
+        // MAX_STREAM_SIZE with a one-byte first chunk, which is malformed
+        // regardless of capacity and must never reach tombstone
+        // construction.
+        const OVERSIZED: u64 = crate::MAX_STREAM_SIZE as u64 * 8;
+        let malicious = crate::StreamHeader {
+            stream_id: 999,
+            total_size: OVERSIZED,
+            chunk_size: 1,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let result = state.begin_v5_stream_or_discard(malicious, 1, pool, false, 1);
+        assert!(
+            result.is_err(),
+            "a declared size far past MAX_STREAM_SIZE must be a fatal protocol error, not a \
+             resource-pressure discard that builds a tombstone sized off the unvalidated \
+             value: {result:?}"
         );
     }
 
