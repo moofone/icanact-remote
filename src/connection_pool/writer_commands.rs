@@ -351,6 +351,16 @@ impl LocalStreamingQueue {
         self.pending_ask_nacks.pop_front()
     }
 
+    /// Whether any backpressure NACK is still queued and unwritten.
+    /// `drain_pending_ask_nacks` consults this after every attempt so its
+    /// caller (`io_task`) can tell outstanding NACK work from a genuinely
+    /// idle turn -- `pending_ask_nacks` is deliberately not part of
+    /// `has_pending`, since that governs streaming-source selection, not
+    /// wakeup/park eligibility.
+    fn has_pending_ask_nacks(&self) -> bool {
+        !self.pending_ask_nacks.is_empty()
+    }
+
     #[cfg(test)]
     fn pending_ask_nack_count(&self) -> usize {
         self.pending_ask_nacks.len()

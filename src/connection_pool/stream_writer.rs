@@ -195,27 +195,35 @@ where
 /// the same result. That specific queued NACK is lost (best-effort, not a
 /// delivery guarantee, per `queue_ask_nack`); the rest stay queued for next
 /// time.
+///
+/// Returns `Ok(true)` if any NACK remains queued once this call returns --
+/// either the `MAX_PER_TURN` cap was hit with the queue still non-empty, or
+/// the zero-progress stop left entries behind it. The caller must treat that
+/// as outstanding work (e.g. `did_work = true`) rather than letting the turn
+/// look idle: `pending_ask_nacks` is not visible to `has_pending` or the
+/// pre-park checks, so nothing else would prevent the I/O task from parking
+/// with a NACK still owed to a peer.
 async fn drain_pending_ask_nacks<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     local_streaming_queue: &mut LocalStreamingQueue,
-) -> std::io::Result<()>
+) -> std::io::Result<bool>
 where
     S: AsyncWrite + Unpin,
 {
     const MAX_PER_TURN: usize = 8;
     for _ in 0..MAX_PER_TURN {
         let Some(header) = local_streaming_queue.pop_ask_nack() else {
-            return Ok(());
+            return Ok(false);
         };
         if !write_ask_nack_header_bounded(stream, bytes_written_counter, bytes_since_flush, header)
             .await?
         {
-            return Ok(());
+            return Ok(local_streaming_queue.has_pending_ask_nacks());
         }
     }
-    Ok(())
+    Ok(local_streaming_queue.has_pending_ask_nacks())
 }
 
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
@@ -1372,7 +1380,7 @@ impl LockFreeStreamHandle {
                 // Queued backpressure NACKs (see `LocalStreamingQueue::queue_ask_nack`)
                 // are only ever safe to write here, now that the wire is
                 // proven free of a partial frame.
-                if let Err(e) = drain_pending_ask_nacks(
+                match drain_pending_ask_nacks(
                     &mut stream,
                     &bytes_written_counter,
                     &mut bytes_since_flush,
@@ -1380,12 +1388,24 @@ impl LockFreeStreamHandle {
                 )
                 .await
                 {
-                    warn!(
-                        peer = ?read_context.as_ref().map(|c| c.peer_addr),
-                        error = %e,
-                        "Failed to drain queued ask backpressure NACKs"
-                    );
-                    return;
+                    // Entries survived the bounded per-turn drain: treat this
+                    // turn as having done work so the loop revisits the top
+                    // (and this drain) again instead of falling into the
+                    // `!did_work` pre-park/idle-select path below with a NACK
+                    // still queued and no other event left to wake it.
+                    Ok(more_pending) => {
+                        if more_pending {
+                            did_work = true;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                            error = %e,
+                            "Failed to drain queued ask backpressure NACKs"
+                        );
+                        return;
+                    }
                 }
                 // ACTOR_REM_2 R8: service the normal write queue when no partial
                 // stream frame is outstanding. The batch remains bounded during

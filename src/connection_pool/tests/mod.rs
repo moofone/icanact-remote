@@ -1470,6 +1470,193 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
     });
 }
 
+/// P1: `drain_pending_ask_nacks` only writes `MAX_PER_TURN` (8) queued
+/// entries per call. Before this fix, it reported nothing about whatever
+/// was left over, so its caller (`io_task`) had no way to distinguish "queue
+/// drained" from "queue still has work" and could treat the turn as idle.
+/// A 9-entry burst must leave the call reporting outstanding work, and a
+/// follow-up call must finish draining it.
+#[test]
+fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
+    run_multi_thread_test(async {
+        let mut queue = LocalStreamingQueue::new();
+        for i in 0..9u32 {
+            queue.queue_ask_nack(crate::framing::write_ask_nack_header(
+                i,
+                crate::framing::AskNackReason::Backpressure,
+            ));
+        }
+        assert_eq!(queue.pending_ask_nack_count(), 9);
+
+        let (mut server_half, mut client_half) = tokio::io::duplex(4096);
+        let bytes_written_counter = Arc::new(AtomicUsize::new(0));
+        let mut bytes_since_flush = 0usize;
+
+        let more_pending = drain_pending_ask_nacks(
+            &mut server_half,
+            &bytes_written_counter,
+            &mut bytes_since_flush,
+            &mut queue,
+        )
+        .await
+        .expect("draining against a healthy transport must not error");
+        assert_eq!(
+            queue.pending_ask_nack_count(),
+            1,
+            "the bounded per-turn drain must stop after MAX_PER_TURN (8) entries"
+        );
+        assert!(
+            more_pending,
+            "drain_pending_ask_nacks must report outstanding work when entries remain after \
+             the bounded burst, so the io_task call site knows not to treat this turn as idle"
+        );
+
+        let more_pending = drain_pending_ask_nacks(
+            &mut server_half,
+            &bytes_written_counter,
+            &mut bytes_since_flush,
+            &mut queue,
+        )
+        .await
+        .expect("draining the remainder must not error");
+        assert!(
+            !more_pending,
+            "the queue must report no outstanding work once fully drained"
+        );
+        assert_eq!(queue.pending_ask_nack_count(), 0);
+
+        // Drain all ten writes off the wire (8 from the first call, 1 from
+        // the second, both against the same live duplex) to confirm nothing
+        // was silently dropped along the way.
+        for expected_correlation_id in 0..9u32 {
+            let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+            tokio::io::AsyncReadExt::read_exact(&mut client_half, &mut header)
+                .await
+                .expect("every queued NACK must have reached the wire");
+            assert_eq!(
+                u32::from_be_bytes(header[4..8].try_into().unwrap()),
+                expected_correlation_id
+            );
+        }
+
+        drop(server_half);
+        drop(client_half);
+    });
+}
+
+/// P1: reproduces the reported deadlock shape end-to-end through the real
+/// `io_task`, not just the drain primitive above. Nine raw `ActorAsk` frames
+/// land in a single `write_all` so all nine are read and dispatched (each
+/// NACKed with `UnknownActor`, since the server registry below has no ask
+/// handler registered at all -- a real production NACK path, not a
+/// manufactured test hook) inside one read-batch pass, before
+/// `drain_pending_ask_nacks` ever gets a turn. That reproduces "more than
+/// `MAX_PER_TURN` (8) queued at once, then nothing else happens" exactly.
+/// No further traffic follows the initial write, so nothing but the
+/// drain/wakeup fix itself can deliver the ninth NACK -- before the fix,
+/// this hangs until `COMPLETION_BOUND` and fails.
+#[test]
+fn nine_queued_ask_nacks_all_reach_the_wire_without_further_traffic() {
+    run_multi_thread_test(async {
+        const ASK_COUNT: u32 = 9;
+        const COMPLETION_BOUND: Duration = Duration::from_secs(5);
+
+        let server_addr: std::net::SocketAddr = "127.0.0.1:44201".parse().unwrap();
+        let peer_addr: std::net::SocketAddr = "127.0.0.1:44202".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "nine_queued_ask_nacks_server",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+
+        let (server_io, mut peer_io) = tokio::io::duplex(1024 * 1024);
+        let server_read_ctx = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr,
+            session_source: peer_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            peer_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+
+        let mut frames = Vec::new();
+        for i in 1..=ASK_COUNT {
+            let payload = b"x";
+            let header = crate::framing::write_actor_ask_header(
+                i,
+                0xBAD0_0000_0000_0000 + i as u64,
+                0xF00D_0001,
+                payload.len(),
+            );
+            frames.extend_from_slice(&header);
+            frames.extend_from_slice(payload);
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut peer_io, &frames)
+            .await
+            .expect("writing all nine ActorAsk frames at once must succeed");
+
+        let outcome = tokio::time::timeout(COMPLETION_BOUND, async {
+            let mut received = Vec::with_capacity(ASK_COUNT as usize);
+            for _ in 0..ASK_COUNT {
+                let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+                tokio::io::AsyncReadExt::read_exact(&mut peer_io, &mut header)
+                    .await
+                    .expect("the peer must receive a NACK header for every queued ask");
+                let correlation_id = u32::from_be_bytes(header[4..8].try_into().unwrap());
+                let reason = crate::framing::ask_nack_reason(&header[4..]);
+                received.push((correlation_id, reason));
+            }
+            received
+        })
+        .await;
+
+        let received = outcome.expect(
+            "all nine queued ask NACKs must reach the wire without further traffic -- a burst \
+             past the 8-per-turn drain cap must not park the I/O task with entries still queued",
+        );
+
+        assert_eq!(received.len(), ASK_COUNT as usize);
+        for (idx, (correlation_id, reason)) in received.iter().enumerate() {
+            assert_eq!(
+                *correlation_id,
+                idx as u32 + 1,
+                "NACKs must arrive in dispatch order"
+            );
+            assert_eq!(
+                *reason,
+                Some(crate::framing::AskNackReason::UnknownActor),
+                "every ask targeted an actor with no registered handler"
+            );
+        }
+
+        server_writer.shutdown();
+        drop(peer_io);
+    });
+}
+
 /// A transport whose `poll_write` legally returns `Ready(Ok(0))` on every
 /// call, from the very first one -- modelling a half-closed write side, per
 /// the `AsyncWrite` contract (distinct from `Pending`, which must be
