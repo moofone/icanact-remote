@@ -23962,6 +23962,338 @@ mod tests {
         );
     }
 
+    /// A peer's session being currently ARMED is not restart evidence by
+    /// itself -- arming happens on every routine reconnect too. A brand-new
+    /// peer's first-ever connection (no prior sequence to reset FROM) must
+    /// not be treated as a restart just because its low clock happens to be
+    /// below a pre-existing tombstone.
+    #[tokio::test]
+    async fn apply_delta_steady_state_armed_session_without_restart_does_not_bypass_tombstone() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7910),
+            test_config_with_seed("restart-tombstone-steady-state"),
+        );
+        let actor = "actor.delta.steady-state-no-restart";
+        let owner = test_peer_id("restart-tombstone-steady-state-peer");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let peer_addr = test_addr(9920);
+        let session_source = test_addr(55112);
+
+        // A peer-death tombstone exists (perhaps left over from a much
+        // earlier, unrelated incarnation of this actor name).
+        let removal_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            removal_clock.increment(owner_node);
+        }
+        removal_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new(removal_clock),
+        );
+
+        // The owner connects for the first time ever (never seen before --
+        // `last_sequence` starts at 0) and its session is armed, exactly
+        // like any ordinary connection. No restart has occurred; there is
+        // nothing to have restarted FROM.
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(owner_node),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            session_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(session_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(session_source),
+            None,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let captured_epoch = {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                peer_info.current_session_source.is_some(),
+                "sanity: the session must be armed"
+            );
+            assert!(
+                !peer_info.session_restart_confirmed,
+                "sanity: a peer's very first connection is not restart evidence"
+            );
+            peer_info.current_session_epoch
+        };
+
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            Some(session_source),
+            Some((peer_addr, captured_epoch)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "a merely-armed session with no actual restart evidence must not bypass a tombstone"
+        );
+        assert!(reg.actor_state.removed_actors.contains_sync(actor));
+    }
+
+    /// A successor connection that self-heals into "current" (because the
+    /// originally-armed connection was superseded) but NEVER ITSELF armed a
+    /// session must not inherit restart-authenticity evidence from the
+    /// session it replaced -- even when that original session HAD genuinely
+    /// confirmed a restart. `session_restart_confirmed` must be reset by the
+    /// self-heal, and the un-armed successor has no way to re-earn it (its
+    /// own `accept_lower_sequence_from` is `None`, so no FullSync on it can
+    /// ever be recognized as an armed restart).
+    #[tokio::test]
+    async fn self_healed_successor_that_never_armed_does_not_get_restart_exemption() {
+        use crate::connection_pool::{ConnectionDirection, LockFreeConnection};
+
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7911),
+            test_config_with_seed("restart-tombstone-self-heal"),
+        );
+        let actor = "actor.delta.self-healed-successor";
+        let owner = test_peer_id("restart-tombstone-self-heal-peer");
+        let owner_node = owner.to_node_id();
+        let observer_node = reg.peer_id.to_node_id();
+        let peer_addr = test_addr(9921);
+
+        let pre_crash_clock = crate::VectorClock::new();
+        for _ in 0..5 {
+            pre_crash_clock.increment(owner_node);
+        }
+        pre_crash_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new(pre_crash_clock),
+        );
+
+        // The ORIGINAL session: armed, and its restart is genuinely
+        // confirmed (so `session_restart_confirmed` starts `true` -- proving
+        // the later reset actually changes something, not just observing an
+        // already-`false` flag).
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(owner_node),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
+        let original_source = test_addr(55211);
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            40,
+            current_timestamp(),
+        )
+        .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            original_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(original_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(original_source),
+            None,
+            1,
+            current_timestamp(),
+        )
+        .await;
+        {
+            let state = reg.gossip_state.lock().await;
+            assert!(
+                state.peers.get(&peer_addr).unwrap().session_restart_confirmed,
+                "sanity: the original session's restart must be confirmed first"
+            );
+        }
+
+        // A DIFFERENT connection instance for the SAME identity is now
+        // published as current in the pool -- WITHOUT ever arming a session
+        // for it (no `arm_sequence_reset_for_new_session` call).
+        let new_source = test_addr(55212);
+        let new_conn = std::sync::Arc::new(LockFreeConnection::new(
+            new_source,
+            ConnectionDirection::Inbound,
+        ));
+        assert!(
+            reg.connection_pool
+                .add_connection_by_peer_id(owner.clone(), peer_addr, new_conn),
+            "the new connection instance must publish as current"
+        );
+
+        // Its own (perfectly ordinary, non-restart-shaped) FullSync makes
+        // `peer_info_is_from_current_session` self-heal: the un-armed
+        // successor becomes recognized as current, clearing the original
+        // session's discriminators -- including, per this fix,
+        // `session_restart_confirmed`.
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(new_source),
+            None,
+            41,
+            current_timestamp(),
+        )
+        .await;
+
+        let captured_epoch = {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                !peer_info.session_restart_confirmed,
+                "the self-healed, never-armed successor must NOT inherit the original \
+                 session's restart-confirmed evidence"
+            );
+            peer_info.current_session_epoch
+        };
+
+        let loc = RemoteActorLocation::new_with_peer(peer_addr, owner.clone());
+        loc.vector_clock.increment(owner_node);
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            Some(new_source),
+            Some((peer_addr, captured_epoch)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "a self-healed successor that never itself armed a session must not get the \
+             restart exemption just because a DIFFERENT, earlier session once earned it"
+        );
+        assert!(reg.actor_state.removed_actors.contains_sync(actor));
+    }
+
+    /// A CONFIRMED connection teardown must invalidate the peer's
+    /// session-authentication state, including `session_restart_confirmed`
+    /// -- otherwise a stale value from before the teardown could still be
+    /// honored by a later message that merely presents the dead
+    /// connection's own (by-then-meaningless) `session_source`.
+    #[tokio::test]
+    async fn handle_peer_connection_failure_invalidates_session_restart_confirmed() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7913),
+            test_config_with_seed("teardown-invalidates-restart"),
+        );
+        let peer_addr = test_addr(9923);
+        let owner = test_peer_id("teardown-invalidates-restart-peer");
+        let owner_node = owner.to_node_id();
+        let session_source = test_addr(55401);
+
+        reg.add_peer_with_node_id(
+            peer_addr,
+            Some(owner_node),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
+        reg.merge_full_sync(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            40,
+            current_timestamp(),
+        )
+        .await;
+        reg.arm_sequence_reset_for_new_session(
+            peer_addr,
+            owner_node,
+            session_source,
+            &owner,
+            &qa_r11_dummy_connection_instance(session_source),
+        )
+        .await;
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            HashMap::new(),
+            owner.clone(),
+            peer_addr,
+            Some(session_source),
+            None,
+            1,
+            current_timestamp(),
+        )
+        .await;
+        {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&peer_addr).unwrap();
+            assert!(
+                peer_info.session_restart_confirmed,
+                "sanity: the restart must be confirmed before the teardown"
+            );
+            assert!(peer_info.current_session_source.is_some());
+        }
+
+        reg.handle_peer_connection_failure(peer_addr, None)
+            .await
+            .unwrap();
+
+        let state = reg.gossip_state.lock().await;
+        let peer_info = state.peers.get(&peer_addr).unwrap();
+        assert!(
+            !peer_info.session_restart_confirmed,
+            "a confirmed teardown must invalidate restart-confirmed evidence from the \
+             now-dead session"
+        );
+        assert!(
+            peer_info.current_session_source.is_none(),
+            "a confirmed teardown must clear the dead session's source discriminator"
+        );
+        assert!(peer_info.accept_lower_sequence_from.is_none());
+    }
+
     #[tokio::test]
     async fn test_merge_full_sync_ignores_stale_sequence() {
         let reg = GossipRegistry::<()>::new(test_addr(7005), test_config());
