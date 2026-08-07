@@ -2553,6 +2553,17 @@ mod tests {
     /// tombstone would otherwise have aged out. Each hit must refresh the
     /// tombstone's own timer, the same way real stream activity refreshes a
     /// live stream's.
+    ///
+    /// Each loop iteration refreshes (the hit) *before* the prune check that
+    /// could observe staleness, not after a sleep whose actual duration
+    /// `sleep` only lower-bounds. That ordering is what makes the interval
+    /// between hits safe to make arbitrarily long (deliberately well past
+    /// the TTL below) instead of needing to stay under it: elapsed-since-hit
+    /// at the prune check is always whatever the refresh-to-check gap is
+    /// (negligible), never the sleep duration. A version of this test that
+    /// pruned *before* refreshing would need each sleep to finish inside
+    /// `ttl`, which `sleep`'s lower-bound-only guarantee cannot promise on a
+    /// loaded worker.
     #[test]
     fn tombstone_is_refreshed_by_repeated_late_chunks_past_its_original_ttl() {
         use std::time::Duration;
@@ -2573,6 +2584,8 @@ mod tests {
             .begin_v5_stream(header, 1, pool, false, 8)
             .expect("start stream and reserve its first chunk");
 
+        // Wants elapsed >= ttl to force the reap: `sleep` only guarantees a
+        // lower bound, so any overshoot only makes the reap more certain.
         std::thread::sleep(ttl + Duration::from_millis(10));
         state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
         assert_eq!(
@@ -2581,13 +2594,14 @@ mod tests {
             "stream must be reaped first"
         );
 
-        // Keep hitting the tombstone at intervals shorter than the TTL, but
-        // whose SUM comfortably exceeds it -- each hit must push the expiry
-        // back out, so the tombstone must never actually lapse.
+        // Keep hitting the tombstone at deliberately long intervals -- each
+        // hit refreshes it, and refresh always happens immediately before
+        // the prune check below observes it, so no interval needs an upper
+        // bound. Sleeping well past `ttl` every time is the point: it shows
+        // the tombstone survives no matter how long the gap between hits
+        // actually is, not just gaps that happen to land under `ttl`.
         for _ in 0..4 {
-            std::thread::sleep(ttl / 2);
-            // prunes any tombstone that truly expired
-            state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
+            std::thread::sleep(ttl * 3);
             let result = state
                 .reserve_v5_chunk_or_discard(301, 1, 8)
                 .expect("a trickling late chunk must never be a fatal protocol error");
@@ -2595,7 +2609,29 @@ mod tests {
                 result.is_none(),
                 "a trickling late chunk must keep being discarded, not accepted as fresh"
             );
+            // Immediately after the refresh above, so elapsed-since-hit is
+            // negligible here regardless of how long the preceding sleep
+            // actually ran: this can never observe the tombstone as stale.
+            state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
+            assert_eq!(
+                state.rejected_stream_count(),
+                1,
+                "the tombstone must still be present immediately after a refreshing hit"
+            );
         }
+
+        // Refresh-on-hit is not a free pass: without a further hit, the
+        // tombstone is not immortal. `sleep`'s lower-bound guarantee is
+        // exactly what this direction needs -- it must reach at least
+        // `ttl`, and any overshoot only makes the expiry more certain.
+        std::thread::sleep(ttl * 3);
+        state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
+        assert_eq!(
+            state.rejected_stream_count(),
+            0,
+            "a tombstone that stops being hit must eventually expire -- refresh-on-hit is \
+             doing real work above, not just sitting behind an unreachably long TTL"
+        );
     }
 
     #[test]
