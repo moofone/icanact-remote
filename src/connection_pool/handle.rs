@@ -407,8 +407,9 @@ impl<T> ConnectionHandle<T> {
                 correlation_id,
                 payload_len,
             )?;
+            let expected_len = header.len() + payload_len;
             let buf = bytes::Bytes::copy_from_slice(&header).chain(payload); // ALLOW_COPY
-            stream_handle.write_buf_control(buf).await
+            stream_handle.write_buf_control(buf, expected_len).await
         } else {
             let bytes = payload.copy_to_bytes(payload.remaining());
             self.send_response_bytes(correlation_id, bytes).await
@@ -1673,6 +1674,81 @@ mod oversized_inline_send_gate_tests {
             .unwrap_err();
         assert!(matches!(err, GossipError::MessageTooLarge { .. }));
         assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    /// PR #183 review, second round: `send_response_buf` builds its header
+    /// from the caller-declared `payload_len`, then chains it onto the
+    /// caller-supplied `Buf` -- which is a *different* value with its own,
+    /// independent `remaining()`. A caller passing an in-bounds
+    /// `payload_len` alongside a `Buf` whose actual `remaining()` is larger
+    /// must not be allowed to reach the wire: unlike every other oversize
+    /// case in this suite, this does not produce a well-formed frame the
+    /// peer cleanly rejects as `MessageTooLarge` -- it writes bytes past
+    /// the frame boundary the header already declared, and the peer reads
+    /// that tail as the next control word. A payload-only equality check
+    /// would not catch this if it only compared against `max_message_size`;
+    /// it has to compare the buffer's actual length against the header's
+    /// declared length directly.
+    #[tokio::test]
+    async fn send_response_buf_whose_remaining_exceeds_declared_payload_len_is_rejected() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        // Both individually well within max_message_size -- this must not be
+        // caught by the size gate, only by the declared-vs-actual mismatch.
+        let declared_payload_len = 8;
+        let actual_payload = bytes::Bytes::from(vec![0u8; 4096]);
+        let err = conn
+            .send_response_buf(1, actual_payload, declared_payload_len)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, GossipError::MessageTooLarge { .. }),
+            "a small declared length must not be reported as MessageTooLarge: {err:?}"
+        );
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    /// Same gap, the other direction: a `Buf` whose actual `remaining()` is
+    /// *smaller* than the header's declared length would leave the frame
+    /// short -- the peer either blocks waiting for bytes that were never
+    /// declared as a separate message, or consumes a later, unrelated
+    /// write's bytes as this frame's tail. Also must be refused, not merely
+    /// the over-length direction.
+    #[tokio::test]
+    async fn send_response_buf_whose_remaining_is_less_than_declared_payload_len_is_rejected() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let declared_payload_len = 4096;
+        let actual_payload = bytes::Bytes::from(vec![0u8; 8]);
+        let err = conn
+            .send_response_buf(1, actual_payload, declared_payload_len)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, GossipError::MessageTooLarge { .. }),
+            "a mismatched-but-small declared length must not be reported as \
+             MessageTooLarge: {err:?}"
+        );
+        assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    /// The gate must not false-reject when `remaining()` and the declared
+    /// length genuinely agree -- proving the mismatch checks above are not
+    /// simply rejecting every `Buf` write.
+    #[tokio::test]
+    async fn send_response_buf_with_matching_declared_and_actual_length_is_written() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let payload = bytes::Bytes::from_static(b"consistent");
+        let payload_len = payload.len();
+        conn.send_response_buf(1, payload.clone(), payload_len)
+            .await
+            .expect("a Buf whose remaining() matches the declared length must be sent");
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        peer.read_exact(&mut ctrl).await.unwrap();
+        let control = crate::framing::decode_control(ctrl).unwrap();
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(
+            control.body_len,
+            crate::framing::ASK_RESPONSE_HEADER_LEN + payload_len
+        );
     }
 
     #[tokio::test]

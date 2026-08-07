@@ -1819,7 +1819,7 @@ impl LockFreeStreamHandle {
                                     }
                                 }
                             }
-                            WritePayload::Buf(mut buf) => {
+                            WritePayload::Buf { mut buf, .. } => {
                                 if !direct_ask_headers.is_empty() {
                                     let bytes_written = match flush_direct_ask_batch(
                                         &mut stream,
@@ -2620,13 +2620,30 @@ impl LockFreeStreamHandle {
     /// `AlignedBytes` conversion, etc.), but none of them is load-bearing
     /// for correctness anymore -- this is.
     ///
-    /// `Single`/`Buf` are intentionally exempt: `Single` carries either an
-    /// already self-contained fixed-size control frame (route bind, stream
-    /// abort -- both far under any real `max_message_size`) or a
-    /// pre-concatenated multi-frame batch
-    /// (`ConnectionHandle::ask_batch_deferred`), and `Buf` is a generic byte
-    /// source with no framing contract this module owns. Neither is "one
-    /// frame's header plus its payload" to decode a single `body_len` from.
+    /// `Single` is intentionally exempt: it carries either an already
+    /// self-contained fixed-size control frame (route bind, stream abort --
+    /// both far under any real `max_message_size`) or a pre-concatenated
+    /// multi-frame batch (`ConnectionHandle::ask_batch_deferred`), neither
+    /// of which is "one frame's header plus its payload" to decode a single
+    /// `body_len` from.
+    ///
+    /// `Buf` cannot be decoded the same way -- it is a generic byte source
+    /// (typically a header `Bytes` chained with a caller-supplied payload
+    /// via `bytes::Buf::chain`), so there is no fixed-offset control word to
+    /// read back out of it reliably. It carries its own declared
+    /// `expected_len` instead (see `WritePayload::Buf`), captured by the
+    /// caller when it built the header this `buf` was chained onto. Trusting
+    /// `buf.remaining()` alone here would miss exactly the bug this method
+    /// exists to prevent: a caller can build a header (and pass the earlier,
+    /// header-only pre-check) from one length while the `Buf` it chains onto
+    /// that header actually yields a different number of bytes. That is
+    /// worse than every other variant's oversize case -- those still send a
+    /// well-formed frame the peer cleanly rejects as `MessageTooLarge`; this
+    /// one writes bytes past (or short of) the frame boundary the header
+    /// already promised the peer, desyncing its parser instead of merely
+    /// tripping a size limit. So `remaining()` disagreeing with
+    /// `expected_len` is rejected unconditionally, not just when it is
+    /// larger than `max_message_size`.
     fn reject_oversize_write_payload(&self, payload: &WritePayload) -> Result<()> {
         let header: &[u8] = match payload {
             WritePayload::HeaderPayload { header, .. } => header.as_ref(),
@@ -2636,7 +2653,28 @@ impl LockFreeStreamHandle {
             WritePayload::HeaderPooled { header, .. } => header.as_ref(),
             WritePayload::HeaderInlinePooled { header, .. } => &header[..],
             WritePayload::DirectAskInline { header, .. } => &header[..],
-            WritePayload::Single(_) | WritePayload::Buf(_) => return Ok(()),
+            WritePayload::Single(_) => return Ok(()),
+            WritePayload::Buf { buf, expected_len } => {
+                let actual_len = buf.remaining();
+                if actual_len != *expected_len {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Buf write declared {expected_len} bytes but the buffer \
+                             actually has {actual_len} remaining -- refusing to send a \
+                             frame whose header would disagree with its own body"
+                        ),
+                    )));
+                }
+                let body_len = expected_len.saturating_sub(framing::LENGTH_PREFIX_LEN);
+                if body_len > self.max_message_size {
+                    return Err(GossipError::MessageTooLarge {
+                        size: body_len,
+                        max: self.max_message_size,
+                    });
+                }
+                return Ok(());
+            }
         };
         if header.len() < framing::LENGTH_PREFIX_LEN {
             return Ok(());
@@ -3087,19 +3125,35 @@ impl LockFreeStreamHandle {
         .await
     }
 
-    pub async fn write_buf_control<B>(&self, buf: B) -> Result<()>
+    /// `expected_len` is the exact byte count the caller declared `buf`
+    /// would produce (see `WritePayload::Buf`). `reject_oversize_write_payload`
+    /// rejects the write outright if `buf.remaining()` disagrees with it --
+    /// a mismatch here means the header this `buf` was chained onto was
+    /// built from a different length than the payload it is actually
+    /// carrying, which would otherwise write bytes past (or short of) the
+    /// frame the header declares and desync the peer's parser, not just
+    /// send an oversize-but-well-formed frame.
+    pub async fn write_buf_control<B>(&self, buf: B, expected_len: usize) -> Result<()>
     where
         B: Buf + Send + 'static,
     {
-        self.enqueue_write(WritePayload::Buf(Box::new(buf))).await
+        self.enqueue_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
     }
 
-    pub async fn write_buf_ask<B>(&self, buf: B) -> Result<()>
+    /// See `write_buf_control`'s `expected_len` doc.
+    pub async fn write_buf_ask<B>(&self, buf: B, expected_len: usize) -> Result<()>
     where
         B: Buf + Send + 'static,
     {
-        self.enqueue_ask_write(WritePayload::Buf(Box::new(buf)))
-            .await
+        self.enqueue_ask_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
     }
 
     /// Enqueue bytes for the background writer (non-blocking).

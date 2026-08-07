@@ -298,7 +298,19 @@ pub enum WritePayload {
         header: [u8; 16], // DIRECT_ASK_FRAME_HEADER_LEN
         payload: bytes::Bytes,
     },
-    Buf(Box<dyn Buf + Send>),
+    /// A generic `Buf` write (header chained with a caller-supplied payload,
+    /// written without concatenating). `expected_len` is the exact byte
+    /// count the caller declared this write would produce -- generally
+    /// `header.len() + payload_len` from whatever `write_*_header` call
+    /// built the frame -- captured separately from `buf` itself precisely
+    /// because `buf.remaining()` is not trustworthy on its own: a caller
+    /// can build a header from one length and chain a `Buf` whose actual
+    /// `remaining()` disagrees with it. See `reject_oversize_write_payload`,
+    /// which is the only place `expected_len` is read.
+    Buf {
+        buf: Box<dyn Buf + Send>,
+        expected_len: usize,
+    },
 }
 
 impl std::fmt::Debug for WritePayload {
@@ -358,7 +370,10 @@ impl std::fmt::Debug for WritePayload {
                 )
                 .field("payload_len", &payload.len())
                 .finish(),
-            WritePayload::Buf(_) => f.debug_tuple("Buf").field(&"<buf>").finish(),
+            WritePayload::Buf { expected_len, .. } => f
+                .debug_struct("Buf")
+                .field("expected_len", expected_len)
+                .finish(),
             WritePayload::DirectAskInline { header: _, payload } => f
                 .debug_struct("DirectAskInline")
                 .field("header_len", &crate::framing::DIRECT_ASK_FRAME_HEADER_LEN)
