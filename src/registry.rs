@@ -24294,6 +24294,105 @@ mod tests {
         assert!(peer_info.accept_lower_sequence_from.is_none());
     }
 
+    /// `merge_tombstone_kind` must keep `ExplicitUnregister` dominant over
+    /// `PeerDeath` in every combination: once any report has established a
+    /// removal was the owner's own deliberate decision, a later,
+    /// concurrently-merged peer-death report must never downgrade it back.
+    #[test]
+    fn merge_tombstone_kind_prefers_explicit_unregister() {
+        assert_eq!(
+            merge_tombstone_kind(Some(TombstoneKind::PeerDeath), TombstoneKind::ExplicitUnregister),
+            TombstoneKind::ExplicitUnregister
+        );
+        assert_eq!(
+            merge_tombstone_kind(Some(TombstoneKind::ExplicitUnregister), TombstoneKind::PeerDeath),
+            TombstoneKind::ExplicitUnregister
+        );
+        assert_eq!(
+            merge_tombstone_kind(Some(TombstoneKind::PeerDeath), TombstoneKind::PeerDeath),
+            TombstoneKind::PeerDeath
+        );
+        assert_eq!(
+            merge_tombstone_kind(None, TombstoneKind::PeerDeath),
+            TombstoneKind::PeerDeath
+        );
+        assert_eq!(
+            merge_tombstone_kind(None, TombstoneKind::ExplicitUnregister),
+            TombstoneKind::ExplicitUnregister
+        );
+    }
+
+    /// End-to-end: an already-established `ExplicitUnregister` tombstone
+    /// must survive a LATER incoming `ActorRemoved` that would, on its own,
+    /// classify as `PeerDeath` (reported by a third party, not the owner).
+    /// Without kind-merging, this later report's own classification would
+    /// silently overwrite the safer, pre-existing classification.
+    #[tokio::test]
+    async fn apply_delta_removal_preserves_explicit_unregister_kind_against_later_peer_death_report()
+     {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7912),
+            test_config_with_seed("tombstone-kind-merge"),
+        );
+        let actor = "actor.removal.kind-merge";
+        let owner = test_peer_id("tombstone-kind-merge-owner");
+        let owner_node = owner.to_node_id();
+        let observer_node = test_peer_id("tombstone-kind-merge-observer").to_node_id();
+
+        // The actor is currently known, owned by `owner`.
+        let known_loc = RemoteActorLocation::new_with_peer(test_addr(9922), owner.clone());
+        known_loc.vector_clock.increment(owner_node);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync(actor.to_string(), known_loc);
+
+        // An ExplicitUnregister tombstone has already been established
+        // (e.g. from an earlier, direct report from the owner itself).
+        let existing_clock = crate::VectorClock::new();
+        existing_clock.increment(observer_node);
+        let _ = reg.actor_state.removed_actors.upsert_sync(
+            actor.to_string(),
+            RemovedActorTombstone::new_explicit_unregister(existing_clock),
+        );
+
+        // A LATER incoming removal, reported by a THIRD PARTY (not the
+        // owner) -- on its own this classifies as `PeerDeath` -- with a
+        // clock that causally dominates the known actor's current entry.
+        let removal_clock = crate::VectorClock::new();
+        removal_clock.increment(owner_node);
+        removal_clock.increment(owner_node);
+        removal_clock.increment(observer_node);
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: removal_clock,
+                removing_node_id: observer_node,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: test_peer_id("tombstone-kind-merge-relay"),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let kind = reg
+            .actor_state
+            .removed_actors
+            .read_sync(actor, |_, tombstone| tombstone.kind)
+            .expect("the actor must still be tombstoned");
+        assert_eq!(
+            kind,
+            TombstoneKind::ExplicitUnregister,
+            "a later third-party peer-death report must not downgrade an already-established \
+             ExplicitUnregister classification"
+        );
+    }
+
     #[tokio::test]
     async fn test_merge_full_sync_ignores_stale_sequence() {
         let reg = GossipRegistry::<()>::new(test_addr(7005), test_config());
