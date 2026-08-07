@@ -850,16 +850,24 @@ struct PeerRegistryOwner {
     /// Latest accepted claim generation for each owned address. This is
     /// lifecycle fencing metadata, not part of the arbitration truth table.
     claim_generation: HashMap<SocketAddr, CommitSeq>,
-    /// When each owned address's claim was last committed or refreshed.
+    /// When each owned address last had DIRECT evidence of a live owner --
+    /// an outbound dial this node completed, or an authenticated inbound
+    /// session (refreshed only by `claim_connection_scoped`, carried
+    /// unchanged rather than refreshed by `migrate`, and never touched by
+    /// the plain `claim` command gossip/discovery claims also go through).
     /// This is the owner's OWN, self-contained notion of "how recently was
-    /// this address touched", independent of `GossipState`'s `failures`/
-    /// `last_failure_time` bookkeeping -- which a reconnect only updates
-    /// AFTER the owner has already committed the fresh claim that proves
-    /// the peer alive, and which lives behind a different lock entirely.
-    /// `release_dead_peer` checks this instead of trusting any liveness
-    /// snapshot a caller took from that other domain, so it can never be
-    /// fooled by a reconnect whose claim commit and whose `GossipState`
-    /// update straddle the caller's own observation in either order.
+    /// this address touched by something that actually proves liveness",
+    /// independent of `GossipState`'s `failures`/`last_failure_time`
+    /// bookkeeping -- which a reconnect only updates AFTER the owner has
+    /// already committed the fresh claim that proves the peer alive, and
+    /// which lives behind a different lock entirely. `release_dead_peer`
+    /// checks this instead of trusting any liveness snapshot a caller took
+    /// from that other domain, so it can never be fooled by a reconnect
+    /// whose claim commit and whose `GossipState` update straddle the
+    /// caller's own observation in either order -- and, because only direct
+    /// evidence refreshes it, it also cannot be kept perpetually "fresh" by
+    /// indirect chatter (repeated gossip/discovery claims, or DNS refresh
+    /// attempts) about a peer nothing has actually reconnected to.
     claim_committed_at: HashMap<SocketAddr, std::time::Instant>,
     /// Connection-scoped ownership receipts: which live authenticated
     /// sessions currently back a peer's claim on an address, and at what
@@ -1025,11 +1033,22 @@ impl PeerRegistryOwner {
                 // Every accepted refresh is a new lifecycle generation even
                 // when peer identity and claim kind are unchanged.
                 self.claim_generation.insert(addr, commit_seq);
-                // Every accepted claim -- including a same-identity refresh
-                // that changes nothing else -- proves this address had a
-                // live claimant just now. `release_dead_peer` checks this.
-                self.claim_committed_at
-                    .insert(addr, std::time::Instant::now());
+                // `claim_committed_at` is deliberately NOT touched here.
+                // This method also serves the gossip/discovery path (any
+                // caller of the plain, non-connection-scoped `claim`
+                // command) -- third-party address announcements this
+                // registry never directly verified, which can be repeated
+                // indefinitely (benign chatter or a deliberate replay)
+                // regardless of whether the claimed peer is actually
+                // reachable. Only `claim_connection_scoped` -- backed by an
+                // outbound dial this node completed or an authenticated
+                // inbound session -- is direct evidence the peer is alive
+                // right now, so only it refreshes this timestamp. Refreshing
+                // it here would let indirect chatter about an offline peer
+                // keep `release_dead_peer`'s freshness fence perpetually
+                // satisfied, answering "when did we last hear a claim
+                // mentioning this address" instead of "when did this
+                // address last have a directly-evidenced live owner".
                 // The lock-free snapshot is also the authoritative
                 // generation fence. Refresh it for every accepted command;
                 // route publication itself remains identity/kind-change only.
@@ -1075,6 +1094,19 @@ impl PeerRegistryOwner {
     ) -> ClaimCommit {
         let peer_id = claim.node_id.clone();
         let commit = self.claim(addr, claim, /* is_local_addr */ false);
+        if commit.is_accepted() {
+            // Unlike the plain `claim` command, every call into this method
+            // is backed by an actual connection -- an outbound dial this
+            // node completed, or an authenticated inbound session (see
+            // `GossipRegistry::add_connection_scoped_peer_claim`'s only two
+            // production callers). That is direct evidence the peer is
+            // alive right now, so this is the one place `claim_committed_at`
+            // is refreshed to "now" -- regardless of whether the address
+            // ends up pinned below, so a currently-connected pinned peer's
+            // address is never mistaken for one that has been untouched.
+            self.claim_committed_at
+                .insert(addr, std::time::Instant::now());
+        }
         // An operator-pinned address (`pin`, set only by `configure_peer`) is
         // a reservation that exists independently of any one connection: no
         // receipt is recorded for it, so nothing here can later mistake a
@@ -1381,9 +1413,19 @@ impl PeerRegistryOwner {
         let commit_seq = self.advance();
         self.claim_generation.remove(&from);
         self.claim_generation.insert(to, commit_seq);
-        self.claim_committed_at.remove(&from);
-        self.claim_committed_at
-            .insert(to, std::time::Instant::now());
+        // Carried over, never reset to "now": `migrate` is exclusively
+        // DNS-refresh-triggered in production (see `refresh_peer_dns`,
+        // itself run as part of a RETRY for a peer that is already
+        // failing), not direct evidence of a live connection. Resetting
+        // this here would let repeated DNS lookups for a peer that never
+        // actually reconnects keep `release_dead_peer`'s freshness fence
+        // perpetually satisfied, the same failure mode a gossip/discovery
+        // claim refreshing it would cause (see `claim`'s doc comment). If
+        // `from` never had direct evidence either, `to` correctly ends up
+        // with none.
+        if let Some(committed_at) = self.claim_committed_at.remove(&from) {
+            self.claim_committed_at.insert(to, committed_at);
+        }
         let snapshot = self.snapshot.load_full();
         let snapshot = snapshot
             .with_owner(from, None)

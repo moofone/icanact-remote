@@ -20369,6 +20369,178 @@ mod tests {
         );
     }
 
+    /// P2 regression: the freshness fence must measure "when did this
+    /// address last have DIRECT evidence of a live owner", not "when did we
+    /// last hear ANY claim mentioning it". `claim` also serves the
+    /// gossip/discovery path -- third-party address announcements this
+    /// registry never itself verified -- so if it refreshed
+    /// `claim_committed_at` too, repeated indirect claims about an
+    /// genuinely offline peer (benign re-gossip, or a deliberate replay)
+    /// could keep re-arming the fence forever and make the peer permanently
+    /// unreapable. Only a connection-scoped claim (an outbound dial this
+    /// node completed, or an authenticated inbound session) may count.
+    ///
+    /// (A bare `Provisional` claim cannot be the FIRST claim on an address
+    /// at all -- `arbitrate` rejects unverified evidence for an unowned
+    /// address outright -- so this establishes ownership with a genuine
+    /// connection-scoped claim first, exactly as a real "peer connected
+    /// once, then went offline" history would, before switching to
+    /// indirect, gossip-shaped refreshes of that SAME identity.)
+    #[tokio::test]
+    async fn cleanup_dead_peers_releases_ownership_despite_repeated_indirect_claims() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_070), config);
+        let peer_addr = test_addr(44_071);
+        let peer_id = test_peer_id("indirect-claims-do-not-refresh-freshness");
+        let session_source = test_addr(44_072);
+
+        // The peer's original, genuinely direct claim -- a connection that
+        // has since ended.
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        // Repeated indirect claims about this SAME, actually-offline peer,
+        // spaced out past `dead_peer_timeout` in aggregate -- benign
+        // re-gossip or a deliberate replay -- must not be able to keep
+        // re-arming the freshness fence forever.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let outcome = registry
+                .add_peer_with_node_id(
+                    peer_addr,
+                    Some(peer_id.to_node_id()),
+                    crate::addr_ownership::ClaimKind::Provisional,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        }
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            None,
+            "repeated indirect (gossip/discovery) claims about an offline peer must \
+             not keep its ownership artificially fresh forever"
+        );
+    }
+
+    /// Companion to `cleanup_dead_peers_releases_ownership_despite_repeated_indirect_claims`:
+    /// the same repetition, but with genuinely direct (connection-scoped)
+    /// claims -- e.g. refreshed on every accepted FullSync from a live
+    /// session -- must still keep the freshness fence satisfied.
+    #[tokio::test]
+    async fn cleanup_dead_peers_keeps_ownership_fresh_across_repeated_direct_claims() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_080), config);
+        let peer_addr = test_addr(44_081);
+        let peer_id = test_peer_id("direct-claims-keep-freshness");
+        let session_source = test_addr(44_082);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: true,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let (outcome, _) = registry
+                .add_connection_scoped_peer_claim(
+                    peer_addr,
+                    peer_id.to_node_id(),
+                    crate::addr_ownership::ClaimKind::Verified,
+                    session_source,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        }
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id),
+            "a genuinely live, repeatedly-refreshed connection-scoped claim must still \
+             prevent cleanup_dead_peers from reaping it"
+        );
+    }
+
     #[tokio::test]
     async fn reconfiguring_peer_releases_previous_configured_address() {
         let registry = GossipRegistry::<()>::new(test_addr(20_029), test_config());
