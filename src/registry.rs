@@ -4458,6 +4458,22 @@ impl<T: 'static> GossipRegistry<T> {
             .or_else(|| pool.get_configured_peer_addr(peer_id));
         match pool.get_connection_to_required_peer(peer_id).await {
             Ok(conn) => {
+                // `get_connection_to_required_peer` can resolve to an
+                // EXISTING connection rather than genuinely dialing out --
+                // including one published by an inbound accept. An
+                // inbound connection is exactly the case
+                // `transport_source_keyed` exists to describe, so scoping
+                // the clear to `conn.addr` alone is not sufficient: it
+                // must also be evidence of an actual outbound dial, not
+                // merely "this function happened to resolve a connection
+                // at this address."
+                let dialed_outbound = self
+                    .connection_pool
+                    .get_lock_free_connection(conn.addr)
+                    .is_some_and(|c| {
+                        c.direction == crate::connection_pool::ConnectionDirection::Outbound
+                    });
+
                 let mut recovered_addrs = Vec::with_capacity(2);
                 recovered_addrs.push(conn.addr);
                 if let Some(addr) = configured_addr
@@ -4472,16 +4488,14 @@ impl<T: 'static> GossipRegistry<T> {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
                         peer_info.outbound_dial_success = true;
-                        // We just independently proved `conn.addr` is
-                        // dialable -- nothing here corroborates
+                        // We only independently proved `conn.addr` is
+                        // dialable when the resolved connection is
+                        // genuinely outbound -- nothing here corroborates
                         // dialability for `configured_addr` too, when it
-                        // differs (the connection can resolve to an
-                        // address other than the one requested, e.g. an
-                        // inbound accept published under its own
-                        // address). Scope the clear to exactly the
-                        // address that was actually resolved to a live
-                        // connection (see PeerInfo::transport_source_keyed).
-                        if *peer_addr == conn.addr {
+                        // differs (see above), nor for an inbound
+                        // connection that merely happens to be published
+                        // at `conn.addr` (see PeerInfo::transport_source_keyed).
+                        if *peer_addr == conn.addr && dialed_outbound {
                             peer_info.transport_source_keyed = false;
                         }
                         peer_info.last_success = now;
@@ -4493,7 +4507,7 @@ impl<T: 'static> GossipRegistry<T> {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
                         peer_info.outbound_dial_success = true;
-                        if *peer_addr == conn.addr {
+                        if *peer_addr == conn.addr && dialed_outbound {
                             peer_info.transport_source_keyed = false;
                         }
                         peer_info.last_success = now;
@@ -12612,13 +12626,20 @@ mod tests {
     /// address that was dialed -- `connect_to_peer` can end up resolving a
     /// connection at a DIFFERENT address than the one it was asked to
     /// reach (e.g. a peer configured at one address whose live session was
-    /// actually published under a different address, such as an inbound
-    /// accept). Clearing `transport_source_keyed` for every address merely
-    /// associated with the peer would clear it on the strength of evidence
-    /// that says nothing about that other address's dialability -- exactly
-    /// the P1 principle already fixed for `add_peer_with_node_id_generation`.
+    /// actually published under a different address). Clearing
+    /// `transport_source_keyed` for every address merely associated with
+    /// the peer would clear it on the strength of evidence that says
+    /// nothing about that other address's dialability -- exactly the P1
+    /// principle already fixed for `add_peer_with_node_id_generation`.
+    ///
+    /// The published connection here is genuinely `ConnectionDirection::
+    /// Outbound` -- this test's whole point is to exercise the
+    /// `conn.addr`-scoped clear on real outbound-dial evidence, as
+    /// distinct from `inbound_connection_never_clears_transport_source_keyed`
+    /// below, which proves an inbound connection resolved by the same
+    /// function never clears anything.
     #[tokio::test]
-    async fn successful_dial_does_not_clear_transport_source_keyed_on_other_address() {
+    async fn successful_outbound_dial_does_not_clear_transport_source_keyed_on_other_address() {
         use crate::connection_pool::{
             BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
             LockFreeStreamHandle,
@@ -12644,10 +12665,10 @@ mod tests {
             state.peers.insert(live_addr, live_info);
         }
 
-        // An existing published connection for this peer ID, but at a
-        // DIFFERENT address than `configured_addr` -- e.g. an inbound
-        // accept published the live session under its own address rather
-        // than the operator-configured one.
+        // An existing published OUTBOUND connection for this peer ID, but
+        // at a DIFFERENT address than `configured_addr` -- e.g. the
+        // configured route changed after the dial already succeeded
+        // under the previous address.
         let (io, _peer_io) = tokio::io::duplex(1024);
         let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
             io,
@@ -12657,7 +12678,7 @@ mod tests {
             None,
             None,
         );
-        let mut conn = LockFreeConnection::new(live_addr, ConnectionDirection::Inbound);
+        let mut conn = LockFreeConnection::new(live_addr, ConnectionDirection::Outbound);
         conn.stream_handle = Some(Arc::new(stream_handle));
         conn.embedded_peer_id = Some(peer_id.clone());
         conn.set_state(ConnectionState::Connected);
@@ -12680,7 +12701,8 @@ mod tests {
                 .get(&live_addr)
                 .expect("peer must exist")
                 .transport_source_keyed,
-            "the address actually resolved to a live connection must have its flag cleared"
+            "the address actually resolved to a live OUTBOUND connection must have \
+             its flag cleared"
         );
         assert!(
             state
@@ -12690,6 +12712,74 @@ mod tests {
                 .transport_source_keyed,
             "an address merely associated with the peer, but not the one actually \
              dialed, must keep its flag"
+        );
+    }
+
+    /// The original bug reached by a shorter path: `connect_to_peer` can
+    /// resolve to an existing INBOUND connection (published under its own
+    /// address by an inbound accept, then later reused here because it is
+    /// already the peer's live session) rather than genuinely dialing out.
+    /// An inbound connection is exactly the case `transport_source_keyed`
+    /// exists to describe, so `connect_to_peer` must never clear it --
+    /// scoping the clear to `conn.addr` alone is not sufficient; the
+    /// connection's direction must also be checked.
+    #[tokio::test]
+    async fn inbound_connection_never_clears_transport_source_keyed() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(20_223), test_config());
+        let peer_id = test_peer_id("inbound-never-clears");
+        let addr = test_addr(20_224);
+
+        registry.configure_peer(peer_id.clone(), addr).await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&addr)
+                .expect("configure_peer must create an entry")
+                .transport_source_keyed = true;
+        }
+
+        // An existing published INBOUND connection for this peer ID, at
+        // the SAME address `connect_to_peer` will resolve to -- e.g. an
+        // inbound accept published under an address that happens to equal
+        // the configured one.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id.clone(), addr, conn.clone());
+
+        registry
+            .connect_to_peer(&peer_id)
+            .await
+            .expect("existing inbound connection must resolve without a real dial");
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            state
+                .peers
+                .get(&addr)
+                .expect("peer must exist")
+                .transport_source_keyed,
+            "connect_to_peer resolving an INBOUND connection must never clear \
+             transport_source_keyed, even for the exact address it resolved to"
         );
     }
 
