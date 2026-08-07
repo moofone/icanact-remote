@@ -288,6 +288,21 @@ pub enum TransportLifecycleEvent {
         peer: PeerId,
         addr: SocketAddr,
     },
+    /// Fired in `GossipRegistry::handle_peer_connection_failure` /
+    /// `handle_peer_connection_failure_by_peer_id`, immediately after a
+    /// confirmed connection's own pool teardown work has fully completed
+    /// (no `gossip_state` lock held across any of it) and immediately
+    /// BEFORE the discovery-state clear and session-authentication
+    /// invalidation that follow re-acquire `gossip_state`. Purely
+    /// instrumentation: lets tests deterministically pin a concurrent
+    /// replacement session — published and armed for the same peer — into
+    /// this exact gap, so `invalidate_session_state_on_teardown`'s epoch
+    /// fence a few lines below observably has to decline clearing a
+    /// session it does not own instead of clobbering the replacement's.
+    SocketFailurePoolTeardownComplete {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+    },
 }
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;

@@ -2126,27 +2126,28 @@ impl RemovedActorTombstone {
 /// capture `owner_node_id` ahead of any mutation that could remove the
 /// `known_actors` entry being classified.
 ///
-/// `owner_node_id` is the actor's current owner, if this node still has it
-/// in `known_actors`; `None` when the actor was never known here at all
-/// (e.g. its removal is gossiped in before its addition ever was).
-/// `removing_node_id` is the wire-claimed reporter of the removal.
+/// `owner_node_id` is the actor's CURRENTLY KNOWN owner; only call this when
+/// `known_actors` actually has an entry for the actor being removed. When it
+/// does not -- either because the actor was never known here at all, or
+/// because an earlier removal already deleted it -- there is no owner
+/// evidence to classify from, and the caller must decide the tombstone kind
+/// some other way rather than calling this (see the two very different call
+/// sites this distinction matters at in `apply_delta_from`).
 ///
+/// `removing_node_id` is the wire-claimed reporter of the removal.
 /// `removing_node_id == owner_node_id` means the actor's own owner reported
 /// its own removal -- a deliberate `unregister_actor` decision propagating
-/// through gossip -- classified `ExplicitUnregister`. A DIFFERENT reporter
-/// is a third party (an observer reaping a peer it believes is dead)
-/// classified `PeerDeath`. When the owner is entirely unknown there is no
-/// basis to conclude this was a deliberate owner action either way, so it
-/// is conservatively classified `ExplicitUnregister` -- the choice that is
-/// NEVER later bypassed by a restart exemption.
+/// through gossip -- classified `ExplicitUnregister`. A DIFFERENT reporter is
+/// a third party (an observer reaping a peer it believes is dead) classified
+/// `PeerDeath`.
 fn tombstone_kind_for_removal(
-    owner_node_id: Option<crate::GossipNodeId>,
+    owner_node_id: crate::GossipNodeId,
     removing_node_id: crate::GossipNodeId,
 ) -> TombstoneKind {
-    match owner_node_id {
-        Some(owner) if owner == removing_node_id => TombstoneKind::ExplicitUnregister,
-        Some(_) => TombstoneKind::PeerDeath,
-        None => TombstoneKind::ExplicitUnregister,
+    if owner_node_id == removing_node_id {
+        TombstoneKind::ExplicitUnregister
+    } else {
+        TombstoneKind::PeerDeath
     }
 }
 
@@ -7406,32 +7407,51 @@ impl<T: 'static> GossipRegistry<T> {
                         priority,
                     } => {
                         // Captured BEFORE `current_actor_removal_plan` (which
-                        // may `remove_sync` the entry): whether the removal
-                        // is the actor's OWN owner reporting its own
-                        // deliberate removal (`removing_node_id` matches the
-                        // owner) or a third party/observer reaping it on the
-                        // owner's behalf. See `TombstoneKind`.
-                        let this_removal_kind = tombstone_kind_for_removal(
-                            self.actor_state
-                                .known_actors
-                                .read_sync(name.as_str(), |_, loc| loc.node_id),
-                            removing_node_id,
-                        );
+                        // may `remove_sync` the entry): the actor's current
+                        // owner, if this node still has it in `known_actors`
+                        // at all. See `TombstoneKind` / `tombstone_kind_for_removal`.
+                        let owner_node_id = self
+                            .actor_state
+                            .known_actors
+                            .read_sync(name.as_str(), |_, loc| loc.node_id);
                         // Also captured BEFORE any upsert below overwrites
                         // it: an existing tombstone this message's removal is
                         // concurrent with (see `current_actor_removal_plan`'s
                         // `Concurrent` branch, which merges the vector clock
-                        // but not the kind) must not have its
-                        // `ExplicitUnregister` classification silently
-                        // downgraded back to `PeerDeath` just because a
-                        // later, concurrently-merged report happens to
-                        // classify as peer-death from ITS OWN sender's
-                        // perspective.
+                        // but not the kind) must not have its classification
+                        // silently changed just because a later,
+                        // concurrently-merged report happens to classify
+                        // differently from ITS OWN sender's perspective.
                         let existing_kind = self
                             .actor_state
                             .removed_actors
                             .read_sync(name.as_str(), |_, tombstone| tombstone.kind);
-                        let kind = merge_tombstone_kind(existing_kind, this_removal_kind);
+                        // `owner_node_id` is `None` in two very different
+                        // situations that must not be conflated: the actor
+                        // was never known here at all (no tombstone exists
+                        // either, so there is nothing to protect --
+                        // `tombstone_kind_for_removal` conservatively
+                        // classifies a first-ever report `ExplicitUnregister`,
+                        // never later bypassed by a restart exemption), OR
+                        // the actor WAS known and an EARLIER removal already
+                        // deleted it (a tombstone already exists). The second
+                        // case carries no owner evidence of its own -- it
+                        // reflects only that this node's own prior processing
+                        // already removed the entry -- and must not be
+                        // allowed to upgrade whatever kind that earlier,
+                        // better-informed removal established (e.g. a
+                        // multi-observer `PeerDeath` reap, where a second
+                        // observer's removal for the same actor arrives after
+                        // the first has already deleted it). Preserve the
+                        // existing tombstone's kind unchanged in that case
+                        // instead.
+                        let kind = match owner_node_id {
+                            Some(owner) => merge_tombstone_kind(
+                                existing_kind,
+                                tombstone_kind_for_removal(owner, removing_node_id),
+                            ),
+                            None => existing_kind.unwrap_or(TombstoneKind::ExplicitUnregister),
+                        };
 
                         let Some((removal_clock, tombstone_only)) = self
                             .current_actor_removal_plan(
@@ -10887,6 +10907,23 @@ impl<T: 'static> GossipRegistry<T> {
             "socket disconnection detected, marking connection as failed (actors remain available)"
         );
 
+        // Captured as early as possible -- before ANY of this handler's pool
+        // teardown work below runs, none of which holds `gossip_state` --
+        // so it reflects this failed connection's own session epoch, not
+        // one a replacement could already have redrawn by the time this
+        // function gets around to invalidating it. See
+        // `invalidate_session_state_on_teardown`'s fence for the full
+        // rationale; `0` (the "never armed" sentinel) if this peer has no
+        // tracked session at all yet.
+        let pre_teardown_session_epoch = {
+            let gossip_state = self.gossip_state.lock().await;
+            gossip_state
+                .peers
+                .get(&failed_peer_addr)
+                .map(|peer_info| peer_info.current_session_epoch)
+                .unwrap_or(0)
+        };
+
         // Address-vs-identity guard. The failure is reported for one specific
         // socket (`observed_peer_addr`). If the peer's current published session
         // is a DIFFERENT connection instance than the one that failed, the
@@ -11124,6 +11161,17 @@ impl<T: 'static> GossipRegistry<T> {
         // replacement connection can already be live by the time this runs
         // (the teardown work above holds no `gossip_state` lock), and the
         // direct check sees it and declines instead of wiping it out.
+        //
+        // Instrumentation seam for tests: fires here, after the teardown
+        // work above but before either of the two calls below re-acquire
+        // `gossip_state`, so a test can deterministically publish AND arm a
+        // replacement session into this exact gap.
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SocketFailurePoolTeardownComplete {
+                peer: peer_id.clone(),
+                addr: failed_peer_addr,
+            },
+        );
         self.clear_discovery_state_if_no_live_connection(failed_peer_addr)
             .await;
 
@@ -11133,8 +11181,11 @@ impl<T: 'static> GossipRegistry<T> {
         // `session_source`/`session_restart_confirmed` left over from the
         // now-dead session could still be honored as "current" by a later
         // message that merely presents the dead connection's own
-        // (by-then-meaningless) session source.
-        self.invalidate_session_state_on_teardown(failed_peer_addr)
+        // (by-then-meaningless) session source. Fenced by
+        // `pre_teardown_session_epoch`, captured before this function did
+        // any teardown work at all, so a replacement session armed in the
+        // gap above is never the one this clears.
+        self.invalidate_session_state_on_teardown(failed_peer_addr, pre_teardown_session_epoch)
             .await;
 
         if let Some(cell) = self.peer_disconnect_handler.load_full() {
@@ -11291,6 +11342,18 @@ impl<T: 'static> GossipRegistry<T> {
 
         let current_time = current_timestamp();
 
+        // Same fencing rationale as `handle_peer_connection_failure`'s own
+        // capture: as early as possible, before any of this function's pool
+        // teardown work below runs.
+        let pre_teardown_session_epoch = {
+            let gossip_state = self.gossip_state.lock().await;
+            gossip_state
+                .peers
+                .get(&failed_peer_addr)
+                .map(|peer_info| peer_info.current_session_epoch)
+                .unwrap_or(0)
+        };
+
         // IMMEDIATELY remove the connection from pool
         // Use disconnect_connection_by_peer_id to clean up ALL address aliases
         // (ephemeral port + bind address mappings created during reindex)
@@ -11324,14 +11387,21 @@ impl<T: 'static> GossipRegistry<T> {
         // doc for the full rationale. Both paths tear down a peer's pool
         // connection and mark it failed; both must reclaim the
         // peer-discovery slot the same way.
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SocketFailurePoolTeardownComplete {
+                peer: Some(failed_peer_id.clone()),
+                addr: failed_peer_addr,
+            },
+        );
         self.clear_discovery_state_if_no_live_connection(failed_peer_addr)
             .await;
 
         // Same session-authentication invalidation as
         // `handle_peer_connection_failure`'s address-keyed path -- see its
         // matching call for the full rationale. This path always represents
-        // a confirmed, peer-wide teardown.
-        self.invalidate_session_state_on_teardown(failed_peer_addr)
+        // a confirmed, peer-wide teardown, fenced the same way by
+        // `pre_teardown_session_epoch`.
+        self.invalidate_session_state_on_teardown(failed_peer_addr, pre_teardown_session_epoch)
             .await;
 
         if let Some(cell) = self.peer_disconnect_handler.load_full() {
@@ -13049,9 +13119,36 @@ impl<T: 'static> GossipRegistry<T> {
     /// session, not an already-superseded one) -- invalidating on an
     /// unconfirmed/superseded report would incorrectly clear a still-live
     /// successor's own, unrelated session state.
-    async fn invalidate_session_state_on_teardown(&self, addr: SocketAddr) {
+    ///
+    /// Confirming that the ORIGINAL teardown happened is not by itself
+    /// enough, though: the caller's own teardown work (removing the failed
+    /// connection from `connection_pool`) runs without holding
+    /// `gossip_state`, and a replacement connection for this same address
+    /// can be published AND arm its own new session in the gap between that
+    /// teardown finishing and this function's lock acquisition above --
+    /// `clear_discovery_state_if_no_live_connection` already anticipates
+    /// exactly this race for discovery state. `expected_epoch` closes the
+    /// same gap here: it is `PeerInfo::current_session_epoch` as the caller
+    /// observed it BEFORE doing any teardown work at all (see
+    /// `handle_peer_connection_failure`'s `pre_teardown_session_epoch`), the
+    /// same capture-then-recheck-under-lock pattern
+    /// `session_epoch_still_current` uses for pending mutations elsewhere.
+    /// If a replacement has since armed, `current_session_epoch` has moved
+    /// on and no longer matches -- this declines entirely rather than
+    /// clearing the replacement's own, unrelated session state.
+    async fn invalidate_session_state_on_teardown(&self, addr: SocketAddr, expected_epoch: u64) {
         let mut gossip_state = self.gossip_state.lock().await;
         if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+            if peer_info.current_session_epoch != expected_epoch {
+                debug!(
+                    addr = %addr,
+                    expected_epoch,
+                    current_epoch = peer_info.current_session_epoch,
+                    "declining to invalidate session state on teardown; a replacement session \
+                     has already been armed for this peer since the teardown began"
+                );
+                return;
+            }
             peer_info.current_session_source = None;
             peer_info.current_session_connection = None;
             peer_info.accept_lower_sequence_from = None;
@@ -24294,6 +24391,151 @@ mod tests {
         assert!(peer_info.accept_lower_sequence_from.is_none());
     }
 
+    /// RED (review finding, teardown-vs-replacement race): a replacement
+    /// connection can be published AND arm its own new session for the same
+    /// peer address in the gap between the failed connection's own pool
+    /// teardown completing and `invalidate_session_state_on_teardown`
+    /// re-acquiring `gossip_state` -- the discovery-state clear right above
+    /// it already accounts for exactly this gap (see
+    /// `clear_discovery_state_if_no_live_connection`'s own doc). Without
+    /// fencing on the failed connection's own session identity, the
+    /// teardown handler unconditionally clears whatever session is CURRENT
+    /// at that later moment -- which, in this race, is the replacement's --
+    /// wiping out its `current_session_source` /
+    /// `accept_lower_sequence_from` / epoch even though the replacement's
+    /// own session was never itself torn down.
+    ///
+    /// Pinned deterministically via the `SocketFailurePoolTeardownComplete`
+    /// lifecycle hook, which fires immediately after the failed
+    /// connection's pool teardown completes and immediately before the
+    /// discovery-clear/session-invalidate calls that follow (the same
+    /// technique `SocketFailureMatchedInstanceTeardownAttempt` uses
+    /// elsewhere in this file): the replacement session is published and
+    /// armed from inside that hook, landing it squarely in the gap this fix
+    /// closes, on every run.
+    #[tokio::test]
+    async fn handle_peer_connection_failure_teardown_race_preserves_replacement_session() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let reg = GossipRegistry::<()>::new(
+            test_addr(9430),
+            test_config_with_seed("teardown-race-preserves-replacement"),
+        );
+        let peer_id = test_peer_id("teardown-race-replacement-peer");
+        let owner_node = peer_id.to_node_id();
+        let addr = test_addr(9431);
+        let pool = reg.connection_pool.clone();
+
+        reg.add_peer_with_node_id(addr, Some(owner_node), crate::addr_ownership::ClaimKind::Verified)
+            .await;
+
+        // The OLD (about to fail) connection: published and armed as the
+        // genuinely current session before the failure.
+        let conn_old = publish_connected_instance(&reg, &peer_id, addr).await;
+        let old_instance_id = conn_old
+            .stream_handle
+            .as_ref()
+            .map(|h| h.instance_id())
+            .expect("conn_old must have a stream handle");
+        let old_source = test_addr(55701);
+        reg.arm_sequence_reset_for_new_session(addr, owner_node, old_source, &peer_id, &conn_old)
+            .await;
+        {
+            let state = reg.gossip_state.lock().await;
+            let peer_info = state.peers.get(&addr).unwrap();
+            assert!(
+                peer_info.current_session_source.is_some(),
+                "test precondition: the old connection's session must be armed before the race"
+            );
+        }
+
+        // The REPLACEMENT session, built ahead of time but published and
+        // armed only from inside the hook below, at the exact moment the
+        // race requires it to land.
+        let new_source = test_addr(55702);
+        let (io_new, _p_new) = tokio::io::duplex(1024);
+        let (sh_new, _w_new, _r_new) = LockFreeStreamHandle::new(
+            io_new,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn_new = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        conn_new.stream_handle = Some(Arc::new(sh_new));
+        conn_new.embedded_peer_id = Some(peer_id.clone());
+        conn_new.set_state(ConnectionState::Connected);
+        let conn_new = Arc::new(conn_new);
+
+        let gossip_state = reg.gossip_state.clone();
+        let _guard = {
+            let pool = pool.clone();
+            let peer_id = peer_id.clone();
+            let conn_new = conn_new.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::SocketFailurePoolTeardownComplete {
+                    addr: event_addr,
+                    ..
+                } = &event
+                    && *event_addr == addr
+                {
+                    // Deregister first -- `add_connection_by_peer_id` below
+                    // fires its own (non-matching) `SessionPublished` event
+                    // through this same global hook, and this avoids any
+                    // reentrant/recursive invocation of this closure.
+                    crate::set_transport_lifecycle_recorder(None);
+                    // Models a real concurrently-published, concurrently-armed
+                    // replacement session: publishes into the pool AND arms
+                    // the new session's discriminators directly, exactly like
+                    // `arm_sequence_reset_for_new_session` would (that method
+                    // itself cannot be called from here -- it is async, and
+                    // this hook is a plain synchronous callback).
+                    assert!(pool.add_connection_by_peer_id(
+                        peer_id.clone(),
+                        addr,
+                        conn_new.clone()
+                    ));
+                    let mut state = gossip_state
+                        .try_lock()
+                        .expect("gossip_state must be free at the teardown-completion seam");
+                    let peer_info = state
+                        .peers
+                        .get_mut(&addr)
+                        .expect("peer must still be tracked");
+                    peer_info.current_session_source = Some(new_source);
+                    peer_info.current_session_connection =
+                        Some(std::sync::Arc::downgrade(&conn_new));
+                    peer_info.accept_lower_sequence_from = Some(new_source);
+                    peer_info.current_session_epoch = next_session_epoch();
+                }
+            }))
+        };
+
+        reg.handle_peer_connection_failure(addr, Some(old_instance_id))
+            .await
+            .unwrap();
+
+        let state = reg.gossip_state.lock().await;
+        let peer_info = state.peers.get(&addr).unwrap();
+        assert_eq!(
+            peer_info.current_session_source,
+            Some(new_source),
+            "the replacement session armed inside the teardown-completion race must survive: \
+             a confirmed teardown of the OLD connection must never clear a DIFFERENT, \
+             already-live replacement session's own discriminator (got {:?})",
+            peer_info.current_session_source
+        );
+        assert!(
+            peer_info.accept_lower_sequence_from.is_some(),
+            "the replacement's one-shot lower-sequence exemption must survive the old \
+             connection's teardown too"
+        );
+    }
+
     /// `merge_tombstone_kind` must keep `ExplicitUnregister` dominant over
     /// `PeerDeath` in every combination: once any report has established a
     /// removal was the owner's own deliberate decision, a later,
@@ -24390,6 +24632,118 @@ mod tests {
             TombstoneKind::ExplicitUnregister,
             "a later third-party peer-death report must not downgrade an already-established \
              ExplicitUnregister classification"
+        );
+    }
+
+    /// RED (review finding, multi-observer removal downgrade): an ordinary
+    /// multi-observer failure pattern, not a race -- two different
+    /// observers each independently report the same dead owner's actor as
+    /// removed. The FIRST removal (observer A, reporter != owner) correctly
+    /// classifies `PeerDeath` and deletes the `known_actors` entry. The
+    /// SECOND removal (observer B, a causally later report for the SAME
+    /// actor) then arrives with `known_actors` already empty -- no current
+    /// owner to compare `removing_node_id` against. Classifying that alone
+    /// as `ExplicitUnregister` and merging it against the existing
+    /// `PeerDeath` tombstone upgrades the tombstone, and an upgraded
+    /// tombstone can no longer be bypassed by authenticated restart
+    /// recovery -- stranding a genuinely restarted owner's actor absent
+    /// even though nobody ever explicitly unregistered it.
+    #[tokio::test]
+    async fn apply_delta_removal_does_not_upgrade_peer_death_tombstone_after_actor_already_gone()
+     {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7915),
+            test_config_with_seed("tombstone-kind-multi-observer"),
+        );
+        let actor = "actor.removal.multi-observer";
+        let owner = test_peer_id("tombstone-kind-multi-observer-owner");
+        let owner_node = owner.to_node_id();
+        let observer_a_node = test_peer_id("tombstone-kind-multi-observer-a").to_node_id();
+        let observer_b_node = test_peer_id("tombstone-kind-multi-observer-b").to_node_id();
+
+        // The actor is currently known, owned by `owner`.
+        let known_loc = RemoteActorLocation::new_with_peer(test_addr(9925), owner.clone());
+        known_loc.vector_clock.increment(owner_node);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync(actor.to_string(), known_loc);
+
+        // Observer A infers the owner is dead and reports the removal on
+        // its behalf -- reporter != owner, so this classifies `PeerDeath`
+        // and genuinely deletes the `known_actors` entry.
+        let removal_clock_a = crate::VectorClock::new();
+        removal_clock_a.increment(owner_node);
+        removal_clock_a.increment(owner_node);
+        removal_clock_a.increment(observer_a_node);
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: removal_clock_a.clone(),
+                removing_node_id: observer_a_node,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: test_peer_id("tombstone-kind-multi-observer-relay-a"),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "test precondition: observer A's removal must have deleted the actor"
+        );
+        let kind_after_first = reg
+            .actor_state
+            .removed_actors
+            .read_sync(actor, |_, tombstone| tombstone.kind)
+            .expect("observer A's removal must record a tombstone");
+        assert_eq!(
+            kind_after_first,
+            TombstoneKind::PeerDeath,
+            "test precondition: the first removal must classify as PeerDeath"
+        );
+
+        // Observer B, unaware the entry is already gone, independently
+        // reports the SAME actor's removal from its OWN observation -- an
+        // ordinary multi-observer duplicate, with a clock that causally
+        // dominates observer A's.
+        let removal_clock_b = crate::VectorClock::new();
+        removal_clock_b.merge(&removal_clock_a);
+        removal_clock_b.increment(observer_b_node);
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 1,
+            current_sequence: 2,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: removal_clock_b,
+                removing_node_id: observer_b_node,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: test_peer_id("tombstone-kind-multi-observer-relay-b"),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let kind = reg
+            .actor_state
+            .removed_actors
+            .read_sync(actor, |_, tombstone| tombstone.kind)
+            .expect("the actor must still be tombstoned");
+        assert_eq!(
+            kind,
+            TombstoneKind::PeerDeath,
+            "a second observer's removal for an actor already deleted by an earlier \
+             peer-death reap must not upgrade the tombstone to ExplicitUnregister -- doing so \
+             blocks authenticated restart recovery for an owner that never explicitly \
+             unregistered anything"
         );
     }
 
