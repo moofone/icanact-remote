@@ -1847,6 +1847,25 @@ impl Drop for DiscoveryTaskTracker {
     }
 }
 
+/// Which owner command `add_peer_with_node_id_generation_inner` submits a
+/// claim through. The three production paths need different atomicity: a
+/// plain claim decides ownership alone; a connection-scoped claim also
+/// commits its session receipt in the same owner step; an operator
+/// configuration also commits its pin (and any evicted pin's release) in
+/// the same owner step. See `PeerRegistryOwner::{claim, claim_connection_scoped,
+/// configure_peer}`.
+enum ClaimSubmission {
+    /// Gossip/discovery-derived claims: no receipt, no pin.
+    Plain,
+    /// An outbound dial this node completed, or an authenticated inbound
+    /// session: commits the session's connection-scoped receipt atomically
+    /// with the ownership decision.
+    ConnectionScoped(SocketAddr),
+    /// `GossipRegistry::configure_peer`: commits the operator pin (and any
+    /// evicted pin's release) atomically with the ownership decision.
+    OperatorConfigured,
+}
+
 impl<T: 'static> GossipRegistry<T> {
     /// The address this node should advertise to peers for anything it
     /// hosts (gossip `sender_addr`, peer-list snapshots, routed-pubsub
@@ -3312,13 +3331,15 @@ impl<T: 'static> GossipRegistry<T> {
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
     ) {
-        self.add_peer_with_node_id_generation_inner(
-            peer_addr,
-            Some(node_id),
-            claim_kind,
-            Some(session_source),
-        )
-        .await
+        let (outcome, receipt, _evicted_release) = self
+            .add_peer_with_node_id_generation_inner(
+                peer_addr,
+                Some(node_id),
+                claim_kind,
+                ClaimSubmission::ConnectionScoped(session_source),
+            )
+            .await;
+        (outcome, receipt)
     }
 
     /// Release all owner claims attributed to one physical session.
@@ -3419,26 +3440,68 @@ impl<T: 'static> GossipRegistry<T> {
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
     ) {
-        self.add_peer_with_node_id_generation_inner(peer_addr, node_id, claim_kind, None)
-            .await
+        let (outcome, receipt, _evicted_release) = self
+            .add_peer_with_node_id_generation_inner(
+                peer_addr,
+                node_id,
+                claim_kind,
+                ClaimSubmission::Plain,
+            )
+            .await;
+        (outcome, receipt)
+    }
+
+    /// Claim `peer_addr` for `node_id` with `ClaimKind::Verified`, and
+    /// install it as the operator's pin for this peer in the SAME
+    /// serialized owner step -- see `PeerRegistryOwner::configure_peer`.
+    /// The sole caller is `configure_peer`.
+    ///
+    /// The third element of the returned tuple is the evicted pin's release
+    /// info (address, release commit position), if installing the new pin
+    /// evicted a DIFFERENT address this same peer was previously pinned at
+    /// AND that eviction also released its ownership in this same atomic
+    /// step (i.e. this peer still genuinely held it). `None` when nothing
+    /// was evicted, or the claim itself was rejected.
+    async fn add_operator_configured_peer_claim(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: crate::GossipNodeId,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        Option<(SocketAddr, crate::registry_owner::CommitSeq)>,
+    ) {
+        let (outcome, _receipt, evicted_release) = self
+            .add_peer_with_node_id_generation_inner(
+                peer_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+                ClaimSubmission::OperatorConfigured,
+            )
+            .await;
+        (outcome, evicted_release)
     }
 
     /// Shared implementation behind `add_peer_with_node_id_generation` (no
-    /// receipt bookkeeping -- gossip/discovery-derived and
-    /// operator-configured routes are not tied to any one physical
-    /// connection) and `add_connection_scoped_peer_claim`
-    /// (`connection_scoped_session = Some(session_source)`, which routes the
-    /// claim through the owner's connection-scoped command so the receipt
-    /// transfer/insert commits atomically with the ownership decision).
+    /// receipt bookkeeping -- gossip/discovery-derived routes are not tied
+    /// to any one physical connection), `add_connection_scoped_peer_claim`
+    /// (`ClaimSubmission::ConnectionScoped`, which routes the claim through
+    /// the owner's connection-scoped command so the receipt transfer/insert
+    /// commits atomically with the ownership decision), and
+    /// `add_operator_configured_peer_claim`
+    /// (`ClaimSubmission::OperatorConfigured`, which routes the claim
+    /// through the owner's atomic configure_peer command so the operator
+    /// pin, and any evicted pin's release, commit atomically with the
+    /// ownership decision).
     async fn add_peer_with_node_id_generation_inner(
         &self,
         peer_addr: SocketAddr,
         node_id: Option<crate::GossipNodeId>,
         claim_kind: crate::addr_ownership::ClaimKind,
-        connection_scoped_session: Option<SocketAddr>,
+        claim_submission: ClaimSubmission,
     ) -> (
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
+        Option<(SocketAddr, crate::registry_owner::CommitSeq)>,
     ) {
         use crate::addr_ownership::AddrClaimOutcome;
 
@@ -3448,7 +3511,7 @@ impl<T: 'static> GossipRegistry<T> {
                 peer = %peer_addr,
                 "refusing to add peer with unspecified address or zero port"
             );
-            return (AddrClaimOutcome::Rejected, None);
+            return (AddrClaimOutcome::Rejected, None, None);
         }
         // Identity self-filter (authoritative — address alone is not
         // sufficient when advertise_address != bind_addr; see
@@ -3458,14 +3521,14 @@ impl<T: 'static> GossipRegistry<T> {
                 peer = %peer_addr,
                 "refusing to add self as peer (node_id identifies this node)"
             );
-            return (AddrClaimOutcome::Rejected, None);
+            return (AddrClaimOutcome::Rejected, None, None);
         }
         // Both the raw bind address and the (possibly different, e.g. NAT/
         // Kubernetes) advertised address identify this node; a remote claim
         // on either must be refused.
         if peer_addr == self.bind_addr || peer_addr == self.advertised_addr() {
             info!(peer = %peer_addr, "not adding peer - same as self");
-            return (AddrClaimOutcome::Rejected, None);
+            return (AddrClaimOutcome::Rejected, None, None);
         }
 
         // Effective verification kind to persist on this address's PeerInfo
@@ -3489,6 +3552,15 @@ impl<T: 'static> GossipRegistry<T> {
         // commit AND be projected in the meantime; the position is what lets
         // this call detect that and stand down.
         let mut projected_claim: Option<crate::registry_owner::ClaimReceipt> = None;
+        // Set only by `ClaimSubmission::OperatorConfigured`: the evicted
+        // pin's release info from this same atomic `configure_peer`
+        // transaction, if installing the new pin evicted a different
+        // address this peer still genuinely owned. Carried through to every
+        // return point below regardless of how the REST of this call's
+        // gossip_state projection resolves -- the owner-side transaction it
+        // reports on already fully committed, atomically, before this call
+        // ever reached this point.
+        let mut evicted_release: Option<(SocketAddr, crate::registry_owner::CommitSeq)> = None;
         if let Some(claimed_node_id) = node_id {
             // Decide and publish through the single-owner actor, and do it
             // BEFORE taking the `gossip_state` guard below. The decision, the
@@ -3503,16 +3575,26 @@ impl<T: 'static> GossipRegistry<T> {
                 node_id: claimed_node_id.to_peer_id(),
                 kind: claim_kind,
             };
-            let commit = match connection_scoped_session {
-                Some(session_source) => {
+            let commit = match claim_submission {
+                ClaimSubmission::ConnectionScoped(session_source) => {
                     self.registry_owner
                         .claim_connection_scoped(peer_addr, claim, session_source)
                         .await
                 }
-                None => {
+                ClaimSubmission::Plain => {
                     self.registry_owner
                         .claim(peer_addr, claim, /* is_local_addr */ false)
                         .await
+                }
+                ClaimSubmission::OperatorConfigured => {
+                    let configured = self
+                        .registry_owner
+                        .configure_peer(peer_addr, claimed_node_id.to_peer_id())
+                        .await;
+                    evicted_release = configured
+                        .evicted_pin()
+                        .zip(configured.evicted_release_seq());
+                    configured.claim().clone()
                 }
             };
             let receipt = commit.receipt();
@@ -3525,7 +3607,7 @@ impl<T: 'static> GossipRegistry<T> {
                     claimant = %claimed_node_id.fmt_short(),
                     "rejecting address claim: ownership conflict"
                 );
-                return (AddrClaimOutcome::Rejected, None);
+                return (AddrClaimOutcome::Rejected, None, None);
             };
             owner_changed = displaced.is_some();
             displaced_owner = displaced;
@@ -3565,10 +3647,14 @@ impl<T: 'static> GossipRegistry<T> {
             // conflict. Its state already won the watermark race, so this
             // call must stand down without replaying anything but still tell
             // connection/configuration callers that their claim is valid.
+            // `evicted_release` is still reported regardless: it reflects
+            // THIS call's own atomic `configure_peer` transaction, which
+            // already fully committed inside the owner before this
+            // gossip_state projection was ever attempted.
             return if authoritative_owner_unchanged {
-                (AddrClaimOutcome::Accepted, projected_claim)
+                (AddrClaimOutcome::Accepted, projected_claim, evicted_release)
             } else {
-                (AddrClaimOutcome::Rejected, projected_claim)
+                (AddrClaimOutcome::Rejected, projected_claim, evicted_release)
             };
         }
 
@@ -3806,7 +3892,7 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        (AddrClaimOutcome::Accepted, projected_claim)
+        (AddrClaimOutcome::Accepted, projected_claim, evicted_release)
     }
 
     /// Best-effort release of an address `peer_id` no longer occupies once
@@ -3858,16 +3944,21 @@ impl<T: 'static> GossipRegistry<T> {
     /// Configure a peer by peer ID and its expected connection address
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
         let previous_addr = self.connection_pool.get_required_peer_addr(&peer_id);
-        // Operator configuration is verified ownership evidence. Reserve the
-        // address in the single-owner authority before publishing the required
-        // dial route, so an offline configured peer cannot be displaced by a
-        // provisional remote self-report.
-        let outcome = self
-            .add_peer_with_node_id(
-                connect_addr,
-                Some(peer_id.to_node_id()),
-                crate::addr_ownership::ClaimKind::Verified,
-            )
+        // Operator configuration is verified ownership evidence: claim
+        // `connect_addr` and install it as this peer's operator pin --
+        // evicting whatever address this SAME peer was pinned at
+        // beforehand and, in that SAME atomic owner step, releasing that
+        // evicted address's ownership if this peer still held it. See
+        // `PeerRegistryOwner::configure_peer`.
+        //
+        // Claiming and pinning as ONE serialized owner transaction, rather
+        // than as two separately-ordered commands, is what closes the
+        // window a concurrent `configure_peer`/claim/migrate could
+        // otherwise land in between them: nothing can ever observe (or
+        // act on) a pin with no matching claim behind it, or an eviction
+        // whose ownership release has not landed yet.
+        let (outcome, evicted_release) = self
+            .add_operator_configured_peer_claim(connect_addr, peer_id.to_node_id())
             .await;
         if outcome == crate::addr_ownership::AddrClaimOutcome::Rejected {
             warn!(
@@ -3877,41 +3968,22 @@ impl<T: 'static> GossipRegistry<T> {
             );
             return;
         }
+        if let Some((evicted_addr, release_seq)) = evicted_release {
+            let mut state = self.gossip_state.lock().await;
+            state.tombstone_ownership_projection(evicted_addr, release_seq);
+        }
 
-        // Operator configuration is a reservation independent of any
-        // connection: pin it so a connection-scoped claim/release for this
-        // exact peer+address (this peer dialing in or being dialed) never
-        // records or retracts it as if it were merely session-scoped.
-        //
-        // Installed BEFORE the release below, and via the owner's own
-        // peer -> address reverse map rather than `previous_addr` (read
-        // above, before the `.await`s this function has already made, and
-        // therefore possibly stale under a concurrent `configure_peer` or
-        // `migrate` for the same peer): whichever address `pin` reports as
-        // evicted is the owner's OWN authoritative answer to "where was
-        // this peer actually pinned a moment ago", not this caller's
-        // possibly-outdated belief. Two concurrent `configure_peer` calls
-        // for the same peer can therefore no longer each install a pin for
-        // a different address and leak the loser forever -- see `pin`'s doc
-        // comment for why the reverse map makes this atomic regardless of
-        // which order the owner task serializes the two commands in.
-        //
-        // `pin` ALSO publishes `connect_addr` as this peer's
-        // `ConnectionPool`-configured route, in that SAME owner command
-        // (`RoutingPublisher::set_configured_peer_addr`), so this call sets
-        // NEITHER of `pin`'s two effects -- the owner's pin and
-        // `ConnectionPool`'s required/configured address -- through a
-        // separate, independently-ordered write afterward. Two concurrent
-        // `configure_peer` calls therefore cannot have the owner decide one
-        // winner while `ConnectionPool` ends up reporting the other.
-        let evicted_pin = self.registry_owner.pin(connect_addr, peer_id.clone()).await;
-
-        let mut stale_addrs: Vec<SocketAddr> =
-            previous_addr.into_iter().chain(evicted_pin).collect();
-        stale_addrs.retain(|addr| *addr != connect_addr);
-        stale_addrs.dedup();
-        for stale_addr in stale_addrs {
-            self.release_configure_peer_stale_address(&peer_id, stale_addr)
+        // `previous_addr` is `ConnectionPool`'s OWN belief about this
+        // peer's prior configured route, read before any of the above --
+        // possibly stale under a concurrent `configure_peer`/`migrate` for
+        // the same peer, and possibly already covered by `evicted_release`
+        // above. Best-effort legacy cleanup only; the owner's own atomic
+        // transaction above is what actually guarantees consistency.
+        if let Some(previous_addr) = previous_addr
+            && previous_addr != connect_addr
+            && Some(previous_addr) != evicted_release.map(|(addr, _)| addr)
+        {
+            self.release_configure_peer_stale_address(&peer_id, previous_addr)
                 .await;
         }
 
