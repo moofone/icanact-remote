@@ -126,6 +126,35 @@ impl crate::registry::ActorMessageHandlerSync for TestActorCounter {
     }
 }
 
+/// Counts every dispatched invocation for (`TEST_TELL_ACTOR_ID`,
+/// `TEST_TELL_HASH`), tell or ask, and additionally echoes the payload back
+/// for asks (correlation id present). Used where a test needs to observe
+/// "the handler ran" for a message regardless of whether it arrived as a
+/// streamed ask or a plain tell.
+struct EchoAskCountAll {
+    delivered: Arc<AtomicU64>,
+}
+
+impl crate::registry::ActorMessageHandlerSync for EchoAskCountAll {
+    fn handle_actor_message_sync(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::AlignedBytes,
+        correlation_id: Option<u32>,
+    ) -> crate::Result<Option<crate::registry::ActorResponse>> {
+        if actor_id != TEST_TELL_ACTOR_ID || type_hash != TEST_TELL_HASH {
+            return Ok(None);
+        }
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+        if correlation_id.is_some() {
+            Ok(Some(crate::registry::ActorResponse::from(payload)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 const TEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024; // Prevent stack overflow during large test runs
 const TEST_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 const TEST_WORKER_THREADS: usize = 4;
@@ -478,6 +507,166 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
             "a permanently parked streaming slice write must not stop the IO task from \
              processing an already-buffered read: a wedged write direction must not disable \
              reads on the same connection"
+        );
+
+        writer_peer.shutdown();
+        writer_wedged.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_wedged).await;
+    });
+}
+
+/// P0 (residual of #180): once `LocalStreamingQueue::is_full()` is true (more
+/// than `MAX_STREAM_SIZE` retained), the read loop's entry gate stops
+/// attempting reads AT ALL for this connection -- not just admission of more
+/// streaming payload, every read. If both peers in a bidirectional streaming
+/// storm reach this state simultaneously, neither drains its socket, so
+/// neither's TCP window reopens, and both bounded slice writes above retry
+/// forever with zero progress: the write-side fix alone cannot resolve it,
+/// because there is nothing left to retry into.
+///
+/// Push a connection's own local streaming-response queue over the
+/// `is_full()` threshold with two real ask responses (one at exactly
+/// `MAX_STREAM_SIZE`, one just over `STREAMING_THRESHOLD` more -- their sum
+/// exceeds the ~64MiB reserve), then send a third ask on the same connection
+/// and assert its handler still runs. Ordering is driven structurally, not
+/// by sleeping: `ask_streaming_bytes` is awaited to its own bounded timeout
+/// fully sequentially (not concurrently), so ask2 and ask3's frames cannot
+/// reach the wire before ask1's do, which guarantees `is_full()` is already
+/// true by the time ask3's frame is parsed.
+#[test]
+fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_read() {
+    run_multi_thread_test(async {
+        let addr_wedged: std::net::SocketAddr = "127.0.0.1:40497".parse().unwrap();
+        let addr_peer: std::net::SocketAddr = "127.0.0.1:40498".parse().unwrap();
+
+        let delivered = Arc::new(AtomicU64::new(0));
+        let registry_wedged = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_wedged,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "local_streaming_queue_full_read_progress",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_wedged
+            .set_actor_message_handler_sync(Arc::new(EchoAskCountAll {
+                delivered: Arc::clone(&delivered),
+            }))
+            .await;
+
+        let correlation_wedged = CorrelationTracker::new();
+        let (io_wedged, io_peer) = tokio::io::duplex(4 * 1024 * 1024);
+        let wedged_stream = WriteWedgedStream { inner: io_wedged };
+
+        let read_ctx_wedged = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_wedged),
+            peer_addr: addr_peer,
+            session_source: addr_peer,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_wedged.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_wedged.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_wedged.actor_message_handler_sync.load_full(),
+        };
+
+        let (writer_wedged, task_wedged, _) = LockFreeStreamHandle::new(
+            wedged_stream,
+            addr_peer,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_wedged),
+        );
+        let writer_wedged = Arc::new(writer_wedged);
+
+        let (writer_peer, _task_peer, _) = LockFreeStreamHandle::new(
+            io_peer,
+            addr_wedged,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer_peer = Arc::new(writer_peer);
+        // All asks below are sent from `conn_peer`, whose transport
+        // (`writer_peer`) writes normally onto the shared duplex; the wedged
+        // side's transport (`writer_wedged`) never sends anything of its own.
+        let conn_peer = ConnectionHandle::<()>::new_stream(
+            addr_wedged,
+            Arc::clone(&writer_peer),
+            CorrelationTracker::new(),
+        );
+
+        // ask1: alone, exactly MAX_STREAM_SIZE -- the largest single response
+        // admission allows (`admit_single_oversize`). Awaited sequentially (not
+        // spawned) to its own bounded timeout: since nothing else runs
+        // concurrently, ask2/ask3's frames structurally cannot reach the wire
+        // before ask1's have, regardless of scheduling. The timeout always
+        // elapses (wedged never responds); it exists only to bound how long
+        // this step waits once sending -- which, for an in-memory duplex, is
+        // far under it -- is done.
+        let ask_one_payload = bytes::Bytes::from(vec![0x11u8; crate::MAX_STREAM_SIZE]);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            conn_peer.ask_streaming_bytes(
+                ask_one_payload,
+                TEST_TELL_HASH,
+                TEST_TELL_ACTOR_ID,
+                Duration::from_secs(120),
+            ),
+        )
+        .await;
+
+        // ask2: on its own this response would fit the connection's normal
+        // reserve, but stacked on ask1's already-retained MAX_STREAM_SIZE it
+        // pushes retained_bytes() past the is_full() threshold (~MAX_STREAM_SIZE).
+        let ask_two_payload = bytes::Bytes::from(vec![0x22u8; STREAMING_THRESHOLD + 1_048_576]);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            conn_peer.ask_streaming_bytes(
+                ask_two_payload,
+                TEST_TELL_HASH,
+                TEST_TELL_ACTOR_ID,
+                Duration::from_secs(120),
+            ),
+        )
+        .await;
+
+        // ask3: tiny, sent last and only after ask1/ask2 have each had their
+        // full bounded window to reach the wire. Its own response needs no
+        // streaming admission at all -- this is purely a read-progress probe.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            conn_peer.ask_streaming_bytes(
+                bytes::Bytes::from_static(b"x"),
+                TEST_TELL_HASH,
+                TEST_TELL_ACTOR_ID,
+                Duration::from_secs(120),
+            ),
+        )
+        .await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            while delivered.load(Ordering::Acquire) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "local_streaming_queue.is_full() must not stop the IO task from reading a later, \
+             unrelated ask on the same connection: delivered={}",
+            delivered.load(Ordering::Acquire)
         );
 
         writer_peer.shutdown();
