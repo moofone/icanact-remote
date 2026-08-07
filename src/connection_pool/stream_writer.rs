@@ -2305,7 +2305,23 @@ impl LockFreeStreamHandle {
                 streaming_state.as_mut(),
             ) {
                 if last_cleanup.elapsed() >= std::time::Duration::from_secs(30) {
-                    streaming_state.cleanup_stale();
+                    // `false` means the aggregate rejected-stream tombstone
+                    // budget was exhausted while reaping: at least one
+                    // stale stream could not be tombstoned, so its trailing
+                    // chunks would otherwise hit the fatal "unknown
+                    // stream_id" path with nothing to catch them. Closing
+                    // the connection here is the explicit failure mode for
+                    // that -- never silently evicting a different,
+                    // unrelated tombstone to make room (see
+                    // `RejectedStreamTombstone`'s invariant in protocol.rs).
+                    if !streaming_state.cleanup_stale() {
+                        warn!(
+                            peer = %ctx.peer_addr,
+                            "Rejected-stream tombstone budget exhausted while reaping stale \
+                             streams; closing connection"
+                        );
+                        return;
+                    }
                     last_cleanup = std::time::Instant::now();
                 }
 
