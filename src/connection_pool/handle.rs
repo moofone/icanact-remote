@@ -234,12 +234,35 @@ impl<T> ConnectionHandle<T> {
             .unwrap_or(0)
     }
 
-    /// Send pre-serialized data through this connection - LOCK-FREE
+    /// Send a pre-serialized, complete V5 frame (or several concatenated)
+    /// through this connection - LOCK-FREE.
+    ///
+    /// PR #183 review, round 14: `data` must already be one or more
+    /// complete, well-formed V5 frames -- this method adds no framing of
+    /// its own, and this crate's wire protocol has no raw-passthrough read
+    /// mode for it to fall back to if `data` isn't. Every read path
+    /// (`read_message_step`/`read_message_step_poll`/
+    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// unconditionally decodes a V5 control word from whatever arrives on
+    /// the connection and fails it if the bytes don't decode; there is no
+    /// way to send genuinely unframed bytes and have the peer treat them
+    /// as anything other than a desynchronizing parse failure, regardless
+    /// of what this method's gate does. See `WritePayload::Single`'s doc
+    /// comment (`connection_pool/types.rs`) for the full invariant this
+    /// crate enforces on writes through this path.
     pub async fn send_data(&self, data: Vec<u8>) -> Result<()> {
         self.write_bytes_control(bytes::Bytes::from(data)).await
     }
 
-    /// Send raw bytes without any framing.
+    /// Send `data` as-is, with no *additional* framing layered on top of
+    /// it by this method.
+    ///
+    /// PR #183 review, round 14: this docstring used to say "without any
+    /// framing," which described a capability this wire protocol does not
+    /// have -- see the note on `send_data` above for the evidence. `data`
+    /// must already be one or more complete, well-formed V5 frames; "raw"
+    /// here means this method doesn't wrap or reframe it, not that the
+    /// peer will accept genuinely unframed content.
     pub async fn send_raw_bytes(&self, data: bytes::Bytes) -> Result<()> {
         self.write_bytes_control(data).await
     }
@@ -475,7 +498,12 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
-    /// Send bytes without copying - TRUE ZERO-COPY
+    /// Send a complete, pre-serialized V5 frame (or several concatenated)
+    /// without copying - TRUE ZERO-COPY.
+    ///
+    /// PR #183 review, round 14: same contract as `send_data` above --
+    /// `data` must already be complete frame(s); see that method's doc
+    /// comment for why.
     pub async fn send_bytes_zero_copy(&self, data: bytes::Bytes) -> Result<()> {
         self.write_bytes_control(data).await
     }
@@ -774,7 +802,13 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
-    /// Send a pre-formatted binary message (already has length prefix).
+    /// Send a pre-formatted, complete V5 frame (already has its control
+    /// word and any structured header -- not a bare length prefix over
+    /// unframed content).
+    ///
+    /// PR #183 review, round 14: same contract as `send_data` above --
+    /// `message` must already be complete frame(s); see that method's doc
+    /// comment for why.
     pub async fn send_binary_message(&self, message: bytes::Bytes) -> Result<()> {
         // Message already has length prefix, send as-is.
         self.write_bytes_control(message).await

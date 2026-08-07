@@ -3006,13 +3006,37 @@ impl LockFreeStreamHandle {
             }
         };
 
+        // PR #183 review, round 14: the same closure property round 13
+        // applied to `Single` -- "what reaches the wire must be a whole
+        // number of complete frames" -- applies here too, however the
+        // frame was split between `header` and `payload`. A header
+        // shorter than a control word, or one that doesn't decode as one,
+        // used to return `Ok(())` here without inspecting `actual_total`
+        // at all: a caller could hand `write_header_and_payload_control`
+        // an empty or 1-3 byte `header` and put a complete oversized V5
+        // frame in `payload`, and this check would never see it. Both
+        // cases are refused outright now, the same as an unrecognizable
+        // or too-short remainder in `reject_oversize_single`.
         if control_source.len() < framing::LENGTH_PREFIX_LEN {
-            return Ok(());
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "header supplies only {} byte(s), too few to contain a complete V5 \
+                     control word ({} bytes) -- refusing a write that is not a whole \
+                     number of complete frames",
+                    control_source.len(),
+                    framing::LENGTH_PREFIX_LEN,
+                ),
+            )));
         }
         let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
         control_word.copy_from_slice(&control_source[..framing::LENGTH_PREFIX_LEN]);
         let Some(control) = framing::decode_control(control_word) else {
-            return Ok(());
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "header's leading bytes do not decode as a valid V5 control word -- \
+                 refusing a write that is not a whole number of complete frames",
+            )));
         };
 
         let expected_total = framing::LENGTH_PREFIX_LEN + control.body_len;
@@ -4975,6 +4999,133 @@ mod write_payload_size_gate_tests {
         assert!(
             matches!(err, GossipError::MessageTooLarge { .. }),
             "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 14: the specific shape this round's finding
+    /// described -- an empty `header` and a complete, self-contained,
+    /// oversized V5 frame packed entirely into `payload`. Before this
+    /// round, `control_source.len() < LENGTH_PREFIX_LEN` returned `Ok(())`
+    /// immediately, so `actual_total` (and therefore `payload`'s size) was
+    /// never inspected at all -- the same closure-property violation round
+    /// 13 closed for `Single`, just reached through the header+payload
+    /// variant instead.
+    #[tokio::test]
+    async fn header_payload_rejects_an_empty_header_hiding_an_oversized_payload() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9998".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9998, max_message_size)),
+        );
+
+        // A genuine, complete, self-contained oversized Gossip frame,
+        // packed entirely into `payload` with nothing held back for
+        // `header`.
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let inner_payload = vec![0u8; payload_len];
+        let inner_header = crate::framing::write_gossip_frame_prefix(inner_payload.len());
+        let mut payload = Vec::with_capacity(inner_header.len() + inner_payload.len());
+        payload.extend_from_slice(&inner_header);
+        payload.extend_from_slice(&inner_payload);
+
+        let err = writer
+            .write_header_and_payload_control(bytes::Bytes::new(), bytes::Bytes::from(payload))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the empty-header call to be refused as too short to contain a \
+             control word, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Degenerate case: a 1-3 byte `header`, same reasoning as the empty
+    /// case above -- too short to hold a complete control word, so it must
+    /// be refused rather than silently letting `payload` through
+    /// unvalidated.
+    #[tokio::test]
+    async fn header_payload_rejects_a_three_byte_header_hiding_an_oversized_payload() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9999".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9999, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let inner_payload = vec![0u8; payload_len];
+        let inner_header = crate::framing::write_gossip_frame_prefix(inner_payload.len());
+        let mut payload = Vec::with_capacity(inner_header.len() + inner_payload.len());
+        payload.extend_from_slice(&inner_header);
+        payload.extend_from_slice(&inner_payload);
+
+        let short_header = bytes::Bytes::from_static(&[0x01, 0x02, 0x03]);
+        let err = writer
+            .write_header_and_payload_control(short_header, bytes::Bytes::from(payload))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the 3-byte-header call to be refused as too short to contain a \
+             control word, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A `header` long enough to hold a control word, but whose leading
+    /// bytes don't decode as one, must also be refused -- the other half
+    /// of the same closure-property violation: undecodable content is not
+    /// "a whole number of complete frames" regardless of its length.
+    #[tokio::test]
+    async fn header_payload_rejects_an_undecodable_header_hiding_an_oversized_payload() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9994".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9994, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let inner_payload = vec![0u8; payload_len];
+        let inner_header = crate::framing::write_gossip_frame_prefix(inner_payload.len());
+        let mut payload = Vec::with_capacity(inner_header.len() + inner_payload.len());
+        payload.extend_from_slice(&inner_header);
+        payload.extend_from_slice(&inner_payload);
+
+        // Kind bits 31 has no `WireKind` mapping.
+        let undecodable_header = bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(
+            crate::framing::decode_control(undecodable_header[..4].try_into().unwrap()).is_none(),
+            "test setup: the header must not decode as a valid control word"
+        );
+        let err = writer
+            .write_header_and_payload_control(undecodable_header, bytes::Bytes::from(payload))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the undecodable-header call to be refused, got {err:?}"
         );
 
         writer.shutdown();
