@@ -443,10 +443,14 @@ impl StreamingState {
     ) -> Result<Option<StreamChunkReservation>> {
         if let Some(tombstoned_at) = self.rejected_streams.get_mut(&stream_id) {
             // A sender still trickling chunks into a reaped/rejected id is
-            // making a good-faith delivery attempt; refresh the tombstone so
-            // it keeps being silently discarded instead of aging out and
-            // falling through to `reserve_v5_chunk`'s fatal "unknown
-            // stream_id" once the original TTL window passes.
+            // making a good-faith delivery attempt; refresh the tombstone's
+            // timestamp so it reads as the most-recently-used entry.
+            // `rejected_streams` is no longer pruned by wall-clock age (see
+            // `cleanup_stale_with`), only by the `MAX_REJECTED_STREAMS`
+            // capacity bound in `tombstone_reaped_stream`/`reject_stream`,
+            // which evicts the *oldest* entry when full -- refreshing here
+            // is what keeps an actively-retried id from being that oldest
+            // entry.
             *tombstoned_at = std::time::Instant::now();
             return Ok(None);
         }
@@ -454,9 +458,17 @@ impl StreamingState {
             .map(Some)
     }
 
+    /// Bounded purely by `MAX_REJECTED_STREAMS` -- not by wall-clock age, so
+    /// a tombstone this function inserts can never be pruned out from under
+    /// a late chunk still arriving for it (see `cleanup_stale_with`'s doc
+    /// comment for the failure that TTL-based pruning caused). At capacity,
+    /// this fails closed (`ResourceBusy`, which `begin_v5_stream_or_discard`
+    /// converts into a clean per-stream discard) rather than evicting an
+    /// older entry the way `tombstone_reaped_stream` does: unlike the
+    /// reaper, this has a caller that can handle an error, so there is no
+    /// need to force room by evicting something else that might still be in
+    /// active use.
     fn reject_stream(&mut self, stream_id: u64) -> Result<()> {
-        self.rejected_streams
-            .retain(|_, at| at.elapsed() <= STREAM_IDLE_TIMEOUT);
         if !self.rejected_streams.contains_key(&stream_id)
             && self.rejected_streams.len() >= MAX_REJECTED_STREAMS
         {
@@ -847,6 +859,20 @@ impl StreamingState {
 
     /// `cleanup_stale` with explicit bounds, so tests do not have to wait
     /// out the production timeouts.
+    ///
+    /// Does **not** prune `rejected_streams` by wall-clock age. It used to:
+    /// the production `io_task` loop runs this once per turn *before*
+    /// draining any new frames, so a tombstone that aged past `idle_timeout`
+    /// since its last refresh could be pruned here moments before the very
+    /// late chunk that would have refreshed it was read -- at which point
+    /// `reserve_v5_chunk_or_discard` finds no tombstone, falls through to
+    /// `reserve_v5_chunk`, and returns the fatal "unknown stream_id" error,
+    /// tearing down the whole connection over one late chunk for an id
+    /// nobody was ever going to reuse. `rejected_streams` is bounded
+    /// entirely by `MAX_REJECTED_STREAMS` instead (see
+    /// `tombstone_reaped_stream`/`reject_stream`), which cannot single out
+    /// "the tombstone the next frame happens to need" the way a periodic
+    /// age sweep can.
     pub(crate) fn cleanup_stale_with(
         &mut self,
         idle_timeout: std::time::Duration,
@@ -854,8 +880,6 @@ impl StreamingState {
         min_bytes_per_window: usize,
     ) {
         let before_count = self.active_streams.len();
-        self.rejected_streams
-            .retain(|_, at| at.elapsed() <= idle_timeout);
 
         // A stream the reaper drops is not necessarily done as far as the
         // sender is concerned -- its next in-flight chunk is already on the
@@ -2651,28 +2675,19 @@ mod tests {
         );
     }
 
-    /// A sender that keeps trickling chunks into a reaped id well past the
-    /// tombstone's original TTL must keep getting them silently discarded,
-    /// not eventually fall through to a fatal "unknown stream_id" once the
-    /// tombstone would otherwise have aged out. Each hit must refresh the
-    /// tombstone's own timer, the same way real stream activity refreshes a
-    /// live stream's.
-    ///
-    /// Each loop iteration refreshes (the hit) *before* the prune check that
-    /// could observe staleness, not after a sleep whose actual duration
-    /// `sleep` only lower-bounds. That ordering is what makes the interval
-    /// between hits safe to make arbitrarily long (deliberately well past
-    /// the TTL below) instead of needing to stay under it: elapsed-since-hit
-    /// at the prune check is always whatever the refresh-to-check gap is
-    /// (negligible), never the sleep duration. A version of this test that
-    /// pruned *before* refreshing would need each sleep to finish inside
-    /// `ttl`, which `sleep`'s lower-bound-only guarantee cannot promise on a
-    /// loaded worker.
+    /// A tombstone must never be pruned by wall-clock age alone:
+    /// `rejected_streams` is bounded entirely by `MAX_REJECTED_STREAMS` (see
+    /// `rejected_stream_table_stays_bounded_under_many_reaped_ids`), not by
+    /// a TTL swept by `cleanup_stale_with`. A sender that keeps trickling
+    /// chunks into a reaped id must keep getting them silently discarded no
+    /// matter how many cleanup sweeps run in between or how long the gaps
+    /// between hits are -- there is no window in which the tombstone can
+    /// have "aged out" on its own.
     #[test]
-    fn tombstone_is_refreshed_by_repeated_late_chunks_past_its_original_ttl() {
+    fn tombstone_survives_repeated_cleanup_sweeps_regardless_of_elapsed_time() {
         use std::time::Duration;
 
-        let ttl = Duration::from_millis(30);
+        let idle_timeout = Duration::from_millis(30);
 
         let mut state = StreamingState::new();
         let pool = Arc::new(crate::AlignedBytesPool::default());
@@ -2688,53 +2703,104 @@ mod tests {
             .begin_v5_stream(header, 1, pool, false, 8)
             .expect("start stream and reserve its first chunk");
 
-        // Wants elapsed >= ttl to force the reap: `sleep` only guarantees a
-        // lower bound, so any overshoot only makes the reap more certain.
-        std::thread::sleep(ttl + Duration::from_millis(10));
-        state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
+        // Wants elapsed >= idle_timeout to force the reap: `sleep` only
+        // guarantees a lower bound, so any overshoot only makes the reap
+        // more certain.
+        std::thread::sleep(idle_timeout + Duration::from_millis(10));
+        state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "stream must be reaped first"
+        );
+        assert_eq!(state.rejected_stream_count(), 1);
+
+        // Repeated cleanup sweeps, each well past the old TTL this table
+        // used to be pruned by, must never remove the tombstone on their
+        // own -- only `MAX_REJECTED_STREAMS` capacity pressure can.
+        for _ in 0..4 {
+            std::thread::sleep(idle_timeout * 3);
+            state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
+            assert_eq!(
+                state.rejected_stream_count(),
+                1,
+                "a cleanup sweep must never prune a tombstone by age alone"
+            );
+        }
+
+        // The tombstone is still live after all of that: a late chunk is
+        // still a clean discard, not a fatal "unknown stream_id".
+        let result = state
+            .reserve_v5_chunk_or_discard(301, 1, 8)
+            .expect("a late chunk for a still-tombstoned id must never be a fatal protocol error");
+        assert!(
+            result.is_none(),
+            "a late chunk for a reaped stream must be discarded, not accepted as fresh"
+        );
+    }
+
+    /// The production `io_task` loop calls `cleanup_stale` once per turn
+    /// *before* draining any new frames (see `cleanup_stale_with`'s doc
+    /// comment) -- so an arbitrary number of cleanup sweeps can run between
+    /// a stream being reaped and its sender's next chunk being read, with no
+    /// refreshing hit in between. A version of this test that hit the
+    /// tombstone (refreshing it) before each cleanup sweep -- the reverse of
+    /// production order -- could never observe a prune-before-classify race
+    /// and would pass whether or not `rejected_streams` was ever pruned by
+    /// age at all. This one drives cleanup, cleanup, cleanup, *then* the
+    /// late chunk, matching production exactly.
+    #[test]
+    fn late_chunk_is_a_clean_discard_after_cleanup_sweeps_ahead_of_it_with_no_refresh() {
+        use std::time::Duration;
+
+        let idle_timeout = Duration::from_millis(30);
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 401,
+            total_size: 8,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let _ = state
+            .begin_v5_stream(header, 1, pool, false, 8)
+            .expect("start stream and reserve its first chunk");
+
+        std::thread::sleep(idle_timeout + Duration::from_millis(10));
+        state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
             "stream must be reaped first"
         );
 
-        // Keep hitting the tombstone at deliberately long intervals -- each
-        // hit refreshes it, and refresh always happens immediately before
-        // the prune check below observes it, so no interval needs an upper
-        // bound. Sleeping well past `ttl` every time is the point: it shows
-        // the tombstone survives no matter how long the gap between hits
-        // actually is, not just gaps that happen to land under `ttl`.
-        for _ in 0..4 {
-            std::thread::sleep(ttl * 3);
-            let result = state
-                .reserve_v5_chunk_or_discard(301, 1, 8)
-                .expect("a trickling late chunk must never be a fatal protocol error");
-            assert!(
-                result.is_none(),
-                "a trickling late chunk must keep being discarded, not accepted as fresh"
-            );
-            // Immediately after the refresh above, so elapsed-since-hit is
-            // negligible here regardless of how long the preceding sleep
-            // actually ran: this can never observe the tombstone as stale.
-            state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
-            assert_eq!(
-                state.rejected_stream_count(),
-                1,
-                "the tombstone must still be present immediately after a refreshing hit"
-            );
+        // Several more cleanup sweeps run, each well past what the
+        // tombstone's TTL used to be, with no chunk arriving -- and so no
+        // refresh -- in between. This is the production ordering: `io_task`
+        // calls `cleanup_stale` on every turn regardless of whether a frame
+        // is waiting to be read.
+        for _ in 0..3 {
+            std::thread::sleep(idle_timeout * 3);
+            state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
         }
 
-        // Refresh-on-hit is not a free pass: without a further hit, the
-        // tombstone is not immortal. `sleep`'s lower-bound guarantee is
-        // exactly what this direction needs -- it must reach at least
-        // `ttl`, and any overshoot only makes the expiry more certain.
-        std::thread::sleep(ttl * 3);
-        state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
-        assert_eq!(
-            state.rejected_stream_count(),
-            0,
-            "a tombstone that stops being hit must eventually expire -- refresh-on-hit is \
-             doing real work above, not just sitting behind an unreachably long TTL"
+        // *Now* the late chunk arrives -- after cleanup has already swept
+        // ahead of it, never before it. Under wall-clock-TTL pruning this
+        // tombstone would already be gone by this point, and this call
+        // would return the fatal "unknown stream_id" network error instead
+        // of a clean discard.
+        let result = state.reserve_v5_chunk_or_discard(401, 1, 8);
+        assert!(
+            result.is_ok(),
+            "a late chunk must not become a fatal protocol error just because cleanup swept \
+             ahead of it with no intervening refresh: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "a late chunk for a reaped stream must be discarded, not accepted as a fresh reservation"
         );
     }
 
