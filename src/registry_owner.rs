@@ -1364,7 +1364,19 @@ impl PeerRegistryOwner {
         // for one peer (see `pin`'s doc comment).
         if let Some(pinned_peer) = self.operator_pinned.remove(&from) {
             self.operator_pinned.insert(to, pinned_peer.clone());
-            self.pinned_by_peer.insert(pinned_peer, to);
+            self.pinned_by_peer.insert(pinned_peer.clone(), to);
+            // The pin's `ConnectionPool` configured/required route must move
+            // with it in this SAME command -- exactly the ordering-domain
+            // unification `pin` already applies for `configure_peer`.
+            // Leaving this publish to some later, separately-ordered step
+            // would let a DNS migration reintroduce the pin/route
+            // divergence through a different door: the owner would protect
+            // `to`, but `ConnectionPool::get_required_peer_addr` would keep
+            // reporting the stale `from` until the operator reconfigured
+            // the peer again.
+            if let Some(routing) = self.routing.upgrade() {
+                routing.set_configured_peer_addr(to, &pinned_peer);
+            }
         }
         let commit_seq = self.advance();
         self.claim_generation.remove(&from);
@@ -1411,11 +1423,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingPublisher {
         events: Mutex<Vec<(SocketAddr, Option<PeerId>)>>,
+        configured_routes: Mutex<Vec<(SocketAddr, PeerId)>>,
     }
 
     impl RecordingPublisher {
         fn events(&self) -> Vec<(SocketAddr, Option<PeerId>)> {
             self.events.lock().expect("publisher mutex").clone()
+        }
+
+        fn configured_routes(&self) -> Vec<(SocketAddr, PeerId)> {
+            self.configured_routes
+                .lock()
+                .expect("publisher mutex")
+                .clone()
         }
     }
 
@@ -1434,11 +1454,11 @@ mod tests {
                 .push((addr, None));
         }
 
-        fn set_configured_peer_addr(&self, _addr: SocketAddr, _peer_id: &PeerId) {
-            // Not exercised by these owner-only tests: `pin`'s interaction
-            // with `ConnectionPool`'s configured-route bookkeeping is
-            // covered end to end in `registry.rs` against the real
-            // `ConnectionPool`.
+        fn set_configured_peer_addr(&self, addr: SocketAddr, peer_id: &PeerId) {
+            self.configured_routes
+                .lock()
+                .expect("publisher mutex")
+                .push((addr, peer_id.clone()));
         }
     }
 
@@ -1981,6 +2001,52 @@ mod tests {
                 .await,
             MigrateOutcome::SourceUnowned,
             "an unclaimed source with a free destination has nothing to move"
+        );
+    }
+
+    /// P2 regression: a DNS-triggered `migrate` that carries an operator pin
+    /// from `from` to `to` must publish `to` as the peer's `ConnectionPool`
+    /// configured/required route in the SAME command -- not leave that
+    /// publish to some later, separately-ordered step. Otherwise the owner
+    /// protects `to` while `ConnectionPool::get_required_peer_addr` keeps
+    /// reporting the stale `from`, reintroducing through `migrate` exactly
+    /// the pin/route divergence `configure_peer` was unified to prevent.
+    #[tokio::test]
+    async fn migrate_moves_the_configured_route_along_with_a_carried_pin() {
+        let (owner, publisher) = owner_handle();
+        let node = peer("migrate-carries-pin");
+        let from = addr(30_014);
+        let to = addr(30_015);
+
+        owner
+            .claim(from, claim_of(node.clone(), ClaimKind::Verified), false)
+            .await;
+        let evicted = owner.pin(from, node.clone()).await;
+        assert_eq!(
+            evicted, None,
+            "sanity: first pin for this peer evicts nothing"
+        );
+
+        let source = current_source(&owner, from);
+        assert!(
+            owner.migrate(from, to, source, false).await.moved(),
+            "a pinned source must still migrate onto a free destination"
+        );
+
+        assert_eq!(
+            publisher.configured_routes().last(),
+            Some(&(to, node.clone())),
+            "migrate must publish the carried pin's new address as the \
+             ConnectionPool configured/required route, in the same command \
+             the pin itself moves in"
+        );
+
+        // The pin itself must have moved: `to` now refuses release, `from`
+        // (no longer owned at all) trivially does not need it protected.
+        let token = owner.ownership_token(&to).expect("still owned at `to`");
+        assert!(
+            owner.release(to, node, token.generation()).await.is_none(),
+            "the migrated pin must still protect `to` from release"
         );
     }
 
