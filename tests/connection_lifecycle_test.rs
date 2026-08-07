@@ -165,6 +165,14 @@ fn test_connection_survives_multiple_gossip_rounds() {
 ///
 /// This specifically tests the fix for the bug where FullSync removes
 /// the ephemeral address mapping before reindex, causing orphaned entries.
+///
+/// Uses a raw `.ask()` as a liveness probe (`"Initial ask"` below); that has
+/// no actor_id/type_hash to route to, so it depends on the test/benchmark-
+/// only command processor (`handle::handle_raw_ask_request`, gated on
+/// `cfg(any(test, feature = "test-helpers"))`). CI runs `cargo test
+/// --all-features`, which enables it; run locally with `cargo test
+/// --features test-helpers` to include this test.
+#[cfg(feature = "test-helpers")]
 #[test]
 fn test_addr_mappings_preserved_after_fullsync() {
     run_async_test("connection-lifecycle-fullsync", async {
