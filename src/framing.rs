@@ -281,6 +281,13 @@ pub enum AskNackReason {
     /// This connection/build has no dispatcher for the ask's wire path
     /// (e.g. a raw or direct ask with no registered handler concept).
     NoDispatcher = 3,
+    /// A dispatcher exists for this wire path, but the connection has no
+    /// spare capacity to admit the answer right now (e.g. the local
+    /// streaming-response queue is full). Distinct from `NoDispatcher`,
+    /// which means no dispatcher exists for this path at all -- this is
+    /// transient: the same ask, retried once capacity frees up (or sent to
+    /// a different peer), may succeed where it fails now.
+    Backpressure = 4,
     /// The peer set the NACK marker with a reason byte this build does not
     /// recognize -- a newer peer's reason, or a corrupted frame. Decode-only:
     /// never written to the wire, so the reserved 0 discriminant cannot
@@ -300,6 +307,7 @@ impl AskNackReason {
             1 => Self::UnknownActor,
             2 => Self::HandlerError,
             3 => Self::NoDispatcher,
+            4 => Self::Backpressure,
             _ => Self::Unsupported,
         }
     }
@@ -311,6 +319,7 @@ impl std::fmt::Display for AskNackReason {
             Self::UnknownActor => "unknown actor",
             Self::HandlerError => "handler error",
             Self::NoDispatcher => "no dispatcher for this ask path",
+            Self::Backpressure => "no spare capacity for this ask right now",
             Self::Unsupported => "refused with a reason this build does not recognize",
         };
         f.write_str(text)
@@ -666,6 +675,18 @@ mod tests {
     }
 
     #[test]
+    fn ask_nack_round_trips_the_backpressure_reason() {
+        // Distinct from `NoDispatcher`: a dispatcher exists, the connection
+        // is just out of capacity right now, so this is transient rather
+        // than "this build can never answer this ask".
+        let header = write_ask_nack_header(42, AskNackReason::Backpressure);
+        assert_eq!(
+            ask_nack_reason(&header[4..]),
+            Some(AskNackReason::Backpressure)
+        );
+    }
+
+    #[test]
     fn a_nack_whose_reason_this_build_does_not_know_is_still_a_nack() {
         // A newer peer can NACK with a reason byte we have never heard of,
         // and a corrupted frame can produce one by accident. Either way the
@@ -673,7 +694,7 @@ mod tests {
         // ordinary response would hand the caller a successful empty payload
         // for a request nobody answered -- fabricated success, the failure
         // mode this whole NACK path exists to remove.
-        for unknown in [0u8, 4, 9, 200, 255] {
+        for unknown in [0u8, 5, 9, 200, 255] {
             let mut header = write_ask_nack_header(7, AskNackReason::UnknownActor);
             header[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = unknown;
             assert_eq!(
