@@ -395,7 +395,6 @@ const STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP: usize =
 /// Reserve for the largest valid streamed payload, used by `is_full`. Stream
 /// frame headers are generated on demand and are not retained by the queue,
 /// so only owned payload bytes count.
-#[cfg_attr(not(test), allow(dead_code))]
 const MAX_STREAMING_RESPONSE_RETAINED_BYTES: usize =
     crate::MAX_STREAM_SIZE.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
@@ -575,13 +574,20 @@ impl LocalStreamingQueue {
     }
 
     /// Whether this queue's retained footprint is at or beyond its aggregate
-    /// reserve. A queue-level invariant checked directly by tests; NOT used to
-    /// gate the IO task's read loop (a blanket pre-check there previously
-    /// stopped every read on the connection -- including ones needing no
-    /// streaming-queue capacity at all -- for as long as this stayed true,
-    /// which is exactly the state a bidirectional streaming storm leaves both
-    /// peers in). Per-response admission is `can_admit_response`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// reserve. A queue-level invariant checked directly by tests, and also
+    /// consulted by `stream_writer.rs::io_task` at its three ActorAsk
+    /// dispatch sites: when this is true, that ask's handler is *not* run --
+    /// it is skipped (queuing a best-effort `AskNackReason::Backpressure`
+    /// NACK instead) rather than run-then-discarded, since running it first
+    /// would compute a response this connection cannot currently retain.
+    /// This is a narrow, per-ask dispatch gate, not a blanket read-loop gate:
+    /// reads, tells, and every other result kind keep flowing regardless of
+    /// this value (a blanket pre-check that stopped *every* read on the
+    /// connection -- including ones needing no streaming-queue capacity at
+    /// all -- for as long as this stayed true is exactly the state a
+    /// bidirectional streaming storm used to leave both peers in). Per-
+    /// response admission after a handler has already produced its answer is
+    /// the separate `can_admit_response`.
     fn is_full(&self) -> bool {
         if self.deferred.is_some() {
             return true;
