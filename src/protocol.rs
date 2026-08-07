@@ -66,13 +66,162 @@ const MIN_SUSTAINED_BYTES_PER_WINDOW: usize = 8 * 1024;
 #[derive(Debug)]
 pub struct StreamingState {
     active_streams: HashMap<u64, InProgressStream>,
-    /// Rejected stream ids are quarantined so their trailing frames can be
-    /// consumed without allocating or tearing down unrelated traffic.
-    rejected_streams: HashMap<u64, std::time::Instant>,
+    /// Rejected/reaped stream ids are quarantined so their trailing frames
+    /// can be discarded without allocating or tearing down unrelated
+    /// traffic. See `RejectedStreamTombstone` for the invariant governing
+    /// how long an entry survives.
+    rejected_streams: HashMap<u64, RejectedStreamTombstone>,
     max_concurrent_streams: usize,
 }
 
-const MAX_REJECTED_STREAMS: usize = 32;
+/// Chunk-completion state for a rejected or reaped stream generation,
+/// tracked precisely enough to know the instant no protocol-compliant
+/// sender can have any more bytes left to send for it.
+///
+/// **Invariant:** a tombstone is removed only when it is *proven* done --
+/// either every chunk index its declared size implies has been observed
+/// (`is_complete`), or a new `StreamStart` for the same `stream_id` arrives
+/// (an unambiguous generation boundary on an ordered transport; handled by
+/// `begin_v5_stream_or_discard`'s unconditional `remove` before it decides
+/// whether to admit or re-reject the retry). Nothing else ever removes an
+/// entry: there is no capacity cap, no LRU eviction, and no wall-clock TTL.
+///
+/// This is a *lifetime* property, not a capacity one, which is why it
+/// replaces three earlier attempts that were all fighting the wrong
+/// dimension:
+/// - A wall-clock TTL pruned tombstones on a timer that could fire moments
+///   before the very chunk that would have refreshed it was read.
+/// - Removing that TTL with no replacement left `reject_stream` needing to
+///   fail once the table filled, turning ordinary sustained overload into a
+///   connection-fatal error.
+/// - Evicting the least-recently-touched entry at a fixed 32-entry capacity
+///   (the previous fix) always has a safe-looking answer, but "which
+///   tombstone to sacrifice" has no correct answer at all: streaming frames
+///   interleave, so nothing bounds how many *other* streams can be
+///   rejected while one specific rejected generation still has trailing
+///   chunks in flight. Any fixed count can be exceeded.
+///
+/// Tracking exact per-generation completion sidesteps the question
+/// entirely instead of picking a better heuristic answer to it: an entry's
+/// size is driven by how many rejected/reaped generations are genuinely
+/// still incomplete, which is bounded by real sender behavior (each one
+/// costs the peer at least one `StreamStart` frame and, to keep the
+/// tombstone alive, continued -- if ultimately discarded -- traffic), not
+/// by an arbitrary constant that a burst of ordinary overload can exceed.
+/// It can never wedge (insertion is an unconditional, infallible
+/// `HashMap::insert`) and never evicts a tombstone whose stream might still
+/// have a frame in flight (nothing evicts at all; entries are only ever
+/// removed once proven done).
+#[derive(Debug, Clone)]
+struct RejectedStreamTombstone {
+    /// Total size declared by this generation's `StreamStart`, in bytes.
+    total_size: u64,
+    /// Chunk length established from the first chunk this tombstone ever
+    /// saw (the inline payload on `StreamStart` for a fresh rejection, or
+    /// whatever the stream had already determined before being reaped).
+    /// `None` only for a degenerate generation whose stride could never be
+    /// established (an empty first chunk) -- such a tombstone is cleared
+    /// only by a retry, never by completion tracking; see `is_complete`.
+    chunk_stride: Option<usize>,
+    expected_chunks: Option<usize>,
+    /// One bit per chunk index, exactly mirroring
+    /// `InProgressStream::received_chunks`. A byte total alone cannot
+    /// safely detect completion -- a duplicated chunk could stand in for
+    /// one that never arrived -- so distinct indices are tracked instead.
+    received_chunks: Vec<u64>,
+}
+
+impl RejectedStreamTombstone {
+    /// A brand-new resource-pressure rejection. `first_chunk_len` bytes are
+    /// the `StreamStart` frame's own inline payload -- already fully
+    /// consumed off the wire as part of that one frame, and chunk index 0 in
+    /// the same numbering `reserve_v5_chunk` uses -- so this establishes the
+    /// stride from it immediately and marks chunk 0 received; the sender
+    /// will not send it again.
+    fn rejected(total_size: u64, first_chunk_len: usize) -> Self {
+        let mut tombstone = Self {
+            total_size,
+            chunk_stride: None,
+            expected_chunks: None,
+            received_chunks: Vec::new(),
+        };
+        tombstone.establish_stride(first_chunk_len);
+        tombstone.mark_chunk_received(0);
+        tombstone
+    }
+
+    /// A stream reaped out of `active_streams` mid-transfer: carries over
+    /// exactly the chunk-completion state it had already validated while
+    /// active (see `commit_v5_chunk`), so nothing already confirmed
+    /// received has to be re-derived, and nothing merely *reserved* but not
+    /// yet committed is ever counted as received before it actually is.
+    fn reaped(
+        total_size: u64,
+        chunk_stride: Option<usize>,
+        expected_chunks: Option<usize>,
+        received_chunks: Vec<u64>,
+    ) -> Self {
+        Self {
+            total_size,
+            chunk_stride,
+            expected_chunks,
+            received_chunks,
+        }
+    }
+
+    /// Establishes the stride once, from the first chunk length observed.
+    /// A zero length leaves the stride unknown -- there is no valid stride
+    /// to derive from an empty chunk (mirrors `reserve_v5_chunk`, which
+    /// rejects a zero-length chunk before ever reaching stride derivation).
+    fn establish_stride(&mut self, chunk_len: usize) {
+        if self.chunk_stride.is_some() || chunk_len == 0 {
+            return;
+        }
+        self.chunk_stride = Some(chunk_len);
+        let expected = (self.total_size as usize).div_ceil(chunk_len);
+        self.expected_chunks = Some(expected);
+        self.received_chunks = vec![0u64; expected.div_ceil(64)];
+    }
+
+    /// Records `chunk_index` as received. Silently ignores an index outside
+    /// the established range (e.g. a malformed/out-of-range chunk on a
+    /// stream we are discarding anyway, or the stride was never
+    /// established) rather than panicking -- this is best-effort completion
+    /// bookkeeping for a stream we are not otherwise validating, not a
+    /// source of truth that must reject bad input.
+    fn mark_chunk_received(&mut self, chunk_index: usize) {
+        let word = chunk_index / 64;
+        let bit = 1u64 << (chunk_index % 64);
+        if let Some(slot) = self.received_chunks.get_mut(word) {
+            *slot |= bit;
+        }
+    }
+
+    /// True once every expected chunk index has been observed -- the exact
+    /// point at which a protocol-compliant sender has no more bytes left to
+    /// send for this generation. Mirrors `InProgressStream::all_chunks_received`.
+    fn is_complete(&self) -> bool {
+        let Some(expected) = self.expected_chunks else {
+            return self.total_size == 0;
+        };
+        if expected == 0 {
+            return true;
+        }
+        let full_words = expected / 64;
+        if self.received_chunks[..full_words]
+            .iter()
+            .any(|w| *w != u64::MAX)
+        {
+            return false;
+        }
+        let remainder = expected % 64;
+        if remainder == 0 {
+            return true;
+        }
+        let mask = (1u64 << remainder) - 1;
+        self.received_chunks[full_words] & mask == mask
+    }
+}
 
 /// A validated, not-yet-committed V5 chunk destination. The IO task receives
 /// plaintext directly into this range and commits it only after every byte was
@@ -356,10 +505,11 @@ impl StreamingState {
         // therefore an unambiguous generation boundary, not a reason to
         // suppress a legitimate retry until the tombstone expires.
         self.rejected_streams.remove(&header.stream_id);
+        let total_size = header.total_size;
         match self.begin_v5_stream(header, correlation_id, pool, is_response, first_chunk_len) {
             Ok(reservation) => Ok(Some(reservation)),
             Err(error) if is_resource_busy(&error) => {
-                self.reject_stream(header.stream_id);
+                self.reject_stream(header.stream_id, total_size, first_chunk_len);
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -441,38 +591,39 @@ impl StreamingState {
         chunk_index: u32,
         chunk_len: usize,
     ) -> Result<Option<StreamChunkReservation>> {
-        if let Some(tombstoned_at) = self.rejected_streams.get_mut(&stream_id) {
+        if let Some(tombstone) = self.rejected_streams.get_mut(&stream_id) {
             // A sender still trickling chunks into a reaped/rejected id is
-            // making a good-faith delivery attempt; refresh the tombstone's
-            // timestamp so it reads as the most-recently-used entry.
-            // `rejected_streams` is no longer pruned by wall-clock age (see
-            // `cleanup_stale_with`), only by the `MAX_REJECTED_STREAMS`
-            // capacity bound in `tombstone_reaped_stream`/`reject_stream`,
-            // which evicts the *oldest* entry when full -- refreshing here
-            // is what keeps an actively-retried id from being that oldest
-            // entry.
-            *tombstoned_at = std::time::Instant::now();
+            // making a good-faith delivery attempt; record it toward this
+            // generation's completion instead of merely refreshing a
+            // timestamp. Once every chunk the generation declared has been
+            // observed, no compliant sender has anything left to send for
+            // it, so the tombstone can be (and is) removed right here --
+            // see `RejectedStreamTombstone`'s invariant.
+            tombstone.mark_chunk_received(chunk_index as usize);
+            if tombstone.is_complete() {
+                self.rejected_streams.remove(&stream_id);
+            }
             return Ok(None);
         }
         self.reserve_v5_chunk(stream_id, chunk_index, chunk_len)
             .map(Some)
     }
 
-    /// Bounded purely by `MAX_REJECTED_STREAMS` -- not by wall-clock age, so
-    /// a tombstone this function inserts can never be pruned out from under
-    /// a late chunk still arriving for it (see `cleanup_stale_with`'s doc
-    /// comment for the failure that TTL-based pruning caused). At capacity,
-    /// evicts the oldest tombstone to make room, the same way
-    /// `tombstone_reaped_stream` does, rather than failing: this function's
-    /// only caller, `begin_v5_stream_or_discard`, invokes it via `?`, so a
-    /// `ResourceBusy` here would propagate as a connection-fatal error
-    /// instead of the clean per-stream discard the caller is trying to
-    /// produce. A peer sustaining resource-pressure rejections with no
-    /// intervening reaps must not be able to take the whole connection down
-    /// over tombstone-table upkeep that has nothing to do with the
-    /// stream_id it was trying to reject.
-    fn reject_stream(&mut self, stream_id: u64) {
-        self.tombstone_stream(stream_id);
+    /// Tombstones a resource-pressure-rejected `StreamStart`. Always
+    /// succeeds -- insertion into `rejected_streams` is an unconditional
+    /// `HashMap::insert`, so this function's only caller,
+    /// `begin_v5_stream_or_discard`, can keep invoking it via `?` without a
+    /// `ResourceBusy` here ever propagating as a connection-fatal error. A
+    /// peer sustaining resource-pressure rejections, with or without any
+    /// intervening reaps, can never take the whole connection down over
+    /// tombstone-table upkeep that has nothing to do with the stream_id it
+    /// was trying to reject. See `RejectedStreamTombstone` for why this
+    /// never needs to evict anything to make room.
+    fn reject_stream(&mut self, stream_id: u64, total_size: u64, first_chunk_len: usize) {
+        self.rejected_streams.insert(
+            stream_id,
+            RejectedStreamTombstone::rejected(total_size, first_chunk_len),
+        );
     }
 
     /// Returns the writable target range for the next read into
@@ -853,19 +1004,11 @@ impl StreamingState {
     /// `cleanup_stale` with explicit bounds, so tests do not have to wait
     /// out the production timeouts.
     ///
-    /// Does **not** prune `rejected_streams` by wall-clock age. It used to:
-    /// the production `io_task` loop runs this once per turn *before*
-    /// draining any new frames, so a tombstone that aged past `idle_timeout`
-    /// since its last refresh could be pruned here moments before the very
-    /// late chunk that would have refreshed it was read -- at which point
-    /// `reserve_v5_chunk_or_discard` finds no tombstone, falls through to
-    /// `reserve_v5_chunk`, and returns the fatal "unknown stream_id" error,
-    /// tearing down the whole connection over one late chunk for an id
-    /// nobody was ever going to reuse. `rejected_streams` is bounded
-    /// entirely by `MAX_REJECTED_STREAMS` instead (see
-    /// `tombstone_reaped_stream`/`reject_stream`), which cannot single out
-    /// "the tombstone the next frame happens to need" the way a periodic
-    /// age sweep can.
+    /// Does **not** prune `rejected_streams` by wall-clock age, and never
+    /// evicts an entry to make room for another: see
+    /// `RejectedStreamTombstone`'s invariant for why a tombstone is removed
+    /// only once proven done, and why that cannot wedge the table full
+    /// either.
     pub(crate) fn cleanup_stale_with(
         &mut self,
         idle_timeout: std::time::Duration,
@@ -876,11 +1019,12 @@ impl StreamingState {
 
         // A stream the reaper drops is not necessarily done as far as the
         // sender is concerned -- its next in-flight chunk is already on the
-        // wire. Collect the reaped ids so they can be tombstoned into
-        // `rejected_streams` below: without that, the late chunk hits
-        // "unknown stream_id", a fatal protocol error that tears down the
-        // whole connection instead of just this stream.
-        let mut reaped_ids = Vec::new();
+        // wire. Collect enough of each reaped stream's chunk-completion
+        // state to tombstone it into `rejected_streams` below: without
+        // that, the late chunk hits "unknown stream_id", a fatal protocol
+        // error that tears down the whole connection instead of just this
+        // stream.
+        let mut reaped = Vec::new();
         self.active_streams.retain(|stream_id, stream| {
             let idle = stream.last_activity.elapsed();
             if idle > idle_timeout {
@@ -892,7 +1036,13 @@ impl StreamingState {
                     expected_size = stream.total_size,
                     "Cleaning up stream with no byte progress within the idle timeout"
                 );
-                reaped_ids.push(*stream_id);
+                reaped.push((
+                    *stream_id,
+                    stream.total_size,
+                    stream.chunk_stride,
+                    stream.expected_chunks,
+                    stream.received_chunks.clone(),
+                ));
                 return false;
             }
 
@@ -922,7 +1072,13 @@ impl StreamingState {
                         expected_size = stream.total_size,
                         "Cleaning up stream that is not sustaining the minimum transfer rate"
                     );
-                    reaped_ids.push(*stream_id);
+                    reaped.push((
+                        *stream_id,
+                        stream.total_size,
+                        stream.chunk_stride,
+                        stream.expected_chunks,
+                        stream.received_chunks.clone(),
+                    ));
                     return false;
                 }
                 // The window is cleared: slide it forward rather than
@@ -937,8 +1093,14 @@ impl StreamingState {
             true
         });
 
-        for stream_id in &reaped_ids {
-            self.tombstone_reaped_stream(*stream_id);
+        for (stream_id, total_size, chunk_stride, expected_chunks, received_chunks) in reaped {
+            self.tombstone_reaped_stream(
+                stream_id,
+                total_size,
+                chunk_stride,
+                expected_chunks,
+                received_chunks,
+            );
         }
 
         let removed = before_count - self.active_streams.len();
@@ -951,40 +1113,29 @@ impl StreamingState {
         }
     }
 
-    /// Quarantines a reaped stream id the same way `reject_stream` quarantines
-    /// a resource-pressure rejection -- both go through `tombstone_stream`,
-    /// so both share the same never-fails, evict-the-oldest-at-capacity
-    /// bound. A recently reaped id is exactly the one a sender is about to
-    /// retry against, so it is the tombstone most worth keeping.
-    fn tombstone_reaped_stream(&mut self, stream_id: u64) {
-        self.tombstone_stream(stream_id);
-    }
-
-    /// Inserts (or refreshes) a tombstone for `stream_id`, evicting the
-    /// oldest entry to make room if `rejected_streams` is already at
-    /// `MAX_REJECTED_STREAMS` capacity. Shared, infallible core of
-    /// `reject_stream` (a new stream rejected for resource pressure) and
-    /// `tombstone_reaped_stream` (an active stream reaped for idle/rate-floor
-    /// violation): both call sites need the identical bound, and neither has
-    /// a good way to spend a caller-visible error on table upkeep -- a
-    /// rejection or a reap must always succeed at quarantining its own
-    /// stream_id, even when the table is momentarily saturated with older
-    /// entries that a real sender may or may not still be retrying against.
-    fn tombstone_stream(&mut self, stream_id: u64) {
-        if !self.rejected_streams.contains_key(&stream_id)
-            && self.rejected_streams.len() >= MAX_REJECTED_STREAMS
-        {
-            if let Some(oldest) = self
-                .rejected_streams
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(id, _)| *id)
-            {
-                self.rejected_streams.remove(&oldest);
-            }
+    /// Quarantines a reaped stream id the same way `reject_stream`
+    /// quarantines a resource-pressure rejection, carrying over the exact
+    /// chunk-completion state `stream` had already validated while active
+    /// (see `RejectedStreamTombstone::reaped`) instead of starting blind.
+    /// If that state already shows the generation complete -- every chunk
+    /// it declared was already committed before it was reaped -- there is
+    /// nothing left a compliant sender could still send, so no tombstone is
+    /// needed at all.
+    fn tombstone_reaped_stream(
+        &mut self,
+        stream_id: u64,
+        total_size: u64,
+        chunk_stride: Option<usize>,
+        expected_chunks: Option<usize>,
+        received_chunks: Vec<u64>,
+    ) {
+        let tombstone =
+            RejectedStreamTombstone::reaped(total_size, chunk_stride, expected_chunks, received_chunks);
+        if tombstone.is_complete() {
+            self.rejected_streams.remove(&stream_id);
+            return;
         }
-        self.rejected_streams
-            .insert(stream_id, std::time::Instant::now());
+        self.rejected_streams.insert(stream_id, tombstone);
     }
 }
 
@@ -2447,56 +2598,60 @@ mod tests {
         );
     }
 
-    /// The reap-tombstone table must stay bounded no matter how many streams
-    /// are reaped over its lifetime: `MAX_REJECTED_STREAMS` is enforced by
-    /// evicting the oldest tombstone, never by growing without bound.
+    /// The reap-tombstone table has no capacity bound: an incomplete
+    /// tombstone is never evicted merely to make room for another. Reaping
+    /// many more streams than the old fixed 32-entry cap allowed must not
+    /// remove any earlier, still-incomplete tombstone -- each is cleared
+    /// only by its own completion or a retry.
     ///
     /// Drives `tombstone_reaped_stream` directly (the exact function
     /// `cleanup_stale_with` calls for every id it reaps) rather than forcing
-    /// real streams through real idle timeouts, so the bound is exercised
-    /// deterministically and without sleeping out the tombstone TTL.
+    /// real streams through real idle timeouts, so this is exercised
+    /// deterministically.
     #[test]
-    fn rejected_stream_table_stays_bounded_under_many_reaped_ids() {
+    fn rejected_stream_table_never_evicts_incomplete_tombstones_no_matter_how_many_are_reaped() {
         let mut state = StreamingState::new();
+        const REAPED_COUNT: u64 = 96; // several multiples of the old 32-entry cap
 
-        for stream_id in 0..(MAX_REJECTED_STREAMS as u64 * 3) {
-            state.tombstone_reaped_stream(stream_id);
-            assert!(
-                state.rejected_stream_count() <= MAX_REJECTED_STREAMS,
-                "tombstone table exceeded its bound after reaping stream_id={stream_id}: {} > {}",
-                state.rejected_stream_count(),
-                MAX_REJECTED_STREAMS
-            );
+        for stream_id in 0..REAPED_COUNT {
+            // total_size=16, stride=8: chunk 0 already committed, chunk 1
+            // still outstanding -- genuinely incomplete, so it must survive.
+            state.tombstone_reaped_stream(stream_id, 16, Some(8), Some(2), vec![0b1]);
         }
 
         assert_eq!(
             state.rejected_stream_count(),
-            MAX_REJECTED_STREAMS,
-            "table should settle at its cap once more ids than it can hold have been reaped"
+            REAPED_COUNT as usize,
+            "no incomplete tombstone may be evicted merely because more streams were reaped afterward"
         );
 
-        // The most recently reaped ids -- the ones a sender is most likely
-        // to still be retrying against -- must be the ones retained.
-        let newest = MAX_REJECTED_STREAMS as u64 * 3 - 1;
+        // The *first* reaped id -- the one an eviction-by-age/order policy
+        // would sacrifice first -- must still be tombstoned: its own
+        // trailing chunk (index 1) must be a clean discard, not a fatal
+        // unknown-stream error.
         assert!(
             state
-                .reserve_v5_chunk_or_discard(newest, 0, 1)
-                .expect("recently reaped id must still be tombstoned")
+                .reserve_v5_chunk_or_discard(0, 1, 8)
+                .expect("the first reaped id's trailing chunk must still be discarded cleanly")
                 .is_none(),
-            "the most recently reaped id must be retained, not evicted"
+            "the first reaped id must not have been evicted by the reaps that followed it"
         );
+        // Completing its declared size removes the tombstone.
+        assert_eq!(state.rejected_stream_count(), REAPED_COUNT as usize - 1);
     }
 
-    /// `reject_stream` must never propagate `ResourceBusy` once its own
-    /// tombstone table is full, even when nothing has ever been reaped.
-    /// `begin_v5_stream_or_discard` calls it via `?`, so a fallible
-    /// `reject_stream` at capacity turns what should be a bounded per-stream
-    /// discard into a connection-fatal error -- a peer sustaining
-    /// resource-pressure rejections with no intervening reaps would take the
-    /// whole connection down over tombstone-table upkeep that has nothing to
-    /// do with the stream_id it was trying to reject.
+    /// Review finding (`protocol.rs:963`): evicting the oldest tombstone at
+    /// a fixed capacity is not a correct answer to "which tombstone can be
+    /// sacrificed" -- streaming frames interleave, so nothing bounds how
+    /// many *other* streams can be rejected while one specific rejected
+    /// generation still has trailing chunks in flight. Reproduces exactly:
+    /// 16 active streams, then a multi-frame rejection, then 33 further
+    /// distinct multi-frame rejections with no reaps or retries in between
+    /// (more than the old 32-entry cap) -- the first rejection's own
+    /// trailing chunk must still be a clean discard, not the fatal
+    /// "unknown stream_id" a since-evicted tombstone would produce.
     #[test]
-    fn reject_stream_stays_bounded_and_never_fails_with_no_reaps_in_between() {
+    fn reject_stream_never_fails_and_never_evicts_an_earlier_incomplete_tombstone() {
         let mut state = StreamingState::new();
         let pool = Arc::new(crate::AlignedBytesPool::default());
 
@@ -2518,13 +2673,32 @@ mod tests {
                 .expect("must be admitted, not discarded");
         }
 
-        // Every further, distinct stream_id is resource-pressure rejected --
-        // more of them than MAX_REJECTED_STREAMS, and never a single reap in
-        // between.
-        for stream_id in 1000..(1000 + MAX_REJECTED_STREAMS as u64 * 2) {
+        // The 17th stream is a multi-frame rejection (total_size=16,
+        // first_chunk_len=8 leaves one more chunk outstanding) -- the first
+        // rejection, and the one an LRU-by-touch policy would evict first.
+        let first_rejected = crate::StreamHeader {
+            stream_id: 17,
+            total_size: 16,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        assert!(
+            state
+                .begin_v5_stream_or_discard(first_rejected, 1, pool.clone(), false, 8)
+                .expect("resource pressure is a stream-local rejection")
+                .is_none()
+        );
+
+        // 33 further, distinct, multi-frame rejections follow -- more than
+        // the old 32-entry cap -- with no reaps or retries in between.
+        // Under the old LRU-at-capacity policy this is exactly what evicted
+        // the first tombstone.
+        for stream_id in 1000..1033u64 {
             let header = crate::StreamHeader {
                 stream_id,
-                total_size: 8,
+                total_size: 16,
                 chunk_size: 8,
                 chunk_index: 0,
                 type_hash: 0,
@@ -2539,11 +2713,20 @@ mod tests {
                 result.unwrap().is_none(),
                 "a resource-pressure-rejected stream must not be admitted"
             );
-            assert!(
-                state.rejected_stream_count() <= MAX_REJECTED_STREAMS,
-                "rejected_streams table exceeded its bound"
-            );
         }
+
+        // The first rejected stream's own trailing chunk (index 1) must
+        // still be a clean discard -- its tombstone must not have been
+        // evicted by the 33 unrelated rejections that followed it.
+        let trailing = state.reserve_v5_chunk_or_discard(17, 1, 8);
+        assert!(
+            trailing.is_ok(),
+            "the first rejected stream's trailing chunk must not be a fatal unknown-stream error: {trailing:?}"
+        );
+        assert!(
+            trailing.unwrap().is_none(),
+            "the first rejected stream's trailing chunk must be discarded, not accepted as fresh"
+        );
     }
 
     /// A single large chunk that trickles in slowly must not be reaped
@@ -2740,14 +2923,15 @@ mod tests {
         );
     }
 
-    /// A tombstone must never be pruned by wall-clock age alone:
-    /// `rejected_streams` is bounded entirely by `MAX_REJECTED_STREAMS` (see
-    /// `rejected_stream_table_stays_bounded_under_many_reaped_ids`), not by
-    /// a TTL swept by `cleanup_stale_with`. A sender that keeps trickling
-    /// chunks into a reaped id must keep getting them silently discarded no
-    /// matter how many cleanup sweeps run in between or how long the gaps
-    /// between hits are -- there is no window in which the tombstone can
-    /// have "aged out" on its own.
+    /// A tombstone must never be pruned by wall-clock age alone: it is
+    /// removed only once proven complete or superseded by a retry, never by
+    /// a TTL swept by `cleanup_stale_with` (see `RejectedStreamTombstone`'s
+    /// invariant, and `rejected_stream_table_never_evicts_incomplete_tombstones_no_matter_how_many_are_reaped`
+    /// for the companion "no capacity eviction either" property). A sender
+    /// that keeps trickling chunks into a reaped id must keep getting them
+    /// silently discarded no matter how many cleanup sweeps run in between
+    /// or how long the gaps between hits are -- there is no window in which
+    /// the tombstone can have "aged out" on its own.
     #[test]
     fn tombstone_survives_repeated_cleanup_sweeps_regardless_of_elapsed_time() {
         use std::time::Duration;
@@ -2782,7 +2966,7 @@ mod tests {
 
         // Repeated cleanup sweeps, each well past the old TTL this table
         // used to be pruned by, must never remove the tombstone on their
-        // own -- only `MAX_REJECTED_STREAMS` capacity pressure can.
+        // own -- only its own completion or a retry can.
         for _ in 0..4 {
             std::thread::sleep(idle_timeout * 3);
             state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
