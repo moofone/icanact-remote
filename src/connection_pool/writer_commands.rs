@@ -140,10 +140,10 @@ impl BytesStreamingResponse {
 /// A unique buffer is kept zero-copy only while its backing allocation is
 /// within this factor of the visible payload. Beyond it, the backing
 /// allocation is treated as slop from a larger scratch buffer (e.g. a small
-/// slice taken at offset 0 of a much bigger read/response buffer) rather than
-/// a right-sized response, and is compacted instead. `2x` tolerates ordinary
-/// allocator rounding without letting a small logical response retain an
-/// arbitrarily larger allocation.
+/// slice taken from the head or tail of a much bigger read/response buffer)
+/// rather than a right-sized response, and is compacted instead. `2x`
+/// tolerates ordinary allocator rounding without letting a small logical
+/// response retain an arbitrarily larger allocation.
 const STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR: usize = 2;
 
 /// Return a streaming payload together with the allocation footprint retained
@@ -153,30 +153,44 @@ const STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR: usize = 2;
 /// much larger allocation alive, so a streaming queue that accounts only for
 /// `len()` can retain unbounded memory behind its byte cap. Unique `Bytes`
 /// values can expose their existing capacity without a copy, but
-/// `BytesMut::capacity()` reports the remaining capacity from the buffer's
-/// *own* start pointer to the end of its allocation -- for a small slice
-/// taken at offset 0 of a much larger buffer (still the sole owner, so
-/// `try_into_mut` still succeeds), that is the whole backing allocation, not
-/// the logical response size. Retaining that zero-copy would count the
-/// response against the admission reserve far above what it actually holds
-/// onto, which can trip admission for a payload nowhere near the real byte
-/// cap. Only buffers within `STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR` of their
-/// visible length keep the zero-copy path; everything else -- oversized
-/// unique buffers as well as shared/owner-backed values -- is compacted once
-/// on this streaming-only path so accounting always matches the real
-/// footprint. The ordinary actor-message queue and its hot path are
+/// `BytesMut::capacity()` only reports the remaining capacity from the
+/// buffer's *own* start pointer to the end of its allocation. For a slice
+/// taken at offset 0 of a much larger buffer that overreports (the whole
+/// backing allocation, correctly rejected by the slop check below), but for a
+/// slice taken from the *tail* of a much larger buffer it *underreports*:
+/// nothing remains after the tail, so `capacity()` comes back close to
+/// `payload_len` -- passing the slop check and staying zero-copy -- while the
+/// buffer still pins the entire backing allocation behind it, invisible to
+/// `capacity()` alone.
+///
+/// `BytesMut::try_reclaim` closes that gap. It never allocates (`bytes`
+/// guarantees it only ever reuses storage the handle already owns), so a
+/// minimal probe is safe to call unconditionally: when the sole owner has at
+/// least `payload_len` bytes of *reclaimable* room behind its current view --
+/// exactly the tail-slice shape above -- it copies the view back to the true
+/// start of the allocation and `capacity()` reports the real size from then
+/// on. A buffer with no such hidden room (the common, honestly-sized case)
+/// returns `false` at the cost of a few comparisons: no copy, no allocation,
+/// no change to `capacity()`. Only buffers within
+/// `STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR` of their visible length, by this
+/// now-trustworthy accounting, keep the zero-copy path; everything else --
+/// oversized unique buffers as well as shared/owner-backed values -- is
+/// compacted once on this streaming-only path so accounting always matches
+/// the real footprint. The ordinary actor-message queue and its hot path are
 /// unchanged.
 fn normalize_streaming_payload(payload: bytes::Bytes) -> (bytes::Bytes, usize) {
     let payload_len = payload.len();
     match payload.try_into_mut() {
-        Ok(buffer) if buffer.capacity() <= payload_len.saturating_mul(STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR) =>
-        {
-            let retained_bytes = buffer.capacity().max(payload_len);
-            (buffer.freeze(), retained_bytes)
-        }
-        Ok(buffer) => {
-            let compact = bytes::Bytes::copy_from_slice(&buffer[..]);
-            (compact, payload_len)
+        Ok(mut buffer) => {
+            let _ = buffer.try_reclaim(1);
+            if buffer.capacity() <= payload_len.saturating_mul(STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR)
+            {
+                let retained_bytes = buffer.capacity().max(payload_len);
+                (buffer.freeze(), retained_bytes)
+            } else {
+                let compact = bytes::Bytes::copy_from_slice(&buffer[..]);
+                (compact, payload_len)
+            }
         }
         Err(payload) => {
             let compact = bytes::Bytes::copy_from_slice(&payload);
@@ -717,6 +731,59 @@ mod normalize_streaming_payload_tests {
             retained_bytes <= VISIBLE_LEN * 4,
             "retained_bytes must reflect the logical payload size ({VISIBLE_LEN}), not the \
              {BACKING_CAPACITY}-byte backing allocation; got {retained_bytes}"
+        );
+    }
+
+    /// The test above slices at offset 0, where `BytesMut::capacity()` is
+    /// honest: it reports the *whole* backing allocation, so the slop check
+    /// correctly rejects it and this passes whether or not the offset is
+    /// accounted for. `capacity()` only measures from a buffer's own start
+    /// pointer to the end of its allocation, so it stops being honest for a
+    /// slice taken from the *tail* instead: a unique 100-byte tail slice of a
+    /// 1MB buffer reports `capacity() == 100` (nothing left after it), not
+    /// 1MB -- passing the slop guard and staying zero-copy while pinning the
+    /// entire 1MB allocation, with `retained_bytes` recording only the small
+    /// figure. Repeated responses of this shape defeat the streaming queue's
+    /// hard byte cap entirely. A slice from the head proves nothing about
+    /// this path; this one constructs the adversarial tail shape directly.
+    #[test]
+    fn does_not_retain_full_backing_capacity_for_a_tail_slice_of_a_large_buffer() {
+        const BACKING_CAPACITY: usize = 1_000_000;
+        const VISIBLE_LEN: usize = 100;
+
+        let mut buf = bytes::BytesMut::with_capacity(BACKING_CAPACITY);
+        buf.extend_from_slice(&vec![0u8; BACKING_CAPACITY]);
+        let full = buf.freeze();
+        let backing_start = full.as_ptr() as usize;
+        let tail = full.slice(BACKING_CAPACITY - VISIBLE_LEN..);
+        // Drop the sibling handle so `tail` is the sole owner and
+        // `try_into_mut` takes the zero-copy path this test targets.
+        drop(full);
+
+        let (payload, retained_bytes) = normalize_streaming_payload(tail);
+
+        assert_eq!(payload.len(), VISIBLE_LEN);
+
+        // The bug this test targets is not a wrong *value* in `retained_bytes`
+        // taken alone -- both the buggy and fixed paths can report a small
+        // number here. It is a mismatch between that number and what the
+        // *returned payload* actually keeps alive. A buggy path still shares
+        // storage with the 1MB backing allocation (its data pointer falls
+        // inside that allocation's address range); a correctly compacted
+        // payload is a fresh, independent allocation and cannot land there.
+        let payload_start = payload.as_ptr() as usize;
+        let still_shares_the_backing_allocation =
+            payload_start >= backing_start && payload_start < backing_start + BACKING_CAPACITY;
+        assert!(
+            !still_shares_the_backing_allocation,
+            "the returned payload must not still share the {BACKING_CAPACITY}-byte backing \
+             allocation with a tail slice this small -- it must be compacted into its own, \
+             right-sized buffer"
+        );
+        assert!(
+            retained_bytes <= VISIBLE_LEN * 4,
+            "retained_bytes ({retained_bytes}) must reflect the logical payload size \
+             ({VISIBLE_LEN}) once compacted, not the {BACKING_CAPACITY}-byte backing allocation"
         );
     }
 
