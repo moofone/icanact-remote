@@ -4422,8 +4422,16 @@ async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_r
     // Pass 1: max_message_size effectively unbounded (still within the V5
     // 27-bit limit), so the response always gets built and sent. Read its
     // real, current encoded body length off the wire.
+    //
+    // The two registries' bind addresses ("10.90.0.11:9501" /
+    // "10.90.0.12:9501") must be the same *string length*: each registry
+    // embeds its own `advertised_addr().to_string()` as `sender_bind_addr`
+    // in the response it builds, so an address-length mismatch between
+    // passes would change the measured payload by that delta and the test
+    // would no longer isolate GOSSIP_HEADER_LEN -- it would pass or fail for
+    // reasons unrelated to the header-overhead accounting it exists to pin.
     let (registry_a, mut peer_a) = registry_with_connection(
-        "10.90.0.9:9501".parse().unwrap(),
+        "10.90.0.11:9501".parse().unwrap(),
         "full-sync-body-len-boundary-local-a",
         sender_peer_id.clone(),
         sender_addr,
@@ -4451,7 +4459,7 @@ async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_r
     // encoded body is `GOSSIP_HEADER_LEN` bytes larger than the limit, so
     // the response must be rejected locally: nothing reaches the wire.
     let (registry_b, mut peer_b) = registry_with_connection(
-        "10.90.0.10:9501".parse().unwrap(),
+        "10.90.0.12:9501".parse().unwrap(),
         "full-sync-body-len-boundary-local-b",
         sender_peer_id.clone(),
         sender_addr,
