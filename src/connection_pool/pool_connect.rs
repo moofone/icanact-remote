@@ -3904,6 +3904,12 @@ impl<T> ConnectionPool<T> {
                 if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
                     let had_failures = peer_info.failures > 0;
                     peer_info.outbound_dial_success = true;
+                    // We just independently proved this exact address is
+                    // dialable (this function only ever runs after a
+                    // fresh outbound dial completed, never for a reused
+                    // inbound connection); a stale fallback attribution
+                    // no longer applies.
+                    peer_info.mark_dialability_confirmed();
                     if had_failures {
                         info!(peer = %peer_addr,
                                   prev_failures = peer_info.failures,
@@ -4304,6 +4310,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_connection: None,
                                 current_session_epoch: 0,
                                 identity_verified: false,
+                                transport_source_keyed: false,
                             });
                         }
                     }
@@ -4573,6 +4580,7 @@ pub(crate) fn handle_incoming_message(
                                 current_session_connection: None,
                                 current_session_epoch: 0,
                                 identity_verified: false,
+                                transport_source_keyed: false,
                             });
                         }
                     }
