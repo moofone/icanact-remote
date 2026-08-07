@@ -44,12 +44,15 @@ const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 /// admission -- is known, so unconditional dispatch would compute a response
 /// this connection cannot currently retain and then discard it
 /// (`can_admit_response` -> `WouldBlock`, the drop documented at
-/// `queue_streaming_response_bytes`/`_pooled`). `is_actor_ask_dispatch`
+/// `queue_streaming_response_bytes`/`_pooled`). `actor_ask_correlation_id`
 /// combined with the same `is_full` check gates dispatch specifically (not
 /// the read) at each of `io_task`'s three call sites: an ask's frame is still
-/// read off the wire either way, but its handler only runs once the queue has
-/// room. Tells, control frames, and every other message keep dispatching
-/// unconditionally -- that is what actually lets the queue drain.
+/// read off the wire either way, but once the queue has no room its handler
+/// never runs -- the peer gets an immediate `AskNackReason::Backpressure`
+/// NACK instead, rather than being left to time out or having a computed
+/// answer discarded after the fact. Tells, control frames, and every other
+/// message keep dispatching unconditionally -- that is what actually lets
+/// the queue drain.
 ///
 /// What is NOT covered by either fix: a partial frame pending together with
 /// `response_batch`/`direct_response_batch` at their own (much smaller, ~8MB)
@@ -1047,20 +1050,25 @@ impl LockFreeStreamHandle {
             }
         }
 
-        /// True for an `ActorAsk`-shaped read result: dispatching it calls an
-        /// ask handler whose response, depending on its size, may need
-        /// `local_streaming_queue` admission (`write_ask_disposition_io` ->
+        /// `Some(correlation_id)` for an `ActorAsk`-shaped read result:
+        /// dispatching it calls an ask handler whose response, depending on
+        /// its size, may need `local_streaming_queue` admission
+        /// (`write_ask_disposition_io` ->
         /// `queue_streaming_response_bytes`/`_pooled`). `DirectAsk` is
         /// excluded: it answers through `direct_response_batch`, never
-        /// through the streaming queue, so it has nothing to gate here.
-        fn is_actor_ask_dispatch(result: &ReadIoResult) -> bool {
+        /// through the streaming queue, so it has nothing to gate here. The
+        /// correlation id is returned (not just a bool) so a caller that
+        /// decides not to dispatch can still answer the peer with a NACK
+        /// instead of silently dropping the already-read ask.
+        fn actor_ask_correlation_id(result: &ReadIoResult) -> Option<u32> {
             match result {
-                ReadIoResult::ActorAsk { .. } => true,
+                ReadIoResult::ActorAsk { correlation_id, .. } => Some(*correlation_id),
                 ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
                     msg_type,
+                    correlation_id,
                     ..
-                }) => *msg_type == crate::MessageType::ActorAsk as u8,
-                _ => false,
+                }) if *msg_type == crate::MessageType::ActorAsk as u8 => Some(*correlation_id),
+                _ => None,
             }
         }
 
@@ -2419,15 +2427,27 @@ impl LockFreeStreamHandle {
                             // discard it (the drop this PR documents at
                             // `queue_streaming_response_bytes`/`_pooled`).
                             // Skipping dispatch avoids wasting that
-                            // computation; it does not avoid the peer timing
-                            // out instead of getting an immediate failure --
-                            // that still needs a wire-level ask NACK (open,
-                            // unmerged PR #185), not invented here. This is
-                            // deliberately conservative: it also skips asks
+                            // computation, and the peer is answered with a
+                            // best-effort `AskNackReason::Backpressure` NACK
+                            // instead of being left to time out. Queued
+                            // (`LocalStreamingQueue::queue_ask_nack`), not
+                            // written here: this may run while
+                            // `pending_stream_cmd` still owns a partially
+                            // written streaming frame, and writing directly
+                            // would splice the NACK into it. This is
+                            // deliberately conservative: it also NACKs asks
                             // whose response would have been small enough to
                             // never need streaming admission at all, since
                             // that is not knowable before the handler runs.
-                            if is_actor_ask_dispatch(&result) && local_streaming_queue.is_full() {
+                            if local_streaming_queue.is_full()
+                                && let Some(correlation_id) = actor_ask_correlation_id(&result)
+                            {
+                                local_streaming_queue.queue_ask_nack(
+                                    crate::framing::write_ask_nack_header(
+                                        correlation_id,
+                                        crate::framing::AskNackReason::Backpressure,
+                                    ),
+                                );
                                 continue;
                             }
                             let fast_result = match try_handle_fast_io(
@@ -2601,10 +2621,18 @@ impl LockFreeStreamHandle {
                                 // See the matching comment on the primary
                                 // drain loop: do not dispatch an ActorAsk
                                 // while the streaming queue has no room for
-                                // even one more protocol-sized response.
-                                if is_actor_ask_dispatch(&result)
-                                    && local_streaming_queue.is_full()
+                                // even one more protocol-sized response --
+                                // answer with an `AskNackReason::Backpressure`
+                                // NACK instead.
+                                if local_streaming_queue.is_full()
+                                    && let Some(correlation_id) = actor_ask_correlation_id(&result)
                                 {
+                                    local_streaming_queue.queue_ask_nack(
+                                        crate::framing::write_ask_nack_header(
+                                            correlation_id,
+                                            crate::framing::AskNackReason::Backpressure,
+                                        ),
+                                    );
                                     continue;
                                 }
                                 let fast_result = match try_handle_fast_io(
@@ -2765,10 +2793,19 @@ impl LockFreeStreamHandle {
                                     // drain loop: do not dispatch an ActorAsk
                                     // while the streaming queue has no room
                                     // for even one more protocol-sized
-                                    // response.
-                                    if is_actor_ask_dispatch(&result)
-                                        && local_streaming_queue.is_full()
+                                    // response -- answer with an
+                                    // `AskNackReason::Backpressure` NACK
+                                    // instead.
+                                    if local_streaming_queue.is_full()
+                                        && let Some(correlation_id) =
+                                            actor_ask_correlation_id(&result)
                                     {
+                                        local_streaming_queue.queue_ask_nack(
+                                            crate::framing::write_ask_nack_header(
+                                                correlation_id,
+                                                crate::framing::AskNackReason::Backpressure,
+                                            ),
+                                        );
                                         continue;
                                     }
                                     let fast_result = match try_handle_fast_io(
