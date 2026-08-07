@@ -71,6 +71,97 @@ where
     Ok(result)
 }
 
+/// Bound on a single attempt to write an ask-backpressure NACK header (see
+/// `try_write_ask_backpressure_nack`). The `io_task` read loop that calls
+/// this owns the connection's socket read side too, so a write that parks
+/// indefinitely on a peer that has stopped draining would park reads with
+/// it -- exactly the shape of deadlock `icanact-remote#186` closes for the
+/// streaming slice writer. A NACK is best-effort, not a delivery guarantee,
+/// so unlike a streaming response frame it can simply be abandoned once an
+/// attempt makes zero progress rather than retried forever.
+const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// See `STREAM_WRITE_SLICE_TIMEOUT`. Only reached once a NACK write has
+/// already committed some bytes to the wire (so it can no longer be
+/// abandoned without corrupting later frames on this connection) and then
+/// stalls -- the backstop for a peer that is truly gone, not merely slow.
+const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
+
+/// Write an ask-backpressure NACK header without risking parking the
+/// caller's read loop on a peer that has stopped draining.
+/// `write_ask_nack_direct` (this file's sibling `read_pipeline.rs`) is the
+/// right shape for the header itself -- reused here via
+/// `write_ask_nack_header` -- but it writes with a plain `write_all`, which
+/// loops over as many `poll_write` calls as it takes and is therefore unsafe
+/// to cancel: a timeout firing between two of those internal polls would
+/// abandon a *partially written* frame, corrupting wire framing for every
+/// later frame on this connection. `write_vectored_once` instead performs
+/// exactly one `poll_write` cycle per call, so each attempt here is
+/// individually safe to bound with `STREAM_WRITE_SLICE_TIMEOUT` -- per the
+/// `AsyncWrite` contract, a `Pending` result never writes a partial byte, so
+/// a timeout before any byte of the header has gone out (`offset == 0`) can
+/// always be abandoned cleanly: nothing was committed to the wire, and the
+/// peer simply times out on this ask instead of getting a fast NACK. Once
+/// any byte of the header *has* gone out, the frame is underway and can no
+/// longer be abandoned safely, so from that point this retries with the same
+/// per-attempt bound until either it completes or `STREAM_WRITE_STUCK_TEARDOWN`
+/// elapses with zero further progress, at which point the caller tears the
+/// connection down rather than leaving it wedged mid-frame forever.
+///
+/// Returns `Ok(true)` if the NACK was written, `Ok(false)` if it was
+/// abandoned cleanly before committing any bytes (the caller should keep
+/// reading either way -- an ask NACK is best-effort, not a delivery
+/// guarantee), or `Err` on a real write error or a stuck mid-frame write
+/// (the caller should tear the connection down, same as any other write
+/// failure in this file).
+async fn try_write_ask_backpressure_nack<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    correlation_id: u32,
+) -> std::io::Result<bool>
+where
+    S: AsyncWrite + Unpin,
+{
+    let header = crate::framing::write_ask_nack_header(
+        correlation_id,
+        crate::framing::AskNackReason::Backpressure,
+    );
+    let mut offset = 0usize;
+    let mut stuck_since: Option<Instant> = None;
+    loop {
+        match tokio::time::timeout(
+            STREAM_WRITE_SLICE_TIMEOUT,
+            write_vectored_once(stream, &[std::io::IoSlice::new(&header[offset..])]),
+        )
+        .await
+        {
+            Ok(Ok(n)) => {
+                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                *bytes_since_flush += n;
+                offset += n;
+                if offset >= header.len() {
+                    return Ok(true);
+                }
+                stuck_since = None;
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                if offset == 0 {
+                    return Ok(false);
+                }
+                let wedged_since = *stuck_since.get_or_insert_with(Instant::now);
+                if wedged_since.elapsed() >= STREAM_WRITE_STUCK_TEARDOWN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ask backpressure NACK write stuck mid-frame",
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
 /// frame-boundary yield lets the scheduler interleave another streaming source
 /// without materializing the remaining response into per-frame commands.
