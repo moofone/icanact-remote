@@ -24429,8 +24429,12 @@ mod tests {
         let addr = test_addr(9431);
         let pool = reg.connection_pool.clone();
 
-        reg.add_peer_with_node_id(addr, Some(owner_node), crate::addr_ownership::ClaimKind::Verified)
-            .await;
+        reg.add_peer_with_node_id(
+            addr,
+            Some(owner_node),
+            crate::addr_ownership::ClaimKind::Verified,
+        )
+        .await;
 
         // The OLD (about to fail) connection: published and armed as the
         // genuinely current session before the failure.
@@ -24649,8 +24653,7 @@ mod tests {
     /// recovery -- stranding a genuinely restarted owner's actor absent
     /// even though nobody ever explicitly unregistered it.
     #[tokio::test]
-    async fn apply_delta_removal_does_not_upgrade_peer_death_tombstone_after_actor_already_gone()
-     {
+    async fn apply_delta_removal_does_not_upgrade_peer_death_tombstone_after_actor_already_gone() {
         let reg = GossipRegistry::<()>::new(
             test_addr(7915),
             test_config_with_seed("tombstone-kind-multi-observer"),
