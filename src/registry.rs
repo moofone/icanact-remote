@@ -4532,15 +4532,21 @@ impl<T: 'static> GossipRegistry<T> {
                 for (peer_addr, peer_info) in gossip_state.peers.iter_mut() {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
-                        peer_info.outbound_dial_success = true;
                         // We only independently proved `conn.addr` is
-                        // dialable when the resolved connection is
-                        // genuinely outbound -- nothing here corroborates
-                        // dialability for `configured_addr` too, when it
-                        // differs (see above), nor for an inbound
-                        // connection that merely happens to be published
-                        // at `conn.addr` (see PeerInfo::transport_source_keyed).
+                        // dialable, by a genuine outbound dial, when the
+                        // resolved connection is itself outbound --
+                        // nothing here corroborates dialability for
+                        // `configured_addr` too, when it differs (see
+                        // above), nor for an inbound connection that
+                        // merely happens to be published at `conn.addr`
+                        // (see PeerInfo::transport_source_keyed).
+                        // `outbound_dial_success`'s name is a promise this
+                        // address was proven by an actual outbound dial,
+                        // so setting it must be scoped identically to
+                        // `mark_dialability_confirmed`, not applied to
+                        // every recovered address.
                         if *peer_addr == conn.addr && dialed_outbound {
+                            peer_info.outbound_dial_success = true;
                             peer_info.mark_dialability_confirmed();
                         }
                         peer_info.last_success = now;
@@ -4551,8 +4557,8 @@ impl<T: 'static> GossipRegistry<T> {
                 for (peer_addr, peer_info) in gossip_state.known_peers.iter_mut() {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
-                        peer_info.outbound_dial_success = true;
                         if *peer_addr == conn.addr && dialed_outbound {
+                            peer_info.outbound_dial_success = true;
                             peer_info.mark_dialability_confirmed();
                         }
                         peer_info.last_success = now;
@@ -13134,6 +13140,106 @@ mod tests {
                 .transport_source_keyed,
             "connect_to_peer resolving an INBOUND connection must never clear \
              transport_source_keyed, even for the exact address it resolved to"
+        );
+    }
+
+    /// `mark_transport_source_keyed_fallback`'s guard is only as trustworthy
+    /// as `outbound_dial_success` itself. `connect_to_peer` resolving an
+    /// existing INBOUND connection (the configured-peer supervisor reusing
+    /// a connection an inbound accept already published, exactly as in
+    /// `inbound_connection_never_clears_transport_source_keyed` above) must
+    /// NOT mark `outbound_dial_success` for that address: no outbound dial
+    /// happened. If it did, a LATER inbound-accept fallback classification
+    /// for the very same ephemeral source would see (bogus) dial evidence
+    /// and decline to set `transport_source_keyed`, leaving a non-dialable
+    /// address eligible for `peers_snapshot` and a `PeerDiscovery` slot --
+    /// the exact hole this PR exists to close.
+    #[tokio::test]
+    async fn connect_to_peer_reusing_inbound_connection_does_not_poison_fallback_marking() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let mut config = test_config_with_seed("connect-to-peer-inbound-reuse-poisons-fallback");
+        config.enable_peer_discovery = true;
+        config.allow_loopback_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(20_290), config);
+        let peer_id = test_peer_id("inbound-reuse-poisons-fallback");
+        let addr = test_addr(20_291);
+
+        // `configure_peer` creates the entry with no dialability evidence
+        // yet: `outbound_dial_success: false`, `transport_source_keyed: false`.
+        registry.configure_peer(peer_id.clone(), addr).await;
+
+        // An existing published INBOUND connection for this peer ID, at the
+        // SAME address -- an inbound accept already published this before
+        // the configured-peer supervisor's connect attempt runs.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id.clone(), addr, conn.clone());
+
+        // The configured-peer supervisor's connect attempt: resolves the
+        // existing INBOUND connection, no real dial occurs.
+        registry
+            .connect_to_peer(&peer_id)
+            .await
+            .expect("existing inbound connection must resolve without a real dial");
+
+        // The fallback marking `handle.rs`'s inbound-accept path performs
+        // for a claim that fell back to this exact observed source.
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let peer_info = state.peers.get_mut(&addr).expect("peer must exist");
+            assert!(
+                !peer_info.outbound_dial_success,
+                "connect_to_peer resolving an INBOUND connection must not mark \
+                 outbound_dial_success -- no outbound dial occurred"
+            );
+            peer_info.mark_transport_source_keyed_fallback();
+        }
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            state
+                .peers
+                .get(&addr)
+                .expect("peer must exist")
+                .transport_source_keyed,
+            "the fallback marking must take effect: connect_to_peer reusing an \
+             inbound connection is not outbound-dial evidence and must not \
+             suppress it"
+        );
+        drop(state);
+
+        let snapshot = registry.peers_snapshot().await;
+        assert!(
+            !snapshot.iter().any(|p| p.address == addr.to_string()),
+            "a transport-source-keyed entry must never be advertised as a \
+             dialable peer: {snapshot:?}"
+        );
+
+        registry.mark_peer_connected(addr).await;
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.connected_peer_count(),
+            0,
+            "a transport-source-keyed entry must not occupy a PeerDiscovery slot"
         );
     }
 
