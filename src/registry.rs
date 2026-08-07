@@ -8641,6 +8641,18 @@ impl<T: 'static> GossipRegistry<T> {
     /// only among aliases tied on both does fewer failures win. All three
     /// are evaluated while iterating, so the result is independent of
     /// visitation order.
+    ///
+    /// Ranking alone only helps a `transport_source_keyed` alias lose when
+    /// the SAME identity also has a better alias to lose to. When it is
+    /// the ONLY alias for its identity, it wins its own one-entry bucket
+    /// trivially and would otherwise be returned -- burning one of the
+    /// caller's bounded target slots on an address that is not live and
+    /// not dialable by anyone else. A non-live source-keyed alias is
+    /// therefore excluded outright, in addition to being ranked low, and
+    /// that exclusion lives here (not in each caller's `eligible`
+    /// closure) so it cannot be forgotten at a future call site the way
+    /// the ranking itself was, three separate times, before this
+    /// function existed.
     fn select_best_alias_per_identity(
         peers: &HashMap<SocketAddr, PeerInfo>,
         is_live: impl Fn(SocketAddr, &PeerInfo) -> bool,
@@ -8656,6 +8668,9 @@ impl<T: 'static> GossipRegistry<T> {
             }
             let live = is_live(*addr, peer);
             let dialable = !peer.transport_source_keyed;
+            if !dialable && !live {
+                continue;
+            }
             best_by_identity
                 .entry(PeerDispatchKey::for_entry(*addr, peer))
                 .and_modify(|(best_addr, best_live, best_dialable, best_failures)| {
@@ -12437,6 +12452,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Ranking only helps a `transport_source_keyed` alias lose when the
+    /// SAME identity has a better alias to lose to. When it is the ONLY
+    /// alias for its identity, ranking alone still returns it -- it wins
+    /// its own one-entry `best_by_identity` bucket trivially -- burning one
+    /// of `select_immediate_gossip_peers_for_test`'s bounded target slots
+    /// on an address that is not live and not dialable by anyone else.
+    /// `select_best_alias_per_identity`'s eligibility must exclude such
+    /// entries outright, not merely rank them low.
+    #[tokio::test]
+    async fn immediate_gossip_selection_excludes_sole_transport_source_keyed_alias_with_no_live_connection(
+    ) {
+        let config = test_config();
+        let registry = GossipRegistry::<()>::new(test_addr(20_265), config);
+
+        let node_id = test_peer_id("immediate-gossip-sole-source-keyed").to_node_id();
+        let source_keyed_addr = test_addr(20_266);
+        let mut info = peer_info_with_node_id(source_keyed_addr, node_id);
+        info.identity_verified = true;
+        info.transport_source_keyed = true;
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(source_keyed_addr, info);
+        }
+
+        let selected = registry.select_immediate_gossip_peers_for_test().await;
+        assert!(
+            !selected.contains(&source_keyed_addr),
+            "a transport-source-keyed alias with no live connection must never be \
+             selected, even as the only alias for its identity: {selected:?}"
+        );
+    }
+
+    /// Same as the immediate-path test above, for the periodic
+    /// (`gossip_peer_list_inner`) path -- the P1 location. A second,
+    /// unrelated identity with a normal address is included only so
+    /// `peers_snapshot` (which already excludes `transport_source_keyed`
+    /// entries) is non-empty and the function reaches target selection at
+    /// all; it proves nothing about the exclusion itself; an identity WITH
+    /// a better alias would pass this assertion even without the fix,
+    /// which is exactly why the source-keyed identity here has no other
+    /// alias to be ranked against.
+    #[tokio::test]
+    async fn gossip_peer_list_excludes_sole_transport_source_keyed_alias_with_no_live_connection()
+    {
+        let mut config =
+            test_config_with_seed("periodic-gossip-sole-source-keyed-no-live-connection");
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(20_267), config);
+
+        let normal_node_id = test_peer_id("periodic-sole-source-keyed-normal").to_node_id();
+        let normal_addr = test_addr(20_268);
+        let mut normal_info = peer_info_with_node_id(normal_addr, normal_node_id);
+        normal_info.identity_verified = true;
+
+        let source_keyed_node_id =
+            test_peer_id("periodic-sole-source-keyed-ephemeral").to_node_id();
+        let source_keyed_addr = test_addr(20_269);
+        let mut source_keyed_info = peer_info_with_node_id(source_keyed_addr, source_keyed_node_id);
+        source_keyed_info.identity_verified = true;
+        source_keyed_info.transport_source_keyed = true;
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(normal_addr, normal_info);
+            state.peers.insert(source_keyed_addr, source_keyed_info);
+        }
+
+        let tasks = registry.gossip_peer_list_immediate().await;
+        let targeted: Vec<SocketAddr> = tasks.iter().map(|t| t.peer_addr).collect();
+        assert!(
+            !targeted.contains(&source_keyed_addr),
+            "a transport-source-keyed alias with no live connection must never be \
+             selected, even as the only alias for its identity: {targeted:?}"
+        );
+    }
+
+    /// Same shape again, for the scheduled (`prepare_gossip_round`) path.
+    #[tokio::test]
+    async fn prepare_gossip_round_excludes_sole_transport_source_keyed_alias_with_no_live_connection(
+    ) {
+        let mut config =
+            test_config_with_seed("scheduled-gossip-sole-source-keyed-no-live-connection");
+        config.small_cluster_threshold = 0;
+        let registry = GossipRegistry::<()>::new(test_addr(20_275), config);
+
+        let node_id = test_peer_id("scheduled-gossip-sole-source-keyed").to_node_id();
+        let source_keyed_addr = test_addr(20_276);
+        let mut info = peer_info_with_node_id(source_keyed_addr, node_id);
+        info.identity_verified = true;
+        info.transport_source_keyed = true;
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.peers.insert(source_keyed_addr, info);
+        }
+
+        let tasks = registry.prepare_gossip_round().await.unwrap();
+        let targeted: Vec<SocketAddr> = tasks.iter().map(|t| t.peer_addr).collect();
+        assert!(
+            !targeted.contains(&source_keyed_addr),
+            "a transport-source-keyed alias with no live connection must never be \
+             selected, even as the only alias for its identity: {targeted:?}"
+        );
     }
 
     /// `get_stats().active_peers` must count distinct physical peers, not
