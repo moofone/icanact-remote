@@ -1608,6 +1608,27 @@ pub struct PeerInfo {
     /// newer session has since been armed or the old one has expired, and
     /// the pending write must be dropped rather than applied.
     pub current_session_epoch: u64,
+    /// Durable (not one-shot) evidence that a genuine sequence-reset restart
+    /// was actually observed for THIS session -- set only by
+    /// `merge_full_sync_from_guarded` when it admits a FullSync whose
+    /// sequence is lower than `last_sequence` on the connection that armed
+    /// `accept_lower_sequence_from` (the same evidence that consumes that
+    /// one-shot exemption). Reset to `false` whenever `current_session_epoch`
+    /// is redrawn -- by `arm_sequence_reset_for_new_session` arming a new
+    /// session, by `peer_info_is_from_current_session`'s self-heal, by an
+    /// address-ownership change rekeying this entry, or by a confirmed
+    /// connection teardown -- because a brand-new TLS-authenticated session
+    /// is established on every routine reconnect too, not only on restarts,
+    /// so merely being current/armed proves nothing about whether the peer
+    /// actually restarted; only an actually-observed sequence reset does.
+    ///
+    /// This is the exact signal the restarted-owner tombstone-recovery
+    /// exemption (`owner_recovery_wins_tombstone`) requires to distinguish a
+    /// genuinely restarted owner's reset clock from an ordinary stale
+    /// replay: a session simply being current says nothing about a restart,
+    /// but a lower sequence successfully admitted on that exact session
+    /// does.
+    pub session_restart_confirmed: bool,
     /// Whether `node_id`'s ownership of this address was established by a
     /// `ClaimKind::Verified` claim (see `crate::addr_ownership`): an observed
     /// connection (inbound accept, successful outbound dial) or an explicit
@@ -1672,6 +1693,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         }
@@ -1805,6 +1827,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         }
@@ -1864,6 +1887,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         })
@@ -3815,6 +3839,7 @@ impl<T: 'static> GossipRegistry<T> {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -4221,6 +4246,12 @@ impl<T: 'static> GossipRegistry<T> {
             // able to reproduce an epoch a still-in-flight, already-stale
             // apply captured against the entry it replaced.
             peer_info.current_session_epoch = next_session_epoch();
+            // A brand-new session starts with restart NOT yet confirmed --
+            // arming happens on every routine reconnect too, not only on
+            // restarts, so it must be re-earned (by an actually-observed
+            // sequence reset in `merge_full_sync_from_guarded`) before the
+            // tombstone-recovery exemption may fire for this session.
+            peer_info.session_restart_confirmed = false;
         }
     }
 
@@ -4872,6 +4903,11 @@ impl<T: 'static> GossipRegistry<T> {
                 existing_peer.current_session_source = None;
                 existing_peer.current_session_connection = None;
                 existing_peer.current_session_epoch = next_session_epoch();
+                // The identity that earned any restart confirmation is gone
+                // -- a new owner at this address has proven no restart of
+                // its own and must earn this the same way any other session
+                // does, via an actually-observed sequence reset.
+                existing_peer.session_restart_confirmed = false;
                 existing_peer.failures = 0;
                 existing_peer.last_failure_time = None;
                 existing_peer.last_failure_instant = None;
@@ -4948,6 +4984,7 @@ impl<T: 'static> GossipRegistry<T> {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     // Derived projection: authoritative ownership lives in
                     // `PeerRegistryOwner`; this mirrors the kind it resolved
                     // for the claim that was just committed.
@@ -8145,6 +8182,7 @@ impl<T: 'static> GossipRegistry<T> {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        session_restart_confirmed: false,
                         identity_verified: false,
                         transport_source_keyed: false,
                     });
@@ -8801,6 +8839,14 @@ impl<T: 'static> GossipRegistry<T> {
         // validated must not be allowed to write. Drawn fresh from the
         // process-wide counter -- see `next_session_epoch`.
         peer_info.current_session_epoch = next_session_epoch();
+        // This successor never itself armed a session (it self-healed in
+        // instead), so it has proven no restart either -- it must earn
+        // `session_restart_confirmed` the same way any other session does,
+        // via an actually-observed sequence reset. Without this reset, a
+        // just-self-healed successor could inherit the replaced session's
+        // restart-confirmed evidence and bypass a tombstone with no
+        // genuine restart of its own behind it.
+        peer_info.session_restart_confirmed = false;
         true
     }
 
@@ -8933,6 +8979,16 @@ impl<T: 'static> GossipRegistry<T> {
         // all, so a newer session can arm (or the validated one can
         // self-expire) in that gap, and this is what lets STEP 2 detect
         // and drop the now-stale pending write instead of applying it.
+        //
+        // Durable restart evidence for the rest of THIS session, read only
+        // after session validation/self-healing and this call's own
+        // restart-detection below have both had a chance to run -- never
+        // from a snapshot taken before either, or a just-self-healed
+        // successor that never itself armed a session (and so has proven no
+        // restart) could inherit stale evidence captured against the
+        // connection it replaced. See `PeerInfo::session_restart_confirmed`
+        // and `owner_recovery_wins_tombstone`.
+        let mut owner_restart_authenticated = false;
         let captured_epoch: Option<u64> = {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(commit_seq) = ownership_commit
@@ -9025,6 +9081,10 @@ impl<T: 'static> GossipRegistry<T> {
                     // any other connection's traffic (see above).
                     peer_info.accept_lower_sequence_from = None;
                     peer_info.last_sequence = sequence;
+                    // Durable restart evidence for the rest of this session:
+                    // a genuine sequence reset was just observed on this
+                    // exact, currently-authenticated session.
+                    peer_info.session_restart_confirmed = true;
                 } else {
                     // Reached only for messages already confirmed to be
                     // from the current session (or before any session was
@@ -9033,6 +9093,12 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_info.accept_lower_sequence_from = None;
                     peer_info.last_sequence = std::cmp::max(peer_info.last_sequence, sequence);
                 }
+
+                // Read LAST, after validation/self-healing and after this
+                // call's own restart-detection above -- see the comment on
+                // this variable's declaration.
+                owner_restart_authenticated = peer_info.session_restart_confirmed;
+
                 Some(peer_info.current_session_epoch)
             } else {
                 None
@@ -10875,6 +10941,16 @@ impl<T: 'static> GossipRegistry<T> {
         self.clear_discovery_state_if_no_live_connection(failed_peer_addr)
             .await;
 
+        // Same CONFIRMED-teardown reasoning as the discovery-state clear
+        // above: invalidate this peer's session-authentication state now
+        // (see `invalidate_session_state_on_teardown`), or a stale
+        // `session_source`/`session_restart_confirmed` left over from the
+        // now-dead session could still be honored as "current" by a later
+        // message that merely presents the dead connection's own
+        // (by-then-meaningless) session source.
+        self.invalidate_session_state_on_teardown(failed_peer_addr)
+            .await;
+
         if let Some(cell) = self.peer_disconnect_handler.load_full() {
             // Skip launching the notifier if we're already shutting
             // down — the spawn would otherwise hold an Arc reference
@@ -11063,6 +11139,13 @@ impl<T: 'static> GossipRegistry<T> {
         // connection and mark it failed; both must reclaim the
         // peer-discovery slot the same way.
         self.clear_discovery_state_if_no_live_connection(failed_peer_addr)
+            .await;
+
+        // Same session-authentication invalidation as
+        // `handle_peer_connection_failure`'s address-keyed path -- see its
+        // matching call for the full rationale. This path always represents
+        // a confirmed, peer-wide teardown.
+        self.invalidate_session_state_on_teardown(failed_peer_addr)
             .await;
 
         if let Some(cell) = self.peer_disconnect_handler.load_full() {
@@ -12560,6 +12643,7 @@ impl<T: 'static> GossipRegistry<T> {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         });
@@ -12752,6 +12836,46 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         }
         discovery.on_peer_disconnected(addr);
+    }
+
+    /// Invalidates `addr`'s session-authentication state on a CONFIRMED
+    /// connection teardown: clears `current_session_source` /
+    /// `current_session_connection` / `accept_lower_sequence_from`, resets
+    /// `session_restart_confirmed`, and draws a fresh session epoch.
+    ///
+    /// Without this, a torn-down connection's `current_session_source` (and,
+    /// critically, `session_restart_confirmed` if it had been set) remain on
+    /// the `PeerInfo` entry unchanged -- `arm_sequence_reset_for_new_session`
+    /// only overwrites them when a NEW session is actually armed, and
+    /// `peer_info_is_from_current_session`'s self-heal only fires when
+    /// `connection_pool` shows a DIFFERENT connection as current. Neither
+    /// condition is guaranteed to occur promptly after a genuine teardown
+    /// (the peer may not reconnect for a while, or at all). Until one does,
+    /// any message that can still present the dead connection's own
+    /// `session_source` value (a delayed/replayed frame, or a caller with no
+    /// real per-connection TCP-source verification) would still be treated
+    /// as "the peer's current authenticated session" -- and, worse, could
+    /// still carry a stale `session_restart_confirmed = true` from BEFORE
+    /// the teardown, letting it bypass a tombstone with no genuinely live
+    /// session behind it at all (see `owner_recovery_wins_tombstone`).
+    /// Called only for a CONFIRMED teardown (the caller has already
+    /// established the failed connection was genuinely this peer's own live
+    /// session, not an already-superseded one) -- invalidating on an
+    /// unconfirmed/superseded report would incorrectly clear a still-live
+    /// successor's own, unrelated session state.
+    async fn invalidate_session_state_on_teardown(&self, addr: SocketAddr) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+            peer_info.current_session_source = None;
+            peer_info.current_session_connection = None;
+            peer_info.accept_lower_sequence_from = None;
+            peer_info.session_restart_confirmed = false;
+            // Drawn fresh from the process-wide counter -- see
+            // `next_session_epoch`'s doc comment for why a locally-reset
+            // scheme is unsafe here. Invalidates any in-flight apply that
+            // captured the pre-teardown epoch as "current".
+            peer_info.current_session_epoch = next_session_epoch();
+        }
     }
 
     /// Duplicate connection tie-breaker
@@ -14862,6 +14986,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         };
@@ -15174,6 +15299,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: true,
             transport_source_keyed: false,
         }
@@ -15559,6 +15685,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -17997,6 +18124,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         };
@@ -18024,6 +18152,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         };
@@ -20579,6 +20708,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -20658,6 +20788,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -20733,6 +20864,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -20788,6 +20920,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -20885,6 +21018,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -21011,6 +21145,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -21202,6 +21337,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -21296,6 +21432,7 @@ mod tests {
                         current_session_source: None,
                         current_session_connection: None,
                         current_session_epoch: 0,
+                        session_restart_confirmed: false,
                         identity_verified: false,
                         transport_source_keyed: false,
                     },
@@ -21390,6 +21527,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -21476,6 +21614,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -22269,6 +22408,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -22333,6 +22473,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -22387,6 +22528,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         };
@@ -22783,6 +22925,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -23493,6 +23636,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -23639,6 +23783,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -23687,6 +23832,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -23735,6 +23881,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -23797,6 +23944,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -23865,6 +24013,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 };
@@ -23963,6 +24112,7 @@ mod tests {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         };
@@ -24026,6 +24176,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -24112,6 +24263,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -24185,6 +24337,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -24250,6 +24403,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -25152,6 +25306,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -25357,6 +25512,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28176,6 +28332,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28275,6 +28432,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28362,6 +28520,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -30473,6 +30632,7 @@ mod tests {
                 current_session_source: None,
                 current_session_connection: None,
                 current_session_epoch: 0,
+                session_restart_confirmed: false,
                 identity_verified: true,
                 transport_source_keyed: false,
             },

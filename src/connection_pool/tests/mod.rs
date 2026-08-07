@@ -6746,6 +6746,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         current_session_source: None,
         current_session_connection: None,
         current_session_epoch: 0,
+        session_restart_confirmed: false,
         identity_verified: false,
         transport_source_keyed: false,
     }
