@@ -262,7 +262,42 @@ impl LockFreeConnection {
 
 /// Payloads for queued writes.
 pub enum WritePayload {
+    /// Arbitrary caller bytes with no framing contract this module owns --
+    /// the public, generic "send these bytes" entry points
+    /// (`write_bytes_control`/`write_bytes_ask`/`write_bytes_nonblocking`,
+    /// and the `ConnectionHandle` methods built on them:
+    /// `send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
+    /// `send_binary_message`) all construct this variant. Because it can be
+    /// a complete self-contained V5 frame, a deliberate fragment of a
+    /// larger one (`write_chunked_nonblocking` splits by design), or
+    /// genuinely unframed opaque bytes, `reject_oversize_write_payload`
+    /// cannot decode a control word out of it the way it does for the
+    /// `Header*` variants -- there is no single, reliable interpretation to
+    /// validate against. What it *can* enforce, and does, is a length
+    /// ceiling: the total bytes here can never exceed `max_message_size`,
+    /// because a complete frame whose declared body exceeds that limit is
+    /// necessarily at least that many bytes long in total too.
+    ///
+    /// This is deliberately the only variant a caller outside this `impl`
+    /// block can reach with arbitrary content -- see `TrustedFrame` for the
+    /// alternative used by every internal caller that built the bytes
+    /// itself and already knows they are safe. That split, not a comment on
+    /// this variant, is what stops a future generic-bytes call site from
+    /// silently inheriting an exemption it was never entitled to.
     Single(bytes::Bytes),
+    /// A caller-opaque byte blob this crate built and validated itself --
+    /// constructible only via `LockFreeStreamHandle::write_trusted_bytes_control`/
+    /// `write_trusted_bytes_ask`, which are `pub(crate)`: nothing outside this
+    /// crate can produce one. `reject_oversize_write_payload` exempts it
+    /// unconditionally, so every call site that constructs it is exactly as
+    /// trusted as that exemption -- currently: the fixed-size `RouteBind`/
+    /// `StreamAbort` control frames (a handful of bytes, built from
+    /// `framing`'s own header constructors, never a caller-supplied length),
+    /// and `ConnectionHandle::ask_batch_deferred`'s pre-concatenated batch
+    /// (each request already passed `reject_oversize_inline` individually
+    /// before concatenation; the aggregate is expected to exceed
+    /// `max_message_size` by design and must not be gated against it).
+    TrustedFrame(bytes::Bytes),
     HeaderPayload {
         header: bytes::Bytes,
         payload: bytes::Bytes,
@@ -317,6 +352,9 @@ impl std::fmt::Debug for WritePayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WritePayload::Single(data) => f.debug_tuple("Single").field(&data.len()).finish(),
+            WritePayload::TrustedFrame(data) => {
+                f.debug_tuple("TrustedFrame").field(&data.len()).finish()
+            }
             WritePayload::HeaderPayload { header, payload } => f
                 .debug_struct("HeaderPayload")
                 .field("header_len", &header.len())

@@ -1304,7 +1304,9 @@ impl LockFreeStreamHandle {
                             total_bytes_written += bytes_written;
                         }
                         match payload {
-                            WritePayload::Single(data) => write_chunks.push(data),
+                            WritePayload::Single(data) | WritePayload::TrustedFrame(data) => {
+                                write_chunks.push(data)
+                            }
                             WritePayload::HeaderPayload { header, payload } => {
                                 if !direct_ask_headers.is_empty() {
                                     let bytes_written = match flush_direct_ask_batch(
@@ -2633,12 +2635,22 @@ impl LockFreeStreamHandle {
     /// just `payload.len()`, so this cannot be fooled by a header/payload
     /// pair built from two different lengths.
     ///
-    /// `Single` is intentionally exempt: it carries either an already
-    /// self-contained fixed-size control frame (route bind, stream abort --
-    /// both far under any real `max_message_size`) or a pre-concatenated
-    /// multi-frame batch (`ConnectionHandle::ask_batch_deferred`), neither
-    /// of which is "one frame's header plus its payload" to decode a single
-    /// `body_len` from.
+    /// `TrustedFrame` is exempt unconditionally -- see the type's own doc
+    /// comment for exactly which internal call sites may construct one and
+    /// why each is safe. `Single` is *not* exempt: it is the generic,
+    /// caller-facing variant (`write_bytes_control`/`write_bytes_ask`/
+    /// `write_bytes_nonblocking`, and everything built on them), so its
+    /// content cannot be assumed to be a single well-formed V5 frame -- it
+    /// can be a deliberate fragment of one (`write_chunked_nonblocking`) or
+    /// genuinely unframed opaque bytes. There is no control word to decode
+    /// out of it reliably, so it gets the one check that is still sound
+    /// regardless of content: a bare length ceiling against
+    /// `max_message_size`. That is also sufficient to close the specific
+    /// gap this exemption used to leave open -- a caller handing in a
+    /// complete, self-built V5 frame whose declared body exceeds
+    /// `max_message_size` is, by construction, at least that many bytes
+    /// long in total, so the ceiling catches it without needing to parse
+    /// anything.
     ///
     /// `Buf` cannot be decoded the same way -- it is a generic byte source
     /// (typically a header `Bytes` chained with a caller-supplied payload
@@ -2672,7 +2684,26 @@ impl LockFreeStreamHandle {
             }
             return Ok(());
         }
-        if matches!(payload, WritePayload::Single(_)) {
+        if matches!(payload, WritePayload::TrustedFrame(_)) {
+            return Ok(());
+        }
+        if let WritePayload::Single(data) = payload {
+            // `max_message_size` bounds `body_len` (the bytes after the
+            // 4-byte length prefix), the same quantity every other
+            // variant's size gate above compares against -- not the total
+            // frame length. Treating `data` as if it were at least a bare
+            // control word keeps this consistent with those checks (a
+            // frame at exactly the boundary is accepted, not rejected one
+            // header short of it) and degrades safely for genuinely
+            // unframed content shorter than 4 bytes (`saturating_sub`
+            // yields 0, so it can never exceed the limit here).
+            let body_len = data.len().saturating_sub(framing::LENGTH_PREFIX_LEN);
+            if body_len > self.max_message_size {
+                return Err(GossipError::MessageTooLarge {
+                    size: body_len,
+                    max: self.max_message_size,
+                });
+            }
             return Ok(());
         }
 
@@ -2741,8 +2772,10 @@ impl LockFreeStreamHandle {
                 // `write_direct_ask_inline`) -- no separate length field.
                 (&header[..], header.len() + payload.len())
             }
-            WritePayload::Single(_) | WritePayload::Buf { .. } => {
-                unreachable!("Single returns early above this match; Buf is handled before it")
+            WritePayload::Single(_) | WritePayload::TrustedFrame(_) | WritePayload::Buf { .. } => {
+                unreachable!(
+                    "Single/TrustedFrame return early above this match; Buf is handled before it"
+                )
             }
         };
 
@@ -2856,6 +2889,18 @@ impl LockFreeStreamHandle {
         self.enqueue_ask_write(WritePayload::Single(data)).await
     }
 
+    /// `pub(crate)`, deliberately not `pub`: constructs `WritePayload::TrustedFrame`,
+    /// which `reject_oversize_write_payload` never validates. See that
+    /// variant's own doc comment for exactly which callers this crate lets
+    /// use it and why each is safe. Nothing outside this crate can reach
+    /// this method, so nothing outside this crate can express an
+    /// unvalidated write this way -- that restriction is enforced by
+    /// visibility, not by a comment asking callers to be careful.
+    pub(crate) async fn write_trusted_bytes_ask(&self, data: bytes::Bytes) -> Result<()> {
+        self.enqueue_ask_write(WritePayload::TrustedFrame(data))
+            .await
+    }
+
     /// Queue a compact ActorAsk, installing its connection-local route first.
     /// Both frames use the one ordered writer queue; the small gate only spans
     /// enqueueing, so no response wait or network I/O is serialized here.
@@ -2927,8 +2972,12 @@ impl LockFreeStreamHandle {
                 payload.len(),
                 self.max_message_size,
             )?;
-            let header =
-                crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len())?;
+            let header = crate::framing::try_write_actor_ask_header(
+                correlation_id,
+                actor_id,
+                type_hash,
+                payload.len(),
+            )?;
             return self
                 .write_header_and_payload_ask_inline32(header, payload)
                 .await;
@@ -2948,13 +2997,16 @@ impl LockFreeStreamHandle {
                 route_slot,
                 route,
             );
-            if let Err(error) = self.write_bytes_control(bytes::Bytes::copy_from_slice(&bind)).await {
+            if let Err(error) = self
+                .write_trusted_bytes_control(bytes::Bytes::copy_from_slice(&bind))
+                .await
+            {
                 // guard drops armed -> remove_unbound(route_slot, route)
                 return Err(error);
             }
             bind_guard.disarm();
         }
-        let header = crate::framing::write_routed_actor_ask_header(
+        let header = crate::framing::try_write_routed_actor_ask_header(
             correlation_id,
             route_slot,
             payload.len(),
@@ -2965,6 +3017,11 @@ impl LockFreeStreamHandle {
 
     pub async fn write_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
         self.enqueue_write(WritePayload::Single(data)).await
+    }
+
+    /// See the note on `write_trusted_bytes_ask` above.
+    pub(crate) async fn write_trusted_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
+        self.enqueue_write(WritePayload::TrustedFrame(data)).await
     }
 
     pub async fn write_header_and_payload_control(
@@ -3587,7 +3644,7 @@ impl LockFreeStreamHandle {
         payload: bytes::Bytes,
         correlation_id: u32,
     ) -> Result<()> {
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
@@ -3650,7 +3707,7 @@ impl LockFreeStreamHandle {
 
     /// Cold-path cancellation for a partially queued V5 stream.
     pub async fn abort_stream(&self, stream_id: u32, reason: u32) -> Result<()> {
-        self.write_bytes_control(bytes::Bytes::copy_from_slice(
+        self.write_trusted_bytes_control(bytes::Bytes::copy_from_slice(
             &crate::framing::write_stream_abort_header(stream_id, reason),
         ))
         .await
@@ -3922,8 +3979,8 @@ mod route_interning_tests {
             None,
         );
         let stream_id = 7;
-        let start =
-            crate::framing::try_write_stream_request_start_header(stream_id, 1, 1, 2, 3, 1).unwrap();
+        let start = crate::framing::try_write_stream_request_start_header(stream_id, 1, 1, 2, 3, 1)
+            .unwrap();
         writer
             .streaming_queue
             .push(StreamingCommand::VectoredWrite(VectoredSendItem {
@@ -4437,7 +4494,7 @@ mod write_payload_size_gate_tests {
         let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
         let payload = bytes::Bytes::from(vec![0u8; payload_len]);
         let header = bytes::Bytes::copy_from_slice(
-            &crate::framing::write_gossip_frame_prefix(payload.len()).unwrap(),
+            &crate::framing::try_write_gossip_frame_prefix(payload.len()).unwrap(),
         );
         let err = writer
             .write_header_and_payload_control(header, payload)
@@ -4477,7 +4534,7 @@ mod write_payload_size_gate_tests {
         let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
         let payload = bytes::Bytes::from(vec![0u8; payload_len]);
         let header = bytes::Bytes::copy_from_slice(
-            &crate::framing::write_gossip_frame_prefix(payload.len()).unwrap(),
+            &crate::framing::try_write_gossip_frame_prefix(payload.len()).unwrap(),
         );
         let err = writer
             .write_header_and_payload_control(header, payload)
@@ -4489,6 +4546,95 @@ mod write_payload_size_gate_tests {
             before,
             "an oversized inline write must be rejected before anything is queued"
         );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 5: `WritePayload::Single` -- constructed by the
+    /// public, generic `write_bytes_nonblocking`/`write_bytes_control`/
+    /// `write_bytes_ask` entry points -- used to be exempt from
+    /// `reject_oversize_write_payload` entirely. A caller can hand
+    /// `write_bytes_nonblocking` a complete, well-formed V5 frame (a real
+    /// control word plus a payload) it built by hand; the early-return
+    /// exemption let that frame's declared body exceed `max_message_size`
+    /// and reach the wire regardless, where the peer fatally rejects it.
+    /// This builds exactly that: a genuine self-contained Gossip frame
+    /// whose control word declares a body over `max_message_size`, passed
+    /// as one `Bytes` blob to the public entry point, not to any internal
+    /// primitive.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_a_genuine_oversize_self_contained_frame() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9953".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9953, 64)),
+        );
+
+        let payload_len = 64 - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let payload = vec![0u8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut frame = Vec::with_capacity(header.len() + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+        // Sanity: this really is one genuine, complete, self-contained V5
+        // frame whose declared body exceeds max_message_size -- not just an
+        // oversize blob of unstructured bytes.
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap()).unwrap();
+        assert_eq!(control.kind, crate::framing::WireKind::Gossip);
+        assert_eq!(
+            control.body_len,
+            crate::framing::GOSSIP_HEADER_LEN + payload_len
+        );
+        assert!(control.body_len > 64);
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from(frame))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The same gate must not false-reject a normal-size `Single` write --
+    /// proving the fix is a real ceiling, not an unconditional rejection.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_accepts_a_frame_within_max_message_size() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9954".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9954, 64)),
+        );
+
+        let payload_len = 64 - crate::framing::GOSSIP_HEADER_LEN;
+        let payload = vec![7u8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut frame = Vec::with_capacity(header.len() + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+        let expected = frame.clone();
+
+        writer
+            .write_bytes_nonblocking(bytes::Bytes::from(frame))
+            .expect("a frame within max_message_size must be accepted");
+
+        let mut received = vec![0u8; expected.len()];
+        AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver the frame to the peer");
+        assert_eq!(received, expected);
 
         writer.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
@@ -4535,7 +4681,8 @@ mod write_payload_length_mismatch_tests {
     async fn header_payload_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9970);
         let header = bytes::Bytes::copy_from_slice(
-            &crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 8).unwrap(),
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap(),
         );
         let payload = bytes::Bytes::from(vec![0u8; 100]); // header declares 8, actual 100
         let err = writer
@@ -4551,7 +4698,7 @@ mod write_payload_length_mismatch_tests {
     async fn header_payload_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9971);
         let header = bytes::Bytes::copy_from_slice(
-            &crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 100)
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
                 .unwrap(),
         );
         let payload = bytes::Bytes::from(vec![0u8; 8]); // header declares 100, actual 8
@@ -4568,7 +4715,8 @@ mod write_payload_length_mismatch_tests {
     async fn header_inline_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9972);
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 8).unwrap();
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 100]);
         let err = writer
             .write_header_and_payload_control_inline(header, 16, payload)
@@ -4583,7 +4731,7 @@ mod write_payload_length_mismatch_tests {
     async fn header_inline_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9973);
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 100)
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
                 .unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 8]);
         let err = writer
@@ -4604,7 +4752,8 @@ mod write_payload_length_mismatch_tests {
     async fn header_inline_aligned_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9974);
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 8).unwrap();
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
         let err = writer
             .write_header_and_payload_control_inline_aligned(header, 16, aligned_payload(100))
             .await
@@ -4618,7 +4767,7 @@ mod write_payload_length_mismatch_tests {
     async fn header_inline_aligned_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9975);
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 100)
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
                 .unwrap();
         let err = writer
             .write_header_and_payload_control_inline_aligned(header, 16, aligned_payload(8))
@@ -4632,7 +4781,7 @@ mod write_payload_length_mismatch_tests {
     #[tokio::test]
     async fn header_inline32_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9976);
-        let header = crate::framing::write_actor_ask_header(1, 7, 9, 8).unwrap();
+        let header = crate::framing::try_write_actor_ask_header(1, 7, 9, 8).unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 100]);
         let err = writer
             .write_header_and_payload_control_inline32(header, payload)
@@ -4646,7 +4795,7 @@ mod write_payload_length_mismatch_tests {
     #[tokio::test]
     async fn header_inline32_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9977);
-        let header = crate::framing::write_actor_ask_header(1, 7, 9, 100).unwrap();
+        let header = crate::framing::try_write_actor_ask_header(1, 7, 9, 100).unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 8]);
         let err = writer
             .write_header_and_payload_control_inline32(header, payload)
@@ -4666,7 +4815,8 @@ mod write_payload_length_mismatch_tests {
     async fn header_pooled_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9978);
         let header = bytes::Bytes::copy_from_slice(
-            &crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 8).unwrap(),
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap(),
         );
         let err = writer
             .write_pooled_control(header, None, pooled_payload(100))
@@ -4681,7 +4831,7 @@ mod write_payload_length_mismatch_tests {
     async fn header_pooled_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9979);
         let header = bytes::Bytes::copy_from_slice(
-            &crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 100)
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
                 .unwrap(),
         );
         let err = writer
@@ -4699,7 +4849,8 @@ mod write_payload_length_mismatch_tests {
     async fn header_inline_pooled_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9980);
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 8).unwrap();
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
         let err = writer
             .write_pooled_ask_inline(header, 16, None, 0, pooled_payload(100))
             .await
@@ -4713,7 +4864,7 @@ mod write_payload_length_mismatch_tests {
     async fn header_inline_pooled_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9981);
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 100)
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
                 .unwrap();
         let err = writer
             .write_pooled_ask_inline(header, 16, None, 0, pooled_payload(8))
@@ -4737,7 +4888,8 @@ mod write_payload_length_mismatch_tests {
         // Header declares body_len = ASK_RESPONSE_HEADER_LEN + 16 (intended
         // prefix) + 8 (payload) = 36.
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 24).unwrap();
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 24)
+                .unwrap();
         let prefix = [0u8; 16];
         // `prefix_len` claims only 8 of the 16 prefix bytes will be sent --
         // the payload alone is honest (8 bytes), so only this field is the
@@ -4754,7 +4906,7 @@ mod write_payload_length_mismatch_tests {
     #[tokio::test]
     async fn direct_ask_inline_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9983);
-        let header = crate::framing::write_direct_ask_header(1, 8).unwrap();
+        let header = crate::framing::try_write_direct_ask_header(1, 8).unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 100]);
         let err = writer
             .write_direct_ask_inline(header, payload)
@@ -4768,7 +4920,7 @@ mod write_payload_length_mismatch_tests {
     #[tokio::test]
     async fn direct_ask_inline_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9984);
-        let header = crate::framing::write_direct_ask_header(1, 100).unwrap();
+        let header = crate::framing::try_write_direct_ask_header(1, 100).unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 8]);
         let err = writer
             .write_direct_ask_inline(header, payload)
@@ -4785,7 +4937,8 @@ mod write_payload_length_mismatch_tests {
     async fn header_inline_pooled_with_matching_lengths_is_written() {
         let (writer, task) = make_writer(9985);
         let header =
-            crate::framing::write_ask_response_header(crate::MessageType::Response, 1, 8).unwrap();
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
         writer
             .write_pooled_ask_inline(header, 16, None, 0, pooled_payload(8))
             .await

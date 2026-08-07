@@ -114,6 +114,18 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
+    /// See the note on `LockFreeStreamHandle::write_trusted_bytes_ask`.
+    async fn write_trusted_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
+        if let Some(stream_handle) = self.stream_handle.as_ref() {
+            stream_handle.write_trusted_bytes_control(data).await
+        } else {
+            Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("connection {} has no writer path", self.addr),
+            )))
+        }
+    }
+
     async fn write_header_and_payload_control_inline(
         &self,
         header: [u8; 16],
@@ -266,7 +278,7 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
     ) -> Result<()> {
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload.len())?;
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
@@ -279,7 +291,7 @@ impl<T> ConnectionHandle<T> {
     /// Send a gossip payload with framing, without copying the payload.
     pub async fn send_gossip_payload(&self, payload: bytes::Bytes) -> Result<()> {
         self.reject_oversize_inline(framing::GOSSIP_HEADER_LEN, payload.len())?;
-        let header = framing::write_gossip_frame_prefix(payload.len())?;
+        let header = framing::try_write_gossip_frame_prefix(payload.len())?;
         self.write_header_and_payload_control_inline(
             header,
             crate::framing::GOSSIP_FRAME_HEADER_LEN as u8,
@@ -291,7 +303,7 @@ impl<T> ConnectionHandle<T> {
     /// Send a routed PubSub payload with framing, without copying the payload.
     pub async fn send_pubsub_payload(&self, payload: bytes::Bytes) -> Result<()> {
         self.reject_oversize_inline(framing::PUBSUB_HEADER_LEN, payload.len())?;
-        let header = framing::write_pubsub_frame_prefix(payload.len())?;
+        let header = framing::try_write_pubsub_frame_prefix(payload.len())?;
         self.write_header_and_payload_control_inline(
             header,
             crate::framing::PUBSUB_FRAME_HEADER_LEN as u8,
@@ -312,7 +324,7 @@ impl<T> ConnectionHandle<T> {
     /// capacity a control-plane reply needs, defeating the reservation.
     pub fn try_send_pubsub_payload(&self, payload: bytes::Bytes) -> Result<()> {
         self.reject_oversize_inline(framing::PUBSUB_HEADER_LEN, payload.len())?;
-        let header = framing::write_pubsub_frame_prefix(payload.len())?;
+        let header = framing::try_write_pubsub_frame_prefix(payload.len())?;
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_header_and_payload_control_inline_nonblocking(
                 header,
@@ -338,7 +350,7 @@ impl<T> ConnectionHandle<T> {
         payload_len: usize,
     ) -> Result<()> {
         self.reject_oversize_inline(framing::PUBSUB_HEADER_LEN, payload_len)?;
-        let header = framing::write_pubsub_frame_prefix(payload_len)?;
+        let header = framing::try_write_pubsub_frame_prefix(payload_len)?;
         let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_pooled_control_inline_nonblocking(
@@ -402,7 +414,7 @@ impl<T> ConnectionHandle<T> {
     {
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload_len)?;
         if let Some(stream_handle) = self.stream_handle.as_ref() {
-            let header = framing::write_ask_response_header(
+            let header = framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
                 payload_len,
@@ -426,7 +438,7 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<()> {
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload_len)?;
         if let Some(stream_handle) = self.stream_handle.as_ref() {
-            let header = framing::write_ask_response_header(
+            let header = framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
                 payload_len,
@@ -539,7 +551,8 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
     ) -> Result<()> {
         self.reject_oversize_inline(framing::ACTOR_TELL_HEADER_LEN, payload.len())?;
-        let header = crate::framing::write_actor_tell_header(actor_id, type_hash, payload.len())?;
+        let header =
+            crate::framing::try_write_actor_tell_header(actor_id, type_hash, payload.len())?;
         self.write_header_and_payload_control_inline(header, 16, payload)
             .await
     }
@@ -554,7 +567,8 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
     ) -> Result<()> {
         self.reject_oversize_inline(framing::ACTOR_TELL_HEADER_LEN, payload.len())?;
-        let header = crate::framing::write_actor_tell_header(actor_id, type_hash, payload.len())?;
+        let header =
+            crate::framing::try_write_actor_tell_header(actor_id, type_hash, payload.len())?;
         self.write_header_and_payload_control_inline_nonblocking(header, 16, payload)
     }
 
@@ -894,7 +908,7 @@ impl<T> ConnectionHandle<T> {
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload_len)?;
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Ask,
             correlation_id,
             payload_len,
@@ -944,7 +958,7 @@ impl<T> ConnectionHandle<T> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
 
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Ask,
             correlation_id,
             request.len(),
@@ -984,7 +998,7 @@ impl<T> ConnectionHandle<T> {
         let correlation_id = slot.id();
 
         // Build DirectAsk header
-        let header = framing::write_direct_ask_header(correlation_id, request.len())?;
+        let header = framing::try_write_direct_ask_header(correlation_id, request.len())?;
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {
@@ -1009,7 +1023,7 @@ impl<T> ConnectionHandle<T> {
         let correlation_id = slot.id();
 
         // Build DirectAsk header
-        let header = framing::write_direct_ask_header(correlation_id, request.len())?;
+        let header = framing::try_write_direct_ask_header(correlation_id, request.len())?;
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {
@@ -1135,7 +1149,7 @@ impl<T> ConnectionHandle<T> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
 
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Ask,
             correlation_id,
             request.len(),
@@ -1196,7 +1210,7 @@ impl<T> ConnectionHandle<T> {
         for request in requests {
             let slot = self.correlation.allocate()?;
 
-            let header = framing::write_ask_response_header(
+            let header = framing::try_write_ask_response_header(
                 crate::MessageType::Ask,
                 slot.id(),
                 request.len(),
@@ -1206,10 +1220,21 @@ impl<T> ConnectionHandle<T> {
             slots.push(slot);
         }
 
+        // Each request's header was built from `request.len()` above and
+        // every request individually cleared `reject_oversize_inline`
+        // before concatenation, but the aggregate `batch_message` is
+        // expected to exceed `max_message_size` by design (it is the sum of
+        // N independently-admitted requests, not one frame) -- so this must
+        // use the trusted lane, not the generic one, which would otherwise
+        // reject a legitimately large batch on the same bare length ceiling
+        // that protects arbitrary caller bytes.
         let send_result = if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle.write_bytes_ask(batch_message.freeze()).await
+            stream_handle
+                .write_trusted_bytes_ask(batch_message.freeze())
+                .await
         } else {
-            self.write_bytes_control(batch_message.freeze()).await
+            self.write_trusted_bytes_control(batch_message.freeze())
+                .await
         };
         // Send-failure path: returning Err drops `slots`, which cancels every
         // reservation. No explicit per-id cancel loop needed.
@@ -1815,5 +1840,89 @@ mod oversized_inline_send_gate_tests {
             peer.read_exact(&mut rest).await.unwrap();
             assert_eq!(&rest[rest.len() - request.len()..], *request);
         }
+    }
+
+    fn make_handle_with_max_message_size(
+        max_message_size: usize,
+    ) -> (
+        ConnectionHandle,
+        Arc<LockFreeStreamHandle>,
+        JoinHandle<()>,
+        tokio::io::DuplexStream,
+    ) {
+        let (client, peer) = tokio::io::duplex(4 * 1024 * 1024);
+        let read_context = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: test_addr(),
+            session_source: test_addr(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            test_addr(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_context),
+        );
+        let stream_handle = Arc::new(stream_handle);
+        let correlation = CorrelationTracker::new();
+        let conn = ConnectionHandle::new_stream(test_addr(), stream_handle.clone(), correlation);
+        (conn, stream_handle, task, peer)
+    }
+
+    /// PR #183 review, round 5: `WritePayload::Single` (the generic,
+    /// caller-facing variant) is now gated with a bare `max_message_size`
+    /// ceiling. `ask_batch_deferred`'s pre-concatenated batch must *not* go
+    /// through that lane -- its aggregate is expected to exceed
+    /// `max_message_size` by design (each request was already admitted
+    /// individually) -- so it was moved to the new `TrustedFrame` variant
+    /// instead. This proves that move actually happened: a batch whose
+    /// aggregate exceeds `max_message_size`, but whose every individual
+    /// request stays within it, must still be accepted and sent whole.
+    #[tokio::test]
+    async fn ask_batch_deferred_aggregate_over_max_message_size_still_succeeds() {
+        let max_message_size = 64;
+        let (conn, _stream_handle, _task, mut peer) =
+            make_handle_with_max_message_size(max_message_size);
+
+        // Every request comfortably fits under max_message_size on its own,
+        // but three of them together do not.
+        let request = vec![9u8; max_message_size - crate::framing::ASK_RESPONSE_HEADER_LEN];
+        let requests: Vec<&[u8]> = vec![&request, &request, &request];
+        let aggregate_frame_bytes: usize = requests
+            .iter()
+            .map(|r| crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN + r.len())
+            .sum();
+        assert!(
+            aggregate_frame_bytes > max_message_size,
+            "test setup: the aggregate must exceed max_message_size for this to prove anything"
+        );
+
+        let handles = conn
+            .ask_batch_deferred(&requests, Duration::from_secs(5))
+            .await
+            .expect(
+                "a batch whose aggregate exceeds max_message_size, but whose members do \
+                     not, must still be accepted",
+            );
+        assert_eq!(handles.len(), requests.len());
+
+        let mut received = vec![0u8; aggregate_frame_bytes];
+        peer.read_exact(&mut received)
+            .await
+            .expect("the whole batch must reach the wire in one piece");
     }
 }
