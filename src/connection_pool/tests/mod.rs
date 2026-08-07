@@ -515,6 +515,192 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
     });
 }
 
+/// A transport whose write side succeeds normally but whose flush never
+/// completes: `poll_write` and `poll_read` delegate straight through to
+/// `inner`, but `poll_flush` always returns `Pending` and never wakes its
+/// waker. Distinct from `WriteWedgedStream` above (whose *write* side is
+/// stuck): here ordinary writes complete immediately, so it is the
+/// automatic post-frame flush -- not an explicit `StreamingCommand::Flush`
+/// -- that gets stuck. Models a buffered/TLS transport whose `poll_flush`
+/// genuinely stays `Pending` while still draining the socket, the shape
+/// `bounded_stream_flush`/`STREAM_FLUSH_STUCK_TEARDOWN` exist for.
+struct FlushWedgedStream<S> {
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for FlushWedgedStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for FlushWedgedStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Review finding: the bounded-flush mechanism built for `StreamingCommand::
+/// Flush` (`bounded_stream_flush`'s predecessor inside
+/// `write_streaming_command_slice`, with its own `stream_flush_wedged_since`
+/// wedge clock and `STREAM_FLUSH_STUCK_TEARDOWN` budget) only ever covered
+/// that one call site. The automatic flushes after an ordinary
+/// (non-streaming) write -- the ask-RTT fast path, `should_flush_stream_output`'s
+/// throughput checkpoint, the immediate-payload flush, and the idle-branch
+/// drain -- were plain, unbounded `stream.flush().await` calls. On a
+/// transport whose `poll_flush` genuinely stays `Pending` while still
+/// draining the socket, any one of those four call sites would park the
+/// whole IO task -- and so its own read side -- forever: precisely the
+/// bidirectional read/write deadlock this PR exists to close, just reached
+/// through a caller the original fix never wired to
+/// `STREAM_WRITE_SLICE_TIMEOUT`.
+///
+/// Sends a tell *from* the wedged side -- an ordinary write, not
+/// `ask_streaming_bytes` (which would go through the explicit
+/// `StreamingCommand::Flush` path that already worked) -- to get its own
+/// automatic flush stuck, waits past `STREAM_WRITE_SLICE_TIMEOUT` so that
+/// attempt has genuinely timed out at least once, then proves a tell
+/// arriving *at* the wedged side is still delivered: the automatic flush's
+/// deadline must hand control back to the loop instead of parking on it.
+#[test]
+fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_read() {
+    run_multi_thread_test(async {
+        let addr_wedged: std::net::SocketAddr = "127.0.0.1:44301".parse().unwrap();
+        let addr_peer: std::net::SocketAddr = "127.0.0.1:44302".parse().unwrap();
+
+        let delivered = Arc::new(AtomicU64::new(0));
+        let registry_wedged = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_wedged,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "wedged_automatic_flush_read_progress",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_wedged
+            .set_actor_message_handler_sync(Arc::new(TestActorCounter {
+                delivered: Arc::clone(&delivered),
+            }))
+            .await;
+
+        let correlation_wedged = CorrelationTracker::new();
+        let (io_wedged, io_peer) = tokio::io::duplex(64 * 1024);
+        let wedged_stream = FlushWedgedStream { inner: io_wedged };
+
+        let read_ctx_wedged = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_wedged),
+            peer_addr: addr_peer,
+            session_source: addr_peer,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_wedged.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_wedged.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_wedged.actor_message_handler_sync.load_full(),
+        };
+
+        let (writer_wedged, task_wedged, _) = LockFreeStreamHandle::new(
+            wedged_stream,
+            addr_peer,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_wedged),
+        );
+        let writer_wedged = Arc::new(writer_wedged);
+        let conn_wedged = ConnectionHandle::<()>::new_stream(
+            addr_peer,
+            Arc::clone(&writer_wedged),
+            correlation_wedged,
+        );
+
+        let (writer_peer, _task_peer, _) = LockFreeStreamHandle::new(
+            io_peer,
+            addr_wedged,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer_peer = Arc::new(writer_peer);
+        let conn_peer = ConnectionHandle::<()>::new_stream(
+            addr_wedged,
+            Arc::clone(&writer_peer),
+            CorrelationTracker::new(),
+        );
+
+        // An ordinary write -- not ask_streaming_bytes -- so its eventual
+        // flush goes through one of the automatic-flush call sites this
+        // finding is about, never through write_streaming_command_slice's
+        // explicit StreamingCommand::Flush.
+        conn_wedged
+            .tell_actor_frame(
+                TEST_TELL_ACTOR_ID,
+                TEST_TELL_HASH,
+                bytes::Bytes::from_static(b"trigger-the-automatic-flush"),
+            )
+            .await
+            .unwrap();
+
+        // Let the wedged side's IO task write it (poll_write succeeds --
+        // FlushWedgedStream delegates that straight through) and then reach,
+        // and genuinely time out on, its automatic flush against
+        // FlushWedgedStream's permanently-Pending poll_flush.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        conn_peer
+            .tell_actor_frame(
+                TEST_TELL_ACTOR_ID,
+                TEST_TELL_HASH,
+                bytes::Bytes::from_static(b"still-alive"),
+            )
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            while delivered.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a permanently-pending automatic (non-StreamingCommand::Flush) flush must not stop \
+             the IO task from processing an already-buffered read: it must hand control back to \
+             the loop on STREAM_WRITE_SLICE_TIMEOUT, the same as an explicit Flush already does"
+        );
+
+        writer_peer.shutdown();
+        writer_wedged.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_wedged).await;
+    });
+}
+
 /// P0 (residual of #180): once `LocalStreamingQueue::is_full()` is true (more
 /// than `MAX_STREAM_SIZE` retained), the read loop's entry gate stops
 /// attempting reads AT ALL for this connection -- not just admission of more

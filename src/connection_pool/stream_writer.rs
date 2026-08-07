@@ -80,6 +80,38 @@ const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 /// connection down. That is a bounded resolution (<= 30s), not a graceful
 /// one -- it is the teardown escape the invariant above allows, not the
 /// backpressure escape the `is_full` fix gives the more common case.
+///
+/// **Every `.await` that can block on this transport needs one of the two
+/// bounds above (or an equivalent), not just the streaming-slice write this
+/// invariant was first written for.** `bounded_stream_flush` closes the same
+/// hole for the automatic, non-`StreamingCommand::Flush` flushes below (an
+/// ask-latency fast path, a throughput-threshold checkpoint, an
+/// immediate-payload flush, an idle-branch drain): each used to be a plain
+/// `stream.flush().await`, unbounded, reachable after any ordinary write --
+/// the same deadlock shape this invariant closes for a stuck write, just
+/// through a caller `write_streaming_command_slice`'s own bounded flush
+/// never covered. It shares `STREAM_WRITE_SLICE_TIMEOUT` and
+/// `STREAM_FLUSH_STUCK_TEARDOWN` (not `STREAM_WRITE_STUCK_TEARDOWN` --
+/// `poll_flush`'s `Pending` carries none of `poll_write`'s "zero bytes"
+/// guarantee, see that constant's own doc comment) with the explicit
+/// `StreamingCommand::Flush` path, since only one flush-shaped attempt on
+/// this transport is ever outstanding at a time.
+///
+/// **Known gap, not yet closed:** `write_response_batch`,
+/// `write_direct_response_batch`, and `write_chunks_batched` (this
+/// connection's ordinary, non-streaming response/tell writers) still loop
+/// over multiple `poll_write`/`write_vectored` calls with no per-attempt
+/// timeout, and `read_pipeline.rs`'s two `flush_each_actor_response` call
+/// sites are plain unbounded flushes of the same shape this fix closes
+/// here. None of them are individually cancel-safe to wrap in a naive
+/// `tokio::time::timeout` the way this file's slice writers are --
+/// `write_all`-shaped internals mean a cancelled attempt can abandon a
+/// partially-written frame mid-flight and corrupt every later frame on the
+/// connection (see `write_ask_nack_header_bounded`'s doc comment for the
+/// exact failure this already burned once). Closing them needs the same
+/// single-attempt-then-retry redesign `write_vectored_once` gave the
+/// streaming path, not a one-line timeout wrapper; tracked as follow-up
+/// work rather than folded into this fix.
 const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// See `STREAM_WRITE_SLICE_TIMEOUT`.
@@ -160,6 +192,86 @@ fn record_slice_attempt(
         SliceAttemptOutcome::TearDown { stuck_for }
     } else {
         SliceAttemptOutcome::Continue
+    }
+}
+
+/// Outcome of one bounded automatic-flush attempt (see `bounded_stream_flush`).
+enum AutoFlushOutcome {
+    /// The flush completed: the caller's own "bytes since flush" tracking
+    /// can be reset to zero.
+    Completed,
+    /// The attempt timed out but has not yet been wedged long enough to
+    /// give up. The caller must **not** reset its "bytes since flush"
+    /// tracking here -- doing so would forget that data is still
+    /// unflushed, and nothing would ever retry it.
+    StillPending,
+    /// Timed out and wedged long enough to give up; the error has already
+    /// been logged. The caller must tear the connection down.
+    TearDown,
+}
+
+/// Bounded counterpart to a plain `stream.flush().await`, for the automatic
+/// flush call sites below that are not part of a `StreamingCommand::Flush`
+/// (an ask-latency fast path, a throughput-threshold checkpoint, an
+/// idle-branch drain -- see each call site). Those cannot route through
+/// `write_streaming_command_slice`'s own bounded call directly, since there
+/// is no `PendingStreamingCommand` to attach the flush to, but they share
+/// the exact hazard `STREAM_FLUSH_STUCK_TEARDOWN` exists for: on a
+/// buffered/TLS transport `poll_flush` can stay `Pending` while still
+/// draining the socket, and that `Pending` carries none of `poll_write`'s
+/// "zero bytes" guarantee (see the doc comment on `STREAM_FLUSH_STUCK_TEARDOWN`).
+/// A plain, unbounded `.await` here parks this task -- and so its own read
+/// side -- exactly the shape of deadlock this file's invariant exists to
+/// prevent; closing it only for the `StreamingCommand`-queue write/flush
+/// path left every other flush call site exposed.
+///
+/// Shares `stream_flush_wedged_since` (and so `STREAM_FLUSH_STUCK_TEARDOWN`)
+/// with the explicit `StreamingCommand::Flush` path rather than tracking a
+/// separate clock: only one flush-shaped attempt on this transport is ever
+/// outstanding at a time (every call site below runs only while
+/// `pending_stream_cmd.is_none()`, the same condition that gates an
+/// in-flight `StreamingCommand::Flush`), so one shared clock is exactly
+/// "how long has flushing this transport been stuck", regardless of which
+/// call site is nominally driving the retry from turn to turn.
+///
+/// A genuine flush *error* (as opposed to a timeout) is intentionally
+/// swallowed here, matching every call site's prior `let _ = stream.flush()
+/// .await` -- unchanged behavior, not a new decision this fix makes.
+async fn bounded_stream_flush<S>(
+    stream: &mut S,
+    stream_write_wedged_since: &mut Option<Instant>,
+    stream_flush_wedged_since: &mut Option<Instant>,
+) -> AutoFlushOutcome
+where
+    S: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(STREAM_WRITE_SLICE_TIMEOUT, stream.flush()).await {
+        Ok(_) => {
+            record_slice_attempt(
+                true,
+                true,
+                Instant::now(),
+                stream_write_wedged_since,
+                stream_flush_wedged_since,
+            );
+            AutoFlushOutcome::Completed
+        }
+        Err(_elapsed) => match record_slice_attempt(
+            true,
+            false,
+            Instant::now(),
+            stream_write_wedged_since,
+            stream_flush_wedged_since,
+        ) {
+            SliceAttemptOutcome::TearDown { stuck_for } => {
+                error!(
+                    ?stuck_for,
+                    "automatic stream flush made no progress for too long; tearing down connection"
+                );
+                AutoFlushOutcome::TearDown
+            }
+            SliceAttemptOutcome::Continue => AutoFlushOutcome::StillPending,
+        },
     }
 }
 
@@ -2337,9 +2449,24 @@ impl LockFreeStreamHandle {
                                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                         if is_immediate_payload && total_bytes_written > 0 {
-                            let _ = stream.flush().await;
-                            total_bytes_written = 0;
-                            flush_pending.store(false, Ordering::Release);
+                            match bounded_stream_flush(
+                                &mut stream,
+                                &mut stream_write_wedged_since,
+                                &mut stream_flush_wedged_since,
+                            )
+                            .await
+                            {
+                                AutoFlushOutcome::Completed => {
+                                    total_bytes_written = 0;
+                                    flush_pending.store(false, Ordering::Release);
+                                }
+                                // Leave total_bytes_written untouched: it still
+                                // folds into bytes_since_flush below, so a later
+                                // flush attempt retries these same bytes instead
+                                // of forgetting them.
+                                AutoFlushOutcome::StillPending => {}
+                                AutoFlushOutcome::TearDown => return,
+                            }
                         }
                     }
                 }
@@ -2393,9 +2520,22 @@ impl LockFreeStreamHandle {
                 pending_stream_cmd.as_ref(),
                 yielded_stream_cmd.as_ref(),
             ) {
-                let _ = stream.flush().await;
-                bytes_since_flush = 0;
-                flush_pending.store(false, Ordering::Release);
+                match bounded_stream_flush(
+                    &mut stream,
+                    &mut stream_write_wedged_since,
+                    &mut stream_flush_wedged_since,
+                )
+                .await
+                {
+                    AutoFlushOutcome::Completed => {
+                        bytes_since_flush = 0;
+                        flush_pending.store(false, Ordering::Release);
+                    }
+                    // Leave bytes_since_flush untouched so the next turn's
+                    // check still sees unflushed data and retries.
+                    AutoFlushOutcome::StillPending => {}
+                    AutoFlushOutcome::TearDown => return,
+                }
             }
 
             if let (Some(ctx), Some(state), Some(streaming_state)) = (
@@ -2676,9 +2816,20 @@ impl LockFreeStreamHandle {
             if (wrote_ask_payload || wrote_actor_responses || wrote_fast_responses)
                 && bytes_since_flush > 0
             {
-                let _ = stream.flush().await;
-                bytes_since_flush = 0;
-                flush_pending.store(false, Ordering::Release);
+                match bounded_stream_flush(
+                    &mut stream,
+                    &mut stream_write_wedged_since,
+                    &mut stream_flush_wedged_since,
+                )
+                .await
+                {
+                    AutoFlushOutcome::Completed => {
+                        bytes_since_flush = 0;
+                        flush_pending.store(false, Ordering::Release);
+                    }
+                    AutoFlushOutcome::StillPending => {}
+                    AutoFlushOutcome::TearDown => return,
+                }
             }
 
             if !did_work {
@@ -3029,9 +3180,20 @@ impl LockFreeStreamHandle {
                             // quiet links. The idle branch has no outer fast-flush checkpoint
                             // after this select arm, so flush direct/actor responses here.
                             if bytes_since_flush > 0 {
-                                let _ = stream.flush().await;
-                                bytes_since_flush = 0;
-                                flush_pending.store(false, Ordering::Release);
+                                match bounded_stream_flush(
+                                    &mut stream,
+                                    &mut stream_write_wedged_since,
+                                    &mut stream_flush_wedged_since,
+                                )
+                                .await
+                                {
+                                    AutoFlushOutcome::Completed => {
+                                        bytes_since_flush = 0;
+                                        flush_pending.store(false, Ordering::Release);
+                                    }
+                                    AutoFlushOutcome::StillPending => {}
+                                    AutoFlushOutcome::TearDown => return,
+                                }
                             }
                         }
                         // Wake on new outbound writes even if the socket is currently idle for reads.
