@@ -2399,7 +2399,16 @@ where
                 && cell.can_handle(actor_id, type_hash)
             {
                 let handle_start = perf.map(|_| Instant::now());
-                let disposition = cell.handle(actor_id, type_hash, payload)?;
+                // Every ask either gets an answer or an explicit NACK: a
+                // handler error must not escape via `?` (it would propagate
+                // out of `try_handle_fast_io`, get logged and swallowed by
+                // its caller in `stream_writer.rs::io_task`, and leave the
+                // requester to time out instead of receiving
+                // `AskNackReason::HandlerError`).
+                let disposition = match cell.handle(actor_id, type_hash, payload) {
+                    Ok(disposition) => disposition,
+                    Err(e) => crate::registry::AskDisposition::Nack(e.ask_nack_reason()),
+                };
                 if let (Some(perf), Some(start)) = (perf, handle_start) {
                     perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
                     perf.actor_handle_ns
@@ -2424,7 +2433,11 @@ where
                 && let Some(context) = ask_context_from_context(ctx, correlation_id)
             {
                 let handle_start = perf.map(|_| Instant::now());
-                let disposition = cell.handle(actor_id, type_hash, payload, context)?;
+                // Same reasoning as the ask_immediate_handler_sync arm above.
+                let disposition = match cell.handle(actor_id, type_hash, payload, context) {
+                    Ok(disposition) => disposition,
+                    Err(e) => crate::registry::AskDisposition::Nack(e.ask_nack_reason()),
+                };
                 if let (Some(perf), Some(start)) = (perf, handle_start) {
                     perf.actor_handle_calls.fetch_add(1, Ordering::Relaxed);
                     perf.actor_handle_ns

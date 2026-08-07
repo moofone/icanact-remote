@@ -68,6 +68,39 @@ impl crate::registry::ActorAskImmediateHandlerSync for ImmediateMissActor {
     }
 }
 
+/// Always errors, for `ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out`.
+struct ErroringImmediateAskActor;
+
+impl crate::registry::ActorAskImmediateHandlerSync for ErroringImmediateAskActor {
+    fn handle_actor_ask_sync_immediate(
+        &self,
+        _actor_id: u64,
+        _type_hash: u32,
+        _payload: crate::AlignedBytes,
+    ) -> crate::Result<crate::registry::AskDisposition> {
+        Err(crate::GossipError::Network(std::io::Error::other(
+            "erroring immediate ask handler (test)",
+        )))
+    }
+}
+
+/// Always errors, for `ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out`.
+struct ErroringDeferredAskActor;
+
+impl crate::registry::ActorAskHandlerSync for ErroringDeferredAskActor {
+    fn handle_actor_ask_sync(
+        &self,
+        _actor_id: u64,
+        _type_hash: u32,
+        _payload: crate::AlignedBytes,
+        _context: crate::AskContext<'_>,
+    ) -> crate::Result<crate::registry::AskDisposition> {
+        Err(crate::GossipError::Network(std::io::Error::other(
+            "erroring deferred ask handler (test)",
+        )))
+    }
+}
+
 const TEST_TELL_ACTOR_ID: u64 = 0xC0DE_BEEF;
 const TEST_TELL_HASH: u32 = 0xA11C_0001;
 struct TestActorCounter {
@@ -817,6 +850,264 @@ fn deferred_actor_ask_sync_replies_via_responder() {
             .await
             .unwrap();
         assert_eq!(reply, payload);
+
+        client_writer.shutdown();
+        server_writer.shutdown();
+    });
+}
+
+/// Review finding (`read_pipeline.rs:2315`): `try_handle_fast_io`'s split
+/// ask fast paths (`ask_immediate_handler_sync`/`ask_handler_sync`) used
+/// `?` on a handler error, letting it escape the function entirely instead
+/// of converting it to a NACK the way the legacy `sync_actor_handler` path
+/// already did. The escaped error is only logged by the io_task caller in
+/// `stream_writer.rs`, which has already consumed the ask off the wire --
+/// so the requester timed out instead of receiving
+/// `AskNackReason::HandlerError`. The invariant is: every ask either gets
+/// an answer or an explicit NACK. This covers the `ask_immediate_handler_sync`
+/// site; see `ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out`
+/// for the `ask_handler_sync` (deferred-context) site.
+#[test]
+fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
+    run_multi_thread_test(async {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:40571".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:40572".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ask_immediate_handler_sync_error_nacks_server",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        server_registry
+            .set_actor_ask_immediate_handler_sync(Arc::new(ErroringImmediateAskActor))
+            .await;
+
+        let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            client_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ask_immediate_handler_sync_error_nacks_client",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let correlation = CorrelationTracker::new();
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+        let client_read_ctx = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&client_registry),
+            peer_addr: server_addr,
+            session_source: server_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
+            client_io,
+            server_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(client_read_ctx),
+        );
+        let client_writer = Arc::new(client_writer);
+        let client_conn = ConnectionHandle::<()>::new_stream(
+            server_addr,
+            Arc::clone(&client_writer),
+            correlation,
+        );
+
+        let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
+        let server_read_ctx = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr: client_addr,
+            session_source: client_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: Some(response_writer.clone()),
+            tell_handler_sync: server_registry.actor_tell_handler_sync.load_full(),
+            tell_handler_sync_context: server_registry.actor_tell_handler_sync_context.load_full(),
+            ask_immediate_handler_sync: server_registry.actor_ask_immediate_handler_sync.load_full(),
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            client_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+        let server_writer = Arc::new(server_writer);
+        response_writer.bind_stream_handle(server_writer.clone());
+
+        let payload = bytes::Bytes::from_static(b"trigger-handler-error");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_conn.ask_actor_frame_no_timeout(0xE440_0001, 0xE440_0002, payload),
+        )
+        .await
+        .expect("the ask must resolve (NACK or reply), not time out");
+
+        match result {
+            Err(crate::GossipError::AskNacked(reason)) => {
+                assert_eq!(
+                    reason,
+                    crate::framing::AskNackReason::HandlerError,
+                    "a handler error must NACK as HandlerError, got {reason:?}"
+                );
+            }
+            other => panic!(
+                "an error from ask_immediate_handler_sync must NACK the asker, not escape \
+                 silently: {other:?}"
+            ),
+        }
+
+        client_writer.shutdown();
+        server_writer.shutdown();
+    });
+}
+
+/// See `ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out`'s doc --
+/// same finding, covering the `ask_handler_sync` (deferred-context) site.
+#[test]
+fn ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
+    run_multi_thread_test(async {
+        let server_addr: std::net::SocketAddr = "127.0.0.1:40573".parse().unwrap();
+        let client_addr: std::net::SocketAddr = "127.0.0.1:40574".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ask_handler_sync_error_nacks_server",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        server_registry
+            .set_actor_ask_handler_sync(Arc::new(ErroringDeferredAskActor))
+            .await;
+
+        let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            client_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ask_handler_sync_error_nacks_client",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let correlation = CorrelationTracker::new();
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+        let client_read_ctx = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&client_registry),
+            peer_addr: server_addr,
+            session_source: server_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: client_registry.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (client_writer, _client_task, _client_reader_task) = LockFreeStreamHandle::new(
+            client_io,
+            server_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(client_read_ctx),
+        );
+        let client_writer = Arc::new(client_writer);
+        let client_conn = ConnectionHandle::<()>::new_stream(
+            server_addr,
+            Arc::clone(&client_writer),
+            correlation,
+        );
+
+        // `ask_handler_sync` dispatch needs `ctx.response_writer` (see
+        // `ask_context_from_context`), same as the deferred-reply test above.
+        let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
+        let server_read_ctx = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr: client_addr,
+            session_source: client_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: Some(response_writer.clone()),
+            tell_handler_sync: server_registry.actor_tell_handler_sync.load_full(),
+            tell_handler_sync_context: server_registry.actor_tell_handler_sync_context.load_full(),
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: server_registry.actor_ask_handler_sync.load_full(),
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            client_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+        let server_writer = Arc::new(server_writer);
+        response_writer.bind_stream_handle(server_writer.clone());
+
+        let payload = bytes::Bytes::from_static(b"trigger-handler-error");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_conn.ask_actor_frame_no_timeout(0xE441_0001, 0xE441_0002, payload),
+        )
+        .await
+        .expect("the ask must resolve (NACK or reply), not time out");
+
+        match result {
+            Err(crate::GossipError::AskNacked(reason)) => {
+                assert_eq!(
+                    reason,
+                    crate::framing::AskNackReason::HandlerError,
+                    "a handler error must NACK as HandlerError, got {reason:?}"
+                );
+            }
+            other => panic!(
+                "an error from ask_handler_sync must NACK the asker, not escape silently: {other:?}"
+            ),
+        }
 
         client_writer.shutdown();
         server_writer.shutdown();
