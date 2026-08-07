@@ -25633,6 +25633,14 @@ mod tests {
             );
         }
 
+        // Age the pin's claim past `dead_peer_timeout` so the freshness
+        // fence (`claim_committed_at`, checked FIRST inside
+        // `release_dead_peer`) would itself permit release -- otherwise
+        // this test cannot tell "refused because pinned" apart from
+        // "refused merely because the claim was still fresh", and would
+        // pass even if the `operator_pinned` guard were deleted.
+        tokio::time::sleep(registry.config.dead_peer_timeout + Duration::from_millis(10)).await;
+
         registry.cleanup_dead_peers().await;
 
         assert_eq!(
