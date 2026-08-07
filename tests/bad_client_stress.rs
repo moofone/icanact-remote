@@ -336,3 +336,105 @@ async fn raw_ask_nacks_in_a_true_release_build() {
 
     handle.shutdown().await;
 }
+
+/// P1: the production no-dispatcher NACK for a raw `Ask` used to be sent via
+/// `handle::send_ask_nack`, which enqueues onto the connection's shared,
+/// bounded `write_queue` and falls back to *awaiting* it once full. That
+/// enqueue runs from inside `process_read_result_io`, on the unified stream
+/// I/O task -- the queue's only consumer, and a task that can read many
+/// frames (`READ_BATCH_LIMIT`) before ever returning to drain a write. A
+/// burst of raw asks large enough to fill `write_queue`
+/// (`DEFAULT_ASK_WINDOW * 8` = 1024 entries) while still inside that same
+/// read batch made the next NACK's enqueue block on space only the
+/// now-blocked task itself could ever free -- a permanent hang, with every
+/// asker past the queue's capacity timing out and every later frame on the
+/// connection stuck behind it, including asks that have nothing to do with
+/// the burst.
+///
+/// Sends 1536 raw asks (1.5x the old `write_queue` bound, comfortably
+/// inside the 2048-frame read-batch limit so the whole burst lands in one
+/// drain pass) in a single write, then sends one more, distinguishable ask
+/// afterward and asserts *that* one still gets answered promptly. It
+/// deliberately does not assert every burst member gets a reply: the fix
+/// routes these NACKs through `LocalStreamingQueue::queue_ask_nack`, whose
+/// own `PENDING_ASK_NACK_CAP` (64) is a separate, already-accepted
+/// best-effort bound -- entries past it are dropped in favor of newer ones,
+/// by design, independent of this finding. What this test isolates is
+/// whether the io_task ever *permanently* wedges itself on `write_queue`;
+/// a connection that is still responsive to new traffic after the burst
+/// proves it did not, regardless of how the bounded NACK queue's own
+/// eviction played out. `#[cfg(not(feature = "test-helpers"))]` for the
+/// same reason as `raw_ask_nacks_in_a_true_release_build`: needs the real
+/// production no-dispatcher path, not the test/benchmark echo mock.
+#[cfg(not(feature = "test-helpers"))]
+#[tokio::test(flavor = "current_thread")]
+async fn a_burst_of_raw_asks_past_the_write_queue_capacity_does_not_deadlock_the_io_task() {
+    let _guard = BAD_CLIENT_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    icanact_remote::tls::ensure_crypto_provider();
+
+    let server_secret = SecretKey::generate();
+    let handle = GossipRegistryHandle::new_with_transport_stack(
+        "127.0.0.1:0".parse().unwrap(),
+        server_secret.clone(),
+        None,
+        icanact_remote::BuilderTlsBootstrap,
+    )
+    .await
+    .expect("start server");
+    let server_addr = handle.registry.bind_addr;
+    let server_node_id = server_secret.public();
+    let schema_hash = handle.registry.config.schema_hash;
+
+    let (mut tls, client_peer_id) = connect_tls(server_addr, server_node_id, schema_hash).await;
+    send_fullsync(&mut tls, client_peer_id).await;
+
+    const BURST: u32 = 1536;
+    let mut frames = Vec::new();
+    for correlation_id in 0..BURST {
+        let payload = b"x";
+        let header = icanact_remote::framing::write_ask_response_header(
+            icanact_remote::MessageType::Ask,
+            correlation_id,
+            payload.len(),
+        );
+        frames.extend_from_slice(&header);
+        frames.extend_from_slice(payload);
+    }
+    // One more, distinguishable ask right after the burst, in the same
+    // write -- this is the one whose answer proves the connection is still
+    // alive, not stuck inside the burst.
+    let final_correlation_id = BURST + 1_000_000;
+    let final_payload = b"y";
+    let final_header = icanact_remote::framing::write_ask_response_header(
+        icanact_remote::MessageType::Ask,
+        final_correlation_id,
+        final_payload.len(),
+    );
+    frames.extend_from_slice(&final_header);
+    frames.extend_from_slice(final_payload);
+
+    tls.write_all(&frames)
+        .await
+        .expect("write burst of raw asks plus one trailing ask");
+    tls.flush().await.expect("flush");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let frame = read_until_ask_nack(&mut tls, final_correlation_id).await;
+        assert_eq!(
+            icanact_remote::framing::ask_nack_reason(&frame),
+            Some(icanact_remote::framing::AskNackReason::NoDispatcher)
+        );
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "the io_task must remain responsive to new traffic after a burst of raw asks past \
+         write_queue capacity, not wedge itself awaiting space in a queue only it drains: \
+         {outcome:?}"
+    );
+
+    handle.shutdown().await;
+}

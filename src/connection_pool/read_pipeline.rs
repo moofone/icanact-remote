@@ -2245,6 +2245,37 @@ where
             .await;
             Ok(())
         }
+        // A raw (unaddressed) Ask has no production dispatcher at all (see
+        // `handle::handle_raw_ask_request`'s doc) -- production always
+        // NACKs it. Queued here via `queue_ask_nack`, not sent through
+        // `handle::send_ask_nack` (which the `other` catch-all below would
+        // reach via `protocol::process_read_result`): that path enqueues
+        // onto the connection's shared `write_queue` and falls back to
+        // *awaiting* it when full. This function runs on the unified
+        // stream I/O task, which is that queue's only consumer -- it can
+        // read many frames before ever draining a write, so a burst of raw
+        // asks large enough to fill the queue while still inside this
+        // task's own read batch would block that await on space only the
+        // now-blocked task itself could ever free. `ActorAsk`/`DirectAsk`
+        // NACKs already avoid this via the task-local pending-NACK queue;
+        // this call site was the one still missing it. Excluded under
+        // `test`/`test-helpers` so the mock/benchmark echo scaffolding in
+        // `handle_raw_ask_request` (reachable only in those builds) is
+        // untouched -- it already answers off this same task via a direct,
+        // bounded write, not the shared queue, so it has no deadlock risk
+        // to fix.
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        crate::handle::MessageReadResult::AskRaw {
+            correlation_id,
+            payload,
+        } => {
+            let _ = payload;
+            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
+                correlation_id,
+                crate::framing::AskNackReason::NoDispatcher,
+            ));
+            Ok(())
+        }
         other => {
             crate::protocol::process_read_result(
                 other,
