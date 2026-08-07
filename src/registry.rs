@@ -9317,15 +9317,31 @@ impl<T: 'static> GossipRegistry<T> {
     pub async fn cleanup_dead_peers(&self) {
         let current_time = current_timestamp();
         let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
+        // A single reference pairing of the monotonic and wall clocks,
+        // taken once here rather than once per candidate below: both
+        // `current_time` and `now_instant` describe the same instant to
+        // within this function's own setup cost, so every candidate's
+        // `last_failure_time` (wall-clock, whole seconds) converts to an
+        // `Instant` (monotonic, sub-millisecond) through the SAME pairing.
+        let now_instant = std::time::Instant::now();
 
-        // This is the oldest failure evidence that could have passed the
-        // selection predicate below. It is fixed before the snapshot and is
-        // never re-derived from wall-clock time when the queued release runs.
-        let evidence_before = std::time::Instant::now()
-            .checked_sub(self.config.dead_peer_timeout)
-            .unwrap_or_else(std::time::Instant::now);
-
-        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>)> = {
+        // This selection is a `gossip_state` read, not an owner-authority
+        // one, and can go stale relative to the owner in either direction --
+        // see `release_dead_peer_ownership`'s doc comment. `evidence_before`
+        // is derived from EACH candidate's OWN `last_failure_time`, fixed
+        // here in the SAME pass as the "looks dead" decision -- not a
+        // single boundary shared by the whole sweep. A global
+        // `now - dead_peer_timeout` cutoff looks conservative (the
+        // selection filter below already requires the failure to be at
+        // least that old) but is wrong the moment the SWEEP ITSELF runs
+        // long enough after the underlying failure+reconnect: failure at
+        // t0, a direct reconnect shortly after at t1, this sweep finally
+        // running at t2 much later -- the reconnect is causally newer than
+        // the failure it is being judged against (what the fence must
+        // answer), yet a cutoff of `t2 - dead_peer_timeout` can still be
+        // newer than t1, wrongly treating a live reconnect as stale. Only
+        // each peer's own failure time answers the right question.
+        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>, std::time::Instant)> = {
             let gossip_state = self.gossip_state.lock().await;
             gossip_state
                 .peers
@@ -9337,7 +9353,21 @@ impl<T: 'static> GossipRegistry<T> {
                             current_time.saturating_sub(failure_time) > dead_peer_timeout_secs
                         })
                 })
-                .map(|(addr, info)| (*addr, info.node_id.map(|node_id| node_id.to_peer_id())))
+                .map(|(addr, info)| {
+                    // Guaranteed `Some` by the filter above.
+                    let failure_time = info
+                        .last_failure_time
+                        .expect("filtered on last_failure_time.is_some");
+                    let failure_age =
+                        Duration::from_secs(current_time.saturating_sub(failure_time));
+                    let evidence_before =
+                        now_instant.checked_sub(failure_age).unwrap_or(now_instant);
+                    (
+                        *addr,
+                        info.node_id.map(|node_id| node_id.to_peer_id()),
+                        evidence_before,
+                    )
+                })
                 .collect()
         };
 
@@ -9348,7 +9378,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Order: actor_state before gossip_state
             let mut gossip_state = self.gossip_state.lock().await;
 
-            for (peer_addr, _) in &peers_to_cleanup {
+            for (peer_addr, _, _) in &peers_to_cleanup {
                 // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
                 // This allows us to reconnect when the peer comes back online
 
@@ -9443,14 +9473,14 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
-            for (peer_addr, node_id) in &peers_to_cleanup {
+            for (peer_addr, node_id, evidence_before) in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
                 self.remove_clock_state_for_addr(peer_addr);
                 // A timed-out peer's connection teardown may never have run,
                 // leaving its owner receipt and address claim behind. Release
                 // both atomically in the owner; configured pins are retained.
                 if let Some(peer_id) = node_id {
-                    self.release_dead_peer_ownership(peer_id, *peer_addr, evidence_before)
+                    self.release_dead_peer_ownership(peer_id, *peer_addr, *evidence_before)
                         .await;
                 }
             }
@@ -25514,6 +25544,20 @@ mod tests {
             Some(peer_id.clone())
         );
 
+        // The claim-to-failure gap must itself exceed a full wall-clock
+        // second, not just be "right after": `last_failure_time`'s
+        // whole-second precision means the fence's derived `evidence_before`
+        // can OVERESTIMATE the true elapsed time by nearly a second
+        // depending on where within its own second the failure capture
+        // below happens to land. With only a short gap between the claim
+        // and the failure capture, that overestimate can exceed the
+        // claim-to-cleanup gap and wrongly refuse to reap, depending on
+        // wall-clock phase alone -- exactly the kind of incidental timing
+        // this suite must not rely on. A gap safely over a second on BOTH
+        // sides (here, and before `cleanup_dead_peers` below) absorbs the
+        // worst case regardless of phase.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
         {
             let mut gossip_state = registry.gossip_state.lock().await;
             gossip_state.peers.insert(
@@ -25531,10 +25575,16 @@ mod tests {
                     last_sequence: 0,
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
-                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
-                    last_failure_instant: Some(
-                        std::time::Instant::now() - Duration::from_secs(10),
-                    ),
+                    // Captured causally AFTER the claim above (not
+                    // backdated): `release_dead_peer`'s fence now refuses
+                    // whenever direct evidence of life is causally AFTER
+                    // the failure it is being judged against, so a failure
+                    // time that predates the claim it is meant to be
+                    // reaping (the old, now-fixed shape of this test) would
+                    // itself misrepresent a peer that connected and only
+                    // THEN failed.
+                    last_failure_time: Some(current_timestamp()),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -25547,6 +25597,11 @@ mod tests {
             );
         }
 
+        // `release_dead_peer` also requires the claim itself to be no
+        // newer than the failure this sweep is acting on (see the P1
+        // follow-on fix); see the comment above for why this gap must
+        // also safely exceed a full wall-clock second.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
         registry.cleanup_dead_peers().await;
 
         assert_eq!(
@@ -25581,6 +25636,432 @@ mod tests {
         );
     }
 
+    /// P1 regression: a dead-peer sweep's release must not clear a route or
+    /// receipt a concurrent reconnect just committed. `release_dead_peer`
+    /// refuses whenever `addr`'s ownership was committed more recently than
+    /// `dead_peer_timeout`, checked against the owner's OWN
+    /// `claim_committed_at` record -- never against a value any caller
+    /// (like `cleanup_dead_peers`) computed earlier from a different
+    /// domain. This covers the reconnect landing between a sweep's
+    /// selection and its release; see
+    /// `cleanup_dead_peers_ignores_a_reconnect_that_committed_before_selection`
+    /// for the reconnect landing strictly before selection instead.
+    #[tokio::test]
+    async fn cleanup_dead_peer_release_is_fenced_against_a_concurrent_reconnect() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_secs(300);
+        let registry = GossipRegistry::<()>::new(test_addr(44_020), config);
+        let peer_id = test_peer_id("dead-peer-reconnect-race");
+        let addr = test_addr(44_021);
+        let old_session = test_addr(44_022);
+        let new_session = test_addr(44_023);
+
+        // The dead session's original claim -- what a dead-peer sweep would
+        // have found when it selected this peer for reaping.
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                old_session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // What a dead-peer sweep's selection would have fixed as this
+        // failure's Instant-equivalent -- BEFORE the reconnect below.
+        let evidence_before = std::time::Instant::now();
+
+        // The peer reconnects and commits a fresh claim -- the race window
+        // opened by dropping `gossip_state` between selection and release
+        // in production.
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                new_session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // The (now stale) dead-peer release runs shortly after, using the
+        // failure evidence fixed BEFORE the reconnect above.
+        registry
+            .release_dead_peer_ownership(&peer_id, addr, evidence_before)
+            .await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(peer_id.clone()),
+            "a stale dead-peer release must not clear a route a concurrent reconnect \
+             just committed"
+        );
+
+        // `old_session`'s own (belated) teardown must still find its
+        // receipt -- proving the stale sweep's ghost-receipt cleanup did
+        // NOT wipe it -- and correctly treat the address as still covered
+        // by the live `new_session`.
+        registry
+            .release_connection_scoped_claims(&peer_id, old_session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(peer_id.clone()),
+            "old_session's receipt must have survived the stale sweep too, and \
+             correctly find the address still covered by the live new_session"
+        );
+
+        // `new_session`'s own later, legitimate teardown must still release
+        // the address -- proving ITS receipt was not wiped either, and that
+        // it is now recognized as the address's sole remaining session.
+        registry
+            .release_connection_scoped_claims(&peer_id, new_session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            None,
+            "the fresh session's own receipt must have survived the stale dead-peer \
+             sweep, so its later teardown still releases the address"
+        );
+    }
+
+    /// P1 follow-on regression: the reconnect's fresh claim can commit
+    /// strictly BEFORE `cleanup_dead_peers` ever takes its `gossip_state`
+    /// snapshot, not only between that snapshot and the release.
+    /// `GossipState`'s own liveness bookkeeping (`failures`/
+    /// `last_failure_time`) is only cleared by `mark_peer_connected*`, which
+    /// runs AFTER the owner has already committed the reconnect's claim --
+    /// so `gossip_state` can still show a peer as "dead" even though the
+    /// owner already holds a strictly fresher claim for its address. A
+    /// caller-computed snapshot of either liveness or ownership generation
+    /// is fooled by this ordering (the generation captured at "selection
+    /// time" would already BE the fresh one); only re-deriving freshness
+    /// from data the owner itself exclusively writes, at release time,
+    /// closes it regardless of which side of the selection the reconnect's
+    /// commit actually landed on.
+    #[tokio::test]
+    async fn cleanup_dead_peers_ignores_a_reconnect_that_committed_before_selection() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_040), config);
+        let peer_addr = test_addr(44_041);
+        let peer_id = test_peer_id("dead-peer-reconnect-before-selection");
+        let old_session = test_addr(44_042);
+        let new_session = test_addr(44_043);
+
+        // The dead session's original claim.
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                old_session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // A stale, dead-looking `PeerInfo` -- exactly what a peer that never
+        // got its own `mark_peer_connected` re-mark looks like to
+        // `cleanup_dead_peers`'s selection filter.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: true,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        // The peer reconnects and commits a fresh claim BEFORE
+        // `cleanup_dead_peers` is ever called -- strictly before its own
+        // internal selection scan, not merely before its release.
+        // `gossip_state.peers[peer_addr]` above is deliberately left
+        // showing the OLD, dead-looking failure state: a real reconnect's
+        // own liveness re-mark runs only AFTER the owner commit below (see
+        // `mark_peer_connected_if_live`'s call sites), so this is exactly
+        // what `cleanup_dead_peers` would observe if it ran right now.
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                new_session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id.clone()),
+            "cleanup_dead_peers must not release ownership a reconnect committed before \
+             its own selection scan, even though GossipState still looked dead at that \
+             exact moment"
+        );
+
+        registry
+            .release_connection_scoped_claims(&peer_id, old_session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id.clone()),
+            "old_session's receipt must have survived too"
+        );
+        registry
+            .release_connection_scoped_claims(&peer_id, new_session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            None,
+            "new_session's own later teardown must still release the address"
+        );
+    }
+
+    /// P1 follow-on regression: `evidence_before` alone being fixed at the
+    /// START of a sweep is not enough if the fence it feeds is still a
+    /// LEASE -- elapsed time measured at whatever point the release
+    /// actually runs. This exercises the full `cleanup_dead_peers` pipeline
+    /// (not just the owner primitive `release_dead_peer` directly): the
+    /// sweep is forced to block, via a held `gossip_state` lock, at the
+    /// exact point right after it fixes its evidence but before its own
+    /// selection scan ever runs. A reconnect commits into that gap, and the
+    /// sweep -- once unblocked -- must still find and refuse to release it,
+    /// however long the delay between fixing the evidence and actually
+    /// reaching the release step turned out to be.
+    #[tokio::test]
+    async fn cleanup_dead_peers_survives_a_reconnect_that_lands_while_the_sweep_is_delayed() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(44_900), config));
+        let peer_addr = test_addr(44_901);
+        let peer_id = test_peer_id("dead-peer-sweep-delay-reconnect");
+        let old_session = test_addr(44_902);
+        let new_session = test_addr(44_903);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                old_session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: true,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        // Hold `gossip_state`'s lock so the spawned sweep below fixes its
+        // `evidence_before` and then blocks on this exact lock, right
+        // before its own selection scan -- before either has run.
+        let guard = registry.gossip_state.lock().await;
+
+        let registry_for_sweep = registry.clone();
+        let sweep = tokio::spawn(async move {
+            registry_for_sweep.cleanup_dead_peers().await;
+        });
+
+        // Give the sweep's task a chance to run its (entirely synchronous,
+        // no other `.await` point precedes the lock) setup and reach the
+        // lock we're holding.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // The peer reconnects WHILE the sweep is blocked -- after its
+        // evidence was already fixed, but before its selection (let alone
+        // its release) has run at all. Submitted directly through the
+        // owner actor rather than `add_connection_scoped_peer_claim`: that
+        // helper also needs `gossip_state` for its own peer-entry
+        // projection, and this test task is already holding it via `guard`
+        // -- reentering the same (non-reentrant) lock from here would
+        // deadlock the test itself. The owner-level claim alone is exactly
+        // the fact under test: it is what commits `claim_committed_at`.
+        let reconnect = registry
+            .registry_owner
+            .claim_connection_scoped(
+                peer_addr,
+                crate::addr_ownership::Claim {
+                    node_id: peer_id.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                new_session,
+            )
+            .await;
+        assert!(reconnect.is_accepted());
+
+        // Hold the sweep blocked for well past `dead_peer_timeout`, past
+        // the reconnect's own commit -- a purely temporal fence (elapsed
+        // time since the commit, measured whenever the release step
+        // actually runs) would stop protecting it at exactly this point;
+        // the causal fence, fixed before the reconnect ever happened, must
+        // not.
+        tokio::time::sleep(registry.config.dead_peer_timeout + Duration::from_millis(10)).await;
+
+        drop(guard);
+        sweep.await.expect("sweep task panicked");
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id.clone()),
+            "a sweep delayed between fixing its evidence and reaching its own release step \
+             must not release ownership a reconnect committed during that delay"
+        );
+    }
+
+    /// P1 follow-on regression: a single `now - dead_peer_timeout` cutoff,
+    /// fixed once for the WHOLE sweep, looks conservative -- the selection
+    /// filter already requires each candidate's failure to be older than
+    /// `dead_peer_timeout` -- but is wrong the moment the sweep itself runs
+    /// long enough after the underlying failure and reconnect. Builds the
+    /// exact t0/t1/t2 sequence: a failure recorded at t0, a direct
+    /// reconnect shortly after at t1 (causally newer than the failure it
+    /// will be judged against), and the sweep finally running at t2 --
+    /// delayed well past `dead_peer_timeout` AFTER t1, long enough that a
+    /// GLOBAL cutoff of `t2 - dead_peer_timeout` would already be newer
+    /// than t1 and wrongly treat the live reconnect as stale. The fence
+    /// must be anchored to THIS peer's own failure time (t0), under which
+    /// t1 is still causally newer and the reconnect survives regardless of
+    /// how delayed t2 is.
+    #[tokio::test]
+    async fn cleanup_dead_peers_uses_each_peers_own_failure_time_not_a_global_sweep_cutoff() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_910), config);
+        let peer_addr = test_addr(44_911);
+        let peer_id = test_peer_id("per-peer-causal-fence");
+        let session_source = test_addr(44_912);
+
+        // t0: the failure is recorded in `GossipState`, entirely
+        // independent of the owner -- no claim has been made for this
+        // address yet at all.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp()),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        // t1: a direct, connection-scoped reconnect commits shortly after
+        // the failure -- causally newer than t0, but NOT reflected back
+        // into `GossipState` (`mark_peer_connected*` never runs here),
+        // exactly the cross-domain staleness this fence exists to survive.
+        //
+        // The t0-to-t1 gap must itself exceed a full wall-clock second, not
+        // just be "a few ms": `last_failure_time`'s whole-second precision
+        // means `evidence_before` is derived from a FLOORED age, which can
+        // underestimate the true elapsed time by nearly a second depending
+        // on where within its own second t0 happened to land. A short
+        // t0-to-t1 gap leaves no margin to absorb that rounding and the
+        // test would pass or fail depending on wall-clock phase alone --
+        // exactly the kind of incidental timing this suite must not rely
+        // on. A gap safely over a second on BOTH sides absorbs the worst
+        // case regardless of phase.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // t2: the sweep runs much later -- well past `dead_peer_timeout`
+        // after t1, with the same safely-over-a-second margin as above so
+        // the rounding on THIS side cannot erase the gap either. A GLOBAL
+        // `t2 - dead_peer_timeout` cutoff would by now be newer than t1,
+        // the exact bug under test.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id),
+            "a direct reconnect causally newer than the failure it is judged against must \
+             survive a sweep delayed well past dead_peer_timeout -- the fence must be \
+             anchored to this peer's own failure time, not a global cutoff for the whole \
+             sweep"
+        );
+    }
     /// Companion to `cleanup_dead_peers_releases_address_ownership`: an
     /// operator-configured reservation must outlive the peer being offline,
     /// exactly as it already outlives a single session's teardown (see
@@ -25600,6 +26081,16 @@ mod tests {
             Some(peer_id.clone())
         );
 
+        // See `cleanup_dead_peers_releases_address_ownership`'s matching
+        // comment for why this claim-to-failure gap must itself safely
+        // exceed a full wall-clock second: `last_failure_time` must be
+        // captured causally AT/AFTER the pin's claim, not before it, or
+        // the CAUSAL fence itself (not the `operator_pinned` guard this
+        // test means to exercise) would refuse the release, and the test
+        // would pass even if that guard were deleted -- shadowed the same
+        // way a purely elapsed-time check could shadow it before.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
         {
             let mut gossip_state = registry.gossip_state.lock().await;
             gossip_state.peers.insert(
@@ -25617,10 +26108,8 @@ mod tests {
                     last_sequence: 0,
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
-                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
-                    last_failure_instant: Some(
-                        std::time::Instant::now() - Duration::from_secs(10),
-                    ),
+                    last_failure_time: Some(current_timestamp()),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -25633,13 +26122,14 @@ mod tests {
             );
         }
 
-        // Age the pin's claim past `dead_peer_timeout` so the freshness
-        // fence (`claim_committed_at`, checked FIRST inside
-        // `release_dead_peer`) would itself permit release -- otherwise
-        // this test cannot tell "refused because pinned" apart from
-        // "refused merely because the claim was still fresh", and would
-        // pass even if the `operator_pinned` guard were deleted.
-        tokio::time::sleep(registry.config.dead_peer_timeout + Duration::from_millis(10)).await;
+        // The causal fence (`claim_committed_at` vs. the failure fixed
+        // above -- checked FIRST inside `release_dead_peer`) must itself
+        // permit release before this sweep runs, so this test cannot tell
+        // "refused because pinned" apart from "refused merely because the
+        // causal fence protected it", and would pass even if the
+        // `operator_pinned` guard were deleted. See the comment above for
+        // why this gap must also safely exceed a full wall-clock second.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
 
         registry.cleanup_dead_peers().await;
 
