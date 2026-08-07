@@ -4694,61 +4694,91 @@ pub(crate) enum MessageReadResult {
 
 /// Answer a raw (unaddressed) `Ask`: it carries opaque bytes with no
 /// actor_id/type_hash, so there is no per-actor handler to route to the way
-/// `ActorAsk` routes through `AskDisposition` (see registry.rs). This is the
-/// standing P0 fix: this used to be gated on `cfg(any(test, feature =
-/// "test-helpers", debug_assertions))`, so a release build hit a dead
-/// `#[cfg(not(...))]` arm that logged a warning and sent NOTHING -- every
-/// `RemoteActorRef::ask` / `ask_with_timeout` / `ask_deferred` / `ask_typed*`
-/// (all raw asks) burned its full timeout in a release build, and the
-/// no-timeout variants hung until the connection dropped. The reference
-/// command processor (`connection_pool::process_mock_request_payload` --
-/// ECHO:/REVERSE:/COUNT:/HASH:, falling back to a byte-count/content
-/// acknowledgement for anything else) always answers with data, so it's the
-/// real answer for a raw ask in every build mode now, not a fabrication
-/// confined to test/debug: a raw ask genuinely has no narrower notion of
-/// "the right handler" to defer to instead.
+/// `ActorAsk` routes through `AskDisposition` (see registry.rs) -- a raw ask
+/// has no production semantics at all. The command-processor echo below
+/// (`connection_pool::process_mock_request_payload` -- ECHO:/REVERSE:/
+/// COUNT:/HASH:, falling back to a byte-count/content acknowledgement) is
+/// test/benchmark scaffolding for exercising the raw-ask wire path without a
+/// registered actor; it must never answer a real caller with a fabricated
+/// transformation of its own request -- that is worse than the timeout it
+/// would otherwise cause, not better (the same class of wrongness as the
+/// DirectAsk echo deleted elsewhere in this batch). Production answers
+/// `AskNackReason::NoDispatcher` instead: `debug_assertions` is deliberately
+/// not part of this gate, since that is what made debug and release diverge
+/// in the first place (the standing P0 -- see `handle_raw_ask_no_dispatcher`).
 pub(crate) async fn handle_raw_ask_request(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
     correlation_id: u32,
     payload: &[u8],
 ) {
-    let response = if std::env::var("ICANACT_REMOTE_TYPED_ECHO").is_ok() && payload.len() >= 8 {
-        payload.to_vec()
-    } else {
-        crate::connection_pool::process_mock_request_payload(payload)
-    };
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        let response = if std::env::var("ICANACT_REMOTE_TYPED_ECHO").is_ok() && payload.len() >= 8 {
+            payload.to_vec()
+        } else {
+            crate::connection_pool::process_mock_request_payload(payload)
+        };
 
-    let conn = {
-        let pool = &registry.connection_pool;
-        pool.get_connection_by_addr(&peer_addr)
-    };
+        let conn = {
+            let pool = &registry.connection_pool;
+            pool.get_connection_by_addr(&peer_addr)
+        };
 
-    if let Some(conn) = conn {
-        if let Some(ref stream_handle) = conn.stream_handle {
-            let header = crate::framing::write_ask_response_header(
-                crate::MessageType::Response,
-                correlation_id,
-                response.len(),
-            );
+        if let Some(conn) = conn {
+            if let Some(ref stream_handle) = conn.stream_handle {
+                let header = crate::framing::write_ask_response_header(
+                    crate::MessageType::Response,
+                    correlation_id,
+                    response.len(),
+                );
 
-            if let Err(e) = stream_handle
-                .write_header_and_payload_control(
-                    bytes::Bytes::copy_from_slice(&header),
-                    bytes::Bytes::from(response),
-                )
-                .await
-            {
-                warn!(peer = %peer_addr, error = %e, "Failed to send Ask response");
+                if let Err(e) = stream_handle
+                    .write_header_and_payload_control(
+                        bytes::Bytes::copy_from_slice(&header),
+                        bytes::Bytes::from(response),
+                    )
+                    .await
+                {
+                    warn!(peer = %peer_addr, error = %e, "Failed to send Ask response");
+                } else {
+                    // Intentionally quiet: this is the hot-path and can spam logs in benchmarks.
+                }
             } else {
-                // Intentionally quiet: this is the hot-path and can spam logs in benchmarks.
+                warn!(peer = %peer_addr, "No stream handle for Ask response");
             }
         } else {
-            warn!(peer = %peer_addr, "No stream handle for Ask response");
+            warn!(peer = %peer_addr, "No connection found for Ask response");
         }
-    } else {
-        warn!(peer = %peer_addr, "No connection found for Ask response");
     }
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    {
+        let _ = payload;
+        handle_raw_ask_no_dispatcher(registry, peer_addr, correlation_id).await;
+    }
+}
+
+/// A raw (unaddressed) ask has no production dispatcher at all -- see
+/// `handle_raw_ask_request`'s doc. Split out so it's unconditionally
+/// compiled and can be exercised directly by a test: `cargo test` always
+/// runs in the dev profile with `cfg(test)` active, so the
+/// `#[cfg(not(any(test, feature = "test-helpers")))]` branch above can never
+/// itself execute under `cargo test` (see
+/// `raw_ask_with_no_dispatcher_nacks_instead_of_silence`, and
+/// `tests/bad_client_stress.rs::raw_ask_nacks_in_a_true_release_build` for
+/// direct evidence from an actual `--release` binary).
+pub(crate) async fn handle_raw_ask_no_dispatcher(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u32,
+) {
+    send_ask_nack(
+        registry,
+        peer_addr,
+        correlation_id,
+        crate::framing::AskNackReason::NoDispatcher,
+    )
+    .await;
 }
 
 /// Send a response back to the peer for a streaming ask request.
@@ -5334,7 +5364,7 @@ where
 #[cfg(test)]
 mod framing_tests {
     use super::{
-        MessageReadResult, handle_raw_ask_request, parse_message_from_pooled_buffer_with_routes,
+        MessageReadResult, handle_raw_ask_no_dispatcher, parse_message_from_pooled_buffer_with_routes,
         read_message_from_tls_reader,
     };
     use crate::{MessageType, framing, registry::RegistryMessage};
@@ -5548,21 +5578,23 @@ mod framing_tests {
         }
     }
 
-    /// Item 2 (standing P0): a raw (unaddressed) `Ask` used to be answered
-    /// only in test/debug builds (`cfg(any(test, feature = "test-helpers",
-    /// debug_assertions))`); a release build hit the complementary
-    /// `#[cfg(not(...))]` arm, which logged a warning and sent NOTHING --
-    /// every `RemoteActorRef::ask` / `ask_with_timeout` / `ask_deferred` /
-    /// `ask_typed*` burned its full timeout in a release build. This proves
-    /// `handle_raw_ask_request` answers with real data unconditionally now
-    /// (there is no cfg-gated branch left to fail to prove -- `cargo build
-    /// --release`, verified separately, proves the function itself compiles
-    /// identically in release).
+    /// Item 2 (standing P0, corrected): a raw (unaddressed) `Ask` has no
+    /// production dispatcher -- `cargo test` always runs in the dev profile
+    /// with `cfg(test)` active, so it can never itself exercise the
+    /// `#[cfg(not(any(test, feature = "test-helpers")))]` branch of
+    /// `handle_raw_ask_request`. This calls the unconditionally-compiled
+    /// `handle_raw_ask_no_dispatcher` that branch delegates to directly,
+    /// emulating what a release build does, and proves it sends a real NACK
+    /// (not silence, and not a fabricated echo of the request) rather than
+    /// merely asserting cfg-gate wiring. It does NOT prove the release
+    /// binary compiles/links this path; only `cargo build --release` does
+    /// that, and `tests/bad_client_stress.rs::raw_ask_nacks_in_a_true_release_build`
+    /// is the direct evidence from an actual `--release` binary.
     #[tokio::test]
-    async fn raw_ask_answers_with_data_not_silence() {
+    async fn raw_ask_with_no_dispatcher_nacks_instead_of_silence() {
         let addr: SocketAddr = "127.0.0.1:19997".parse().unwrap();
         let config = crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("raw-ask-answers-self")),
+            key_pair: Some(crate::KeyPair::new_for_testing("raw-ask-no-dispatcher-self")),
             ..Default::default()
         };
         let registry = crate::registry::GossipRegistry::<()>::new(addr, config);
@@ -5581,36 +5613,28 @@ mod framing_tests {
             crate::connection_pool::LockFreeConnection::new(addr, crate::connection_pool::ConnectionDirection::Inbound);
         conn.stream_handle = Some(std::sync::Arc::new(stream_handle));
         conn.set_state(crate::connection_pool::ConnectionState::Connected);
-        let peer_id = crate::KeyPair::new_for_testing("raw-ask-answers-peer").peer_id();
+        let peer_id = crate::KeyPair::new_for_testing("raw-ask-no-dispatcher-peer").peer_id();
         registry
             .connection_pool
             .add_connection_by_peer_id(peer_id, addr, std::sync::Arc::new(conn));
 
         let registry = std::sync::Arc::new(registry);
-        handle_raw_ask_request(&registry, addr, 555, b"ECHO:hello").await;
+        handle_raw_ask_no_dispatcher(&registry, addr, 555).await;
 
-        let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
-        tokio::time::timeout(std::time::Duration::from_secs(2), peer_io.read_exact(&mut header))
+        let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer_io.read_exact(&mut frame))
             .await
-            .expect("a raw ask must be answered immediately, not left to a timeout")
-            .expect("peer must receive the response frame");
+            .expect("a NACK must be sent immediately, not left to a timeout")
+            .expect("peer must receive the NACK frame");
 
-        let control = crate::framing::decode_control(header[..4].try_into().unwrap())
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
             .expect("valid control word");
         assert_eq!(control.kind, crate::framing::WireKind::Response);
-        assert_eq!(u32::from_be_bytes(header[4..8].try_into().unwrap()), 555);
+        assert_eq!(u32::from_be_bytes(frame[4..8].try_into().unwrap()), 555);
         assert_eq!(
-            crate::framing::ask_nack_reason(&header[4..]),
-            None,
-            "a raw ask always gets a real answer, never a NACK"
+            crate::framing::ask_nack_reason(&frame[4..]),
+            Some(crate::framing::AskNackReason::NoDispatcher)
         );
-
-        let mut payload = vec![0u8; control.body_len - crate::framing::ASK_RESPONSE_HEADER_LEN];
-        tokio::time::timeout(std::time::Duration::from_secs(2), peer_io.read_exact(&mut payload))
-            .await
-            .expect("payload must follow immediately")
-            .expect("peer must receive the payload");
-        assert_eq!(payload, b"ECHOED:hello");
     }
 
     /// Item 4, fail-closed: a DirectAsk frame with request_id == 0 (the
