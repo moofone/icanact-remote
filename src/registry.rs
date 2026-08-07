@@ -5931,36 +5931,36 @@ impl<T: 'static> GossipRegistry<T> {
             }
 
             // Filter to retry-eligible, non-suppressed peers and deduplicate
-            // by stable identity (GossipNodeId) so a physical peer that is tracked
-            // under multiple SocketAddr keys — ephemeral TCP-source still
-            // present alongside its migrated bind address, dual-stack
-            // IPv4/IPv6 aliases, DNS-resolved hostnames — receives one
-            // delivery per round. Peers whose GossipNodeId is not yet known
-            // continue to be keyed by SocketAddr.
-            let mut seen: std::collections::HashSet<PeerDispatchKey> =
-                std::collections::HashSet::new();
-            let mut available_peers: Vec<SocketAddr> = Vec::new();
-            for (peer_addr, peer) in gossip_state.peers.iter() {
-                let retry_window_open = peer.failures < self.config.max_peer_failures
-                    || (current_time.saturating_sub(peer.last_attempt))
-                        > self.config.peer_retry_interval.as_secs();
-                if !retry_window_open {
-                    continue;
-                }
-                if self.should_suppress_outbound_retry_for_peer(peer) {
-                    debug!(
-                        peer = %peer_addr,
-                        inbound_observed = peer.inbound_observed,
-                        outbound_dial_success = peer.outbound_dial_success,
-                        peer_addr_key = %peer.address,
-                        "Suppressing outbound retry for inbound-only undialable peer"
-                    );
-                    continue;
-                }
-                if seen.insert(PeerDispatchKey::for_entry(*peer_addr, peer)) {
-                    available_peers.push(*peer_addr);
-                }
-            }
+            // (and rank) by stable identity via `select_best_alias_per_identity`
+            // (see `PeerDispatchKey`) so a physical peer tracked under
+            // multiple SocketAddr keys — ephemeral TCP-source still present
+            // alongside its migrated bind address, dual-stack IPv4/IPv6
+            // aliases, DNS-resolved hostnames — receives one delivery per
+            // round, and a transport-source-keyed ephemeral alias can never
+            // win that slot over the peer's genuinely live/dialable one.
+            let available_peers = Self::select_best_alias_per_identity(
+                &gossip_state.peers,
+                |addr, peer| self.addr_has_live_connection(addr, peer),
+                |peer_addr, peer| {
+                    let retry_window_open = peer.failures < self.config.max_peer_failures
+                        || (current_time.saturating_sub(peer.last_attempt))
+                            > self.config.peer_retry_interval.as_secs();
+                    if !retry_window_open {
+                        return false;
+                    }
+                    if self.should_suppress_outbound_retry_for_peer(peer) {
+                        debug!(
+                            peer = %peer_addr,
+                            inbound_observed = peer.inbound_observed,
+                            outbound_dial_success = peer.outbound_dial_success,
+                            peer_addr_key = %peer.address,
+                            "Suppressing outbound retry for inbound-only undialable peer"
+                        );
+                        return false;
+                    }
+                    true
+                },
+            );
 
             if available_peers.is_empty() {
                 info!(
@@ -8580,20 +8580,57 @@ impl<T: 'static> GossipRegistry<T> {
         max_peer_failures: usize,
         fanout: usize,
     ) -> Vec<SocketAddr> {
+        let mut selected = Self::select_best_alias_per_identity(
+            peers,
+            |addr, peer| self.addr_has_live_connection(addr, peer),
+            |_addr, peer| peer.failures < max_peer_failures,
+        );
+        selected.truncate(fanout);
+        selected
+    }
+
+    /// Pick the single best `SocketAddr` alias per stable identity (see
+    /// `PeerDispatchKey`) among the entries `eligible` admits.
+    ///
+    /// This is the ONE place per-identity gossip-target selection may
+    /// happen -- every caller that needs to turn `gossip_state.peers`
+    /// (a `HashMap`, so iteration order is arbitrary) into "one candidate
+    /// address per physical peer" must go through this, rather than
+    /// growing its own `seen: HashSet<PeerDispatchKey>` first-wins dedup.
+    /// A fourth ad hoc copy is exactly how this bug kept recurring:
+    /// first-seen-wins silently prefers whichever alias `HashMap`
+    /// iteration visits first, which can just as easily be a
+    /// `transport_source_keyed` ephemeral source as the peer's genuinely
+    /// dialable address.
+    ///
+    /// Ranking precedence (highest first): a live connection (per
+    /// `is_live`) always wins over a non-live one; among equally
+    /// (non-)live aliases, a genuinely dialable one (`!transport_source_keyed`)
+    /// always wins over a source-keyed one, regardless of failure count --
+    /// an ephemeral connection source is not dialable by anyone else, so
+    /// it must never be preferred merely for having fewer failures; and
+    /// only among aliases tied on both does fewer failures win. All three
+    /// are evaluated while iterating, so the result is independent of
+    /// visitation order.
+    fn select_best_alias_per_identity(
+        peers: &HashMap<SocketAddr, PeerInfo>,
+        is_live: impl Fn(SocketAddr, &PeerInfo) -> bool,
+        eligible: impl Fn(SocketAddr, &PeerInfo) -> bool,
+    ) -> Vec<SocketAddr> {
         let mut best_by_identity: std::collections::HashMap<
             PeerDispatchKey,
             (SocketAddr, bool, bool, usize),
         > = std::collections::HashMap::new();
         for (addr, peer) in peers.iter() {
-            if peer.failures >= max_peer_failures {
+            if !eligible(*addr, peer) {
                 continue;
             }
-            let is_live = self.addr_has_live_connection(*addr, peer);
+            let live = is_live(*addr, peer);
             let dialable = !peer.transport_source_keyed;
             best_by_identity
                 .entry(PeerDispatchKey::for_entry(*addr, peer))
-                .and_modify(|(best_addr, best_is_live, best_dialable, best_failures)| {
-                    let better = match (is_live, *best_is_live) {
+                .and_modify(|(best_addr, best_live, best_dialable, best_failures)| {
+                    let better = match (live, *best_live) {
                         (true, false) => true,
                         (false, true) => false,
                         _ => match (dialable, *best_dialable) {
@@ -8604,19 +8641,17 @@ impl<T: 'static> GossipRegistry<T> {
                     };
                     if better {
                         *best_addr = *addr;
-                        *best_is_live = is_live;
+                        *best_live = live;
                         *best_dialable = dialable;
                         *best_failures = peer.failures;
                     }
                 })
-                .or_insert((*addr, is_live, dialable, peer.failures));
+                .or_insert((*addr, live, dialable, peer.failures));
         }
-        let mut selected: Vec<SocketAddr> = best_by_identity
+        best_by_identity
             .into_values()
             .map(|(addr, _, _, _)| addr)
-            .collect();
-        selected.truncate(fanout);
-        selected
+            .collect()
     }
 
     #[cfg(test)]
@@ -8982,60 +9017,20 @@ impl<T: 'static> GossipRegistry<T> {
             return Vec::new();
         }
 
-        // Get active peers to gossip to, deduplicated by stable identity
-        // (see `PeerDispatchKey`) so a physical peer tracked under
-        // multiple SocketAddr aliases does not burn more than one slot of
-        // the `max_peer_gossip_targets` budget. `gossip_state.peers` is a
-        // `HashMap`, whose iteration order is effectively arbitrary, so
-        // picking "whichever alias is seen first" can just as easily keep
-        // a stale-but-under-threshold alias and drop the address this
-        // node is actually connected to right now, silently skipping that
-        // peer's gossip for the round. Track the best alias seen so far
-        // per identity instead, ranked (highest priority first): a live
-        // connection always wins over a non-live one; among equally
-        // (non-)live aliases, a genuinely dialable one always wins over a
-        // `transport_source_keyed` one -- an ephemeral connection source
-        // is not dialable by anyone else, so it must never be preferred
-        // merely for having fewer failures; and only among aliases tied
-        // on both wins on fewer failures. All three are checked while
-        // iterating, so the result is independent of visitation order.
+        // Get active peers to gossip to, deduplicated (and ranked) by
+        // stable identity via `select_best_alias_per_identity` (see
+        // `PeerDispatchKey`) so a physical peer tracked under multiple
+        // SocketAddr aliases does not burn more than one slot of the
+        // `max_peer_gossip_targets` budget, and so a stale or
+        // transport-source-keyed alias never wins that slot over the
+        // peer's genuinely live/dialable one.
         let targets: Vec<SocketAddr> = {
             let gossip_state = self.gossip_state.lock().await;
-            let mut best_by_identity: std::collections::HashMap<
-                PeerDispatchKey,
-                (SocketAddr, bool, bool, usize),
-            > = std::collections::HashMap::new();
-            for (addr, info) in gossip_state.peers.iter() {
-                if info.failures >= self.config.max_peer_failures {
-                    continue;
-                }
-                let is_live = self.addr_has_live_connection(*addr, info);
-                let dialable = !info.transport_source_keyed;
-                best_by_identity
-                    .entry(PeerDispatchKey::for_entry(*addr, info))
-                    .and_modify(|(best_addr, best_is_live, best_dialable, best_failures)| {
-                        let better = match (is_live, *best_is_live) {
-                            (true, false) => true,
-                            (false, true) => false,
-                            _ => match (dialable, *best_dialable) {
-                                (true, false) => true,
-                                (false, true) => false,
-                                _ => info.failures < *best_failures,
-                            },
-                        };
-                        if better {
-                            *best_addr = *addr;
-                            *best_is_live = is_live;
-                            *best_dialable = dialable;
-                            *best_failures = info.failures;
-                        }
-                    })
-                    .or_insert((*addr, is_live, dialable, info.failures));
-            }
-            let mut active_peers: Vec<SocketAddr> = best_by_identity
-                .into_values()
-                .map(|(addr, _, _, _)| addr)
-                .collect();
+            let mut active_peers = Self::select_best_alias_per_identity(
+                &gossip_state.peers,
+                |addr, info| self.addr_has_live_connection(addr, info),
+                |_addr, info| info.failures < self.config.max_peer_failures,
+            );
 
             // Shuffle and take max_peer_gossip_targets
             active_peers.shuffle(&mut rand::rng());
@@ -12137,6 +12132,69 @@ mod tests {
              aliases {alias_a} and {alias_b}, got {aliases_targeted} (tasks: {:?})",
             tasks.iter().map(|t| t.peer_addr).collect::<Vec<_>>()
         );
+    }
+
+    /// Among aliases of one identity tied on liveness (here: neither live)
+    /// and failure count, a `transport_source_keyed` entry must lose to a
+    /// genuinely dialable one in the SCHEDULED gossip round too -- mirroring
+    /// `gossip_peer_list_target_selection_prefers_dialable_alias_over_transport_source_keyed`
+    /// (periodic peer-list path) and
+    /// `immediate_gossip_selection_prefers_dialable_alias_over_transport_source_keyed`
+    /// (urgent path) for `prepare_gossip_round`'s own dedup. Without ranking,
+    /// `gossip_state.peers` being a `HashMap` means which alias survives
+    /// dedup is arbitrary, and repeatedly targeting the ephemeral source
+    /// wastes the round on an address nobody else can dial. This test
+    /// constructs both possible insertion orders and repeats each one
+    /// (HashMap hashing is randomly re-seeded per instance) so a wrong
+    /// answer can't hide behind luck.
+    #[tokio::test]
+    async fn prepare_gossip_round_prefers_dialable_alias_over_transport_source_keyed() {
+        for reversed in [false, true] {
+            for _ in 0..20 {
+                let mut config = test_config();
+                config.small_cluster_threshold = 0;
+                let registry = GossipRegistry::<()>::new(test_addr(20_270), config);
+
+                let shared_node_id =
+                    test_peer_id("prepare-gossip-round-dialable-shared").to_node_id();
+                let dialable_addr = test_addr(20_271);
+                let source_keyed_addr = test_addr(20_272);
+
+                let dialable_info = peer_info_with_node_id(dialable_addr, shared_node_id);
+                let mut source_keyed_info =
+                    peer_info_with_node_id(source_keyed_addr, shared_node_id);
+                source_keyed_info.transport_source_keyed = true;
+
+                {
+                    let mut state = registry.gossip_state.lock().await;
+                    if reversed {
+                        state.peers.insert(source_keyed_addr, source_keyed_info);
+                        state.peers.insert(dialable_addr, dialable_info);
+                    } else {
+                        state.peers.insert(dialable_addr, dialable_info);
+                        state.peers.insert(source_keyed_addr, source_keyed_info);
+                    }
+                }
+
+                let tasks = registry.prepare_gossip_round().await.unwrap();
+                let targeted: Vec<SocketAddr> = tasks.iter().map(|t| t.peer_addr).collect();
+                assert_eq!(
+                    targeted
+                        .iter()
+                        .filter(|a| **a == dialable_addr || **a == source_keyed_addr)
+                        .count(),
+                    1,
+                    "the shared identity must receive exactly one scheduled gossip \
+                     task (reversed: {reversed}): {targeted:?}"
+                );
+                assert!(
+                    targeted.contains(&dialable_addr),
+                    "the dialable alias must be chosen over the transport-source-keyed \
+                     one, not whichever HashMap iteration visits first \
+                     (reversed: {reversed}): {targeted:?}"
+                );
+            }
+        }
     }
 
     /// A peer can be genuinely retry-eligible (its `last_attempt` really is
