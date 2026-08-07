@@ -101,6 +101,27 @@ pub struct StreamingState {
 /// the tombstone it still needs.
 const REJECTED_STREAMS_BITMAP_WORD_BUDGET: usize = 131_072;
 
+/// Hard ceiling on the number of *entries* `rejected_streams` may hold,
+/// independent of `REJECTED_STREAMS_BITMAP_WORD_BUDGET`. The byte budget
+/// alone cannot bound an entry whose bitmap costs zero words -- two such
+/// paths have been found in this table's history (an unvalidated empty
+/// first V5 chunk, and a legacy stream reaped before its stride was ever
+/// established; see `begin_v5_stream`'s `first_chunk_len == 0` check and
+/// `tombstone_reaped_stream`'s `chunk_stride.is_none()` check) -- so every
+/// tombstone, regardless of its own bitmap size, also costs exactly one
+/// unit against this budget. `4096` is far beyond any legitimate backlog
+/// (`max_concurrent_streams` bounds how many streams can be active at once,
+/// and a rejected/reaped generation's tombstone is removed as soon as its
+/// own completion is observed) while still capping the table's fixed
+/// per-entry overhead -- the `RejectedStreamTombstone` struct plus
+/// `HashMap` bookkeeping, independent of `received_chunks`'s length -- at a
+/// small, constant worst case, exactly the property a *count* budget adds
+/// that a *byte* budget cannot: it does not depend on every entry
+/// continuing to cost a nonzero number of words, which is a property of
+/// today's two insertion paths, not a guarantee this table can enforce
+/// against a third one.
+const REJECTED_STREAMS_ENTRY_BUDGET: usize = 4096;
+
 #[cfg(test)]
 thread_local! {
     /// Test-only instrumentation: the word count of the last bitmap
@@ -765,9 +786,9 @@ impl StreamingState {
     /// an existing tombstone to make room -- that is exactly the bug this
     /// table's redesign removed, since any existing entry might still have
     /// a frame in flight -- so it can fail outright when
-    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` is already exhausted. Returns
-    /// `true` if the tombstone was recorded (or none was needed -- see
-    /// below), `false` if the budget refused it; the caller
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` or `REJECTED_STREAMS_ENTRY_BUDGET`
+    /// is already exhausted. Returns `true` if the tombstone was recorded
+    /// (or none was needed -- see below), `false` if either budget refused it; the caller
     /// (`begin_v5_stream_or_discard`) turns `false` into a hard,
     /// connection-fatal error rather than silently discarding the stream
     /// with no way to recognize its own trailing chunks later.
@@ -822,13 +843,19 @@ impl StreamingState {
 
     /// The aggregate bitmap word count `rejected_streams` would hold if
     /// `stream_id`'s tombstone were (re)inserted needing `new_words` words,
-    /// or `None` if that would exceed `REJECTED_STREAMS_BITMAP_WORD_BUDGET`.
-    /// An existing tombstone already charged against the budget for the same
-    /// `stream_id` is replaced, not added to. Split out from
-    /// `try_insert_tombstone` so `reject_stream` can run the same check
-    /// *before* the (potentially large) bitmap `new_words` describes is ever
-    /// allocated.
+    /// or `None` if that would exceed `REJECTED_STREAMS_BITMAP_WORD_BUDGET`
+    /// *or* `REJECTED_STREAMS_ENTRY_BUDGET`. An existing tombstone already
+    /// charged against both budgets for the same `stream_id` is replaced,
+    /// not added to, for either dimension -- replacing it can never grow
+    /// the entry count, so only a genuinely new `stream_id` is subject to
+    /// the entry-count check. Split out from `try_insert_tombstone` so
+    /// `reject_stream` can run the same check *before* the (potentially
+    /// large) bitmap `new_words` describes is ever allocated.
     fn projected_bitmap_words(&self, stream_id: u64, new_words: usize) -> Option<usize> {
+        let is_new_entry = !self.rejected_streams.contains_key(&stream_id);
+        if is_new_entry && self.rejected_streams.len() >= REJECTED_STREAMS_ENTRY_BUDGET {
+            return None;
+        }
         let previous_words = self
             .rejected_streams
             .get(&stream_id)
@@ -841,11 +868,13 @@ impl StreamingState {
     }
 
     /// Attempts to insert (or replace) a tombstone, respecting
-    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET`. Returns `false` -- without
-    /// touching `rejected_streams` at all -- if doing so would exceed the
-    /// budget; every existing entry is left exactly as it was. Keeps
-    /// `rejected_streams_bitmap_words` in sync so the budget check stays
-    /// O(1) rather than re-summing the whole table on every call.
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` and
+    /// `REJECTED_STREAMS_ENTRY_BUDGET`. Returns `false` -- without touching
+    /// `rejected_streams` at all -- if doing so would exceed either budget;
+    /// every existing entry is left exactly as it was. Keeps
+    /// `rejected_streams_bitmap_words` in sync so the byte-budget check
+    /// stays O(1) rather than re-summing the whole table on every call (the
+    /// entry-count check is already O(1) via `HashMap::len`).
     fn try_insert_tombstone(&mut self, stream_id: u64, tombstone: RejectedStreamTombstone) -> bool {
         let new_words = tombstone.received_chunks.len();
         let Some(projected_words) = self.projected_bitmap_words(stream_id, new_words) else {
@@ -1378,8 +1407,19 @@ impl StreamingState {
     /// If that state already shows the generation complete -- every chunk
     /// it declared was already committed before it was reaped -- there is
     /// nothing left a compliant sender could still send, so no tombstone is
-    /// needed at all. Returns `false` if `REJECTED_STREAMS_BITMAP_WORD_BUDGET`
-    /// refused the (incomplete) tombstone; see `try_insert_tombstone`.
+    /// needed at all. Returns `false` if either `REJECTED_STREAMS_BITMAP_WORD_BUDGET`
+    /// or `REJECTED_STREAMS_ENTRY_BUDGET` refused the (incomplete) tombstone;
+    /// see `try_insert_tombstone`.
+    ///
+    /// **`chunk_stride.is_none()` means this stream was reaped before its
+    /// stride was ever established, and is never tombstoned at all** -- see
+    /// the reasoning inline below. This is the only shape that reaches this
+    /// function with an empty `received_chunks` (a V5 stream always
+    /// establishes its stride at creation, from the mandatory inline first
+    /// chunk on its `StreamStart` -- see `begin_v5_stream`/`reserve_v5_chunk`
+    /// -- so only a *legacy* stream, whose `StreamStart` can legitimately
+    /// arrive with no inline chunk at all, can still have `chunk_stride ==
+    /// None` by the time it is reaped).
     fn tombstone_reaped_stream(
         &mut self,
         stream_id: u64,
@@ -1388,6 +1428,45 @@ impl StreamingState {
         expected_chunks: Option<usize>,
         received_chunks: Vec<u64>,
     ) -> bool {
+        if chunk_stride.is_none() {
+            // A tombstone for this generation cannot serve the purpose
+            // tombstones exist for: with no stride, `is_complete` can never
+            // observe completion (there is no known chunk count to check
+            // against), and -- more fundamentally -- nothing removes it.
+            // Legacy chunk delivery gates on `active_streams` alone
+            // (`metadata_for`, checked by the dispatcher before
+            // `add_chunk_with_correlation` is ever called), never on
+            // `rejected_streams`; and legacy's own `StreamStart` entry point
+            // (`start_stream_with_correlation_and_kind`) never calls
+            // `remove_tombstone` the way `begin_v5_stream_or_discard` does
+            // for V5. Inserting one anyway would create an entry that costs
+            // *zero* bitmap words -- invisible to
+            // `REJECTED_STREAMS_BITMAP_WORD_BUDGET` -- and that nothing in
+            // this table can ever reclaim: exactly the zero-cost,
+            // never-removed hole this function exists to close, not one to
+            // reopen with a budget check.
+            //
+            // Consequence for a late chunk of the reaped generation: a
+            // legacy `StreamData` frame for an id no longer in
+            // `active_streams` is already dropped as a harmless, warned
+            // no-op by the dispatcher's `metadata_for` check, independent of
+            // whether a tombstone exists -- so nothing changes for the case
+            // tombstones actually protect. What does change: a chunk
+            // referencing this exact id through the *V5* path
+            // (`reserve_v5_chunk_or_discard`) after this point is no longer
+            // silently absorbed by an inert tombstone and instead hits the
+            // ordinary "unknown stream_id" fatal error -- the same fallback
+            // a truly unrecognized id already gets, and the correct one for
+            // an id collision across protocol variants rather than a
+            // legitimate late chunk of an already-reaped generation.
+            //
+            // `remove_tombstone` clears any stale tombstone a *different*
+            // earlier generation of this same id might have left behind
+            // (legacy's `StreamStart` not clearing on start, per above, cuts
+            // both ways); it is a no-op when there is nothing to remove.
+            self.remove_tombstone(stream_id);
+            return true;
+        }
         let tombstone =
             RejectedStreamTombstone::reaped(total_size, chunk_stride, expected_chunks, received_chunks);
         if tombstone.is_complete() {
@@ -3061,6 +3140,131 @@ mod tests {
         assert!(
             matches!(trailing, Ok(None)),
             "budget exhaustion must never evict an existing tombstone: {trailing:?}"
+        );
+    }
+
+    /// Review finding: a legacy stream reaped before its stride was ever
+    /// established -- a header-only `StreamStart` (`chunk_size == 0`, the
+    /// dispatcher's `chunk_data.is_empty()` short-circuit) with no
+    /// `StreamData` chunk following before the idle reaper catches it -- used
+    /// to be tombstoned with an empty completion bitmap: zero bitmap words,
+    /// entirely invisible to `REJECTED_STREAMS_BITMAP_WORD_BUDGET`. Worse,
+    /// nothing removes it afterward: legacy chunk delivery gates on
+    /// `active_streams` alone (`metadata_for`), never on `rejected_streams`,
+    /// and legacy's own `StreamStart` entry point
+    /// (`start_stream_with_correlation_and_kind`) never clears an existing
+    /// tombstone the way `begin_v5_stream_or_discard` does for V5. A peer
+    /// repeating this -- well past `max_concurrent_streams`, since each
+    /// cycle reaps its batch before the next one starts -- used to grow
+    /// `rejected_streams` without bound: the same shape as the zero-stride
+    /// hole closed on the V5 path (`begin_v5_stream`'s `first_chunk_len ==
+    /// 0` check), just reached through legacy's header-only short-circuit
+    /// instead.
+    ///
+    /// Asserts the bound holds throughout every cycle, not merely that some
+    /// later insertion eventually gets refused: the bug is that these
+    /// insertions were never refused, or budgeted, at all.
+    #[test]
+    fn header_only_legacy_streams_never_accumulate_tombstones() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let mut next_stream_id = 1u64;
+
+        for cycle in 0..300 {
+            for _ in 0..16 {
+                let header = crate::StreamHeader {
+                    stream_id: next_stream_id,
+                    total_size: 64,
+                    chunk_size: 0,
+                    chunk_index: 0,
+                    type_hash: 0,
+                    actor_id: 0,
+                };
+                next_stream_id += 1;
+                state
+                    .start_stream_with_correlation_and_kind(header, 1, pool.clone(), None, false)
+                    .expect("header-only legacy StreamStart is accepted while capacity allows");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let _ = state.cleanup_stale_with(
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(3600),
+                1,
+            );
+            assert_eq!(
+                state.rejected_stream_count(),
+                0,
+                "cycle {cycle}: a stride-less legacy stream must never be tombstoned -- it can \
+                 never be removed (legacy chunk delivery never consults rejected_streams, and \
+                 legacy's StreamStart never clears it either), so tombstoning it can only \
+                 accumulate"
+            );
+        }
+
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "every header-only stream must have been reaped by the end"
+        );
+    }
+
+    /// Review finding: a byte-word budget alone cannot bound an entry that
+    /// costs zero (or, as here, very few) words -- `REJECTED_STREAMS_ENTRY_BUDGET`
+    /// exists as an independent, orthogonal ceiling on the table's entry
+    /// count. Uses genuine, cheap (1-word) multi-frame V5 rejections --
+    /// `REJECTED_STREAMS_ENTRY_BUDGET + 1` of them sums to a fraction of
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET`, so only the entry-count check
+    /// can be the one that eventually refuses.
+    #[test]
+    fn entry_budget_bounds_the_table_independent_of_bitmap_words() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+
+        // Fill max_concurrent_streams (16) so every further start hits the
+        // resource-pressure path.
+        for stream_id in 0..16u64 {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size: 8,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8)
+                .expect("connection has room for the first 16 streams")
+                .expect("must be admitted, not discarded");
+        }
+
+        let mut refused_at = None;
+        for i in 0..=REJECTED_STREAMS_ENTRY_BUDGET {
+            let header = crate::StreamHeader {
+                stream_id: 1000 + i as u64,
+                total_size: 128,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            // total_size=128, first_chunk_len=8 -> 16 expected chunks -> a
+            // single (1-word) bitmap: deliberately far under the byte
+            // budget even summed across every iteration.
+            let result = state.begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8);
+            if result.is_err() {
+                refused_at = Some(i);
+                break;
+            }
+        }
+
+        assert_eq!(
+            refused_at,
+            Some(REJECTED_STREAMS_ENTRY_BUDGET),
+            "the entry-count budget must refuse the (REJECTED_STREAMS_ENTRY_BUDGET + 1)-th \
+             cheap tombstone even though its aggregate bitmap-word cost \
+             ({}) is nowhere near REJECTED_STREAMS_BITMAP_WORD_BUDGET ({})",
+            REJECTED_STREAMS_ENTRY_BUDGET,
+            REJECTED_STREAMS_BITMAP_WORD_BUDGET
         );
     }
 
