@@ -519,6 +519,32 @@ impl StreamingState {
         is_response: bool,
         first_chunk_len: usize,
     ) -> Result<StreamChunkReservation> {
+        // Validated *before* `start_stream_with_correlation_and_kind`'s
+        // capacity check, for the same reason `total_size` is (see that
+        // call's comment below): `begin_v5_stream_or_discard` reclassifies
+        // a `ResourceBusy` from that check into a stream-local discard and
+        // builds a `RejectedStreamTombstone` from this same
+        // `first_chunk_len`. `reserve_v5_chunk` (the only other place a
+        // zero-length chunk is normally rejected, with "V5 stream chunk is
+        // empty") is never reached in that path -- capacity fails first --
+        // so an empty first chunk previously reached tombstone
+        // construction unvalidated. `RejectedStreamTombstone::establish_stride`
+        // treats a zero length as "stride unknown" and leaves
+        // `received_chunks` empty, so that tombstone charges *zero* words
+        // against the aggregate budget: a peer at capacity could send
+        // unlimited distinct header-only `StreamStart`s and grow
+        // `rejected_streams` without bound, straight past the budget that
+        // exists to prevent exactly that. A legitimate V5 stream never has
+        // a zero-length first chunk regardless of `total_size` (a
+        // genuinely empty message uses `start_stream_with_correlation`,
+        // not this path), so this is unconditionally fatal, matching
+        // `reserve_v5_chunk`'s existing rejection for the same shape.
+        if first_chunk_len == 0 {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "V5 stream chunk is empty",
+            )));
+        }
         if first_chunk_len > header.total_size as usize {
             return Err(GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -671,15 +697,29 @@ impl StreamingState {
     /// table's redesign removed, since any existing entry might still have
     /// a frame in flight -- so it can fail outright when
     /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` is already exhausted. Returns
-    /// `true` if the tombstone was recorded, `false` if the budget refused
-    /// it; the caller (`begin_v5_stream_or_discard`) turns `false` into a
-    /// hard, connection-fatal error rather than silently discarding the
-    /// stream with no way to recognize its own trailing chunks later.
+    /// `true` if the tombstone was recorded (or none was needed -- see
+    /// below), `false` if the budget refused it; the caller
+    /// (`begin_v5_stream_or_discard`) turns `false` into a hard,
+    /// connection-fatal error rather than silently discarding the stream
+    /// with no way to recognize its own trailing chunks later.
+    ///
+    /// When the `StreamStart`'s own inline first chunk already covers the
+    /// entire declared size, `RejectedStreamTombstone::rejected` produces
+    /// an already-complete tombstone: nothing more will ever arrive for
+    /// this generation, so there is nothing left to quarantine. Skipping
+    /// insertion in that case (mirroring `tombstone_reaped_stream`'s
+    /// identical check) matters because a complete tombstone can *only*
+    /// ever be removed by completion (already true, so it will never
+    /// trigger again) or by a retry of this exact `stream_id` -- which,
+    /// with a peer that never reuses ids, may never happen. Inserting it
+    /// anyway would leak one map entry per single-frame rejection forever.
     fn reject_stream(&mut self, stream_id: u64, total_size: u64, first_chunk_len: usize) -> bool {
-        self.try_insert_tombstone(
-            stream_id,
-            RejectedStreamTombstone::rejected(total_size, first_chunk_len),
-        )
+        let tombstone = RejectedStreamTombstone::rejected(total_size, first_chunk_len);
+        if tombstone.is_complete() {
+            self.remove_tombstone(stream_id);
+            return true;
+        }
+        self.try_insert_tombstone(stream_id, tombstone)
     }
 
     /// Attempts to insert (or replace) a tombstone, respecting
@@ -2966,6 +3006,121 @@ mod tests {
             "a declared size far past MAX_STREAM_SIZE must be a fatal protocol error, not a \
              resource-pressure discard that builds a tombstone sized off the unvalidated \
              value: {result:?}"
+        );
+    }
+
+    /// Review finding: `begin_v5_stream`'s own validation only checked
+    /// `first_chunk_len > total_size`, never `first_chunk_len == 0` -- and
+    /// `reserve_v5_chunk`'s existing "V5 stream chunk is empty" rejection
+    /// for that shape is never reached in the resource-pressure path
+    /// (capacity fails first). `RejectedStreamTombstone::establish_stride`
+    /// treats a zero length as "stride unknown" and leaves `received_chunks`
+    /// empty, so that tombstone charges *zero* words against
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET`. A peer at capacity could
+    /// therefore send unlimited distinct header-only `StreamStart`s and
+    /// grow `rejected_streams` without bound, straight past the budget
+    /// meant to prevent exactly that -- the exact hole the budget exists to
+    /// close, just via a different field than `total_size`.
+    #[test]
+    fn header_only_stream_start_is_fatal_even_when_capacity_pressure_would_otherwise_discard_it()
+     {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+
+        for stream_id in 0..16u64 {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size: 8,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8)
+                .expect("connection has room for the first 16 streams")
+                .expect("must be admitted, not discarded");
+        }
+
+        // Capacity is now full, so this would ordinarily hit the
+        // resource-pressure discard path -- except its first chunk is
+        // empty, which is malformed regardless of capacity and must never
+        // reach tombstone construction.
+        let header_only = crate::StreamHeader {
+            stream_id: 999,
+            total_size: 64,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let result = state.begin_v5_stream_or_discard(header_only, 1, pool, false, 0);
+        assert!(
+            result.is_err(),
+            "a header-only StreamStart (an empty first chunk) must be a fatal protocol error, \
+             not a resource-pressure discard that builds a zero-budget tombstone: {result:?}"
+        );
+        assert_eq!(
+            state.rejected_stream_count(),
+            0,
+            "a rejected header-only StreamStart must not leave any tombstone behind -- a \
+             zero-budget entry defeats the aggregate cap regardless of how small it looks"
+        );
+    }
+
+    /// Review finding (P2): when the `StreamStart`'s own inline first chunk
+    /// already covers the entire declared size, `RejectedStreamTombstone::rejected`
+    /// produces an already-complete tombstone -- but `reject_stream` used to
+    /// insert it anyway. Nothing will ever arrive to remove it (completion
+    /// is already true, so it can never re-trigger; the only other removal
+    /// path is a retry of this exact `stream_id`, which a peer that never
+    /// reuses ids will never do), so every ordinary one-frame rejection
+    /// leaked one map entry forever.
+    #[test]
+    fn single_frame_rejection_does_not_leak_an_already_complete_tombstone() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+
+        for stream_id in 0..16u64 {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size: 8,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8)
+                .expect("connection has room for the first 16 streams")
+                .expect("must be admitted, not discarded");
+        }
+
+        // total_size == first_chunk_len: the entire declared stream fits in
+        // the StreamStart's own inline payload -- an ordinary single-frame
+        // rejection, not malformed at all.
+        let single_frame = crate::StreamHeader {
+            stream_id: 999,
+            total_size: 8,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let result = state.begin_v5_stream_or_discard(single_frame, 1, pool, false, 8);
+        assert!(
+            result
+                .expect("a single-frame rejection is a clean resource-pressure discard, not fatal")
+                .is_none(),
+            "a single-frame rejection must not be admitted"
+        );
+
+        assert_eq!(
+            state.rejected_stream_count(),
+            0,
+            "a tombstone that is already complete at construction must not be inserted at all \
+             -- it can never be removed by completion (already true) and may never be retried, \
+             leaking a map entry forever otherwise"
         );
     }
 
