@@ -120,16 +120,49 @@ fn stable_concurrent_removal_wins(
 fn owner_recovery_wins_tombstone(
     location: &RemoteActorLocation,
     sender_peer_id: &PeerId,
-    tombstone: &crate::VectorClock,
+    tombstone: &RemovedActorTombstone,
+    owner_restart_authenticated: bool,
 ) -> bool {
     // A peer-death tombstone is created by an observer. A direct authenticated
     // announcement from the actor owner is the recovery signal after a
     // transient disconnect, even when the actor itself did not re-register.
     // Also allow owner-clock advancement, which older equality-only recovery
     // checks rejected when the tombstone's observer component made the clocks
-    // concurrent.
-    location.peer_id == *sender_peer_id
-        && location.vector_clock.get(&location.node_id) >= tombstone.get(&location.node_id)
+    // concurrent. This forward-progress case is safe regardless of tombstone
+    // kind: a genuinely higher owner clock component proves the SAME live
+    // owner did more work after the removal was recorded, whether that
+    // removal was an explicit unregister or a peer-death reap.
+    if location.peer_id != *sender_peer_id {
+        return false;
+    }
+    if location.vector_clock.get(&location.node_id) >= tombstone.vector_clock.get(&location.node_id)
+    {
+        return true;
+    }
+
+    // Below this point the owner's clock component is LOWER than the
+    // tombstone's -- the reset-clock-after-restart shape, not mere forward
+    // progress. Bypassing the tombstone here needs BOTH:
+    //
+    // - `tombstone.kind == PeerDeath`: an explicit `unregister_actor`
+    //   removal is the owner's own deliberate decision and must NEVER be
+    //   silently undone just because its session later looks like a restart
+    //   -- that would resurrect an actor its owner intentionally took down.
+    //   Only a removal an OBSERVER inferred on the owner's behalf (the owner
+    //   never asked for it) may be reversed once the owner is confirmed
+    //   live.
+    //
+    // - `owner_restart_authenticated`: durable evidence
+    //   (`PeerInfo::session_restart_confirmed`) that a genuine sequence-reset
+    //   restart was actually observed for this exact, currently-authenticated
+    //   session -- not merely that a session is currently armed. Arming
+    //   happens on every routine reconnect too, not only on restarts, so
+    //   "armed" alone proves nothing about whether the owner actually
+    //   restarted. A replay, a steady-state reconnect with no restart, or a
+    //   message from a non-current/unauthenticated connection can never set
+    //   this -- those are dropped, or leave the flag `false`, before any
+    //   upsert plan is even built.
+    owner_restart_authenticated && tombstone.kind == TombstoneKind::PeerDeath
 }
 
 /// Does `location` (an actor's own, independently current record) still
@@ -7254,6 +7287,25 @@ impl<T: 'static> GossipRegistry<T> {
                 return Ok(Vec::new());
             }
 
+            // `true` only when this delta arrived under a `session_guard`
+            // already validated by the caller as the peer's CURRENT
+            // authenticated session (re-checked for races immediately above
+            // via `session_epoch_still_current`) AND
+            // `session_restart_confirmed` -- durable evidence that a genuine
+            // sequence-reset restart was actually observed for this exact
+            // session (see `merge_full_sync_from_guarded`), not merely that
+            // a session is currently armed. `None` (local/test callers, or a
+            // caller with no session context to validate against) fails
+            // closed to `false`: the restart exemption in
+            // `owner_recovery_wins_tombstone` must never fire for a message
+            // with no authenticated-current-session evidence backing it.
+            let owner_restart_authenticated = session_guard.is_some_and(|(session_peer_addr, _)| {
+                gossip_state
+                    .peers
+                    .get(&session_peer_addr)
+                    .is_some_and(|peer_info| peer_info.session_restart_confirmed)
+            });
+
             let mut log_adds = Vec::new();
             let mut sender_actors = bookkeeping_addr
                 .and_then(|addr| gossip_state.peer_to_actors.get(&addr).cloned())
@@ -7305,6 +7357,7 @@ impl<T: 'static> GossipRegistry<T> {
                             name.as_str(),
                             &location,
                             &sender_peer_id,
+                            owner_restart_authenticated,
                         ) else {
                             continue;
                         };
@@ -7770,6 +7823,7 @@ impl<T: 'static> GossipRegistry<T> {
         name: &str,
         location: &RemoteActorLocation,
         sender_peer_id: &PeerId,
+        owner_restart_authenticated: bool,
     ) -> Option<(bool, bool)> {
         if location.peer_id == self.peer_id {
             debug!(
@@ -7791,14 +7845,19 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(tombstone) = self
             .actor_state
             .removed_actors
-            .read_sync(name, |_, tombstone| tombstone.vector_clock.clone())
+            .read_sync(name, |_, tombstone| tombstone.clone())
         {
-            match location.vector_clock.compare(&tombstone) {
+            match location.vector_clock.compare(&tombstone.vector_clock) {
                 crate::ClockOrdering::After => {
                     clear_tombstone = true;
                 }
                 crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
-                    if owner_recovery_wins_tombstone(location, sender_peer_id, &tombstone) =>
+                    if owner_recovery_wins_tombstone(
+                        location,
+                        sender_peer_id,
+                        &tombstone,
+                        owner_restart_authenticated,
+                    ) =>
                 {
                     clear_tombstone = true;
                 }
@@ -9385,8 +9444,12 @@ impl<T: 'static> GossipRegistry<T> {
                     rejected_by_global_cap += 1;
                     continue;
                 }
-                let upsert_plan =
-                    self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id);
+                let upsert_plan = self.current_actor_upsert_plan(
+                    name.as_str(),
+                    location,
+                    &sender_peer_id,
+                    owner_restart_authenticated,
+                );
                 if upsert_plan.is_none() {
                     // An exact duplicate is still an admitted advertisement
                     // when the actor already exists. Other rejected candidates
