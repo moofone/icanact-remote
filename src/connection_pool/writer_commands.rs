@@ -201,15 +201,49 @@ const STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR: usize = 2;
 /// `slop_threshold - payload_len + 1` more than `len()` (i.e. `payload_len`,
 /// with the default factor) makes the reclaim succeed exactly when
 /// `true_backing_capacity > slop_threshold` -- precisely the condition the
-/// slop check below needs to see. Every buffer that currently looks small
-/// enough to pass is forced through a real reclaim attempt first, which
-/// pulls in the true backing size whenever a hidden prefix would have
-/// pushed it over the threshold. Only buffers within
-/// `STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR` of their visible length, by this
-/// now-trustworthy accounting, keep the zero-copy path; everything else --
-/// oversized unique buffers as well as shared/owner-backed values -- is
-/// compacted once on this streaming-only path so accounting always matches
-/// the real footprint. The ordinary actor-message queue and its hot path are
+/// slop check below needs to see.
+///
+/// **Invariant: the `retained_bytes` this function returns must never be
+/// less than what the returned `Bytes` actually pins.** Under-charging is
+/// the only direction that can break the queue's aggregate byte cap --
+/// over-charging only makes the cap bind a little earlier than strictly
+/// necessary, which is always safe. That matters here because a *failed*
+/// reclaim does not prove `capacity()` is accurate, only that the true
+/// backing capacity is at most `slop_threshold`: `try_reclaim`'s own
+/// amortized-cost heuristic (see `bytes::BytesMut::reserve_inner`) declines
+/// to reclaim whenever the hidden prefix (`offset`) is smaller than the
+/// visible length (`len()`), *regardless of how much is requested* -- there
+/// is no `additional` value that changes that outcome. A unique tail slice
+/// backed by, say, 1.5x its visible length has exactly this shape: the
+/// probe fails, `capacity()` never moves off its small, visible-only value,
+/// and -- confirmed empirically, not just by reading the source -- that
+/// failure is observationally *identical* to a genuinely right-sized buffer
+/// (`offset == 0`) also failing the same heuristic. There is no further
+/// query against the public `BytesMut` API that distinguishes "small hidden
+/// prefix" from "no hidden prefix at all" without forcing an allocation.
+/// Since `capacity()` cannot be trusted to reveal a hidden prefix whenever
+/// the probe fails, and the *only* fact a failure proves is the
+/// `slop_threshold` upper bound itself, charging that bound is the only
+/// charge that can never fall below what the buffer actually pins.
+/// Concretely, whenever this reaches the zero-copy branch below, the probe
+/// is *always* the reason (a successful reclaim, by construction of
+/// `reclaim_request`, always pushes `capacity()` strictly above
+/// `slop_threshold` and would have taken the compaction branch instead) --
+/// so charging `slop_threshold` unconditionally there is not merely the
+/// safe choice, it is the only value consistent with what a failure
+/// actually establishes. This does mean an honestly right-sized buffer is
+/// sometimes charged its full slop allowance rather than its exact size:
+/// that is the accepted cost of never under-charging one that is not.
+///
+/// Every buffer that currently looks small enough to pass is forced
+/// through a real reclaim attempt first, which pulls in the true backing
+/// size (and, per the invariant above, the conservative bound otherwise)
+/// whenever a hidden prefix would have pushed it over the threshold. Only
+/// buffers within `STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR` of their visible
+/// length keep the zero-copy path; everything else -- oversized unique
+/// buffers as well as shared/owner-backed values -- is compacted once on
+/// this streaming-only path so accounting always matches the real
+/// footprint. The ordinary actor-message queue and its hot path are
 /// unchanged.
 fn normalize_streaming_payload(payload: bytes::Bytes) -> (bytes::Bytes, usize) {
     let payload_len = payload.len();
@@ -241,8 +275,15 @@ fn normalize_streaming_payload(payload: bytes::Bytes) -> (bytes::Bytes, usize) {
                 .saturating_add(1);
             let _ = buffer.try_reclaim(reclaim_request);
             if buffer.capacity() <= slop_threshold {
-                let retained_bytes = buffer.capacity().max(payload_len);
-                (buffer.freeze(), retained_bytes)
+                // See this function's doc comment: reaching this branch
+                // means the probe above failed (a successful reclaim always
+                // pushes capacity() past slop_threshold, routing to the
+                // compaction branch instead), so capacity() is not proven
+                // accurate -- it may be silently hiding a hidden prefix up
+                // to slop_threshold itself. Charging the threshold, not
+                // capacity(), is the only value the failure actually
+                // establishes as a safe upper bound.
+                (buffer.freeze(), slop_threshold.max(payload_len))
             } else {
                 let compact = bytes::Bytes::copy_from_slice(&buffer[..]);
                 (compact, payload_len)
@@ -946,8 +987,15 @@ mod normalize_streaming_payload_tests {
     }
 
     /// A unique `Bytes` whose backing allocation is already right-sized (no
-    /// meaningful slop) keeps the zero-copy path: no compaction copy, and
-    /// `retained_bytes` reflects the real (small) footprint.
+    /// meaningful slop) keeps the zero-copy path: no compaction copy. Its
+    /// `try_reclaim` probe fails the same as a hidden-prefix buffer would
+    /// (see `does_not_undercharge_a_failed_reclaim_in_the_1x_to_2x_band`)
+    /// -- `offset == 0` fails `bytes`' own `offset >= len` heuristic exactly
+    /// like a small hidden prefix does -- so `retained_bytes` is charged the
+    /// same conservative `slop_threshold` a genuinely-sliced buffer in that
+    /// band would be, per this function's documented invariant. Zero-copy
+    /// behavior (no allocation, no data movement) is unaffected; only the
+    /// accounting number is deliberately conservative rather than exact.
     #[test]
     fn keeps_zero_copy_for_a_right_sized_unique_buffer() {
         const LEN: usize = 4096;
@@ -959,11 +1007,68 @@ mod normalize_streaming_payload_tests {
         let (out, retained_bytes) = normalize_streaming_payload(payload);
 
         assert_eq!(out.len(), LEN);
-        assert_eq!(retained_bytes, LEN);
+        assert_eq!(
+            retained_bytes,
+            LEN * STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR,
+            "a failed reclaim probe (offset == 0 fails the same offset >= len heuristic a \
+             hidden prefix would) must be charged the conservative slop_threshold, never the \
+             possibly-inaccurate capacity()"
+        );
         assert_eq!(
             out.as_ptr(),
             ptr_before,
-            "a right-sized unique buffer must stay zero-copy"
+            "a right-sized unique buffer must stay zero-copy even though its accounting is \
+             conservative"
+        );
+    }
+
+    /// Review finding: a *failed* reclaim probe proves only that the true
+    /// backing capacity is at most `slop_threshold` -- it does not make
+    /// `capacity()` reveal a hidden prefix. `bytes`' own amortized-cost
+    /// heuristic (`offset >= len`) declines to reclaim whenever the hidden
+    /// prefix is smaller than the visible length, *for any requested
+    /// amount* -- there is no `reclaim_request` that changes this. A unique
+    /// 100,000-byte tail slice backed by 1.5x its visible length (squarely
+    /// inside that band, distinct from the already-covered 2x-3x band where
+    /// the probe *succeeds*) fails reclaim, so `capacity()` never moves off
+    /// its small, visible-only value. The old code charged that
+    /// unreclaimed `capacity()` directly; charging it means a queue that
+    /// repeats this shape retains close to twice its advertised hard cap
+    /// while the accounting insists it is within budget.
+    #[test]
+    fn does_not_undercharge_a_failed_reclaim_in_the_1x_to_2x_band() {
+        const VISIBLE_LEN: usize = 100_000;
+        const BACKING_CAPACITY: usize = VISIBLE_LEN * 3 / 2; // 1.5x: strictly inside (1x, 2x).
+
+        let mut buf = bytes::BytesMut::with_capacity(BACKING_CAPACITY);
+        buf.extend_from_slice(&vec![0u8; BACKING_CAPACITY]);
+        let full = buf.freeze();
+        let backing_start = full.as_ptr() as usize;
+        let tail = full.slice(BACKING_CAPACITY - VISIBLE_LEN..);
+        // Drop the sibling handle so `tail` is the sole owner and
+        // `try_into_mut` takes the zero-copy path this test targets.
+        drop(full);
+
+        let (payload, retained_bytes) = normalize_streaming_payload(tail);
+
+        assert_eq!(payload.len(), VISIBLE_LEN);
+
+        // This must genuinely be the zero-copy-retained branch, not
+        // compaction -- otherwise this test would not exercise the
+        // failed-probe accounting path this finding is about.
+        let payload_start = payload.as_ptr() as usize;
+        assert!(
+            payload_start >= backing_start && payload_start < backing_start + BACKING_CAPACITY,
+            "this test must exercise the zero-copy-retained path (the 1.5x band's reclaim probe \
+             must fail, per bytes' own offset >= len heuristic), not compaction"
+        );
+
+        assert!(
+            retained_bytes >= BACKING_CAPACITY,
+            "retained_bytes ({retained_bytes}) must never be less than what this buffer \
+             actually pins ({BACKING_CAPACITY} bytes) -- a failed reclaim probe proves only \
+             that the true backing capacity is at most the slop threshold, not that capacity() \
+             reveals it"
         );
     }
 }
