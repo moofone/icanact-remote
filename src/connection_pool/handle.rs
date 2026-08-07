@@ -1170,20 +1170,29 @@ impl<T> ConnectionHandle<T> {
             return Ok(Vec::new());
         }
 
+        // Validate every request's encoded size *before* touching the
+        // allocator. `reject_oversize_inline` used to run inside the loop
+        // below, after `BytesMut::with_capacity(total_size)` had already
+        // reserved space for the whole batch -- so a batch with one
+        // oversized request (which must return `MessageTooLarge`) still
+        // paid for a `total_size` allocation sized off that same oversized
+        // request first. Computing `total_size` only from lengths that have
+        // already cleared the gate means a caller-supplied giant request can
+        // never reach the allocator at all, let alone abort the process on
+        // it before this check would have rejected it.
+        let mut total_size = 0usize;
+        for request in requests {
+            self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
+            total_size += framing::ASK_RESPONSE_FRAME_HEADER_LEN + request.len();
+        }
+
         // Hold each reservation in an RAII guard so a partial-batch failure
         // (allocate err, write err, etc.) auto-cancels every slot we already
         // claimed via `Vec<SlotGuard>` Drop.
         let mut slots: Vec<SlotGuard<'_>> = Vec::with_capacity(requests.len());
-
-        // Pre-calculate total message size to avoid growth reallocations.
-        let total_size: usize = requests
-            .iter()
-            .map(|req| framing::ASK_RESPONSE_FRAME_HEADER_LEN + req.len())
-            .sum();
         let mut batch_message = bytes::BytesMut::with_capacity(total_size);
 
         for request in requests {
-            self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
             let slot = self.correlation.allocate()?;
 
             let header = framing::write_ask_response_header(
@@ -1680,5 +1689,55 @@ mod oversized_inline_send_gate_tests {
             .unwrap_err();
         assert!(matches!(err, GossipError::MessageTooLarge { .. }));
         assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
+    }
+
+    /// `ask_batch_deferred` used to validate each request's size *inside*
+    /// the loop that also allocates the shared `batch_message` buffer,
+    /// after `BytesMut::with_capacity(total_size)` had already reserved
+    /// space for the full (unvalidated) batch. Reordering to validate every
+    /// length first means an oversized member is still rejected correctly
+    /// -- this pins that observable contract; the allocation-avoidance
+    /// itself is a structural property of the reorder (see the fix's
+    /// comment), not something a safe unit test can force an allocator
+    /// abort to prove without risking the test process.
+    #[tokio::test]
+    async fn ask_batch_deferred_rejects_a_batch_with_an_oversized_member() {
+        let (conn, _stream_handle, _task, _peer) = make_handle();
+        let small = b"ok".as_slice();
+        let big = vec![0u8; OVERSIZED];
+        let requests: Vec<&[u8]> = vec![small, &big, small];
+        let err = conn
+            .ask_batch_deferred(&requests, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+    }
+
+    /// Baseline coverage: `ask_batch_deferred` had none before this PR.
+    /// Every request in a valid batch reaches the wire as its own Ask
+    /// frame, in order, in the one write.
+    #[tokio::test]
+    async fn ask_batch_deferred_sends_every_request_as_its_own_frame() {
+        let (conn, _stream_handle, _task, mut peer) = make_handle();
+        let requests: Vec<&[u8]> = vec![b"one".as_slice(), b"two".as_slice()];
+        let handles = conn
+            .ask_batch_deferred(&requests, Duration::from_secs(5))
+            .await
+            .expect("a valid batch must be accepted");
+        assert_eq!(handles.len(), requests.len());
+
+        for request in &requests {
+            let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+            peer.read_exact(&mut ctrl).await.unwrap();
+            let control = crate::framing::decode_control(ctrl).unwrap();
+            assert_eq!(control.kind, crate::framing::WireKind::Ask);
+            assert_eq!(
+                control.body_len,
+                crate::framing::ASK_RESPONSE_HEADER_LEN + request.len()
+            );
+            let mut rest = vec![0u8; crate::framing::ASK_RESPONSE_HEADER_LEN + request.len()];
+            peer.read_exact(&mut rest).await.unwrap();
+            assert_eq!(&rest[rest.len() - request.len()..], *request);
+        }
     }
 }
