@@ -8560,31 +8560,69 @@ impl<T: 'static> GossipRegistry<T> {
     /// aliases) counts once. Peers whose `node_id` is not yet known are
     /// keyed by address — a pre-handshake peer can't be confused with any
     /// other peer record.
+    ///
+    /// `peers` is a `HashMap`, so which alias of a shared identity is
+    /// visited first is arbitrary. Picking "whichever is seen first" can
+    /// just as easily keep a `transport_source_keyed` ephemeral alias and
+    /// drop the peer's genuinely dialable one -- the immediate-gossip
+    /// caller then sends the sole delivery to an unusable address and the
+    /// urgent change is silently lost for that physical peer. Track the
+    /// best alias seen so far per identity instead, ranked (highest
+    /// priority first) exactly like `gossip_peer_list_inner`'s periodic
+    /// selection: a live connection always wins over a non-live one; among
+    /// equally (non-)live aliases, a genuinely dialable one always wins
+    /// over a `transport_source_keyed` one; and only among aliases tied on
+    /// both does fewer failures win. All three are checked while iterating,
+    /// so the result is independent of visitation order.
     fn select_immediate_gossip_peers(
+        &self,
         peers: &HashMap<SocketAddr, PeerInfo>,
         max_peer_failures: usize,
         fanout: usize,
     ) -> Vec<SocketAddr> {
-        let mut seen: std::collections::HashSet<PeerDispatchKey> = std::collections::HashSet::new();
-        let mut selected: Vec<SocketAddr> = Vec::new();
+        let mut best_by_identity: std::collections::HashMap<
+            PeerDispatchKey,
+            (SocketAddr, bool, bool, usize),
+        > = std::collections::HashMap::new();
         for (addr, peer) in peers.iter() {
             if peer.failures >= max_peer_failures {
                 continue;
             }
-            if seen.insert(PeerDispatchKey::for_entry(*addr, peer)) {
-                selected.push(*addr);
-                if selected.len() >= fanout {
-                    break;
-                }
-            }
+            let is_live = self.addr_has_live_connection(*addr, peer);
+            let dialable = !peer.transport_source_keyed;
+            best_by_identity
+                .entry(PeerDispatchKey::for_entry(*addr, peer))
+                .and_modify(|(best_addr, best_is_live, best_dialable, best_failures)| {
+                    let better = match (is_live, *best_is_live) {
+                        (true, false) => true,
+                        (false, true) => false,
+                        _ => match (dialable, *best_dialable) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => peer.failures < *best_failures,
+                        },
+                    };
+                    if better {
+                        *best_addr = *addr;
+                        *best_is_live = is_live;
+                        *best_dialable = dialable;
+                        *best_failures = peer.failures;
+                    }
+                })
+                .or_insert((*addr, is_live, dialable, peer.failures));
         }
+        let mut selected: Vec<SocketAddr> = best_by_identity
+            .into_values()
+            .map(|(addr, _, _, _)| addr)
+            .collect();
+        selected.truncate(fanout);
         selected
     }
 
     #[cfg(test)]
     pub(crate) async fn select_immediate_gossip_peers_for_test(&self) -> Vec<SocketAddr> {
         let state = self.gossip_state.lock().await;
-        Self::select_immediate_gossip_peers(
+        self.select_immediate_gossip_peers(
             &state.peers,
             self.config.max_peer_failures,
             self.config.urgent_gossip_fanout,
@@ -8614,7 +8652,7 @@ impl<T: 'static> GossipRegistry<T> {
             // migrated bind address, dual-stack IPv4/IPv6, DNS-resolved
             // hostnames mapped to several addresses, etc.) receives one
             // delivery rather than `aliases × peers` deliveries.
-            let peers = Self::select_immediate_gossip_peers(
+            let peers = self.select_immediate_gossip_peers(
                 &gossip_state.peers,
                 self.config.max_peer_failures,
                 self.config.urgent_gossip_fanout,
@@ -12210,6 +12248,69 @@ mod tests {
              aliases {alias_a},{alias_b},{alias_c}, got {aliases_selected} (selected: {:?})",
             selected
         );
+    }
+
+    /// Among aliases of one identity tied on liveness (here: neither live)
+    /// and failure count, a `transport_source_keyed` entry must lose to a
+    /// genuinely dialable one in the URGENT fan-out path too -- mirroring
+    /// `gossip_peer_list_target_selection_prefers_dialable_alias_over_transport_source_keyed`
+    /// for the periodic path. `select_immediate_gossip_peers` iterates a
+    /// `HashMap`, so which alias is visited first is arbitrary; without
+    /// ranking by dialability, `trigger_immediate_gossip` can pick the
+    /// ephemeral source as the sole delivery target, `seen` then suppresses
+    /// the real alias, and the urgent change is silently dropped for that
+    /// physical peer instead of being queued for retry. This test
+    /// constructs both possible insertion orders and repeats each one
+    /// (HashMap hashing is randomly re-seeded per instance) so a wrong
+    /// answer can't hide behind luck.
+    #[tokio::test]
+    async fn immediate_gossip_selection_prefers_dialable_alias_over_transport_source_keyed() {
+        for reversed in [false, true] {
+            for _ in 0..20 {
+                let config = test_config();
+                let registry = GossipRegistry::<()>::new(test_addr(20_260), config);
+
+                let shared_node_id =
+                    test_peer_id("immediate-gossip-dialable-shared").to_node_id();
+                let dialable_addr = test_addr(20_261);
+                let source_keyed_addr = test_addr(20_262);
+
+                let mut dialable_info = peer_info_with_node_id(dialable_addr, shared_node_id);
+                dialable_info.identity_verified = true;
+                let mut source_keyed_info =
+                    peer_info_with_node_id(source_keyed_addr, shared_node_id);
+                source_keyed_info.identity_verified = true;
+                source_keyed_info.transport_source_keyed = true;
+
+                {
+                    let mut state = registry.gossip_state.lock().await;
+                    if reversed {
+                        state.peers.insert(source_keyed_addr, source_keyed_info);
+                        state.peers.insert(dialable_addr, dialable_info);
+                    } else {
+                        state.peers.insert(dialable_addr, dialable_info);
+                        state.peers.insert(source_keyed_addr, source_keyed_info);
+                    }
+                }
+
+                let selected = registry.select_immediate_gossip_peers_for_test().await;
+                assert_eq!(
+                    selected
+                        .iter()
+                        .filter(|a| **a == dialable_addr || **a == source_keyed_addr)
+                        .count(),
+                    1,
+                    "the shared identity must produce exactly one immediate-gossip \
+                     target (reversed: {reversed}): {selected:?}"
+                );
+                assert!(
+                    selected.contains(&dialable_addr),
+                    "the dialable alias must be chosen over the transport-source-keyed \
+                     one, not whichever HashMap iteration visits first \
+                     (reversed: {reversed}): {selected:?}"
+                );
+            }
+        }
     }
 
     /// `get_stats().active_peers` must count distinct physical peers, not
