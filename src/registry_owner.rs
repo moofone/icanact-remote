@@ -662,8 +662,7 @@ enum OwnerCommand {
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
-        dead_peer_timeout: std::time::Duration,
-        expected_generation: Option<CommitSeq>,
+        evidence_before: std::time::Instant,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
     /// Atomically checks the causal fence a dead-peer reap also checks
@@ -1007,16 +1006,14 @@ impl RegistryOwnerHandle {
         &self,
         peer_id: PeerId,
         addr: SocketAddr,
-        dead_peer_timeout: std::time::Duration,
-        expected_generation: Option<CommitSeq>,
+        evidence_before: std::time::Instant,
     ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReleaseDeadPeer {
             peer_id,
             addr,
-            dead_peer_timeout,
-            expected_generation,
+            evidence_before,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -1690,16 +1687,10 @@ impl PeerRegistryOwner {
             OwnerCommand::ReleaseDeadPeer {
                 peer_id,
                 addr,
-                dead_peer_timeout,
-                expected_generation,
+                evidence_before,
                 reply,
             } => {
-                let released = self.release_dead_peer(
-                    &peer_id,
-                    addr,
-                    dead_peer_timeout,
-                    expected_generation,
-                );
+                let released = self.release_dead_peer(&peer_id, addr, evidence_before);
                 let _ = reply.send(released);
             }
             OwnerCommand::ReserveForReap {
@@ -1993,26 +1984,17 @@ impl PeerRegistryOwner {
         &mut self,
         peer_id: &PeerId,
         addr: SocketAddr,
-        dead_peer_timeout: std::time::Duration,
-        expected_generation: Option<CommitSeq>,
+        evidence_before: std::time::Instant,
     ) -> Option<CommitSeq> {
-        if self.claim_generation.get(&addr).copied() != expected_generation {
-            trace!(
-                addr = %addr,
-                peer = %peer_id,
-                "dead-peer release refused: ownership generation advanced past this sweep's selection"
-            );
-            return None;
-        }
         if self
             .claim_committed_at
             .get(&addr)
-            .is_some_and(|committed_at| committed_at.elapsed() < dead_peer_timeout)
+            .is_some_and(|committed_at| *committed_at > evidence_before)
         {
             trace!(
                 addr = %addr,
                 peer = %peer_id,
-                "dead-peer release refused: address claimed more recently than the dead-peer timeout"
+                "dead-peer release refused: address has direct evidence of life after the failure this reap is acting on"
             );
             return None;
         }

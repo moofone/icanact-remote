@@ -4289,23 +4289,19 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Release ownership and any connection-scoped receipts left behind by a
     /// peer that has exceeded the dead-peer timeout. The owner performs the
-    /// receipt cleanup and ownership decision in one serialized operation;
-    /// the selected ownership generation is rechecked there so a reconnect
-    /// between selection and release cannot be cleared by a stale sweep.
+    /// receipt cleanup and ownership decision in one serialized operation.
+    /// `evidence_before` is fixed at the sweep's selection boundary, so a
+    /// reconnect committed after that evidence permanently invalidates this
+    /// reap even if the release command is delayed by queueing or locks.
     async fn release_dead_peer_ownership(
         &self,
         peer_id: &crate::PeerId,
         addr: SocketAddr,
-        expected_generation: Option<crate::registry_owner::CommitSeq>,
+        evidence_before: std::time::Instant,
     ) {
         if let Some(release_seq) = self
             .registry_owner
-            .release_dead_peer(
-                peer_id.clone(),
-                addr,
-                self.config.dead_peer_timeout,
-                expected_generation,
-            )
+            .release_dead_peer(peer_id.clone(), addr, evidence_before)
             .await
         {
             let mut state = self.gossip_state.lock().await;
@@ -9314,29 +9310,22 @@ impl<T: 'static> GossipRegistry<T> {
         });
     }
 
-    /// Clean up actors from peers that have been disconnected for longer than dead_peer_timeout
-    /// IMPORTANT: We keep the peer itself to allow reconnection, only clean up their actors
-    ///
-    /// SCOPE NOTE: unchanged from `main`. This function does NOT
-    /// release address ownership when a peer times out, and does NOT
-    /// re-validate a candidate's liveness/identity between selection and
-    /// destruction. Both are real, known gaps (the former is a
-    /// permanent ownership leak on a dead peer's address with no recovery
-    /// path short of a restart) that rebuilding this
-    /// function around the `ReapReservation` primitive
-    /// (`RegistryOwnerHandle::reserve_for_reap`/`try_consume`) -- see that
-    /// primitive's own doc comment -- would close, as a dedicated piece of
-    /// structural work tracked separately from ownership-release-on-teardown
-    /// and `configure_peer` atomicity.
+    /// Clean up actors from peers that have been disconnected for longer than
+    /// `dead_peer_timeout`, retaining the peer entry so a later reconnect can
+    /// be observed. Ownership release is coordinated through the owner actor;
+    /// its causal fence is fixed once before the liveness snapshot below.
     pub async fn cleanup_dead_peers(&self) {
         let current_time = current_timestamp();
         let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
 
-        let peers_to_cleanup: Vec<(
-            SocketAddr,
-            Option<crate::PeerId>,
-            Option<crate::registry_owner::CommitSeq>,
-        )> = {
+        // This is the oldest failure evidence that could have passed the
+        // selection predicate below. It is fixed before the snapshot and is
+        // never re-derived from wall-clock time when the queued release runs.
+        let evidence_before = std::time::Instant::now()
+            .checked_sub(self.config.dead_peer_timeout)
+            .unwrap_or_else(std::time::Instant::now);
+
+        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>)> = {
             let gossip_state = self.gossip_state.lock().await;
             gossip_state
                 .peers
@@ -9348,17 +9337,7 @@ impl<T: 'static> GossipRegistry<T> {
                             current_time.saturating_sub(failure_time) > dead_peer_timeout_secs
                         })
                 })
-                .map(|(addr, info)| {
-                    let observed_generation = self
-                        .registry_owner
-                        .ownership_token(addr)
-                        .map(|token| token.generation());
-                    (
-                        *addr,
-                        info.node_id.map(|node_id| node_id.to_peer_id()),
-                        observed_generation,
-                    )
-                })
+                .map(|(addr, info)| (*addr, info.node_id.map(|node_id| node_id.to_peer_id())))
                 .collect()
         };
 
@@ -9369,7 +9348,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Order: actor_state before gossip_state
             let mut gossip_state = self.gossip_state.lock().await;
 
-            for (peer_addr, _, _) in &peers_to_cleanup {
+            for (peer_addr, _) in &peers_to_cleanup {
                 // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
                 // This allows us to reconnect when the peer comes back online
 
@@ -9464,14 +9443,14 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
-            for (peer_addr, node_id, observed_generation) in &peers_to_cleanup {
+            for (peer_addr, node_id) in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
                 self.remove_clock_state_for_addr(peer_addr);
                 // A timed-out peer's connection teardown may never have run,
                 // leaving its owner receipt and address claim behind. Release
                 // both atomically in the owner; configured pins are retained.
                 if let Some(peer_id) = node_id {
-                    self.release_dead_peer_ownership(peer_id, *peer_addr, *observed_generation)
+                    self.release_dead_peer_ownership(peer_id, *peer_addr, evidence_before)
                         .await;
                 }
             }
