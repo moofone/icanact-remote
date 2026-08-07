@@ -329,10 +329,30 @@ pub fn write_direct_response_header(
 /// (itself derived from `max_message_size`, which config validation already
 /// bounds to the V5 27-bit limit), so `checked_body_len` can never observe an
 /// oversize value on this path.
+///
+/// That invariant depends on nothing outside the streaming writer ever
+/// calling these with an unclamped length, so it is enforced at the API
+/// boundary, not just by convention: all three are `pub(crate)`, not `pub`.
+/// A caller elsewhere in this crate can still reach them (the streaming
+/// writer lives in `connection_pool`, a sibling module), but nothing outside
+/// the crate can construct an oversize `first_chunk_len`/`payload_len` here
+/// in the first place -- there is no visibility-checked runtime bound to
+/// bypass. Unlike the writers converted to `Result` elsewhere in this file,
+/// there is no legitimate external caller to support: building a valid V5
+/// stream requires allocating a `stream_id` with the crate's own
+/// odd/even-partitioned counters and sequencing chunks against
+/// `max_stream_chunk_size()`, neither of which is exposed, so a `pub` header
+/// builder alone was never a usable standalone API.
 const STREAM_CHUNK_INVARIANT: &str =
     "stream chunk length is bounded by max_stream_chunk_size, always within the V5 27-bit limit";
 
-pub fn write_stream_request_start_header(
+/// `pub(crate)`: see the note on `STREAM_CHUNK_INVARIANT` above. Verified
+/// unreachable from outside the crate -- this must fail to compile:
+///
+/// ```compile_fail
+/// let _ = icanact_remote::framing::write_stream_request_start_header(0, 0, 0, 0, 0, 0);
+/// ```
+pub(crate) fn write_stream_request_start_header(
     stream_id: u32,
     correlation_id: u32,
     total_size: u32,
@@ -352,7 +372,13 @@ pub fn write_stream_request_start_header(
     header
 }
 
-pub fn write_stream_response_start_header(
+/// `pub(crate)`: see the note on `STREAM_CHUNK_INVARIANT` above. Verified
+/// unreachable from outside the crate -- this must fail to compile:
+///
+/// ```compile_fail
+/// let _ = icanact_remote::framing::write_stream_response_start_header(0, 0, 0, 0);
+/// ```
+pub(crate) fn write_stream_response_start_header(
     stream_id: u32,
     correlation_id: u32,
     total_size: u32,
@@ -368,7 +394,13 @@ pub fn write_stream_response_start_header(
     header
 }
 
-pub fn write_stream_data_header(
+/// `pub(crate)`: see the note on `STREAM_CHUNK_INVARIANT` above. Verified
+/// unreachable from outside the crate -- this must fail to compile:
+///
+/// ```compile_fail
+/// let _ = icanact_remote::framing::write_stream_data_header(false, 0, 0, 0);
+/// ```
+pub(crate) fn write_stream_data_header(
     response: bool,
     stream_id: u32,
     chunk_index: u32,
