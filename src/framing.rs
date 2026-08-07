@@ -374,11 +374,24 @@ pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER
 }
 
 /// Build a DirectAsk frame header. `request_id` is a stable identifier the
-/// caller controls (unlike `correlation_id`, which is a connection-local
-/// slot index that gets recycled on every reconnect): it is what lets a
-/// receiver recognize "this is the same logical ask retried after a
-/// transport reset" via the `(peer_id, request_id)` identity, rather than
-/// treating a retry as a brand-new request and risking double execution.
+/// caller controls, unlike `correlation_id`, which is a connection-local slot
+/// index recycled on every reconnect. `(peer_id, request_id)` is the identity
+/// a receiver would need to recognize "this is the same logical ask retried
+/// after a transport reset" rather than treating the retry as a new request
+/// and executing it twice.
+///
+/// **No receiver does that today, and none can.** DirectAsk has no registered
+/// application handler in any build mode -- every read path answers it with
+/// `AskNackReason::NoDispatcher` -- so nothing reaches a point where this id
+/// could be consulted. It is wire surface kept ready for a future DirectAsk
+/// dispatcher, not a capability in use.
+///
+/// In particular this is *not* what makes the actor-ask path idempotent.
+/// `WireKind::ActorAsk` carries no `request_id` (see
+/// `write_actor_ask_header`), and that is the frame real ask traffic uses.
+/// Dedupe on that path keys on an identity carried inside the payload
+/// instead, so it needs nothing from this header.
+///
 /// Occupies bytes the frame has always reserved and zeroed after
 /// `correlation_id`, so it costs no extra frame. Fail-closed: `request_id`
 /// must be nonzero (see `direct_ask_request_id` on the read side); 0 is
