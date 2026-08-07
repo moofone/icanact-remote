@@ -224,6 +224,14 @@ fn wire_v5_e2e_zero_copy_proof() {
 /// large outbound stream is in flight (the head-of-line-blocking scenario), and
 /// the large stream's own throughput. Prints metrics; asserts no throughput
 /// regression and that ask latency stays bounded. Run with `--nocapture`.
+///
+/// The small-ask probe is a raw `.ask()`, which has no actor_id/type_hash to
+/// route to and so depends on the test/benchmark-only command processor
+/// (`handle::handle_raw_ask_request`, gated on `cfg(any(test, feature =
+/// "test-helpers"))`). CI runs `cargo test --all-features`, which enables
+/// it; run locally with `cargo test --features test-helpers` to include
+/// this test.
+#[cfg(feature = "test-helpers")]
 #[test]
 fn bench_ask_latency_and_throughput_under_large_stream() {
     run_streaming_test("r8-hol-bench", || async {
@@ -394,7 +402,12 @@ fn test_streaming_request_zero_copy() {
     });
 }
 
-/// Test streaming response (large reply via auto-streaming)
+/// Test streaming response (large reply via auto-streaming).
+///
+/// Uses a raw `.ask()`, which depends on the test/benchmark-only command
+/// processor -- see `bench_ask_latency_and_throughput_under_large_stream`'s
+/// doc.
+#[cfg(feature = "test-helpers")]
 #[test]
 fn test_streaming_response_auto() {
     run_streaming_test("streaming-response-auto", || async {
@@ -458,7 +471,12 @@ fn test_streaming_response_auto() {
     });
 }
 
-/// Test that small payloads use the write queue (not streaming)
+/// Test that small payloads use the write queue (not streaming).
+///
+/// Uses a raw `.ask()`, which depends on the test/benchmark-only command
+/// processor -- see `bench_ask_latency_and_throughput_under_large_stream`'s
+/// doc.
+#[cfg(feature = "test-helpers")]
 #[test]
 fn test_small_payload_uses_write_queue() {
     run_streaming_test("small-payload-write-queue", || async {

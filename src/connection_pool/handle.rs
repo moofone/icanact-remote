@@ -248,6 +248,19 @@ impl<T> ConnectionHandle<T> {
             .await
     }
 
+    /// Send an ask NACK: same frame kind and header shape as a normal
+    /// response (`send_response_bytes`), zero-length payload, reason packed
+    /// into the header's reserved bytes (`framing::write_ask_nack_header`).
+    pub async fn send_ask_nack(
+        &self,
+        correlation_id: u32,
+        reason: crate::framing::AskNackReason,
+    ) -> Result<()> {
+        let header = framing::write_ask_nack_header(correlation_id, reason);
+        self.write_header_and_payload_control_inline(header, 16, bytes::Bytes::new())
+            .await
+    }
+
     /// Send a gossip payload with framing, without copying the payload.
     pub async fn send_gossip_payload(&self, payload: bytes::Bytes) -> Result<()> {
         let header = framing::write_gossip_frame_prefix(payload.len());
@@ -919,6 +932,15 @@ impl<T> ConnectionHandle<T> {
     /// the server can generate responses directly without spawning actor tasks.
     ///
     /// Wire format: [length:4][type:1][correlation_id:4][payload_len:4][payload:N]
+    ///
+    /// Uses the connection-local `correlation_id` as the frame's stable
+    /// `request_id` too (it's already guaranteed nonzero by
+    /// `CorrelationTracker::allocate`, which never hands out 0). That's
+    /// stable enough for this method's own contract (no timeout/retry
+    /// wrapping happens here), but it does NOT survive a transport reset --
+    /// a caller that needs an id stable across reconnects/retries (e.g. to
+    /// dedupe a retried ask server-side) must supply its own via
+    /// `ask_direct_with_id`.
     pub async fn ask_direct(
         &self,
         request: bytes::Bytes,
@@ -926,9 +948,43 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<bytes::Bytes> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
+        self.ask_direct_on_slot(correlation_id, u64::from(correlation_id), request, timeout, slot)
+            .await
+    }
 
-        // Build DirectAsk header
-        let header = framing::write_direct_ask_header(correlation_id, request.len());
+    /// Like `ask_direct`, but the caller supplies a stable `request_id` that
+    /// survives across a transport reset/retry (unlike the connection-local
+    /// `correlation_id`, which is recycled on every reconnect). Fail-closed:
+    /// `request_id` must be nonzero -- 0 is the wire's reserved "absent"
+    /// sentinel (see `framing::write_direct_ask_header`) and is rejected
+    /// before anything is sent, rather than silently accepted as a
+    /// valid-looking id that could collide across independent asks.
+    pub async fn ask_direct_with_id(
+        &self,
+        request_id: u64,
+        request: bytes::Bytes,
+        timeout: Duration,
+    ) -> Result<bytes::Bytes> {
+        if request_id == 0 {
+            return Err(GossipError::InvalidConfig(
+                "ask_direct_with_id: request_id must be nonzero".to_string(),
+            ));
+        }
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
+        self.ask_direct_on_slot(correlation_id, request_id, request, timeout, slot)
+            .await
+    }
+
+    async fn ask_direct_on_slot(
+        &self,
+        correlation_id: u32,
+        request_id: u64,
+        request: bytes::Bytes,
+        timeout: Duration,
+        slot: SlotGuard<'_>,
+    ) -> Result<bytes::Bytes> {
+        let header = framing::write_direct_ask_header(correlation_id, request_id, request.len());
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {
@@ -947,12 +1003,16 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// Fast-path direct ask without timeout allocation (benchmarking/hot path).
+    ///
+    /// See `ask_direct`'s doc for why `correlation_id` doubles as
+    /// `request_id` here.
     pub async fn ask_direct_no_timeout(&self, request: bytes::Bytes) -> Result<bytes::Bytes> {
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
 
         // Build DirectAsk header
-        let header = framing::write_direct_ask_header(correlation_id, request.len());
+        let header =
+            framing::write_direct_ask_header(correlation_id, u64::from(correlation_id), request.len());
 
         // Write header + payload inline (fast path)
         if let Err(e) = self.write_direct_ask_inline(header, request).await {
@@ -1194,6 +1254,51 @@ impl<T> ConnectionHandle<T> {
                 format!("connection {} has no writer path", self.addr),
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_nack_send_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:19998".parse().expect("valid test addr")
+    }
+
+    #[tokio::test]
+    async fn send_ask_nack_writes_the_wire_nack_frame() {
+        let (io, mut peer) = tokio::io::duplex(256);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            test_addr(),
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream_handle = Arc::new(stream_handle);
+        let correlation = CorrelationTracker::new();
+        let conn: ConnectionHandle =
+            ConnectionHandle::new_stream(test_addr(), stream_handle, correlation);
+
+        conn.send_ask_nack(77, crate::framing::AskNackReason::HandlerError)
+            .await
+            .expect("send_ask_nack must succeed");
+
+        let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        peer.read_exact(&mut frame)
+            .await
+            .expect("peer must receive the NACK frame");
+
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
+            .expect("valid control word");
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(u32::from_be_bytes(frame[4..8].try_into().unwrap()), 77);
+        assert_eq!(
+            crate::framing::ask_nack_reason(&frame[4..]),
+            Some(crate::framing::AskNackReason::HandlerError)
+        );
     }
 }
 

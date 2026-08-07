@@ -289,9 +289,12 @@ pub const fn fnv1a_hash(input: &str) -> u64 {
 
 /// Encode a typed message for the wire.
 ///
-/// In debug builds, prefixes the payload with the type hash for validation.
+/// Prefixes the payload with the type hash for validation. This is
+/// unconditional in every build mode: debug and release must speak the same
+/// wire format for typed payloads, or a mixed debug/release deployment would
+/// silently corrupt or misinterpret them.
 ///
-/// Important: the debug prefix is padded to preserve alignment for total zero-copy archived access
+/// Important: the prefix is padded to preserve alignment for total zero-copy archived access
 /// on the receiver. (See `PAYLOAD_ALIGNMENT` in `aligned.rs`.)
 pub fn encode_typed<T>(value: &T) -> Result<Bytes>
 where
@@ -301,21 +304,13 @@ where
     let payload =
         rkyv::to_bytes::<rkyv::rancor::Error>(value).map_err(GossipError::Serialization)?;
 
-    #[cfg(debug_assertions)]
-    {
-        const DEBUG_PREFIX_LEN: usize = 16;
-        let mut buf = Vec::with_capacity(DEBUG_PREFIX_LEN + payload.len());
-        buf.extend_from_slice(&T::TYPE_HASH.to_be_bytes());
-        // Pad to 16 bytes so the archive body stays 16-aligned when the underlying buffer is.
-        buf.extend_from_slice(&[0u8; DEBUG_PREFIX_LEN - 8]);
-        buf.extend_from_slice(payload.as_ref());
-        Ok(Bytes::from(buf))
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        Ok(Bytes::copy_from_slice(payload.as_ref()))
-    }
+    const PREFIX_LEN: usize = 16;
+    let mut buf = Vec::with_capacity(PREFIX_LEN + payload.len());
+    buf.extend_from_slice(&T::TYPE_HASH.to_be_bytes());
+    // Pad to 16 bytes so the archive body stays 16-aligned when the underlying buffer is.
+    buf.extend_from_slice(&[0u8; PREFIX_LEN - 8]);
+    buf.extend_from_slice(payload.as_ref());
+    Ok(Bytes::from(buf))
 }
 
 /// Encode a typed payload using the pooled serializer context.
@@ -333,26 +328,16 @@ where
     })
 }
 
-/// Wrap a pooled payload with the debug type hash prefix when enabled.
+/// Wrap a pooled payload with the type hash prefix. Unconditional in every
+/// build mode -- see `encode_typed`.
 pub fn typed_payload_parts<T: WireType>(
     payload: PooledPayload,
 ) -> (PooledPayload, Option<[u8; 16]>, usize) {
-    #[cfg(debug_assertions)]
-    {
-        const DEBUG_PREFIX_LEN: usize = 16;
-        let mut prefix = [0u8; DEBUG_PREFIX_LEN];
-        prefix[..8].copy_from_slice(&T::TYPE_HASH.to_be_bytes());
-        let total_len = prefix.len() + payload.len();
-        // Note: this widens the prefix compared to the previous 8-byte debug format.
-        // Debug builds are not wire-compatible with older debug builds across this change.
-        (payload, Some(prefix), total_len)
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let total_len = payload.len();
-        return (payload, None, total_len);
-    }
+    const PREFIX_LEN: usize = 16;
+    let mut prefix = [0u8; PREFIX_LEN];
+    prefix[..8].copy_from_slice(&T::TYPE_HASH.to_be_bytes());
+    let total_len = prefix.len() + payload.len();
+    (payload, Some(prefix), total_len)
 }
 
 #[cfg(test)]
@@ -368,6 +353,27 @@ mod tests {
     }
 
     wire_type!(TestMsg, "typed::TestMsg");
+
+    /// The type-hash prefix and its verification must be unconditional: a
+    /// debug binary and a release binary must speak the exact same wire
+    /// format for every typed payload. `cargo test` always runs in the dev
+    /// profile (that attribute is true), so a behavioral test cannot observe
+    /// the release path directly; this asserts the *source* no longer
+    /// branches on it, which is the only way the two build modes can be
+    /// guaranteed to agree. The needles are built by concatenation (never
+    /// written as a contiguous literal anywhere in this file) so this test
+    /// cannot trip over its own source text.
+    #[test]
+    fn typed_prefix_logic_does_not_vary_by_cfg_debug_assertions() {
+        let source = include_str!("typed.rs");
+        let positive: String = ["cfg", "(", "debug_assertions", ")"].concat();
+        let negative: String = ["cfg", "(", "not", "(", "debug_assertions", ")", ")"].concat();
+        assert!(
+            !source.contains(&positive) && !source.contains(&negative),
+            "typed.rs must not gate the type-hash prefix (encode/decode, typed_payload_parts) \
+             on debug_assertions -- debug and release must be wire-compatible for every typed payload"
+        );
+    }
 
     #[test]
     fn pooled_payload_buf_semantics() {
@@ -426,52 +432,46 @@ mod tests {
     }
 
     #[test]
-    fn typed_payload_parts_includes_hash_in_debug() {
+    fn typed_payload_parts_includes_hash_unconditionally() {
         let msg = TestMsg { value: 1 };
         let payload = encode_typed_pooled(&msg).unwrap();
         let (_payload, prefix, total_len) = typed_payload_parts::<TestMsg>(payload);
 
-        #[cfg(debug_assertions)]
-        {
-            assert!(total_len >= 16);
-            assert!(prefix.is_some());
-        }
+        assert!(total_len >= 16);
+        assert!(prefix.is_some());
     }
 
     #[test]
-    fn archived_body_is_validated_in_debug_prefix_mode() {
-        #[cfg(debug_assertions)]
-        {
-            #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, PartialEq)]
-            struct AlignedTest {
-                v: u128,
-            }
-            wire_type!(AlignedTest, "typed::AlignedTest");
-
-            // Encode (debug prefix included), then copy into an aligned receive buffer to
-            // simulate the real receive path.
-            let pooled = encode_typed_pooled(&AlignedTest { v: 7 }).unwrap();
-            let (payload, prefix, total_len) = typed_payload_parts::<AlignedTest>(pooled);
-            let mut encoded = Vec::with_capacity(total_len);
-            if let Some(prefix) = prefix {
-                encoded.extend_from_slice(&prefix);
-            }
-            encoded.extend_from_slice(payload.chunk());
-            let pool = Arc::new(AlignedBytesPool::new(1));
-            let aligned = AlignedBytes::from_pooled_slice(&encoded, Arc::clone(&pool));
-            let bytes: Bytes = aligned.into();
-
-            let archived = decode_typed_archived::<AlignedTest>(bytes).unwrap();
-            let a = archived.archived().unwrap();
-            assert_eq!(a.v, 7);
-
-            let mut malformed = encoded;
-            malformed.pop();
-            assert!(
-                decode_typed_archived::<AlignedTest>(Bytes::from(malformed)).is_err(),
-                "a matching debug type hash must not bypass archived byte validation"
-            );
+    fn archived_body_is_validated_alongside_the_prefix() {
+        #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, PartialEq)]
+        struct AlignedTest {
+            v: u128,
         }
+        wire_type!(AlignedTest, "typed::AlignedTest");
+
+        // Encode (prefix included), then copy into an aligned receive buffer to
+        // simulate the real receive path.
+        let pooled = encode_typed_pooled(&AlignedTest { v: 7 }).unwrap();
+        let (payload, prefix, total_len) = typed_payload_parts::<AlignedTest>(pooled);
+        let mut encoded = Vec::with_capacity(total_len);
+        if let Some(prefix) = prefix {
+            encoded.extend_from_slice(&prefix);
+        }
+        encoded.extend_from_slice(payload.chunk());
+        let pool = Arc::new(AlignedBytesPool::new(1));
+        let aligned = AlignedBytes::from_pooled_slice(&encoded, Arc::clone(&pool));
+        let bytes: Bytes = aligned.into();
+
+        let archived = decode_typed_archived::<AlignedTest>(bytes).unwrap();
+        let a = archived.archived().unwrap();
+        assert_eq!(a.v, 7);
+
+        let mut malformed = encoded;
+        malformed.pop();
+        assert!(
+            decode_typed_archived::<AlignedTest>(Bytes::from(malformed)).is_err(),
+            "a matching type hash must not bypass archived byte validation"
+        );
     }
 
     #[test]
@@ -485,7 +485,7 @@ mod tests {
         encoded.extend_from_slice(payload.chunk());
         let archive_alignment = std::mem::align_of::<<TestMsg as rkyv::Archive>::Archived>();
         assert!(archive_alignment > 1);
-        let body_offset = if cfg!(debug_assertions) { 16 } else { 0 };
+        let body_offset = 16;
         let mut storage = vec![0_u8; encoded.len() + archive_alignment];
         let storage_address = storage.as_ptr() as usize;
         let offset = (0..archive_alignment)
@@ -563,7 +563,8 @@ where
 
 /// Decode a typed message from the wire.
 ///
-/// In debug builds, verifies and strips the type hash prefix.
+/// Verifies and strips the type hash prefix. Unconditional in every build
+/// mode -- see `encode_typed`.
 pub fn decode_typed<T>(payload: &[u8]) -> Result<T>
 where
     T: WireType + rkyv::Archive,
@@ -577,45 +578,35 @@ where
             >,
         > + rkyv::Deserialize<T, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
 {
-    #[cfg(debug_assertions)]
-    {
-        const DEBUG_PREFIX_LEN: usize = 16;
-        if payload.len() < DEBUG_PREFIX_LEN {
-            return Err(GossipError::InvalidConfig(format!(
-                "typed payload too short for type hash ({})",
-                T::TYPE_NAME
-            )));
-        }
-        let mut hash_bytes = [0u8; 8];
-        hash_bytes.copy_from_slice(&payload[..8]);
-        let hash = u64::from_be_bytes(hash_bytes);
-        if hash != T::TYPE_HASH {
-            return Err(GossipError::InvalidConfig(format!(
-                "typed payload hash mismatch for {}: expected {:016x}, got {:016x}",
-                T::TYPE_NAME,
-                T::TYPE_HASH,
-                hash
-            )));
-        }
-        let body = &payload[DEBUG_PREFIX_LEN..];
-        let archived = rkyv::access::<T::Archived, rkyv::rancor::Error>(body)?;
-        let mut pool = rkyv::de::Pool::new();
-        let mut deserializer = rkyv::rancor::Strategy::wrap(&mut pool);
-        Ok(rkyv::Deserialize::deserialize(archived, &mut deserializer)?)
+    const PREFIX_LEN: usize = 16;
+    if payload.len() < PREFIX_LEN {
+        return Err(GossipError::InvalidConfig(format!(
+            "typed payload too short for type hash ({})",
+            T::TYPE_NAME
+        )));
     }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let archived = rkyv::access::<T::Archived, rkyv::rancor::Error>(payload)?;
-        let mut pool = rkyv::de::Pool::new();
-        let mut deserializer = rkyv::rancor::Strategy::wrap(&mut pool);
-        Ok(rkyv::Deserialize::deserialize(archived, &mut deserializer)?)
+    let mut hash_bytes = [0u8; 8];
+    hash_bytes.copy_from_slice(&payload[..8]);
+    let hash = u64::from_be_bytes(hash_bytes);
+    if hash != T::TYPE_HASH {
+        return Err(GossipError::InvalidConfig(format!(
+            "typed payload hash mismatch for {}: expected {:016x}, got {:016x}",
+            T::TYPE_NAME,
+            T::TYPE_HASH,
+            hash
+        )));
     }
+    let body = &payload[PREFIX_LEN..];
+    let archived = rkyv::access::<T::Archived, rkyv::rancor::Error>(body)?;
+    let mut pool = rkyv::de::Pool::new();
+    let mut deserializer = rkyv::rancor::Strategy::wrap(&mut pool);
+    Ok(rkyv::Deserialize::deserialize(archived, &mut deserializer)?)
 }
 
 /// Decode a typed message into an archived view (zero-copy).
 ///
-/// In debug builds, verifies and strips the type hash prefix without copying.
+/// Verifies and strips the type hash prefix without copying. Unconditional
+/// in every build mode -- see `encode_typed`.
 pub fn decode_typed_archived<T>(payload: Bytes) -> Result<ArchivedBytes<T>>
 where
     T: WireType + rkyv::Archive,
@@ -630,48 +621,33 @@ where
             >,
         >,
 {
-    #[cfg(debug_assertions)]
-    {
-        const DEBUG_PREFIX_LEN: usize = 16;
-        if payload.len() < DEBUG_PREFIX_LEN {
-            return Err(GossipError::InvalidConfig(format!(
-                "typed payload too short for type hash ({})",
-                T::TYPE_NAME
-            )));
-        }
-        let mut hash_bytes = [0u8; 8];
-        hash_bytes.copy_from_slice(&payload[..8]);
-        let hash = u64::from_be_bytes(hash_bytes);
-        if hash != T::TYPE_HASH {
-            return Err(GossipError::InvalidConfig(format!(
-                "typed payload hash mismatch for {}: expected {:016x}, got {:016x}",
-                T::TYPE_NAME,
-                T::TYPE_HASH,
-                hash
-            )));
-        }
-        validate_archive_alignment::<T::Archived>(&payload[DEBUG_PREFIX_LEN..], T::TYPE_NAME)?;
-        // Validate before exposing the zero-copy wrapper. The wrapper owns the
-        // bytes, so the validated archive remains stable for its lifetime.
-        rkyv::access::<T::Archived, rkyv::rancor::Error>(&payload[DEBUG_PREFIX_LEN..])?;
-        Ok(ArchivedBytes {
-            bytes: payload,
-            offset: DEBUG_PREFIX_LEN,
-            _marker: PhantomData,
-        })
+    const PREFIX_LEN: usize = 16;
+    if payload.len() < PREFIX_LEN {
+        return Err(GossipError::InvalidConfig(format!(
+            "typed payload too short for type hash ({})",
+            T::TYPE_NAME
+        )));
     }
-
-    #[cfg(not(debug_assertions))]
-    {
-        validate_archive_alignment::<T::Archived>(&payload, T::TYPE_NAME)?;
-        // Network payloads must pass bytecheck in release as well as debug.
-        rkyv::access::<T::Archived, rkyv::rancor::Error>(&payload)?;
-        Ok(ArchivedBytes {
-            bytes: payload,
-            offset: 0,
-            _marker: PhantomData,
-        })
+    let mut hash_bytes = [0u8; 8];
+    hash_bytes.copy_from_slice(&payload[..8]);
+    let hash = u64::from_be_bytes(hash_bytes);
+    if hash != T::TYPE_HASH {
+        return Err(GossipError::InvalidConfig(format!(
+            "typed payload hash mismatch for {}: expected {:016x}, got {:016x}",
+            T::TYPE_NAME,
+            T::TYPE_HASH,
+            hash
+        )));
     }
+    validate_archive_alignment::<T::Archived>(&payload[PREFIX_LEN..], T::TYPE_NAME)?;
+    // Validate before exposing the zero-copy wrapper. The wrapper owns the
+    // bytes, so the validated archive remains stable for its lifetime.
+    rkyv::access::<T::Archived, rkyv::rancor::Error>(&payload[PREFIX_LEN..])?;
+    Ok(ArchivedBytes {
+        bytes: payload,
+        offset: PREFIX_LEN,
+        _marker: PhantomData,
+    })
 }
 
 /// Implement WireType with a stable, shared string identifier.

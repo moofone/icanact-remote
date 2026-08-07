@@ -68,6 +68,33 @@ pub enum WireKind {
 }
 
 impl WireKind {
+    /// Every dense V5 kind, in discriminant order. Single source of truth so
+    /// tests that must cover "every `WireKind`" (control-encoding coverage,
+    /// the capability-gating guard in `handshake.rs`) can't drift from each
+    /// other by editing one list and forgetting another.
+    ///
+    /// Only referenced from `#[cfg(test)]` code today (no production call
+    /// site iterates every kind), which a non-test `cargo clippy` build
+    /// reports as dead code.
+    #[allow(dead_code)]
+    pub(crate) const ALL: [WireKind; 15] = [
+        Self::Gossip,
+        Self::Ask,
+        Self::Response,
+        Self::ActorTell,
+        Self::ActorAsk,
+        Self::StreamStart,
+        Self::StreamData,
+        Self::StreamResponseStart,
+        Self::StreamResponseData,
+        Self::DirectAsk,
+        Self::DirectResponse,
+        Self::PubSub,
+        Self::StreamAbort,
+        Self::RouteBind,
+        Self::RoutedActorAsk,
+    ];
+
     pub const fn from_message_type(msg_type: MessageType) -> Option<Self> {
         match msg_type {
             MessageType::Gossip => Some(Self::Gossip),
@@ -240,6 +267,107 @@ pub fn write_ask_response_header(
     header
 }
 
+/// Machine-readable reason an ask could not be answered with data. Carried in
+/// a Response frame's `ASK_RESPONSE_HEADER_LEN` fixed region, which has
+/// always been zero-padded past the correlation id (no application payload
+/// has ever been placed there), so a NACK costs no extra frame or round trip.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskNackReason {
+    /// No actor/handler is wired up to answer this ask at all.
+    UnknownActor = 1,
+    /// A handler was invoked and returned an application error.
+    HandlerError = 2,
+    /// This connection/build has no dispatcher for the ask's wire path
+    /// (e.g. a raw or direct ask with no registered handler concept).
+    NoDispatcher = 3,
+    /// A dispatcher exists for this wire path, but the connection has no
+    /// spare capacity to admit the answer right now (e.g. the local
+    /// streaming-response queue is full). Distinct from `NoDispatcher`,
+    /// which means no dispatcher exists for this path at all -- this is
+    /// transient: the same ask, retried once capacity frees up (or sent to
+    /// a different peer), may succeed where it fails now.
+    Backpressure = 4,
+    /// The peer set the NACK marker with a reason byte this build does not
+    /// recognize -- a newer peer's reason, or a corrupted frame. Decode-only:
+    /// never written to the wire, so the reserved 0 discriminant cannot
+    /// collide with a reason a future version assigns.
+    Unsupported = 0,
+}
+
+impl AskNackReason {
+    /// Total by construction: every byte maps to a reason, so a frame whose
+    /// NACK marker is set can never decode as an ordinary response. An
+    /// unrecognized byte degrades to `Unsupported` rather than falling
+    /// through to success, and stays forward-compatible -- a newer peer's
+    /// reason still resolves the waiter with an error instead of tearing
+    /// down the connection.
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::UnknownActor,
+            2 => Self::HandlerError,
+            3 => Self::NoDispatcher,
+            4 => Self::Backpressure,
+            _ => Self::Unsupported,
+        }
+    }
+}
+
+impl std::fmt::Display for AskNackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::UnknownActor => "unknown actor",
+            Self::HandlerError => "handler error",
+            Self::NoDispatcher => "no dispatcher for this ask path",
+            Self::Backpressure => "no spare capacity for this ask right now",
+            Self::Unsupported => "refused with a reason this build does not recognize",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Byte offset, within the Response frame's fixed region (i.e. relative to
+/// `body[0]`, right after the control word), of the NACK marker. Offset 0..4
+/// is the correlation id; this is the first previously-unused padding byte.
+const ASK_NACK_FLAG_BODY_OFFSET: usize = 4;
+const ASK_NACK_REASON_BODY_OFFSET: usize = 5;
+const ASK_NACK_FLAG_SET: u8 = 1;
+
+/// Build a Response frame that NACKs an ask instead of answering it: same
+/// kind and header shape as a normal response, zero-length payload, with the
+/// reason packed into the header's reserved bytes.
+pub fn write_ask_nack_header(
+    correlation_id: u32,
+    reason: AskNackReason,
+) -> [u8; ASK_RESPONSE_FRAME_HEADER_LEN] {
+    let mut header = init_header(WireKind::Response, ASK_RESPONSE_HEADER_LEN);
+    header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    header[LENGTH_PREFIX_LEN + ASK_NACK_FLAG_BODY_OFFSET] = ASK_NACK_FLAG_SET;
+    header[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = reason as u8;
+    header
+}
+
+/// Inspect a Response frame's body (the bytes after the control word,
+/// starting at the correlation id) for the NACK marker. Returns `None` for
+/// an ordinary response, including every response written before this
+/// marker existed (that padding was always zeroed).
+///
+/// `None` means exactly one thing -- the marker is absent -- so a set marker
+/// always yields a NACK. An unrecognized reason byte resolves to
+/// `Unsupported` instead of `None`; conflating the two would deliver a
+/// rejection to the caller as a successful empty response.
+pub fn ask_nack_reason(response_fixed_region: &[u8]) -> Option<AskNackReason> {
+    if response_fixed_region.len() < ASK_RESPONSE_HEADER_LEN {
+        return None;
+    }
+    if response_fixed_region[ASK_NACK_FLAG_BODY_OFFSET] != ASK_NACK_FLAG_SET {
+        return None;
+    }
+    Some(AskNackReason::from_u8(
+        response_fixed_region[ASK_NACK_REASON_BODY_OFFSET],
+    ))
+}
+
 pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER_LEN] {
     init_header(
         WireKind::Gossip,
@@ -254,14 +382,57 @@ pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER
     )
 }
 
+/// Build a DirectAsk frame header. `request_id` is a stable identifier the
+/// caller controls, unlike `correlation_id`, which is a connection-local slot
+/// index recycled on every reconnect. `(peer_id, request_id)` is the identity
+/// a receiver would need to recognize "this is the same logical ask retried
+/// after a transport reset" rather than treating the retry as a new request
+/// and executing it twice.
+///
+/// **No receiver does that today, and none can.** DirectAsk has no registered
+/// application handler in any build mode -- every read path answers it with
+/// `AskNackReason::NoDispatcher` -- so nothing reaches a point where this id
+/// could be consulted. It is wire surface kept ready for a future DirectAsk
+/// dispatcher, not a capability in use.
+///
+/// In particular this is *not* what makes the actor-ask path idempotent.
+/// `WireKind::ActorAsk` carries no `request_id` (see
+/// `write_actor_ask_header`), and that is the frame real ask traffic uses.
+/// Dedupe on that path keys on an identity carried inside the payload
+/// instead, so it needs nothing from this header.
+///
+/// Occupies bytes the frame has always reserved and zeroed after
+/// `correlation_id`, so it costs no extra frame. Fail-closed: `request_id`
+/// must be nonzero (see `direct_ask_request_id` on the read side); 0 is
+/// reserved to mean "absent" and is rejected rather than silently accepted
+/// as a valid-looking id that could collide across independent asks.
 pub fn write_direct_ask_header(
     correlation_id: u32,
+    request_id: u64,
     payload_len: usize,
 ) -> [u8; DIRECT_ASK_FRAME_HEADER_LEN] {
     let body_len = checked_body_len(DIRECT_ASK_HEADER_LEN, payload_len);
     let mut header = init_header(WireKind::DirectAsk, body_len);
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    header[8..16].copy_from_slice(&request_id.to_be_bytes());
     header
+}
+
+/// Read back the stable request id `write_direct_ask_header` wrote, from a
+/// DirectAsk frame's body (the bytes after the control word, starting at the
+/// correlation id). Fail-closed: `None` both for a truncated body and for
+/// the reserved-zero sentinel (`request_id == 0`), so a caller can't
+/// mistake "absent" for a valid id.
+pub fn direct_ask_request_id(body: &[u8]) -> Option<u64> {
+    if body.len() < DIRECT_ASK_HEADER_LEN {
+        return None;
+    }
+    let request_id = u64::from_be_bytes(body[4..12].try_into().unwrap());
+    if request_id == 0 {
+        None
+    } else {
+        Some(request_id)
+    }
 }
 
 pub fn write_direct_response_header(
@@ -356,24 +527,7 @@ mod tests {
 
     #[test]
     fn every_v5_wire_kind_has_a_pinned_dense_control_encoding() {
-        let kinds = [
-            WireKind::Gossip,
-            WireKind::Ask,
-            WireKind::Response,
-            WireKind::ActorTell,
-            WireKind::ActorAsk,
-            WireKind::StreamStart,
-            WireKind::StreamData,
-            WireKind::StreamResponseStart,
-            WireKind::StreamResponseData,
-            WireKind::DirectAsk,
-            WireKind::DirectResponse,
-            WireKind::PubSub,
-            WireKind::StreamAbort,
-            WireKind::RouteBind,
-            WireKind::RoutedActorAsk,
-        ];
-        for (expected_value, kind) in kinds.into_iter().enumerate() {
+        for (expected_value, kind) in WireKind::ALL.into_iter().enumerate() {
             let bytes = encode_control(kind, 17);
             assert_eq!(
                 u32::from_be_bytes(bytes) >> CONTROL_BODY_LEN_BITS,
@@ -385,9 +539,11 @@ mod tests {
 
     #[test]
     fn control_codec_preserves_boundary_lengths_for_every_kind() {
+        // Was `0..=WireKind::StreamAbort as u8`, silently excluding
+        // RouteBind/RoutedActorAsk (13, 14) from coverage. WireKind::ALL is
+        // the single source of truth so this can't drift again.
         let lengths = [0, 1, 15, 16, 17, CONTROL_BODY_LEN_MASK as usize];
-        for raw_kind in 0..=WireKind::StreamAbort as u8 {
-            let kind = WireKind::from_u8(raw_kind).expect("dense V5 kind");
+        for kind in WireKind::ALL {
             for body_len in lengths {
                 let encoded = encode_control(kind, body_len);
                 assert_eq!(decode_control(encoded), Some(Control { kind, body_len }));
@@ -441,7 +597,7 @@ mod tests {
 
     #[test]
     fn direct_frames_do_not_encode_redundant_payload_length() {
-        let header = write_direct_ask_header(0x1234_5678, 9);
+        let header = write_direct_ask_header(0x1234_5678, 0xdead_beef_cafe_1234, 9);
         let control = decode_control(header[..4].try_into().unwrap()).unwrap();
         assert_eq!(control.kind, WireKind::DirectAsk);
         assert_eq!(control.body_len, DIRECT_ASK_HEADER_LEN + 9);
@@ -449,7 +605,24 @@ mod tests {
             u32::from_be_bytes(header[4..8].try_into().unwrap()),
             0x1234_5678
         );
-        assert_eq!(&header[8..], &[0; 8]);
+        assert_eq!(
+            u64::from_be_bytes(header[8..16].try_into().unwrap()),
+            0xdead_beef_cafe_1234
+        );
+    }
+
+    /// The stable request id occupies bytes the frame has always reserved
+    /// (and zeroed) after the connection-local correlation id, so it costs
+    /// no extra frame -- same trick as the ask-NACK marker in the Response
+    /// header.
+    #[test]
+    fn direct_ask_request_id_round_trips_through_the_headers_reserved_bytes() {
+        let header = write_direct_ask_header(1, 42, 0);
+        assert_eq!(
+            u64::from_be_bytes(header[8..16].try_into().unwrap()),
+            42,
+            "request_id must occupy the frame's previously-zeroed trailing bytes"
+        );
     }
 
     #[test]
@@ -479,6 +652,69 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn ask_nack_round_trips_through_the_response_headers_reserved_bytes() {
+        // The NACK marker rides in bytes the wire has always reserved (and
+        // zeroed) after the correlation id in a Response frame, so it costs
+        // no extra frame and old-shaped Response parsing that never looked
+        // past the correlation id keeps working.
+        let header = write_ask_nack_header(0x0102_0304, AskNackReason::UnknownActor);
+        let control = decode_control(header[..4].try_into().unwrap()).unwrap();
+        assert_eq!(control.kind, WireKind::Response);
+        assert_eq!(control.body_len, ASK_RESPONSE_HEADER_LEN);
+        assert_eq!(
+            u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            0x0102_0304
+        );
+        assert_eq!(
+            ask_nack_reason(&header[4..]),
+            Some(AskNackReason::UnknownActor)
+        );
+    }
+
+    #[test]
+    fn ask_nack_round_trips_the_backpressure_reason() {
+        // Distinct from `NoDispatcher`: a dispatcher exists, the connection
+        // is just out of capacity right now, so this is transient rather
+        // than "this build can never answer this ask".
+        let header = write_ask_nack_header(42, AskNackReason::Backpressure);
+        assert_eq!(
+            ask_nack_reason(&header[4..]),
+            Some(AskNackReason::Backpressure)
+        );
+    }
+
+    #[test]
+    fn a_nack_whose_reason_this_build_does_not_know_is_still_a_nack() {
+        // A newer peer can NACK with a reason byte we have never heard of,
+        // and a corrupted frame can produce one by accident. Either way the
+        // marker is set, so the ask was refused. Decoding that as an
+        // ordinary response would hand the caller a successful empty payload
+        // for a request nobody answered -- fabricated success, the failure
+        // mode this whole NACK path exists to remove.
+        for unknown in [0u8, 5, 9, 200, 255] {
+            let mut header = write_ask_nack_header(7, AskNackReason::UnknownActor);
+            header[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = unknown;
+            assert_eq!(
+                ask_nack_reason(&header[4..]),
+                Some(AskNackReason::Unsupported),
+                "reason byte {unknown} left the marker set, so it must not decode as a response"
+            );
+        }
+
+        // The marker itself still distinguishes the two cases: an ordinary
+        // response is unaffected no matter what the reason byte holds.
+        let mut ordinary = write_ask_response_header(MessageType::Response, 7, 0);
+        ordinary[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = 200;
+        assert_eq!(ask_nack_reason(&ordinary[4..]), None);
+    }
+
+    #[test]
+    fn a_normal_response_header_never_parses_as_a_nack() {
+        let header = write_ask_response_header(MessageType::Response, 7, 5);
+        assert_eq!(ask_nack_reason(&header[4..]), None);
     }
 
     #[test]

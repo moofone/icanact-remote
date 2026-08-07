@@ -1,3 +1,12 @@
+//! A raw `.ask()`/`.ask_bytes()` has no actor_id/type_hash to route to, so
+//! it has no production dispatcher; every test in this file exercises the
+//! test/benchmark-only ECHO:/REVERSE:/COUNT:/HASH: command processor
+//! (`handle::handle_raw_ask_request`, gated on `cfg(any(test, feature =
+//! "test-helpers"))`), not a registered actor. CI runs `cargo test
+//! --all-features`, which enables it; run locally with `cargo test
+//! --features test-helpers` to include this file.
+#![cfg(feature = "test-helpers")]
+
 use std::net::SocketAddr;
 
 use futures::{
