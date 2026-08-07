@@ -1470,6 +1470,106 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
     });
 }
 
+/// A transport whose `poll_write` legally returns `Ready(Ok(0))` on every
+/// call, from the very first one -- modelling a half-closed write side, per
+/// the `AsyncWrite` contract (distinct from `Pending`, which must be
+/// re-polled; `Ok(0)` on a non-empty buffer means no further progress is
+/// possible). `poll_write_calls` counts how many times the transport was
+/// actually polled, so a test can assert the caller stopped promptly instead
+/// of spinning.
+struct AlwaysZeroWrite {
+    poll_write_calls: Arc<AtomicUsize>,
+}
+
+impl AsyncWrite for AlwaysZeroWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.poll_write_calls.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Ok(0))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Review finding: `write_ask_nack_header_bounded`'s retry loop matches
+/// `write_vectored_once`'s result as `Ok(Ok(n)) => { ... offset += n; ...
+/// stuck_since = None; }` with no check that `n > 0`. Read in isolation,
+/// nothing stops `n == 0` from taking that branch on every iteration --
+/// adding zero to `offset`, never reaching `offset >= header.len()`,
+/// resetting `stuck_since` so the stuck-mid-frame teardown timer can never
+/// accumulate, and looping straight back into another poll with no
+/// `Pending` and no timeout in between. That shape is exactly the CPU-spin
+/// livelock R4 fixed for `OwnedChunks`' raw `.write()` tail
+/// (`owned_chunks_zero_write_past_max_iov_exits_instead_of_livelocking`).
+///
+/// This does not actually reach that branch today: `write_vectored_once`
+/// (its only caller here) already folds a real `result == 0` into
+/// `Err(WriteZero)` before returning, so `Ok(Ok(0))` is unreachable through
+/// this call path, and `Ok(Ok(n))` is safe to assume `n > 0` -- confirmed
+/// here by proving a transport that legally returns `Ok(0)` from its very
+/// first poll makes `write_ask_nack_header_bounded` return an `Err`
+/// immediately, after exactly one poll, rather than spinning. Kept as an
+/// explicit regression guard bounded by a hard timeout (fails loudly rather
+/// than hanging the suite) so that if `write_vectored_once`'s zero-check
+/// above it is ever weakened or bypassed, this test starts failing instead
+/// of the bug going unnoticed until a stuck peer finds it in production.
+#[tokio::test]
+async fn write_ask_nack_header_bounded_does_not_spin_on_a_legal_zero_write() {
+    let poll_write_calls = Arc::new(AtomicUsize::new(0));
+    let mut stream = AlwaysZeroWrite {
+        poll_write_calls: poll_write_calls.clone(),
+    };
+    let bytes_written_counter = Arc::new(AtomicUsize::new(0));
+    let mut bytes_since_flush = 0usize;
+    let header = crate::framing::write_ask_nack_header(
+        0x1111_2222,
+        crate::framing::AskNackReason::Backpressure,
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        write_ask_nack_header_bounded(
+            &mut stream,
+            &bytes_written_counter,
+            &mut bytes_since_flush,
+            header,
+        ),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "write_ask_nack_header_bounded did not return within 5s against a transport that \
+         legally returns Ok(0) on every poll -- livelocked instead of erroring (poll_write \
+         calls observed: {})",
+        poll_write_calls.load(Ordering::SeqCst)
+    );
+    assert!(
+        result.unwrap().is_err(),
+        "a transport that can never make progress must surface as an error, not Ok(true)/Ok(false)"
+    );
+    assert_eq!(
+        poll_write_calls.load(Ordering::SeqCst),
+        1,
+        "must stop after the first Ok(0) rather than retrying a transport that has already \
+         reported it can never make progress"
+    );
+    assert_eq!(
+        bytes_written_counter.load(Ordering::Acquire),
+        0,
+        "no bytes were actually written"
+    );
+}
+
 // The genuinely-mid-frame "a queued NACK must never splice into a partially
 // written streaming frame" property needs reads to keep flowing while a
 // write is stuck -- otherwise the second/third ask that would trigger the

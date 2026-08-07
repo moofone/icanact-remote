@@ -139,6 +139,24 @@ where
         )
         .await
         {
+            // `write_vectored_once` already folds a real zero-byte write
+            // into `Err(WriteZero)` before returning, so this arm is
+            // unreachable through that call path today. Checked locally
+            // anyway rather than relying on that callee detail: `offset`
+            // is nonempty-until-completion here, so `n == 0` taking this
+            // branch would add nothing, never reach `offset >=
+            // header.len()`, and reset `stuck_since` -- clearing the one
+            // signal that would otherwise let the stuck-mid-frame teardown
+            // timer above ever fire, letting a conforming `AsyncWrite`
+            // that starts returning `Ok(0)` pin this loop in a CPU-burning
+            // spin with no `Pending` and no timeout in between. Same class
+            // of bug R4 fixed for `OwnedChunks`' raw unwrapped-write tail.
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "ask NACK write made no progress",
+                ));
+            }
             Ok(Ok(n)) => {
                 bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                 *bytes_since_flush += n;
