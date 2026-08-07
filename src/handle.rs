@@ -4767,6 +4767,15 @@ pub(crate) async fn handle_raw_ask_request(
 /// `raw_ask_with_no_dispatcher_nacks_instead_of_silence`, and
 /// `tests/bad_client_stress.rs::raw_ask_nacks_in_a_true_release_build` for
 /// direct evidence from an actual `--release` binary).
+///
+/// `#[allow(dead_code)]`: when the library is linked into an external test
+/// binary that enables `feature = "test-helpers"` (as CI does via
+/// `--all-features`), `cfg(test)` is false for that copy of the library (it
+/// isn't the crate's own `--lib` test target), so both this function's only
+/// production call site (excluded, since test-helpers turns the mock branch
+/// on) and its unit test (excluded, `#[cfg(test)]`) are absent from that
+/// specific build -- there is nothing left calling it there.
+#[allow(dead_code)]
 pub(crate) async fn handle_raw_ask_no_dispatcher(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
