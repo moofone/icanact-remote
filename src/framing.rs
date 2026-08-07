@@ -323,27 +323,58 @@ pub fn write_direct_response_header(
     Ok(header)
 }
 
+/// Shared `.expect()` message for the infallible `write_stream_*_header`
+/// wrappers below -- see the note on `write_stream_request_start_header`.
+const STREAM_CHUNK_INVARIANT: &str =
+    "stream chunk length is bounded by max_stream_chunk_size, always within the V5 27-bit limit";
+
 /// In every current caller (the streaming writer in `connection_pool`),
 /// `first_chunk_len`/`payload_len` here are never the caller's raw,
 /// unbounded payload length -- the streaming writer always clamps every
 /// chunk to `max_stream_chunk_size()` first (itself derived from
 /// `max_message_size`, which config validation already bounds to the V5
 /// 27-bit limit), so `checked_body_len` cannot observe an oversize value on
-/// that path in practice. That evidence hasn't changed.
+/// that path in practice. That evidence hasn't changed across four review
+/// rounds.
 ///
-/// These three were `pub(crate)` for exactly that reason -- the invariant
-/// held at the only call site this crate has, and a `pub` header builder
-/// alone was never a usable standalone API without the crate's own
-/// `stream_id` allocator and `max_stream_chunk_size()`, neither of which is
-/// exposed. codex raised the source-compatibility objection to that
-/// restriction three times across review rounds; rather than keep
-/// re-litigating it, they're `pub` again here and, like every other header
-/// builder in this file, return `Result` instead of trusting the internal
-/// invariant with `.expect()`. That closes the objection outright (no
-/// compile-time break for a hypothetical downstream caller, ever) at zero
-/// cost to the one real caller, which already handles `Result` from every
-/// sibling `write_*_header` function.
+/// codex's objection moved each time a fix landed: `pub(crate)` broke a
+/// hypothetical downstream caller by hiding the function; `pub` + `Result`
+/// broke it anyway by changing the return type, since any expression that
+/// indexed, iterated, or otherwise used the returned array no longer
+/// compiles against a `Result`. The only change that is genuinely
+/// source-compatible with whatever a caller outside this crate could have
+/// written before this PR touched these functions is *no signature change
+/// at all*: these three stay `pub fn (..) -> [u8; N]`, exactly as they
+/// were, and panic via the same trusted-invariant `.expect()` every other
+/// infallible builder in this file uses (`write_route_bind_header`,
+/// `write_stream_abort_header`). `try_write_stream_request_start_header`/
+/// `try_write_stream_response_start_header`/`try_write_stream_data_header`
+/// below are the fallible siblings: every internal caller in this crate
+/// uses those instead, so no panicking path is reachable in practice
+/// despite the infallible signatures staying available for whatever a
+/// hypothetical downstream caller might already depend on.
 pub fn write_stream_request_start_header(
+    stream_id: u32,
+    correlation_id: u32,
+    total_size: u32,
+    actor_id: u64,
+    type_hash: u32,
+    first_chunk_len: usize,
+) -> [u8; STREAM_REQUEST_START_FRAME_HEADER_LEN] {
+    try_write_stream_request_start_header(
+        stream_id,
+        correlation_id,
+        total_size,
+        actor_id,
+        type_hash,
+        first_chunk_len,
+    )
+    .expect(STREAM_CHUNK_INVARIANT)
+}
+
+/// Fallible sibling of `write_stream_request_start_header` -- see the note
+/// there. Every internal caller uses this, not the infallible form above.
+pub fn try_write_stream_request_start_header(
     stream_id: u32,
     correlation_id: u32,
     total_size: u32,
@@ -368,6 +399,19 @@ pub fn write_stream_response_start_header(
     correlation_id: u32,
     total_size: u32,
     first_chunk_len: usize,
+) -> [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] {
+    try_write_stream_response_start_header(stream_id, correlation_id, total_size, first_chunk_len)
+        .expect(STREAM_CHUNK_INVARIANT)
+}
+
+/// Fallible sibling of `write_stream_response_start_header` -- see the note
+/// on `write_stream_request_start_header` above. Every internal caller uses
+/// this, not the infallible form above.
+pub fn try_write_stream_response_start_header(
+    stream_id: u32,
+    correlation_id: u32,
+    total_size: u32,
+    first_chunk_len: usize,
 ) -> Result<[u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN]> {
     let body_len = checked_body_len(STREAM_RESPONSE_START_HEADER_LEN, first_chunk_len)?;
     let mut header: [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] =
@@ -380,6 +424,19 @@ pub fn write_stream_response_start_header(
 
 /// See the note on `write_stream_request_start_header` above.
 pub fn write_stream_data_header(
+    response: bool,
+    stream_id: u32,
+    chunk_index: u32,
+    payload_len: usize,
+) -> [u8; STREAM_DATA_FRAME_HEADER_LEN] {
+    try_write_stream_data_header(response, stream_id, chunk_index, payload_len)
+        .expect(STREAM_CHUNK_INVARIANT)
+}
+
+/// Fallible sibling of `write_stream_data_header` -- see the note on
+/// `write_stream_request_start_header` above. Every internal caller uses
+/// this, not the infallible form above.
+pub fn try_write_stream_data_header(
     response: bool,
     stream_id: u32,
     chunk_index: u32,

@@ -1063,7 +1063,7 @@ impl<T> ConnectionHandle<T> {
             max: crate::MAX_STREAM_SIZE,
         })?;
         let first_len = payload.len().min(chunk_size);
-        let first_header = crate::framing::write_stream_request_start_header(
+        let first_header = crate::framing::try_write_stream_request_start_header(
             stream_id,
             correlation_id,
             total_size,
@@ -1082,7 +1082,7 @@ impl<T> ConnectionHandle<T> {
         let mut index = 1u32;
         while offset < payload.len() {
             let end = (offset + chunk_size).min(payload.len());
-            let header = crate::framing::write_stream_data_header(
+            let header = crate::framing::try_write_stream_data_header(
                 false,
                 stream_id,
                 index,

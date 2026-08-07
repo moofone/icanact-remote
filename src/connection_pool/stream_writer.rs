@@ -3447,7 +3447,7 @@ impl LockFreeStreamHandle {
         })?;
         let first_len = payload.len().min(chunk_size);
         self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
-            header: InlineFrameHeader::from_array(crate::framing::write_stream_request_start_header(
+            header: InlineFrameHeader::from_array(crate::framing::try_write_stream_request_start_header(
                 stream_id,
                 0,
                 total_size,
@@ -3463,7 +3463,7 @@ impl LockFreeStreamHandle {
         while offset < payload.len() {
             let end = (offset + chunk_size).min(payload.len());
             self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
-                header: InlineFrameHeader::from_array(crate::framing::write_stream_data_header(
+                header: InlineFrameHeader::from_array(crate::framing::try_write_stream_data_header(
                     false,
                     stream_id,
                     index,
@@ -3534,7 +3534,7 @@ impl LockFreeStreamHandle {
             }
         })?;
         let first_len = payload.len().min(chunk_size);
-        let first_header = crate::framing::write_stream_response_start_header(
+        let first_header = crate::framing::try_write_stream_response_start_header(
             stream_id,
             correlation_id,
             total_size,
@@ -3551,7 +3551,7 @@ impl LockFreeStreamHandle {
         let mut index = 1u32;
         while offset < payload.len() {
             let end = (offset + chunk_size).min(payload.len());
-            let header = crate::framing::write_stream_data_header(
+            let header = crate::framing::try_write_stream_data_header(
                 true,
                 stream_id,
                 index,
@@ -3923,7 +3923,7 @@ mod route_interning_tests {
         );
         let stream_id = 7;
         let start =
-            crate::framing::write_stream_request_start_header(stream_id, 1, 1, 2, 3, 1).unwrap();
+            crate::framing::try_write_stream_request_start_header(stream_id, 1, 1, 2, 3, 1).unwrap();
         writer
             .streaming_queue
             .push(StreamingCommand::VectoredWrite(VectoredSendItem {

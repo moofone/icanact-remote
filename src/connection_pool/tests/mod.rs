@@ -1234,7 +1234,7 @@ async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
     let queue = StreamingQueue::new(1, "127.0.0.1:40493".parse().unwrap());
     let mut yielded_slot = None;
     let header =
-        crate::framing::write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17)
+        crate::framing::try_write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17)
             .unwrap();
     let payload = bytes::Bytes::from(vec![0xA7; STREAM_WRITE_SLICE_BYTES + 17]);
     let pending =
@@ -1643,7 +1643,7 @@ async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
     logical_payload.extend_from_slice(&payload_bytes);
     let mut expected = Vec::new();
     expected.extend_from_slice(
-        &crate::framing::write_stream_response_start_header(
+        &crate::framing::try_write_stream_response_start_header(
             stream_id,
             0xC0DE,
             payload_len as u32,
@@ -1658,7 +1658,7 @@ async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
         let frame_payload_start = wire_offset;
         let frame_payload_end = (wire_offset + chunk_size).min(payload_len);
         expected.extend_from_slice(
-            &crate::framing::write_stream_data_header(
+            &crate::framing::try_write_stream_data_header(
                 true,
                 stream_id,
                 chunk_index,
@@ -1763,7 +1763,7 @@ async fn bytes_streaming_response_writes_frame_order() {
     let chunk_size = 64 - crate::framing::STREAM_RESPONSE_START_HEADER_LEN;
     let mut expected = Vec::new();
     expected.extend_from_slice(
-        &crate::framing::write_stream_response_start_header(
+        &crate::framing::try_write_stream_response_start_header(
             stream_id,
             0xC0DE,
             payload_len as u32,
@@ -1777,7 +1777,7 @@ async fn bytes_streaming_response_writes_frame_order() {
     while offset < payload_len {
         let end = (offset + chunk_size).min(payload_len);
         expected.extend_from_slice(
-            &crate::framing::write_stream_data_header(true, stream_id, chunk_index, end - offset)
+            &crate::framing::try_write_stream_data_header(true, stream_id, chunk_index, end - offset)
                 .unwrap(),
         );
         expected.extend_from_slice(&payload_bytes[offset..end]);
@@ -3926,7 +3926,7 @@ fn accept_path_streaming_state_handoff_completes_a_stream_split_across_the_first
         // The peer, unaware the accept path already consumed the first
         // frame, sends only the second (and final) chunk.
         let second_header =
-            crate::framing::write_stream_data_header(false, stream_id as u32, 1, STRIDE).unwrap();
+            crate::framing::try_write_stream_data_header(false, stream_id as u32, 1, STRIDE).unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client_io, &second_header)
             .await
             .unwrap();
