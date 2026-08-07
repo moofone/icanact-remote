@@ -35,11 +35,21 @@ const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 /// accumulate that much retained backlog -- a bidirectional large-ask storm,
 /// exactly the scenario this constant exists for -- would stop reading each
 /// other entirely, and a write that keeps retrying into a socket nobody is
-/// draining never resolves either. That pre-check is removed; admission is
-/// bounded per response instead (`can_admit_response` -> `WouldBlock`), so a
-/// read that does not need streaming capacity keeps flowing regardless of
-/// backlog. See the comment at the read loop's `while` condition in
-/// `io_task`.
+/// draining never resolves either. That pre-check is removed: reading (and
+/// so draining the peer) no longer depends on `is_full` at all. See the
+/// comment at the read loop's `while` condition in `io_task`.
+///
+/// Reading is not the same as dispatching. An `ActorAsk`'s handler runs
+/// before its response size -- and so whether it will need streaming
+/// admission -- is known, so unconditional dispatch would compute a response
+/// this connection cannot currently retain and then discard it
+/// (`can_admit_response` -> `WouldBlock`, the drop documented at
+/// `queue_streaming_response_bytes`/`_pooled`). `is_actor_ask_dispatch`
+/// combined with the same `is_full` check gates dispatch specifically (not
+/// the read) at each of `io_task`'s three call sites: an ask's frame is still
+/// read off the wire either way, but its handler only runs once the queue has
+/// room. Tells, control frames, and every other message keep dispatching
+/// unconditionally -- that is what actually lets the queue drain.
 ///
 /// What is NOT covered by either fix: a partial frame pending together with
 /// `response_batch`/`direct_response_batch` at their own (much smaller, ~8MB)
