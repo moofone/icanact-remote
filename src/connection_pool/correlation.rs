@@ -6,12 +6,31 @@ const SLOT_WAITING: u8 = 1;
 const SLOT_WRITING: u8 = 2;
 const SLOT_READY: u8 = 3;
 
+/// What a completed slot resolves to: a real payload, or an explicit NACK
+/// from the peer. `Nack` is `Copy` (a tag + a one-byte reason), so publishing
+/// it costs nothing beyond what `Response` already pays to publish a payload.
+pub(crate) enum CorrelationOutcome {
+    Response(crate::AlignedBytes),
+    Nack(crate::framing::AskNackReason),
+}
+
+impl CorrelationOutcome {
+    /// Convert to the `Result` a waiter actually receives: a NACK becomes an
+    /// immediate typed error rather than a payload the caller must inspect.
+    fn into_result(self) -> Result<crate::AlignedBytes> {
+        match self {
+            Self::Response(bytes) => Ok(bytes),
+            Self::Nack(reason) => Err(crate::GossipError::AskNacked(reason)),
+        }
+    }
+}
+
 /// Outcome of attempting to take a slot's ready response.
 enum ReadyTake {
     /// Slot was not READY.
     NotReady,
     /// Took this waiter's own response.
-    Taken(crate::AlignedBytes),
+    Taken(CorrelationOutcome),
     /// Slot is READY but belongs to a different correlation id: this waiter's
     /// request was recycled (R-10). The caller must stop waiting.
     ForeignReady,
@@ -27,7 +46,7 @@ struct PendingResponseSlot {
     /// so a stale/delayed response for a recycled id cannot complete a
     /// *different* in-flight request occupying the same slot.
     id: AtomicU32,
-    response: UnsafeCell<MaybeUninit<crate::AlignedBytes>>,
+    response: UnsafeCell<MaybeUninit<CorrelationOutcome>>,
     waker: AtomicWaker,
     /// R-10: gates waker registration against allocation/recycle so a stale
     /// waiter cannot register (and overwrite the current owner's waker) once
@@ -108,10 +127,10 @@ impl CorrelationTracker {
             }
             // SAFETY: READY -> WRITING gives this reader exclusive ownership;
             // allocation requires EMPTY and cancellation spins on WRITING.
-            let response = unsafe { (*slot_ref.response.get()).assume_init_read() };
+            let outcome = unsafe { (*slot_ref.response.get()).assume_init_read() };
             before_slot_release();
             slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
-            return ReadyTake::Taken(response);
+            return ReadyTake::Taken(outcome);
         }
         ReadyTake::NotReady
     }
@@ -231,16 +250,15 @@ impl CorrelationTracker {
         Err(NoFreeSlots)
     }
 
-    /// Complete a pending request with a response.
-    ///
-    /// Returns true when the response was consumed and published.
-    pub(crate) fn complete(
-        &self,
-        correlation_id: u32,
-        response: &mut Option<crate::AlignedBytes>,
-    ) -> bool {
-        let slot = Self::slot_index(correlation_id);
-        let slot_ref = &self.pending[slot];
+    /// Claim exclusive (WRITING) ownership of `correlation_id`'s slot for
+    /// publishing a completion, verifying the full id so a stale or delayed
+    /// completion for a recycled id (`id` and `id + 8192*k` share a slot
+    /// index) cannot complete a *different* in-flight request. On any
+    /// failure the slot is left exactly as `complete`/`complete_nack` have
+    /// always left it (WAITING restored on an id mismatch, untouched on a
+    /// failed CAS), so this refactor changes no observable behavior.
+    fn claim_slot_for_completion(&self, correlation_id: u32) -> Option<&PendingResponseSlot> {
+        let slot_ref = &self.pending[Self::slot_index(correlation_id)];
         if slot_ref
             .state
             .compare_exchange(
@@ -251,32 +269,60 @@ impl CorrelationTracker {
             )
             .is_err()
         {
-            return false;
+            return None;
         }
-
-        // We now exclusively own the slot (WRITING). Reject a response whose
-        // full correlation id does not match the request currently occupying
-        // this slot: `id` and `id + 8192*k` share a slot index, so a stale or
-        // delayed response for a recycled id must not complete a *different*
-        // in-flight request. Restore the WAITING state so the genuine owner is
-        // still completed by its own response.
         if slot_ref.id.load(Ordering::Relaxed) != correlation_id {
             slot_ref.state.store(SLOT_WAITING, Ordering::Release);
-            return false;
+            return None;
         }
+        Some(slot_ref)
+    }
 
+    /// Publish a claimed slot's outcome as READY and wake its waiter.
+    fn publish_outcome(slot_ref: &PendingResponseSlot, outcome: CorrelationOutcome) {
+        unsafe {
+            (*slot_ref.response.get()).write(outcome);
+        }
+        slot_ref.state.store(SLOT_READY, Ordering::Release);
+        slot_ref.waker.wake();
+    }
+
+    /// Complete a pending request with a response.
+    ///
+    /// Returns true when the response was consumed and published.
+    pub(crate) fn complete(
+        &self,
+        correlation_id: u32,
+        response: &mut Option<crate::AlignedBytes>,
+    ) -> bool {
+        let Some(slot_ref) = self.claim_slot_for_completion(correlation_id) else {
+            return false;
+        };
         let Some(response) = response.take() else {
             slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
             slot_ref.waker.wake();
             return false;
         };
+        Self::publish_outcome(slot_ref, CorrelationOutcome::Response(response));
+        true
+    }
 
-        // Store response, then publish READY
-        unsafe {
-            (*slot_ref.response.get()).write(response);
-        }
-        slot_ref.state.store(SLOT_READY, Ordering::Release);
-        slot_ref.waker.wake();
+    /// Complete a pending request with a NACK: the peer received the ask and
+    /// explicitly declined or failed to answer it. Mirrors `complete`, so a
+    /// waiter parked in `wait_for_response`/`wait_for_response_no_timeout`
+    /// resolves immediately with `Err(GossipError::AskNacked(reason))`
+    /// instead of hanging until its timeout fires.
+    ///
+    /// Returns true when the NACK was consumed and published.
+    pub(crate) fn complete_nack(
+        &self,
+        correlation_id: u32,
+        reason: crate::framing::AskNackReason,
+    ) -> bool {
+        let Some(slot_ref) = self.claim_slot_for_completion(correlation_id) else {
+            return false;
+        };
+        Self::publish_outcome(slot_ref, CorrelationOutcome::Nack(reason));
         true
     }
 
@@ -408,7 +454,9 @@ impl CorrelationTracker {
             // If the slot was cancelled (e.g. connection dropped and cancel_all() ran),
             // return a concrete error instead of waiting forever.
             match Self::try_take_ready(slot_ref, correlation_id) {
-                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::Taken(outcome) => {
+                    return std::task::Poll::Ready(outcome.into_result());
+                }
                 ReadyTake::ForeignReady => {
                     return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
                 }
@@ -428,7 +476,9 @@ impl CorrelationTracker {
             }
 
             match Self::try_take_ready(slot_ref, correlation_id) {
-                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::Taken(outcome) => {
+                    return std::task::Poll::Ready(outcome.into_result());
+                }
                 ReadyTake::ForeignReady => {
                     return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
                 }
@@ -468,7 +518,7 @@ impl CorrelationTracker {
                     }
                 }
                 match Self::try_take_ready(slot_ref, correlation_id) {
-                    ReadyTake::Taken(response) => return Ok(response),
+                    ReadyTake::Taken(outcome) => return outcome.into_result(),
                     ReadyTake::ForeignReady => return Err(crate::GossipError::ConnectionDropped),
                     ReadyTake::NotReady => {}
                 }
@@ -490,7 +540,9 @@ impl CorrelationTracker {
 
         futures::future::poll_fn(|cx| {
             match Self::try_take_ready(slot_ref, correlation_id) {
-                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::Taken(outcome) => {
+                    return std::task::Poll::Ready(outcome.into_result());
+                }
                 ReadyTake::ForeignReady => {
                     return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
                 }
@@ -508,7 +560,9 @@ impl CorrelationTracker {
                 return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
             }
             match Self::try_take_ready(slot_ref, correlation_id) {
-                ReadyTake::Taken(response) => return std::task::Poll::Ready(Ok(response)),
+                ReadyTake::Taken(outcome) => {
+                    return std::task::Poll::Ready(outcome.into_result());
+                }
                 ReadyTake::ForeignReady => {
                     return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
                 }
@@ -600,13 +654,47 @@ mod correlation_tests {
 
     use super::*;
 
-    /// Unwrap a `ReadyTake::Taken`, panicking otherwise (test helper).
+    /// Unwrap a `ReadyTake::Taken` holding a real response, panicking
+    /// otherwise (test helper).
     fn expect_taken(take: ReadyTake, msg: &str) -> crate::AlignedBytes {
         match take {
-            ReadyTake::Taken(response) => response,
+            ReadyTake::Taken(CorrelationOutcome::Response(response)) => response,
+            ReadyTake::Taken(CorrelationOutcome::Nack(reason)) => {
+                panic!("{msg}: slot held a NACK ({reason}), not a response")
+            }
             ReadyTake::NotReady => panic!("{msg}: slot was not READY (NotReady)"),
             ReadyTake::ForeignReady => panic!("{msg}: slot held a foreign id (ForeignReady)"),
         }
+    }
+
+    /// A NACK must reach the waiter as an immediate typed error, not a
+    /// timeout: `complete_nack` publishes the slot exactly like `complete`
+    /// does for a real payload, but `wait_for_response` translates it into
+    /// `Err(GossipError::AskNacked(reason))` instead of `Ok(bytes)`.
+    #[tokio::test]
+    async fn complete_nack_delivers_a_typed_error_instead_of_a_timeout() {
+        let tracker = CorrelationTracker::new();
+        let guard = tracker.allocate().expect("slot should allocate");
+        let id = guard.id();
+
+        assert!(tracker.complete_nack(id, crate::framing::AskNackReason::UnknownActor));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tracker.wait_for_response_no_timeout(id),
+        )
+        .await
+        .expect("a NACK must resolve immediately, not hang until the timeout fires");
+
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::GossipError::AskNacked(
+                    crate::framing::AskNackReason::UnknownActor
+                ))
+            ),
+            "expected an immediate typed NACK error, got {outcome:?}"
+        );
     }
 
     #[test]

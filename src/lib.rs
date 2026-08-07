@@ -1324,11 +1324,32 @@ pub enum GossipError {
 
     #[error("correlation tracker exhausted: all slots in use (slot leak suspected)")]
     CorrelationTrackerExhausted,
+
+    /// The peer answered an ask with an explicit NACK instead of data: it
+    /// received the request but could not or would not produce a response.
+    /// Delivered to the waiter immediately through the correlation tracker,
+    /// so an unanswerable ask fails fast instead of burning its timeout.
+    #[error("ask was not answered: {0}")]
+    AskNacked(crate::framing::AskNackReason),
 }
 
 impl From<crate::connection_pool::NoFreeSlots> for GossipError {
     fn from(_: crate::connection_pool::NoFreeSlots) -> Self {
         GossipError::CorrelationTrackerExhausted
+    }
+}
+
+impl GossipError {
+    /// Map a dispatch failure to the machine-readable reason an ask NACK
+    /// carries back to the waiter. `ActorNotFound` and an explicit
+    /// `AskNacked` (an `AskDisposition::Nack` the handler chose) keep their
+    /// specific reason; anything else is a generic handler error.
+    pub(crate) fn ask_nack_reason(&self) -> crate::framing::AskNackReason {
+        match self {
+            GossipError::ActorNotFound(_) => crate::framing::AskNackReason::UnknownActor,
+            GossipError::AskNacked(reason) => *reason,
+            _ => crate::framing::AskNackReason::HandlerError,
+        }
     }
 }
 
@@ -1457,6 +1478,9 @@ mod tests {
 
         let err = GossipError::ActorAlreadyExists("test_actor".to_string());
         assert_eq!(err.to_string(), "actor 'test_actor' already exists");
+
+        let err = GossipError::AskNacked(crate::framing::AskNackReason::UnknownActor);
+        assert_eq!(err.to_string(), "ask was not answered: unknown actor");
     }
 
     #[test]

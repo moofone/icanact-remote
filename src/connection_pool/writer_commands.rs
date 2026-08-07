@@ -293,7 +293,28 @@ struct LocalStreamingQueue {
     /// `pop_front` promotes this batch.
     deferred: Option<Vec<StreamingCommand>>,
     deferred_bytes: usize,
+    /// Backpressure NACKs owed to the peer, queued here instead of written
+    /// directly. The caller that decides to NACK (deep inside
+    /// `write_ask_disposition_io`, or the pre-dispatch gate in
+    /// `stream_writer.rs::io_task`) cannot know whether a partial streaming
+    /// frame currently owns the wire -- `io_task` is the only place that
+    /// does. Writing there instead of here would risk splicing the NACK's
+    /// bytes into an in-progress frame's payload and desynchronizing every
+    /// frame after it (the same class of bug #183 fixed for
+    /// `WritePayload::Buf`). `io_task` drains this queue only once
+    /// `pending_stream_cmd.is_none()` proves the wire is free. See
+    /// `queue_ask_nack`.
+    pending_ask_nacks:
+        std::collections::VecDeque<[u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]>,
 }
+
+/// Cap on queued-but-not-yet-written backpressure NACKs. Each entry is a
+/// fixed 16-byte header with no payload -- unlike a streaming response, it
+/// never contributes to `retained_bytes`/admission accounting -- so this
+/// bounds a small, fixed footprint (at most `PENDING_ASK_NACK_CAP * 16`
+/// bytes) regardless of how many asks arrive while a streaming frame owns
+/// the wire.
+const PENDING_ASK_NACK_CAP: usize = 64;
 
 /// Keep the local response queue within the normal response-batch cap while
 /// allowing one protocol-sized stream to be retained behind an in-flight
@@ -335,7 +356,64 @@ impl LocalStreamingQueue {
             deferred: None,
             deferred_bytes: 0,
             wire_blocked: false,
+            pending_ask_nacks: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Queue a backpressure NACK header for the peer. Always succeeds --
+    /// never blocks, never fails, never consults `is_full`/response
+    /// admission at all, since a fixed 16-byte header cannot meaningfully
+    /// threaten the retention bound those exist to enforce.
+    ///
+    /// Never evicts an already-queued entry to make room for a new one:
+    /// that header is the *only* remaining record that a specific,
+    /// already-consumed ask exists at all. Dropping it silently loses that
+    /// ask's terminal outcome -- no reply, no NACK, just a correlation id
+    /// the requester eventually times out waiting on. That is exactly the
+    /// failure this whole NACK mechanism exists to remove; reintroducing it
+    /// one layer down, inside the queue built to prevent it, defeats the
+    /// point. Bounding growth is the read side's job instead: `io_task`'s
+    /// read-batch loops gate further reads on `has_room_for_ask_nack` (see
+    /// that method), so this is structurally never called while the queue
+    /// is already at `PENDING_ASK_NACK_CAP` -- growth stops at the source
+    /// of new entries, not by discarding existing ones.
+    fn queue_ask_nack(&mut self, header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]) {
+        self.pending_ask_nacks.push_back(header);
+    }
+
+    /// Whether the queue has room for one more NACK without exceeding
+    /// `PENDING_ASK_NACK_CAP`. `io_task`'s read-batch loops must stop
+    /// admitting further reads once this is `false` and let a drain turn
+    /// run first (`drain_pending_ask_nacks`, gated on
+    /// `pending_stream_cmd.is_none()`) -- this is what keeps
+    /// `queue_ask_nack` itself able to stay unconditional: as long as every
+    /// caller that could add an entry checks this first, the queue can
+    /// never be asked to hold more than its cap, so it never has to choose
+    /// what to discard.
+    fn has_room_for_ask_nack(&self) -> bool {
+        self.pending_ask_nacks.len() < PENDING_ASK_NACK_CAP
+    }
+
+    /// Pop the oldest queued NACK header for `io_task` to attempt writing.
+    /// Callers must only do so when `pending_stream_cmd.is_none()`; see
+    /// `queue_ask_nack`.
+    fn pop_ask_nack(&mut self) -> Option<[u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]> {
+        self.pending_ask_nacks.pop_front()
+    }
+
+    /// Whether any backpressure NACK is still queued and unwritten.
+    /// `drain_pending_ask_nacks` consults this after every attempt so its
+    /// caller (`io_task`) can tell outstanding NACK work from a genuinely
+    /// idle turn -- `pending_ask_nacks` is deliberately not part of
+    /// `has_pending`, since that governs streaming-source selection, not
+    /// wakeup/park eligibility.
+    fn has_pending_ask_nacks(&self) -> bool {
+        !self.pending_ask_nacks.is_empty()
+    }
+
+    #[cfg(test)]
+    fn pending_ask_nack_count(&self) -> usize {
+        self.pending_ask_nacks.len()
     }
 
     fn pop_front(&mut self) -> Option<StreamingCommand> {

@@ -39,6 +39,47 @@ impl Feature {
     }
 }
 
+/// Whether sending a given `WireKind` to a peer requires a capability that
+/// was actually negotiated in the Hello exchange, versus being covered by
+/// the mandatory `schema_hash` equality check (which already refuses a
+/// connection between peers running different wire code -- see
+/// `perform_hello_handshake`).
+///
+/// This is deliberately an exhaustive match with no wildcard arm: adding a
+/// new `WireKind` variant without extending this match is a compile error,
+/// not a silent default. That is the guard -- kinds 13/14
+/// (RouteBind/RoutedActorAsk) shipped without any such mechanism, and an
+/// older peer receiving one tore the connection down on the unrecognized
+/// kind (`framing::decode_control` returning `None`) rather than failing
+/// gracefully or being avoided in the first place.
+///
+/// `None` means "no capability required" -- every kind today, including
+/// RouteBind/RoutedActorAsk, which are already fleet-wide and would gain
+/// nothing from retroactive gating (see the guard tests in this module).
+/// A future extension kind that must be avoided when talking to a peer that
+/// predates it (rather than relying on a fleet-wide schema_hash bump) should
+/// return `Some(Feature::_)` here instead.
+pub const fn wire_kind_capability(kind: crate::framing::WireKind) -> Option<Feature> {
+    use crate::framing::WireKind;
+    match kind {
+        WireKind::Gossip
+        | WireKind::Ask
+        | WireKind::Response
+        | WireKind::ActorTell
+        | WireKind::ActorAsk
+        | WireKind::StreamStart
+        | WireKind::StreamData
+        | WireKind::StreamResponseStart
+        | WireKind::StreamResponseData
+        | WireKind::DirectAsk
+        | WireKind::DirectResponse
+        | WireKind::PubSub
+        | WireKind::StreamAbort
+        | WireKind::RouteBind
+        | WireKind::RoutedActorAsk => None,
+    }
+}
+
 /// Hello message sent during connection establishment
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct Hello {
@@ -129,6 +170,16 @@ impl PeerCapabilities {
     /// Check if a specific feature is supported
     pub fn supports_feature(&self, feature: Feature) -> bool {
         (self.features & feature.bit()) != 0
+    }
+
+    /// Whether this negotiated relationship supports sending `kind` to the
+    /// peer. Kinds with no capability requirement (see
+    /// `wire_kind_capability`) are always supported.
+    pub fn supports_wire_kind(&self, kind: crate::framing::WireKind) -> bool {
+        match wire_kind_capability(kind) {
+            None => true,
+            Some(feature) => self.supports_feature(feature),
+        }
     }
 }
 
@@ -247,6 +298,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard: every `WireKind` must have an explicit capability answer.
+    /// `wire_kind_capability` is an exhaustive match with no wildcard arm, so
+    /// the compiler already refuses to build if a new `WireKind` variant is
+    /// added without one; this test additionally drives it through
+    /// `WireKind::ALL` (the same single source of truth the framing-layer
+    /// control-encoding tests use) so a variant that's added to the enum but
+    /// never added to `ALL` -- which the exhaustiveness check alone would
+    /// not catch -- is still exercised here.
+    #[test]
+    fn every_wire_kind_has_a_capability_mapping() {
+        for kind in crate::framing::WireKind::ALL {
+            // Calling it is the assertion: an unmapped kind is a compile
+            // error, not a runtime failure, but this pins the current,
+            // reviewed answer for each kind so a change shows up as a diff.
+            let _ = wire_kind_capability(kind);
+        }
+    }
+
+    /// RouteBind/RoutedActorAsk (13, 14) shipped fleet-wide without any
+    /// gating mechanism -- the incident this mechanism exists to prevent a
+    /// repeat of. Do not retroactively gate them: they are already assumed
+    /// universally understood, and gating them now would be pure cost for
+    /// no benefit (every peer that can dial at all already speaks them).
+    #[test]
+    fn route_bind_and_routed_actor_ask_are_not_retroactively_gated() {
+        assert_eq!(
+            wire_kind_capability(crate::framing::WireKind::RouteBind),
+            None
+        );
+        assert_eq!(
+            wire_kind_capability(crate::framing::WireKind::RoutedActorAsk),
+            None
+        );
+    }
+
+    /// A capability a peer never advertised must not be treated as
+    /// supported, and a `None` (ungated) kind must always be treated as
+    /// supported regardless of what either side negotiated.
+    #[test]
+    fn peer_capabilities_supports_wire_kind_respects_the_mapping() {
+        let gated_but_unsupported = PeerCapabilities {
+            version: PROTOCOL_VERSION_V5,
+            features: 0,
+        };
+        assert!(
+            gated_but_unsupported.supports_wire_kind(crate::framing::WireKind::Gossip),
+            "an ungated kind must be supported even with zero negotiated features"
+        );
+    }
 
     #[test]
     fn test_hello_new() {

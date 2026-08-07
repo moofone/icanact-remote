@@ -71,6 +71,161 @@ where
     Ok(result)
 }
 
+/// Bound on a single attempt to write an ask-backpressure NACK header (see
+/// `write_ask_nack_header_bounded`). The `io_task` read loop that calls
+/// this owns the connection's socket read side too, so a write that parks
+/// indefinitely on a peer that has stopped draining would park reads with
+/// it -- exactly the shape of deadlock `icanact-remote#186` closes for the
+/// streaming slice writer. A NACK is best-effort, not a delivery guarantee,
+/// so unlike a streaming response frame it can simply be abandoned once an
+/// attempt makes zero progress rather than retried forever.
+const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// See `STREAM_WRITE_SLICE_TIMEOUT`. Only reached once a NACK write has
+/// already committed some bytes to the wire (so it can no longer be
+/// abandoned without corrupting later frames on this connection) and then
+/// stalls -- the backstop for a peer that is truly gone, not merely slow.
+const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
+
+/// Write one already-built ask-NACK header without risking parking the
+/// caller's read loop on a peer that has stopped draining. A plain
+/// `write_all` is the wrong shape for this: it loops over as many
+/// `poll_write` calls as it takes and is therefore unsafe to cancel -- a
+/// timeout firing between two of those internal polls would abandon a
+/// *partially written* frame, corrupting wire framing for every later frame
+/// on this connection (this is exactly the mistake the read path's earlier,
+/// now-deleted `write_ask_nack_direct` made -- see the review history on
+/// `icanact-remote#186`). `write_vectored_once` instead performs
+/// exactly one `poll_write` cycle per call, so each attempt here is
+/// individually safe to bound with `STREAM_WRITE_SLICE_TIMEOUT` -- per the
+/// `AsyncWrite` contract, a `Pending` result never writes a partial byte, so
+/// a timeout before any byte of the header has gone out (`offset == 0`) can
+/// always be abandoned cleanly: nothing was committed to the wire, and the
+/// peer simply times out on this ask instead of getting a fast NACK. Once
+/// any byte of the header *has* gone out, the frame is underway and can no
+/// longer be abandoned safely, so from that point this retries with the same
+/// per-attempt bound until either it completes or `STREAM_WRITE_STUCK_TEARDOWN`
+/// elapses with zero further progress, at which point the caller tears the
+/// connection down rather than leaving it wedged mid-frame forever.
+///
+/// Does **not** decide *when* it is safe to call: that is
+/// `drain_pending_ask_nacks`'s job (only ever called while
+/// `pending_stream_cmd.is_none()`, so no partial streaming frame owns the
+/// wire). Writing here unconditionally would let this NACK's bytes splice
+/// into an in-progress frame's payload and desynchronize every frame after
+/// it -- the same class of bug #183 fixed for `WritePayload::Buf`.
+///
+/// Returns `Ok(true)` if the NACK was written, `Ok(false)` if it was
+/// abandoned cleanly before committing any bytes (the caller should keep
+/// reading either way -- an ask NACK is best-effort, not a delivery
+/// guarantee), or `Err` on a real write error or a stuck mid-frame write
+/// (the caller should tear the connection down, same as any other write
+/// failure in this file).
+async fn write_ask_nack_header_bounded<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+) -> std::io::Result<bool>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut offset = 0usize;
+    let mut stuck_since: Option<Instant> = None;
+    loop {
+        match tokio::time::timeout(
+            STREAM_WRITE_SLICE_TIMEOUT,
+            write_vectored_once(stream, &[std::io::IoSlice::new(&header[offset..])]),
+        )
+        .await
+        {
+            // `write_vectored_once` already folds a real zero-byte write
+            // into `Err(WriteZero)` before returning, so this arm is
+            // unreachable through that call path today. Checked locally
+            // anyway rather than relying on that callee detail: `offset`
+            // is nonempty-until-completion here, so `n == 0` taking this
+            // branch would add nothing, never reach `offset >=
+            // header.len()`, and reset `stuck_since` -- clearing the one
+            // signal that would otherwise let the stuck-mid-frame teardown
+            // timer above ever fire, letting a conforming `AsyncWrite`
+            // that starts returning `Ok(0)` pin this loop in a CPU-burning
+            // spin with no `Pending` and no timeout in between. Same class
+            // of bug R4 fixed for `OwnedChunks`' raw unwrapped-write tail.
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "ask NACK write made no progress",
+                ));
+            }
+            Ok(Ok(n)) => {
+                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                *bytes_since_flush += n;
+                offset += n;
+                if offset >= header.len() {
+                    return Ok(true);
+                }
+                stuck_since = None;
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                if offset == 0 {
+                    return Ok(false);
+                }
+                let wedged_since = *stuck_since.get_or_insert_with(Instant::now);
+                if wedged_since.elapsed() >= STREAM_WRITE_STUCK_TEARDOWN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ask backpressure NACK write stuck mid-frame",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Drain `LocalStreamingQueue`'s queued backpressure NACKs onto the wire.
+/// **Callers must only invoke this while `pending_stream_cmd.is_none()`** --
+/// see `write_ask_nack_header_bounded` and `LocalStreamingQueue::queue_ask_nack`
+/// for why writing during a partial frame would corrupt it. Bounded to a
+/// small burst per call (`MAX_PER_TURN`) so a backlog of queued NACKs cannot
+/// starve the read loop's return to reading; the rest wait for a later call.
+/// Stops (without error) at the first attempt that makes zero progress --
+/// likely the socket itself has no room right now, so further attempts this
+/// turn would just burn through more `STREAM_WRITE_SLICE_TIMEOUT` waits for
+/// the same result. That specific queued NACK is lost (best-effort, not a
+/// delivery guarantee, per `queue_ask_nack`); the rest stay queued for next
+/// time.
+///
+/// Returns `Ok(true)` if any NACK remains queued once this call returns --
+/// either the `MAX_PER_TURN` cap was hit with the queue still non-empty, or
+/// the zero-progress stop left entries behind it. The caller must treat that
+/// as outstanding work (e.g. `did_work = true`) rather than letting the turn
+/// look idle: `pending_ask_nacks` is not visible to `has_pending` or the
+/// pre-park checks, so nothing else would prevent the I/O task from parking
+/// with a NACK still owed to a peer.
+async fn drain_pending_ask_nacks<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    local_streaming_queue: &mut LocalStreamingQueue,
+) -> std::io::Result<bool>
+where
+    S: AsyncWrite + Unpin,
+{
+    const MAX_PER_TURN: usize = 8;
+    for _ in 0..MAX_PER_TURN {
+        let Some(header) = local_streaming_queue.pop_ask_nack() else {
+            return Ok(false);
+        };
+        if !write_ask_nack_header_bounded(stream, bytes_written_counter, bytes_since_flush, header)
+            .await?
+        {
+            return Ok(local_streaming_queue.has_pending_ask_nacks());
+        }
+    }
+    Ok(local_streaming_queue.has_pending_ask_nacks())
+}
+
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
 /// frame-boundary yield lets the scheduler interleave another streaming source
 /// without materializing the remaining response into per-frame commands.
@@ -1222,6 +1377,36 @@ impl LockFreeStreamHandle {
             // still run below, but no normal/response write can interleave and
             // corrupt the frame boundary.
             if pending_stream_cmd.is_none() {
+                // Queued backpressure NACKs (see `LocalStreamingQueue::queue_ask_nack`)
+                // are only ever safe to write here, now that the wire is
+                // proven free of a partial frame.
+                match drain_pending_ask_nacks(
+                    &mut stream,
+                    &bytes_written_counter,
+                    &mut bytes_since_flush,
+                    &mut local_streaming_queue,
+                )
+                .await
+                {
+                    // Entries survived the bounded per-turn drain: treat this
+                    // turn as having done work so the loop revisits the top
+                    // (and this drain) again instead of falling into the
+                    // `!did_work` pre-park/idle-select path below with a NACK
+                    // still queued and no other event left to wake it.
+                    Ok(more_pending) => {
+                        if more_pending {
+                            did_work = true;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                            error = %e,
+                            "Failed to drain queued ask backpressure NACKs"
+                        );
+                        return;
+                    }
+                }
                 // ACTOR_REM_2 R8: service the normal write queue when no partial
                 // stream frame is outstanding. The batch remains bounded during
                 // active streaming so control traffic is not starved.
@@ -2011,6 +2196,16 @@ impl LockFreeStreamHandle {
                     let mut read_batch_limit = READ_BATCH_LIMIT;
                     while reads < read_batch_limit
                         && !local_streaming_queue.is_full()
+                        // A read that dispatches to an unknown actor, a
+                        // missing handler, or backpressure can queue a NACK
+                        // (`LocalStreamingQueue::queue_ask_nack`). Admitting
+                        // reads past the point where that queue has no more
+                        // room would force it to either evict an
+                        // already-consumed ask's only remaining record
+                        // (silently losing its terminal outcome) or grow
+                        // without bound; stopping here instead lets the
+                        // drain at the top of the next turn make room first.
+                        && local_streaming_queue.has_room_for_ask_nack()
                         && (pending_stream_cmd.is_none()
                             || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                 && direct_response_batch.total_bytes()
@@ -2332,6 +2527,9 @@ impl LockFreeStreamHandle {
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
                             while drained < drain_batch_limit
                                 && !local_streaming_queue.is_full()
+                                // See the identical check in the primary
+                                // drain loop above.
+                                && local_streaming_queue.has_room_for_ask_nack()
                                 && (pending_stream_cmd.is_none()
                                     || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                         && direct_response_batch.total_bytes()
@@ -5813,7 +6011,7 @@ mod write_payload_length_mismatch_tests {
     #[tokio::test]
     async fn direct_ask_inline_actual_longer_than_declared_is_rejected() {
         let (writer, task) = make_writer(9983);
-        let header = crate::framing::try_write_direct_ask_header(1, 8).unwrap();
+        let header = crate::framing::try_write_direct_ask_header(1, 1, 8).unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 100]);
         let err = writer
             .write_direct_ask_inline(header, payload)
@@ -5827,7 +6025,7 @@ mod write_payload_length_mismatch_tests {
     #[tokio::test]
     async fn direct_ask_inline_actual_shorter_than_declared_is_rejected() {
         let (writer, task) = make_writer(9984);
-        let header = crate::framing::try_write_direct_ask_header(1, 100).unwrap();
+        let header = crate::framing::try_write_direct_ask_header(1, 1, 100).unwrap();
         let payload = bytes::Bytes::from(vec![0u8; 8]);
         let err = writer
             .write_direct_ask_inline(header, payload)

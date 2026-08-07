@@ -21,7 +21,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tracing::trace;
 use tracing::{debug, error, info, warn};
 
-#[cfg(any(test, feature = "test-helpers", debug_assertions))]
+#[cfg(any(test, feature = "test-helpers"))]
 use sha2::{Digest, Sha256};
 
 use crate::{

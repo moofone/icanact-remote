@@ -652,6 +652,13 @@ fn test_remote_actor_ref_debug_output() {
     });
 }
 
+/// Uses a raw `.ask()`, which has no actor_id/type_hash to route to and so
+/// depends on the test/benchmark-only command processor
+/// (`handle::handle_raw_ask_request`, gated on `cfg(any(test, feature =
+/// "test-helpers"))`). CI runs `cargo test --all-features`, which enables
+/// it; run locally with `cargo test --features test-helpers` to include
+/// this test.
+#[cfg(feature = "test-helpers")]
 async fn test_remote_actor_ref_with_timeout_inner() {
     maybe_init_tracing();
 
@@ -717,6 +724,7 @@ async fn test_remote_actor_ref_with_timeout_inner() {
     handle_b.shutdown().await;
 }
 
+#[cfg(feature = "test-helpers")]
 #[test]
 fn test_remote_actor_ref_with_timeout() {
     run_remote_actor_ref_test("with-timeout", || {

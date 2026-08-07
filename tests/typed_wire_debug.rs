@@ -1,4 +1,6 @@
-#[cfg(debug_assertions)]
+// The type-hash prefix (and its verification) is unconditional in every
+// build mode -- see typed::encode_typed -- so these round-trip checks are no
+// longer debug-only and must also run under `cargo test --release`.
 mod tests {
     use bytes::Buf;
     use icanact_remote::{decode_typed, typed, wire_type};
@@ -40,7 +42,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_hash_mismatch_errors_in_debug() {
+    fn typed_hash_mismatch_errors() {
         let msg = Ping { id: 42 };
         let payload = encode_wire_bytes(&msg);
         let err = decode_typed::<Pong>(payload.as_ref()).unwrap_err();

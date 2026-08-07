@@ -1,3 +1,12 @@
+//! A raw `.ask()` has no actor_id/type_hash to route to, so it has no
+//! production dispatcher; both tests in this file exercise the
+//! test/benchmark-only ECHO:/... command processor
+//! (`handle::handle_raw_ask_request`, gated on `cfg(any(test, feature =
+//! "test-helpers"))`), not a registered actor. CI runs `cargo test
+//! --all-features`, which enables it; run locally with `cargo test
+//! --features test-helpers` to include this file.
+#![cfg(feature = "test-helpers")]
+
 use icanact_remote::*;
 use std::future::Future;
 use std::sync::OnceLock;

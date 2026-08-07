@@ -391,6 +391,11 @@ pub enum AskDisposition {
         payload_len: usize,
     },
     Deferred,
+    /// The handler ran and explicitly declined to answer with data (as
+    /// opposed to `Deferred`, which answers later out-of-band). Delivered to
+    /// the asker as an immediate typed error
+    /// (`GossipError::AskNacked(reason)`) instead of a payload.
+    Nack(crate::framing::AskNackReason),
 }
 
 #[derive(Clone)]
@@ -2258,7 +2263,8 @@ impl<T: 'static> GossipRegistry<T> {
             .map(|address| {
                 (
                     *address,
-                    self.pending_clock_echoes.read_sync(address, |_, echo| *echo),
+                    self.pending_clock_echoes
+                        .read_sync(address, |_, echo| *echo),
                 )
             })
             .collect();
@@ -2283,22 +2289,24 @@ impl<T: 'static> GossipRegistry<T> {
         let pool = peer_ids
             .iter()
             .flat_map(|peer_id| {
-                addresses.iter().map(move |address| InboundPoolProjectionSnapshot {
-                    peer_id: peer_id.clone(),
-                    peer_route: self.connection_pool.get_configured_peer_addr(peer_id),
-                    peer_connection: self
-                        .connection_pool
-                        .peer_current_connection_snapshot(peer_id),
-                    addr: *address,
-                    addr_route: self
-                        .connection_pool
-                        .addr_to_peer_id
-                        .read_sync(address, |_, owner| owner.clone()),
-                    addr_connection: self
-                        .connection_pool
-                        .connections_by_addr
-                        .read_sync(address, |_, connection| connection.clone()),
-                })
+                addresses
+                    .iter()
+                    .map(move |address| InboundPoolProjectionSnapshot {
+                        peer_id: peer_id.clone(),
+                        peer_route: self.connection_pool.get_configured_peer_addr(peer_id),
+                        peer_connection: self
+                            .connection_pool
+                            .peer_current_connection_snapshot(peer_id),
+                        addr: *address,
+                        addr_route: self
+                            .connection_pool
+                            .addr_to_peer_id
+                            .read_sync(address, |_, owner| owner.clone()),
+                        addr_connection: self
+                            .connection_pool
+                            .connections_by_addr
+                            .read_sync(address, |_, connection| connection.clone()),
+                    })
             })
             .collect();
 
@@ -2339,11 +2347,8 @@ impl<T: 'static> GossipRegistry<T> {
                 return false;
             }
 
-            let current_admission_names = state
-                .peer_to_actors
-                .get(&addr)
-                .cloned()
-                .unwrap_or_default();
+            let current_admission_names =
+                state.peer_to_actors.get(&addr).cloned().unwrap_or_default();
 
             match snapshot.peer.clone() {
                 Some(peer) => {
@@ -2439,9 +2444,7 @@ impl<T: 'static> GossipRegistry<T> {
         for (node_id, caps) in &snapshot.capabilities_by_node {
             match caps {
                 Some(caps) => {
-                    let _ = self
-                        .peer_capabilities_by_node
-                        .upsert_sync(*node_id, *caps);
+                    let _ = self.peer_capabilities_by_node.upsert_sync(*node_id, *caps);
                 }
                 None => {
                     let _ = self.peer_capabilities_by_node.remove_sync(node_id);
@@ -2492,10 +2495,10 @@ impl<T: 'static> GossipRegistry<T> {
                     .connection_pool
                     .set_discovered_peer_addr(&projection.peer_id, *route),
                 None => {
-                    let _ = self.connection_pool.peer_id_to_addr.remove_if_sync(
-                        &projection.peer_id,
-                        |current| *current == projection.addr,
-                    );
+                    let _ = self
+                        .connection_pool
+                        .peer_id_to_addr
+                        .remove_if_sync(&projection.peer_id, |current| *current == projection.addr);
                 }
             }
             if let Some(connection) = &projection.peer_connection {
@@ -2512,10 +2515,10 @@ impl<T: 'static> GossipRegistry<T> {
                         .upsert_sync(projection.addr, owner.clone());
                 }
                 None => {
-                    let _ = self.connection_pool.addr_to_peer_id.remove_if_sync(
-                        &projection.addr,
-                        |owner| owner == &projection.peer_id,
-                    );
+                    let _ = self
+                        .connection_pool
+                        .addr_to_peer_id
+                        .remove_if_sync(&projection.addr, |owner| owner == &projection.peer_id);
                 }
             }
             match &projection.addr_connection {
@@ -2526,12 +2529,12 @@ impl<T: 'static> GossipRegistry<T> {
                         .upsert_sync(projection.addr, connection.clone());
                 }
                 None => {
-                    let _ = self
-                        .connection_pool
-                        .connections_by_addr
-                        .remove_if_sync(&projection.addr, |connection| {
+                    let _ = self.connection_pool.connections_by_addr.remove_if_sync(
+                        &projection.addr,
+                        |connection| {
                             connection.embedded_peer_id.as_ref() == Some(&projection.peer_id)
-                        });
+                        },
+                    );
                 }
             }
         }
@@ -3140,11 +3143,23 @@ impl<T: 'static> GossipRegistry<T> {
             cell.handler
                 .handle_actor_message(actor_id, type_hash, payload, correlation_id)
                 .await
+        } else if let Some(correlation_id) = correlation_id {
+            // Nothing is wired up to answer this ask at all -- distinct from a
+            // handler that ran and chose not to reply yet (AskDisposition::Deferred,
+            // which never reaches this fallback). Fail closed so the waiter gets
+            // an immediate NACK instead of silently timing out.
+            warn!(
+                actor_id = actor_id,
+                type_hash = type_hash,
+                correlation_id = correlation_id,
+                "no actor message handler registered - NACKing ask"
+            );
+            Err(GossipError::ActorNotFound(actor_id.to_string()))
         } else {
             warn!(
                 actor_id = actor_id,
                 type_hash = type_hash,
-                "no actor message handler registered - message dropped"
+                "no actor message handler registered - tell dropped"
             );
             Ok(None)
         }
@@ -3378,11 +3393,7 @@ impl<T: 'static> GossipRegistry<T> {
             .get_required_peer_addr(&peer_id)
             .is_some_and(|configured| configured == peer_addr);
         let (outcome, receipt) = self
-            .add_peer_with_node_id_generation(
-                peer_addr,
-                Some(peer_id.to_node_id()),
-                claim_kind,
-            )
+            .add_peer_with_node_id_generation(peer_addr, Some(peer_id.to_node_id()), claim_kind)
             .await;
         if outcome == crate::addr_ownership::AddrClaimOutcome::Accepted
             && !persistent
@@ -3406,10 +3417,8 @@ impl<T: 'static> GossipRegistry<T> {
                     .connection_scoped_claims
                     .upsert_sync(key, receipt.generation());
             }
-            self.connection_scoped_claims.upsert_sync(
-                (peer_id, session_source, peer_addr),
-                receipt.generation(),
-            );
+            self.connection_scoped_claims
+                .upsert_sync((peer_id, session_source, peer_addr), receipt.generation());
             return (outcome, Some(receipt));
         }
         (outcome, receipt)
@@ -12010,6 +12019,28 @@ mod tests {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         assert_eq!(registry.bind_addr, test_addr(8080));
         assert!(!registry.is_shutdown().await);
+    }
+
+    /// An ask against a fresh registry with no actor message handler wired up
+    /// at all must fail closed with a machine-readable error the caller can
+    /// distinguish from "the handler ran and returned no reply" (`Ok(None)`,
+    /// e.g. a legitimate `AskDisposition::Deferred`). Before this fix it
+    /// silently returned `Ok(None)`, which left an ask waiter to burn its
+    /// full timeout instead of getting an immediate NACK.
+    #[tokio::test]
+    async fn handle_actor_message_with_no_handler_registered_fails_closed_for_an_ask() {
+        let registry = GossipRegistry::<()>::new(test_addr(8081), test_config());
+        let pool = std::sync::Arc::new(crate::AlignedBytesPool::default());
+        let payload = crate::AlignedBytes::from_pooled_slice(b"ask payload", pool);
+
+        let result = registry.handle_actor_message(42, 7, payload, Some(1)).await;
+
+        match result {
+            Err(GossipError::ActorNotFound(_)) => {}
+            Ok(Some(_)) => panic!("expected Err(ActorNotFound), got a response payload"),
+            Ok(None) => panic!("expected Err(ActorNotFound), got Ok(None)"),
+            Err(other) => panic!("expected Err(ActorNotFound), got a different error: {other}"),
+        }
     }
 
     /// Audit finding A1: TLS server-cert GossipNodeId pinning is only enforced when
@@ -20906,8 +20937,7 @@ mod tests {
                 .actor_admissions_by_peer
                 .get(&unrelated)
                 .is_some_and(|names| {
-                    names.contains(&unrelated_actor)
-                        && names.contains("rollback/unrelated-new")
+                    names.contains(&unrelated_actor) && names.contains("rollback/unrelated-new")
                 }),
             "rollback must not replace another peer's concurrent admission updates"
         );

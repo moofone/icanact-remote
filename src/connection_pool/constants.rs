@@ -1097,7 +1097,16 @@ impl StreamingQueue {
     }
 }
 
-#[cfg(any(test, feature = "test-helpers", debug_assertions))]
+/// Test/benchmark scaffolding for a raw (unaddressed) `Ask`
+/// (`handle::handle_raw_ask_request`): recognizes a small set of ECHO:/
+/// REVERSE:/COUNT:/HASH: commands and otherwise acknowledges the byte count
+/// and raw content. A raw ask carries opaque bytes with no actor_id/
+/// type_hash, so there is no production dispatcher to route it to -- this
+/// exists purely so tests/benchmarks can exercise the raw-ask wire path
+/// without standing up a registered actor. Production answers
+/// `AskNackReason::NoDispatcher` instead; fabricating a transformed reply to
+/// a real caller would be worse than the timeout it replaced.
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn process_mock_request(request: &str) -> Vec<u8> {
     if let Some(payload) = request.strip_prefix("ECHO:") {
         return format!("ECHOED:{}", payload).into_bytes();
@@ -1119,7 +1128,11 @@ pub(crate) fn process_mock_request(request: &str) -> Vec<u8> {
     format!("RECEIVED:{} bytes, content: '{}'", request.len(), request).into_bytes()
 }
 
-#[cfg(any(test, feature = "test-helpers", debug_assertions))]
+/// Byte-oriented entry point for `process_mock_request`: a 4-byte payload is
+/// treated as a little protocol of its own (increment-and-echo, used by the
+/// realistic correlation benchmark), anything else is treated as UTF-8 and
+/// handed to `process_mock_request`.
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn process_mock_request_payload(payload: &[u8]) -> Vec<u8> {
     if payload.len() == 4 {
         let value = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);

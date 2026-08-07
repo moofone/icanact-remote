@@ -2,6 +2,7 @@ use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, wire_type};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "test-helpers")]
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::time::sleep;
@@ -60,6 +61,15 @@ struct Ping {
 
 wire_type!(Ping, "icanact.remote.PingTLS");
 
+/// `ask_typed` layers on a raw `.ask()`, which has no actor_id/type_hash to
+/// route to and so depends on the test/benchmark-only raw-ask processor
+/// (`handle::handle_raw_ask_request`, gated on `cfg(any(test, feature =
+/// "test-helpers"))`) -- here via `ICANACT_REMOTE_TYPED_ECHO`, which makes
+/// it echo the payload verbatim instead of running the ECHO:/REVERSE:/...
+/// command parser. CI runs `cargo test --all-features`, which enables it;
+/// run locally with `cargo test --features test-helpers` to include this
+/// test.
+#[cfg(feature = "test-helpers")]
 #[test]
 fn test_typed_ask_over_tls_with_pooled_path() {
     run_typed_tls_test("typed-ask-pooled", || async {
@@ -115,6 +125,9 @@ fn test_typed_ask_over_tls_with_pooled_path() {
     });
 }
 
+/// See `test_typed_ask_over_tls_with_pooled_path`'s doc: depends on the
+/// test/benchmark-only raw-ask processor via `ICANACT_REMOTE_TYPED_ECHO`.
+#[cfg(feature = "test-helpers")]
 #[test]
 fn test_typed_ask_archived_over_tls_with_pooled_path() {
     run_typed_tls_test("typed-ask-archived-pooled", || async {

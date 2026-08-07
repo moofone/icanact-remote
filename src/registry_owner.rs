@@ -979,7 +979,8 @@ mod tests {
             &pool, addr, &old_owner,
         );
         assert_eq!(
-            pool.addr_to_peer_id.read_sync(&addr, |_, owner| owner.clone()),
+            pool.addr_to_peer_id
+                .read_sync(&addr, |_, owner| owner.clone()),
             Some(current_owner.clone()),
             "a stale retract must not remove a newer route"
         );

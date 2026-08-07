@@ -54,6 +54,13 @@ where
     handle.join().expect("lookup API test panicked");
 }
 
+/// Uses a raw `.ask()`, which has no actor_id/type_hash to route to and so
+/// depends on the test/benchmark-only command processor
+/// (`handle::handle_raw_ask_request`, gated on `cfg(any(test, feature =
+/// "test-helpers"))`). CI runs `cargo test --all-features`, which enables
+/// it; run locally with `cargo test --features test-helpers` to include
+/// this test.
+#[cfg(feature = "test-helpers")]
 async fn test_new_lookup_api_returns_actor_ref_inner() {
     let config = GossipConfig {
         gossip_interval: Duration::from_secs(300),
@@ -167,6 +174,7 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
     handle_b.shutdown().await;
 }
 
+#[cfg(feature = "test-helpers")]
 #[test]
 fn test_new_lookup_api_returns_actor_ref() {
     run_lookup_api_test("returns-actor-ref", || {

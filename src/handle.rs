@@ -3733,6 +3733,17 @@ where
                 return ConnectionCloseOutcome::Normal { node_id: None };
             }
         }
+        Ok(MessageReadResult::AskNack { .. }) => {
+            if let Some(node_id) = known_node_id {
+                (node_id.to_peer_id().to_hex(), None, None)
+            } else {
+                warn!(
+                    peer_addr = %peer_addr,
+                    "AskNack arrived before peer GossipNodeId is known"
+                );
+                return ConnectionCloseOutcome::Normal { node_id: None };
+            }
+        }
         Ok(MessageReadResult::DirectAsk { correlation_id, .. }) => {
             if let Some(node_id) = known_node_id {
                 (node_id.to_peer_id().to_hex(), Some(*correlation_id), None)
@@ -4630,6 +4641,13 @@ pub(crate) enum MessageReadResult {
         correlation_id: u32,
         payload: AlignedBytes,
     },
+    /// A peer explicitly declined to answer an ask (see
+    /// `framing::ask_nack_reason`). Delivered to the waiter's correlation
+    /// slot as an immediate typed error instead of a payload.
+    AskNack {
+        correlation_id: u32,
+        reason: crate::framing::AskNackReason,
+    },
     Raw(bytes::Bytes),
     PubSub {
         payload: AlignedBytes,
@@ -4657,6 +4675,15 @@ pub(crate) enum MessageReadResult {
     /// Fast-path direct ask (bypasses actor message handler)
     DirectAsk {
         correlation_id: u32,
+        /// Stable, caller-controlled, guaranteed-nonzero identity (see
+        /// `framing::write_direct_ask_header`), independent of
+        /// `correlation_id` (which is a connection-local slot recycled on
+        /// every reconnect). Not yet consumed downstream -- there is no
+        /// application dispatcher for DirectAsk today (every request is
+        /// NACKed, see `protocol::process_read_result`) -- but it is on the
+        /// wire, parsed, and fail-closed validated so it's available once
+        /// one exists.
+        request_id: u64,
         payload: AlignedBytes,
     },
     /// Fast-path direct response
@@ -4666,13 +4693,27 @@ pub(crate) enum MessageReadResult {
     },
 }
 
+/// Answer a raw (unaddressed) `Ask`: it carries opaque bytes with no
+/// actor_id/type_hash, so there is no per-actor handler to route to the way
+/// `ActorAsk` routes through `AskDisposition` (see registry.rs) -- a raw ask
+/// has no production semantics at all. The command-processor echo below
+/// (`connection_pool::process_mock_request_payload` -- ECHO:/REVERSE:/
+/// COUNT:/HASH:, falling back to a byte-count/content acknowledgement) is
+/// test/benchmark scaffolding for exercising the raw-ask wire path without a
+/// registered actor; it must never answer a real caller with a fabricated
+/// transformation of its own request -- that is worse than the timeout it
+/// would otherwise cause, not better (the same class of wrongness as the
+/// DirectAsk echo deleted elsewhere in this batch). Production answers
+/// `AskNackReason::NoDispatcher` instead: `debug_assertions` is deliberately
+/// not part of this gate, since that is what made debug and release diverge
+/// in the first place (the standing P0 -- see `handle_raw_ask_no_dispatcher`).
 pub(crate) async fn handle_raw_ask_request(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
     correlation_id: u32,
     payload: &[u8],
 ) {
-    #[cfg(any(test, feature = "test-helpers", debug_assertions))]
+    #[cfg(any(test, feature = "test-helpers"))]
     {
         let response = if std::env::var("ICANACT_REMOTE_TYPED_ECHO").is_ok() && payload.len() >= 8 {
             payload.to_vec()
@@ -4717,16 +4758,43 @@ pub(crate) async fn handle_raw_ask_request(
             warn!(peer = %peer_addr, "No connection found for Ask response");
         }
     }
-    #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
+    #[cfg(not(any(test, feature = "test-helpers")))]
     {
-        let _ = registry;
         let _ = payload;
-        warn!(
-            peer = %peer_addr,
-            correlation_id = correlation_id,
-            "Received raw Ask request - not supported"
-        );
+        handle_raw_ask_no_dispatcher(registry, peer_addr, correlation_id).await;
     }
+}
+
+/// A raw (unaddressed) ask has no production dispatcher at all -- see
+/// `handle_raw_ask_request`'s doc. Split out so it's unconditionally
+/// compiled and can be exercised directly by a test: `cargo test` always
+/// runs in the dev profile with `cfg(test)` active, so the
+/// `#[cfg(not(any(test, feature = "test-helpers")))]` branch above can never
+/// itself execute under `cargo test` (see
+/// `raw_ask_with_no_dispatcher_nacks_instead_of_silence`, and
+/// `tests/bad_client_stress.rs::raw_ask_nacks_in_a_true_release_build` for
+/// direct evidence from an actual `--release` binary).
+///
+/// `#[allow(dead_code)]`: when the library is linked into an external test
+/// binary that enables `feature = "test-helpers"` (as CI does via
+/// `--all-features`), `cfg(test)` is false for that copy of the library (it
+/// isn't the crate's own `--lib` test target), so both this function's only
+/// production call site (excluded, since test-helpers turns the mock branch
+/// on) and its unit test (excluded, `#[cfg(test)]`) are absent from that
+/// specific build -- there is nothing left calling it there.
+#[allow(dead_code)]
+pub(crate) async fn handle_raw_ask_no_dispatcher(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u32,
+) {
+    send_ask_nack(
+        registry,
+        peer_addr,
+        correlation_id,
+        crate::framing::AskNackReason::NoDispatcher,
+    )
+    .await;
 }
 
 /// Send a response back to the peer for a streaming ask request.
@@ -4811,6 +4879,35 @@ pub(crate) async fn send_inline_response(
     }
 }
 
+/// Send an ask NACK back to the peer: the ask could not be answered with
+/// data (see `crate::framing::AskNackReason`). Same connection lookup as
+/// `send_inline_response`, so a NACK is delivered on whatever connection a
+/// real response would have used.
+pub(crate) async fn send_ask_nack(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u32,
+    reason: crate::framing::AskNackReason,
+) {
+    let pool = &registry.connection_pool;
+    if let Some(conn) = pool.get_existing_connection(peer_addr) {
+        if let Err(e) = conn.send_ask_nack(correlation_id, reason).await {
+            warn!(
+                peer = %peer_addr,
+                error = %e,
+                correlation_id = correlation_id,
+                "Failed to send ask NACK"
+            );
+        }
+    } else {
+        warn!(
+            peer = %peer_addr,
+            correlation_id = correlation_id,
+            "No connection found for ask NACK"
+        );
+    }
+}
+
 /// Send a response back to the peer for a non-streaming ask request using aligned bytes.
 pub(crate) async fn send_inline_response_aligned(
     registry: &Arc<GossipRegistry>,
@@ -4883,6 +4980,42 @@ pub(crate) async fn handle_response_message(
     if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
         if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
             let _ = correlation.complete(correlation_id, &mut payload);
+        }
+    }
+}
+
+/// Deliver an ask NACK to whichever correlation tracker is waiting on
+/// `correlation_id`. Mirrors `handle_response_message`'s three-tier lookup
+/// (connection-scoped tracker, then the connection's embedded tracker, then
+/// the shared-by-peer-id fallback) exactly, but completes the slot with
+/// `complete_nack` so the waiter resolves to `Err(GossipError::AskNacked)`
+/// immediately instead of the response payload path.
+pub(crate) async fn handle_response_nack_message(
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    correlation_id: u32,
+    reason: crate::framing::AskNackReason,
+    response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
+) {
+    if let Some(correlation) = response_correlation {
+        if correlation.complete_nack(correlation_id, reason) {
+            return;
+        }
+    }
+
+    let pool = &registry.connection_pool;
+
+    if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
+        if let Some(ref correlation) = conn.correlation {
+            if correlation.complete_nack(correlation_id, reason) {
+                return;
+            }
+        }
+    }
+
+    if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
+        if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
+            let _ = correlation.complete_nack(correlation_id, reason);
         }
     }
 }
@@ -5038,8 +5171,15 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
             if body.len() < crate::framing::ASK_RESPONSE_HEADER_LEN {
                 return Err(invalid_v5_frame("truncated response"));
             }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            if let Some(reason) = crate::framing::ask_nack_reason(body) {
+                return Ok(MessageReadResult::AskNack {
+                    correlation_id,
+                    reason,
+                });
+            }
             Ok(MessageReadResult::Response {
-                correlation_id: u32::from_be_bytes(body[..4].try_into().unwrap()),
+                correlation_id,
                 payload: aligned(
                     buffer,
                     crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN,
@@ -5047,9 +5187,30 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
                 )?,
             })
         }
-        crate::framing::WireKind::DirectAsk | crate::framing::WireKind::DirectResponse => {
+        crate::framing::WireKind::DirectAsk => {
             if body.len() < crate::framing::DIRECT_ASK_HEADER_LEN {
-                return Err(invalid_v5_frame("truncated direct frame"));
+                return Err(invalid_v5_frame("truncated direct ask"));
+            }
+            let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
+            // Fail-closed: a DirectAsk without a stable, nonzero request_id
+            // is rejected rather than silently accepted -- see
+            // `framing::write_direct_ask_header`.
+            let request_id = crate::framing::direct_ask_request_id(body)
+                .ok_or_else(|| invalid_v5_frame("direct ask missing a nonzero request_id"))?;
+            let payload = aligned(
+                buffer,
+                crate::framing::DIRECT_ASK_FRAME_HEADER_LEN,
+                body_len - crate::framing::DIRECT_ASK_HEADER_LEN,
+            )?;
+            Ok(MessageReadResult::DirectAsk {
+                correlation_id,
+                request_id,
+                payload,
+            })
+        }
+        crate::framing::WireKind::DirectResponse => {
+            if body.len() < crate::framing::DIRECT_ASK_HEADER_LEN {
+                return Err(invalid_v5_frame("truncated direct response"));
             }
             let correlation_id = u32::from_be_bytes(body[..4].try_into().unwrap());
             let payload = aligned(
@@ -5057,17 +5218,10 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
                 crate::framing::DIRECT_ASK_FRAME_HEADER_LEN,
                 body_len - crate::framing::DIRECT_ASK_HEADER_LEN,
             )?;
-            if control.kind == crate::framing::WireKind::DirectAsk {
-                Ok(MessageReadResult::DirectAsk {
-                    correlation_id,
-                    payload,
-                })
-            } else {
-                Ok(MessageReadResult::DirectResponse {
-                    correlation_id,
-                    payload,
-                })
-            }
+            Ok(MessageReadResult::DirectResponse {
+                correlation_id,
+                payload,
+            })
         }
         crate::framing::WireKind::PubSub => {
             if body.len() < crate::framing::PUBSUB_HEADER_LEN {
@@ -5226,12 +5380,13 @@ where
 #[cfg(test)]
 mod framing_tests {
     use super::{
-        MessageReadResult, parse_message_from_pooled_buffer_with_routes,
-        read_message_from_tls_reader,
+        MessageReadResult, handle_raw_ask_no_dispatcher,
+        parse_message_from_pooled_buffer_with_routes, read_message_from_tls_reader,
     };
     use crate::{MessageType, framing, registry::RegistryMessage};
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn read_frame(frame: Vec<u8>) -> MessageReadResult {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
@@ -5422,6 +5577,132 @@ mod framing_tests {
                 assert_eq!(body.as_ref(), payload_bytes);
             }
             _ => panic!("unexpected result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_nack_header_parses_as_a_distinct_result_not_a_zero_length_response() {
+        let header = framing::write_ask_nack_header(99, framing::AskNackReason::UnknownActor);
+
+        match read_frame(header.to_vec()).await {
+            MessageReadResult::AskNack {
+                correlation_id,
+                reason,
+            } => {
+                assert_eq!(correlation_id, 99);
+                assert_eq!(reason, framing::AskNackReason::UnknownActor);
+            }
+            other => panic!("expected AskNack, got {other:?}"),
+        }
+    }
+
+    /// Item 2 (standing P0, corrected): a raw (unaddressed) `Ask` has no
+    /// production dispatcher -- `cargo test` always runs in the dev profile
+    /// with `cfg(test)` active, so it can never itself exercise the
+    /// `#[cfg(not(any(test, feature = "test-helpers")))]` branch of
+    /// `handle_raw_ask_request`. This calls the unconditionally-compiled
+    /// `handle_raw_ask_no_dispatcher` that branch delegates to directly,
+    /// emulating what a release build does, and proves it sends a real NACK
+    /// (not silence, and not a fabricated echo of the request) rather than
+    /// merely asserting cfg-gate wiring. It does NOT prove the release
+    /// binary compiles/links this path; only `cargo build --release` does
+    /// that, and `tests/bad_client_stress.rs::raw_ask_nacks_in_a_true_release_build`
+    /// is the direct evidence from an actual `--release` binary.
+    #[tokio::test]
+    async fn raw_ask_with_no_dispatcher_nacks_instead_of_silence() {
+        let addr: SocketAddr = "127.0.0.1:19997".parse().unwrap();
+        let config = crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "raw-ask-no-dispatcher-self",
+            )),
+            ..Default::default()
+        };
+        let registry = crate::registry::GossipRegistry::<()>::new(addr, config);
+
+        let (io, mut peer_io) = tokio::io::duplex(256);
+        let (stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                io,
+                addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut conn = crate::connection_pool::LockFreeConnection::new(
+            addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
+        conn.stream_handle = Some(std::sync::Arc::new(stream_handle));
+        conn.set_state(crate::connection_pool::ConnectionState::Connected);
+        let peer_id = crate::KeyPair::new_for_testing("raw-ask-no-dispatcher-peer").peer_id();
+        registry.connection_pool.add_connection_by_peer_id(
+            peer_id,
+            addr,
+            std::sync::Arc::new(conn),
+        );
+
+        let registry = std::sync::Arc::new(registry);
+        handle_raw_ask_no_dispatcher(&registry, addr, 555).await;
+
+        let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_io.read_exact(&mut frame),
+        )
+        .await
+        .expect("a NACK must be sent immediately, not left to a timeout")
+        .expect("peer must receive the NACK frame");
+
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
+            .expect("valid control word");
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(u32::from_be_bytes(frame[4..8].try_into().unwrap()), 555);
+        assert_eq!(
+            crate::framing::ask_nack_reason(&frame[4..]),
+            Some(crate::framing::AskNackReason::NoDispatcher)
+        );
+    }
+
+    /// Item 4, fail-closed: a DirectAsk frame with request_id == 0 (the
+    /// wire's reserved "absent" sentinel -- see
+    /// `framing::write_direct_ask_header`) must be rejected, not silently
+    /// accepted with an ambiguous identity.
+    #[test]
+    fn direct_ask_with_zero_request_id_is_rejected() {
+        let payload = b"PING";
+        let header = framing::write_direct_ask_header(1, 0, payload.len());
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(payload);
+
+        let routes = crate::route_interning::RouteTable::new();
+        assert!(
+            parse_with_routes(&frame, &routes).is_err(),
+            "a DirectAsk with request_id == 0 must be rejected, not parsed"
+        );
+    }
+
+    /// Item 4: a well-formed, nonzero request_id round-trips through the
+    /// shared frame parser (not just the standalone framing::write/read
+    /// helpers tested in framing.rs).
+    #[tokio::test]
+    async fn direct_ask_carries_its_request_id_through_the_frame_parser() {
+        let payload = b"PING";
+        let header = framing::write_direct_ask_header(7, 0xabad_1dea, payload.len());
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(payload);
+
+        match read_frame(frame).await {
+            MessageReadResult::DirectAsk {
+                correlation_id,
+                request_id,
+                payload: body,
+            } => {
+                assert_eq!(correlation_id, 7);
+                assert_eq!(request_id, 0xabad_1dea);
+                assert_eq!(body.as_ref(), payload);
+            }
+            other => panic!("expected DirectAsk, got {other:?}"),
         }
     }
 

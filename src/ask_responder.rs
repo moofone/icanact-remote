@@ -64,7 +64,9 @@ async fn send_pooled_via_stream_handle(
         .saturating_sub(framing::ASK_RESPONSE_HEADER_LEN);
     if payload_len > stream_handle.streaming_threshold() || payload_len > inline_payload_limit {
         let bytes = pooled_payload_into_bytes(prefix, payload);
-        return stream_handle.stream_response_bytes(bytes, correlation_id).await;
+        return stream_handle
+            .stream_response_bytes(bytes, correlation_id)
+            .await;
     }
     let header = framing::try_write_ask_response_header(
         crate::MessageType::Response,
