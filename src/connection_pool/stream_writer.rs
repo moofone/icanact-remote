@@ -72,7 +72,7 @@ where
 }
 
 /// Bound on a single attempt to write an ask-backpressure NACK header (see
-/// `try_write_ask_backpressure_nack`). The `io_task` read loop that calls
+/// `write_ask_nack_header_bounded`). The `io_task` read loop that calls
 /// this owns the connection's socket read side too, so a write that parks
 /// indefinitely on a peer that has stopped draining would park reads with
 /// it -- exactly the shape of deadlock `icanact-remote#186` closes for the
@@ -88,14 +88,14 @@ const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
 const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
 
 /// Write one already-built ask-NACK header without risking parking the
-/// caller's read loop on a peer that has stopped draining.
-/// `write_ask_nack_direct` (this file's sibling `read_pipeline.rs`) is the
-/// right shape for the header itself -- built the same way via
-/// `write_ask_nack_header` -- but it writes with a plain `write_all`, which
-/// loops over as many `poll_write` calls as it takes and is therefore unsafe
-/// to cancel: a timeout firing between two of those internal polls would
-/// abandon a *partially written* frame, corrupting wire framing for every
-/// later frame on this connection. `write_vectored_once` instead performs
+/// caller's read loop on a peer that has stopped draining. A plain
+/// `write_all` is the wrong shape for this: it loops over as many
+/// `poll_write` calls as it takes and is therefore unsafe to cancel -- a
+/// timeout firing between two of those internal polls would abandon a
+/// *partially written* frame, corrupting wire framing for every later frame
+/// on this connection (this is exactly the mistake the read path's earlier,
+/// now-deleted `write_ask_nack_direct` made -- see the review history on
+/// `icanact-remote#186`). `write_vectored_once` instead performs
 /// exactly one `poll_write` cycle per call, so each attempt here is
 /// individually safe to bound with `STREAM_WRITE_SLICE_TIMEOUT` -- per the
 /// `AsyncWrite` contract, a `Pending` result never writes a partial byte, so

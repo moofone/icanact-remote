@@ -1526,30 +1526,6 @@ where
     }
 }
 
-/// Write an ask NACK directly to the stream, bypassing `response_batch`. A
-/// NACK is a rare/exceptional path (an unanswerable ask), so it does not
-/// need the batched-write optimization the normal response path uses.
-async fn write_ask_nack_direct<S>(
-    stream: &mut S,
-    bytes_written_counter: &Arc<AtomicUsize>,
-    bytes_since_flush: &mut usize,
-    correlation_id: u32,
-    reason: crate::framing::AskNackReason,
-) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let header = crate::framing::write_ask_nack_header(correlation_id, reason);
-    write_header_payload_vectored(
-        stream,
-        bytes_written_counter,
-        bytes_since_flush,
-        &header,
-        &[],
-    )
-    .await
-}
-
 async fn write_actor_response_direct<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
@@ -1669,14 +1645,14 @@ where
     match disposition {
         crate::registry::AskDisposition::Deferred => {}
         crate::registry::AskDisposition::Nack(reason) => {
-            write_ask_nack_direct(
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
-                correlation_id,
-                reason,
-            )
-            .await?;
+            // Queued (`LocalStreamingQueue::queue_ask_nack`), never written
+            // here directly: this function has no way to know whether a
+            // partial streaming frame currently owns the wire, and a direct
+            // write regardless would risk splicing the NACK's bytes into
+            // that frame's payload. `io_task` drains the queue only once it
+            // has proven the wire free of a partial frame.
+            streaming_responses
+                .queue_ask_nack(crate::framing::write_ask_nack_header(correlation_id, reason));
             *wrote_response_bytes = true;
         }
         crate::registry::AskDisposition::Immediate(response) => match response {
@@ -1888,11 +1864,12 @@ where
 /// run and consumed the ask -- there is no request left to hand back to the
 /// caller if this fails. Returns `WouldBlock` (the local streaming queue has
 /// no room; see `LocalStreamingQueue::can_admit_response`) rather than
-/// answering the peer itself, because this function has no `stream` to write
-/// a NACK to. Every call site instead goes through
-/// `queue_streaming_response_bytes_or_nack`, which does have one: on
-/// `WouldBlock` specifically it answers with an `AskNackReason::Backpressure`
-/// NACK (via `try_write_ask_backpressure_nack`) instead of losing the
+/// answering the peer itself, because this function cannot know whether a
+/// partial streaming frame currently owns the wire. Every call site instead
+/// goes through `queue_streaming_response_bytes_or_nack`, which on
+/// `WouldBlock` specifically answers with an `AskNackReason::Backpressure`
+/// NACK -- queued via `LocalStreamingQueue::queue_ask_nack`, drained by
+/// `io_task` only once it has proven the wire free -- instead of losing the
 /// already-computed response and letting the error propagate out of the read
 /// loop. Every other error (a genuinely oversized response, a config error)
 /// still propagates unchanged.
@@ -2246,20 +2223,12 @@ where
             // it was already fail-closed validated (nonzero) by the parser.
             let _ = (payload, request_id);
             let _ = &direct_response_batch;
-            let write_start = perf.map(|_| Instant::now());
-            write_ask_nack_direct(
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
+            // Queued, not written directly here -- see the identical
+            // reasoning on `AskDisposition::Nack` in `write_ask_disposition_io`.
+            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::NoDispatcher,
-            )
-            .await?;
-            if let (Some(perf), Some(start)) = (perf, write_start) {
-                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                perf.response_write_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
+            ));
             Ok(())
         }
         crate::handle::MessageReadResult::DirectResponse {
@@ -2450,15 +2419,13 @@ where
         let Some(cell) = ctx.sync_actor_handler.as_ref() else {
             // Nothing is wired up to answer this ask at all: fail closed with
             // an immediate NACK instead of leaving the caller to time out.
+            // Queued, not written directly here -- see the identical
+            // reasoning on `AskDisposition::Nack` in `write_ask_disposition_io`.
             if let Some(correlation_id) = correlation_id {
-                write_ask_nack_direct(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
+                streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                     correlation_id,
                     crate::framing::AskNackReason::UnknownActor,
-                )
-                .await?;
+                ));
                 *wrote_response_bytes = true;
             }
             return Ok(());
@@ -2509,21 +2476,13 @@ where
             let _ = payload;
             let _ = request_id;
             let _ = &direct_response_batch;
-            let write_start = perf.map(|_| Instant::now());
-            write_ask_nack_direct(
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
+            // Queued, not written directly here -- see the identical
+            // reasoning on `AskDisposition::Nack` in `write_ask_disposition_io`.
+            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::NoDispatcher,
-            )
-            .await?;
+            ));
             *wrote_response_bytes = true;
-            if let (Some(perf), Some(start)) = (perf, write_start) {
-                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                perf.response_write_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
             Ok(None)
         }
         ReadIoResult::ActorAsk {
@@ -2625,21 +2584,13 @@ where
             // it was already fail-closed validated (nonzero) by the parser.
             let _ = (payload, request_id);
             let _ = &direct_response_batch;
-            let write_start = perf.map(|_| Instant::now());
-            write_ask_nack_direct(
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
+            // Queued, not written directly here -- see the identical
+            // reasoning on `AskDisposition::Nack` in `write_ask_disposition_io`.
+            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::NoDispatcher,
-            )
-            .await?;
+            ));
             *wrote_response_bytes = true;
-            if let (Some(perf), Some(start)) = (perf, write_start) {
-                perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
-                perf.response_write_ns
-                    .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
             Ok(None)
         }
         ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
