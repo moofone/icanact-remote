@@ -2194,6 +2194,16 @@ impl LockFreeStreamHandle {
                     let mut read_batch_limit = READ_BATCH_LIMIT;
                     while reads < read_batch_limit
                         && !local_streaming_queue.is_full()
+                        // A read that dispatches to an unknown actor, a
+                        // missing handler, or backpressure can queue a NACK
+                        // (`LocalStreamingQueue::queue_ask_nack`). Admitting
+                        // reads past the point where that queue has no more
+                        // room would force it to either evict an
+                        // already-consumed ask's only remaining record
+                        // (silently losing its terminal outcome) or grow
+                        // without bound; stopping here instead lets the
+                        // drain at the top of the next turn make room first.
+                        && local_streaming_queue.has_room_for_ask_nack()
                         && (pending_stream_cmd.is_none()
                             || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                 && direct_response_batch.total_bytes()
@@ -2515,6 +2525,9 @@ impl LockFreeStreamHandle {
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
                             while drained < drain_batch_limit
                                 && !local_streaming_queue.is_full()
+                                // See the identical check in the primary
+                                // drain loop above.
+                                && local_streaming_queue.has_room_for_ask_nack()
                                 && (pending_stream_cmd.is_none()
                                     || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                         && direct_response_batch.total_bytes()

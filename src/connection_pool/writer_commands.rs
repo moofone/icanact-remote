@@ -330,18 +330,37 @@ impl LocalStreamingQueue {
     }
 
     /// Queue a backpressure NACK header for the peer. Always succeeds --
-    /// never blocks, never fails, never consults `is_full`/admission at
-    /// all, since a fixed 16-byte header cannot meaningfully threaten the
-    /// retention bound those exist to enforce. Under sustained load once
-    /// `PENDING_ASK_NACK_CAP` is reached, the oldest not-yet-written NACK is
-    /// dropped in favor of the newest: best-effort delivery, not a
-    /// guarantee, and no worse than the timeout the peer would otherwise
-    /// see either way.
+    /// never blocks, never fails, never consults `is_full`/response
+    /// admission at all, since a fixed 16-byte header cannot meaningfully
+    /// threaten the retention bound those exist to enforce.
+    ///
+    /// Never evicts an already-queued entry to make room for a new one:
+    /// that header is the *only* remaining record that a specific,
+    /// already-consumed ask exists at all. Dropping it silently loses that
+    /// ask's terminal outcome -- no reply, no NACK, just a correlation id
+    /// the requester eventually times out waiting on. That is exactly the
+    /// failure this whole NACK mechanism exists to remove; reintroducing it
+    /// one layer down, inside the queue built to prevent it, defeats the
+    /// point. Bounding growth is the read side's job instead: `io_task`'s
+    /// read-batch loops gate further reads on `has_room_for_ask_nack` (see
+    /// that method), so this is structurally never called while the queue
+    /// is already at `PENDING_ASK_NACK_CAP` -- growth stops at the source
+    /// of new entries, not by discarding existing ones.
     fn queue_ask_nack(&mut self, header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]) {
-        if self.pending_ask_nacks.len() >= PENDING_ASK_NACK_CAP {
-            self.pending_ask_nacks.pop_front();
-        }
         self.pending_ask_nacks.push_back(header);
+    }
+
+    /// Whether the queue has room for one more NACK without exceeding
+    /// `PENDING_ASK_NACK_CAP`. `io_task`'s read-batch loops must stop
+    /// admitting further reads once this is `false` and let a drain turn
+    /// run first (`drain_pending_ask_nacks`, gated on
+    /// `pending_stream_cmd.is_none()`) -- this is what keeps
+    /// `queue_ask_nack` itself able to stay unconditional: as long as every
+    /// caller that could add an entry checks this first, the queue can
+    /// never be asked to hold more than its cap, so it never has to choose
+    /// what to discard.
+    fn has_room_for_ask_nack(&self) -> bool {
+        self.pending_ask_nacks.len() < PENDING_ASK_NACK_CAP
     }
 
     /// Pop the oldest queued NACK header for `io_task` to attempt writing.

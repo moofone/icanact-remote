@@ -1948,6 +1948,129 @@ fn nine_queued_ask_nacks_all_reach_the_wire_without_further_traffic() {
     });
 }
 
+/// P1: a burst past `PENDING_ASK_NACK_CAP` (64) used to silently *evict*
+/// the oldest not-yet-written NACK to make room for the newest -- dropping
+/// the only remaining record that a specific, already-consumed ask existed
+/// at all. That ask's requester then timed out instead of getting the fast
+/// NACK this whole mechanism exists to deliver: the exact failure class
+/// this line of work removes, reintroduced one layer down. 96 raw
+/// `ActorAsk` frames (comfortably past the 64-entry cap, comfortably under
+/// `READ_BATCH_LIMIT`) land in one `write_all` so all 96 are read and
+/// dispatched -- each `UnknownActor`-NACKed, since the server registry has
+/// no ask handler registered -- inside one read-batch pass. The fix gates
+/// further reads on `LocalStreamingQueue::has_room_for_ask_nack`, so the
+/// batch pauses at 64 queued, drains, and resumes -- every one of the 96
+/// must still arrive, including the earliest ones the old eviction would
+/// have discarded first.
+#[test]
+fn ninety_six_queued_ask_nacks_all_reach_the_wire_none_evicted() {
+    run_multi_thread_test(async {
+        const ASK_COUNT: u32 = 96;
+        const COMPLETION_BOUND: Duration = Duration::from_secs(5);
+
+        let server_addr: std::net::SocketAddr = "127.0.0.1:44203".parse().unwrap();
+        let peer_addr: std::net::SocketAddr = "127.0.0.1:44204".parse().unwrap();
+
+        let server_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            server_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ninety_six_queued_ask_nacks_server",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+
+        let (server_io, mut peer_io) = tokio::io::duplex(1024 * 1024);
+        let server_read_ctx = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&server_registry),
+            peer_addr,
+            session_source: peer_addr,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: server_registry.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (server_writer, _server_task, _server_reader_task) = LockFreeStreamHandle::new(
+            server_io,
+            peer_addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(server_read_ctx),
+        );
+
+        let mut frames = Vec::new();
+        for i in 1..=ASK_COUNT {
+            let payload = b"x";
+            let header = crate::framing::write_actor_ask_header(
+                i,
+                0xBAD1_0000_0000_0000 + i as u64,
+                0xF00D_0002,
+                payload.len(),
+            );
+            frames.extend_from_slice(&header);
+            frames.extend_from_slice(payload);
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut peer_io, &frames)
+            .await
+            .expect("writing all 96 ActorAsk frames at once must succeed");
+
+        let outcome = tokio::time::timeout(COMPLETION_BOUND, async {
+            let mut received = Vec::with_capacity(ASK_COUNT as usize);
+            for _ in 0..ASK_COUNT {
+                let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+                tokio::io::AsyncReadExt::read_exact(&mut peer_io, &mut header)
+                    .await
+                    .expect("the peer must receive a NACK header for every queued ask");
+                let correlation_id = u32::from_be_bytes(header[4..8].try_into().unwrap());
+                let reason = crate::framing::ask_nack_reason(&header[4..]);
+                received.push((correlation_id, reason));
+            }
+            received
+        })
+        .await;
+
+        let received = outcome.expect(
+            "every one of the 96 asks must reach a terminal outcome (a NACK) -- a burst past \
+             the 64-entry pending-NACK cap must gate further reads, not evict an \
+             already-consumed ask's only remaining record",
+        );
+
+        assert_eq!(
+            received.len(),
+            ASK_COUNT as usize,
+            "no queued NACK may be silently dropped, including the earliest ones an eviction \
+             policy would discard first"
+        );
+        for (idx, (correlation_id, reason)) in received.iter().enumerate() {
+            assert_eq!(
+                *correlation_id,
+                idx as u32 + 1,
+                "NACKs must arrive in dispatch order, and every correlation id from 1..=96 must \
+                 be present -- none evicted"
+            );
+            assert_eq!(
+                *reason,
+                Some(crate::framing::AskNackReason::UnknownActor),
+                "every ask targeted an actor with no registered handler"
+            );
+        }
+
+        server_writer.shutdown();
+        drop(peer_io);
+    });
+}
+
 /// A transport whose `poll_write` legally returns `Ready(Ok(0))` on every
 /// call, from the very first one -- modelling a half-closed write side, per
 /// the `AsyncWrite` contract (distinct from `Pending`, which must be
