@@ -12,14 +12,54 @@ use crate::{
     registry::{ActorResponse, GossipRegistry, RegistryMessage},
 };
 
-/// How long an in-progress stream may go without receiving a chunk before it is
-/// reaped. Measured from the last chunk, not from the start, so a legitimately
-/// slow or large transfer is not evicted mid-flight.
+/// How long an in-progress stream may go with ZERO byte progress before it
+/// is reaped. Measured from the last time bytes actually advanced -- never
+/// from stream start, and never merely from the last time the reader was
+/// polled -- so a stream that is genuinely still receiving data is never
+/// reaped by this check alone. A peer that stops advancing entirely
+/// (including one that never sends a single byte after `StreamStart`) loses
+/// its slot and reserved bytes within this window.
+///
+/// This bound alone is not sufficient to keep a slot from being pinned
+/// indefinitely: see `MIN_SUSTAINED_RATE_WINDOW` / `MIN_SUSTAINED_BYTES_PER_WINDOW`
+/// for the bound that catches a peer trickling just enough to dodge this one.
+///
+/// Also doubles as the base tombstone TTL for a reaped/rejected stream id
+/// (see `reject_stream` / `tombstone_reaped_stream`): a tombstone hit
+/// refreshes its own timer the same way genuine stream activity does, so a
+/// sender still trickling into a dead id keeps being silently discarded
+/// instead of eventually falling through to a fatal "unknown stream_id".
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Absolute ceiling on a single stream's lifetime, so a peer cannot hold a slot
-/// open forever by trickling one chunk just inside the idle timeout.
-const MAX_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+/// Width of the tumbling window over which a minimum sustained transfer
+/// rate is enforced (see `MIN_SUSTAINED_BYTES_PER_WINDOW`). Deliberately
+/// much wider than `STREAM_IDLE_TIMEOUT`: this check exists to catch a
+/// pattern the idle check cannot -- nonzero progress on every poll, just
+/// under the idle bound -- so it must tolerate the bursty-then-quiet
+/// delivery pattern of a real, honest, low-bandwidth link without
+/// mistaking a lull for starvation.
+const MIN_SUSTAINED_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The minimum number of bytes a stream must receive within any one
+/// `MIN_SUSTAINED_RATE_WINDOW` to avoid being reaped for insufficient
+/// throughput.
+///
+/// This is the bound that keeps "any progress at all resets the clock"
+/// from being exploitable: without it, a peer that sends a single byte just
+/// under `STREAM_IDLE_TIMEOUT` forever holds its stream slot and its share
+/// of `MAX_INFLIGHT_STREAM_BYTES` for free, which is exactly the slow-drip
+/// resource pin an absolute lifetime cap used to prevent. 8 KiB per 5
+/// minutes (~27 B/s sustained) is far below any real network transfer --
+/// including a link too slow to be worth transferring over at all -- while
+/// being thousands of times more than a peer can get away with sending
+/// merely to keep the idle timer from firing. A peer that wants to hold a
+/// slot open now has to pay for it in real, continuous bandwidth rather
+/// than one byte a minute; that does not bound the worst case to a fixed
+/// wall-clock ceiling the way the old absolute cap did, but it converts an
+/// unbounded *free* resource pin into a bounded-cost one, on top of the
+/// existing per-connection `max_concurrent_streams` / `MAX_INFLIGHT_STREAM_BYTES`
+/// budgets that already limit the blast radius of any single connection.
+const MIN_SUSTAINED_BYTES_PER_WINDOW: usize = 8 * 1024;
 
 /// Per-connection streaming state for managing partial streams
 #[derive(Debug)]
@@ -91,10 +131,33 @@ struct InProgressStream {
     expected_chunks: Option<usize>,
     /// Count of chunk indices seen more than once, for diagnostics.
     duplicate_chunks: u32,
-    /// Timestamp when stream started (bounds total lifetime).
+    /// Timestamp when stream started. Kept for diagnostics only -- neither
+    /// reap check is measured from this; see `last_activity` and
+    /// `rate_window_started_at`.
     started_at: std::time::Instant,
-    /// Timestamp of the most recent chunk (drives idle reaping).
+    /// Timestamp of the most recent genuine byte progress (drives the
+    /// zero-progress idle reap).
     last_activity: std::time::Instant,
+    /// Total bytes physically read for this stream so far, including bytes
+    /// already read into a chunk reservation that has not committed yet.
+    ///
+    /// Deliberately separate from `received_size`, which only advances on a
+    /// full chunk commit: crediting the rate window off `received_size`
+    /// alone means a single large chunk that is genuinely, steadily
+    /// progressing looks like zero progress until it fully commits, and
+    /// gets reaped mid-transfer for insufficient rate -- reintroducing,
+    /// through the rate bound, the exact failure this whole change exists
+    /// to fix. This field is bumped by the exact number of new bytes a real
+    /// socket read returns, so it can only advance at the cost of the peer
+    /// actually sending that many bytes; there is no path that credits it
+    /// without a matching read.
+    total_bytes_progressed: usize,
+    /// Start of the current minimum-sustained-rate tumbling window.
+    rate_window_started_at: std::time::Instant,
+    /// `total_bytes_progressed` as of `rate_window_started_at`, so the
+    /// reaper can tell how many bytes landed during the current window
+    /// without a separate running counter.
+    progressed_bytes_at_window_start: usize,
 }
 
 impl InProgressStream {
@@ -244,6 +307,9 @@ impl StreamingState {
             duplicate_chunks: 0,
             started_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
+            total_bytes_progressed: 0,
+            rate_window_started_at: std::time::Instant::now(),
+            progressed_bytes_at_window_start: 0,
         };
         self.active_streams.insert(header.stream_id, stream);
         Ok(())
@@ -374,7 +440,13 @@ impl StreamingState {
         chunk_index: u32,
         chunk_len: usize,
     ) -> Result<Option<StreamChunkReservation>> {
-        if self.rejected_streams.contains_key(&stream_id) {
+        if let Some(tombstoned_at) = self.rejected_streams.get_mut(&stream_id) {
+            // A sender still trickling chunks into a reaped/rejected id is
+            // making a good-faith delivery attempt; refresh the tombstone so
+            // it keeps being silently discarded instead of aging out and
+            // falling through to `reserve_v5_chunk`'s fatal "unknown
+            // stream_id" once the original TTL window passes.
+            *tombstoned_at = std::time::Instant::now();
             return Ok(None);
         }
         self.reserve_v5_chunk(stream_id, chunk_index, chunk_len)
@@ -397,6 +469,20 @@ impl StreamingState {
         Ok(())
     }
 
+    /// Returns the writable target range for the next read into
+    /// `reservation`. This function is called on every poll of the
+    /// underlying socket read -- including polls where nothing is actually
+    /// transferred -- so it must stay free of any side effect on the
+    /// stream's activity timer. Callers advance progress explicitly via
+    /// `record_v5_chunk_progress` after a read that returns at least one
+    /// byte.
+    ///
+    /// Returns a `NotFound` network error (checked by `is_stream_reaped_error`)
+    /// if the owning stream was reaped while this reservation was still
+    /// live. Callers must treat that as a per-stream discard, not a fatal
+    /// connection error: the remainder of the in-flight chunk still has to
+    /// be drained off the wire to keep framing intact, but the stream's
+    /// backing buffer is already gone.
     pub(crate) fn v5_chunk_target(
         &mut self,
         reservation: StreamChunkReservation,
@@ -407,8 +493,8 @@ impl StreamingState {
             .get_mut(&reservation.stream_id)
             .ok_or_else(|| {
                 GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "stream vanished",
+                    std::io::ErrorKind::NotFound,
+                    "stream reaped while its chunk reservation was still live",
                 ))
             })?;
         if read > reservation.len {
@@ -417,15 +503,30 @@ impl StreamingState {
                 "V5 stream read exceeds reserved chunk",
             )));
         }
-        // R-L(a): a single chunk can be larger than one idle window (e.g. a
-        // 1 MiB chunk trickling in at <17 KB/s). Forward byte progress on a
-        // partial read is real activity even though the chunk has not fully
-        // committed yet, so the idle reaper must not treat the stream as
-        // stalled while the reader still holds this live reservation.
-        stream.last_activity = std::time::Instant::now();
         let start = reservation.offset + read;
         let end = reservation.offset + reservation.len;
         Ok(&mut stream.buffer.as_mut_slice()[start..end])
+    }
+
+    /// Records that `new_bytes` actually landed in `reservation`'s target
+    /// range, keeping the owning stream out of the idle reaper AND crediting
+    /// it toward the minimum-sustained-rate window -- even though the chunk
+    /// this reservation belongs to has not committed yet. Must only be
+    /// called after a read that returned at least one byte, with exactly
+    /// the number of bytes that read returned: crediting progress for a
+    /// poll that transferred nothing is exactly what let a stalled peer's
+    /// live reservation pin a slot indefinitely, and crediting more than
+    /// was actually read would let a peer buy rate-window credit it never
+    /// paid bandwidth for.
+    pub(crate) fn record_v5_chunk_progress(
+        &mut self,
+        reservation: StreamChunkReservation,
+        new_bytes: usize,
+    ) {
+        if let Some(stream) = self.active_streams.get_mut(&reservation.stream_id) {
+            stream.last_activity = std::time::Instant::now();
+            stream.total_bytes_progressed = stream.total_bytes_progressed.saturating_add(new_bytes);
+        }
     }
 
     pub(crate) fn commit_v5_chunk(
@@ -599,8 +700,15 @@ impl StreamingState {
         // CRITICAL_PATH: write chunk directly into final buffer.
         stream.buffer.as_mut_slice()[offset..end].copy_from_slice(&chunk_data);
         stream.received_size += chunk_data.len();
-        // Progress, so the idle reaper must not treat this stream as stalled.
+        // Progress, so the idle reaper must not treat this stream as stalled,
+        // and so the minimum-sustained-rate window credits it (this path
+        // delivers a whole chunk at once rather than incrementally, so
+        // unlike the V5 direct-read path there is no separate partial-read
+        // credit to double-count against).
         stream.last_activity = std::time::Instant::now();
+        stream.total_bytes_progressed = stream
+            .total_bytes_progressed
+            .saturating_add(chunk_data.len());
 
         if stream.all_chunks_received() {
             self.assemble_complete_message_with_correlation(header.stream_id)
@@ -703,64 +811,109 @@ impl StreamingState {
         self.active_streams.len()
     }
 
-    /// Clean up in-progress streams that have stopped making progress.
-    ///
-    /// Reaping is keyed on *idle* time, not age since the stream started. A
-    /// large or slow-but-healthy transfer legitimately runs longer than the
-    /// timeout, and evicting it mid-flight fails the sender's ask with no
-    /// server-side diagnostic. `MAX_STREAM_LIFETIME` remains as a backstop so a
-    /// peer cannot hold a slot open indefinitely by trickling one chunk forever.
-    pub fn cleanup_stale(&mut self) {
-        self.cleanup_stale_with(STREAM_IDLE_TIMEOUT, MAX_STREAM_LIFETIME);
+    /// Number of tombstoned (rejected or reaped) stream ids currently
+    /// quarantined. Exposed for tests that verify the table stays bounded.
+    #[cfg(test)]
+    fn rejected_stream_count(&self) -> usize {
+        self.rejected_streams.len()
     }
 
-    /// `cleanup_stale` with explicit bounds, so tests do not have to wait out
-    /// the production timeouts.
+    /// Clean up in-progress streams that have stopped making genuine byte
+    /// progress, or that are not sustaining a minimum transfer rate. A
+    /// stream is never reaped merely for its total age: as long as it keeps
+    /// clearing both checks below, it survives no matter how long the
+    /// transfer takes, so a large or slow-but-healthy transfer is never
+    /// evicted mid-flight. Two independent bounds are enforced, because
+    /// neither alone is sufficient:
+    ///
+    /// - Zero progress for `STREAM_IDLE_TIMEOUT`: catches a peer that stops
+    ///   advancing bytes entirely, including one that never sends any after
+    ///   `StreamStart`.
+    /// - Fewer than `MIN_SUSTAINED_BYTES_PER_WINDOW` bytes across a
+    ///   `MIN_SUSTAINED_RATE_WINDOW`-wide tumbling window: catches a peer
+    ///   that keeps sending just enough to dodge the idle check (e.g. one
+    ///   byte every `STREAM_IDLE_TIMEOUT` minus a second) without ever
+    ///   sustaining a real transfer rate. Without this, "any progress
+    ///   resets the idle clock" lets that peer pin a slot and its share of
+    ///   `MAX_INFLIGHT_STREAM_BYTES` for free, forever.
+    pub fn cleanup_stale(&mut self) {
+        self.cleanup_stale_with(
+            STREAM_IDLE_TIMEOUT,
+            MIN_SUSTAINED_RATE_WINDOW,
+            MIN_SUSTAINED_BYTES_PER_WINDOW,
+        );
+    }
+
+    /// `cleanup_stale` with explicit bounds, so tests do not have to wait
+    /// out the production timeouts.
     pub(crate) fn cleanup_stale_with(
         &mut self,
         idle_timeout: std::time::Duration,
-        max_lifetime: std::time::Duration,
+        rate_window: std::time::Duration,
+        min_bytes_per_window: usize,
     ) {
         let before_count = self.active_streams.len();
         self.rejected_streams
             .retain(|_, at| at.elapsed() <= idle_timeout);
 
-        // R-L(b): a stream the reaper drops is not necessarily done as far as
-        // the sender is concerned -- its next in-flight chunk (or, for the
-        // absolute lifetime cap, a chunk for a still-progressing transfer) is
-        // already on the wire. Collect the reaped ids so they can be
-        // tombstoned into `rejected_streams` below: without that, the late
-        // chunk hits "unknown stream_id", which is a fatal protocol error
-        // that tears down the whole connection instead of just this stream.
+        // A stream the reaper drops is not necessarily done as far as the
+        // sender is concerned -- its next in-flight chunk is already on the
+        // wire. Collect the reaped ids so they can be tombstoned into
+        // `rejected_streams` below: without that, the late chunk hits
+        // "unknown stream_id", a fatal protocol error that tears down the
+        // whole connection instead of just this stream.
         let mut reaped_ids = Vec::new();
         self.active_streams.retain(|stream_id, stream| {
             let idle = stream.last_activity.elapsed();
-            let age = stream.started_at.elapsed();
-
             if idle > idle_timeout {
                 warn!(
                     stream_id = stream_id,
                     idle_secs = idle.as_secs(),
-                    age_secs = age.as_secs(),
+                    age_secs = stream.started_at.elapsed().as_secs(),
                     received_size = stream.received_size,
                     expected_size = stream.total_size,
-                    "Cleaning up idle stream - no chunk arrived within the idle timeout"
+                    "Cleaning up stream with no byte progress within the idle timeout"
                 );
                 reaped_ids.push(*stream_id);
                 return false;
             }
 
-            if age > max_lifetime {
-                warn!(
-                    stream_id = stream_id,
-                    idle_secs = idle.as_secs(),
-                    age_secs = age.as_secs(),
-                    received_size = stream.received_size,
-                    expected_size = stream.total_size,
-                    "Cleaning up stream that exceeded its maximum lifetime"
-                );
-                reaped_ids.push(*stream_id);
-                return false;
+            // Tumbling minimum-rate window: only evaluated once a full
+            // window has elapsed since it last opened, so a stream still
+            // inside its first window is judged by the idle check alone.
+            //
+            // Credited off `total_bytes_progressed`, not `received_size`:
+            // the latter only advances on a full chunk commit, so a single
+            // large chunk that is genuinely, steadily progressing would
+            // look like zero progress -- and get reaped for insufficient
+            // rate -- for as long as it takes to fill. `total_bytes_progressed`
+            // advances on every real byte read, committed or not, so it
+            // agrees with `last_activity` about what counts as progress.
+            let window_elapsed = stream.rate_window_started_at.elapsed();
+            if window_elapsed >= rate_window {
+                let bytes_this_window = stream
+                    .total_bytes_progressed
+                    .saturating_sub(stream.progressed_bytes_at_window_start);
+                if bytes_this_window < min_bytes_per_window {
+                    warn!(
+                        stream_id = stream_id,
+                        bytes_this_window,
+                        min_bytes_per_window,
+                        window_secs = window_elapsed.as_secs(),
+                        received_size = stream.received_size,
+                        expected_size = stream.total_size,
+                        "Cleaning up stream that is not sustaining the minimum transfer rate"
+                    );
+                    reaped_ids.push(*stream_id);
+                    return false;
+                }
+                // The window is cleared: slide it forward rather than
+                // letting it grow unbounded, so the check keeps measuring a
+                // *recent* rate rather than a lifetime average (a transfer
+                // that starts slow and speeds up must not be penalized
+                // forever for its opening window).
+                stream.rate_window_started_at = std::time::Instant::now();
+                stream.progressed_bytes_at_window_start = stream.total_bytes_progressed;
             }
 
             true
@@ -812,6 +965,16 @@ impl Default for StreamingState {
 
 fn is_resource_busy(error: &GossipError) -> bool {
     matches!(error, GossipError::Network(io) if io.kind() == std::io::ErrorKind::ResourceBusy)
+}
+
+/// True if `error` is `v5_chunk_target`'s "reservation vanished" signal --
+/// the owning stream was reaped while a chunk read into it was still in
+/// flight. The caller must drain and discard the remainder of that one
+/// chunk instead of treating this as a fatal protocol error, mirroring how
+/// a resource-pressure rejection is drained rather than tearing down the
+/// connection (see `DiscardStreamPayload` in `connection_pool::read_pipeline`).
+pub(crate) fn is_stream_reaped_error(error: &GossipError) -> bool {
+    matches!(error, GossipError::Network(io) if io.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
@@ -1808,7 +1971,9 @@ mod tests {
         use std::time::Duration;
 
         let idle_timeout = Duration::from_millis(40);
-        let max_lifetime = Duration::from_secs(60);
+        // Wide enough that this test's ~60ms run never crosses it: this test
+        // is about the idle check alone, not the rate floor.
+        let rate_window = Duration::from_secs(3600);
 
         let mut state = StreamingState::new();
         let total = (STRIDE * 4) as u64;
@@ -1820,7 +1985,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
             let payload = [0x5Au8; STRIDE];
             let _ = chunk(&mut state, 10, total, idx, &payload);
-            state.cleanup_stale_with(idle_timeout, max_lifetime);
+            state.cleanup_stale_with(idle_timeout, rate_window, 1);
             if idx < 3 {
                 assert_eq!(
                     state.active_stream_count(),
@@ -1832,49 +1997,161 @@ mod tests {
         }
     }
 
-    /// The reaper must still collect a stream that genuinely stalls.
+    /// A stream that sustains at least the minimum required rate survives
+    /// across many tumbling rate windows, no matter how many reaper ticks
+    /// land while it is transferring. This is the positive side of the
+    /// minimum-sustained-rate check: a slow-but-adequate transfer is never
+    /// mistaken for the drip attack `stream_below_the_rate_floor_is_reaped_despite_dodging_the_idle_check`
+    /// guards against below.
     #[test]
-    fn idle_stream_is_still_reaped() {
-        use chunk_integrity::{STRIDE, start};
-        use std::time::Duration;
-
-        let mut state = StreamingState::new();
-        start(&mut state, 11, (STRIDE * 2) as u64);
-        assert_eq!(state.active_stream_count(), 1);
-
-        std::thread::sleep(Duration::from_millis(30));
-        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(60));
-
-        assert_eq!(
-            state.active_stream_count(),
-            0,
-            "a stream with no activity past the idle timeout must be reaped"
-        );
-    }
-
-    /// A peer must not be able to hold a slot open forever by trickling chunks
-    /// just inside the idle window.
-    #[test]
-    fn stream_exceeding_max_lifetime_is_reaped_even_while_progressing() {
+    fn stream_meeting_the_rate_floor_survives_across_many_windows() {
         use chunk_integrity::{STRIDE, chunk, start};
         use std::time::Duration;
 
+        let idle_timeout = Duration::from_secs(3600); // not under test here
+        let rate_window = Duration::from_millis(30);
+        let min_bytes_per_window = 1; // any chunk at all clears it
+
         let mut state = StreamingState::new();
-        let total = (STRIDE * 4) as u64;
-        start(&mut state, 12, total);
+        // Declares far more chunks than the loop sends, so the stream never
+        // completes mid-test.
+        let total = (STRIDE * 1000) as u64;
+        start(&mut state, 14, total);
 
-        std::thread::sleep(Duration::from_millis(20));
-        let payload = [0x5Au8; STRIDE];
-        let _ = chunk(&mut state, 12, total, 0, &payload);
+        for idx in 0..12u32 {
+            std::thread::sleep(Duration::from_millis(10));
+            let payload = [0x5Au8; STRIDE];
+            let _ = chunk(&mut state, 14, total, idx, &payload);
+            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            assert_eq!(
+                state.active_stream_count(),
+                1,
+                "a stream clearing the minimum rate every window must not be reaped"
+            );
+        }
+    }
 
-        // Chunk just arrived, so it is not idle -- but its lifetime is spent.
-        state.cleanup_stale_with(Duration::from_secs(60), Duration::from_millis(10));
+    /// The bound that keeps "any progress resets the clock" from being
+    /// exploitable: a stream that sends real, nonzero progress on every
+    /// single reaper tick -- so the zero-progress idle check alone never
+    /// fires -- must still be reaped once it fails to sustain
+    /// `min_bytes_per_window` across a full rate window. Without this
+    /// check, a peer trickling one chunk just under the idle timeout could
+    /// hold its slot and inflight-byte reservation forever for the cost of
+    /// a few bytes a tick.
+    ///
+    /// This test genuinely fails if the rate-floor check is removed, or
+    /// inverted to require only nonzero (rather than sufficient) progress
+    /// per window: with either of those, this stream would never be
+    /// reaped and the loop would exhaust its iterations still active.
+    #[test]
+    fn stream_below_the_rate_floor_is_reaped_despite_dodging_the_idle_check() {
+        use chunk_integrity::{STRIDE, chunk, start};
+        use std::time::Duration;
+
+        let idle_timeout = Duration::from_millis(50); // never crossed: a chunk lands every tick
+        let rate_window = Duration::from_millis(30);
+        // One STRIDE-sized chunk per tick delivers STRIDE bytes per window at
+        // best; demanding far more than that per window makes the floor
+        // unmeetable by this drip, regardless of exact tick timing.
+        let min_bytes_per_window = STRIDE * 100;
+
+        let mut state = StreamingState::new();
+        let total = (STRIDE * 1000) as u64;
+        start(&mut state, 15, total);
+
+        let mut reaped = false;
+        for idx in 0..40u32 {
+            std::thread::sleep(Duration::from_millis(5));
+            let payload = [0x5Au8; STRIDE];
+            // The drip keeps making real, nonzero progress every tick, which
+            // is enough to defeat a zero-progress-only idle check.
+            let _ = chunk(&mut state, 15, total, idx, &payload);
+            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            if state.active_stream_count() == 0 {
+                reaped = true;
+                break;
+            }
+        }
+        assert!(
+            reaped,
+            "a stream making only trickle progress every tick must eventually be reaped \
+             for failing to sustain the minimum transfer rate, even though it never goes \
+             idle long enough to trip the zero-progress check alone"
+        );
+    }
+
+    /// The reaper must still collect a stream that genuinely stalls, and
+    /// release both its slot and its reserved inflight-byte budget.
+    #[test]
+    fn idle_stream_is_reaped_and_releases_its_slot_and_reserved_bytes() {
+        use std::time::Duration;
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let per = crate::MAX_STREAM_SIZE as u64;
+        let allowed = crate::MAX_INFLIGHT_STREAM_BYTES / crate::MAX_STREAM_SIZE;
+
+        // Fully commit the per-connection inflight budget across the max
+        // number of max-size streams it allows, none of which ever receive
+        // a chunk.
+        for i in 0..allowed as u64 {
+            let header = crate::StreamHeader {
+                stream_id: i,
+                total_size: per,
+                chunk_size: 0,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .start_stream_with_correlation(header, 1, pool.clone(), None)
+                .expect("streams within the budget are accepted");
+        }
+        assert_eq!(state.active_stream_count(), allowed);
+
+        // The budget is fully committed: one more max-size stream must be
+        // rejected while the others are still active.
+        let blocked = crate::StreamHeader {
+            stream_id: 999,
+            total_size: per,
+            chunk_size: 0,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        assert!(
+            state
+                .start_stream_with_correlation(blocked, 1, pool.clone(), None)
+                .is_err(),
+            "inflight budget must be fully committed by the existing streams"
+        );
+
+        std::thread::sleep(Duration::from_millis(30));
+        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
 
         assert_eq!(
             state.active_stream_count(),
             0,
-            "the absolute lifetime backstop must still reap a trickling stream"
+            "streams with no activity past the idle timeout must be reaped"
         );
+
+        // Every slot and its reserved bytes must be released: the full set
+        // of max-size streams can be admitted again from scratch.
+        for i in 1000..(1000 + allowed as u64) {
+            let header = crate::StreamHeader {
+                stream_id: i,
+                total_size: per,
+                chunk_size: 0,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .start_stream_with_correlation(header, 1, pool.clone(), None)
+                .expect("reaping stalled streams must release their reserved inflight bytes");
+        }
+        assert_eq!(state.active_stream_count(), allowed);
     }
 
     /// The existing zero-length stream contract must keep working.
@@ -2036,17 +2313,59 @@ mod tests {
         );
     }
 
-    /// R-L(a): a single large chunk that trickles in slowly must not be
-    /// reaped mid-read while the reader holds a live reservation. Before the
-    /// fix, `last_activity` was only advanced on a full chunk *commit*, so a
-    /// chunk larger than one idle window (e.g. a 1 MiB chunk at <17 KB/s)
-    /// looked idle even while bytes were actively arriving.
+    /// The reap-tombstone table must stay bounded no matter how many streams
+    /// are reaped over its lifetime: `MAX_REJECTED_STREAMS` is enforced by
+    /// evicting the oldest tombstone, never by growing without bound.
+    ///
+    /// Drives `tombstone_reaped_stream` directly (the exact function
+    /// `cleanup_stale_with` calls for every id it reaps) rather than forcing
+    /// real streams through real idle timeouts, so the bound is exercised
+    /// deterministically and without sleeping out the tombstone TTL.
+    #[test]
+    fn rejected_stream_table_stays_bounded_under_many_reaped_ids() {
+        let mut state = StreamingState::new();
+
+        for stream_id in 0..(MAX_REJECTED_STREAMS as u64 * 3) {
+            state.tombstone_reaped_stream(stream_id);
+            assert!(
+                state.rejected_stream_count() <= MAX_REJECTED_STREAMS,
+                "tombstone table exceeded its bound after reaping stream_id={stream_id}: {} > {}",
+                state.rejected_stream_count(),
+                MAX_REJECTED_STREAMS
+            );
+        }
+
+        assert_eq!(
+            state.rejected_stream_count(),
+            MAX_REJECTED_STREAMS,
+            "table should settle at its cap once more ids than it can hold have been reaped"
+        );
+
+        // The most recently reaped ids -- the ones a sender is most likely
+        // to still be retrying against -- must be the ones retained.
+        let newest = MAX_REJECTED_STREAMS as u64 * 3 - 1;
+        assert!(
+            state
+                .reserve_v5_chunk_or_discard(newest, 0, 1)
+                .expect("recently reaped id must still be tombstoned")
+                .is_none(),
+            "the most recently reaped id must be retained, not evicted"
+        );
+    }
+
+    /// A single large chunk that trickles in slowly must not be reaped
+    /// mid-read while the reader holds a live reservation. Progress must be
+    /// recorded explicitly via `record_v5_chunk_progress` -- mirroring what
+    /// the IO reader does after each successful partial read -- rather than
+    /// as a side effect of merely asking for the next write target, since a
+    /// chunk larger than one idle window (e.g. a 1 MiB chunk at <17 KB/s) is
+    /// polled for its target many times before any of those polls actually
+    /// transfers a byte.
     #[test]
     fn partial_v5_chunk_progress_keeps_stream_alive_past_idle_timeout() {
         use std::time::Duration;
 
         let idle_timeout = Duration::from_millis(40);
-        let max_lifetime = Duration::from_secs(60);
 
         let mut state = StreamingState::new();
         let pool = Arc::new(crate::AlignedBytesPool::default());
@@ -2073,7 +2392,8 @@ mod tests {
                 .expect("reservation is still live");
             target[..8].copy_from_slice(&[0xAB; 8]);
             read += 8;
-            state.cleanup_stale_with(idle_timeout, max_lifetime);
+            state.record_v5_chunk_progress(reservation, 8);
+            state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
             assert_eq!(
                 state.active_stream_count(),
                 1,
@@ -2082,12 +2402,112 @@ mod tests {
         }
     }
 
-    /// R-L(b): once the reaper removes a stream (idle or over the absolute
-    /// lifetime cap), the sender's next in-flight chunk for that id must be a
-    /// clean per-stream rejection, not a fatal "unknown stream_id" that tears
-    /// down the whole connection. This requires the reaped id to be
-    /// tombstoned into `rejected_streams`, mirroring the existing resource-
-    /// pressure rejection path.
+    /// The minimum-sustained-rate window must be credited by bytes actually
+    /// read, not just bytes committed. A single large chunk that never
+    /// fully commits during this test still trickles in real, steady
+    /// partial progress every tick; the rate window must see that progress
+    /// and let the stream survive across several windows, exactly like
+    /// `partial_v5_chunk_progress_keeps_stream_alive_past_idle_timeout`
+    /// proves for the idle check.
+    ///
+    /// This fails against a `cleanup_stale_with` that credits the rate
+    /// window off `received_size` alone: `received_size` stays 0 for the
+    /// whole test (the chunk never commits), so the very first rate window
+    /// to elapse would see zero bytes and reap the stream mid-transfer --
+    /// reintroducing, through the rate bound, the mid-chunk reap this whole
+    /// change exists to prevent.
+    #[test]
+    fn steady_partial_progress_through_one_large_chunk_survives_several_rate_windows() {
+        use std::time::Duration;
+
+        let idle_timeout = Duration::from_secs(3600); // not under test here
+        let rate_window = Duration::from_millis(15);
+        let min_bytes_per_window = 4;
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 220,
+            // Large enough that 8 ticks of 8 bytes each (64 bytes total)
+            // never completes it, so `received_size` never advances at all
+            // during this test -- any survival here is entirely down to
+            // crediting the in-flight partial read.
+            total_size: 128,
+            chunk_size: 128,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let reservation = state
+            .begin_v5_stream(header, 1, pool, false, 128)
+            .expect("reserve the single large chunk");
+
+        let mut read = 0usize;
+        for tick in 0..8 {
+            std::thread::sleep(Duration::from_millis(5));
+            let target = state
+                .v5_chunk_target(reservation, read)
+                .expect("reservation is still live");
+            target[..8].copy_from_slice(&[0xCDu8; 8]);
+            read += 8;
+            state.record_v5_chunk_progress(reservation, 8);
+            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            assert_eq!(
+                state.active_stream_count(),
+                1,
+                "tick {tick}: steady partial progress through an uncommitted chunk must survive \
+                 the rate-window check"
+            );
+        }
+    }
+
+    /// Merely asking for the write target (polling, with no bytes actually
+    /// transferred) must not count as progress -- otherwise a peer that
+    /// opens a stream's reservation and then never sends another byte would
+    /// still get its idle timer refreshed on every poll of the IO reader,
+    /// pinning the slot and its reservation forever.
+    #[test]
+    fn polling_the_chunk_target_without_reading_bytes_does_not_refresh_activity() {
+        use std::time::Duration;
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 210,
+            total_size: 64,
+            chunk_size: 64,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let reservation = state
+            .begin_v5_stream(header, 1, pool, false, 64)
+            .expect("reserve the chunk");
+
+        std::thread::sleep(Duration::from_millis(15));
+        // The reader is polled repeatedly (e.g. the socket is not yet
+        // readable) but no byte is ever transferred, so progress is never
+        // recorded.
+        for _ in 0..5 {
+            let _ = state
+                .v5_chunk_target(reservation, 0)
+                .expect("reservation is still live");
+        }
+
+        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "polling for a write target without transferring bytes must not block idle reaping"
+        );
+    }
+
+    /// Once the reaper removes a stream (idle timeout, no absolute cap), the
+    /// sender's next in-flight chunk for that id must be a clean per-stream
+    /// rejection, not a fatal "unknown stream_id" that tears down the whole
+    /// connection. This requires the reaped id to be tombstoned into
+    /// `rejected_streams`, mirroring the existing resource-pressure
+    /// rejection path.
     #[test]
     fn reaped_stream_tombstones_so_late_chunk_is_a_clean_rejection_not_a_fatal_teardown() {
         use std::time::Duration;
@@ -2108,7 +2528,7 @@ mod tests {
 
         // Idle out with nothing further arriving for this stream, then reap.
         std::thread::sleep(Duration::from_millis(20));
-        state.cleanup_stale_with(Duration::from_millis(5), Duration::from_secs(60));
+        state.cleanup_stale_with(Duration::from_millis(5), Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -2124,6 +2544,93 @@ mod tests {
         assert!(
             result.unwrap().is_none(),
             "a late chunk for a reaped stream must be discarded, not accepted as a fresh reservation"
+        );
+    }
+
+    /// A sender that keeps trickling chunks into a reaped id well past the
+    /// tombstone's original TTL must keep getting them silently discarded,
+    /// not eventually fall through to a fatal "unknown stream_id" once the
+    /// tombstone would otherwise have aged out. Each hit must refresh the
+    /// tombstone's own timer, the same way real stream activity refreshes a
+    /// live stream's.
+    ///
+    /// Each loop iteration refreshes (the hit) *before* the prune check that
+    /// could observe staleness, not after a sleep whose actual duration
+    /// `sleep` only lower-bounds. That ordering is what makes the interval
+    /// between hits safe to make arbitrarily long (deliberately well past
+    /// the TTL below) instead of needing to stay under it: elapsed-since-hit
+    /// at the prune check is always whatever the refresh-to-check gap is
+    /// (negligible), never the sleep duration. A version of this test that
+    /// pruned *before* refreshing would need each sleep to finish inside
+    /// `ttl`, which `sleep`'s lower-bound-only guarantee cannot promise on a
+    /// loaded worker.
+    #[test]
+    fn tombstone_is_refreshed_by_repeated_late_chunks_past_its_original_ttl() {
+        use std::time::Duration;
+
+        let ttl = Duration::from_millis(30);
+
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let header = crate::StreamHeader {
+            stream_id: 301,
+            total_size: 8,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let _ = state
+            .begin_v5_stream(header, 1, pool, false, 8)
+            .expect("start stream and reserve its first chunk");
+
+        // Wants elapsed >= ttl to force the reap: `sleep` only guarantees a
+        // lower bound, so any overshoot only makes the reap more certain.
+        std::thread::sleep(ttl + Duration::from_millis(10));
+        state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
+        assert_eq!(
+            state.active_stream_count(),
+            0,
+            "stream must be reaped first"
+        );
+
+        // Keep hitting the tombstone at deliberately long intervals -- each
+        // hit refreshes it, and refresh always happens immediately before
+        // the prune check below observes it, so no interval needs an upper
+        // bound. Sleeping well past `ttl` every time is the point: it shows
+        // the tombstone survives no matter how long the gap between hits
+        // actually is, not just gaps that happen to land under `ttl`.
+        for _ in 0..4 {
+            std::thread::sleep(ttl * 3);
+            let result = state
+                .reserve_v5_chunk_or_discard(301, 1, 8)
+                .expect("a trickling late chunk must never be a fatal protocol error");
+            assert!(
+                result.is_none(),
+                "a trickling late chunk must keep being discarded, not accepted as fresh"
+            );
+            // Immediately after the refresh above, so elapsed-since-hit is
+            // negligible here regardless of how long the preceding sleep
+            // actually ran: this can never observe the tombstone as stale.
+            state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
+            assert_eq!(
+                state.rejected_stream_count(),
+                1,
+                "the tombstone must still be present immediately after a refreshing hit"
+            );
+        }
+
+        // Refresh-on-hit is not a free pass: without a further hit, the
+        // tombstone is not immortal. `sleep`'s lower-bound guarantee is
+        // exactly what this direction needs -- it must reach at least
+        // `ttl`, and any overshoot only makes the expiry more certain.
+        std::thread::sleep(ttl * 3);
+        state.cleanup_stale_with(ttl, Duration::from_secs(3600), 1);
+        assert_eq!(
+            state.rejected_stream_count(),
+            0,
+            "a tombstone that stops being hit must eventually expire -- refresh-on-hit is \
+             doing real work above, not just sitting behind an unreachably long TTL"
         );
     }
 
