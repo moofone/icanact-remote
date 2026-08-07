@@ -2,6 +2,36 @@
 /// read side. Ordinary tell/ask commands never use this slice machinery.
 const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 
+/// Invariant: a connection must never end up with both directions unable to
+/// read because both are unable to write.
+///
+/// The IO task owns one socket's read and write sides sequentially on one
+/// task: each turn writes at most one bounded slice, then reads. A slice
+/// write is a single `poll_write` -- per the `AsyncWrite` contract it either
+/// completes having written some bytes, or returns `Pending` having written
+/// none -- so it is always safe to bound and retry from the same offset. If
+/// it were left as a plain, unbounded `.await` instead, a peer that has
+/// stopped draining its receive window parks this task inside that await
+/// with no way to return to its own read loop. Both peers running the same
+/// logic then deadlock symmetrically: neither drains its socket, so neither
+/// peer's advertised TCP window ever reopens, so neither blocked write can
+/// ever complete -- a purely application-level circular wait despite both
+/// sockets being perfectly healthy at the transport level.
+///
+/// `STREAM_WRITE_SLICE_TIMEOUT` bounds each attempt so this task always
+/// returns to its read loop on a fixed cadence regardless of how long the
+/// peer takes to drain. That alone breaks the deadlock: draining our own
+/// socket reopens our advertised window, which is exactly the progress the
+/// peer's own blocked write is waiting on, and vice versa -- ordinary TCP
+/// flow control does the rest. `STREAM_WRITE_STUCK_TEARDOWN` is the backstop
+/// for when draining never lets it through anyway (the peer is truly gone,
+/// not merely slow): once a slice has made zero progress for that long, the
+/// IO task gives up on the connection instead of retrying forever.
+const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// See `STREAM_WRITE_SLICE_TIMEOUT`.
+const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
+
 async fn write_vectored_all<S>(
     stream: &mut S,
     slices: &[std::io::IoSlice<'_>],
@@ -1287,6 +1317,9 @@ impl LockFreeStreamHandle {
                 .map(|_| crate::protocol::StreamingState::new()),
         };
         let mut last_cleanup = std::time::Instant::now();
+        // Set on the first streaming slice write that makes zero progress,
+        // cleared on any write that does. See `STREAM_WRITE_SLICE_TIMEOUT`.
+        let mut stream_write_wedged_since: Option<Instant> = None;
 
         while !shutdown_signal.load(Ordering::Acquire) {
             let mut total_bytes_written = 0;
@@ -1349,17 +1382,45 @@ impl LockFreeStreamHandle {
             if let Some(mut pending) = next_stream {
                 did_work = true;
                 let command_is_flush = matches!(&pending.command, StreamingCommand::Flush);
-                let (written, complete) =
-                    match write_streaming_command_slice(&mut stream, &mut pending).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            error!(%error, "streaming write error");
+                // Bounded, not a plain `.await` -- see the invariant on
+                // `STREAM_WRITE_SLICE_TIMEOUT`. A timeout is not an error: it
+                // means this specific attempt made zero progress, which is
+                // exactly what a `Pending` `poll_write` already means, so
+                // `pending` (offset untouched) falls through to the same
+                // "not complete" handling as an ordinary short write and is
+                // retried next turn.
+                let (written, complete) = match tokio::time::timeout(
+                    STREAM_WRITE_SLICE_TIMEOUT,
+                    write_streaming_command_slice(&mut stream, &mut pending),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        stream_write_wedged_since = None;
+                        result
+                    }
+                    Ok(Err(error)) => {
+                        error!(%error, "streaming write error");
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        let wedged_since =
+                            *stream_write_wedged_since.get_or_insert_with(Instant::now);
+                        let stuck_for = wedged_since.elapsed();
+                        if stuck_for >= STREAM_WRITE_STUCK_TEARDOWN {
+                            error!(
+                                ?stuck_for,
+                                "streaming slice write made no progress for too long; \
+                                 tearing down connection"
+                            );
                             return;
                         }
-                    };
+                        (0, false)
+                    }
+                };
                 bytes_written_counter.fetch_add(written, Ordering::Relaxed);
                 total_bytes_written += written;
-                if command_is_flush {
+                if command_is_flush && complete {
                     flush_pending.store(false, Ordering::Release);
                     bytes_since_flush = 0;
                 }
