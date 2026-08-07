@@ -267,18 +267,10 @@ pub enum WritePayload {
     /// `write_vectored_nonblocking`, `write_chunked_nonblocking`, and the
     /// `ConnectionHandle` methods built on them:
     /// `send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
-    /// `send_binary_message`) all construct this variant. Content can be
-    /// one complete self-contained V5 frame, or several concatenated (a
-    /// caller pipelining more than one send into a single write) --
-    /// `reject_oversize_single` (in `stream_writer.rs`) decodes as many
-    /// complete frames off the front as the content will yield and checks
-    /// each one's *own* `body_len` against `max_message_size`, so several
-    /// individually-valid frames concatenated together are judged the way
-    /// separate writes would have been, not rejected for their aggregate
-    /// length.
+    /// `send_binary_message`) all construct this variant.
     ///
     /// PR #183 review, round 12: this crate's wire protocol has no concept
-    /// of *opaque, unframed* bytes for this variant to carry -- rounds 11
+    /// of *opaque, unframed* bytes for this variant to carry -- round 11
     /// tried an opaque/framed split on the theory that content cannot
     /// answer "is this a frame" and the caller should declare it instead,
     /// which is true about content-sniffing but false about there being a
@@ -290,13 +282,22 @@ pub enum WritePayload {
     /// raw-passthrough mode a sender could target with genuinely unframed
     /// bytes. So every one of the methods above -- whether or not anything
     /// in this crate currently calls them -- carries complete frame(s) by
-    /// the only contract this wire format supports, and `Single` is
-    /// validated as such unconditionally, not sniffed for it. Content that
-    /// never decodes as a frame at all falls back to a bare length
-    /// ceiling as a backstop against the aggregate byte count, not because
-    /// unparseable content is an accepted shape (see
-    /// `reject_oversize_single`'s own doc comment for why: it would
-    /// desync the peer's parser regardless of what this check does).
+    /// the only contract this wire format supports.
+    ///
+    /// PR #183 review, round 13: `reject_oversize_single` (in
+    /// `stream_writer.rs`) enforces that contract as a closure property --
+    /// a `Single` write is accepted if and only if it consists of exactly
+    /// N complete V5 frames, N >= 0, each within `max_message_size`, with
+    /// nothing left over. Several valid frames concatenated in one write
+    /// are judged the way separate writes would have been (not rejected
+    /// for their aggregate length), but *any* leftover bytes that are not
+    /// themselves a complete frame -- too short to hold a control word, a
+    /// control word that doesn't decode, or a decoded frame the buffer
+    /// doesn't fully supply -- are refused outright. There is no
+    /// bare-length fallback for undecodable content: see that method's own
+    /// doc comment for the induction argument this closure property makes
+    /// sufficient on its own, independent of how a caller splits its
+    /// writes.
     ///
     /// This is deliberately the only variant a caller outside this `impl`
     /// block can reach with arbitrary content -- see `TrustedFrame` for the

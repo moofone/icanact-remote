@@ -3217,7 +3217,19 @@ fn test_connection_handle_send_data_closed() {
             CorrelationTracker::new(),
         );
 
-        let result = handle.send_data(vec![1, 2, 3]).await;
+        // PR #183 review, round 13: `send_data` carries a complete V5
+        // frame (this crate's wire protocol has no opaque-bytes case), so
+        // this must be genuine, complete frame bytes, not a bare 3-byte
+        // literal -- a nonempty remainder shorter than a control word is
+        // now refused regardless of the underlying writer's health, which
+        // isn't what this test is exercising.
+        let payload = vec![9u8; 4];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
+
+        let result = handle.send_data(data).await;
         assert!(result.is_ok());
     });
 }
