@@ -28,6 +28,19 @@ const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 /// not merely slow): once a slice has made zero progress for that long, the
 /// IO task gives up on the connection instead of retrying forever.
 ///
+/// Both constants are reused by `write_ask_nack_header_bounded` for the same
+/// "how long before we give up on this one write attempt" question, applied
+/// to a queued ask-backpressure NACK instead of a streaming response slice:
+/// a NACK write that parks indefinitely on a peer that has stopped draining
+/// would park this task's read side right along with it, the same shape of
+/// deadlock this constant exists to close for the streaming slice writer.
+/// `STREAM_WRITE_STUCK_TEARDOWN` there is only reached once the NACK write
+/// has already committed some bytes to the wire (so it can no longer be
+/// abandoned without corrupting every later frame on the connection) and
+/// then stalls; a NACK that has not yet written anything is simply
+/// abandoned instead -- best-effort, not a delivery guarantee, unlike a
+/// streaming response frame.
+///
 /// A bounded write alone is not sufficient: the read loop below also used to
 /// refuse to attempt a read at all once `local_streaming_queue.is_full()`
 /// (more than ~`MAX_STREAM_SIZE` retained), regardless of whether the next
@@ -140,22 +153,6 @@ where
     }
     Ok(result)
 }
-
-/// Bound on a single attempt to write an ask-backpressure NACK header (see
-/// `write_ask_nack_header_bounded`). The `io_task` read loop that calls
-/// this owns the connection's socket read side too, so a write that parks
-/// indefinitely on a peer that has stopped draining would park reads with
-/// it -- exactly the shape of deadlock `icanact-remote#186` closes for the
-/// streaming slice writer. A NACK is best-effort, not a delivery guarantee,
-/// so unlike a streaming response frame it can simply be abandoned once an
-/// attempt makes zero progress rather than retried forever.
-const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// See `STREAM_WRITE_SLICE_TIMEOUT`. Only reached once a NACK write has
-/// already committed some bytes to the wire (so it can no longer be
-/// abandoned without corrupting later frames on this connection) and then
-/// stalls -- the backstop for a peer that is truly gone, not merely slow.
-const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
 
 /// Write one already-built ask-NACK header without risking parking the
 /// caller's read loop on a peer that has stopped draining. A plain
