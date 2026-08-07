@@ -179,12 +179,32 @@ const STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR: usize = 2;
 /// after it already satisfies a request for "1 more byte", so a fixed
 /// `try_reclaim(1)` never reclaims (and so never sees) a hidden prefix for
 /// that shape -- a *near*-tail slice, one byte narrower than the adversarial
-/// exact-tail case above, sails through undetected. Requesting one more than
-/// `STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR * payload_len` (the slop threshold
-/// itself) instead means the cheap path can only be taken when the visible
-/// capacity is already large enough to fail the slop check on its own --
-/// every buffer that currently looks small enough to pass is forced through
-/// a real reclaim attempt first. Only buffers within
+/// exact-tail case above, sails through undetected.
+///
+/// `try_reclaim(additional)`'s `additional` is bytes *beyond the buffer's
+/// current `len()`*, and its success test is against the true backing
+/// allocation measured from its real start pointer -- not against the
+/// visible capacity, and not a desired *total* capacity. Concretely (see
+/// `bytes::BytesMut::reserve_inner`): it reclaims iff
+/// `true_backing_capacity >= len() + additional`. Requesting
+/// `slop_threshold + 1` therefore only ever reclaims when
+/// `true_backing_capacity >= payload_len + slop_threshold + 1` -- with the
+/// default 2x factor, that is `3 * payload_len + 1`, not the `2 *
+/// payload_len` this probe is actually trying to bound. Anything backed by
+/// *less* than `3 * payload_len + 1` but still more than the intended `2 *
+/// payload_len` slop bound -- e.g. a tail slice backed by 2.5x its visible
+/// length -- silently escapes: `try_reclaim` declines to look behind the
+/// view, `capacity()` keeps reporting the small unreclaimed figure, and it
+/// passes the slop check below unreclaimed and uncompacted.
+///
+/// The request must instead target the threshold itself: asking for
+/// `slop_threshold - payload_len + 1` more than `len()` (i.e. `payload_len`,
+/// with the default factor) makes the reclaim succeed exactly when
+/// `true_backing_capacity > slop_threshold` -- precisely the condition the
+/// slop check below needs to see. Every buffer that currently looks small
+/// enough to pass is forced through a real reclaim attempt first, which
+/// pulls in the true backing size whenever a hidden prefix would have
+/// pushed it over the threshold. Only buffers within
 /// `STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR` of their visible length, by this
 /// now-trustworthy accounting, keep the zero-copy path; everything else --
 /// oversized unique buffers as well as shared/owner-backed values -- is
@@ -196,22 +216,30 @@ fn normalize_streaming_payload(payload: bytes::Bytes) -> (bytes::Bytes, usize) {
     let slop_threshold = payload_len.saturating_mul(STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR);
     match payload.try_into_mut() {
         Ok(mut buffer) => {
-            // `try_reclaim(additional)` is a no-op whenever the *currently
-            // visible* capacity already satisfies `additional` -- it only
-            // moves the view back to the allocation's true start when it
-            // would not otherwise fit. Requesting merely "1 more byte" is
-            // satisfied by any slice with so much as a single spare byte
-            // after it, so it never examines (let alone reclaims) a hidden
-            // prefix in that case -- exactly the near-tail shape that slips
-            // past the slop check below undetected. Requesting one more
-            // than the slop threshold itself instead guarantees the fast
-            // path can only be taken when the visible capacity is *already*
-            // large enough to fail the check on its own (no reclaim needed
-            // to reach the right answer); every buffer that currently looks
-            // small enough to pass is forced through the real reclaim
-            // attempt, which pulls in the true backing size whenever a
-            // hidden prefix would have pushed it over the threshold.
-            let _ = buffer.try_reclaim(slop_threshold.saturating_add(1));
+            // `try_reclaim(additional)` reclaims (moves the view back to the
+            // allocation's true start) iff `true_backing_capacity >= len() +
+            // additional`. Requesting merely "1 more byte" is satisfied by
+            // any slice with so much as a single spare byte after it, so it
+            // never examines (let alone reclaims) a hidden prefix in that
+            // case -- the near-tail shape that slips past the slop check
+            // below undetected. Requesting `slop_threshold + 1` (rather than
+            // `slop_threshold - payload_len + 1`) makes the same mistake one
+            // level up: since `additional` is counted beyond `len()`, not
+            // beyond the threshold, that only reclaims once the true backing
+            // capacity reaches `payload_len + slop_threshold + 1` --
+            // `3 * payload_len + 1` at the default factor, not the `2 *
+            // payload_len` this is meant to bound. Requesting `slop_threshold
+            // - payload_len + 1` more than `len()` instead guarantees the
+            // fast path is only taken when the visible capacity is *already*
+            // large enough to fail the check on its own; every buffer that
+            // currently looks small enough to pass is forced through the
+            // real reclaim attempt, which pulls in the true backing size
+            // whenever a hidden prefix would have pushed it over the
+            // threshold.
+            let reclaim_request = slop_threshold
+                .saturating_sub(payload_len)
+                .saturating_add(1);
+            let _ = buffer.try_reclaim(reclaim_request);
             if buffer.capacity() <= slop_threshold {
                 let retained_bytes = buffer.capacity().max(payload_len);
                 (buffer.freeze(), retained_bytes)
@@ -859,6 +887,55 @@ mod normalize_streaming_payload_tests {
             retained_bytes <= VISIBLE_LEN * 4,
             "retained_bytes ({retained_bytes}) must reflect the logical payload size \
              ({VISIBLE_LEN}) once compacted, not the {BACKING_CAPACITY}-byte backing allocation"
+        );
+    }
+
+    /// Review finding: `try_reclaim(additional)` measures `additional` beyond
+    /// `len()`, not beyond `slop_threshold`, and its success test is against
+    /// the *true* backing allocation, not the visible capacity. The old
+    /// `try_reclaim(slop_threshold + 1)` request therefore only ever actually
+    /// reclaims once the true backing capacity reaches roughly `3 *
+    /// payload_len + 1` -- every buffer backed by *less* than that but still
+    /// more than the intended `2 * payload_len` slop bound escapes
+    /// undetected. The three tests above all use a 1MB backing allocation
+    /// against a 100-byte slice (10,000x), which clears even the buggy
+    /// `3x` threshold and so cannot distinguish the bug from the fix. This
+    /// one lands exactly in the gap the buggy request never exercised: a
+    /// tail slice backed by 2.5x its visible length -- inside `(2x, 3x)` --
+    /// must still be compacted.
+    #[test]
+    fn does_not_retain_full_backing_capacity_for_a_tail_slice_backed_by_between_two_and_three_times_its_length()
+     {
+        const VISIBLE_LEN: usize = 100_000;
+        const BACKING_CAPACITY: usize = VISIBLE_LEN * 5 / 2; // 2.5x: strictly inside (2x, 3x).
+
+        let mut buf = bytes::BytesMut::with_capacity(BACKING_CAPACITY);
+        buf.extend_from_slice(&vec![0u8; BACKING_CAPACITY]);
+        let full = buf.freeze();
+        let backing_start = full.as_ptr() as usize;
+        let tail = full.slice(BACKING_CAPACITY - VISIBLE_LEN..);
+        // Drop the sibling handle so `tail` is the sole owner and
+        // `try_into_mut` takes the zero-copy path this test targets.
+        drop(full);
+
+        let (payload, retained_bytes) = normalize_streaming_payload(tail);
+
+        assert_eq!(payload.len(), VISIBLE_LEN);
+
+        let payload_start = payload.as_ptr() as usize;
+        let still_shares_the_backing_allocation =
+            payload_start >= backing_start && payload_start < backing_start + BACKING_CAPACITY;
+        assert!(
+            !still_shares_the_backing_allocation,
+            "a tail slice backed by {BACKING_CAPACITY} bytes (2.5x its {VISIBLE_LEN}-byte \
+             visible length -- inside the (2x, 3x) band the old `slop_threshold + 1` request \
+             never actually reclaimed) must be compacted, not retained zero-copy"
+        );
+        assert!(
+            retained_bytes <= VISIBLE_LEN * STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR,
+            "retained_bytes ({retained_bytes}) must respect the \
+             {STREAMING_PAYLOAD_RETAIN_SLOP_FACTOR}x accounting bound once compacted, not the \
+             {BACKING_CAPACITY}-byte backing allocation"
         );
     }
 
