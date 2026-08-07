@@ -2601,6 +2601,60 @@ impl LockFreeStreamHandle {
         }
     }
 
+    /// Every `WritePayload` variant that carries an explicit frame header
+    /// begins it with the V5 control word (`framing::encode_control`), whose
+    /// decoded `body_len` is already `fixed_header_len + payload_len` for
+    /// whichever frame kind built it -- every `write_*_header` constructor in
+    /// `framing.rs` computes it that way (see `checked_body_len`). Decoding
+    /// it back here, once, at the single point every inline (non-streaming)
+    /// write funnels through -- this method is called from all four
+    /// `enqueue_*` functions below -- is the authoritative backstop for the
+    /// `max_message_size` gate: it does not matter whether the caller went
+    /// through `ConnectionHandle::reject_oversize_inline`'s pre-check, a
+    /// narrower pre-check (`ask_responder`'s streaming-threshold-only
+    /// lanes), or no pre-check at all -- an oversize inline send cannot
+    /// reach the write queue, so it cannot reach the wire and get the peer
+    /// to fatally reject it and tear the whole shared connection down. A
+    /// pre-check upstream of this one is still worth keeping where it
+    /// exists (it can reject before spending a header build, an
+    /// `AlignedBytes` conversion, etc.), but none of them is load-bearing
+    /// for correctness anymore -- this is.
+    ///
+    /// `Single`/`Buf` are intentionally exempt: `Single` carries either an
+    /// already self-contained fixed-size control frame (route bind, stream
+    /// abort -- both far under any real `max_message_size`) or a
+    /// pre-concatenated multi-frame batch
+    /// (`ConnectionHandle::ask_batch_deferred`), and `Buf` is a generic byte
+    /// source with no framing contract this module owns. Neither is "one
+    /// frame's header plus its payload" to decode a single `body_len` from.
+    fn reject_oversize_write_payload(&self, payload: &WritePayload) -> Result<()> {
+        let header: &[u8] = match payload {
+            WritePayload::HeaderPayload { header, .. } => header.as_ref(),
+            WritePayload::HeaderInline { header, .. } => &header[..],
+            WritePayload::HeaderInlineAligned { header, .. } => &header[..],
+            WritePayload::HeaderInline32 { header, .. } => &header[..],
+            WritePayload::HeaderPooled { header, .. } => header.as_ref(),
+            WritePayload::HeaderInlinePooled { header, .. } => &header[..],
+            WritePayload::DirectAskInline { header, .. } => &header[..],
+            WritePayload::Single(_) | WritePayload::Buf(_) => return Ok(()),
+        };
+        if header.len() < framing::LENGTH_PREFIX_LEN {
+            return Ok(());
+        }
+        let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
+        control_word.copy_from_slice(&header[..framing::LENGTH_PREFIX_LEN]);
+        let Some(control) = framing::decode_control(control_word) else {
+            return Ok(());
+        };
+        if control.body_len > self.max_message_size {
+            return Err(GossipError::MessageTooLarge {
+                size: control.body_len,
+                max: self.max_message_size,
+            });
+        }
+        Ok(())
+    }
+
     async fn enqueue_write(&self, payload: WritePayload) -> Result<()> {
         if self.exit_flag.load(Ordering::Acquire) {
             return Err(GossipError::ConnectionClosed(self.addr));
@@ -2608,6 +2662,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         let command = WriteCommand::Payload(payload);
         match self.write_queue.try_push(command) {
@@ -2626,6 +2681,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         let command = WriteCommand::AskPayload(payload);
         match self.write_queue.try_push(command) {
@@ -2644,6 +2700,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         match self.write_queue.try_push(WriteCommand::Payload(payload)) {
             Ok(()) => {
@@ -2661,6 +2718,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         match self
             .immediate_write_queue
@@ -4084,6 +4142,174 @@ mod route_interning_tests {
         );
         writer.shutdown();
         drop(peer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review: the size gate landed only on `ConnectionHandle`'s entry
+/// points. Every caller that reaches `LockFreeStreamHandle` some other way
+/// (`stream_writer.rs`'s own `write_response_inline`/`send_response_auto*`,
+/// `ask_responder`'s pooled/nonblocking lanes, `pool_connect.rs`'s gossip
+/// responses, the debug-only raw-ask echo in `handle.rs`) built a header via
+/// a `write_*_header` call (which only enforces the V5 27-bit wire ceiling)
+/// and enqueued it directly, with no `max_message_size` check anywhere on
+/// that path. These tests exercise `reject_oversize_write_payload` -- the
+/// backstop in `enqueue_write`/`enqueue_ask_write`/
+/// `enqueue_write_nonblocking`/`enqueue_immediate_write_nonblocking` -- at
+/// the entry points those bypassing callers actually use, so a future
+/// caller added anywhere in the crate inherits the gate automatically
+/// instead of needing its own copy.
+#[cfg(test)]
+mod write_payload_size_gate_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    /// `max_message_size` (via `ReadContext`) is set far below the default
+    /// streaming threshold (~1 MiB, from `BufferConfig::default`), so a
+    /// payload comfortably under the streaming threshold -- meaning
+    /// `send_response_auto_bytes` picks the inline branch
+    /// (`write_response_inline`), never `stream_response_bytes` -- still has
+    /// an encoded body one byte over `max_message_size`. Before this gate,
+    /// that frame was queued for the wire; the peer would have fatally
+    /// rejected it as `MessageTooLarge` and torn the whole shared connection
+    /// down (the exact bug PR #183 exists to prevent, still open on this
+    /// entry point after the `ConnectionHandle`-only fix).
+    #[tokio::test]
+    async fn auto_response_inline_over_max_message_size_is_rejected() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 4096;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9950".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9950, max_message_size)),
+        );
+        assert!(
+            max_message_size < writer.streaming_threshold(),
+            "test setup: max_message_size must sit below the streaming \
+             threshold so the payload below takes the inline path"
+        );
+
+        let oversize_len = max_message_size - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
+        let oversize_payload = bytes::Bytes::from(vec![0u8; oversize_len]);
+        let err = writer
+            .send_response_auto_bytes(1, oversize_payload)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        // The connection must still carry a normal-size response afterward --
+        // proving the gate rejected the oversized payload locally instead of
+        // desyncing or tearing the connection down.
+        let ok_len = max_message_size - crate::framing::ASK_RESPONSE_HEADER_LEN;
+        let ok_payload = bytes::Bytes::from(vec![7u8; ok_len]);
+        writer
+            .send_response_auto_bytes(2, ok_payload.clone())
+            .await
+            .unwrap();
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        peer.read_exact(&mut ctrl).await.unwrap();
+        let control = crate::framing::decode_control(ctrl).unwrap();
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(control.body_len, crate::framing::ASK_RESPONSE_HEADER_LEN + ok_len);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `write_header_and_payload_control` (the `Bytes`-header `HeaderPayload`
+    /// primitive `pool_connect.rs`'s gossip-response sends and the
+    /// debug-only raw-ask echo in `handle.rs` use) has no `max_message_size`
+    /// pre-check of its own anywhere upstream of it -- this proves the same
+    /// backstop covers it too.
+    #[tokio::test]
+    async fn header_payload_over_max_message_size_is_rejected() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9951".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9951, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let payload = bytes::Bytes::from(vec![0u8; payload_len]);
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::write_gossip_frame_prefix(payload.len()).unwrap(),
+        );
+        let err = writer
+            .write_header_and_payload_control(header, payload)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A rejected oversize write must not bump `sequence_number` -- mirroring
+    /// `raw_tell_oversize_never_enqueues_a_corrupted_frame`
+    /// (`connection_pool/handle.rs`) for this backstop: nothing was ever
+    /// queued, so the observability counter must not move either.
+    #[tokio::test]
+    async fn rejected_oversize_write_does_not_advance_sequence_number() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9952".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9952, max_message_size)),
+        );
+
+        let before = writer.sequence_number();
+        let oversize_len = max_message_size - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
+        let err = writer
+            .send_response_auto_bytes(1, bytes::Bytes::from(vec![0u8; oversize_len]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_eq!(
+            writer.sequence_number(),
+            before,
+            "an oversized inline write must be rejected before anything is queued"
+        );
+
+        writer.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 }
