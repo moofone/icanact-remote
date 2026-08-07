@@ -85,6 +85,84 @@ const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
 /// See `STREAM_WRITE_SLICE_TIMEOUT`.
 const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
 
+/// `StreamingCommand::Flush`'s own stuck-teardown budget, tracked on its own
+/// wedge clock independently of `STREAM_WRITE_STUCK_TEARDOWN` (see
+/// `record_slice_attempt`). Sharing a clock and a budget with the other
+/// `StreamingCommand` variants is wrong for `Flush`, not just imprecise:
+///
+/// - `AsyncWrite::poll_write` guarantees a `Pending` result wrote zero bytes,
+///   which is exactly what lets a `STREAM_WRITE_SLICE_TIMEOUT` miss stand in
+///   for "this attempt made zero progress" for every other variant (see
+///   `write_vectored_once`). `AsyncWrite::poll_flush` carries no equivalent
+///   guarantee: a real implementation (buffered writers, TLS) commonly drains
+///   part of its internal buffer through the underlying transport and *then*
+///   returns `Pending` because more is still queued. Folding that into the
+///   same "zero progress" bucket as a genuinely wedged `poll_write` is simply
+///   the wrong reading of the contract, not a conservative one.
+/// - Buffered/TLS `poll_write` calls typically return `Ready` as soon as the
+///   bytes are copied into the writer's own buffer, well before they have
+///   necessarily reached the peer. The real "wait for a slow socket to
+///   actually drain" time `STREAM_WRITE_STUCK_TEARDOWN` is calibrated to
+///   bound is therefore, for a large buffered backlog, mostly *not* spent
+///   inside any single write slice at all -- it lands on the `Flush` that
+///   follows once every write has already reported `complete`. A `Flush`
+///   finishing a large backlog over a slow-but-healthy link is
+///   disproportionately likely to need longer than any one write ever does,
+///   purely because it is left holding that concentrated wait, not because
+///   anything is actually wrong with the connection.
+///
+/// Set well above `STREAM_WRITE_STUCK_TEARDOWN` accordingly, trading a slower
+/// worst-case detection of a `Flush` stuck on a genuinely dead peer for not
+/// tearing down a connection that is still visibly draining, just slowly.
+const STREAM_FLUSH_STUCK_TEARDOWN: Duration = Duration::from_secs(120);
+
+/// Outcome of one bounded streaming slice attempt (write or flush) that did
+/// not complete within `STREAM_WRITE_SLICE_TIMEOUT`, or that did.
+#[derive(Debug, PartialEq, Eq)]
+enum SliceAttemptOutcome {
+    /// Retry next turn: either the attempt completed/made progress, or it
+    /// timed out but has not yet been wedged long enough to give up.
+    Continue,
+    /// Timed out with zero confirmed progress for at least the applicable
+    /// teardown budget; the caller should tear the connection down.
+    TearDown { stuck_for: Duration },
+}
+
+/// Update the write/flush wedge clocks for one slice attempt's result and
+/// decide whether the applicable kind-specific teardown budget has now
+/// elapsed. `Flush` and every other `StreamingCommand` variant are tracked on
+/// independent clocks against independent budgets (`STREAM_FLUSH_STUCK_TEARDOWN`
+/// vs. `STREAM_WRITE_STUCK_TEARDOWN`) -- see the doc comment on the former for
+/// why conflating them is a correctness bug, not just imprecise accounting.
+///
+/// Takes `now` as an explicit parameter (never calls `Instant::now()` itself)
+/// so this is unit-testable against fabricated instants instead of requiring
+/// callers to wait out the real multi-second/minute budgets end to end.
+fn record_slice_attempt(
+    command_is_flush: bool,
+    attempt_completed: bool,
+    now: Instant,
+    write_wedged_since: &mut Option<Instant>,
+    flush_wedged_since: &mut Option<Instant>,
+) -> SliceAttemptOutcome {
+    let (wedged_since, teardown_budget) = if command_is_flush {
+        (flush_wedged_since, STREAM_FLUSH_STUCK_TEARDOWN)
+    } else {
+        (write_wedged_since, STREAM_WRITE_STUCK_TEARDOWN)
+    };
+    if attempt_completed {
+        *wedged_since = None;
+        return SliceAttemptOutcome::Continue;
+    }
+    let started = *wedged_since.get_or_insert(now);
+    let stuck_for = now.saturating_duration_since(started);
+    if stuck_for >= teardown_budget {
+        SliceAttemptOutcome::TearDown { stuck_for }
+    } else {
+        SliceAttemptOutcome::Continue
+    }
+}
+
 async fn write_vectored_all<S>(
     stream: &mut S,
     slices: &[std::io::IoSlice<'_>],
@@ -1378,7 +1456,13 @@ impl LockFreeStreamHandle {
         let mut last_cleanup = std::time::Instant::now();
         // Set on the first streaming slice write that makes zero progress,
         // cleared on any write that does. See `STREAM_WRITE_SLICE_TIMEOUT`.
+        // `Flush` attempts never touch this clock -- see
+        // `stream_flush_wedged_since` and `STREAM_FLUSH_STUCK_TEARDOWN`.
         let mut stream_write_wedged_since: Option<Instant> = None;
+        // Same as `stream_write_wedged_since`, but for `StreamingCommand::Flush`
+        // attempts only, against `STREAM_FLUSH_STUCK_TEARDOWN` instead of
+        // `STREAM_WRITE_STUCK_TEARDOWN`. See `record_slice_attempt`.
+        let mut stream_flush_wedged_since: Option<Instant> = None;
 
         while !shutdown_signal.load(Ordering::Acquire) {
             let mut total_bytes_written = 0;
@@ -1447,7 +1531,10 @@ impl LockFreeStreamHandle {
                 // exactly what a `Pending` `poll_write` already means, so
                 // `pending` (offset untouched) falls through to the same
                 // "not complete" handling as an ordinary short write and is
-                // retried next turn.
+                // retried next turn. `Flush` does not carry that same
+                // `Pending`-means-zero-progress guarantee, so its attempts are
+                // tracked on their own wedge clock and budget -- see
+                // `record_slice_attempt` and `STREAM_FLUSH_STUCK_TEARDOWN`.
                 let (written, complete) = match tokio::time::timeout(
                     STREAM_WRITE_SLICE_TIMEOUT,
                     write_streaming_command_slice(&mut stream, &mut pending),
@@ -1455,7 +1542,13 @@ impl LockFreeStreamHandle {
                 .await
                 {
                     Ok(Ok(result)) => {
-                        stream_write_wedged_since = None;
+                        record_slice_attempt(
+                            command_is_flush,
+                            true,
+                            Instant::now(),
+                            &mut stream_write_wedged_since,
+                            &mut stream_flush_wedged_since,
+                        );
                         result
                     }
                     Ok(Err(error)) => {
@@ -1463,12 +1556,18 @@ impl LockFreeStreamHandle {
                         return;
                     }
                     Err(_elapsed) => {
-                        let wedged_since =
-                            *stream_write_wedged_since.get_or_insert_with(Instant::now);
-                        let stuck_for = wedged_since.elapsed();
-                        if stuck_for >= STREAM_WRITE_STUCK_TEARDOWN {
+                        if let SliceAttemptOutcome::TearDown { stuck_for } =
+                            record_slice_attempt(
+                                command_is_flush,
+                                false,
+                                Instant::now(),
+                                &mut stream_write_wedged_since,
+                                &mut stream_flush_wedged_since,
+                            )
+                        {
                             error!(
                                 ?stuck_for,
+                                command_is_flush,
                                 "streaming slice write made no progress for too long; \
                                  tearing down connection"
                             );
@@ -4474,5 +4573,144 @@ mod route_interning_tests {
         writer.shutdown();
         drop(peer);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    // `record_slice_attempt` tests below use fabricated `Instant`s (a real
+    // `Instant::now()` plus a synthetic offset) instead of sleeping, so they
+    // exercise the multi-second/minute teardown budgets deterministically and
+    // instantly rather than waiting them out end to end.
+
+    /// A `Flush` attempt that times out must accumulate against its own
+    /// clock, never `stream_write_wedged_since` -- and vice versa for a
+    /// write. Before this fix both kinds shared one clock and one budget
+    /// (`STREAM_WRITE_STUCK_TEARDOWN`), so a write that had already been
+    /// stuck for a while left a `Flush` that started right after it with an
+    /// already-partially-spent budget it never should have inherited.
+    #[test]
+    fn flush_and_write_timeouts_accumulate_on_independent_clocks() {
+        let t0 = Instant::now();
+        let mut write_wedged_since: Option<Instant> = None;
+        let mut flush_wedged_since: Option<Instant> = None;
+
+        // A write has already been stuck for 20s.
+        record_slice_attempt(
+            false,
+            false,
+            t0 + Duration::from_secs(20),
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(write_wedged_since, Some(t0 + Duration::from_secs(20)));
+        assert_eq!(flush_wedged_since, None, "an unrelated write must never set the flush clock");
+
+        // A flush's first timeout arrives right after, at the same instant.
+        // It must start its own clock from *now*, not inherit the write's.
+        record_slice_attempt(
+            true,
+            false,
+            t0 + Duration::from_secs(20),
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            flush_wedged_since,
+            Some(t0 + Duration::from_secs(20)),
+            "flush must start its own wedge clock, not read the write clock"
+        );
+        assert_eq!(
+            write_wedged_since,
+            Some(t0 + Duration::from_secs(20)),
+            "a flush timeout must never touch the write clock"
+        );
+    }
+
+    /// The core regression this fix addresses: a `Flush` that keeps timing
+    /// out past `STREAM_WRITE_STUCK_TEARDOWN` (30s) -- while a *write* stuck
+    /// that long is correctly torn down -- must not be torn down, because
+    /// `poll_flush`'s `Pending` carries no "zero progress" guarantee the way
+    /// `poll_write`'s does. It only gives up once its own, larger
+    /// `STREAM_FLUSH_STUCK_TEARDOWN` budget elapses.
+    #[test]
+    fn flush_outlives_the_write_teardown_budget_but_not_its_own() {
+        let t0 = Instant::now();
+        let mut write_wedged_since: Option<Instant> = None;
+        let mut flush_wedged_since: Option<Instant> = None;
+
+        // First timeout for each, at t0.
+        record_slice_attempt(false, false, t0, &mut write_wedged_since, &mut flush_wedged_since);
+        record_slice_attempt(true, false, t0, &mut write_wedged_since, &mut flush_wedged_since);
+
+        // Exactly at the write budget: a write stuck this long is torn down...
+        let at_write_budget = t0 + STREAM_WRITE_STUCK_TEARDOWN;
+        let write_outcome = record_slice_attempt(
+            false,
+            false,
+            at_write_budget,
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            write_outcome,
+            SliceAttemptOutcome::TearDown {
+                stuck_for: STREAM_WRITE_STUCK_TEARDOWN
+            },
+            "a write stuck for STREAM_WRITE_STUCK_TEARDOWN must still be torn down"
+        );
+
+        // ...but a flush stuck for the exact same duration must not be: it
+        // has not yet reached its own, larger budget.
+        let flush_outcome = record_slice_attempt(
+            true,
+            false,
+            at_write_budget,
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            flush_outcome,
+            SliceAttemptOutcome::Continue,
+            "a flush stuck for only STREAM_WRITE_STUCK_TEARDOWN must not be torn down: \
+             poll_flush's Pending does not mean zero progress the way poll_write's does"
+        );
+
+        // A flush stuck for its own, larger budget is torn down.
+        let at_flush_budget = t0 + STREAM_FLUSH_STUCK_TEARDOWN;
+        let flush_outcome_at_budget = record_slice_attempt(
+            true,
+            false,
+            at_flush_budget,
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            flush_outcome_at_budget,
+            SliceAttemptOutcome::TearDown {
+                stuck_for: STREAM_FLUSH_STUCK_TEARDOWN
+            },
+            "a flush stuck for its own STREAM_FLUSH_STUCK_TEARDOWN budget must be torn down"
+        );
+    }
+
+    /// A completed attempt clears only its own kind's clock, leaving the
+    /// other kind's in-flight wedge state untouched.
+    #[test]
+    fn completed_attempt_clears_only_its_own_clock() {
+        let t0 = Instant::now();
+        let mut write_wedged_since: Option<Instant> = Some(t0);
+        let mut flush_wedged_since: Option<Instant> = Some(t0);
+
+        record_slice_attempt(
+            true,
+            true,
+            t0 + Duration::from_secs(5),
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(flush_wedged_since, None, "a completed flush must clear the flush clock");
+        assert_eq!(
+            write_wedged_since,
+            Some(t0),
+            "a completed flush must not touch an unrelated in-flight write's clock"
+        );
     }
 }
