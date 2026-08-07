@@ -8931,40 +8931,50 @@ impl<T: 'static> GossipRegistry<T> {
         // a stale-but-under-threshold alias and drop the address this
         // node is actually connected to right now, silently skipping that
         // peer's gossip for the round. Track the best alias seen so far
-        // per identity instead: a live connection always wins over a
-        // non-live one, and among equally (non-)live aliases fewer
-        // failures wins -- both checked while iterating, so the result is
-        // independent of visitation order.
+        // per identity instead, ranked (highest priority first): a live
+        // connection always wins over a non-live one; among equally
+        // (non-)live aliases, a genuinely dialable one always wins over a
+        // `transport_source_keyed` one -- an ephemeral connection source
+        // is not dialable by anyone else, so it must never be preferred
+        // merely for having fewer failures; and only among aliases tied
+        // on both wins on fewer failures. All three are checked while
+        // iterating, so the result is independent of visitation order.
         let targets: Vec<SocketAddr> = {
             let gossip_state = self.gossip_state.lock().await;
             let mut best_by_identity: std::collections::HashMap<
                 PeerDispatchKey,
-                (SocketAddr, bool, usize),
+                (SocketAddr, bool, bool, usize),
             > = std::collections::HashMap::new();
             for (addr, info) in gossip_state.peers.iter() {
                 if info.failures >= self.config.max_peer_failures {
                     continue;
                 }
                 let is_live = self.addr_has_live_connection(*addr, info);
+                let dialable = !info.transport_source_keyed;
                 best_by_identity
                     .entry(PeerDispatchKey::for_entry(*addr, info))
-                    .and_modify(|(best_addr, best_is_live, best_failures)| {
+                    .and_modify(|(best_addr, best_is_live, best_dialable, best_failures)| {
                         let better = match (is_live, *best_is_live) {
                             (true, false) => true,
                             (false, true) => false,
-                            _ => info.failures < *best_failures,
+                            _ => match (dialable, *best_dialable) {
+                                (true, false) => true,
+                                (false, true) => false,
+                                _ => info.failures < *best_failures,
+                            },
                         };
                         if better {
                             *best_addr = *addr;
                             *best_is_live = is_live;
+                            *best_dialable = dialable;
                             *best_failures = info.failures;
                         }
                     })
-                    .or_insert((*addr, is_live, info.failures));
+                    .or_insert((*addr, is_live, dialable, info.failures));
             }
             let mut active_peers: Vec<SocketAddr> = best_by_identity
                 .into_values()
-                .map(|(addr, _, _)| addr)
+                .map(|(addr, _, _, _)| addr)
                 .collect();
 
             // Shuffle and take max_peer_gossip_targets
@@ -12426,6 +12436,70 @@ mod tests {
              whichever alias the peer-id-wide connection fallback would also \
              match: {targeted:?}"
         );
+    }
+
+    /// Among equally-live (here: neither live) aliases of one identity
+    /// with EQUAL failure counts, a `transport_source_keyed` entry must
+    /// lose to a genuinely dialable one. Without this, `HashMap`
+    /// iteration decides which alias survives dedup, and picking the
+    /// ephemeral source as the `GossipTask.peer_addr` is exactly the
+    /// outcome this PR exists to prevent -- that address is not dialable
+    /// by anyone else. `gossip_state.peers` is a `HashMap`, so which
+    /// alias iteration visits first is arbitrary; this test constructs
+    /// both possible insertion orders and repeats each one (HashMap
+    /// hashing is randomly re-seeded per instance) so a wrong answer
+    /// can't hide behind luck.
+    #[tokio::test]
+    async fn gossip_peer_list_target_selection_prefers_dialable_alias_over_transport_source_keyed()
+    {
+        for reversed in [false, true] {
+            for _ in 0..20 {
+                let mut config =
+                    test_config_with_seed("gossip-target-prefers-dialable-over-source-keyed");
+                config.enable_peer_discovery = true;
+                let registry = GossipRegistry::<()>::new(test_addr(20_250), config);
+
+                let shared_node_id = test_peer_id("gossip-target-dialable-shared").to_node_id();
+                let dialable_addr = test_addr(20_251);
+                let source_keyed_addr = test_addr(20_252);
+
+                let mut dialable_info = peer_info_with_node_id(dialable_addr, shared_node_id);
+                dialable_info.identity_verified = true;
+                let mut source_keyed_info =
+                    peer_info_with_node_id(source_keyed_addr, shared_node_id);
+                source_keyed_info.identity_verified = true;
+                source_keyed_info.transport_source_keyed = true;
+
+                {
+                    let mut state = registry.gossip_state.lock().await;
+                    if reversed {
+                        state.peers.insert(source_keyed_addr, source_keyed_info);
+                        state.peers.insert(dialable_addr, dialable_info);
+                    } else {
+                        state.peers.insert(dialable_addr, dialable_info);
+                        state.peers.insert(source_keyed_addr, source_keyed_info);
+                    }
+                }
+
+                let tasks = registry.gossip_peer_list_immediate().await;
+                let targeted: Vec<SocketAddr> = tasks.iter().map(|t| t.peer_addr).collect();
+                assert_eq!(
+                    targeted
+                        .iter()
+                        .filter(|a| **a == dialable_addr || **a == source_keyed_addr)
+                        .count(),
+                    1,
+                    "the shared identity must receive exactly one peer-list gossip \
+                     task (reversed: {reversed}): {targeted:?}"
+                );
+                assert!(
+                    targeted.contains(&dialable_addr),
+                    "the dialable alias must be chosen over the transport-source-keyed \
+                     one, not whichever HashMap iteration visits first \
+                     (reversed: {reversed}): {targeted:?}"
+                );
+            }
+        }
     }
 
     /// `transport_source_keyed` must not survive an operator explicitly
