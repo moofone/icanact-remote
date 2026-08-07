@@ -101,6 +101,23 @@ pub struct StreamingState {
 /// the tombstone it still needs.
 const REJECTED_STREAMS_BITMAP_WORD_BUDGET: usize = 131_072;
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only instrumentation: the word count of the last bitmap
+    /// `RejectedStreamTombstone::establish_stride` actually allocated on
+    /// this thread, or `None` if it has not allocated one on this thread
+    /// since the test last reset it. Thread-local (not a shared counter) so
+    /// this stays reliable under `cargo test`'s default parallelism -- each
+    /// `#[test]` runs to completion on one thread, so a shared counter
+    /// would otherwise be contaminated by unrelated tests allocating
+    /// bitmaps concurrently on other threads. Lets a test assert that a
+    /// budget-exhausted rejection prevented the allocation itself, not
+    /// merely that the tombstone was not inserted afterward -- see
+    /// `reject_stream`.
+    static LAST_ESTABLISHED_BITMAP_WORDS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Chunk-completion state for a rejected or reaped stream generation,
 /// tracked precisely enough to know the instant no protocol-compliant
 /// sender can have any more bytes left to send for it.
@@ -207,9 +224,30 @@ impl RejectedStreamTombstone {
             return;
         }
         self.chunk_stride = Some(chunk_len);
-        let expected = (self.total_size as usize).div_ceil(chunk_len);
+        let expected = Self::expected_chunk_count(self.total_size, chunk_len);
         self.expected_chunks = Some(expected);
-        self.received_chunks = vec![0u64; expected.div_ceil(64)];
+        let words = Self::bitmap_words_for(expected);
+        #[cfg(test)]
+        LAST_ESTABLISHED_BITMAP_WORDS.with(|cell| cell.set(Some(words)));
+        self.received_chunks = vec![0u64; words];
+    }
+
+    /// The chunk count `establish_stride` would derive for a stride of
+    /// `chunk_len` against a declared `total_size` -- pure arithmetic, no
+    /// allocation. `chunk_len` must be nonzero (see `establish_stride`).
+    /// Shared with `StreamingState::reject_stream` so it can size (and
+    /// budget-check) the bitmap `establish_stride` would allocate *before*
+    /// ever constructing the tombstone that allocates it, using the exact
+    /// same formula rather than a hand-derived copy that could drift.
+    fn expected_chunk_count(total_size: u64, chunk_len: usize) -> usize {
+        (total_size as usize).div_ceil(chunk_len)
+    }
+
+    /// The chunk-completion bitmap word count for `expected_chunks` chunks
+    /// (one bit per chunk, packed into `u64` words) -- pure arithmetic, no
+    /// allocation. See `expected_chunk_count`.
+    fn bitmap_words_for(expected_chunks: usize) -> usize {
+        expected_chunks.div_ceil(64)
     }
 
     /// Records `chunk_index` as received. Silently ignores an index outside
@@ -744,13 +782,62 @@ impl StreamingState {
     /// trigger again) or by a retry of this exact `stream_id` -- which,
     /// with a peer that never reuses ids, may never happen. Inserting it
     /// anyway would leak one map entry per single-frame rejection forever.
+    ///
+    /// A single expected chunk (`first_chunk_len >= total_size`) is exactly
+    /// the condition under which the tombstone `RejectedStreamTombstone::
+    /// rejected` would build is already complete (see
+    /// `RejectedStreamTombstone::expected_chunk_count`/`is_complete`): chunk
+    /// 0 is marked received at construction, and one chunk is all there is.
+    /// Checked here, before either the budget or the tombstone itself, using
+    /// the same allocation-free arithmetic `establish_stride` uses, so this
+    /// never-inserted case is also never charged bitmap-word accounting it
+    /// would not actually need.
+    ///
+    /// Otherwise, the projected bitmap word count is checked against
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` *before* constructing the
+    /// tombstone that would allocate it. A valid `MAX_STREAM_SIZE`
+    /// declaration paired with a one-byte first chunk needs ~1,048,576 words
+    /// (8 MiB) against a 131,072-word (1 MiB) budget; building the tombstone
+    /// first and only then consulting the budget (the previous shape of this
+    /// function) pays for that allocation on every such rejection regardless
+    /// of whether the budget would have refused it.
     fn reject_stream(&mut self, stream_id: u64, total_size: u64, first_chunk_len: usize) -> bool {
-        let tombstone = RejectedStreamTombstone::rejected(total_size, first_chunk_len);
-        if tombstone.is_complete() {
+        let expected_chunks =
+            RejectedStreamTombstone::expected_chunk_count(total_size, first_chunk_len);
+        if expected_chunks <= 1 {
             self.remove_tombstone(stream_id);
             return true;
         }
+        let new_words = RejectedStreamTombstone::bitmap_words_for(expected_chunks);
+        if self.projected_bitmap_words(stream_id, new_words).is_none() {
+            return false;
+        }
+        let tombstone = RejectedStreamTombstone::rejected(total_size, first_chunk_len);
+        debug_assert!(
+            !tombstone.is_complete(),
+            "expected_chunks > 1 above must not agree with is_complete()"
+        );
         self.try_insert_tombstone(stream_id, tombstone)
+    }
+
+    /// The aggregate bitmap word count `rejected_streams` would hold if
+    /// `stream_id`'s tombstone were (re)inserted needing `new_words` words,
+    /// or `None` if that would exceed `REJECTED_STREAMS_BITMAP_WORD_BUDGET`.
+    /// An existing tombstone already charged against the budget for the same
+    /// `stream_id` is replaced, not added to. Split out from
+    /// `try_insert_tombstone` so `reject_stream` can run the same check
+    /// *before* the (potentially large) bitmap `new_words` describes is ever
+    /// allocated.
+    fn projected_bitmap_words(&self, stream_id: u64, new_words: usize) -> Option<usize> {
+        let previous_words = self
+            .rejected_streams
+            .get(&stream_id)
+            .map_or(0, |existing| existing.received_chunks.len());
+        let projected_words = self
+            .rejected_streams_bitmap_words
+            .saturating_sub(previous_words)
+            .saturating_add(new_words);
+        (projected_words <= REJECTED_STREAMS_BITMAP_WORD_BUDGET).then_some(projected_words)
     }
 
     /// Attempts to insert (or replace) a tombstone, respecting
@@ -760,18 +847,10 @@ impl StreamingState {
     /// `rejected_streams_bitmap_words` in sync so the budget check stays
     /// O(1) rather than re-summing the whole table on every call.
     fn try_insert_tombstone(&mut self, stream_id: u64, tombstone: RejectedStreamTombstone) -> bool {
-        let previous_words = self
-            .rejected_streams
-            .get(&stream_id)
-            .map_or(0, |existing| existing.received_chunks.len());
         let new_words = tombstone.received_chunks.len();
-        let projected_words = self
-            .rejected_streams_bitmap_words
-            .saturating_sub(previous_words)
-            .saturating_add(new_words);
-        if projected_words > REJECTED_STREAMS_BITMAP_WORD_BUDGET {
+        let Some(projected_words) = self.projected_bitmap_words(stream_id, new_words) else {
             return false;
-        }
+        };
         self.rejected_streams_bitmap_words = projected_words;
         self.rejected_streams.insert(stream_id, tombstone);
         true
@@ -2982,6 +3061,51 @@ mod tests {
         assert!(
             matches!(trailing, Ok(None)),
             "budget exhaustion must never evict an existing tombstone: {trailing:?}"
+        );
+    }
+
+    /// Review finding: `reject_stream` used to build the whole
+    /// `RejectedStreamTombstone` -- allocating its completion bitmap --
+    /// before `try_insert_tombstone` ever checked
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET`. A valid `MAX_STREAM_SIZE`
+    /// declaration paired with a one-byte first chunk needs
+    /// `MAX_STREAM_SIZE / 64` == 1,048,576 words (8 MiB) -- eight times the
+    /// entire 131,072-word (1 MiB) budget -- so the old code paid for that
+    /// allocation on *every* such rejection, budget or no budget. A peer
+    /// repeating this against many connections spikes memory well before
+    /// the budget check does anything.
+    ///
+    /// Asserts the allocation itself never happens, not merely that the
+    /// tombstone was not inserted afterward -- see
+    /// `LAST_ESTABLISHED_BITMAP_WORDS`. A fresh `StreamingState` is enough:
+    /// this single request already exceeds the *entire* budget on its own,
+    /// with nothing else competing for it.
+    #[test]
+    fn reject_stream_checks_the_bitmap_budget_before_allocating_it() {
+        LAST_ESTABLISHED_BITMAP_WORDS.with(|cell| cell.set(None));
+
+        let mut state = StreamingState::new();
+        // Not admitted via begin_v5_stream_or_discard (which would need a
+        // full active-stream setup to reach ResourceBusy first): calling
+        // the private rejection path directly isolates exactly the
+        // allocate-before-budget-check ordering this finding is about.
+        let admitted = state.reject_stream(1, crate::MAX_STREAM_SIZE as u64, 1);
+
+        assert!(
+            !admitted,
+            "a bitmap this large (1,048,576 words) must exceed the 131,072-word budget"
+        );
+        assert_eq!(
+            LAST_ESTABLISHED_BITMAP_WORDS.with(|cell| cell.get()),
+            None,
+            "the budget check must run and refuse this rejection *before* \
+             establish_stride ever allocates the ~8 MiB bitmap it would need -- \
+             not merely discard the tombstone after paying for the allocation"
+        );
+        assert_eq!(
+            state.rejected_stream_count(),
+            0,
+            "a budget-refused rejection must not be inserted"
         );
     }
 
