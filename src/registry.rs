@@ -3369,15 +3369,36 @@ impl<T: 'static> GossipRegistry<T> {
     /// reconnect's `GossipState` liveness update (`mark_peer_connected*`)
     /// only happens AFTER the owner has already committed that claim.
     /// `RegistryOwnerHandle::release_dead_peer` does not trust anything this
-    /// caller observed about liveness or generation; it re-derives its own
-    /// answer from `dead_peer_timeout` against the owner's OWN
-    /// `claim_committed_at` record, so a stale reaping decision can never
-    /// clear a live reconnect's receipts or route regardless of which side
-    /// of this call's own selection the reconnect's commit landed on.
-    async fn release_dead_peer_ownership(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+    /// caller observed about liveness; it re-derives that answer from
+    /// `dead_peer_timeout` against the owner's OWN `claim_committed_at`
+    /// record, so a stale reaping decision can never clear a live
+    /// reconnect's receipts or route regardless of which side of this
+    /// call's own selection the reconnect's commit landed on.
+    ///
+    /// `expected_generation` is a SECOND, independent fence: `addr`'s
+    /// owner-actor generation as observed at selection time (the same pass
+    /// that read `gossip_state` and decided this peer looks dead -- see
+    /// `cleanup_dead_peers`). The timeout fence alone only measures elapsed
+    /// wall time since the address's last commit; it cannot tell a decision
+    /// that has simply been queued a while from one that is stale relative
+    /// to a reconnect that landed and was itself proven live DURING that
+    /// wait. Requiring the generation to still match what was observed
+    /// before this decision was made closes that gap regardless of how long
+    /// this call then took to actually run.
+    async fn release_dead_peer_ownership(
+        &self,
+        peer_id: &crate::PeerId,
+        addr: SocketAddr,
+        expected_generation: Option<crate::registry_owner::CommitSeq>,
+    ) {
         if let Some(release_seq) = self
             .registry_owner
-            .release_dead_peer(peer_id.clone(), addr, self.config.dead_peer_timeout)
+            .release_dead_peer(
+                peer_id.clone(),
+                addr,
+                self.config.dead_peer_timeout,
+                expected_generation,
+            )
             .await
         {
             let mut state = self.gossip_state.lock().await;
@@ -7296,11 +7317,21 @@ impl<T: 'static> GossipRegistry<T> {
 
         // This selection is a `gossip_state` read, not an owner-authority
         // one, and can go stale relative to the owner in either direction --
-        // see `release_dead_peer_ownership`'s doc comment for why a
-        // caller-computed snapshot (of either liveness or ownership
-        // generation) can never fully close that gap, and how the owner
-        // closes it instead by re-deriving its own answer at release time.
-        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>)> = {
+        // see `release_dead_peer_ownership`'s doc comment. The owner's own
+        // `claim_committed_at` timeout fence covers the "reconnect landed
+        // before this selection, but `gossip_state` had not caught up yet"
+        // direction regardless of elapsed time. `observed_generation`,
+        // captured here in the SAME pass as this "looks dead" decision,
+        // covers the other direction: it lets `release_dead_peer` detect a
+        // reconnect that lands AFTER this selection but before this
+        // decision is actually acted on, no matter how long that takes --
+        // lock contention, or simply earlier peers in this same sweep each
+        // doing their own owner round trip first.
+        let peers_to_cleanup: Vec<(
+            SocketAddr,
+            Option<crate::PeerId>,
+            Option<crate::registry_owner::CommitSeq>,
+        )> = {
             let gossip_state = self.gossip_state.lock().await;
             gossip_state
                 .peers
@@ -7312,7 +7343,17 @@ impl<T: 'static> GossipRegistry<T> {
                             current_time.saturating_sub(failure_time) > dead_peer_timeout_secs
                         })
                 })
-                .map(|(addr, info)| (*addr, info.node_id.map(|node_id| node_id.to_peer_id())))
+                .map(|(addr, info)| {
+                    let observed_generation = self
+                        .registry_owner
+                        .ownership_token(addr)
+                        .map(|token| token.generation());
+                    (
+                        *addr,
+                        info.node_id.map(|node_id| node_id.to_peer_id()),
+                        observed_generation,
+                    )
+                })
                 .collect()
         };
 
@@ -7323,7 +7364,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Order: actor_state before gossip_state
             let mut gossip_state = self.gossip_state.lock().await;
 
-            for (peer_addr, _) in &peers_to_cleanup {
+            for (peer_addr, _, _) in &peers_to_cleanup {
                 // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
                 // This allows us to reconnect when the peer comes back online
 
@@ -7410,7 +7451,7 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
-            for (peer_addr, node_id) in &peers_to_cleanup {
+            for (peer_addr, node_id, observed_generation) in &peers_to_cleanup {
                 self.clear_peer_capabilities(peer_addr);
                 self.remove_clock_state_for_addr(peer_addr);
                 // A peer this stale has been gone longer than the dead-peer
@@ -7420,7 +7461,8 @@ impl<T: 'static> GossipRegistry<T> {
                 // other identity out of the address. `peers` itself is left
                 // untouched above so a genuine reconnect is still recognized.
                 if let Some(peer_id) = node_id {
-                    self.release_dead_peer_ownership(peer_id, *peer_addr).await;
+                    self.release_dead_peer_ownership(peer_id, *peer_addr, *observed_generation)
+                        .await;
                 }
             }
 
@@ -20150,7 +20192,19 @@ mod tests {
 
         // The (now stale) dead-peer release runs shortly after -- well
         // within `dead_peer_timeout` of the reconnect's own commit above.
-        registry.release_dead_peer_ownership(&peer_id, addr).await;
+        // This test targets the freshness-timeout fence specifically, so
+        // `expected_generation` is captured right here (matching the
+        // reconnect's own generation, exactly as an immediately-following
+        // selection would observe) rather than staged stale itself --
+        // `cleanup_dead_peers_ignores_a_reconnect_that_committed_before_selection`
+        // below is the dedicated regression for a stale generation snapshot.
+        let observed_generation = registry
+            .registry_owner
+            .ownership_token(&addr)
+            .map(|token| token.generation());
+        registry
+            .release_dead_peer_ownership(&peer_id, addr, observed_generation)
+            .await;
 
         assert_eq!(
             registry.registry_owner.routes_to(&addr),

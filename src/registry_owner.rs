@@ -490,10 +490,26 @@ enum OwnerCommand {
     /// rather than trust a value the caller computed earlier from a
     /// different domain, is what closes that gap regardless of which side
     /// of the caller's own snapshot the reconnect's commit landed on.
+    ///
+    /// Also refused, independently of the timeout, if `expected_generation`
+    /// no longer matches `addr`'s current `claim_generation`. The timeout
+    /// alone is a LEASE, not a fence: it only measures elapsed time since
+    /// the last commit, so a stale selection that sits queued behind lock
+    /// contention or earlier peers in the same sweep can still "become"
+    /// valid purely by that queueing delay, even though a reconnect landed
+    /// (and was itself proven live) while it waited. `expected_generation`
+    /// is captured by the caller at selection time and must still hold at
+    /// release time: any claim accepted for `addr` in between -- regardless
+    /// of how much wall-clock time then passes before this command finally
+    /// runs -- changes the generation and voids a decision made before it.
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
         dead_peer_timeout: std::time::Duration,
+        /// The generation `addr` was at when the caller decided it looked
+        /// dead. `None` if the caller observed no owner at all at that
+        /// moment.
+        expected_generation: Option<CommitSeq>,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
     /// Atomically install `peer_id`'s operator pin at `addr`, replacing
@@ -684,13 +700,15 @@ impl RegistryOwnerHandle {
     /// connection-scoped receipt recorded for it under any session, and the
     /// address ownership itself if `peer_id` still holds it and `addr` is not
     /// operator-pinned -- but ONLY if `addr`'s ownership hasn't been
-    /// committed or refreshed within the last `dead_peer_timeout`; otherwise
-    /// a no-op. See `OwnerCommand::ReleaseDeadPeer`.
+    /// committed or refreshed within the last `dead_peer_timeout`, AND
+    /// `expected_generation` still matches `addr`'s current generation;
+    /// otherwise a no-op. See `OwnerCommand::ReleaseDeadPeer`.
     pub async fn release_dead_peer(
         &self,
         peer_id: PeerId,
         addr: SocketAddr,
         dead_peer_timeout: std::time::Duration,
+        expected_generation: Option<CommitSeq>,
     ) -> Option<CommitSeq> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
@@ -698,6 +716,7 @@ impl RegistryOwnerHandle {
             peer_id,
             addr,
             dead_peer_timeout,
+            expected_generation,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -985,9 +1004,11 @@ impl PeerRegistryOwner {
                 peer_id,
                 addr,
                 dead_peer_timeout,
+                expected_generation,
                 reply,
             } => {
-                let released = self.release_dead_peer(&peer_id, addr, dead_peer_timeout);
+                let released =
+                    self.release_dead_peer(&peer_id, addr, dead_peer_timeout, expected_generation);
                 let _ = reply.send(released);
             }
             OwnerCommand::Pin {
@@ -1212,12 +1233,38 @@ impl PeerRegistryOwner {
     /// but this task ever writes, is what closes the gap in every one of
     /// those orderings rather than just the ones a caller-supplied token
     /// happens to fence.
+    ///
+    /// `expected_generation` is a SECOND, independent fence, checked first:
+    /// the timeout alone only asks "is there recent evidence right now", not
+    /// "is the decision this command carries still the one the caller
+    /// actually made". A sweep that selects this exact (peer, addr) pair can
+    /// take arbitrarily long to actually reach this command -- lock
+    /// contention, or simply earlier peers in the same sweep each doing
+    /// their own owner round trip first -- and a reconnect's fresh claim can
+    /// land at any point during that delay. Once enough time then passes
+    /// AFTER that reconnect, the timeout fence alone would stop protecting
+    /// it: elapsed time since the (new, genuinely fresh) commit would exceed
+    /// `dead_peer_timeout` even though the address has been continuously,
+    /// correctly owned the whole time. Requiring the generation to still
+    /// match what the caller observed BEFORE it made this decision closes
+    /// that gap: any claim accepted for `addr` since then -- regardless of
+    /// how long this command then sits queued -- changes the generation and
+    /// voids a decision made before it, independent of wall-clock time.
     fn release_dead_peer(
         &mut self,
         peer_id: &PeerId,
         addr: SocketAddr,
         dead_peer_timeout: std::time::Duration,
+        expected_generation: Option<CommitSeq>,
     ) -> Option<CommitSeq> {
+        if self.claim_generation.get(&addr).copied() != expected_generation {
+            trace!(
+                addr = %addr,
+                peer = %peer_id,
+                "dead-peer release refused: ownership generation advanced past this sweep's selection"
+            );
+            return None;
+        }
         if self
             .claim_committed_at
             .get(&addr)
@@ -1993,6 +2040,75 @@ mod tests {
         );
     }
 
+    /// P1 follow-on regression: `dead_peer_timeout` alone is a LEASE, not a
+    /// fence -- it only measures elapsed time since the address's last
+    /// commit, so a stale dead-peer decision that sits queued long enough
+    /// (lock contention, or earlier peers in the same sweep each doing
+    /// their own owner round trip first) can "become" valid purely by that
+    /// delay, even though a reconnect landed -- and was itself proven live
+    /// -- while it waited. This reproduces exactly that: a generation is
+    /// captured as a sweep's selection would, a reconnect then commits a
+    /// fresh claim, and enough wall time passes that the timeout fence
+    /// alone (measured from the RECONNECT's own genuinely fresh commit)
+    /// would no longer protect it. The release must still be refused,
+    /// because the generation captured before the reconnect no longer
+    /// matches -- a decision elapsed wall time alone must never validate.
+    #[tokio::test]
+    async fn release_dead_peer_is_fenced_against_a_generation_captured_before_a_late_reconnect()
+     {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("late-reconnect-generation-fence");
+        let target = addr(30_040);
+        let old_session = addr(30_041);
+        let new_session = addr(30_042);
+        let dead_peer_timeout = Duration::from_millis(30);
+
+        let original = owner
+            .claim_connection_scoped(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                old_session,
+            )
+            .await;
+        // What a dead-peer sweep would have captured as this address's
+        // generation at selection time -- BEFORE the reconnect below, e.g.
+        // because `old_session` had already gone quiet and `gossip_state`
+        // looked dead at that exact moment.
+        let observed_generation = original.commit_seq();
+
+        // The reconnect: a fresh, genuinely live claim for the SAME
+        // identity, committed strictly AFTER the sweep's selection but well
+        // before its (delayed) release actually runs.
+        owner
+            .claim_connection_scoped(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                new_session,
+            )
+            .await;
+
+        // Enough wall time now passes that the timeout fence ALONE,
+        // measured from the reconnect's own commit, would no longer
+        // protect it.
+        tokio::time::sleep(dead_peer_timeout + Duration::from_millis(10)).await;
+
+        let released = owner
+            .release_dead_peer(node.clone(), target, dead_peer_timeout, observed_generation)
+            .await;
+
+        assert_eq!(
+            released, None,
+            "a dead-peer release must refuse when the generation has moved on since \
+             selection, regardless of how much wall-clock time has since elapsed"
+        );
+        assert_eq!(
+            owner.routes_to(&target),
+            Some(node),
+            "the reconnect's ownership must survive a stale sweep's delayed, \
+             generation-mismatched release"
+        );
+    }
+
     /// Address re-resolution moves ownership rather than stranding it.
     #[tokio::test]
     async fn migrate_moves_ownership_to_the_new_address() {
@@ -2155,10 +2271,13 @@ mod tests {
         // `to`'s freshness must reflect ITS OWN newer evidence, not
         // `from`'s much older one: a dead_peer_timeout comfortably longer
         // than `to`'s real age (just now) but shorter than `from`'s (80ms+)
-        // must still refuse to release it.
+        // must still refuse to release it. The generation passed here
+        // matches `to`'s current one (this test is exercising the
+        // freshness-timeout fence, not the separate generation fence).
+        let to_generation = owner.ownership_token(&to).map(|token| token.generation());
         assert!(
             owner
-                .release_dead_peer(node, to, Duration::from_millis(60))
+                .release_dead_peer(node, to, Duration::from_millis(60), to_generation)
                 .await
                 .is_none(),
             "migrate must not age a destination with newer direct evidence backwards to \
