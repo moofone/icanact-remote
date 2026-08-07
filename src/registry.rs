@@ -2030,18 +2030,110 @@ pub struct GossipResult {
     pub outcome: Result<Option<RegistryMessage>>,
 }
 
+/// Distinguishes WHY an actor was removed, so restart-recovery logic can
+/// tell a crash/dead-peer reap (recorded by an observer on the owner's
+/// behalf, and safely undone once the owner is confirmed live again) from a
+/// deliberate, explicit removal (which must never be silently undone,
+/// restarted owner or not). See `owner_recovery_wins_tombstone`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneKind {
+    /// Recorded by an observer (`cleanup_dead_peers`, or a relayed removal
+    /// whose `removing_node_id` differs from the actor's own owner) that
+    /// inferred the owner is unreachable -- not a decision the owner itself
+    /// made. Safe to un-delete once the owner is confirmed to be genuinely,
+    /// authentically live again.
+    PeerDeath,
+    /// Recorded because the actor's own owner explicitly removed it
+    /// (`unregister_actor`, or a relayed removal whose `removing_node_id`
+    /// matches the actor's own owner). A deliberate removal must never be
+    /// un-deleted just because the same owner's session later looks like a
+    /// restart -- that would resurrect an actor its owner intentionally
+    /// took down.
+    ExplicitUnregister,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemovedActorTombstone {
     pub vector_clock: crate::VectorClock,
     pub removed_at: u64,
+    pub kind: TombstoneKind,
 }
 
 impl RemovedActorTombstone {
+    /// Peer-death tombstone (the predominant, historical shape): recorded by
+    /// an observer, not the owner itself. Use `new_explicit_unregister` for
+    /// a deliberate removal the owner itself requested.
     fn new(vector_clock: crate::VectorClock) -> Self {
         Self {
             vector_clock,
             removed_at: current_timestamp(),
+            kind: TombstoneKind::PeerDeath,
         }
+    }
+
+    fn new_explicit_unregister(vector_clock: crate::VectorClock) -> Self {
+        Self {
+            vector_clock,
+            removed_at: current_timestamp(),
+            kind: TombstoneKind::ExplicitUnregister,
+        }
+    }
+
+    fn with_kind(vector_clock: crate::VectorClock, kind: TombstoneKind) -> Self {
+        Self {
+            vector_clock,
+            removed_at: current_timestamp(),
+            kind,
+        }
+    }
+}
+
+/// Classifies an incoming `RegistryChange::ActorRemoved`'s tombstone kind
+/// from information available BEFORE the removal is applied -- callers must
+/// capture `owner_node_id` ahead of any mutation that could remove the
+/// `known_actors` entry being classified.
+///
+/// `owner_node_id` is the actor's current owner, if this node still has it
+/// in `known_actors`; `None` when the actor was never known here at all
+/// (e.g. its removal is gossiped in before its addition ever was).
+/// `removing_node_id` is the wire-claimed reporter of the removal.
+///
+/// `removing_node_id == owner_node_id` means the actor's own owner reported
+/// its own removal -- a deliberate `unregister_actor` decision propagating
+/// through gossip -- classified `ExplicitUnregister`. A DIFFERENT reporter
+/// is a third party (an observer reaping a peer it believes is dead)
+/// classified `PeerDeath`. When the owner is entirely unknown there is no
+/// basis to conclude this was a deliberate owner action either way, so it
+/// is conservatively classified `ExplicitUnregister` -- the choice that is
+/// NEVER later bypassed by a restart exemption.
+fn tombstone_kind_for_removal(
+    owner_node_id: Option<crate::GossipNodeId>,
+    removing_node_id: crate::GossipNodeId,
+) -> TombstoneKind {
+    match owner_node_id {
+        Some(owner) if owner == removing_node_id => TombstoneKind::ExplicitUnregister,
+        Some(_) => TombstoneKind::PeerDeath,
+        None => TombstoneKind::ExplicitUnregister,
+    }
+}
+
+/// Merges an EXISTING tombstone's kind (if any) with a newly classified
+/// removal's kind for the SAME actor, keeping the safer of the two:
+/// `ExplicitUnregister` dominates `PeerDeath`. Two independent nodes can
+/// concurrently record different removals for the same actor -- one
+/// observing the owner's own explicit unregister, another (unaware of that)
+/// inferring a peer-death reap -- and `current_actor_removal_plan`'s
+/// `Concurrent` branch merges their vector clocks into one tombstone. Once
+/// ANY report has established this was the owner's own deliberate decision,
+/// that must never be silently downgraded back to `PeerDeath` by a later
+/// merge, or a legitimately-unregistered actor could still end up
+/// resurrectable by a restart exemption.
+fn merge_tombstone_kind(existing: Option<TombstoneKind>, new: TombstoneKind) -> TombstoneKind {
+    if existing == Some(TombstoneKind::ExplicitUnregister) || new == TombstoneKind::ExplicitUnregister
+    {
+        TombstoneKind::ExplicitUnregister
+    } else {
+        new
     }
 }
 
@@ -6879,9 +6971,12 @@ impl<T: 'static> GossipRegistry<T> {
                 // Create a new vector clock for the removal with proper causality
                 let removal_clock = location.vector_clock.clone();
                 removal_clock.increment(self.peer_id.to_node_id());
+                // This node is explicitly unregistering its OWN actor -- a
+                // deliberate decision, never to be silently undone by a
+                // later restart-looking session (see `TombstoneKind`).
                 let _ = self.actor_state.removed_actors.upsert_sync(
                     name.to_string(),
-                    RemovedActorTombstone::new(removal_clock.clone()),
+                    RemovedActorTombstone::new_explicit_unregister(removal_clock.clone()),
                 );
 
                 let change = RegistryChange::ActorRemoved {
@@ -7257,6 +7352,34 @@ impl<T: 'static> GossipRegistry<T> {
                         removing_node_id,
                         priority,
                     } => {
+                        // Captured BEFORE `current_actor_removal_plan` (which
+                        // may `remove_sync` the entry): whether the removal
+                        // is the actor's OWN owner reporting its own
+                        // deliberate removal (`removing_node_id` matches the
+                        // owner) or a third party/observer reaping it on the
+                        // owner's behalf. See `TombstoneKind`.
+                        let this_removal_kind = tombstone_kind_for_removal(
+                            self.actor_state
+                                .known_actors
+                                .read_sync(name.as_str(), |_, loc| loc.node_id),
+                            removing_node_id,
+                        );
+                        // Also captured BEFORE any upsert below overwrites
+                        // it: an existing tombstone this message's removal is
+                        // concurrent with (see `current_actor_removal_plan`'s
+                        // `Concurrent` branch, which merges the vector clock
+                        // but not the kind) must not have its
+                        // `ExplicitUnregister` classification silently
+                        // downgraded back to `PeerDeath` just because a
+                        // later, concurrently-merged report happens to
+                        // classify as peer-death from ITS OWN sender's
+                        // perspective.
+                        let existing_kind = self
+                            .actor_state
+                            .removed_actors
+                            .read_sync(name.as_str(), |_, tombstone| tombstone.kind);
+                        let kind = merge_tombstone_kind(existing_kind, this_removal_kind);
+
                         let Some((removal_clock, tombstone_only)) = self
                             .current_actor_removal_plan(
                                 name.as_str(),
@@ -7276,7 +7399,7 @@ impl<T: 'static> GossipRegistry<T> {
                         if tombstone_only {
                             let _ = self.actor_state.removed_actors.upsert_sync(
                                 name.clone(),
-                                RemovedActorTombstone::new(removal_clock),
+                                RemovedActorTombstone::with_kind(removal_clock, kind),
                             );
                             gossip_state
                                 .pending_changes
@@ -7293,10 +7416,10 @@ impl<T: 'static> GossipRegistry<T> {
                             sender_actors.remove(&name);
                             peer_actor_names_changed.insert(name.clone());
                             applied_count += 1;
-                            let _ = self
-                                .actor_state
-                                .removed_actors
-                                .upsert_sync(name, RemovedActorTombstone::new(removal_clock));
+                            let _ = self.actor_state.removed_actors.upsert_sync(
+                                name,
+                                RemovedActorTombstone::with_kind(removal_clock, kind),
+                            );
                             gossip_state
                                 .pending_changes
                                 .push(Self::as_regular_gossip_change(&forwarded));
@@ -20596,6 +20719,7 @@ mod tests {
             RemovedActorTombstone {
                 vector_clock: old_clock,
                 removed_at: current_timestamp().saturating_sub(11),
+                kind: TombstoneKind::PeerDeath,
             },
         );
         let _ = registry.actor_state.removed_actors.upsert_sync(
