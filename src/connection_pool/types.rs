@@ -267,23 +267,36 @@ pub enum WritePayload {
     /// (`write_bytes_control`/`write_bytes_ask`/`write_bytes_nonblocking`,
     /// and the `ConnectionHandle` methods built on them:
     /// `send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
-    /// `send_binary_message`) all construct this variant. Because it can be
+    /// `send_binary_message`) all construct this variant. Content can be
     /// one complete self-contained V5 frame, several concatenated (a
-    /// caller pipelining more than one send into a single write), a
-    /// deliberate fragment of a larger one (`write_chunked_nonblocking`
-    /// splits by design), or genuinely unframed opaque bytes, there is no
-    /// single, reliable interpretation to validate the whole buffer
-    /// against up front. `reject_oversize_single` (in `stream_writer.rs`)
-    /// instead walks it decoding as many complete frames off the front as
-    /// it will yield and checks each one's own `body_len` against
-    /// `max_message_size`, so several individually-valid frames
-    /// concatenated together are not punished for their aggregate length.
-    /// Whatever does not decode as a complete frame -- a non-frame-shaped
-    /// remainder, or the whole buffer if none of it looks like a frame --
-    /// falls back to a bare length ceiling, which stays sound with no
-    /// control word to trust: a complete frame whose declared body exceeds
-    /// `max_message_size` is, by construction, at least that many bytes
-    /// long in total too.
+    /// caller pipelining more than one send into a single write), or
+    /// genuinely unframed opaque bytes -- there is no single, reliable
+    /// interpretation to validate the whole buffer against up front, so
+    /// `reject_oversize_single` (in `stream_writer.rs`) walks it, decoding
+    /// as many complete frames off the front as it will yield and checking
+    /// each one's own `body_len` against `max_message_size`, so several
+    /// individually-valid frames concatenated together are not punished
+    /// for their aggregate length. Content that never starts looking like
+    /// a frame at all falls back to a bare length ceiling, which stays
+    /// sound with no control word to trust: a complete frame whose
+    /// declared body exceeds `max_message_size` is, by construction, at
+    /// least that many bytes long in total too.
+    ///
+    /// PR #183 review, round 10: what this variant does *not* carry is a
+    /// fragment of a frame split across separate calls -- content whose
+    /// leading bytes decode as a valid control word, but that does not
+    /// supply that frame's complete declared body, is refused outright,
+    /// not judged as if the missing bytes simply weren't there. Splitting
+    /// one frame's header from its body across independent `Single` writes
+    /// let each individual call look small enough to pass while the peer
+    /// reassembled the whole (possibly oversized) frame from the
+    /// continuous TCP stream, since separate `write()` calls have no
+    /// boundary on the wire. `write_chunked_nonblocking` needs exactly
+    /// this "supply a frame's bytes across several enqueue calls" shape
+    /// for its own legitimate purpose -- it validates the complete buffer
+    /// once, up front, before chunking, then uses `TrustedFrame` for the
+    /// fragments precisely because they are not independently valid
+    /// `Single` writes.
     ///
     /// This is deliberately the only variant a caller outside this `impl`
     /// block can reach with arbitrary content -- see `TrustedFrame` for the
