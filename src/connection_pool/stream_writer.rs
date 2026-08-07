@@ -4237,7 +4237,10 @@ mod write_payload_size_gate_tests {
         peer.read_exact(&mut ctrl).await.unwrap();
         let control = crate::framing::decode_control(ctrl).unwrap();
         assert_eq!(control.kind, crate::framing::WireKind::Response);
-        assert_eq!(control.body_len, crate::framing::ASK_RESPONSE_HEADER_LEN + ok_len);
+        assert_eq!(
+            control.body_len,
+            crate::framing::ASK_RESPONSE_HEADER_LEN + ok_len
+        );
 
         writer.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;

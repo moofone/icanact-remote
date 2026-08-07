@@ -2447,10 +2447,8 @@ mod write_actor_response_direct_size_gate_tests {
     #[tokio::test]
     async fn bytes_response_over_max_message_size_is_rejected() {
         let payload_len = MAX_MESSAGE_SIZE - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
-        let response = crate::registry::ActorResponse::Bytes(bytes::Bytes::from(vec![
-            0u8;
-            payload_len
-        ]));
+        let response =
+            crate::registry::ActorResponse::Bytes(bytes::Bytes::from(vec![0u8; payload_len]));
         let (result, written) = write_bytes_response(response).await;
         assert!(
             matches!(result, Err(crate::GossipError::MessageTooLarge { .. })),
@@ -2497,6 +2495,9 @@ mod write_actor_response_direct_size_gate_tests {
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let control = crate::framing::decode_control(written[..4].try_into().unwrap()).unwrap();
         assert_eq!(control.kind, crate::framing::WireKind::Response);
-        assert_eq!(control.body_len, crate::framing::ASK_RESPONSE_HEADER_LEN + payload_len);
+        assert_eq!(
+            control.body_len,
+            crate::framing::ASK_RESPONSE_HEADER_LEN + payload_len
+        );
     }
 }
