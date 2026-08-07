@@ -1366,6 +1366,28 @@ impl PeerInfo {
             transport_source_keyed: false,
         })
     }
+
+    /// Record that this address is now known to be genuinely dialable,
+    /// clearing a stale `transport_source_keyed` attribution if present.
+    ///
+    /// Deliberately takes no parameter and only ever clears -- unlike a
+    /// plain `bool` setter, it cannot be (mis)used to request "set" or
+    /// "leave as-is": this exact shape of bug (a boolean writer silently
+    /// clearing the flag when a caller passes `false` without meaning to)
+    /// has recurred at three different call sites. Callers are solely
+    /// responsible for verifying dialability evidence specific to THIS
+    /// address before calling -- a genuine outbound dial resolved to
+    /// exactly this address (not merely "some connection was resolved",
+    /// which can be an inbound one -- see `GossipRegistry::connect_to_peer`),
+    /// or explicit operator configuration (`GossipRegistry::configure_peer`).
+    /// This method performs no such verification itself; the *evidence*
+    /// each caller checks is irreducibly different (address+direction
+    /// scoping against a set of candidate addresses, a context that
+    /// already guarantees a fresh outbound dial, or a bare operator
+    /// assertion), so that verification is deliberately NOT unified here.
+    pub(crate) fn mark_dialability_confirmed(&mut self) {
+        self.transport_source_keyed = false;
+    }
 }
 
 /// Stable dedup key for a `peers` entry, keyed by verified identity where
@@ -3839,7 +3861,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&connect_addr) {
-                peer_info.transport_source_keyed = false;
+                peer_info.mark_dialability_confirmed();
             }
         }
 
@@ -4496,7 +4518,7 @@ impl<T: 'static> GossipRegistry<T> {
                         // connection that merely happens to be published
                         // at `conn.addr` (see PeerInfo::transport_source_keyed).
                         if *peer_addr == conn.addr && dialed_outbound {
-                            peer_info.transport_source_keyed = false;
+                            peer_info.mark_dialability_confirmed();
                         }
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
@@ -4508,7 +4530,7 @@ impl<T: 'static> GossipRegistry<T> {
                         peer_info.failures = 0;
                         peer_info.outbound_dial_success = true;
                         if *peer_addr == conn.addr && dialed_outbound {
-                            peer_info.transport_source_keyed = false;
+                            peer_info.mark_dialability_confirmed();
                         }
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
@@ -9471,17 +9493,20 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Record that this peer was observed on an inbound connection accepted by this node.
     ///
-    /// `transport_source_keyed` mirrors `PeerInfo::transport_source_keyed`:
-    /// pass `true` only when the caller knows `peer_addr` is the raw
-    /// observed TCP source used as a fallback key (address-claim
-    /// arbitration rejected the peer's advertised address), never inferred
-    /// here from `source == peer_addr` -- a peer legitimately dialing out
-    /// from its own listen port satisfies that too.
+    /// Deliberately does NOT take or touch `transport_source_keyed`: an
+    /// inbound observation is never dialability evidence (see
+    /// `PeerInfo::transport_source_keyed`), so this setter cannot express
+    /// "clear" at all -- there is no parameter through which a caller
+    /// could (mis)request it, unlike a plain `bool` that silently clears
+    /// an existing flag whenever passed `false`. The one caller that DOES
+    /// know a claim fell back to the raw observed TCP source
+    /// (`handle.rs`'s inbound-accept path) sets the flag directly on the
+    /// entry, under its own lock acquisition, before ever calling this
+    /// function -- see the `fell_back_to_observed_source` block there.
     pub async fn mark_inbound_connection_observed(
         &self,
         peer_addr: SocketAddr,
         source: SocketAddr,
-        transport_source_keyed: bool,
     ) {
         let now = current_timestamp();
         let now_ms = crate::current_timestamp_millis();
@@ -9513,7 +9538,6 @@ impl<T: 'static> GossipRegistry<T> {
         if source != peer_addr {
             peer.peer_address = Some(source);
         }
-        peer.transport_source_keyed = transport_source_keyed;
         peer.last_success = peer.last_success.max(now);
         // Inbound payload is real liveness evidence — the framing layer
         // has decoded and dispatched at least one valid message on this
@@ -12350,6 +12374,41 @@ mod tests {
         );
     }
 
+    /// An inbound observation for an address already marked
+    /// `transport_source_keyed` must never un-mark it. Only dialability
+    /// evidence (a genuine outbound dial to this exact address, or
+    /// explicit operator configuration) may clear the flag -- an inbound
+    /// observation is never that evidence, regardless of what caller
+    /// context originally set the flag.
+    #[tokio::test]
+    async fn inbound_observation_does_not_clear_transport_source_keyed() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_260), test_config());
+        let addr = test_addr(20_261);
+        let source = test_addr(20_262);
+        let node_id = test_peer_id("inbound-observation-does-not-clear").to_node_id();
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut info = peer_info_with_node_id(addr, node_id);
+            info.transport_source_keyed = true;
+            state.peers.insert(addr, info);
+        }
+
+        registry
+            .mark_inbound_connection_observed(addr, source)
+            .await;
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            state
+                .peers
+                .get(&addr)
+                .expect("peer must still exist")
+                .transport_source_keyed,
+            "an inbound observation must never clear transport_source_keyed"
+        );
+    }
+
     /// Gossip target selection must not retain an arbitrary alias for a
     /// shared identity. `gossip_state.peers` is a `HashMap`, whose
     /// iteration order is effectively arbitrary (re-seeded per instance),
@@ -13235,7 +13294,7 @@ mod tests {
             .unwrap();
         registry.add_peer(test_addr(8081)).await;
         registry
-            .mark_inbound_connection_observed(test_addr(8081), test_addr(8081), false)
+            .mark_inbound_connection_observed(test_addr(8081), test_addr(8081))
             .await;
 
         let stats = registry.get_stats().await;
@@ -19606,7 +19665,7 @@ mod tests {
             );
         }
 
-        reg.mark_inbound_connection_observed(peer_addr, source_addr, false)
+        reg.mark_inbound_connection_observed(peer_addr, source_addr)
             .await;
 
         let state = reg.gossip_state.lock().await;
@@ -20011,7 +20070,7 @@ mod tests {
         // `victim_addr` -- exactly the bug this test guards against -- it
         // must not upgrade the recorded ownership kind.
         registry
-            .mark_inbound_connection_observed(victim_addr, attacker_source_addr, false)
+            .mark_inbound_connection_observed(victim_addr, attacker_source_addr)
             .await;
 
         // Authoritative ownership now lives in the owner actor, so assert

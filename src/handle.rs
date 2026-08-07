@@ -4043,13 +4043,12 @@ where
         // Attribute liveness to the address arbitration accepted and retain
         // the raw TCP source in `PeerInfo::peer_address`. Creating a separate
         // PeerInfo at the ephemeral source would let the first FullSync
-        // migration overwrite this identity-bearing entry.
+        // migration overwrite this identity-bearing entry. Does not
+        // (cannot) touch `transport_source_keyed`; that was already set
+        // above, before `mark_peer_connected`, from this function's own
+        // first-hand knowledge of whether the claim fell back.
         registry
-            .mark_inbound_connection_observed(
-                effective_addr,
-                peer_addr,
-                fell_back_to_observed_source,
-            )
+            .mark_inbound_connection_observed(effective_addr, peer_addr)
             .await;
 
         debug!(

@@ -3905,9 +3905,11 @@ impl<T> ConnectionPool<T> {
                     let had_failures = peer_info.failures > 0;
                     peer_info.outbound_dial_success = true;
                     // We just independently proved this exact address is
-                    // dialable; a stale fallback attribution no longer
-                    // applies (see PeerInfo::transport_source_keyed).
-                    peer_info.transport_source_keyed = false;
+                    // dialable (this function only ever runs after a
+                    // fresh outbound dial completed, never for a reused
+                    // inbound connection); a stale fallback attribution
+                    // no longer applies.
+                    peer_info.mark_dialability_confirmed();
                     if had_failures {
                         info!(peer = %peer_addr,
                                   prev_failures = peer_info.failures,
