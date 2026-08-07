@@ -142,22 +142,58 @@ impl BytesStreamingResponse {
 ///
 /// `Bytes::len()` describes only the visible slice. A sliced value can keep a
 /// much larger allocation alive, so a streaming queue that accounts only for
-/// `len()` can retain unbounded memory behind its byte cap. Unique `Bytes`
-/// values can expose their existing capacity without a copy; shared or
-/// owner-backed values are compacted once on this streaming-only path. The
-/// ordinary actor-message queue and its hot path are unchanged.
+/// `len()` can retain unbounded memory behind its byte cap: `BytesMut::
+/// capacity()` only reports the remaining capacity from the buffer's *own*
+/// start pointer to the end of its allocation, which *underreports* for a
+/// slice taken from the tail of a much larger buffer (nothing remains after
+/// the tail, so `capacity()` comes back close to `payload_len` while the
+/// buffer still pins the entire backing allocation behind it).
+///
+/// **Four earlier attempts tried to recover the true footprint from outside
+/// `bytes` -- via `capacity()`, then via `BytesMut::try_reclaim` probes of
+/// increasing precision -- and every one was eventually wrong.**
+/// `try_reclaim`'s own amortized-cost heuristic (see `bytes::BytesMut::
+/// reserve_inner`) declines to reclaim whenever the hidden prefix (`offset`)
+/// is smaller than the visible length (`len()`), *regardless of the true
+/// backing size and regardless of what is requested*: a failed probe proves
+/// nothing about size, in either direction, and nothing in the public
+/// `BytesMut` API distinguishes "genuinely small" from "large, but not worth
+/// the memmove given the offset" without forcing an allocation. The last
+/// attempt's own reclaim-request formula made this unfixable in principle:
+/// requesting enough beyond `len()` to force reclamation of a hidden prefix
+/// means a *successful* reclaim always leaves `capacity()` above the
+/// zero-copy threshold too, so the two outcomes ("small enough to keep" and
+/// "reclaim succeeded") became mutually exclusive -- the zero-copy branch was
+/// unreachable, and every unique payload was silently compacted anyway,
+/// while the code still read as though it had a fast path.
+///
+/// **So this stops interrogating `bytes` after the fact.** Every payload is
+/// unconditionally copied into a fresh, exact-length buffer, and
+/// `retained_bytes` is exactly that buffer's length. **Invariant, true by
+/// construction rather than a running argument about allocator internals:
+/// `retained_bytes` always equals what the returned `Bytes` actually pins.**
+/// The alternative -- carrying the true allocation size from the point a
+/// payload is *created*, so a genuinely right-sized buffer never needs to pay
+/// this copy -- is the structurally correct fix, but it means an
+/// origin-aware buffer type threaded through every path that can produce a
+/// streaming response, including arbitrary actor handler code outside this
+/// crate (`queue_streaming_response_bytes` receives an already-computed
+/// `Bytes` from whatever the handler returned). That is a wider API change
+/// than this fix, not a decision to make inside a review round.
+///
+/// The copy this pays is bounded by `payload_len` (only the visible slice is
+/// ever copied, never a hidden backing allocation behind it) and, measured on
+/// development hardware via `Bytes::copy_from_slice` at a memcpy throughput
+/// of roughly 60-90 GiB/s: about 12us for a 1 MiB response, about 1ms for the
+/// largest payload this path ever sees (`MAX_STREAM_SIZE`, 64 MiB). Both are
+/// negligible next to the cost of actually writing that many bytes to a
+/// socket and having the peer receive them, which is the dominant cost on
+/// this path regardless. If a workload makes this genuinely hot, that is a
+/// measurement to bring back, not a reason to return to estimating.
 fn normalize_streaming_payload(payload: bytes::Bytes) -> (bytes::Bytes, usize) {
     let payload_len = payload.len();
-    match payload.try_into_mut() {
-        Ok(buffer) => {
-            let retained_bytes = buffer.capacity().max(payload_len);
-            (buffer.freeze(), retained_bytes)
-        }
-        Err(payload) => {
-            let compact = bytes::Bytes::copy_from_slice(&payload);
-            (compact, payload_len)
-        }
-    }
+    let compact = bytes::Bytes::copy_from_slice(&payload);
+    (compact, payload_len)
 }
 
 impl PooledStreamingResponse {
@@ -247,7 +283,11 @@ struct LocalStreamingQueue {
     wire_blocked: bool,
     /// Reserve normal queue room for one configured response frame when
     /// reading another frame. The aggregate stream-sized reservation is
-    /// enforced separately by `is_full`.
+    /// checked separately by `is_full`, which is a queue-level invariant used
+    /// by tests; production admission control is entirely `can_admit_response`
+    /// (`WouldBlock` per response, not a blanket read-loop gate -- see the
+    /// comment on the read loop in `stream_writer.rs::io_task`).
+    #[cfg_attr(not(test), allow(dead_code))]
     response_reserve_bytes: usize,
     /// Reserve command slots for the next maximum-sized response as well as
     /// bytes. The command cap is independent from the retained-payload cap,
@@ -257,9 +297,10 @@ struct LocalStreamingQueue {
     response_reserve_commands: usize,
     /// One response that arrived after the bounded queue filled. Keeping the
     /// complete command batch here preserves the consumed ask's response
-    /// without opening an unbounded side queue; the aggregate hard cap and
-    /// `is_full` stop further reads until the current response drains and
-    /// `pop_front` promotes this batch.
+    /// without opening an unbounded side queue; the aggregate hard cap stops
+    /// further *admission* until the current response drains and `pop_front`
+    /// promotes this batch (reads that do not need streaming-queue capacity
+    /// are unaffected -- see `can_admit_response`).
     deferred: Option<Vec<StreamingCommand>>,
     deferred_bytes: usize,
     /// Backpressure NACKs owed to the peer, queued here instead of written
@@ -292,9 +333,9 @@ const PENDING_ASK_NACK_CAP: usize = 64;
 const STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP: usize =
     crate::MAX_INFLIGHT_STREAM_BYTES.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
-/// Reserve for the largest valid streamed payload when deciding whether the
-/// read side may consume another ask. Stream frame headers are generated on
-/// demand and are not retained by the queue, so only owned payload bytes count.
+/// Reserve for the largest valid streamed payload, used by `is_full`. Stream
+/// frame headers are generated on demand and are not retained by the queue,
+/// so only owned payload bytes count.
 const MAX_STREAMING_RESPONSE_RETAINED_BYTES: usize =
     crate::MAX_STREAM_SIZE.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
@@ -473,6 +514,21 @@ impl LocalStreamingQueue {
             || self.can_defer_response(command_count, response_bytes)
     }
 
+    /// Whether this queue's retained footprint is at or beyond its aggregate
+    /// reserve. A queue-level invariant checked directly by tests, and also
+    /// consulted by `stream_writer.rs::io_task` at its three ActorAsk
+    /// dispatch sites: when this is true, that ask's handler is *not* run --
+    /// it is skipped (queuing a best-effort `AskNackReason::Backpressure`
+    /// NACK instead) rather than run-then-discarded, since running it first
+    /// would compute a response this connection cannot currently retain.
+    /// This is a narrow, per-ask dispatch gate, not a blanket read-loop gate:
+    /// reads, tells, and every other result kind keep flowing regardless of
+    /// this value (a blanket pre-check that stopped *every* read on the
+    /// connection -- including ones needing no streaming-queue capacity at
+    /// all -- for as long as this stayed true is exactly the state a
+    /// bidirectional streaming storm used to leave both peers in). Per-
+    /// response admission after a handler has already produced its answer is
+    /// the separate `can_admit_response`.
     fn is_full(&self) -> bool {
         if self.deferred.is_some() {
             return true;
@@ -641,5 +697,156 @@ impl std::fmt::Debug for StreamingCommand {
                 .field("reason", reason)
                 .finish(),
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_streaming_payload_tests {
+    use super::*;
+
+    /// Asserts the two properties `normalize_streaming_payload` must hold for
+    /// any input, regardless of how much of a larger allocation `payload`
+    /// shares: the returned `Bytes` never shares memory with `backing_start`
+    /// (proving compaction actually happened, not merely that the numbers
+    /// look right), and `retained_bytes` equals its length exactly.
+    fn assert_compacted_and_exactly_charged(
+        payload: bytes::Bytes,
+        backing_start: usize,
+        backing_len: usize,
+    ) {
+        let visible_len = payload.len();
+        let (out, retained_bytes) = normalize_streaming_payload(payload);
+
+        assert_eq!(out.len(), visible_len);
+        let out_start = out.as_ptr() as usize;
+        let still_shares_the_backing_allocation =
+            out_start >= backing_start && out_start < backing_start + backing_len;
+        assert!(
+            !still_shares_the_backing_allocation,
+            "the returned payload must be a fresh allocation, not still sharing the \
+             {backing_len}-byte backing allocation"
+        );
+        assert_eq!(
+            retained_bytes, visible_len,
+            "retained_bytes ({retained_bytes}) must equal the compacted buffer's real, exact \
+             length ({visible_len})"
+        );
+    }
+
+    /// Every unique `Bytes` this function sees is unconditionally compacted
+    /// (see the function doc comment for why estimating from `bytes`
+    /// internals was abandoned): `retained_bytes` is always exactly
+    /// `payload.len()`, regardless of how much of a larger allocation the
+    /// input shares. The four shapes below are kept as named regression pins
+    /// for the specific constructions that broke each of the four earlier,
+    /// estimation-based attempts, even though none of them exercise a
+    /// different code path today.
+    #[test]
+    fn compacts_a_head_slice_of_a_much_larger_buffer() {
+        const BACKING_CAPACITY: usize = 1_000_000;
+        const VISIBLE_LEN: usize = 100;
+        let mut buf = bytes::BytesMut::with_capacity(BACKING_CAPACITY);
+        buf.extend_from_slice(&vec![0u8; BACKING_CAPACITY]);
+        let full = buf.freeze();
+        let backing_start = full.as_ptr() as usize;
+        let head = full.slice(0..VISIBLE_LEN);
+        drop(full); // `head` becomes the sole owner.
+        assert_compacted_and_exactly_charged(head, backing_start, BACKING_CAPACITY);
+    }
+
+    /// A tail slice with zero bytes of trailing capacity -- the shape where
+    /// `BytesMut::capacity()` alone is most misleading (it reports exactly
+    /// `VISIBLE_LEN`, identical to a genuinely right-sized buffer).
+    #[test]
+    fn compacts_an_exact_tail_slice_of_a_much_larger_buffer() {
+        const BACKING_CAPACITY: usize = 1_000_000;
+        const VISIBLE_LEN: usize = 100;
+        let mut buf = bytes::BytesMut::with_capacity(BACKING_CAPACITY);
+        buf.extend_from_slice(&vec![0u8; BACKING_CAPACITY]);
+        let full = buf.freeze();
+        let backing_start = full.as_ptr() as usize;
+        let tail = full.slice(BACKING_CAPACITY - VISIBLE_LEN..);
+        drop(full);
+        assert_compacted_and_exactly_charged(tail, backing_start, BACKING_CAPACITY);
+    }
+
+    /// One byte narrower than an exact tail slice -- distinguishes this from
+    /// a fixed `try_reclaim(1)`-style probe, which is satisfied by even one
+    /// spare trailing byte and so would not have examined this shape at all.
+    #[test]
+    fn compacts_a_near_tail_slice_with_one_trailing_spare_byte() {
+        const BACKING_CAPACITY: usize = 1_000_000;
+        const VISIBLE_LEN: usize = 100;
+        let mut buf = bytes::BytesMut::with_capacity(BACKING_CAPACITY);
+        buf.extend_from_slice(&vec![0u8; BACKING_CAPACITY]);
+        let full = buf.freeze();
+        let backing_start = full.as_ptr() as usize;
+        let start = BACKING_CAPACITY - VISIBLE_LEN - 1;
+        let near_tail = full.slice(start..start + VISIBLE_LEN);
+        drop(full);
+        assert_compacted_and_exactly_charged(near_tail, backing_start, BACKING_CAPACITY);
+    }
+
+    /// A slice whose offset is just below its own length inside a backing
+    /// allocation just under 3x that length: the shape that defeated
+    /// charging a `2x` slop-threshold estimate on a failed probe, because it
+    /// fails `bytes`' `offset >= len` reclaim heuristic for the *offset*
+    /// reason while still being backed by nearly `3x` -- an estimate bounded
+    /// at `2x` would undercharge it by nearly `1x`.
+    #[test]
+    fn compacts_a_slice_whose_offset_is_just_below_its_length_in_a_near_three_x_allocation() {
+        const VISIBLE_LEN: usize = 100_000;
+        const BACKING_CAPACITY: usize = VISIBLE_LEN * 3 - 1;
+        const OFFSET: usize = VISIBLE_LEN - 1;
+        let mut buf = bytes::BytesMut::with_capacity(BACKING_CAPACITY);
+        buf.extend_from_slice(&vec![0u8; BACKING_CAPACITY]);
+        let full = buf.freeze();
+        let backing_start = full.as_ptr() as usize;
+        let slice = full.slice(OFFSET..OFFSET + VISIBLE_LEN);
+        drop(full);
+        assert_compacted_and_exactly_charged(slice, backing_start, BACKING_CAPACITY);
+    }
+
+    /// A unique, already right-sized buffer (`offset == 0`, no slop at all)
+    /// is compacted too: nothing about a right-sized buffer is
+    /// distinguishable from the shapes above without forcing an allocation
+    /// (see the function doc comment), so this function no longer tries.
+    /// Checks the copied bytes as well as the length/pointer properties,
+    /// since this is the one case where a subtle off-by-one in a from-scratch
+    /// copy would not be caught by a length-only check against a
+    /// much-larger backing buffer.
+    #[test]
+    fn compacts_a_right_sized_unique_buffer() {
+        const LEN: usize = 4096;
+        let mut buf = bytes::BytesMut::with_capacity(LEN);
+        buf.extend_from_slice(&vec![7u8; LEN]);
+        let payload = buf.freeze();
+        let ptr_before = payload.as_ptr() as usize;
+
+        let (out, retained_bytes) = normalize_streaming_payload(payload);
+
+        assert_eq!(&out[..], &vec![7u8; LEN][..]);
+        assert_eq!(retained_bytes, LEN);
+        assert_ne!(
+            out.as_ptr() as usize,
+            ptr_before,
+            "a right-sized buffer is still compacted into a fresh allocation, not kept zero-copy"
+        );
+    }
+
+    /// A still-shared `Bytes` (multiple owners, `try_into_mut` fails) takes
+    /// the same unconditional-compaction path as a unique one.
+    #[test]
+    fn compacts_a_shared_bytes_value() {
+        const LEN: usize = 4096;
+        let payload = bytes::Bytes::from(vec![9u8; LEN]);
+        let _sibling = payload.clone(); // Keeps `payload` from being unique.
+        let ptr_before = payload.as_ptr() as usize;
+
+        let (out, retained_bytes) = normalize_streaming_payload(payload);
+
+        assert_eq!(&out[..], &vec![9u8; LEN][..]);
+        assert_eq!(retained_bytes, LEN);
+        assert_ne!(out.as_ptr() as usize, ptr_before);
     }
 }

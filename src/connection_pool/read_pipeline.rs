@@ -283,7 +283,7 @@ mod read_pipeline_tests {
             // of reach of even this maximally aggressive idle bound. The
             // rate window is wide enough that this test's real-time span
             // never crosses it -- it exercises the idle bound only.
-            streams.cleanup_stale_with(idle_timeout, std::time::Duration::from_secs(3600), 1);
+            let _ = streams.cleanup_stale_with(idle_timeout, std::time::Duration::from_secs(3600), 1);
             assert_eq!(
                 streams.active_stream_count(),
                 1,
@@ -345,6 +345,17 @@ mod read_pipeline_tests {
     /// never tear the connection down. This is the exact race #151/ffebf77
     /// established the pattern for: drain the frame's remaining bytes into
     /// scratch instead of surfacing a fatal "stream vanished" error.
+    ///
+    /// Also covers a review finding: the reap tombstone is built from
+    /// `InProgressStream::received_chunks`, which only gets a bit set on
+    /// *commit* -- and a chunk that was reserved (mid-read) at the moment of
+    /// the reap was never committed, so the tombstone's bitmap does not
+    /// include it. Draining that chunk's remainder here is its only
+    /// remaining chance to be marked received; without that, this being the
+    /// stream's one and only chunk means the tombstone can never become
+    /// complete and leaks forever (the peer would have to reuse this exact
+    /// `stream_id` to clear it). Asserts the tombstone is gone once the
+    /// discard finishes.
     #[tokio::test]
     async fn stream_reaped_mid_read_discards_the_chunk_without_a_connection_teardown() {
         let stream_id = 51u32;
@@ -393,7 +404,7 @@ mod read_pipeline_tests {
 
         // Force the reap: any elapsed time at all exceeds a zero idle bound,
         // deterministically reaping the stream without a real sleep.
-        streams.cleanup_stale_with(
+        let _ = streams.cleanup_stale_with(
             std::time::Duration::from_millis(0),
             std::time::Duration::from_secs(3600),
             1,
@@ -402,6 +413,11 @@ mod read_pipeline_tests {
             streams.active_stream_count(),
             0,
             "the stream must have been reaped out from under the live reservation"
+        );
+        assert_eq!(
+            streams.rejected_stream_count(),
+            1,
+            "the reap must have tombstoned the stream so its trailing bytes are a clean discard"
         );
 
         // The remainder of the chunk arrives, unaware the stream is gone.
@@ -428,6 +444,18 @@ mod read_pipeline_tests {
             abort_result,
             crate::handle::MessageReadResult::StreamAbort { stream_id: 777, reason: 2 }
         ));
+
+        // The discarded chunk was this stream's only one: draining its
+        // remainder must have marked it received and completed the
+        // tombstone, removing it -- not left it to leak forever with no
+        // more traffic ever able to clear it.
+        assert_eq!(
+            streams.rejected_stream_count(),
+            0,
+            "the tombstone for a fully-drained, single-chunk reap must not survive -- draining \
+             a chunk's remainder is its only chance to be marked received, since it was already \
+             reserved (not a fresh StreamData frame) before the reap happened"
+        );
     }
 }
 
@@ -457,11 +485,20 @@ enum ReadState {
         reservation: crate::protocol::StreamChunkReservation,
         read: usize,
     },
-    /// Payload of a stream rejected for bounded resource pressure. Consume it
-    /// into a fixed scratch buffer to keep framing aligned without allocating.
+    /// Payload of a stream rejected for bounded resource pressure, or the
+    /// unread tail of a chunk whose owning stream was reaped mid-read.
+    /// Consume it into a fixed scratch buffer to keep framing aligned
+    /// without allocating.
     DiscardStreamPayload {
         remaining: usize,
         scratch: Box<[u8; 8192]>,
+        /// `(stream_id, chunk_index)` to mark received, once `remaining`
+        /// reaches zero, on the tombstone this discard's bytes belong to --
+        /// see `discard_remainder_of_reservation`. `None` for a
+        /// resource-pressure-rejected `StreamStart`'s inline first chunk,
+        /// whose tombstone already accounted for it at construction (see
+        /// `RejectedStreamTombstone::rejected`).
+        on_complete_mark_received: Option<(u64, usize)>,
     },
 }
 
@@ -609,6 +646,7 @@ fn stream_payload_state(
         None => ReadState::DiscardStreamPayload {
             remaining: body_len - meta_len,
             scratch: Box::new([0; 8192]),
+            on_complete_mark_received: None,
         },
     }
 }
@@ -627,6 +665,27 @@ fn discard_remainder_of_reservation(
     ReadState::DiscardStreamPayload {
         remaining: reservation.len() - read,
         scratch: Box::new([0; 8192]),
+        // This chunk was already reserved (and partially read) against the
+        // stream's own buffer before the reap tombstoned it -- unlike a
+        // fresh StreamData frame for an already-tombstoned id, nothing else
+        // will ever mark it received. Draining these bytes is this chunk's
+        // only remaining opportunity to do so.
+        on_complete_mark_received: Some((reservation.stream_id(), reservation.chunk_index())),
+    }
+}
+
+/// Marks a `DiscardStreamPayload`'s carried `(stream_id, chunk_index)` as
+/// received, if it has one, once its bytes have been fully drained off the
+/// wire (including the case where it was already fully drained on entry --
+/// see the two call sites below). A no-op for a discard that never carried
+/// one (a resource-pressure-rejected `StreamStart`'s inline first chunk,
+/// already accounted for at tombstone construction).
+fn finish_discarding_reservation(
+    streaming_state: &mut crate::protocol::StreamingState,
+    on_complete_mark_received: Option<(u64, usize)>,
+) {
+    if let Some((stream_id, chunk_index)) = on_complete_mark_received {
+        streaming_state.mark_reap_discarded_chunk_received(stream_id, chunk_index);
     }
 }
 
@@ -807,9 +866,14 @@ where
                 .commit_v5_chunk(reservation)?
                 .map(completed_v5_stream_result))
         }
-        ReadState::DiscardStreamPayload { remaining, scratch } => {
+        ReadState::DiscardStreamPayload {
+            remaining,
+            scratch,
+            on_complete_mark_received,
+        } => {
             let read_len = (*remaining).min(scratch.len());
             if read_len == 0 {
+                finish_discarding_reservation(streaming_state, *on_complete_mark_received);
                 *state = ReadState::new();
                 return Ok(None);
             }
@@ -822,6 +886,7 @@ where
             }
             *remaining -= n;
             if *remaining == 0 {
+                finish_discarding_reservation(streaming_state, *on_complete_mark_received);
                 *state = ReadState::new();
             }
             Ok(None)
@@ -1144,9 +1209,14 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-        ReadState::DiscardStreamPayload { remaining, scratch } => {
+        ReadState::DiscardStreamPayload {
+            remaining,
+            scratch,
+            on_complete_mark_received,
+        } => {
             let read_len = (*remaining).min(scratch.len());
             if read_len == 0 {
+                finish_discarding_reservation(streaming_state, *on_complete_mark_received);
                 *state = ReadState::new();
                 return Poll::Ready(Ok(ReadPollResult {
                     result: None,
@@ -1166,6 +1236,7 @@ where
                 Poll::Ready(Ok(n)) => {
                     *remaining -= n;
                     if *remaining == 0 {
+                        finish_discarding_reservation(streaming_state, *on_complete_mark_received);
                         *state = ReadState::new();
                     }
                     Poll::Ready(Ok(ReadPollResult {
@@ -1425,9 +1496,14 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-        ReadState::DiscardStreamPayload { remaining, scratch } => {
+        ReadState::DiscardStreamPayload {
+            remaining,
+            scratch,
+            on_complete_mark_received,
+        } => {
             let read_len = (*remaining).min(scratch.len());
             if read_len == 0 {
+                finish_discarding_reservation(streaming_state, *on_complete_mark_received);
                 *state = ReadState::new();
                 return Poll::Ready(Ok(ReadPollResult {
                     result: None,
@@ -1446,6 +1522,7 @@ where
                 Poll::Ready(Ok(n)) => {
                     *remaining -= n;
                     if *remaining == 0 {
+                        finish_discarding_reservation(streaming_state, *on_complete_mark_received);
                         *state = ReadState::new();
                     }
                     Poll::Ready(Ok(ReadPollResult {
