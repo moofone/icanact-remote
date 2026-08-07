@@ -2625,7 +2625,13 @@ mod write_actor_response_direct_size_gate_tests {
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let control = crate::framing::decode_control(written[..4].try_into().unwrap()).unwrap();
         assert_eq!(control.kind, crate::framing::WireKind::Response);
-        assert_eq!(control.body_len, crate::framing::ASK_RESPONSE_HEADER_LEN + 24);
-        assert_eq!(written.len(), crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN + 24);
+        assert_eq!(
+            control.body_len,
+            crate::framing::ASK_RESPONSE_HEADER_LEN + 24
+        );
+        assert_eq!(
+            written.len(),
+            crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN + 24
+        );
     }
 }
