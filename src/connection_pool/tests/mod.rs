@@ -1561,10 +1561,9 @@ fn pooled_streaming_response_retains_owned_payload_without_materializing_bytes()
 fn pooled_streaming_admission_accounts_surplus_payload() {
     let expected_payload_len = STREAM_CHUNK_SIZE / 4;
     let retained_payload_len = expected_payload_len * 2;
-    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(
-        retained_payload_len,
-        |out| out.extend(std::iter::repeat_n(0xA7, retained_payload_len)),
-    )
+    let payload = crate::typed::PooledPayload::try_from_pooled_bytes(retained_payload_len, |out| {
+        out.extend(std::iter::repeat_n(0xA7, retained_payload_len))
+    })
     .expect("pooled payload allocation");
     let mut queue = LocalStreamingQueue::new();
 
@@ -1939,10 +1938,7 @@ fn response_admission_rejects_beyond_hard_retained_footprints() {
     let mut queue = LocalStreamingQueue::new();
     queue
         .try_extend([
-            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![
-                0u8;
-                RESPONSE_BATCH_BYTE_CAP
-            ])),
+            StreamingCommand::WriteBytes(bytes::Bytes::from(vec![0u8; RESPONSE_BATCH_BYTE_CAP])),
             StreamingCommand::Flush,
         ])
         .expect("the first bounded response fits");

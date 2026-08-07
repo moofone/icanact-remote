@@ -281,15 +281,26 @@ pub enum AskNackReason {
     /// This connection/build has no dispatcher for the ask's wire path
     /// (e.g. a raw or direct ask with no registered handler concept).
     NoDispatcher = 3,
+    /// The peer set the NACK marker with a reason byte this build does not
+    /// recognize -- a newer peer's reason, or a corrupted frame. Decode-only:
+    /// never written to the wire, so the reserved 0 discriminant cannot
+    /// collide with a reason a future version assigns.
+    Unsupported = 0,
 }
 
 impl AskNackReason {
-    pub const fn from_u8(value: u8) -> Option<Self> {
+    /// Total by construction: every byte maps to a reason, so a frame whose
+    /// NACK marker is set can never decode as an ordinary response. An
+    /// unrecognized byte degrades to `Unsupported` rather than falling
+    /// through to success, and stays forward-compatible -- a newer peer's
+    /// reason still resolves the waiter with an error instead of tearing
+    /// down the connection.
+    pub const fn from_u8(value: u8) -> Self {
         match value {
-            1 => Some(Self::UnknownActor),
-            2 => Some(Self::HandlerError),
-            3 => Some(Self::NoDispatcher),
-            _ => None,
+            1 => Self::UnknownActor,
+            2 => Self::HandlerError,
+            3 => Self::NoDispatcher,
+            _ => Self::Unsupported,
         }
     }
 }
@@ -300,6 +311,7 @@ impl std::fmt::Display for AskNackReason {
             Self::UnknownActor => "unknown actor",
             Self::HandlerError => "handler error",
             Self::NoDispatcher => "no dispatcher for this ask path",
+            Self::Unsupported => "refused with a reason this build does not recognize",
         };
         f.write_str(text)
     }
@@ -330,6 +342,11 @@ pub fn write_ask_nack_header(
 /// starting at the correlation id) for the NACK marker. Returns `None` for
 /// an ordinary response, including every response written before this
 /// marker existed (that padding was always zeroed).
+///
+/// `None` means exactly one thing -- the marker is absent -- so a set marker
+/// always yields a NACK. An unrecognized reason byte resolves to
+/// `Unsupported` instead of `None`; conflating the two would deliver a
+/// rejection to the caller as a successful empty response.
 pub fn ask_nack_reason(response_fixed_region: &[u8]) -> Option<AskNackReason> {
     if response_fixed_region.len() < ASK_RESPONSE_HEADER_LEN {
         return None;
@@ -337,7 +354,9 @@ pub fn ask_nack_reason(response_fixed_region: &[u8]) -> Option<AskNackReason> {
     if response_fixed_region[ASK_NACK_FLAG_BODY_OFFSET] != ASK_NACK_FLAG_SET {
         return None;
     }
-    AskNackReason::from_u8(response_fixed_region[ASK_NACK_REASON_BODY_OFFSET])
+    Some(AskNackReason::from_u8(
+        response_fixed_region[ASK_NACK_REASON_BODY_OFFSET],
+    ))
 }
 
 pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER_LEN] {
@@ -387,7 +406,11 @@ pub fn direct_ask_request_id(body: &[u8]) -> Option<u64> {
         return None;
     }
     let request_id = u64::from_be_bytes(body[4..12].try_into().unwrap());
-    if request_id == 0 { None } else { Some(request_id) }
+    if request_id == 0 {
+        None
+    } else {
+        Some(request_id)
+    }
 }
 
 pub fn write_direct_response_header(
@@ -627,6 +650,31 @@ mod tests {
             ask_nack_reason(&header[4..]),
             Some(AskNackReason::UnknownActor)
         );
+    }
+
+    #[test]
+    fn a_nack_whose_reason_this_build_does_not_know_is_still_a_nack() {
+        // A newer peer can NACK with a reason byte we have never heard of,
+        // and a corrupted frame can produce one by accident. Either way the
+        // marker is set, so the ask was refused. Decoding that as an
+        // ordinary response would hand the caller a successful empty payload
+        // for a request nobody answered -- fabricated success, the failure
+        // mode this whole NACK path exists to remove.
+        for unknown in [0u8, 4, 9, 200, 255] {
+            let mut header = write_ask_nack_header(7, AskNackReason::UnknownActor);
+            header[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = unknown;
+            assert_eq!(
+                ask_nack_reason(&header[4..]),
+                Some(AskNackReason::Unsupported),
+                "reason byte {unknown} left the marker set, so it must not decode as a response"
+            );
+        }
+
+        // The marker itself still distinguishes the two cases: an ordinary
+        // response is unaffected no matter what the reason byte holds.
+        let mut ordinary = write_ask_response_header(MessageType::Response, 7, 0);
+        ordinary[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = 200;
+        assert_eq!(ask_nack_reason(&ordinary[4..]), None);
     }
 
     #[test]

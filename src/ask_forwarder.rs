@@ -381,8 +381,14 @@ mod tests {
     async fn forwarded_reply_survives_full_normal_write_queue() {
         let (client, mut peer) = tokio::io::duplex(64 * 1024);
         let buffer_config = BufferConfig::default().with_write_queue_capacity(128);
-        let (stream_handle, task, _) =
-            LockFreeStreamHandle::new(client, test_addr(), ChannelId::TellAsk, buffer_config, None, None);
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            test_addr(),
+            ChannelId::TellAsk,
+            buffer_config,
+            None,
+            None,
+        );
         let stream_handle = Arc::new(stream_handle);
 
         // Saturate the ordinary (non-immediate) write queue synchronously, so
@@ -439,8 +445,14 @@ mod tests {
     async fn sibling_reply_after_claim_is_consumed_is_dropped_not_retried() {
         let (client, mut peer) = tokio::io::duplex(64 * 1024);
         let buffer_config = BufferConfig::default().with_write_queue_capacity(128);
-        let (stream_handle, task, _) =
-            LockFreeStreamHandle::new(client, test_addr(), ChannelId::TellAsk, buffer_config, None, None);
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            test_addr(),
+            ChannelId::TellAsk,
+            buffer_config,
+            None,
+            None,
+        );
         let stream_handle = Arc::new(stream_handle);
 
         // Two sibling responders sharing one guard, as minted from one AskContext.
@@ -484,8 +496,14 @@ mod tests {
     async fn claimed_reply_whose_own_enqueue_fails_is_still_delivered_not_dropped() {
         let (client, mut peer) = tokio::io::duplex(64 * 1024);
         let buffer_config = BufferConfig::default().with_write_queue_capacity(128);
-        let (stream_handle, task, _) =
-            LockFreeStreamHandle::new(client, test_addr(), ChannelId::TellAsk, buffer_config, None, None);
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            test_addr(),
+            ChannelId::TellAsk,
+            buffer_config,
+            None,
+            None,
+        );
         let stream_handle = Arc::new(stream_handle);
 
         // Saturate the ordinary write queue synchronously so the winning

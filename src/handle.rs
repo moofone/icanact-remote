@@ -5373,8 +5373,8 @@ where
 #[cfg(test)]
 mod framing_tests {
     use super::{
-        MessageReadResult, handle_raw_ask_no_dispatcher, parse_message_from_pooled_buffer_with_routes,
-        read_message_from_tls_reader,
+        MessageReadResult, handle_raw_ask_no_dispatcher,
+        parse_message_from_pooled_buffer_with_routes, read_message_from_tls_reader,
     };
     use crate::{MessageType, framing, registry::RegistryMessage};
     use std::net::SocketAddr;
@@ -5603,7 +5603,9 @@ mod framing_tests {
     async fn raw_ask_with_no_dispatcher_nacks_instead_of_silence() {
         let addr: SocketAddr = "127.0.0.1:19997".parse().unwrap();
         let config = crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("raw-ask-no-dispatcher-self")),
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "raw-ask-no-dispatcher-self",
+            )),
             ..Default::default()
         };
         let registry = crate::registry::GossipRegistry::<()>::new(addr, config);
@@ -5618,23 +5620,30 @@ mod framing_tests {
                 None,
                 None,
             );
-        let mut conn =
-            crate::connection_pool::LockFreeConnection::new(addr, crate::connection_pool::ConnectionDirection::Inbound);
+        let mut conn = crate::connection_pool::LockFreeConnection::new(
+            addr,
+            crate::connection_pool::ConnectionDirection::Inbound,
+        );
         conn.stream_handle = Some(std::sync::Arc::new(stream_handle));
         conn.set_state(crate::connection_pool::ConnectionState::Connected);
         let peer_id = crate::KeyPair::new_for_testing("raw-ask-no-dispatcher-peer").peer_id();
-        registry
-            .connection_pool
-            .add_connection_by_peer_id(peer_id, addr, std::sync::Arc::new(conn));
+        registry.connection_pool.add_connection_by_peer_id(
+            peer_id,
+            addr,
+            std::sync::Arc::new(conn),
+        );
 
         let registry = std::sync::Arc::new(registry);
         handle_raw_ask_no_dispatcher(&registry, addr, 555).await;
 
         let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
-        tokio::time::timeout(std::time::Duration::from_secs(2), peer_io.read_exact(&mut frame))
-            .await
-            .expect("a NACK must be sent immediately, not left to a timeout")
-            .expect("peer must receive the NACK frame");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_io.read_exact(&mut frame),
+        )
+        .await
+        .expect("a NACK must be sent immediately, not left to a timeout")
+        .expect("peer must receive the NACK frame");
 
         let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
             .expect("valid control word");

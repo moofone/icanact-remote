@@ -1430,8 +1430,8 @@ async fn handle_assembled_message(
         }
     } else if let Some(cell) = registry.actor_ask_immediate_handler_sync.load_full() {
         if cell.can_handle(actor_id, type_hash) {
-            cell.handle(actor_id, type_hash, complete_data)
-                .and_then(|disposition| match disposition {
+            cell.handle(actor_id, type_hash, complete_data).and_then(
+                |disposition| match disposition {
                     crate::registry::AskDisposition::Immediate(response) => Ok(Some(response)),
                     crate::registry::AskDisposition::ImmediateBytes(response) => {
                         Ok(Some(ActorResponse::Bytes(response)))
@@ -1452,7 +1452,8 @@ async fn handle_assembled_message(
                     crate::registry::AskDisposition::Nack(reason) => {
                         Err(GossipError::AskNacked(reason))
                     }
-                })
+                },
+            )
         } else if let Some(cell) = registry.actor_ask_handler_sync.load_full() {
             if let Some(stream_handle) =
                 response_connection.and_then(|conn| conn.stream_handle.as_ref().cloned())
@@ -1540,78 +1541,79 @@ async fn handle_assembled_message(
 
     match response {
         Ok(Some(response)) => {
-        // Only send response for asks (non-zero correlation_id)
-        if corr_id != 0 {
-            match response {
-                ActorResponse::Bytes(response) => {
-                    if should_stream_response(
-                        registry,
-                        response_connection,
-                        response.len(),
-                        response_mode,
-                    ) {
-                        send_streaming_response(registry, peer_addr, corr_id, response).await;
-                    } else {
-                        send_inline_response(registry, peer_addr, corr_id, response).await;
-                    }
-                }
-                ActorResponse::Aligned(response) => {
-                    if should_stream_response(
-                        registry,
-                        response_connection,
-                        response.len(),
-                        response_mode,
-                    ) {
-                        let bytes = response.into_bytes();
-                        send_streaming_response(registry, peer_addr, corr_id, bytes).await;
-                    } else {
-                        send_inline_response_aligned(registry, peer_addr, corr_id, response).await;
-                    }
-                }
-                ActorResponse::Pooled {
-                    payload,
-                    prefix,
-                    payload_len,
-                } => {
-                    if should_stream_response(
-                        registry,
-                        response_connection,
-                        payload_len,
-                        response_mode,
-                    ) {
-                        // Fallback to copying for oversize pooled responses so the caller doesn't
-                        // time out on a valid response.
-                        let mut buf = bytes::BytesMut::with_capacity(payload_len);
-                        if let Some(p) = prefix {
-                            buf.extend_from_slice(&p); // ALLOW_COPY
-                        }
-                        let mut payload = payload;
-                        while payload.has_remaining() {
-                            let chunk = payload.chunk();
-                            if chunk.is_empty() {
-                                break;
-                            }
-                            buf.extend_from_slice(chunk); // ALLOW_COPY
-                            let len = chunk.len();
-                            payload.advance(len);
-                        }
-                        let bytes = buf.freeze();
-
-                        send_streaming_response(registry, peer_addr, corr_id, bytes).await;
-                    } else {
-                        send_pooled_response(
+            // Only send response for asks (non-zero correlation_id)
+            if corr_id != 0 {
+                match response {
+                    ActorResponse::Bytes(response) => {
+                        if should_stream_response(
                             registry,
-                            peer_addr,
-                            corr_id,
-                            payload,
-                            prefix,
+                            response_connection,
+                            response.len(),
+                            response_mode,
+                        ) {
+                            send_streaming_response(registry, peer_addr, corr_id, response).await;
+                        } else {
+                            send_inline_response(registry, peer_addr, corr_id, response).await;
+                        }
+                    }
+                    ActorResponse::Aligned(response) => {
+                        if should_stream_response(
+                            registry,
+                            response_connection,
+                            response.len(),
+                            response_mode,
+                        ) {
+                            let bytes = response.into_bytes();
+                            send_streaming_response(registry, peer_addr, corr_id, bytes).await;
+                        } else {
+                            send_inline_response_aligned(registry, peer_addr, corr_id, response)
+                                .await;
+                        }
+                    }
+                    ActorResponse::Pooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    } => {
+                        if should_stream_response(
+                            registry,
+                            response_connection,
                             payload_len,
-                        )
-                        .await;
+                            response_mode,
+                        ) {
+                            // Fallback to copying for oversize pooled responses so the caller doesn't
+                            // time out on a valid response.
+                            let mut buf = bytes::BytesMut::with_capacity(payload_len);
+                            if let Some(p) = prefix {
+                                buf.extend_from_slice(&p); // ALLOW_COPY
+                            }
+                            let mut payload = payload;
+                            while payload.has_remaining() {
+                                let chunk = payload.chunk();
+                                if chunk.is_empty() {
+                                    break;
+                                }
+                                buf.extend_from_slice(chunk); // ALLOW_COPY
+                                let len = chunk.len();
+                                payload.advance(len);
+                            }
+                            let bytes = buf.freeze();
+
+                            send_streaming_response(registry, peer_addr, corr_id, bytes).await;
+                        } else {
+                            send_pooled_response(
+                                registry,
+                                peer_addr,
+                                corr_id,
+                                payload,
+                                prefix,
+                                payload_len,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
-        }
         }
         Ok(None) => {}
         Err(e) => {
@@ -1639,7 +1641,9 @@ mod tests {
     async fn direct_ask_never_echoes_and_always_nacks() {
         let addr: SocketAddr = "127.0.0.1:19996".parse().unwrap();
         let config = crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("direct-ask-never-echoes-self")),
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "direct-ask-never-echoes-self",
+            )),
             ..Default::default()
         };
         let registry = crate::registry::GossipRegistry::<()>::new(addr, config);
@@ -1687,10 +1691,13 @@ mod tests {
         .unwrap();
 
         let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
-        tokio::time::timeout(std::time::Duration::from_secs(2), peer_io.read_exact(&mut frame))
-            .await
-            .expect("a NACK must be sent immediately, not left to a timeout")
-            .expect("peer must receive the NACK frame");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_io.read_exact(&mut frame),
+        )
+        .await
+        .expect("a NACK must be sent immediately, not left to a timeout")
+        .expect("peer must receive the NACK frame");
 
         let control = crate::framing::decode_control(frame[..4].try_into().unwrap())
             .expect("valid control word");

@@ -101,9 +101,11 @@ mod read_pipeline_tests {
             &ctx,
             &mut crate::protocol::StreamingState::new(),
         )
-            .await
-            .expect_err("zero-length frames must be rejected before entering ReadBody");
-        assert!(matches!(error, crate::GossipError::Network(ref io) if io.kind() == std::io::ErrorKind::InvalidData));
+        .await
+        .expect_err("zero-length frames must be rejected before entering ReadBody");
+        assert!(
+            matches!(error, crate::GossipError::Network(ref io) if io.kind() == std::io::ErrorKind::InvalidData)
+        );
     }
 
     #[tokio::test]
@@ -113,22 +115,37 @@ mod read_pipeline_tests {
         writer.write_all(&frame).await.unwrap();
         let ctx = super::ReadContext {
             streaming_state_handoff: None,
-            registry_weak: std::sync::Weak::new(), peer_addr: "127.0.0.1:9001".parse().unwrap(),
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: "127.0.0.1:9001".parse().unwrap(),
             session_source: "127.0.0.1:9001".parse().unwrap(),
-            peer_id: None, max_message_size: 1024, expected_schema_hash: None,
+            peer_id: None,
+            max_message_size: 1024,
+            expected_schema_hash: None,
             aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
-            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()), response_correlation: None,
-            response_writer: None, tell_handler_sync: None, tell_handler_sync_context: None,
-            ask_immediate_handler_sync: None, ask_handler_sync: None, sync_actor_handler: None,
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
         };
         let mut state = super::ReadState::new();
         let mut streams = crate::protocol::StreamingState::new();
         let _ = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
-            .await.unwrap();
+            .await
+            .unwrap();
         let result = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
-            .await.unwrap().expect("StreamAbort must produce a result");
-        assert!(matches!(result,
-            crate::handle::MessageReadResult::StreamAbort { stream_id: 7, reason: 9 }
+            .await
+            .unwrap()
+            .expect("StreamAbort must produce a result");
+        assert!(matches!(
+            result,
+            crate::handle::MessageReadResult::StreamAbort {
+                stream_id: 7,
+                reason: 9
+            }
         ));
     }
 
@@ -137,9 +154,11 @@ mod read_pipeline_tests {
         let _g = allocator_test_lock();
         // R-5: even partition — the max even id (u32::MAX - 1) wraps back to 2,
         // never colliding with the per-handle allocator's odd ids.
-        let previous =
-            super::NEXT_DIRECT_RESPONSE_STREAM_ID.swap(u32::MAX - 1, Ordering::SeqCst);
-        assert_eq!(super::allocate_direct_response_stream_id().unwrap(), u32::MAX - 1);
+        let previous = super::NEXT_DIRECT_RESPONSE_STREAM_ID.swap(u32::MAX - 1, Ordering::SeqCst);
+        assert_eq!(
+            super::allocate_direct_response_stream_id().unwrap(),
+            u32::MAX - 1
+        );
         assert_eq!(super::allocate_direct_response_stream_id().unwrap(), 2);
         super::NEXT_DIRECT_RESPONSE_STREAM_ID.store(previous, Ordering::SeqCst);
     }
@@ -475,8 +494,12 @@ fn allocate_direct_response_stream_id() -> Result<u32> {
 
 fn stream_meta_len(kind: crate::framing::WireKind) -> Option<usize> {
     match kind {
-        crate::framing::WireKind::StreamStart => Some(crate::framing::STREAM_REQUEST_START_HEADER_LEN),
-        crate::framing::WireKind::StreamResponseStart => Some(crate::framing::STREAM_RESPONSE_START_HEADER_LEN),
+        crate::framing::WireKind::StreamStart => {
+            Some(crate::framing::STREAM_REQUEST_START_HEADER_LEN)
+        }
+        crate::framing::WireKind::StreamResponseStart => {
+            Some(crate::framing::STREAM_RESPONSE_START_HEADER_LEN)
+        }
         crate::framing::WireKind::StreamData | crate::framing::WireKind::StreamResponseData => {
             Some(crate::framing::STREAM_DATA_HEADER_LEN)
         }
@@ -484,7 +507,9 @@ fn stream_meta_len(kind: crate::framing::WireKind) -> Option<usize> {
     }
 }
 
-fn completed_v5_stream_result(completed: crate::protocol::CompletedV5Stream) -> crate::handle::MessageReadResult {
+fn completed_v5_stream_result(
+    completed: crate::protocol::CompletedV5Stream,
+) -> crate::handle::MessageReadResult {
     if completed.is_response {
         crate::handle::MessageReadResult::Response {
             correlation_id: completed.correlation_id,
@@ -514,9 +539,12 @@ fn reserve_v5_stream_payload(
     pool: Arc<crate::AlignedBytesPool>,
 ) -> Result<Option<crate::protocol::StreamChunkReservation>> {
     let meta_len = stream_meta_len(kind).expect("stream kind has metadata");
-    let payload_len = body_len.checked_sub(meta_len).ok_or_else(|| GossipError::Network(
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated V5 stream metadata"),
-    ))?;
+    let payload_len = body_len.checked_sub(meta_len).ok_or_else(|| {
+        GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated V5 stream metadata",
+        ))
+    })?;
     match kind {
         crate::framing::WireKind::StreamStart => {
             let stream_id = u32::from_be_bytes(meta[..4].try_into().unwrap()) as u64;
@@ -525,7 +553,14 @@ fn reserve_v5_stream_payload(
             let actor_id = u64::from_be_bytes(meta[12..20].try_into().unwrap());
             let type_hash = u32::from_be_bytes(meta[20..24].try_into().unwrap());
             streaming_state.begin_v5_stream_or_discard(
-                crate::StreamHeader { stream_id, total_size, chunk_size: payload_len as u32, chunk_index: 0, type_hash, actor_id },
+                crate::StreamHeader {
+                    stream_id,
+                    total_size,
+                    chunk_size: payload_len as u32,
+                    chunk_index: 0,
+                    type_hash,
+                    actor_id,
+                },
                 correlation_id,
                 pool,
                 false,
@@ -537,7 +572,14 @@ fn reserve_v5_stream_payload(
             let correlation_id = u32::from_be_bytes(meta[4..8].try_into().unwrap());
             let total_size = u32::from_be_bytes(meta[8..12].try_into().unwrap()) as u64;
             streaming_state.begin_v5_stream_or_discard(
-                crate::StreamHeader { stream_id, total_size, chunk_size: payload_len as u32, chunk_index: 0, type_hash: 0, actor_id: 0 },
+                crate::StreamHeader {
+                    stream_id,
+                    total_size,
+                    chunk_size: payload_len as u32,
+                    chunk_index: 0,
+                    type_hash: 0,
+                    actor_id: 0,
+                },
                 correlation_id,
                 pool,
                 true,
@@ -560,7 +602,10 @@ fn stream_payload_state(
 ) -> ReadState {
     match reservation {
         Some(reservation) if reservation.is_empty() => ReadState::new(),
-        Some(reservation) => ReadState::ReadStreamPayload { reservation, read: 0 },
+        Some(reservation) => ReadState::ReadStreamPayload {
+            reservation,
+            read: 0,
+        },
         None => ReadState::DiscardStreamPayload {
             remaining: body_len - meta_len,
             scratch: Box::new([0; 8192]),
@@ -626,11 +671,12 @@ where
                 return Ok(None);
             }
 
-            let control = crate::framing::decode_control(*buf)
-                .ok_or_else(|| crate::GossipError::Network(std::io::Error::new(
+            let control = crate::framing::decode_control(*buf).ok_or_else(|| {
+                crate::GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "unknown V5 wire kind",
-                )))?;
+                ))
+            })?;
             let msg_len = control.body_len;
             if msg_len == 0 {
                 return Err(reject_zero_length_frame());
@@ -704,7 +750,13 @@ where
             )?;
             Ok(Some(result))
         }
-        ReadState::ReadStreamMeta { kind, body_len, meta, meta_len, read } => {
+        ReadState::ReadStreamMeta {
+            kind,
+            body_len,
+            meta,
+            meta_len,
+            read,
+        } => {
             let n = stream.read(&mut meta[*read..*meta_len]).await?;
             if n == 0 {
                 return Err(GossipError::Network(std::io::Error::new(
@@ -717,7 +769,11 @@ where
                 return Ok(None);
             }
             let reservation = reserve_v5_stream_payload(
-                *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
+                *kind,
+                *body_len,
+                &meta[..*meta_len],
+                streaming_state,
+                ctx.aligned_pool.clone(),
             )?;
             *state = stream_payload_state(reservation, *body_len, *meta_len);
             Ok(None)
@@ -747,7 +803,9 @@ where
                 ReadState::ReadStreamPayload { reservation, .. } => reservation,
                 _ => unreachable!("read state must be V5 stream payload"),
             };
-            Ok(streaming_state.commit_v5_chunk(reservation)?.map(completed_v5_stream_result))
+            Ok(streaming_state
+                .commit_v5_chunk(reservation)?
+                .map(completed_v5_stream_result))
         }
         ReadState::DiscardStreamPayload { remaining, scratch } => {
             let read_len = (*remaining).min(scratch.len());
@@ -784,6 +842,12 @@ enum ReadIoResult {
     Generic(crate::handle::MessageReadResult),
     DirectAsk {
         correlation_id: u32,
+        /// Stable, caller-controlled ask identity. Carried here so wiring the
+        /// zero-copy parser to this seam cannot quietly skip the nonzero
+        /// check the generic parser enforces: whoever constructs this variant
+        /// has to produce the id, and `parse_direct_ask_request_id` is the
+        /// only way to get one.
+        request_id: u64,
         payload: crate::AlignedBytes,
     },
     ActorAsk {
@@ -870,11 +934,12 @@ where
                         }));
                     }
 
-                    let control = crate::framing::decode_control(*buf)
-                        .ok_or_else(|| crate::GossipError::Network(std::io::Error::new(
+                    let control = crate::framing::decode_control(*buf).ok_or_else(|| {
+                        crate::GossipError::Network(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "unknown V5 wire kind",
-                        )))?;
+                        ))
+                    })?;
                     let msg_len = control.body_len;
                     if msg_len == 0 {
                         return Poll::Ready(Err(reject_zero_length_frame()));
@@ -900,7 +965,10 @@ where
                             meta_len,
                             read: 0,
                         };
-                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                        return Poll::Ready(Ok(ReadPollResult {
+                            result: None,
+                            progressed: true,
+                        }));
                     }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
                     let mut buffer = unsafe {
@@ -993,27 +1061,45 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-        ReadState::ReadStreamMeta { kind, body_len, meta, meta_len, read } => {
-            match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
-                Poll::Pending if block_on_pending => Poll::Pending,
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream metadata",
-                )))),
-                Poll::Ready(Ok(n)) => {
-                    *read += n;
-                    if *read < *meta_len {
-                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
-                    }
-                    let reservation = reserve_v5_stream_payload(
-                        *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
-                    )?;
-                    *state = stream_payload_state(reservation, *body_len, *meta_len);
-                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
+        ReadState::ReadStreamMeta {
+            kind,
+            body_len,
+            meta,
+            meta_len,
+            read,
+        } => match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
+            Poll::Pending if block_on_pending => Poll::Pending,
+            Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                result: None,
+                progressed: false,
+            })),
+            Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed during V5 stream metadata",
+            )))),
+            Poll::Ready(Ok(n)) => {
+                *read += n;
+                if *read < *meta_len {
+                    return Poll::Ready(Ok(ReadPollResult {
+                        result: None,
+                        progressed: true,
+                    }));
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                let reservation = reserve_v5_stream_payload(
+                    *kind,
+                    *body_len,
+                    &meta[..*meta_len],
+                    streaming_state,
+                    ctx.aligned_pool.clone(),
+                )?;
+                *state = stream_payload_state(reservation, *body_len, *meta_len);
+                Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: true,
+                }))
             }
-        }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        },
         ReadState::ReadStreamPayload { reservation, read } => {
             let target = match streaming_state.v5_chunk_target(*reservation, *read) {
                 Ok(target) => target,
@@ -1025,24 +1111,35 @@ where
             };
             match poll_read_once(stream, cx, target) {
                 Poll::Pending if block_on_pending => Poll::Pending,
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: false,
+                })),
                 Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream payload",
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed during V5 stream payload",
                 )))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
                     streaming_state.record_v5_chunk_progress(*reservation, n);
                     if *read < reservation.len() {
-                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                        return Poll::Ready(Ok(ReadPollResult {
+                            result: None,
+                            progressed: true,
+                        }));
                     }
                     let reservation = match std::mem::replace(state, ReadState::new()) {
                         ReadState::ReadStreamPayload { reservation, .. } => reservation,
                         _ => unreachable!(),
                     };
-                    let result = streaming_state.commit_v5_chunk(reservation)?
+                    let result = streaming_state
+                        .commit_v5_chunk(reservation)?
                         .map(completed_v5_stream_result)
                         .map(ReadIoResult::Generic);
-                    Poll::Ready(Ok(ReadPollResult { result, progressed: true }))
+                    Poll::Ready(Ok(ReadPollResult {
+                        result,
+                        progressed: true,
+                    }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
@@ -1051,11 +1148,17 @@ where
             let read_len = (*remaining).min(scratch.len());
             if read_len == 0 {
                 *state = ReadState::new();
-                return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                return Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: true,
+                }));
             }
             match poll_read_once(stream, cx, &mut scratch[..read_len]) {
                 Poll::Pending if block_on_pending => Poll::Pending,
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: false,
+                })),
                 Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "connection closed while discarding rejected stream payload",
@@ -1065,7 +1168,10 @@ where
                     if *remaining == 0 {
                         *state = ReadState::new();
                     }
-                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
+                    Poll::Ready(Ok(ReadPollResult {
+                        result: None,
+                        progressed: true,
+                    }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
@@ -1117,11 +1223,12 @@ where
                         }));
                     }
 
-                    let control = crate::framing::decode_control(*buf)
-                        .ok_or_else(|| crate::GossipError::Network(std::io::Error::new(
+                    let control = crate::framing::decode_control(*buf).ok_or_else(|| {
+                        crate::GossipError::Network(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "unknown V5 wire kind",
-                        )))?;
+                        ))
+                    })?;
                     let msg_len = control.body_len;
                     if msg_len == 0 {
                         return Poll::Ready(Err(reject_zero_length_frame()));
@@ -1147,7 +1254,10 @@ where
                             meta_len,
                             read: 0,
                         };
-                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                        return Poll::Ready(Ok(ReadPollResult {
+                            result: None,
+                            progressed: true,
+                        }));
                     }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
                     let mut buffer = unsafe {
@@ -1234,26 +1344,44 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-        ReadState::ReadStreamMeta { kind, body_len, meta, meta_len, read } => {
-            match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream metadata",
-                )))),
-                Poll::Ready(Ok(n)) => {
-                    *read += n;
-                    if *read < *meta_len {
-                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
-                    }
-                    let reservation = reserve_v5_stream_payload(
-                        *kind, *body_len, &meta[..*meta_len], streaming_state, ctx.aligned_pool.clone(),
-                    )?;
-                    *state = stream_payload_state(reservation, *body_len, *meta_len);
-                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
+        ReadState::ReadStreamMeta {
+            kind,
+            body_len,
+            meta,
+            meta_len,
+            read,
+        } => match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
+            Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                result: None,
+                progressed: false,
+            })),
+            Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed during V5 stream metadata",
+            )))),
+            Poll::Ready(Ok(n)) => {
+                *read += n;
+                if *read < *meta_len {
+                    return Poll::Ready(Ok(ReadPollResult {
+                        result: None,
+                        progressed: true,
+                    }));
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                let reservation = reserve_v5_stream_payload(
+                    *kind,
+                    *body_len,
+                    &meta[..*meta_len],
+                    streaming_state,
+                    ctx.aligned_pool.clone(),
+                )?;
+                *state = stream_payload_state(reservation, *body_len, *meta_len);
+                Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: true,
+                }))
             }
-        }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        },
         ReadState::ReadStreamPayload { reservation, read } => {
             let target = match streaming_state.v5_chunk_target(*reservation, *read) {
                 Ok(target) => target,
@@ -1264,24 +1392,35 @@ where
                 Err(e) => return Poll::Ready(Err(e)),
             };
             match poll_read_once(stream, cx, target) {
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: false,
+                })),
                 Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof, "connection closed during V5 stream payload",
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed during V5 stream payload",
                 )))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
                     streaming_state.record_v5_chunk_progress(*reservation, n);
                     if *read < reservation.len() {
-                        return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                        return Poll::Ready(Ok(ReadPollResult {
+                            result: None,
+                            progressed: true,
+                        }));
                     }
                     let reservation = match std::mem::replace(state, ReadState::new()) {
                         ReadState::ReadStreamPayload { reservation, .. } => reservation,
                         _ => unreachable!(),
                     };
-                    let result = streaming_state.commit_v5_chunk(reservation)?
+                    let result = streaming_state
+                        .commit_v5_chunk(reservation)?
                         .map(completed_v5_stream_result)
                         .map(ReadIoResult::Generic);
-                    Poll::Ready(Ok(ReadPollResult { result, progressed: true }))
+                    Poll::Ready(Ok(ReadPollResult {
+                        result,
+                        progressed: true,
+                    }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
@@ -1290,10 +1429,16 @@ where
             let read_len = (*remaining).min(scratch.len());
             if read_len == 0 {
                 *state = ReadState::new();
-                return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                return Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: true,
+                }));
             }
             match poll_read_once(stream, cx, &mut scratch[..read_len]) {
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult { result: None, progressed: false })),
+                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                    result: None,
+                    progressed: false,
+                })),
                 Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "connection closed while discarding rejected stream payload",
@@ -1303,7 +1448,10 @@ where
                     if *remaining == 0 {
                         *state = ReadState::new();
                     }
-                    Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }))
+                    Poll::Ready(Ok(ReadPollResult {
+                        result: None,
+                        progressed: true,
+                    }))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
@@ -1392,8 +1540,14 @@ where
     S: AsyncWrite + Unpin,
 {
     let header = crate::framing::write_ask_nack_header(correlation_id, reason);
-    write_header_payload_vectored(stream, bytes_written_counter, bytes_since_flush, &header, &[])
-        .await
+    write_header_payload_vectored(
+        stream,
+        bytes_written_counter,
+        bytes_since_flush,
+        &header,
+        &[],
+    )
+    .await
 }
 
 async fn write_actor_response_direct<S>(
@@ -1742,11 +1896,13 @@ fn queue_streaming_response_bytes(
         });
     }
     // A V5 data frame is [control:4][stream_id:4][chunk_index:4][payload].
-    let max_chunk = max_message_size.saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
+    let max_chunk =
+        max_message_size.saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
     if max_chunk == 0 {
         return Err(GossipError::InvalidConfig(format!(
             "max_message_size={} too small for streaming (overhead={})",
-            max_message_size, crate::framing::STREAM_RESPONSE_START_HEADER_LEN
+            max_message_size,
+            crate::framing::STREAM_RESPONSE_START_HEADER_LEN
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
@@ -1808,8 +1964,8 @@ fn queue_streaming_response_pooled(
         });
     }
 
-    let max_chunk = max_message_size
-        .saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
+    let max_chunk =
+        max_message_size.saturating_sub(crate::framing::STREAM_RESPONSE_START_HEADER_LEN);
     if max_chunk == 0 {
         return Err(GossipError::InvalidConfig(format!(
             "max_message_size={} too small for streaming (overhead={})",
@@ -1948,7 +2104,9 @@ where
             }
             if corr_id != 0 {
                 let disposition = match response {
-                    Ok(Some(response)) => Some(crate::registry::AskDisposition::Immediate(response)),
+                    Ok(Some(response)) => {
+                        Some(crate::registry::AskDisposition::Immediate(response))
+                    }
                     Ok(None) => None,
                     Err(e) => Some(crate::registry::AskDisposition::Nack(e.ask_nack_reason())),
                 };
@@ -1966,7 +2124,7 @@ where
                         response_correlation: None,
                         response_writer: None,
                         tell_handler_sync: None,
-                tell_handler_sync_context: None,
+                        tell_handler_sync_context: None,
                         ask_immediate_handler_sync: None,
                         ask_handler_sync: None,
                         sync_actor_handler: None,
@@ -2094,7 +2252,9 @@ where
             }
             if let Some(correlation_id) = correlation_id {
                 let disposition = match response {
-                    Ok(Some(response)) => Some(crate::registry::AskDisposition::Immediate(response)),
+                    Ok(Some(response)) => {
+                        Some(crate::registry::AskDisposition::Immediate(response))
+                    }
                     Ok(None) => None,
                     Err(e) => Some(crate::registry::AskDisposition::Nack(e.ask_nack_reason())),
                 };
@@ -2253,12 +2413,14 @@ where
     match result {
         ReadIoResult::DirectAsk {
             correlation_id,
+            request_id,
             payload,
         } => {
             // DirectAsk has no registered application handler in any build
             // mode: never fabricate a response from the request bytes,
             // identically in test/test-helpers/debug/release.
             let _ = payload;
+            let _ = request_id;
             let _ = &direct_response_batch;
             let write_start = perf.map(|_| Instant::now());
             write_ask_nack_direct(
