@@ -880,14 +880,339 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
     });
 }
 
-// `try_write_ask_backpressure_nack`'s own wire-content unit test
-// (`try_write_ask_backpressure_nack_writes_a_decodable_nack_on_a_healthy_stream`)
-// now lives alongside the function's definition on
+// `write_ask_nack_header_bounded`'s own wire-content unit test
+// (`write_ask_nack_header_bounded_writes_a_decodable_nack_on_a_healthy_stream`)
+// and the `LocalStreamingQueue::queue_ask_nack`/`drain_pending_ask_nacks`
+// queuing machinery it's called through now live on
 // `feat/wire-batch-nack-and-capabilities` (#185), which this branch is
 // stacked on -- see that PR for the function and its test.
 // `ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room`
 // above still proves this branch's own property: the pre-dispatch gate
-// answers with that NACK instead of consuming and dropping the ask.
+// answers with that NACK instead of consuming and dropping the ask. The
+// test below proves the property #185 could not: that the queued NACK
+// genuinely waits for a partially-written frame to finish, since only this
+// branch keeps reads flowing while a write is stuck.
+
+/// A transport that lets exactly `budget` (an externally adjustable, shared
+/// counter) bytes through in total across all `poll_write` calls, then
+/// returns `Pending` for anything beyond it. Models a peer whose receive
+/// window stalls partway through a frame and later reopens: deterministic
+/// (no real timing/socket race), so a test can raise the budget on its own
+/// schedule and observe exactly what was written before and after. Unlike
+/// `WriteWedgedStream` above (which never needs to resume and so never
+/// wakes), this stores the waker and calls it via `raise_budget_and_wake`.
+struct StallAfterNBytesStream<S> {
+    inner: S,
+    budget: Arc<AtomicUsize>,
+    written: usize,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
+}
+
+fn raise_budget_and_wake(budget: &Arc<AtomicUsize>, waker: &Arc<Mutex<Option<std::task::Waker>>>) {
+    budget.store(usize::MAX, Ordering::Release);
+    if let Some(w) = waker.lock().unwrap().take() {
+        w.wake();
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for StallAfterNBytesStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for StallAfterNBytesStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let budget = this.budget.load(Ordering::Acquire);
+        if this.written >= budget || buf.is_empty() {
+            *this.waker.lock().unwrap() = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let allowed = (budget - this.written).min(buf.len());
+        match Pin::new(&mut this.inner).poll_write(cx, &buf[..allowed]) {
+            Poll::Ready(Ok(n)) => {
+                this.written += n;
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// A queued backpressure NACK must never be attempted while a streaming
+/// frame is only *partially* written -- exactly the shape a NACK "between
+/// frames" cannot exercise, since that shape would pass whether or not the
+/// frame-boundary guard exists at all. Stalls ask1's response mid-payload
+/// (well past its much smaller V5 stream header, proven by `bytes_written()`
+/// plateauing at the stall budget), drives a second ask into the deferred
+/// slot (making `is_full()` true) and a third into the pre-dispatch gate
+/// while ask1 sits stuck there, and asserts nothing more is written until
+/// the stall lifts -- this branch's own read loop keeps ask2/ask3 flowing
+/// through that whole window, unlike #185 alone. Once the stall lifts,
+/// ask1's payload must still reassemble byte-for-byte (a splice would
+/// corrupt V5 stream framing enough that it could not), and the queued NACK
+/// must still reach the peer correctly right after.
+///
+/// Confirmed red by reverting the fix at this call site to a direct
+/// `write_ask_nack_header_bounded` call (bypassing `queue_ask_nack`): under
+/// this exact construction the direct write competes for the same stalled
+/// transport and is abandoned rather than landing mid-frame, so the
+/// observed failure is ask3 never resolving (the silent-drop symptom this
+/// mechanism exists to remove) rather than a raw corrupted-bytes assertion
+/// -- but it is a failure precisely because the old code still attempts a
+/// direct write while genuinely mid-frame, which is the property this test
+/// exists to rule out. A transport with real room to let that write
+/// through -- the realistic case -- would show the same unconditional
+/// attempt as actual byte splicing instead.
+#[test]
+fn ask_backpressure_nack_never_splices_into_an_in_flight_streaming_frame() {
+    run_multi_thread_test(async {
+        const ASK1_LEN: usize = 4 * 1024 * 1024;
+        const ASK2_LEN: usize = 5 * 1024 * 1024;
+        const ASK3_LEN: usize = 2 * 1024 * 1024;
+        const STALL_BUDGET: usize = 200;
+
+        let addr_wedged: std::net::SocketAddr = "127.0.0.1:40523".parse().unwrap();
+        let addr_peer: std::net::SocketAddr = "127.0.0.1:40524".parse().unwrap();
+
+        let registry_wedged = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_wedged,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ask_nack_never_splices_mid_frame",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_wedged
+            .set_actor_message_handler_sync(Arc::new(TestActor))
+            .await;
+
+        let correlation_wedged = CorrelationTracker::new();
+        let (io_wedged, io_peer) = tokio::io::duplex(16 * 1024 * 1024);
+        let budget = Arc::new(AtomicUsize::new(STALL_BUDGET));
+        let stall_waker: Arc<Mutex<Option<std::task::Waker>>> = Arc::new(Mutex::new(None));
+        let stalled_stream = StallAfterNBytesStream {
+            inner: io_wedged,
+            budget: Arc::clone(&budget),
+            written: 0,
+            waker: Arc::clone(&stall_waker),
+        };
+
+        let read_ctx_wedged = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_wedged),
+            peer_addr: addr_peer,
+            session_source: addr_peer,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_wedged.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_wedged.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_wedged.actor_message_handler_sync.load_full(),
+        };
+
+        let (writer_wedged, task_wedged, _) = LockFreeStreamHandle::new(
+            stalled_stream,
+            addr_peer,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_wedged),
+        );
+        let writer_wedged = Arc::new(writer_wedged);
+
+        // Unlike the wedged-transport tests above, this test needs the
+        // client to actually receive and reassemble a real response (ask1's
+        // echo), not just observe a timeout -- so, unlike those, its read
+        // side needs a `ReadContext` wiring `response_correlation` to the
+        // same tracker `ConnectionHandle` registers waiters on. It also
+        // needs a *real* registry: `process_read_result_io` requires
+        // `registry_weak.upgrade()` to succeed for every incoming frame,
+        // including plain responses, and kills the IO task outright if it
+        // does not -- a dangling `Weak::new()` is only safe for lower-level
+        // tests that never reach that dispatch path.
+        let registry_peer = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_peer,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ask_nack_never_splices_mid_frame_peer",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let correlation_peer = CorrelationTracker::new();
+        let read_ctx_peer = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_peer),
+            peer_addr: addr_wedged,
+            session_source: addr_wedged,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_peer.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_peer.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (writer_peer, _task_peer, _) = LockFreeStreamHandle::new(
+            io_peer,
+            addr_wedged,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_peer),
+        );
+        let writer_peer = Arc::new(writer_peer);
+        let conn_peer = ConnectionHandle::<()>::new_stream(
+            addr_wedged,
+            Arc::clone(&writer_peer),
+            correlation_peer,
+        );
+
+        // ask1: echoed back by `TestActor`. Its response write starts, then
+        // stalls at `STALL_BUDGET` bytes -- deep into the frame's payload,
+        // well past its (much smaller) V5 stream header.
+        let ask1_payload = bytes::Bytes::from(vec![0xA1u8; ASK1_LEN]);
+        let ask1_task = tokio::spawn({
+            let conn_peer = conn_peer.clone();
+            let ask1_payload = ask1_payload.clone();
+            async move {
+                conn_peer
+                    .ask_streaming_bytes(
+                        ask1_payload,
+                        TEST_TELL_HASH,
+                        TEST_TELL_ACTOR_ID,
+                        Duration::from_secs(10),
+                    )
+                    .await
+            }
+        });
+
+        // Wait for the stall to actually bite: `bytes_written()` must reach
+        // the budget (ask1 is underway) and then hold there.
+        let reached_stall = tokio::time::timeout(Duration::from_secs(3), async {
+            while writer_wedged.bytes_written() < STALL_BUDGET {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached_stall.is_ok(),
+            "ask1's response write must reach the stall budget: bytes_written={}",
+            writer_wedged.bytes_written()
+        );
+
+        // ask2: fills the deferred slot (declined `fits_queue` while ask1 is
+        // in flight and not yet fully written, but small enough relative to
+        // the hard cap to defer). This alone makes `is_full()` true. Reads
+        // keep flowing on this branch, so this is read and dispatched
+        // (and its response queued) despite ask1's frame still being stuck.
+        let ask2_payload = bytes::Bytes::from(vec![0xA2u8; ASK2_LEN]);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            conn_peer.ask_streaming_bytes(
+                ask2_payload,
+                TEST_TELL_HASH,
+                TEST_TELL_ACTOR_ID,
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        // ask3: arrives once the deferred slot is occupied, so the
+        // pre-dispatch `is_full()` gate queues a Backpressure NACK for it
+        // instead of dispatching -- but must not write that NACK while
+        // ask1's frame still owns the wire.
+        let ask3_payload = bytes::Bytes::from(vec![0xA3u8; ASK3_LEN]);
+        let ask3_task = tokio::spawn({
+            let conn_peer = conn_peer.clone();
+            async move {
+                conn_peer
+                    .ask_streaming_bytes(
+                        ask3_payload,
+                        TEST_TELL_HASH,
+                        TEST_TELL_ACTOR_ID,
+                        Duration::from_secs(10),
+                    )
+                    .await
+            }
+        });
+
+        // Give ask3 ample turns to be read, gated, and its NACK queued --
+        // then assert nothing beyond the stall budget has reached the wire.
+        // If the NACK (or anything else) had been spliced into ask1's
+        // in-flight frame, this would already have grown.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            writer_wedged.bytes_written(),
+            STALL_BUDGET,
+            "no bytes may be written while ask1's streaming frame is only partially sent -- a \
+             queued NACK must wait, not splice in"
+        );
+
+        // Lift the stall: ask1's frame completes, then (only once
+        // `pending_stream_cmd` is `None` again) the queued NACK drains.
+        raise_budget_and_wake(&budget, &stall_waker);
+
+        let ask1_result = tokio::time::timeout(Duration::from_secs(5), ask1_task)
+            .await
+            .expect("ask1 must complete once the stall lifts")
+            .expect("ask1 task must not panic");
+        assert_eq!(
+            ask1_result.expect("ask1 must succeed"),
+            ask1_payload,
+            "ask1's reassembled payload must be byte-for-byte correct -- a NACK spliced into \
+             its in-flight frame would corrupt V5 stream framing enough that it could not be"
+        );
+
+        let ask3_result = tokio::time::timeout(Duration::from_secs(5), ask3_task)
+            .await
+            .expect("ask3 must resolve once the stall lifts and the queued NACK can drain")
+            .expect("ask3 task must not panic");
+        match ask3_result {
+            Err(crate::GossipError::AskNacked(reason)) => {
+                assert_eq!(reason, crate::framing::AskNackReason::Backpressure);
+            }
+            other => panic!(
+                "ask3 must resolve to AskNacked(Backpressure) once its queued NACK drains \
+                 cleanly after ask1's frame completes: {other:?}"
+            ),
+        }
+
+        writer_peer.shutdown();
+        writer_wedged.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_wedged).await;
+    });
+}
 
 fn reset_io_perf() {
     let _ = IoPerfCounters::global().snapshot_and_reset();
