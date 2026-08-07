@@ -283,7 +283,7 @@ mod read_pipeline_tests {
             // of reach of even this maximally aggressive idle bound. The
             // rate window is wide enough that this test's real-time span
             // never crosses it -- it exercises the idle bound only.
-            streams.cleanup_stale_with(idle_timeout, std::time::Duration::from_secs(3600), 1);
+            let _ = streams.cleanup_stale_with(idle_timeout, std::time::Duration::from_secs(3600), 1);
             assert_eq!(
                 streams.active_stream_count(),
                 1,
@@ -393,7 +393,7 @@ mod read_pipeline_tests {
 
         // Force the reap: any elapsed time at all exceeds a zero idle bound,
         // deterministically reaping the stream without a real sleep.
-        streams.cleanup_stale_with(
+        let _ = streams.cleanup_stale_with(
             std::time::Duration::from_millis(0),
             std::time::Duration::from_secs(3600),
             1,

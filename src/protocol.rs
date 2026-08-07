@@ -69,10 +69,37 @@ pub struct StreamingState {
     /// Rejected/reaped stream ids are quarantined so their trailing frames
     /// can be discarded without allocating or tearing down unrelated
     /// traffic. See `RejectedStreamTombstone` for the invariant governing
-    /// how long an entry survives.
+    /// how long an entry survives, and `REJECTED_STREAMS_BITMAP_WORD_BUDGET`
+    /// for the aggregate bound on how much of this table can exist at once.
     rejected_streams: HashMap<u64, RejectedStreamTombstone>,
+    /// Running total of `received_chunks.len()` (bitmap words) across every
+    /// entry in `rejected_streams`, kept in sync by `try_insert_tombstone`/
+    /// `remove_tombstone` so the aggregate budget can be checked in O(1)
+    /// rather than re-summing the whole table on every insertion.
+    rejected_streams_bitmap_words: usize,
     max_concurrent_streams: usize,
 }
+
+/// Aggregate cap, in bitmap words (8 bytes each; see
+/// `RejectedStreamTombstone::received_chunks`), on how much
+/// chunk-completion-tracking memory `rejected_streams` may hold across *all*
+/// its tombstones combined. `131_072` words is 1 MiB -- generous for
+/// ordinary operation (a realistically-sized stride needs only a handful of
+/// words per tombstone regardless of declared size) but a hard ceiling on
+/// the worst case (a peer pairing a huge declared size with a
+/// one-byte-stride first chunk on every rejected/reaped generation).
+///
+/// This is a *budget*, not a capacity-eviction policy: exceeding it never
+/// evicts an existing tombstone to make room (see `RejectedStreamTombstone`'s
+/// invariant -- that is exactly the bug this table's redesign removed, since
+/// any existing entry might still have a frame in flight). Instead,
+/// `try_insert_tombstone` refuses the *new* entry that would cross the
+/// budget, and its caller turns that refusal into a hard, connection-fatal
+/// error (see `begin_v5_stream_or_discard` and `cleanup_stale_with`'s
+/// return values). The peer whose traffic caused the pressure bears the
+/// cost -- its connection closes -- rather than an unrelated stream losing
+/// the tombstone it still needs.
+const REJECTED_STREAMS_BITMAP_WORD_BUDGET: usize = 131_072;
 
 /// Chunk-completion state for a rejected or reaped stream generation,
 /// tracked precisely enough to know the instant no protocol-compliant
@@ -82,13 +109,16 @@ pub struct StreamingState {
 /// either every chunk index its declared size implies has been observed
 /// (`is_complete`), or a new `StreamStart` for the same `stream_id` arrives
 /// (an unambiguous generation boundary on an ordered transport; handled by
-/// `begin_v5_stream_or_discard`'s unconditional `remove` before it decides
-/// whether to admit or re-reject the retry). Nothing else ever removes an
-/// entry: there is no capacity cap, no LRU eviction, and no wall-clock TTL.
+/// `begin_v5_stream_or_discard`'s unconditional `remove_tombstone` before it
+/// decides whether to admit or re-reject the retry). No existing tombstone
+/// is ever evicted to make room for another -- that is the one property
+/// every earlier attempt got wrong (see below) -- but a *new* tombstone can
+/// be refused outright by `REJECTED_STREAMS_BITMAP_WORD_BUDGET`, which is a
+/// bound on the table's aggregate size, not on any individual entry's
+/// lifetime.
 ///
-/// This is a *lifetime* property, not a capacity one, which is why it
-/// replaces three earlier attempts that were all fighting the wrong
-/// dimension:
+/// This is fundamentally a *lifetime* property, which is why it replaces
+/// three earlier attempts that were all fighting the wrong dimension:
 /// - A wall-clock TTL pruned tombstones on a timer that could fire moments
 ///   before the very chunk that would have refreshed it was read.
 /// - Removing that TTL with no replacement left `reject_stream` needing to
@@ -99,19 +129,18 @@ pub struct StreamingState {
 ///   tombstone to sacrifice" has no correct answer at all: streaming frames
 ///   interleave, so nothing bounds how many *other* streams can be
 ///   rejected while one specific rejected generation still has trailing
-///   chunks in flight. Any fixed count can be exceeded.
+///   chunks in flight. Any fixed count can be exceeded, and evicting
+///   *anything* to make room risks evicting a tombstone still needed.
 ///
-/// Tracking exact per-generation completion sidesteps the question
-/// entirely instead of picking a better heuristic answer to it: an entry's
-/// size is driven by how many rejected/reaped generations are genuinely
-/// still incomplete, which is bounded by real sender behavior (each one
-/// costs the peer at least one `StreamStart` frame and, to keep the
-/// tombstone alive, continued -- if ultimately discarded -- traffic), not
-/// by an arbitrary constant that a burst of ordinary overload can exceed.
-/// It can never wedge (insertion is an unconditional, infallible
-/// `HashMap::insert`) and never evicts a tombstone whose stream might still
-/// have a frame in flight (nothing evicts at all; entries are only ever
-/// removed once proven done).
+/// Tracking exact per-generation completion sidesteps that question for
+/// every *existing* entry: an entry's own lifetime is driven entirely by
+/// its own generation's completion, never by how many other rejections
+/// happen around it. The aggregate word budget above is a separate,
+/// orthogonal bound -- on how much the table may grow *at all* -- with an
+/// explicit, non-silent failure mode (connection teardown) rather than a
+/// silent eviction, so the two concerns (an entry's lifetime vs. the
+/// table's aggregate size) are never conflated the way the LRU attempt
+/// conflated them.
 #[derive(Debug, Clone)]
 struct RejectedStreamTombstone {
     /// Total size declared by this generation's `StreamStart`, in bytes.
@@ -360,6 +389,7 @@ impl StreamingState {
         Self {
             active_streams: HashMap::new(),
             rejected_streams: HashMap::new(),
+            rejected_streams_bitmap_words: 0,
             max_concurrent_streams: 16, // Reasonable limit
         }
     }
@@ -506,7 +536,13 @@ impl StreamingState {
     }
 
     /// Convert only bounded resource-pressure rejections into a stream-local
-    /// discard. Malformed frames stay fatal protocol errors.
+    /// discard. Malformed frames stay fatal protocol errors -- and so does a
+    /// rejection that cannot be tombstoned because
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` is already exhausted: closing
+    /// this connection is the explicit, non-silent failure mode for that
+    /// case (see `reject_stream`), not silently admitting a stream this
+    /// connection has no room for, and not evicting some other, unrelated
+    /// tombstone to make room.
     pub(crate) fn begin_v5_stream_or_discard(
         &mut self,
         header: crate::StreamHeader,
@@ -519,13 +555,19 @@ impl StreamingState {
         // generation arrives before a later StreamStart. A new start is
         // therefore an unambiguous generation boundary, not a reason to
         // suppress a legitimate retry until the tombstone expires.
-        self.rejected_streams.remove(&header.stream_id);
+        self.remove_tombstone(header.stream_id);
         let total_size = header.total_size;
         match self.begin_v5_stream(header, correlation_id, pool, is_response, first_chunk_len) {
             Ok(reservation) => Ok(Some(reservation)),
             Err(error) if is_resource_busy(&error) => {
-                self.reject_stream(header.stream_id, total_size, first_chunk_len);
-                Ok(None)
+                if self.reject_stream(header.stream_id, total_size, first_chunk_len) {
+                    Ok(None)
+                } else {
+                    Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::QuotaExceeded,
+                        "rejected-stream tombstone budget exhausted",
+                    )))
+                }
             }
             Err(error) => Err(error),
         }
@@ -616,7 +658,7 @@ impl StreamingState {
             // see `RejectedStreamTombstone`'s invariant.
             tombstone.mark_chunk_received(chunk_index as usize);
             if tombstone.is_complete() {
-                self.rejected_streams.remove(&stream_id);
+                self.remove_tombstone(stream_id);
             }
             return Ok(None);
         }
@@ -624,21 +666,54 @@ impl StreamingState {
             .map(Some)
     }
 
-    /// Tombstones a resource-pressure-rejected `StreamStart`. Always
-    /// succeeds -- insertion into `rejected_streams` is an unconditional
-    /// `HashMap::insert`, so this function's only caller,
-    /// `begin_v5_stream_or_discard`, can keep invoking it via `?` without a
-    /// `ResourceBusy` here ever propagating as a connection-fatal error. A
-    /// peer sustaining resource-pressure rejections, with or without any
-    /// intervening reaps, can never take the whole connection down over
-    /// tombstone-table upkeep that has nothing to do with the stream_id it
-    /// was trying to reject. See `RejectedStreamTombstone` for why this
-    /// never needs to evict anything to make room.
-    fn reject_stream(&mut self, stream_id: u64, total_size: u64, first_chunk_len: usize) {
-        self.rejected_streams.insert(
+    /// Tombstones a resource-pressure-rejected `StreamStart`. Never evicts
+    /// an existing tombstone to make room -- that is exactly the bug this
+    /// table's redesign removed, since any existing entry might still have
+    /// a frame in flight -- so it can fail outright when
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` is already exhausted. Returns
+    /// `true` if the tombstone was recorded, `false` if the budget refused
+    /// it; the caller (`begin_v5_stream_or_discard`) turns `false` into a
+    /// hard, connection-fatal error rather than silently discarding the
+    /// stream with no way to recognize its own trailing chunks later.
+    fn reject_stream(&mut self, stream_id: u64, total_size: u64, first_chunk_len: usize) -> bool {
+        self.try_insert_tombstone(
             stream_id,
             RejectedStreamTombstone::rejected(total_size, first_chunk_len),
-        );
+        )
+    }
+
+    /// Attempts to insert (or replace) a tombstone, respecting
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET`. Returns `false` -- without
+    /// touching `rejected_streams` at all -- if doing so would exceed the
+    /// budget; every existing entry is left exactly as it was. Keeps
+    /// `rejected_streams_bitmap_words` in sync so the budget check stays
+    /// O(1) rather than re-summing the whole table on every call.
+    fn try_insert_tombstone(&mut self, stream_id: u64, tombstone: RejectedStreamTombstone) -> bool {
+        let previous_words = self
+            .rejected_streams
+            .get(&stream_id)
+            .map_or(0, |existing| existing.received_chunks.len());
+        let new_words = tombstone.received_chunks.len();
+        let projected_words = self
+            .rejected_streams_bitmap_words
+            .saturating_sub(previous_words)
+            .saturating_add(new_words);
+        if projected_words > REJECTED_STREAMS_BITMAP_WORD_BUDGET {
+            return false;
+        }
+        self.rejected_streams_bitmap_words = projected_words;
+        self.rejected_streams.insert(stream_id, tombstone);
+        true
+    }
+
+    /// Removes a tombstone, if present, keeping
+    /// `rejected_streams_bitmap_words` in sync.
+    fn remove_tombstone(&mut self, stream_id: u64) {
+        if let Some(removed) = self.rejected_streams.remove(&stream_id) {
+            self.rejected_streams_bitmap_words = self
+                .rejected_streams_bitmap_words
+                .saturating_sub(removed.received_chunks.len());
+        }
     }
 
     /// Returns the writable target range for the next read into
@@ -1008,12 +1083,18 @@ impl StreamingState {
     ///   sustaining a real transfer rate. Without this, "any progress
     ///   resets the idle clock" lets that peer pin a slot and its share of
     ///   `MAX_INFLIGHT_STREAM_BYTES` for free, forever.
-    pub fn cleanup_stale(&mut self) {
+    ///
+    /// Returns `false` if the aggregate tombstone budget was exhausted while
+    /// trying to quarantine a reaped stream -- see `cleanup_stale_with`.
+    /// Production callers (`stream_writer.rs::io_task`) must treat that as
+    /// connection-fatal.
+    #[must_use]
+    pub fn cleanup_stale(&mut self) -> bool {
         self.cleanup_stale_with(
             STREAM_IDLE_TIMEOUT,
             MIN_SUSTAINED_RATE_WINDOW,
             MIN_SUSTAINED_BYTES_PER_WINDOW,
-        );
+        )
     }
 
     /// `cleanup_stale` with explicit bounds, so tests do not have to wait
@@ -1022,14 +1103,19 @@ impl StreamingState {
     /// Does **not** prune `rejected_streams` by wall-clock age, and never
     /// evicts an entry to make room for another: see
     /// `RejectedStreamTombstone`'s invariant for why a tombstone is removed
-    /// only once proven done, and why that cannot wedge the table full
-    /// either.
+    /// only once proven done. Returns `false` if
+    /// `REJECTED_STREAMS_BITMAP_WORD_BUDGET` refused to tombstone one or
+    /// more of the streams reaped by this call -- their trailing chunks
+    /// would otherwise hit the fatal "unknown stream_id" path with no
+    /// tombstone to catch them, so the caller must treat `false` as
+    /// connection-fatal rather than silently losing track of those streams.
+    #[must_use]
     pub(crate) fn cleanup_stale_with(
         &mut self,
         idle_timeout: std::time::Duration,
         rate_window: std::time::Duration,
         min_bytes_per_window: usize,
-    ) {
+    ) -> bool {
         let before_count = self.active_streams.len();
 
         // A stream the reaper drops is not necessarily done as far as the
@@ -1108,14 +1194,17 @@ impl StreamingState {
             true
         });
 
+        let mut budget_exhausted = false;
         for (stream_id, total_size, chunk_stride, expected_chunks, received_chunks) in reaped {
-            self.tombstone_reaped_stream(
+            if !self.tombstone_reaped_stream(
                 stream_id,
                 total_size,
                 chunk_stride,
                 expected_chunks,
                 received_chunks,
-            );
+            ) {
+                budget_exhausted = true;
+            }
         }
 
         let removed = before_count - self.active_streams.len();
@@ -1126,6 +1215,8 @@ impl StreamingState {
                 "Cleaned up stale in-progress streams"
             );
         }
+
+        !budget_exhausted
     }
 
     /// Quarantines a reaped stream id the same way `reject_stream`
@@ -1135,7 +1226,8 @@ impl StreamingState {
     /// If that state already shows the generation complete -- every chunk
     /// it declared was already committed before it was reaped -- there is
     /// nothing left a compliant sender could still send, so no tombstone is
-    /// needed at all.
+    /// needed at all. Returns `false` if `REJECTED_STREAMS_BITMAP_WORD_BUDGET`
+    /// refused the (incomplete) tombstone; see `try_insert_tombstone`.
     fn tombstone_reaped_stream(
         &mut self,
         stream_id: u64,
@@ -1143,14 +1235,14 @@ impl StreamingState {
         chunk_stride: Option<usize>,
         expected_chunks: Option<usize>,
         received_chunks: Vec<u64>,
-    ) {
+    ) -> bool {
         let tombstone =
             RejectedStreamTombstone::reaped(total_size, chunk_stride, expected_chunks, received_chunks);
         if tombstone.is_complete() {
-            self.rejected_streams.remove(&stream_id);
-            return;
+            self.remove_tombstone(stream_id);
+            return true;
         }
-        self.rejected_streams.insert(stream_id, tombstone);
+        self.try_insert_tombstone(stream_id, tombstone)
     }
 }
 
@@ -2285,7 +2377,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
             let payload = [0x5Au8; STRIDE];
             let _ = chunk(&mut state, 10, total, idx, &payload);
-            state.cleanup_stale_with(idle_timeout, rate_window, 1);
+            let _ = state.cleanup_stale_with(idle_timeout, rate_window, 1);
             if idx < 3 {
                 assert_eq!(
                     state.active_stream_count(),
@@ -2322,7 +2414,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
             let payload = [0x5Au8; STRIDE];
             let _ = chunk(&mut state, 14, total, idx, &payload);
-            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            let _ = state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
             assert_eq!(
                 state.active_stream_count(),
                 1,
@@ -2367,7 +2459,7 @@ mod tests {
             // The drip keeps making real, nonzero progress every tick, which
             // is enough to defeat a zero-progress-only idle check.
             let _ = chunk(&mut state, 15, total, idx, &payload);
-            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            let _ = state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
             if state.active_stream_count() == 0 {
                 reaped = true;
                 break;
@@ -2428,7 +2520,7 @@ mod tests {
         );
 
         std::thread::sleep(Duration::from_millis(30));
-        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
+        let _ = state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
 
         assert_eq!(
             state.active_stream_count(),
@@ -2744,6 +2836,82 @@ mod tests {
         );
     }
 
+    /// Correction to the completion-tracking redesign: removing capacity
+    /// *eviction* (the LRU bug) does not mean the table should have no
+    /// budget at all. `REJECTED_STREAMS_BITMAP_WORD_BUDGET` bounds its
+    /// aggregate size; exhausting it must be a hard, connection-fatal error
+    /// for the specific rejection that crosses it -- never a silent
+    /// eviction of a different, still-needed tombstone, and never silent
+    /// admission of a stream this connection has no room to track.
+    #[test]
+    fn tombstone_budget_exhaustion_closes_the_connection_without_evicting_an_existing_tombstone() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+
+        for stream_id in 0..16u64 {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size: 8,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8)
+                .expect("connection has room for the first 16 streams")
+                .expect("must be admitted, not discarded");
+        }
+
+        // A modest, legitimate multi-frame rejection -- this tombstone must
+        // survive everything that follows.
+        let first_rejected = crate::StreamHeader {
+            stream_id: 17,
+            total_size: 16,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        assert!(
+            state
+                .begin_v5_stream_or_discard(first_rejected, 1, pool.clone(), false, 8)
+                .expect("resource pressure is a stream-local rejection")
+                .is_none()
+        );
+
+        // A single further rejection at MAX_STREAM_SIZE with an 8-byte
+        // stride -- an ordinary, legitimately-sized large multi-frame
+        // request, not a malformed declaration -- needs a completion
+        // bitmap exactly as large as the entire aggregate budget on its
+        // own (64 MiB / 8-byte stride / 64 chunks-per-word ==
+        // REJECTED_STREAMS_BITMAP_WORD_BUDGET words), so it alone, on top
+        // of the first rejection's 1-word tombstone, crosses it.
+        let budget_buster = crate::StreamHeader {
+            stream_id: 18,
+            total_size: crate::MAX_STREAM_SIZE as u64,
+            chunk_size: 8,
+            chunk_index: 0,
+            type_hash: 0,
+            actor_id: 0,
+        };
+        let result = state.begin_v5_stream_or_discard(budget_buster, 1, pool, false, 8);
+        assert!(
+            result.is_err(),
+            "exhausting the aggregate tombstone budget must be a hard, connection-fatal error, \
+             not a silent discard with no tombstone to catch its trailing chunks: {result:?}"
+        );
+
+        // The *first* rejection's tombstone must still be intact -- budget
+        // exhaustion must never silently evict an existing, unrelated
+        // tombstone to make room for the one that was refused.
+        let trailing = state.reserve_v5_chunk_or_discard(17, 1, 8);
+        assert!(
+            matches!(trailing, Ok(None)),
+            "budget exhaustion must never evict an existing tombstone: {trailing:?}"
+        );
+    }
+
     /// Review finding: `begin_v5_stream_or_discard` reclassified
     /// `start_stream_with_correlation_and_kind`'s `ResourceBusy` into a
     /// clean, stream-local discard -- and built a `RejectedStreamTombstone`
@@ -2841,7 +3009,7 @@ mod tests {
             target[..8].copy_from_slice(&[0xAB; 8]);
             read += 8;
             state.record_v5_chunk_progress(reservation, 8);
-            state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
+            let _ = state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
             assert_eq!(
                 state.active_stream_count(),
                 1,
@@ -2899,7 +3067,7 @@ mod tests {
             target[..8].copy_from_slice(&[0xCDu8; 8]);
             read += 8;
             state.record_v5_chunk_progress(reservation, 8);
-            state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
+            let _ = state.cleanup_stale_with(idle_timeout, rate_window, min_bytes_per_window);
             assert_eq!(
                 state.active_stream_count(),
                 1,
@@ -2942,7 +3110,7 @@ mod tests {
                 .expect("reservation is still live");
         }
 
-        state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
+        let _ = state.cleanup_stale_with(Duration::from_millis(10), Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -2976,7 +3144,7 @@ mod tests {
 
         // Idle out with nothing further arriving for this stream, then reap.
         std::thread::sleep(Duration::from_millis(20));
-        state.cleanup_stale_with(Duration::from_millis(5), Duration::from_secs(3600), 1);
+        let _ = state.cleanup_stale_with(Duration::from_millis(5), Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -3028,7 +3196,7 @@ mod tests {
         // guarantees a lower bound, so any overshoot only makes the reap
         // more certain.
         std::thread::sleep(idle_timeout + Duration::from_millis(10));
-        state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
+        let _ = state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -3041,7 +3209,7 @@ mod tests {
         // own -- only its own completion or a retry can.
         for _ in 0..4 {
             std::thread::sleep(idle_timeout * 3);
-            state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
+            let _ = state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
             assert_eq!(
                 state.rejected_stream_count(),
                 1,
@@ -3091,7 +3259,7 @@ mod tests {
             .expect("start stream and reserve its first chunk");
 
         std::thread::sleep(idle_timeout + Duration::from_millis(10));
-        state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
+        let _ = state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
         assert_eq!(
             state.active_stream_count(),
             0,
@@ -3105,7 +3273,7 @@ mod tests {
         // is waiting to be read.
         for _ in 0..3 {
             std::thread::sleep(idle_timeout * 3);
-            state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
+            let _ = state.cleanup_stale_with(idle_timeout, Duration::from_secs(3600), 1);
         }
 
         // *Now* the late chunk arrives -- after cleanup has already swept
