@@ -665,6 +665,15 @@ enum OwnerCommand {
         evidence_before: std::time::Instant,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
+    /// Read `ReleaseDeadPeer`'s causal liveness fence without performing
+    /// any side effects. Cleanup uses this before destroying actors or
+    /// emitting tombstones so a reconnect that raced selection protects the
+    /// entire candidate, not merely its address ownership.
+    HasNewerLivenessEvidence {
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+        reply: oneshot::Sender<bool>,
+    },
     /// Atomically checks the causal fence a dead-peer reap also checks
     /// (does `addr` have DIRECT evidence of a live owner causally NEWER
     /// than `evidence_before`?) AND revalidates the full identity selection
@@ -1020,6 +1029,27 @@ impl RegistryOwnerHandle {
             return None;
         }
         response.await.unwrap_or(None)
+    }
+
+    /// Read `release_dead_peer`'s causal liveness fence without applying its
+    /// ownership side effects. Fail closed when the owner is unavailable:
+    /// cleanup must preserve a candidate it cannot prove safe to destroy.
+    pub async fn has_newer_liveness_evidence_since(
+        &self,
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+    ) -> bool {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::HasNewerLivenessEvidence {
+            addr,
+            evidence_before,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return true;
+        }
+        response.await.unwrap_or(true)
     }
 
     /// See `OwnerCommand::ReserveForReap`'s doc comment for the causal
@@ -1692,6 +1722,17 @@ impl PeerRegistryOwner {
             } => {
                 let released = self.release_dead_peer(&peer_id, addr, evidence_before);
                 let _ = reply.send(released);
+            }
+            OwnerCommand::HasNewerLivenessEvidence {
+                addr,
+                evidence_before,
+                reply,
+            } => {
+                let has_newer = self
+                    .claim_committed_at
+                    .get(&addr)
+                    .is_some_and(|committed_at| *committed_at > evidence_before);
+                let _ = reply.send(has_newer);
             }
             OwnerCommand::ReserveForReap {
                 addr,

@@ -9371,6 +9371,29 @@ impl<T: 'static> GossipRegistry<T> {
                 .collect()
         };
 
+        // Revalidate the owner's causal liveness fence before any
+        // destructive work. A reconnect can commit after the stale
+        // `gossip_state` selection but before this sweep reaches the actor
+        // removal loop; in that case preserve actors, tombstones, and
+        // side-table state, not merely the address ownership at the final
+        // release step.
+        let mut confirmed_dead = Vec::with_capacity(peers_to_cleanup.len());
+        for (peer_addr, node_id, evidence_before) in peers_to_cleanup {
+            if self
+                .registry_owner
+                .has_newer_liveness_evidence_since(peer_addr, evidence_before)
+                .await
+            {
+                debug!(
+                    peer = %peer_addr,
+                    "cleanup_dead_peers: preserving candidate with newer owner-side liveness evidence"
+                );
+                continue;
+            }
+            confirmed_dead.push((peer_addr, node_id, evidence_before));
+        }
+        let peers_to_cleanup = confirmed_dead;
+
         let mut should_trigger_immediate = false;
 
         if !peers_to_cleanup.is_empty() {
@@ -26006,6 +26029,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp()),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -26060,6 +26084,101 @@ mod tests {
              survive a sweep delayed well past dead_peer_timeout -- the fence must be \
              anchored to this peer's own failure time, not a global cutoff for the whole \
              sweep"
+        );
+    }
+
+    /// A reconnect that commits after the stale `GossipState` failure
+    /// snapshot must protect the whole candidate, not only its ownership.
+    /// The owner-side fence is checked before actor/tombstone destruction.
+    #[tokio::test]
+    async fn cleanup_dead_peers_preserves_actor_state_when_reconnect_races_selection() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = GossipRegistry::<()>::new(test_addr(44_930), config);
+        let peer_addr = test_addr(44_931);
+        let peer_id = test_peer_id("actors-survive-fence-race");
+        let session_source = test_addr(44_932);
+        let actor_name = "svc-actors-survive-fence-race";
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(
+                        std::time::Instant::now() - Duration::from_secs(10),
+                    ),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+            let mut actors = HashSet::new();
+            actors.insert(actor_name.to_string());
+            gossip_state.peer_to_actors.insert(peer_addr, actors);
+        }
+        let location = RemoteActorLocation::new_with_peer(peer_addr, peer_id.clone());
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), location);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        registry.cleanup_dead_peers().await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&peer_addr),
+            Some(peer_id),
+            "the reconnect's owner-side liveness evidence must preserve ownership"
+        );
+        assert!(
+            registry.actor_state.known_actors.contains_sync(actor_name),
+            "a protected candidate's actor must not be destroyed"
+        );
+        assert!(
+            registry
+                .actor_state
+                .removed_actors
+                .read_sync(actor_name, |_, _| ())
+                .is_none(),
+            "a protected candidate must not receive a removal tombstone"
+        );
+        assert!(
+            registry
+                .gossip_state
+                .lock()
+                .await
+                .peer_to_actors
+                .contains_key(&peer_addr),
+            "a protected candidate's side table must remain intact"
         );
     }
     /// Companion to `cleanup_dead_peers_releases_address_ownership`: an
