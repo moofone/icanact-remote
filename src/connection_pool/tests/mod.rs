@@ -527,12 +527,20 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
 /// Push a connection's own local streaming-response queue over the
 /// `is_full()` threshold with two real ask responses (one at exactly
 /// `MAX_STREAM_SIZE`, one just over `STREAMING_THRESHOLD` more -- their sum
-/// exceeds the ~64MiB reserve), then send a third ask on the same connection
+/// exceeds the ~64MiB reserve), then send a plain tell on the same connection
 /// and assert its handler still runs. Ordering is driven structurally, not
 /// by sleeping: `ask_streaming_bytes` is awaited to its own bounded timeout
-/// fully sequentially (not concurrently), so ask2 and ask3's frames cannot
-/// reach the wire before ask1's do, which guarantees `is_full()` is already
-/// true by the time ask3's frame is parsed.
+/// fully sequentially (not concurrently), so the tell's frame cannot reach
+/// the wire before ask1/ask2's do, which guarantees `is_full()` is already
+/// true by the time the tell is parsed.
+///
+/// Deliberately a tell, not a third ask: dispatching an `ActorAsk` is itself
+/// conditionally skipped while the streaming queue has no room (see
+/// `ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room`
+/// below), so a probe ask would not distinguish "reads stopped" from
+/// "reads continued but ask dispatch was correctly deferred". A tell has no
+/// response to admit and is never subject to that gate, so it isolates the
+/// property this test is actually about: the read loop itself keeps running.
 #[test]
 fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_read() {
     run_multi_thread_test(async {
@@ -641,19 +649,18 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
         )
         .await;
 
-        // ask3: tiny, sent last and only after ask1/ask2 have each had their
-        // full bounded window to reach the wire. Its own response needs no
-        // streaming admission at all -- this is purely a read-progress probe.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            conn_peer.ask_streaming_bytes(
-                bytes::Bytes::from_static(b"x"),
-                TEST_TELL_HASH,
+        // A plain tell, sent last and only after ask1/ask2 have each had
+        // their full bounded window to reach the wire: a pure read-progress
+        // probe with no response to admit, so nothing about it is subject to
+        // the ask-dispatch gate.
+        conn_peer
+            .tell_actor_frame(
                 TEST_TELL_ACTOR_ID,
-                Duration::from_secs(120),
-            ),
-        )
-        .await;
+                TEST_TELL_HASH,
+                bytes::Bytes::from_static(b"still-alive"),
+            )
+            .await
+            .unwrap();
 
         let outcome = tokio::time::timeout(Duration::from_secs(5), async {
             while delivered.load(Ordering::Acquire) < 3 {
@@ -665,8 +672,181 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
         assert!(
             outcome.is_ok(),
             "local_streaming_queue.is_full() must not stop the IO task from reading a later, \
-             unrelated ask on the same connection: delivered={}",
+             unrelated tell on the same connection: delivered={}",
             delivered.load(Ordering::Acquire)
+        );
+
+        writer_peer.shutdown();
+        writer_wedged.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_wedged).await;
+    });
+}
+
+/// P1 (residual of the two fixes above): removing `is_full()` from the read
+/// loop's entry gate must not turn into "dispatch the ask handler and then
+/// discard whatever it produces". The handler runs before
+/// `can_admit_response` is ever consulted, so if dispatch is unconditional,
+/// an ask that arrives once the streaming queue and its deferred slot are
+/// both already full is consumed, its response computed, admission fails,
+/// and the answer is thrown away -- the exact silent drop documented at
+/// `queue_streaming_response_bytes`/`_pooled`, now happening systematically
+/// instead of only at a tight byte-cap race.
+///
+/// Fill the connection's own retained streaming-response backlog past
+/// `is_full()` (same construction as the test above: one response at exactly
+/// `MAX_STREAM_SIZE`, one more just over `STREAMING_THRESHOLD`), then send a
+/// third, large ask into that saturated state and assert its handler never
+/// runs at all (`delivered` must not advance past 2) -- not "ran and its
+/// answer vanished". A plain tell sent immediately after must still be
+/// dispatched (`delivered` reaches 3), proving the connection did not fall
+/// back to blocking all reads to get there.
+#[test]
+fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
+    run_multi_thread_test(async {
+        let addr_wedged: std::net::SocketAddr = "127.0.0.1:40499".parse().unwrap();
+        let addr_peer: std::net::SocketAddr = "127.0.0.1:40500".parse().unwrap();
+
+        let delivered = Arc::new(AtomicU64::new(0));
+        let registry_wedged = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_wedged,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "ask_dispatch_skipped_not_dropped",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_wedged
+            .set_actor_message_handler_sync(Arc::new(EchoAskCountAll {
+                delivered: Arc::clone(&delivered),
+            }))
+            .await;
+
+        let correlation_wedged = CorrelationTracker::new();
+        let (io_wedged, io_peer) = tokio::io::duplex(4 * 1024 * 1024);
+        let wedged_stream = WriteWedgedStream { inner: io_wedged };
+
+        let read_ctx_wedged = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_wedged),
+            peer_addr: addr_peer,
+            session_source: addr_peer,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_wedged.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_wedged.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_wedged.actor_message_handler_sync.load_full(),
+        };
+
+        let (writer_wedged, task_wedged, _) = LockFreeStreamHandle::new(
+            wedged_stream,
+            addr_peer,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_wedged),
+        );
+        let writer_wedged = Arc::new(writer_wedged);
+
+        let (writer_peer, _task_peer, _) = LockFreeStreamHandle::new(
+            io_peer,
+            addr_wedged,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer_peer = Arc::new(writer_peer);
+        let conn_peer = ConnectionHandle::<()>::new_stream(
+            addr_wedged,
+            Arc::clone(&writer_peer),
+            CorrelationTracker::new(),
+        );
+
+        // ask1: alone, exactly MAX_STREAM_SIZE (admit_single_oversize). delivered -> 1.
+        let ask_one_payload = bytes::Bytes::from(vec![0x11u8; crate::MAX_STREAM_SIZE]);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            conn_peer.ask_streaming_bytes(
+                ask_one_payload,
+                TEST_TELL_HASH,
+                TEST_TELL_ACTOR_ID,
+                Duration::from_secs(120),
+            ),
+        )
+        .await;
+
+        // ask2: pushes retained_bytes() past the is_full() threshold via the
+        // deferred-response slot. delivered -> 2. The streaming queue and its
+        // deferred slot are now both occupied -- exactly the precondition
+        // this test targets.
+        let ask_two_payload = bytes::Bytes::from(vec![0x22u8; STREAMING_THRESHOLD + 1_048_576]);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            conn_peer.ask_streaming_bytes(
+                ask_two_payload,
+                TEST_TELL_HASH,
+                TEST_TELL_ACTOR_ID,
+                Duration::from_secs(120),
+            ),
+        )
+        .await;
+
+        // ask3: another large ask (its response, if computed, would need
+        // streaming admission) arriving while the queue has zero room. Must
+        // not be dispatched: `delivered` must not advance past 2 for this.
+        let ask_three_payload = bytes::Bytes::from(vec![0x33u8; STREAMING_THRESHOLD + 4096]);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            conn_peer.ask_streaming_bytes(
+                ask_three_payload,
+                TEST_TELL_HASH,
+                TEST_TELL_ACTOR_ID,
+                Duration::from_secs(120),
+            ),
+        )
+        .await;
+
+        // A plain tell right behind it must still be dispatched: reads (and
+        // dispatch of messages that need no streaming admission) must keep
+        // flowing past the skipped ask, not stall behind it.
+        conn_peer
+            .tell_actor_frame(
+                TEST_TELL_ACTOR_ID,
+                TEST_TELL_HASH,
+                bytes::Bytes::from_static(b"still-alive"),
+            )
+            .await
+            .unwrap();
+
+        let reached_three = tokio::time::timeout(Duration::from_secs(5), async {
+            while delivered.load(Ordering::Acquire) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached_three.is_ok(),
+            "the tell must still be dispatched after the skipped ask: delivered={}",
+            delivered.load(Ordering::Acquire)
+        );
+
+        // Give any (incorrect) delayed/duplicate dispatch of ask3 a generous
+        // window to show up before asserting it never does.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            delivered.load(Ordering::Acquire),
+            3,
+            "ask3's handler must never run while the streaming queue has no room for its \
+             response -- consuming it and then discarding the computed answer is exactly the \
+             silent drop this test guards against"
         );
 
         writer_peer.shutdown();
