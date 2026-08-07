@@ -300,10 +300,15 @@ pub enum WritePayload {
     /// trusted as that exemption -- currently: the fixed-size `RouteBind`/
     /// `StreamAbort` control frames (a handful of bytes, built from
     /// `framing`'s own header constructors, never a caller-supplied length),
-    /// and `ConnectionHandle::ask_batch_deferred`'s pre-concatenated batch
+    /// `ConnectionHandle::ask_batch_deferred`'s pre-concatenated batch
     /// (each request already passed `reject_oversize_inline` individually
     /// before concatenation; the aggregate is expected to exceed
-    /// `max_message_size` by design and must not be gated against it).
+    /// `max_message_size` by design and must not be gated against it), and
+    /// `write_chunked_nonblocking`'s per-chunk fragments (the whole buffer
+    /// is validated once, before chunking -- a fragment has no declared
+    /// length of its own to check, and re-validating one as if it were a
+    /// complete `Single` write could reject a fragment of already-valid
+    /// content).
     TrustedFrame(bytes::Bytes),
     HeaderPayload {
         header: bytes::Bytes,

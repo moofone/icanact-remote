@@ -3442,16 +3442,51 @@ impl LockFreeStreamHandle {
         self.write_bytes_nonblocking(combined_buffer.freeze())
     }
 
-    /// Write large data in chunks to avoid blocking
+    /// Write large data in chunks to avoid blocking.
+    ///
+    /// PR #183 review, round 7: the size gate lives at the granularity of
+    /// one enqueued `WritePayload` -- and each chunk here used to be its
+    /// own separate `Single` write. A chunk holding only the beginning of
+    /// a frame has no way to see that frame's own declared `body_len`; it
+    /// can only see its own (small, chunk-sized) length, so a frame
+    /// declaring a body larger than `max_message_size` could be split into
+    /// pieces every one of which passed the per-fragment check, and the
+    /// peer would reassemble the oversized frame from the TCP stream
+    /// anyway. A fragment has no independent meaning to validate -- the
+    /// declared length that matters belongs to the whole logical write, so
+    /// this validates `data` once, as a whole, exactly the way
+    /// `write_bytes_nonblocking` would if `data` were sent as a single
+    /// `Single` write, *before* any chunking happens.
+    ///
+    /// Once `data` has passed that check, each chunk is enqueued as
+    /// `TrustedFrame` rather than `Single` -- re-running the per-fragment
+    /// size gate on an already-validated slice would be meaningless (see
+    /// above), and could even reject a fragment of legitimately-sized
+    /// content if `chunk_size` happened to exceed `max_message_size`. See
+    /// `WritePayload::TrustedFrame`'s doc comment for the other callers
+    /// this same trust boundary applies to.
+    ///
+    /// Returns the first enqueue error encountered, rather than the
+    /// previous unconditional `Ok(())` that discarded every per-chunk
+    /// result -- a discarded `MessageTooLarge`, queue-full, or
+    /// connection-closed error here meant the caller was told a write
+    /// succeeded when part or all of it never reached the wire. If a later
+    /// chunk fails after earlier chunks were already enqueued, those
+    /// earlier bytes are already queued for (or already on) the wire: the
+    /// peer has received, or will receive, part of a frame it will never
+    /// get the rest of. That is not a state a caller can recover from by
+    /// retrying this call -- an error here must be treated as fatal to the
+    /// connection, the same as any other mid-stream write failure.
     pub fn write_chunked_nonblocking(&self, data: &[u8], chunk_size: usize) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
+        self.reject_oversize_single(data)?;
 
         for chunk in data.chunks(chunk_size) {
-            let _ = self.write_bytes_nonblocking(
+            self.enqueue_write_nonblocking(WritePayload::TrustedFrame(
                 bytes::Bytes::copy_from_slice(chunk), /* ALLOW_COPY */
-            );
+            ))?;
         }
 
         Ok(())
@@ -4990,6 +5025,180 @@ mod write_buf_control_single_arg_tests {
             matches!(err, GossipError::MessageTooLarge { size: 65, max: 64 }),
             "expected MessageTooLarge{{size: 65, max: 64}}, got {err:?}"
         );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 7: `write_chunked_nonblocking` used to validate
+/// (and enqueue) each chunk as an independent `Single` write, so a frame
+/// whose declared body exceeded `max_message_size` could be split into
+/// pieces small enough that every individual fragment passed on its own --
+/// and it discarded every per-chunk `Result`, always returning `Ok(())`
+/// regardless of what actually reached the write queue.
+#[cfg(test)]
+mod write_chunked_nonblocking_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    /// A frame whose declared body exceeds `max_message_size` must be
+    /// rejected even when `chunk_size` is small enough that every
+    /// individual fragment would pass the per-`Single` size gate on its
+    /// own -- this is the shape that distinguishes up-front whole-buffer
+    /// validation (rejects this) from the old per-fragment validation
+    /// (every fragment individually looked fine, so nothing ever caught
+    /// it).
+    #[tokio::test]
+    async fn write_chunked_nonblocking_rejects_an_oversize_frame_split_into_small_chunks() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9961".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9961, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let header = crate::framing::write_gossip_frame_prefix(payload_len);
+        let mut frame = Vec::with_capacity(header.len() + payload_len);
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&vec![0u8; payload_len]);
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap()).unwrap();
+        assert!(
+            control.body_len > max_message_size,
+            "test setup: the frame's own declared body must exceed the limit"
+        );
+
+        // Every fragment here is far shorter than max_message_size (and
+        // shorter than LENGTH_PREFIX_LEN for most of them), so a
+        // per-fragment-only check would have accepted every single one.
+        let chunk_size = 8;
+        assert!(chunk_size < max_message_size);
+
+        let err = writer
+            .write_chunked_nonblocking(&frame, chunk_size)
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A legitimately-sized buffer must still be delivered intact once
+    /// chunked -- the up-front validation must not have turned this into
+    /// an unconditional rejection.
+    #[tokio::test]
+    async fn write_chunked_nonblocking_delivers_a_buffer_within_max_message_size() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9962".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9962, max_message_size)),
+        );
+
+        let data: Vec<u8> = (0u8..40).collect();
+        writer
+            .write_chunked_nonblocking(&data, 6)
+            .expect("a buffer within max_message_size, chunked, must be accepted");
+
+        let mut received = vec![0u8; data.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver every chunk to the peer");
+        assert_eq!(received, data);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A later chunk's enqueue failure must surface as an error, not be
+    /// silently discarded -- proving the caller can tell a chunked write
+    /// only partially reached the wire, instead of being told (incorrectly)
+    /// that it fully succeeded. Uses the queue-notify test hook to force
+    /// `exit_flag` after exactly two chunks have already been pushed,
+    /// deterministically reproducing "a later chunk fails after earlier
+    /// chunks were already enqueued" without racing a real queue-full
+    /// condition.
+    #[tokio::test]
+    async fn write_chunked_nonblocking_surfaces_a_later_chunk_failure_instead_of_ok() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 4096;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9963".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9963, max_message_size)),
+        );
+
+        let successful_pushes = Arc::new(AtomicUsize::new(0));
+        let exit_flag = writer.exit_flag.clone();
+        let successful_pushes_for_hook = successful_pushes.clone();
+        queue_notify_hook::install(Arc::new(move || {
+            let n = successful_pushes_for_hook.fetch_add(1, Ordering::SeqCst);
+            if n == 1 {
+                // Fires after the second chunk's push has already
+                // succeeded -- the third chunk's `enqueue_write_nonblocking`
+                // call must observe this and fail before pushing.
+                exit_flag.store(true, Ordering::Release);
+            }
+        }));
+
+        // Chunked content is unframed opaque bytes here (no valid V5
+        // control word), so the up-front `reject_oversize_single` check
+        // takes the bare-length fallback path and passes trivially -- this
+        // test isolates the per-chunk enqueue failure, not the size gate.
+        let data = vec![0xABu8; 40];
+        let chunk_size = 10;
+        let result = writer.write_chunked_nonblocking(&data, chunk_size);
+
+        queue_notify_hook::uninstall();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GossipError::ConnectionClosed(_)),
+            "expected the third chunk's enqueue to observe exit_flag and \
+             fail with ConnectionClosed, got {err:?}"
+        );
+        assert_eq!(
+            successful_pushes.load(Ordering::SeqCst),
+            2,
+            "exactly two chunks must have been successfully enqueued before \
+             the failure -- proving this is a *later* chunk failing, not the \
+             first"
+        );
+
         writer.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
