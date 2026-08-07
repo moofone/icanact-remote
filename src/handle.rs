@@ -4034,14 +4034,18 @@ where
             // second, idempotent post-publish re-mark.
             //
             // Goes through `mark_transport_source_keyed_fallback` rather
-            // than a direct assignment: a peer that legitimately dials out
-            // from its own listen port can also be the address a LATER
-            // claim falls back to observing here, and this specific claim
-            // taking the fallback is not evidence that contradicts the
-            // address's already-established dialability.
+            // than a direct assignment, passing `claim_receipt`'s own
+            // `created_ownership()` -- the authoritative fact of whether
+            // THIS fallback claim is what brought `effective_addr` under
+            // ownership. A peer that legitimately connects from its own
+            // advertised listen port has its entry created by the
+            // `Accepted` arm above instead, never by the fallback; a
+            // LATER, unrelated claim falling back to that SAME
+            // already-owned address is a same-node refresh
+            // (`created_ownership() == false`) and must not reclassify it.
             let mut gossip_state = registry.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
-                peer_info.mark_transport_source_keyed_fallback();
+                peer_info.mark_transport_source_keyed_fallback(claim_receipt.created_ownership());
             }
         }
 

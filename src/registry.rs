@@ -1394,20 +1394,32 @@ impl PeerInfo {
     /// `handle.rs`'s `fell_back_to_observed_source` branch), rather than a
     /// claim corroborated by an outbound dial or operator configuration.
     ///
-    /// Declines to set the flag when this exact address already carries
-    /// independent dialability evidence (`outbound_dial_success`): a peer
-    /// that legitimately dials out from its own listen port can also be
-    /// the address a LATER inbound advertised-address claim falls back to
-    /// observing, and that fallback must not erase the earlier, still-true
-    /// evidence that this address is in fact dialable by other nodes.
+    /// `claim_created_ownership` must be the exact fallback claim's own
+    /// `registry_owner::ClaimReceipt::created_ownership()` -- the
+    /// authoritative, structural fact from the single-owner ownership
+    /// actor of whether this address had NO owner before this exact
+    /// claim. Only then does the fallback classification apply. When it
+    /// is `false` (a same-node refresh of an ALREADY-owned address), this
+    /// call leaves the existing classification untouched: a peer that
+    /// legitimately connects from its own advertised listen port has its
+    /// entry created by handle.rs's `Accepted` arm, never by the
+    /// fallback, so a LATER, unrelated connection's claim falling back to
+    /// that same already-owned address must not reclassify it.
+    ///
+    /// Deliberately does NOT infer this from `outbound_dial_success` (an
+    /// earlier version of this method did): that field can be `false` for
+    /// an entry that is nonetheless not fallback-created, and inferring
+    /// "was this entry created by the fallback" from accumulated evidence
+    /// another code path also writes is the exact mistake this PR keeps
+    /// making. `claim_created_ownership` is instead a fact the claim path
+    /// itself knows for certain, not an inference.
     ///
     /// Symmetric to `mark_dialability_confirmed` above: that one only ever
     /// clears the flag (never sets it), this one only ever sets it (never
-    /// clears it), and each declines to act when the accumulated evidence
-    /// for this specific address already contradicts the claim it was
-    /// asked to record.
-    pub(crate) fn mark_transport_source_keyed_fallback(&mut self) {
-        if !self.outbound_dial_success {
+    /// clears it), and each declines to act when its caller's evidence
+    /// does not support the claim it was asked to record.
+    pub(crate) fn mark_transport_source_keyed_fallback(&mut self, claim_created_ownership: bool) {
+        if claim_created_ownership {
             self.transport_source_keyed = true;
         }
     }
@@ -12125,42 +12137,135 @@ mod tests {
         }
     }
 
-    /// `mark_transport_source_keyed_fallback` is the mirror image of
-    /// `mark_dialability_confirmed`: earlier bugs cleared the flag on
-    /// evidence that never proved dialability (inbound acceptance,
-    /// source-equality, reusing an existing connection). This is the
-    /// opposite mistake -- SETTING the flag despite evidence that already
-    /// proves dialability. A peer can legitimately dial out from its own
-    /// listen port (`outbound_dial_success = true` for that exact
-    /// address); if a LATER inbound advertised-address claim is rejected
-    /// and falls back to observing that same source, the fallback must not
-    /// erase the earlier, still-true classification.
+    /// `mark_transport_source_keyed_fallback`'s gate is a fact its caller
+    /// hands it directly (`registry_owner::ClaimReceipt::created_ownership()`),
+    /// not an inference drawn from another evidence field -- an earlier
+    /// version of this method inferred from `outbound_dial_success`, which
+    /// `mark_transport_source_keyed_fallback_does_not_misclassify_already_owned_listen_port_address`
+    /// demonstrates is unsound (that field can be `false` for an entry
+    /// that is nonetheless not fallback-created).
     #[test]
-    fn mark_transport_source_keyed_fallback_declines_when_outbound_dial_already_proved_it() {
-        let node_id = test_peer_id("fallback-declines-with-dial-evidence").to_node_id();
+    fn mark_transport_source_keyed_fallback_only_acts_when_claim_created_ownership() {
+        let node_id = test_peer_id("fallback-gate-created-ownership").to_node_id();
         let addr = test_addr(20_280);
 
-        // No prior dialability evidence: the fallback is the only
-        // information we have, so it must set the flag.
-        let mut undialed = peer_info_with_node_id(addr, node_id);
-        undialed.outbound_dial_success = false;
-        undialed.mark_transport_source_keyed_fallback();
+        // The fallback claim created ownership fresh: this genuinely is
+        // the first-ever attribution for this address, so the flag is set.
+        let mut fresh = peer_info_with_node_id(addr, node_id);
+        fresh.transport_source_keyed = false;
+        fresh.mark_transport_source_keyed_fallback(true);
         assert!(
-            undialed.transport_source_keyed,
-            "the fallback must set the flag when there is no contradicting evidence"
+            fresh.transport_source_keyed,
+            "the fallback must set the flag when its claim created ownership fresh"
         );
 
-        // Prior successful outbound dial to this EXACT address: that is
-        // independent dialability evidence a later inbound-fallback claim
-        // for the same source must not erase.
-        let mut dialed = peer_info_with_node_id(addr, node_id);
-        dialed.outbound_dial_success = true;
-        dialed.transport_source_keyed = false;
-        dialed.mark_transport_source_keyed_fallback();
+        // The fallback claim was a same-node refresh of an ALREADY-owned
+        // address (e.g. a peer legitimately connecting from its own
+        // advertised listen port on an earlier, unrelated connection):
+        // this call must not touch the flag.
+        let mut refreshed = peer_info_with_node_id(addr, node_id);
+        refreshed.transport_source_keyed = false;
+        refreshed.mark_transport_source_keyed_fallback(false);
         assert!(
-            !dialed.transport_source_keyed,
-            "the fallback must NOT set the flag when this address already has \
-             independent outbound-dial evidence of dialability"
+            !refreshed.transport_source_keyed,
+            "the fallback must NOT set the flag for a same-node refresh of an \
+             already-owned address"
+        );
+    }
+
+    /// The inbound-accept fallback marking must apply ONLY to an entry
+    /// this exact fallback claim brought into existence, not to any
+    /// address it merely happens to resolve to. A peer can legitimately
+    /// connect from its own advertised listen port -- `peer_state_addr ==
+    /// peer_addr` is satisfied via handle.rs's `Accepted` arm outright,
+    /// never touching the fallback at all, so the resulting entry has
+    /// BOTH `transport_source_keyed == false` AND `outbound_dial_success
+    /// == false` (no outbound dial ever happened either). A later,
+    /// unrelated connection's advertised-address claim can then be
+    /// rejected and fall back to observing this SAME already-owned
+    /// address: `add_connection_scoped_peer_claim`'s receipt for that
+    /// fallback reports `created_ownership() == false` (a same-node
+    /// refresh, not a fresh claim), which is the authoritative,
+    /// structural fact that this entry was NOT created by this fallback --
+    /// unlike `outbound_dial_success`, which is silently wrong here (it
+    /// really is `false`, but that does not mean the fallback is honest
+    /// evidence for this address).
+    #[tokio::test]
+    async fn mark_transport_source_keyed_fallback_does_not_misclassify_already_owned_listen_port_address()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_285), test_config());
+        let node_id = test_peer_id("listen-port-then-fallback-reclaim").to_node_id();
+        let addr = test_addr(20_286);
+
+        // First inbound connection: the peer connects from its own
+        // advertised listen port. `peer_state_addr == peer_addr == addr`,
+        // so handle.rs's `Accepted` arm handles this directly -- the
+        // fallback path is never taken.
+        let (outcome1, receipt1) = registry
+            .add_connection_scoped_peer_claim(
+                addr,
+                node_id,
+                crate::addr_ownership::ClaimKind::Verified,
+                addr,
+            )
+            .await;
+        assert_eq!(outcome1, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        let receipt1 = receipt1.expect("accepted claim must return a receipt");
+        assert!(
+            receipt1.created_ownership(),
+            "test setup: the first claim for this unowned address must create ownership"
+        );
+        {
+            let state = registry.gossip_state.lock().await;
+            assert!(
+                !state
+                    .peers
+                    .get(&addr)
+                    .expect("claim must have created the entry")
+                    .transport_source_keyed,
+                "test setup: a peer connecting from its own advertised listen port \
+                 must not be classified as transport-source-keyed"
+            );
+        }
+
+        // A LATER, unrelated connection's advertised-address claim is
+        // rejected and falls back to observing this SAME already-owned
+        // source -- exactly handle.rs's fallback branch's own claim call.
+        let (outcome2, receipt2) = registry
+            .add_connection_scoped_peer_claim(
+                addr,
+                node_id,
+                crate::addr_ownership::ClaimKind::Verified,
+                addr,
+            )
+            .await;
+        assert_eq!(outcome2, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        let receipt2 = receipt2.expect("same-node refresh must still return a receipt");
+        assert!(
+            !receipt2.created_ownership(),
+            "test setup: reclaiming the SAME address for the SAME node must be a \
+             refresh, not fresh ownership"
+        );
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let peer_info = state.peers.get_mut(&addr).expect("peer must exist");
+            // The fallback marking handle.rs performs for THIS second
+            // claim, which took the fallback branch, passing this exact
+            // claim's own `created_ownership()`.
+            peer_info.mark_transport_source_keyed_fallback(receipt2.created_ownership());
+        }
+
+        let state = registry.gossip_state.lock().await;
+        assert!(
+            !state
+                .peers
+                .get(&addr)
+                .expect("peer must exist")
+                .transport_source_keyed,
+            "a same-node refresh of an address already owned via a genuine \
+             listen-port acceptance must not be reclassified as \
+             transport-source-keyed"
         );
     }
 
@@ -13264,17 +13369,19 @@ mod tests {
         );
     }
 
-    /// `mark_transport_source_keyed_fallback`'s guard is only as trustworthy
-    /// as `outbound_dial_success` itself. `connect_to_peer` resolving an
-    /// existing INBOUND connection (the configured-peer supervisor reusing
-    /// a connection an inbound accept already published, exactly as in
-    /// `inbound_connection_never_clears_transport_source_keyed` above) must
-    /// NOT mark `outbound_dial_success` for that address: no outbound dial
-    /// happened. If it did, a LATER inbound-accept fallback classification
-    /// for the very same ephemeral source would see (bogus) dial evidence
-    /// and decline to set `transport_source_keyed`, leaving a non-dialable
-    /// address eligible for `peers_snapshot` and a `PeerDiscovery` slot --
-    /// the exact hole this PR exists to close.
+    /// `connect_to_peer` resolving an existing INBOUND connection (the
+    /// configured-peer supervisor reusing a connection an inbound accept
+    /// already published, exactly as in
+    /// `inbound_connection_never_clears_transport_source_keyed` above)
+    /// must NOT mark `outbound_dial_success` for that address: no outbound
+    /// dial happened. `mark_transport_source_keyed_fallback` no longer
+    /// derives its gate from this field (it now takes the claim's own
+    /// `created_ownership()` directly -- see
+    /// `mark_transport_source_keyed_fallback_only_acts_when_claim_created_ownership`),
+    /// but `outbound_dial_success` has its own honest consumers
+    /// (`should_suppress_outbound_retry_for_peer`, `get_stats`) that
+    /// depend on it meaning a genuine successful dial, so this write site
+    /// is independently wrong if it fires here regardless.
     #[tokio::test]
     async fn connect_to_peer_reusing_inbound_connection_does_not_poison_fallback_marking() {
         use crate::connection_pool::{
@@ -13321,17 +13428,33 @@ mod tests {
             .await
             .expect("existing inbound connection must resolve without a real dial");
 
-        // The fallback marking `handle.rs`'s inbound-accept path performs
-        // for a claim that fell back to this exact observed source.
+        // The write site under test: `outbound_dial_success` must stay
+        // `false` after `connect_to_peer` merely resolved an existing
+        // inbound connection.
         {
-            let mut state = registry.gossip_state.lock().await;
-            let peer_info = state.peers.get_mut(&addr).expect("peer must exist");
+            let state = registry.gossip_state.lock().await;
             assert!(
-                !peer_info.outbound_dial_success,
+                !state
+                    .peers
+                    .get(&addr)
+                    .expect("peer must exist")
+                    .outbound_dial_success,
                 "connect_to_peer resolving an INBOUND connection must not mark \
                  outbound_dial_success -- no outbound dial occurred"
             );
-            peer_info.mark_transport_source_keyed_fallback();
+        }
+
+        // The fallback marking `handle.rs`'s inbound-accept path performs
+        // for a claim that fell back to this exact observed source. `true`
+        // stands in for that claim's own `created_ownership()` -- this
+        // test is about the write site above, not about
+        // `created_ownership` gating, which
+        // `mark_transport_source_keyed_fallback_does_not_misclassify_already_owned_listen_port_address`
+        // covers directly.
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let peer_info = state.peers.get_mut(&addr).expect("peer must exist");
+            peer_info.mark_transport_source_keyed_fallback(true);
         }
 
         let state = registry.gossip_state.lock().await;
