@@ -262,70 +262,49 @@ impl LockFreeConnection {
 
 /// Payloads for queued writes.
 pub enum WritePayload {
-    /// Arbitrary, genuinely opaque caller bytes -- no framing contract this
-    /// module owns, and *no attempt made to infer one from content*. The
-    /// public, generic "send these bytes" entry points
+    /// The public, generic "send these bytes" entry points
     /// (`write_bytes_control`/`write_bytes_ask`/`write_bytes_nonblocking`,
-    /// `write_vectored_nonblocking`, and the `ConnectionHandle` methods
-    /// built on them: `send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
-    /// `send_binary_message`) all construct this variant, and all of them
-    /// are documented as carrying unframed data -- a serialized blob, a
-    /// caller's own wire format, anything. `reject_oversize_opaque` (in
-    /// `stream_writer.rs`) checks exactly one thing: the total byte count
-    /// against `max_message_size`. Nothing about the content is inspected.
+    /// `write_vectored_nonblocking`, `write_chunked_nonblocking`, and the
+    /// `ConnectionHandle` methods built on them:
+    /// `send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
+    /// `send_binary_message`) all construct this variant. Content can be
+    /// one complete self-contained V5 frame, or several concatenated (a
+    /// caller pipelining more than one send into a single write) --
+    /// `reject_oversize_single` (in `stream_writer.rs`) decodes as many
+    /// complete frames off the front as the content will yield and checks
+    /// each one's *own* `body_len` against `max_message_size`, so several
+    /// individually-valid frames concatenated together are judged the way
+    /// separate writes would have been, not rejected for their aggregate
+    /// length.
     ///
-    /// PR #183 review, round 11: this variant used to *parse* its content --
-    /// decode a leading control word if one was there, walk multiple
-    /// frames, refuse content that looked like an incomplete frame. That
-    /// was rounds 6 and 10's fix for a real problem (`Single` used to be
-    /// bypassable by a caller who split a frame's header from its body,
-    /// or padded past a whole-buffer length ceiling with a second valid
-    /// frame), but content-sniffing was the wrong tool for it: opaque
-    /// caller data and a genuine frame prefix are indistinguishable by
-    /// construction, so the same check that closed the frame-splitting
-    /// hole also rejected ordinary opaque bytes that merely happened to
-    /// start with four bytes decoding as a plausible `WireKind` + length --
-    /// which is not a rare coincidence for arbitrary data, it is routine
-    /// (roughly 15/32 of random leading bytes land on a valid kind). A
-    /// real caller cannot rewrite its own serialized payload's leading
-    /// bytes to dodge a sniff it doesn't know exists. See `Framed` below
-    /// for the lane that gets the parse-and-walk treatment now -- a
-    /// caller that actually is sending a frame declares that explicitly by
-    /// choosing `Framed`'s constructors instead of `Single`'s, rather than
-    /// this module inferring it from the bytes.
+    /// PR #183 review, round 12: this crate's wire protocol has no concept
+    /// of *opaque, unframed* bytes for this variant to carry -- rounds 11
+    /// tried an opaque/framed split on the theory that content cannot
+    /// answer "is this a frame" and the caller should declare it instead,
+    /// which is true about content-sniffing but false about there being a
+    /// legitimate opaque case to declare. Every read path this crate has
+    /// (`read_message_step`/`read_message_step_poll`/
+    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// unconditionally decodes a control word from whatever the peer sends
+    /// and fails the connection if it doesn't decode; there is no
+    /// raw-passthrough mode a sender could target with genuinely unframed
+    /// bytes. So every one of the methods above -- whether or not anything
+    /// in this crate currently calls them -- carries complete frame(s) by
+    /// the only contract this wire format supports, and `Single` is
+    /// validated as such unconditionally, not sniffed for it. Content that
+    /// never decodes as a frame at all falls back to a bare length
+    /// ceiling as a backstop against the aggregate byte count, not because
+    /// unparseable content is an accepted shape (see
+    /// `reject_oversize_single`'s own doc comment for why: it would
+    /// desync the peer's parser regardless of what this check does).
     ///
-    /// This is deliberately the only *opaque* variant a caller outside
-    /// this `impl` block can reach -- see `TrustedFrame` for self-built
-    /// bytes an internal caller already knows are safe, and `Framed` for a
-    /// caller-declared frame. That split, not a comment on this variant,
-    /// is what stops a future generic-bytes call site from silently
-    /// inheriting an exemption it was never entitled to.
+    /// This is deliberately the only variant a caller outside this `impl`
+    /// block can reach with arbitrary content -- see `TrustedFrame` for the
+    /// alternative used by every internal caller that built the bytes
+    /// itself and already knows they are safe. That split, not a comment on
+    /// this variant, is what stops a future generic-bytes call site from
+    /// silently inheriting an exemption it was never entitled to.
     Single(bytes::Bytes),
-    /// A caller-declared V5 frame (or several concatenated), reachable
-    /// through `LockFreeStreamHandle::write_framed_bytes_control`/
-    /// `write_framed_bytes_ask`/`write_framed_bytes_nonblocking`. Unlike
-    /// `Single`, choosing this constructor *is* the caller's declaration
-    /// that the bytes are framed -- `reject_oversize_framed` (in
-    /// `stream_writer.rs`) trusts that declaration enough to parse: it
-    /// decodes as many complete frames off the front of the buffer as it
-    /// will yield, checks each one's own `body_len` against
-    /// `max_message_size` (so several valid frames concatenated are judged
-    /// the way separate writes would have been, not punished for their
-    /// aggregate length), and refuses outright any content that begins a
-    /// frame it does not fully supply -- a `Framed` write cannot assert
-    /// "the rest is coming in a later call" the way an internal
-    /// `TrustedFrame` producer can assert "I already built the rest
-    /// myself." Content that never starts looking like a frame at all
-    /// falls back to a bare length ceiling, the same one `Single` always
-    /// uses.
-    ///
-    /// Nothing in this crate constructs one today -- every current public
-    /// caller sends genuinely opaque bytes (`Single`) or bytes it already
-    /// built and trusts completely (`TrustedFrame`) -- but the lane exists
-    /// so that "I am sending a frame and want it validated as one" has
-    /// somewhere to go other than `Single` inferring it from content,
-    /// which is exactly the inference this split exists to retire.
-    Framed(bytes::Bytes),
     /// A caller-opaque byte blob this crate built and validated itself --
     /// constructible only via `LockFreeStreamHandle::write_trusted_bytes_control`/
     /// `write_trusted_bytes_ask`, which are `pub(crate)`: nothing outside this
@@ -339,11 +318,10 @@ pub enum WritePayload {
     /// before concatenation; the aggregate is expected to exceed
     /// `max_message_size` by design and must not be gated against it), and
     /// `write_chunked_nonblocking`'s per-chunk fragments (the whole buffer
-    /// is validated once, before chunking, against the same bare length
-    /// ceiling `Single` uses -- a fragment has no declared length of its
-    /// own to check, and re-validating one as if it were a complete
-    /// `Single`/`Framed` write could reject a fragment of already-valid
-    /// content).
+    /// is validated once, before chunking, against the same per-frame walk
+    /// `Single` uses -- a fragment has no declared length of its own to
+    /// check, and re-validating one as if it were a complete `Single`
+    /// write could reject a fragment of already-valid content).
     TrustedFrame(bytes::Bytes),
     HeaderPayload {
         header: bytes::Bytes,
@@ -399,7 +377,6 @@ impl std::fmt::Debug for WritePayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WritePayload::Single(data) => f.debug_tuple("Single").field(&data.len()).finish(),
-            WritePayload::Framed(data) => f.debug_tuple("Framed").field(&data.len()).finish(),
             WritePayload::TrustedFrame(data) => {
                 f.debug_tuple("TrustedFrame").field(&data.len()).finish()
             }

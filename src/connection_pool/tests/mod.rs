@@ -3031,11 +3031,16 @@ fn test_connection_handle_send_data() {
             CorrelationTracker::new(),
         );
 
-        // PR #183 review, round 11: `send_data` is the opaque lane
-        // (`WritePayload::Single`) -- content is never inspected, so a
-        // plain literal that happens to decode as a valid-but-incomplete
-        // V5 control word if it were parsed is unaffected.
-        let data = vec![1, 2, 3, 4];
+        // PR #183 review, round 12: `send_data` carries a complete V5
+        // frame -- this crate's wire protocol has no opaque-bytes case
+        // (see the module doc comment above `reject_oversize_write_payload`
+        // in stream_writer.rs), so this must be a genuine, complete frame,
+        // not a bare literal.
+        let payload = vec![9u8; 4];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
         handle.send_data(data.clone()).await.unwrap();
 
         // Allow the background writer to drain the queue
@@ -3060,15 +3065,20 @@ fn test_writer_owner_batch_preserves_order() {
             None,
         );
 
-        // PR #183 review, round 11: `write_bytes_nonblocking` is the opaque
-        // lane -- content is never inspected, so "three" (whose leading
-        // bytes happen to decode as a valid-but-far-too-large V5 control
-        // word if parsed) is unaffected.
-        let payloads = [
-            bytes::Bytes::from_static(b"one"),
-            bytes::Bytes::from_static(b"two"),
-            bytes::Bytes::from_static(b"three"),
-        ];
+        // PR #183 review, round 12: `write_bytes_nonblocking` carries a
+        // complete V5 frame per call -- this crate's wire protocol has no
+        // opaque-bytes case (see the module doc comment above
+        // `reject_oversize_write_payload` in stream_writer.rs), so each of
+        // these must be a genuine, complete frame, not a bare literal.
+        let make_frame = |fill: u8, len: usize| {
+            let payload = vec![fill; len];
+            let header = crate::framing::write_gossip_frame_prefix(payload.len());
+            let mut frame = Vec::with_capacity(header.len() + payload.len());
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&payload);
+            bytes::Bytes::from(frame)
+        };
+        let payloads = [make_frame(1, 3), make_frame(2, 3), make_frame(3, 5)];
 
         for payload in &payloads {
             stream_handle
@@ -3099,14 +3109,21 @@ fn test_writer_vectored_sequence_header_payload() {
             None,
         );
 
-        // PR #183 review, round 11: same reasoning as `payloads` in
-        // `test_writer_owner_batch_preserves_order` above -- the opaque
-        // `write_bytes_nonblocking` lane never inspects content, so
-        // "first"/"second" (whose leading bytes happen to decode as
-        // valid-but-far-too-large V5 control words if parsed) are
-        // unaffected.
-        let first = bytes::Bytes::from_static(b"first");
-        let second = bytes::Bytes::from_static(b"second");
+        // PR #183 review, round 12: same reasoning as `payloads` in
+        // `test_writer_owner_batch_preserves_order` above -- `first`/
+        // `second` go through `write_bytes_nonblocking`, which carries a
+        // complete V5 frame per call, so each must be genuine, not a bare
+        // literal.
+        let make_frame = |fill: u8, len: usize| {
+            let payload = vec![fill; len];
+            let header = crate::framing::write_gossip_frame_prefix(payload.len());
+            let mut frame = Vec::with_capacity(header.len() + payload.len());
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&payload);
+            bytes::Bytes::from(frame)
+        };
+        let first = make_frame(1, 5);
+        let second = make_frame(2, 6);
         let payload = bytes::Bytes::from_static(b"PAYLOAD");
         // A real V5 control word declaring `payload`'s exact length: the
         // gate in `enqueue_write_nonblocking` decodes `body_len` from the
@@ -3332,19 +3349,25 @@ async fn test_ask_backpressure_no_write_buffer_full() {
         }
     });
 
+    // PR #183 review, round 12: `write_bytes_ask` carries a complete V5
+    // frame -- this crate's wire protocol has no opaque-bytes case (see
+    // the module doc comment above `reject_oversize_write_payload` in
+    // stream_writer.rs), so this must be a genuine, complete frame, not a
+    // bare literal like "ping".
+    let ping_payload = vec![7u8; 4];
+    let ping_header = crate::framing::write_gossip_frame_prefix(ping_payload.len());
+    let mut ping_bytes = Vec::with_capacity(ping_header.len() + ping_payload.len());
+    ping_bytes.extend_from_slice(&ping_header);
+    ping_bytes.extend_from_slice(&ping_payload);
+    let ping = bytes::Bytes::from(ping_bytes);
+
     let mut tasks = Vec::new();
     for _ in 0..100 {
         let handle = handle.clone();
+        let ping = ping.clone();
         tasks.push(tokio::spawn(async move {
             for _ in 0..10 {
-                // PR #183 review, round 11: `write_bytes_ask` is the opaque
-                // lane -- content is never inspected, so "ping" (whose
-                // leading bytes happen to decode as a valid-but-far-too-
-                // large V5 control word if parsed) is unaffected. See the
-                // note in `test_writer_owner_batch_preserves_order` above.
-                handle
-                    .write_bytes_ask(bytes::Bytes::from_static(b"ping"))
-                    .await?;
+                handle.write_bytes_ask(ping.clone()).await?;
             }
             Ok::<(), crate::GossipError>(())
         }));

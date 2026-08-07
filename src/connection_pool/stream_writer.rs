@@ -1489,9 +1489,9 @@ impl LockFreeStreamHandle {
                             total_bytes_written += bytes_written;
                         }
                         match payload {
-                            WritePayload::Single(data)
-                            | WritePayload::Framed(data)
-                            | WritePayload::TrustedFrame(data) => write_chunks.push(data),
+                            WritePayload::Single(data) | WritePayload::TrustedFrame(data) => {
+                                write_chunks.push(data)
+                            }
                             WritePayload::HeaderPayload { header, payload } => {
                                 if !direct_ask_headers.is_empty() {
                                     let bytes_written = match flush_direct_ask_batch(
@@ -2840,23 +2840,36 @@ impl LockFreeStreamHandle {
     /// times, because a hand-maintained list of call sites is exactly as
     /// complete as its last audit. Stated instead as an exhaustive
     /// property of `WritePayload` the enum: every variant falls into
-    /// exactly one of three categories, and the `match` a few lines below
+    /// exactly one of two categories, and the `match` a few lines below
     /// this comment is exhaustive over them -- adding a variant that
-    /// doesn't fit any of them fails to compile, not just fails to be
+    /// doesn't fit either one fails to compile, not just fails to be
     /// remembered.
     ///
-    /// PR #183 review, round 11: round 10 put `Single` in the "parse it to
-    /// find out" category below, which was itself the error -- a sniff
-    /// that infers "framed" or "opaque" from content cannot tell an
-    /// opaque caller's payload from a genuine frame prefix, because the
-    /// two are indistinguishable by construction, and arbitrary data lands
-    /// on a plausible-looking control word routinely (roughly 15/32 of
-    /// random leading bytes), not as some crafted edge case. Content
-    /// cannot answer "is this a frame," so the caller has to declare it
-    /// instead: `Single` is now unconditionally opaque (bare length
-    /// check, content never inspected), and `Framed` is the new lane for
-    /// a caller that is genuinely declaring "this is a frame" and wants
-    /// it validated as one.
+    /// PR #183 review, round 11 introduced (and round 12 retired) an
+    /// opaque-vs-framed split on `Single`, on the theory that content
+    /// cannot answer "is this a frame" and the caller should declare it
+    /// instead. That theory was right about content-sniffing, wrong about
+    /// there being a legitimate opaque case to declare: **this crate's
+    /// wire protocol has no concept of unframed bytes.** Every read path
+    /// (`read_message_step`/`read_message_step_poll`/
+    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// unconditionally decodes a control word from whatever arrives on the
+    /// stream and fails the connection (`"unknown V5 wire kind"`) if it
+    /// doesn't decode -- there is no raw-passthrough read mode a sender
+    /// could target with genuinely opaque bytes. `Single` backs
+    /// `write_bytes_control`/`write_bytes_ask`/`write_bytes_nonblocking`
+    /// and the `ConnectionHandle` methods built on them
+    /// (`send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
+    /// `send_binary_message`); none of those methods has a caller anywhere
+    /// in this crate today, but every one whose doc comment says anything
+    /// about shape (`send_data`: "pre-serialized data"; `send_binary_message`:
+    /// "already has length prefix") describes a complete frame, and the
+    /// peer-side fact above means that is the *only* coherent contract for
+    /// content these methods put on a V5-framed connection, not a matter
+    /// of which docstring is technically most convenient to read. `Single`
+    /// therefore gets the same per-frame walk `TrustedFrame`'s
+    /// producers already know their bytes would pass, just not the
+    /// exemption from having to prove it.
     ///
     /// - **Self-built, trusted bytes: `TrustedFrame`.** Exempt
     ///   unconditionally. Constructible only via `pub(crate)` methods (see
@@ -2865,39 +2878,36 @@ impl LockFreeStreamHandle {
     ///   visibility, not by convention, and each one already built the
     ///   complete, valid bytes itself before enqueueing -- there is
     ///   nothing left here to check.
-    /// - **Caller-declared opaque bytes: `Single`.** No framing contract,
-    ///   and none inferred -- `reject_oversize_opaque` (below) checks only
-    ///   the total byte count against `max_message_size`. This is the
-    ///   lane every current public "send these bytes" method uses
-    ///   (`write_bytes_control`/`write_bytes_ask`/`write_bytes_nonblocking`
-    ///   and everything built on them), because all of them are documented
-    ///   as carrying unframed data.
-    /// - **Caller-declared frame(s): `Framed`.** The caller is asserting
-    ///   this content is one or more complete V5 frames by choosing this
-    ///   constructor over `Single`'s, so `reject_oversize_framed` (below)
-    ///   trusts that enough to parse: it decodes as many complete frames
-    ///   off the front as the buffer will yield, checking each one's own
-    ///   `body_len` against `max_message_size` (so several valid frames
-    ///   concatenated are judged the way separate writes would have been),
-    ///   and refuses outright any content that begins a frame it does not
-    ///   fully supply -- a `Framed` write cannot assert "the rest is
-    ///   coming in a later call" the way an internal `TrustedFrame`
-    ///   producer can assert "I already built the rest myself." Content
-    ///   that never starts looking like a frame at all falls back to the
-    ///   same bare length ceiling `Single` uses.
-    /// - **Everything else (`Buf`, and the header-carrying variants)** has
-    ///   an independently-declared length or header slice to check the
-    ///   real bytes against, so it was never subject to this
-    ///   opaque-vs-framed ambiguity in the first place:
-    ///   `HeaderPayload`/`HeaderInline`/`HeaderInlineAligned`/
-    ///   `HeaderInline32`/`HeaderPooled`/`HeaderInlinePooled`/
-    ///   `DirectAskInline` carry a header slice with its own embedded
-    ///   control word: decode it, and compare the total it declares
-    ///   against the real total the write loop will produce for that
-    ///   exact command. `Buf` carries no header slice to decode a control
-    ///   word from, only a caller-declared `expected_len` captured when
-    ///   the header it is chained onto was built: compare that against
-    ///   `buf.remaining()`.
+    /// - **Caller-observable bytes: every other variant.** The exact
+    ///   content, or the exact length, was supplied by (or on behalf of) a
+    ///   caller outside this trusted-construction boundary, so it is
+    ///   validated before it can reach the write queue. What "validated"
+    ///   means differs by what each variant structurally has to check
+    ///   against:
+    ///   - `HeaderPayload`/`HeaderInline`/`HeaderInlineAligned`/
+    ///     `HeaderInline32`/`HeaderPooled`/`HeaderInlinePooled`/
+    ///     `DirectAskInline` carry a header slice with its own embedded
+    ///     control word: decode it, and compare the total it declares
+    ///     against the real total the write loop will produce for that
+    ///     exact command.
+    ///   - `Buf` carries no header slice to decode a control word from,
+    ///     only a caller-declared `expected_len` captured when the header
+    ///     it is chained onto was built: compare that against
+    ///     `buf.remaining()`.
+    ///   - `Single` carries no separately-declared length *or* header
+    ///     slice at all -- whatever control word exists is embedded in
+    ///     the content itself, at an offset this method has to walk to
+    ///     find. `reject_oversize_single` (below) decodes as many complete
+    ///     frames off the front as the buffer will yield, checking each
+    ///     one's own `body_len` against `max_message_size` (so several
+    ///     valid frames concatenated are judged the way separate writes
+    ///     would have been), and refuses outright any content that begins
+    ///     a frame it does not fully supply -- a `Single` write cannot
+    ///     assert "the rest is coming in a later call" the way an internal
+    ///     `TrustedFrame` producer can assert "I already built the rest
+    ///     myself." Content that never starts looking like a frame at all
+    ///     falls back to a bare length ceiling, still sound with no
+    ///     control word to trust.
     fn reject_oversize_write_payload(&self, payload: &WritePayload) -> Result<()> {
         // `Buf` has no header slice to decode a control word from; check it
         // against its own caller-declared `expected_len` and return early.
@@ -2926,10 +2936,7 @@ impl LockFreeStreamHandle {
             return Ok(());
         }
         if let WritePayload::Single(data) = payload {
-            return self.reject_oversize_opaque(data);
-        }
-        if let WritePayload::Framed(data) = payload {
-            return self.reject_oversize_framed(data);
+            return self.reject_oversize_single(data);
         }
 
         // Every other variant: pair the header bytes the write loop will
@@ -2997,12 +3004,9 @@ impl LockFreeStreamHandle {
                 // `write_direct_ask_inline`) -- no separate length field.
                 (&header[..], header.len() + payload.len())
             }
-            WritePayload::Single(_)
-            | WritePayload::Framed(_)
-            | WritePayload::TrustedFrame(_)
-            | WritePayload::Buf { .. } => {
+            WritePayload::Single(_) | WritePayload::TrustedFrame(_) | WritePayload::Buf { .. } => {
                 unreachable!(
-                    "Single/Framed/TrustedFrame return early above this match; Buf is handled before it"
+                    "Single/TrustedFrame return early above this match; Buf is handled before it"
                 )
             }
         };
@@ -3037,58 +3041,42 @@ impl LockFreeStreamHandle {
     }
 
     /// Size gate for `WritePayload::Single` -- see the note on it above.
-    /// `Single` is unconditionally opaque: the only thing checked is the
-    /// total byte count against `max_message_size`. Content is never
-    /// inspected, decoded, or walked -- that used to happen here (rounds 6
-    /// and 10), and it was the bug: a check that infers "this looks like a
-    /// frame" from content cannot tell an opaque caller's payload from a
-    /// genuine frame prefix, because arbitrary bytes land on a
-    /// plausible-looking `WireKind` + length routinely, not as some
-    /// contrived adversarial case. See `reject_oversize_framed` below for
-    /// the lane a caller uses when it is genuinely declaring "this is a
-    /// frame" by construction of the `WritePayload` it built, rather than
-    /// this method inferring it from the bytes.
-    fn reject_oversize_opaque(&self, data: &[u8]) -> Result<()> {
-        let body_len = data.len().saturating_sub(framing::LENGTH_PREFIX_LEN);
-        if body_len > self.max_message_size {
-            return Err(GossipError::MessageTooLarge {
-                size: body_len,
-                max: self.max_message_size,
-            });
-        }
-        Ok(())
-    }
-
-    /// Size gate for `WritePayload::Framed` -- see the note on
-    /// `reject_oversize_write_payload` above. Choosing `Framed`'s
-    /// constructors over `Single`'s is the caller's explicit declaration
-    /// that `data` is one or more complete V5 frames, so unlike
-    /// `reject_oversize_opaque`, this trusts that declaration enough to
-    /// parse: it walks the buffer decoding as many complete frames off the
-    /// front as it will yield instead of assuming any one interpretation.
+    /// `data` may be one complete V5 frame, several concatenated, or
+    /// opaque-*looking* bytes with no framing at all -- but see this
+    /// method's own rejection below for the one shape it refuses outright:
+    /// content that *begins* a frame (a control word decodes) but does not
+    /// supply that frame's complete declared bytes. This walks the buffer
+    /// decoding as many complete frames off the front as it will yield
+    /// instead of assuming any one interpretation.
+    ///
+    /// PR #183 review, round 12: there is no genuinely-opaque case for
+    /// this method to fall back to as an alternative interpretation --
+    /// every byte a V5-framed connection's peer reads gets parsed as frame
+    /// data (see the note on `reject_oversize_write_payload` above), so
+    /// content that never decodes as a frame at all is not "valid opaque
+    /// payload," it is content that would desync the peer regardless of
+    /// this check. The bare length ceiling this falls back to for
+    /// undecodable content is a courtesy backstop against the aggregate
+    /// byte count, not a statement that unparseable content is an accepted
+    /// shape.
     ///
     /// Each successfully decoded frame is checked against
     /// `max_message_size` on its own `body_len`, not the buffer's
     /// aggregate length -- two valid 100-byte frames concatenated into one
-    /// 208-byte `Framed` write are exactly as acceptable as two separate
-    /// writes of them would have been, even though 208 alone would fail a
+    /// 208-byte `Single` are exactly as acceptable as two separate writes
+    /// of them would have been, even though 208 alone would fail a
     /// whole-buffer ceiling. The walk stops -- successfully -- the moment a
     /// control word fails to decode, since at that point the remaining
     /// bytes are no longer reliably frame-shaped and fall back to the bare
-    /// length ceiling `Single` always uses: still sound with no control
-    /// word to trust, since a complete frame whose declared body exceeds
-    /// `max_message_size` is, by construction, at least that many bytes
-    /// long in total. The walk stops with an *error* if a control word
-    /// decodes but the buffer does not contain that frame's complete
-    /// declared bytes -- see the rejection below. A caller that declared
-    /// "this is a frame" and then supplied an incomplete one gets no more
-    /// benefit of the doubt than one that supplied garbage.
+    /// length ceiling described above. The walk stops with an *error* if a
+    /// control word decodes but the buffer does not contain that frame's
+    /// complete declared bytes -- see the rejection below.
     ///
     /// `offset` strictly increases by at least `LENGTH_PREFIX_LEN` each
     /// iteration (every decoded frame is at least that many bytes), so
     /// this terminates in at most `data.len() / LENGTH_PREFIX_LEN`
     /// iterations -- no adversarially-crafted content can loop it.
-    fn reject_oversize_framed(&self, data: &[u8]) -> Result<()> {
+    fn reject_oversize_single(&self, data: &[u8]) -> Result<()> {
         let mut offset = 0usize;
         while data.len() - offset >= framing::LENGTH_PREFIX_LEN {
             let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
@@ -3098,18 +3086,18 @@ impl LockFreeStreamHandle {
             };
             let frame_total = framing::LENGTH_PREFIX_LEN + control.body_len;
             if data.len() - offset < frame_total {
-                // PR #183 review, round 10: a `Framed` write that begins a
-                // frame it does not complete is refused outright, not
-                // judged as if the missing bytes simply weren't there --
-                // otherwise a caller could split one frame's header
-                // (declaring an arbitrary, possibly oversized body) from
-                // its body across separate `Framed` writes: each
-                // individual call would supply too few bytes to look like
-                // a complete frame, so each one would pass, while the peer
-                // reassembled the whole frame from the continuous TCP
-                // stream anyway (write() boundaries are invisible on the
-                // wire). A `Framed` write cannot assert "the rest is
-                // coming in a later call" the way an internal
+                // PR #183 review, round 10 (reaffirmed round 12): a
+                // `Single` write that begins a frame it does not complete
+                // is refused outright, not judged as if the missing bytes
+                // simply weren't there -- otherwise a caller could split
+                // one frame's header (declaring an arbitrary, possibly
+                // oversized body) from its body across separate `Single`
+                // writes: each individual call would supply too few bytes
+                // to look like a complete frame, so each one would pass,
+                // while the peer reassembled the whole frame from the
+                // continuous TCP stream anyway (write() boundaries are
+                // invisible on the wire). A `Single` write cannot assert
+                // "the rest is coming in a later call" the way an internal
                 // `TrustedFrame` producer can assert "I already built the
                 // rest myself."
                 return Err(GossipError::Network(std::io::Error::new(
@@ -3117,7 +3105,7 @@ impl LockFreeStreamHandle {
                     format!(
                         "control word at offset {offset} declares a {frame_total}-byte \
                          frame (kind {:?}, body_len {}) but this write only supplies \
-                         {} bytes from that offset -- refusing a Framed write that \
+                         {} bytes from that offset -- refusing a Single write that \
                          begins a frame it does not complete; a frame split across \
                          separate public calls cannot be validated per-call",
                         control.kind,
@@ -3226,13 +3214,6 @@ impl LockFreeStreamHandle {
 
     pub async fn write_bytes_ask(&self, data: bytes::Bytes) -> Result<()> {
         self.enqueue_ask_write(WritePayload::Single(data)).await
-    }
-
-    /// See `write_bytes_ask` above for the opaque lane. This is the
-    /// counterpart for a caller that is declaring `data` is one or more
-    /// complete V5 frames -- see `WritePayload::Framed`'s doc comment.
-    pub async fn write_framed_bytes_ask(&self, data: bytes::Bytes) -> Result<()> {
-        self.enqueue_ask_write(WritePayload::Framed(data)).await
     }
 
     /// `pub(crate)`, deliberately not `pub`: constructs `WritePayload::TrustedFrame`,
@@ -3363,13 +3344,6 @@ impl LockFreeStreamHandle {
 
     pub async fn write_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
         self.enqueue_write(WritePayload::Single(data)).await
-    }
-
-    /// See `write_bytes_control` above for the opaque lane. This is the
-    /// counterpart for a caller that is declaring `data` is one or more
-    /// complete V5 frames -- see `WritePayload::Framed`'s doc comment.
-    pub async fn write_framed_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
-        self.enqueue_write(WritePayload::Framed(data)).await
     }
 
     /// See the note on `write_trusted_bytes_ask` above.
@@ -3688,13 +3662,6 @@ impl LockFreeStreamHandle {
         self.enqueue_write_nonblocking(WritePayload::Single(data))
     }
 
-    /// See `write_bytes_nonblocking` above for the opaque lane. This is the
-    /// counterpart for a caller that is declaring `data` is one or more
-    /// complete V5 frames -- see `WritePayload::Framed`'s doc comment.
-    pub fn write_framed_bytes_nonblocking(&self, data: bytes::Bytes) -> Result<()> {
-        self.enqueue_write_nonblocking(WritePayload::Framed(data))
-    }
-
     /// Enqueue header + payload without concatenating.
     pub fn write_header_and_payload_nonblocking(
         &self,
@@ -3765,20 +3732,15 @@ impl LockFreeStreamHandle {
     /// to the whole logical write, so this validates `data` once, as a
     /// whole, *before* any chunking happens.
     ///
-    /// PR #183 review, round 11: that up-front check is
-    /// `reject_oversize_opaque` (a bare length ceiling), the same one
-    /// `write_bytes_nonblocking` applies to a `Single` write -- not
-    /// `reject_oversize_framed`'s per-frame walk. `data` here is exactly
-    /// as opaque to this method as it is to `write_bytes_nonblocking`;
-    /// nothing about calling this in chunks makes it more likely to be a
-    /// V5 frame, and parsing it as one would reject legitimate opaque data
-    /// whose bytes happen to look like an incomplete frame, the same
-    /// content-sniffing bug that motivated splitting `Framed` out of
-    /// `Single` in the first place. Round 7's actual requirement was
-    /// "check the total length once, before chunking, instead of per
-    /// fragment" -- a bare length ceiling on the whole buffer satisfies
-    /// that exactly as well as a frame walk would, without inferring
-    /// anything about the content's shape.
+    /// PR #183 review, round 11 tried making that up-front check a bare
+    /// length ceiling instead of the per-frame walk, reasoning `data` here
+    /// was as opaque to this method as it is to `write_bytes_nonblocking`.
+    /// Round 12 established that premise was false: this crate's wire
+    /// protocol has no opaque-bytes case at all (see the note on
+    /// `reject_oversize_write_payload`), so `data` here is exactly as
+    /// frame-shaped as any other `Single`-backed write, and gets the same
+    /// `reject_oversize_single` walk (including the incomplete-frame
+    /// rejection) applied to the whole buffer before chunking begins.
     ///
     /// Once `data` has passed that check, each chunk is enqueued as
     /// `TrustedFrame` rather than `Single` -- re-running any size gate on
@@ -3824,7 +3786,7 @@ impl LockFreeStreamHandle {
         if data.is_empty() {
             return Ok(());
         }
-        self.reject_oversize_opaque(data)?;
+        self.reject_oversize_single(data)?;
 
         let mut enqueued_any = false;
         for chunk in data.chunks(chunk_size) {
@@ -4667,11 +4629,16 @@ mod route_interning_tests {
         // Saturate the write queue. Each push completes without yielding while
         // there is space; a zero-duration timeout turns the parked (129th) push
         // into a clean "queue is full" signal — no sleep-based synchronization.
-        // PR #183 review, round 11: `write_bytes_control` is the opaque
-        // `Single` lane -- content is never inspected, so this plain
-        // literal (which happens to decode as a valid-but-far-too-large V5
-        // control word if it were parsed) is unaffected either way.
-        let pad = bytes::Bytes::from_static(b"padpadpadpad");
+        // PR #183 review, round 12: `write_bytes_control` carries a complete
+        // V5 frame (this crate's wire protocol has no opaque-bytes case --
+        // see the module doc comment above `reject_oversize_write_payload`),
+        // so this must be a genuine, complete frame, not a bare literal.
+        let pad_payload = vec![0u8; 8];
+        let pad_header = crate::framing::write_gossip_frame_prefix(pad_payload.len());
+        let mut pad_bytes = Vec::with_capacity(pad_header.len() + pad_payload.len());
+        pad_bytes.extend_from_slice(&pad_header);
+        pad_bytes.extend_from_slice(&pad_payload);
+        let pad = bytes::Bytes::from(pad_bytes);
         while let Ok(Ok(())) = tokio::time::timeout(
             std::time::Duration::from_millis(0),
             writer.write_bytes_control(pad.clone()),
@@ -5126,26 +5093,23 @@ mod write_payload_size_gate_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 
-    /// PR #183 review, round 6 (moved to the `Framed` lane in round 11):
-    /// two individually-valid frames concatenated into one `Framed` write
-    /// must not be rejected just because their *aggregate* length exceeds
-    /// `max_message_size` -- that bound applies per frame, the same way it
-    /// would if these had been two separate `write_framed_bytes_nonblocking`
-    /// calls. This is the shape that distinguishes a whole-buffer length
-    /// ceiling (over-rejects this) from a per-frame walk (accepts it): each
-    /// frame here is exactly at the 64-byte limit on its own, but the
-    /// concatenated buffer is 136 bytes -- comfortably past
-    /// `max_message_size + LENGTH_PREFIX_LEN` (68).
+    /// PR #183 review, round 6: two individually-valid frames concatenated
+    /// into one `Single` write must not be rejected just because their
+    /// *aggregate* length exceeds `max_message_size` -- that bound applies
+    /// per frame, the same way it would if these had been two separate
+    /// `write_bytes_nonblocking` calls. This is the shape that distinguishes
+    /// a whole-buffer length ceiling (over-rejects this) from a per-frame
+    /// walk (accepts it): each frame here is exactly at the 64-byte limit
+    /// on its own, but the concatenated buffer is 136 bytes -- comfortably
+    /// past `max_message_size + LENGTH_PREFIX_LEN` (68).
     ///
-    /// This lives on `write_framed_bytes_nonblocking`, not
-    /// `write_bytes_nonblocking`, because round 11 moved the per-frame walk
-    /// off the opaque `Single` lane entirely -- see the module doc comment
-    /// above `reject_oversize_write_payload` and
-    /// `write_bytes_nonblocking_judges_two_concatenated_frames_by_total_length_not_by_parsing_them`
-    /// below for the opaque lane's equivalent (judged by length alone,
-    /// content never inspected).
+    /// Round 11 briefly moved this behavior to an opt-in `Framed` lane on
+    /// the theory that `Single` should be content-blind; round 12
+    /// established that theory was wrong -- this crate's wire protocol has
+    /// no opaque-bytes case, so `Single` carries frames unconditionally
+    /// and this test lives on it again.
     #[tokio::test]
-    async fn write_framed_bytes_nonblocking_accepts_two_valid_frames_whose_aggregate_exceeds_max_message_size()
+    async fn write_bytes_nonblocking_accepts_two_valid_frames_whose_aggregate_exceeds_max_message_size()
      {
         let (client, mut peer) = tokio::io::duplex(64 * 1024);
         let max_message_size = 64;
@@ -5187,7 +5151,7 @@ mod write_payload_size_gate_tests {
         let expected = both.clone();
 
         writer
-            .write_framed_bytes_nonblocking(bytes::Bytes::from(both))
+            .write_bytes_nonblocking(bytes::Bytes::from(both))
             .expect(
                 "two frames each within max_message_size must be accepted, even though \
                  their concatenated length is not",
@@ -5208,10 +5172,9 @@ mod write_payload_size_gate_tests {
     /// is *accepted*, not what is *checked*. A valid frame followed by one
     /// whose own declared body exceeds `max_message_size` must still be
     /// refused, exactly as it would if the oversize frame had been sent by
-    /// itself. Moved to `write_framed_bytes_nonblocking` in round 11, same
-    /// reasoning as the aggregate-acceptance test above.
+    /// itself.
     #[tokio::test]
-    async fn write_framed_bytes_nonblocking_rejects_an_oversize_frame_following_a_valid_one() {
+    async fn write_bytes_nonblocking_rejects_an_oversize_frame_following_a_valid_one() {
         let (client, _peer) = tokio::io::duplex(64 * 1024);
         let max_message_size = 64;
         let (writer, task, _) = LockFreeStreamHandle::new(
@@ -5240,7 +5203,7 @@ mod write_payload_size_gate_tests {
         both.extend_from_slice(&oversize_frame);
 
         let err = writer
-            .write_framed_bytes_nonblocking(bytes::Bytes::from(both))
+            .write_bytes_nonblocking(bytes::Bytes::from(both))
             .unwrap_err();
         assert!(
             matches!(err, GossipError::MessageTooLarge { .. }),
@@ -5251,61 +5214,13 @@ mod write_payload_size_gate_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 
-    /// PR #183 review, round 11: the coordinator's exact evidence for why
-    /// content-sniffing was the wrong tool -- the *same* two-valid-frames
-    /// buffer that `write_framed_bytes_nonblocking` correctly parses and
-    /// accepts above must, on the opaque `write_bytes_nonblocking` lane,
-    /// be judged purely on total length and nothing else. Its total length
-    /// (136 bytes) exceeds `max_message_size` (64), so the opaque lane
-    /// rejects it -- not because it "looks like two frames", but because
-    /// `Single` never looks at content at all, and 136 bytes of *anything*
-    /// opaque exceeds the ceiling. This is the correct, content-blind
-    /// behavior: an opaque caller whose payload happens to be exactly this
-    /// shape gets the same answer any other 136-byte opaque payload would.
-    #[tokio::test]
-    async fn write_bytes_nonblocking_judges_two_concatenated_frames_by_total_length_not_by_parsing_them()
-     {
-        let (client, _peer) = tokio::io::duplex(64 * 1024);
-        let max_message_size = 64;
-        let (writer, task, _) = LockFreeStreamHandle::new(
-            client,
-            "127.0.0.1:9995".parse().unwrap(),
-            ChannelId::TellAsk,
-            BufferConfig::default(),
-            None,
-            Some(small_message_read_context(9995, max_message_size)),
-        );
-
-        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN;
-        let make_frame = |fill: u8| {
-            let payload = vec![fill; payload_len];
-            let header = crate::framing::write_gossip_frame_prefix(payload.len());
-            let mut frame = Vec::with_capacity(header.len() + payload.len());
-            frame.extend_from_slice(&header);
-            frame.extend_from_slice(&payload);
-            frame
-        };
-        let mut both = make_frame(1);
-        both.extend_from_slice(&make_frame(2));
-        assert!(both.len() > max_message_size + crate::framing::LENGTH_PREFIX_LEN);
-
-        let err = writer
-            .write_bytes_nonblocking(bytes::Bytes::from(both))
-            .unwrap_err();
-        assert!(
-            matches!(err, GossipError::MessageTooLarge { .. }),
-            "expected MessageTooLarge (bare length ceiling), got {err:?}"
-        );
-
-        writer.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
-    }
-
-    /// Genuinely unframed opaque bytes (content that would never decode as
-    /// a V5 control word even if this lane parsed content, which it does
-    /// not) must still be judged against the bare length ceiling -- the
-    /// opaque lane must not become a way to bypass `max_message_size`
-    /// altogether.
+    /// Content that never decodes as a complete V5 frame at all must still
+    /// fall back to the bare length ceiling -- the per-frame walk must not
+    /// accidentally exempt non-frame-shaped content from size checking
+    /// entirely. This content would desync the peer's parser regardless
+    /// (see the module doc comment above `reject_oversize_write_payload`);
+    /// this test only proves the local gate still bounds it too, not that
+    /// it is an accepted shape.
     #[tokio::test]
     async fn write_bytes_nonblocking_rejects_oversize_unframed_bytes() {
         let (client, _peer) = tokio::io::duplex(64 * 1024);
@@ -5342,34 +5257,26 @@ mod write_payload_size_gate_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 
-    /// PR #183 review, round 10 (moved to the `Framed` lane in round 11):
-    /// the adversarial sequence that used to defeat the size gate entirely
-    /// -- enqueue a frame's 4-byte control word alone, declaring a body far
-    /// larger than `max_message_size`, then supply the body across
-    /// separate, individually small calls. Each call on its own used to
-    /// look too short to be judged against the declared `body_len` (the
-    /// walk fell through to a bare-length check on whatever few bytes were
-    /// actually present), so every call passed while the peer reassembled
-    /// the whole oversized frame from the continuous TCP stream -- separate
-    /// `write()` calls have no boundary once the bytes are on the wire.
+    /// PR #183 review, round 10 (reaffirmed round 12 after a brief detour
+    /// through an opt-in `Framed` lane in round 11): the adversarial
+    /// sequence that used to defeat the size gate entirely -- enqueue a
+    /// frame's 4-byte control word alone, declaring a body far larger than
+    /// `max_message_size`, then supply the body across separate,
+    /// individually small calls. Each call on its own used to look too
+    /// short to be judged against the declared `body_len` (the walk fell
+    /// through to a bare-length check on whatever few bytes were actually
+    /// present), so every call passed while the peer reassembled the whole
+    /// oversized frame from the continuous TCP stream -- separate `write()`
+    /// calls have no boundary once the bytes are on the wire.
     ///
-    /// The fix refuses the *first* call outright: a `Framed` write whose
+    /// The fix refuses the *first* call outright: a `Single` write whose
     /// content begins a frame it does not complete is no longer a
     /// "not enough information yet" case, it is a rejected one. This test
     /// asserts exactly that -- the header-alone call must fail -- which is
     /// sufficient to close the sequence, since a caller who never gets past
     /// the first call can never reach the second.
-    ///
-    /// Round 11 moved this from `write_bytes_nonblocking` to
-    /// `write_framed_bytes_nonblocking`: the vulnerability this closes only
-    /// applies to a caller that has declared "this is a frame" and is
-    /// splitting it across calls anyway. An *opaque* caller (`Single`)
-    /// makes no such declaration and gets no such parsing -- see
-    /// `write_bytes_nonblocking_does_not_reject_bytes_that_merely_look_like_an_incomplete_frame`
-    /// below.
     #[tokio::test]
-    async fn write_framed_bytes_nonblocking_rejects_a_frame_header_split_from_its_body_across_calls()
-     {
+    async fn write_bytes_nonblocking_rejects_a_frame_header_split_from_its_body_across_calls() {
         let (client, _peer) = tokio::io::duplex(64 * 1024);
         let max_message_size = 64;
         let (writer, task, _) = LockFreeStreamHandle::new(
@@ -5392,9 +5299,7 @@ mod write_payload_size_gate_tests {
             "test setup: this call supplies only the 4-byte control word, no body"
         );
 
-        let err = writer
-            .write_framed_bytes_nonblocking(header_alone)
-            .unwrap_err();
+        let err = writer.write_bytes_nonblocking(header_alone).unwrap_err();
         assert!(
             matches!(err, GossipError::Network(_)),
             "expected the header-alone call to be refused as an incomplete \
@@ -5402,24 +5307,23 @@ mod write_payload_size_gate_tests {
         );
 
         // The exploit's second half -- supplying the declared body across
-        // further small `Framed` writes -- is unreachable once the first
+        // further small `Single` writes -- is unreachable once the first
         // call above is refused; a well-behaved caller stops there. Included
         // only to document the shape this closes, not because reaching it
         // would be meaningful: a caller that ignored the first error and
         // sent body fragments anyway would just be sending unrelated,
-        // independently-judged `Framed` writes at that point.
+        // independently-judged `Single` writes at that point.
         let body_fragment = bytes::Bytes::from(vec![0u8; 16]);
-        let _ = writer.write_framed_bytes_nonblocking(body_fragment);
+        let _ = writer.write_bytes_nonblocking(body_fragment);
 
         writer.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 
     /// Parity for the ask lane: the same header-alone call must be refused
-    /// through `write_framed_bytes_ask`, not just
-    /// `write_framed_bytes_nonblocking`.
+    /// through `write_bytes_ask`, not just `write_bytes_nonblocking`.
     #[tokio::test]
-    async fn write_framed_bytes_ask_rejects_a_frame_header_split_from_its_body_across_calls() {
+    async fn write_bytes_ask_rejects_a_frame_header_split_from_its_body_across_calls() {
         let (client, _peer) = tokio::io::duplex(64 * 1024);
         let max_message_size = 64;
         let (writer, task, _) = LockFreeStreamHandle::new(
@@ -5437,10 +5341,7 @@ mod write_payload_size_gate_tests {
             oversized_body_len,
         ));
 
-        let err = writer
-            .write_framed_bytes_ask(header_alone)
-            .await
-            .unwrap_err();
+        let err = writer.write_bytes_ask(header_alone).await.unwrap_err();
         assert!(
             matches!(err, GossipError::Network(_)),
             "expected the header-alone call to be refused as an incomplete \
@@ -5456,10 +5357,9 @@ mod write_payload_size_gate_tests {
     /// body just the same, must also be refused. Otherwise the rule would
     /// only close the oversized case, leaving the general "frame split
     /// across public calls" shape open for anything small enough to slip
-    /// under the ceiling. Moved to `write_framed_bytes_nonblocking` in
-    /// round 11, same reasoning as the two tests above.
+    /// under the ceiling.
     #[tokio::test]
-    async fn write_framed_bytes_nonblocking_rejects_an_incomplete_frame_even_when_body_len_is_within_max_message_size()
+    async fn write_bytes_nonblocking_rejects_an_incomplete_frame_even_when_body_len_is_within_max_message_size()
      {
         let (client, _peer) = tokio::io::duplex(64 * 1024);
         let max_message_size = 64;
@@ -5479,63 +5379,13 @@ mod write_payload_size_gate_tests {
             32,
         ));
 
-        let err = writer
-            .write_framed_bytes_nonblocking(header_alone)
-            .unwrap_err();
+        let err = writer.write_bytes_nonblocking(header_alone).unwrap_err();
         assert!(
             matches!(err, GossipError::Network(_)),
             "an incomplete frame must be refused regardless of whether its \
              declared body would itself have fit under max_message_size, \
              got {err:?}"
         );
-
-        writer.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
-    }
-
-    /// PR #183 review, round 11: the exact regression this round's finding
-    /// identified. The same header-alone bytes that
-    /// `write_framed_bytes_nonblocking` correctly refuses above (a
-    /// caller-declared frame that doesn't supply its own body) must be
-    /// *accepted* on the opaque `write_bytes_nonblocking` lane, because an
-    /// opaque caller never declared this was a frame -- it is 4 bytes of
-    /// arbitrary data that happen to decode as a plausible control word if
-    /// parsed, and this lane does not parse. Real serialized payloads hit
-    /// this pattern routinely (roughly 15/32 of random leading bytes land
-    /// on a valid `WireKind`); a sender-side gate that refuses what the
-    /// peer would accept as ordinary opaque payload bytes is its own
-    /// defect, not a safety property.
-    #[tokio::test]
-    async fn write_bytes_nonblocking_does_not_reject_bytes_that_merely_look_like_an_incomplete_frame()
-     {
-        let (client, mut peer) = tokio::io::duplex(64 * 1024);
-        let max_message_size = 64;
-        let (writer, task, _) = LockFreeStreamHandle::new(
-            client,
-            "127.0.0.1:9996".parse().unwrap(),
-            ChannelId::TellAsk,
-            BufferConfig::default(),
-            None,
-            Some(small_message_read_context(9996, max_message_size)),
-        );
-
-        let oversized_body_len = max_message_size * 100;
-        let opaque_payload = bytes::Bytes::copy_from_slice(&crate::framing::encode_control(
-            crate::framing::WireKind::Gossip,
-            oversized_body_len,
-        ));
-        let expected = opaque_payload.clone();
-
-        writer.write_bytes_nonblocking(opaque_payload).expect(
-            "an opaque write must not be refused just because it would decode as an \
-             incomplete frame if parsed -- the opaque lane never parses",
-        );
-
-        let mut received = vec![0u8; expected.len()];
-        AsyncReadExt::read_exact(&mut peer, &mut received)
-            .await
-            .expect("connection must deliver the opaque bytes to the peer");
-        assert_eq!(received, expected.as_ref());
 
         writer.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
@@ -5751,12 +5601,19 @@ mod write_chunked_nonblocking_tests {
             Some(small_message_read_context(9962, max_message_size)),
         );
 
-        // PR #183 review, round 11: `write_chunked_nonblocking`'s up-front
-        // check is the same opaque bare-length ceiling `write_bytes_nonblocking`
-        // uses -- content is never inspected, so an ordinary 0,1,2,3,...
-        // sequence (which would have decoded as a valid-but-incomplete
-        // Gossip control word if this were parsed as a frame) is unaffected.
-        let data: Vec<u8> = (0u8..40).collect();
+        // PR #183 review, round 12: `write_chunked_nonblocking` carries a
+        // complete V5 frame, the same as `write_bytes_nonblocking` -- this
+        // crate's wire protocol has no opaque-bytes case (see the module
+        // doc comment above `reject_oversize_write_payload`), so this must
+        // be a genuine, complete frame, not an arbitrary byte sequence.
+        let payload_len =
+            40 - crate::framing::LENGTH_PREFIX_LEN - crate::framing::GOSSIP_HEADER_LEN;
+        let payload = vec![7u8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
+        assert_eq!(data.len(), 40, "test setup: a 40-byte complete frame");
         writer
             .write_chunked_nonblocking(&data, 6)
             .expect("a buffer within max_message_size, chunked, must be accepted");
