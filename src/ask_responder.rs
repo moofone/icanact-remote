@@ -809,4 +809,102 @@ mod size_gate_tests {
         stream_handle.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
+
+    /// A handle whose `max_message_size` (via `ReadContext`) sits far below
+    /// the default streaming threshold (~1 MiB, from `BufferConfig::default`)
+    /// -- every reply built from it below is well under the streaming
+    /// threshold and `MAX_STREAM_SIZE`, so it takes the inline branch, not
+    /// `stream_response_bytes`.
+    fn small_message_stream_handle(
+        port: u16,
+        max_message_size: usize,
+    ) -> (Arc<LockFreeStreamHandle>, tokio::task::JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(8 * 1024);
+        let read_context = crate::connection_pool::ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_context),
+        );
+        let stream_handle = Arc::new(stream_handle);
+        assert!(
+            max_message_size < stream_handle.streaming_threshold(),
+            "test setup: max_message_size must sit below the streaming \
+             threshold so the reply below takes the inline path"
+        );
+        (stream_handle, task)
+    }
+
+    /// PR #183 review: the pooled inline lane
+    /// (`AskResponder::reply_typed` -> `send_response_pooled` ->
+    /// `send_pooled_via_stream_handle`) checked only `MAX_STREAM_SIZE` and
+    /// the streaming threshold -- neither is `max_message_size` -- and
+    /// calls `LockFreeStreamHandle` directly, bypassing
+    /// `ConnectionHandle::reject_oversize_inline` entirely. This exercises
+    /// the real `AskResponder` call path (not the `LockFreeStreamHandle`
+    /// primitive directly) to prove the `enqueue_write` choke point closes
+    /// the gap regardless.
+    #[tokio::test]
+    async fn qa_re_pooled_reply_over_max_message_size_is_rejected() {
+        let max_message_size = 64;
+        let (stream_handle, task) = small_message_stream_handle(9993, max_message_size);
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(44, stream_handle.clone(), used);
+
+        let big = BigReply {
+            data: vec![0u8; max_message_size],
+        };
+        let err = responder.reply_typed(&big).await.unwrap_err();
+        assert!(
+            matches!(err, crate::GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        stream_handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Same gap, the nonblocking `Bytes` reply lane
+    /// (`try_reply_bytes` -> `try_send_response_bytes`): its own
+    /// `reject_oversize_for_nonblocking_lane` pre-check only compares
+    /// against the streaming threshold.
+    #[tokio::test]
+    async fn qa_re_nonblocking_bytes_reply_over_max_message_size_is_rejected() {
+        let max_message_size = 64;
+        let (stream_handle, task) = small_message_stream_handle(9994, max_message_size);
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(45, stream_handle.clone(), used);
+
+        let payload_len = max_message_size - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
+        let err = responder
+            .try_reply_bytes(Bytes::from(vec![0u8; payload_len]))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        stream_handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
 }
