@@ -416,6 +416,41 @@ impl<T: 'static> RoutingPublisher for crate::connection_pool::ConnectionPool<T> 
     }
 }
 
+/// The committed result of an atomic `configure_peer` transaction: a
+/// `ClaimKind::Verified` claim and its operator pin, decided and published
+/// in one serialized owner step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurePeerCommit {
+    claim: ClaimCommit,
+    /// The address (if any, and if different from the newly pinned one)
+    /// this peer was pinned at immediately beforehand.
+    evicted_pin: Option<SocketAddr>,
+    /// If the eviction above also released that address's ownership --
+    /// because this SAME peer still genuinely owned it -- the position of
+    /// that release in the owner's commit order. Released in this SAME
+    /// synchronous step as the eviction, never as a separate, later command
+    /// a concurrent claim or migrate could land in front of.
+    evicted_release_seq: Option<CommitSeq>,
+}
+
+impl ConfigurePeerCommit {
+    /// The underlying claim decision.
+    pub fn claim(&self) -> &ClaimCommit {
+        &self.claim
+    }
+
+    /// The address evicted from this peer's previous pin, if any.
+    pub fn evicted_pin(&self) -> Option<SocketAddr> {
+        self.evicted_pin
+    }
+
+    /// The evicted address's release position, if this transaction also
+    /// released its ownership.
+    pub fn evicted_release_seq(&self) -> Option<CommitSeq> {
+        self.evicted_release_seq
+    }
+}
+
 /// Commands accepted by the owner task. Every variant that mutates carries a
 /// reply channel so the caller observes the committed state, never a promise.
 enum OwnerCommand {
@@ -521,6 +556,24 @@ enum OwnerCommand {
         addr: SocketAddr,
         peer_id: PeerId,
         reply: oneshot::Sender<Option<SocketAddr>>,
+    },
+    /// Atomically claim `addr` for `peer_id` with `ClaimKind::Verified` and,
+    /// if accepted, install it as `peer_id`'s operator pin -- evicting
+    /// whatever address this SAME peer was pinned at beforehand and, in
+    /// this SAME synchronous step, releasing that evicted address's
+    /// ownership if `peer_id` still holds it.
+    ///
+    /// This is the atomic transaction `GossipRegistry::configure_peer`
+    /// submits in place of separately-ordered claim, pin, and release
+    /// commands. Folding the three into one `&mut self` step closes the
+    /// interleaving window a concurrent `configure_peer`/claim/migrate
+    /// could otherwise exploit between the claim taking effect and the pin
+    /// (with its eviction and release) landing -- see
+    /// `PeerRegistryOwner::configure_peer`.
+    ConfigurePeer {
+        addr: SocketAddr,
+        peer_id: PeerId,
+        reply: oneshot::Sender<ConfigurePeerCommit>,
     },
     #[cfg(test)]
     InspectGeneration {
@@ -727,21 +780,34 @@ impl RegistryOwnerHandle {
 
     /// Reserve `addr` for `peer_id` independently of any connection,
     /// atomically replacing any address this peer was previously pinned at.
-    /// Called only from `GossipRegistry::configure_peer`. Returns the
-    /// evicted address, if this peer held a DIFFERENT pin beforehand --
-    /// the caller's cue to also release that address's ownership.
+    /// Returns the evicted address, if this peer held a DIFFERENT pin
+    /// beforehand -- the caller's cue to also release that address's
+    /// ownership.
     ///
-    /// Two concurrent `configure_peer` calls for the same peer can each
-    /// observe the same stale "previous address" from `ConnectionPool`
-    /// before either has applied its own change; if each then independently
-    /// pinned its own target, both addresses would end up pinned for one
-    /// peer, and since a pinned address can never be reclaimed by `release`/
-    /// `release_dead_peer`, the loser would stay reserved forever. Routing
-    /// the replacement through the owner's own reverse map instead --
-    /// looked up here, at the moment this command actually runs, rather
-    /// than trusted from the caller -- means whichever `pin` call the owner
-    /// serializes LAST always wins outright, and there is never a window in
-    /// which two addresses are simultaneously pinned for the same peer.
+    /// The lower-level pin-bookkeeping primitive `configure_peer` (below)
+    /// is now built on: it does NOT itself verify that `peer_id` actually
+    /// owns `addr` (or, for the evicted address, release its ownership) --
+    /// only `pinned_by_peer`/`operator_pinned`/the `ConnectionPool` route
+    /// are touched here. `GossipRegistry::configure_peer` no longer calls
+    /// this directly for that reason: claiming and pinning as two
+    /// separately-ordered commands left a window for another command to
+    /// land in between, observing (or acting on) a pin with no matching
+    /// claim. Kept as its own command for the reverse-map invariant it
+    /// guarantees in isolation (see the concurrent-pin tests below); any
+    /// future caller must claim ownership first in the SAME atomic step --
+    /// i.e. use `configure_peer` -- rather than calling this directly.
+    ///
+    /// Two concurrent callers for the same peer can each observe the same
+    /// stale "previous address" from `ConnectionPool` before either has
+    /// applied its own change; if each then independently pinned its own
+    /// target, both addresses would end up pinned for one peer, and since a
+    /// pinned address can never be reclaimed by `release`/`release_dead_peer`,
+    /// the loser would stay reserved forever. Routing the replacement
+    /// through the owner's own reverse map instead -- looked up here, at
+    /// the moment this command actually runs, rather than trusted from the
+    /// caller -- means whichever `pin` command the owner serializes LAST
+    /// always wins outright, and there is never a window in which two
+    /// addresses are simultaneously pinned for the same peer.
     pub async fn pin(&self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
@@ -754,6 +820,36 @@ impl RegistryOwnerHandle {
             return None;
         }
         response.await.unwrap_or(None)
+    }
+
+    /// Atomically claim `addr` for `peer_id` (`ClaimKind::Verified`) and
+    /// install it as `peer_id`'s operator pin, evicting and releasing any
+    /// previous pin for this SAME peer in the same synchronous step. See
+    /// `OwnerCommand::ConfigurePeer` and `PeerRegistryOwner::configure_peer`.
+    ///
+    /// An owner-unavailable send failure reports a rejected claim with no
+    /// eviction, the same fail-closed shape as every other command here.
+    pub async fn configure_peer(&self, addr: SocketAddr, peer_id: PeerId) -> ConfigurePeerCommit {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::ConfigurePeer {
+            addr,
+            peer_id,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            warn!(addr = %addr, "registry owner unavailable; failing configure_peer closed");
+            return ConfigurePeerCommit {
+                claim: ClaimCommit::Rejected(ClaimRejection::OwnerUnavailable),
+                evicted_pin: None,
+                evicted_release_seq: None,
+            };
+        }
+        response.await.unwrap_or(ConfigurePeerCommit {
+            claim: ClaimCommit::Rejected(ClaimRejection::OwnerUnavailable),
+            evicted_pin: None,
+            evicted_release_seq: None,
+        })
     }
 
     /// Drop the recorded ownership of `addr` only when both `expected_owner`
@@ -1018,6 +1114,14 @@ impl PeerRegistryOwner {
             } => {
                 let evicted = self.pin(addr, peer_id);
                 let _ = reply.send(evicted);
+            }
+            OwnerCommand::ConfigurePeer {
+                addr,
+                peer_id,
+                reply,
+            } => {
+                let commit = self.configure_peer(addr, peer_id);
+                let _ = reply.send(commit);
             }
             #[cfg(test)]
             OwnerCommand::InspectGeneration { addr, reply } => {
@@ -1295,11 +1399,7 @@ impl PeerRegistryOwner {
 
     /// Atomically install `peer_id`'s operator pin at `addr`, evicting
     /// whatever address `pinned_by_peer` shows this SAME peer pinned at
-    /// beforehand (if different). Called only from
-    /// `GossipRegistry::configure_peer`, never from a connection lifecycle
-    /// path: a pin marks a reservation that exists independently of any
-    /// connection, and only the operator-configuration call site is trusted
-    /// to know when one should move.
+    /// beforehand (if different).
     ///
     /// The eviction is keyed off `pinned_by_peer`, not off any address the
     /// caller believes was previously configured: that belief can be stale
@@ -1308,11 +1408,16 @@ impl PeerRegistryOwner {
     /// serialized ahead of this one here). Consulting the owner's own
     /// authoritative reverse map instead is what guarantees at most one
     /// pinned address per peer at every instant, regardless of how many
-    /// `pin` calls for that peer are in flight or in what order the owner
+    /// pin installs for that peer are in flight or in what order the owner
     /// task actually processes them.
     ///
     /// Returns the evicted address, if any and if different from `addr` --
-    /// the caller's cue to also release that address's ownership.
+    /// the caller's cue to also release that address's ownership. This
+    /// helper only touches pin bookkeeping and the `ConnectionPool` route;
+    /// releasing the evicted address's ownership (when applicable) is the
+    /// caller's responsibility -- `configure_peer` below does so in the
+    /// SAME synchronous step, atomically; the standalone `pin` command does
+    /// not, by design (see its doc comment).
     ///
     /// Also publishes `addr` as `peer_id`'s configured/required
     /// `ConnectionPool` dial target, in this SAME step, via
@@ -1322,7 +1427,7 @@ impl PeerRegistryOwner {
     /// current for this peer, the way two independently-atomic writes
     /// (owner pin, then a separate later `ConnectionPool` write) could
     /// under two concurrent `configure_peer` calls for the same peer.
-    fn pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
+    fn install_pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
         let previous = self.pinned_by_peer.insert(peer_id.clone(), addr);
         let evicted = previous.filter(|previous_addr| *previous_addr != addr);
         if let Some(evicted_addr) = evicted {
@@ -1333,6 +1438,73 @@ impl PeerRegistryOwner {
         }
         self.operator_pinned.insert(addr, peer_id);
         evicted
+    }
+
+    /// `OwnerCommand::Pin`'s handler: see `install_pin`. Kept as its own,
+    /// narrower command (never called from `GossipRegistry::configure_peer`,
+    /// which uses the atomic `configure_peer` below instead) for the
+    /// reverse-map invariant it guarantees on its own -- see
+    /// `RegistryOwnerHandle::pin`'s doc comment for why a caller needing an
+    /// ownership-backed pin must use `configure_peer` instead.
+    fn pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
+        self.install_pin(addr, peer_id)
+    }
+
+    /// `OwnerCommand::ConfigurePeer`'s handler: the atomic transaction
+    /// behind `GossipRegistry::configure_peer`. Claims `addr` for `peer_id`
+    /// with `ClaimKind::Verified` and, only if that claim is accepted,
+    /// installs the operator pin in the SAME synchronous step -- so no other
+    /// owner command can ever be processed between the claim taking effect
+    /// and the pin landing, and by the time `install_pin` runs, `peer_id`
+    /// claiming `addr` is not merely believed but a fact this exact call
+    /// itself just committed.
+    ///
+    /// If installing the pin evicts a DIFFERENT address this same peer was
+    /// previously pinned at, that address's ownership is released in this
+    /// SAME step too, when `peer_id` still holds it -- not left for a
+    /// caller to reclaim afterward through a separately-ordered `release`
+    /// call a concurrent `migrate` could race ahead of. This is what closes
+    /// the window in which the evicted address is unpinned but still
+    /// "owned" by a peer that has already moved its configuration
+    /// elsewhere.
+    fn configure_peer(&mut self, addr: SocketAddr, peer_id: PeerId) -> ConfigurePeerCommit {
+        let claim = Claim {
+            node_id: peer_id.clone(),
+            kind: ClaimKind::Verified,
+        };
+        let commit = self.claim(addr, claim, /* is_local_addr */ false);
+        if !commit.is_accepted() {
+            return ConfigurePeerCommit {
+                claim: commit,
+                evicted_pin: None,
+                evicted_release_seq: None,
+            };
+        }
+        let evicted_pin = self.install_pin(addr, peer_id.clone());
+        let evicted_release_seq = evicted_pin.and_then(|evicted_addr| {
+            // Ghost connection-scoped receipts for the evicted address must
+            // not survive its release either -- the same cleanup `release`
+            // itself performs, just folded into this atomic step instead of
+            // a separately-ordered call.
+            self.connection_scoped_claims
+                .retain(|key, _| !(key.0 == peer_id && key.2 == evicted_addr));
+            let still_owned = self
+                .addr_ownership
+                .get(&evicted_addr)
+                .is_some_and(|owner| owner.node_id == peer_id);
+            still_owned.then(|| {
+                let owner = self
+                    .addr_ownership
+                    .remove(&evicted_addr)
+                    .expect("still_owned just confirmed this entry exists");
+                self.retract_owner(evicted_addr, owner)
+            })
+        });
+        ConfigurePeerCommit {
+            claim: commit,
+            evicted_pin,
+            evicted_release_seq,
+        }
     }
 
     /// Shared tail of every path that drops a recorded owner: clear its
@@ -2604,6 +2776,105 @@ mod tests {
             ))
         );
         assert_eq!(owner.routes_to(&to), Some(node));
+    }
+
+    /// P1 regression: the OLD `configure_peer` submitted its claim and its
+    /// pin as two separately-ordered owner commands, so the eviction `pin`
+    /// reports and the release of that evicted address's ownership were
+    /// necessarily two separate steps too -- a window in which a concurrent
+    /// `migrate` could move the still-owned evicted address elsewhere
+    /// before a caller's own follow-up `release` ever ran. The atomic
+    /// `configure_peer` transaction closes this by releasing the evicted
+    /// address's ownership in the SAME synchronous step as the eviction
+    /// itself: by the time the second `configure_peer` call returns, the
+    /// first address is no longer merely unpinned but already fully
+    /// unowned, with no separate caller action required or possible to race.
+    #[tokio::test]
+    async fn configure_peer_atomically_releases_the_evicted_pins_ownership() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("atomic-configure-peer-eviction");
+        let addr_p = addr(30_060);
+        let addr_y = addr(30_061);
+
+        let first = owner.configure_peer(addr_p, node.clone()).await;
+        assert!(first.claim().is_accepted());
+        assert_eq!(first.evicted_pin(), None);
+        assert_eq!(first.evicted_release_seq(), None);
+
+        let second = owner.configure_peer(addr_y, node.clone()).await;
+        assert!(second.claim().is_accepted());
+        assert_eq!(second.evicted_pin(), Some(addr_p));
+        assert!(
+            second.evicted_release_seq().is_some(),
+            "evicting a pin this peer still owns must release its ownership in the same step"
+        );
+
+        assert_eq!(
+            owner.ownership_token(&addr_p),
+            None,
+            "the evicted pin's ownership must already be gone -- released atomically with \
+             the eviction, not left dangling for a later, separately-ordered release"
+        );
+        assert_eq!(owner.routes_to(&addr_p), None);
+        assert_eq!(owner.routes_to(&addr_y), Some(node));
+    }
+
+    /// P1 regression: `pin` used to be processed as a command entirely
+    /// separate from the claim that was supposed to justify it, so it never
+    /// verified `peer_id` actually owned `addr` at the moment it ran. The
+    /// atomic `configure_peer` transaction closes this by construction: the
+    /// pin step only ever runs after this SAME call's own claim just
+    /// committed, so a claim rejection (a different identity already
+    /// verified-owns the address) must leave NEITHER a pin NOR a route
+    /// behind for the rejected peer.
+    #[tokio::test]
+    async fn configure_peer_never_pins_when_the_claim_is_rejected() {
+        let (owner, publisher) = owner_handle();
+        let incumbent = peer("cfgpeer-incumbent");
+        let challenger = peer("cfgpeer-challenger");
+        let target = addr(30_062);
+
+        let original = owner
+            .claim(target, claim_of(incumbent.clone(), ClaimKind::Verified), false)
+            .await;
+        let original_generation = original.commit_seq().expect("original claim commits");
+        let events_before = publisher.events();
+        let configured_routes_before = publisher.configured_routes();
+
+        let commit = owner.configure_peer(target, challenger.clone()).await;
+
+        assert!(!commit.claim().is_accepted());
+        assert_eq!(commit.evicted_pin(), None);
+        assert_eq!(commit.evicted_release_seq(), None);
+        assert_eq!(
+            owner.routes_to(&target),
+            Some(incumbent.clone()),
+            "a rejected claim must never install a pin for the challenger"
+        );
+        assert_eq!(
+            publisher.events(),
+            events_before,
+            "a rejected claim must publish no ownership route change"
+        );
+        assert_eq!(
+            publisher.configured_routes(),
+            configured_routes_before,
+            "a rejected claim must publish no configured-route write either"
+        );
+        // The strongest check: if the rejected claim had wrongly installed a
+        // pin for `challenger` anyway, `target` would now refuse release
+        // even though `incumbent` genuinely still owns it (`release`'s
+        // FIRST check is `operator_pinned`). No pin must have been
+        // installed, so the incumbent's own, still perfectly valid release
+        // must succeed.
+        assert!(
+            owner
+                .release(target, incumbent, original_generation)
+                .await
+                .is_some(),
+            "a rejected challenger claim must not leave `target` pinned against its \
+             genuine, still-valid incumbent owner"
+        );
     }
 
     /// P2 regression: two concurrent `configure_peer` calls for the SAME
