@@ -312,6 +312,180 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
     });
 }
 
+/// A transport whose write side never completes: `poll_write`/`poll_flush`
+/// always return `Pending` and never wake their waker. Models the residual
+/// bidirectional-streaming deadlock's write side -- a peer that has stopped
+/// draining its receive window, so real TCP backpressure would otherwise
+/// park the single bounded slice write forever. Reads delegate straight
+/// through to `inner` so the test can still feed the IO task real frames.
+struct WriteWedgedStream<S> {
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteWedgedStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: Unpin> AsyncWrite for WriteWedgedStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// P0 (residual of #180): a partial streaming frame's bounded slice write is
+/// a plain, unbounded `.await` on the shared socket. The IO task owns both
+/// directions of the connection sequentially, so a write that never completes
+/// -- not merely a slow one, one that genuinely never comes back -- starves
+/// the read side forever along with it, including reads that have nothing to
+/// do with the stuck frame. Drive the wedged side's own outbound streaming
+/// ask into a permanently-`Pending` write, then prove a plain tell that
+/// arrives on the same connection is still delivered: the write's deadline
+/// must eventually hand control back to the loop instead of parking on it.
+#[test]
+fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_read() {
+    run_multi_thread_test(async {
+        let addr_wedged: std::net::SocketAddr = "127.0.0.1:40495".parse().unwrap();
+        let addr_peer: std::net::SocketAddr = "127.0.0.1:40496".parse().unwrap();
+
+        let delivered = Arc::new(AtomicU64::new(0));
+        let registry_wedged = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            addr_wedged,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(
+                    "wedged_write_read_progress",
+                )),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        registry_wedged
+            .set_actor_message_handler_sync(Arc::new(TestActorCounter {
+                delivered: Arc::clone(&delivered),
+            }))
+            .await;
+
+        let correlation_wedged = CorrelationTracker::new();
+        let (io_wedged, io_peer) = tokio::io::duplex(64 * 1024);
+        let wedged_stream = WriteWedgedStream { inner: io_wedged };
+
+        let read_ctx_wedged = ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: Arc::downgrade(&registry_wedged),
+            peer_addr: addr_peer,
+            session_source: addr_peer,
+            peer_id: None,
+            max_message_size: MASTER_BUFFER_SIZE,
+            expected_schema_hash: None,
+            aligned_pool: registry_wedged.connection_pool.aligned_bytes_pool(),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: Some(correlation_wedged.clone()),
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: registry_wedged.actor_message_handler_sync.load_full(),
+        };
+
+        let (writer_wedged, task_wedged, _) = LockFreeStreamHandle::new(
+            wedged_stream,
+            addr_peer,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_ctx_wedged),
+        );
+        let writer_wedged = Arc::new(writer_wedged);
+        let conn_wedged = ConnectionHandle::<()>::new_stream(
+            addr_peer,
+            Arc::clone(&writer_wedged),
+            correlation_wedged,
+        );
+
+        let (writer_peer, _task_peer, _) = LockFreeStreamHandle::new(
+            io_peer,
+            addr_wedged,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer_peer = Arc::new(writer_peer);
+        let conn_peer = ConnectionHandle::<()>::new_stream(
+            addr_wedged,
+            Arc::clone(&writer_peer),
+            CorrelationTracker::new(),
+        );
+
+        // Occupy the wedged side's own streaming write path: this ask is
+        // large enough to go through the chunked slice-write machinery
+        // (`write_streaming_command_slice`), whose socket writes always
+        // return `Pending` on `wedged_stream`. Never awaited -- it is meant
+        // to hang; the assertion below is entirely about the read side.
+        let stuck_payload = bytes::Bytes::from(vec![0x11u8; 3 * 1024 * 1024]);
+        tokio::spawn(async move {
+            let _ = conn_wedged
+                .ask_streaming_bytes(
+                    stuck_payload,
+                    0xA11C_0001,
+                    0xC0DE_BEEF,
+                    Duration::from_secs(120),
+                )
+                .await;
+        });
+
+        // Let the wedged writer's IO task pick up the streaming ask and reach
+        // (and get stuck on) its first bounded slice write.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        conn_peer
+            .tell_actor_frame(
+                TEST_TELL_ACTOR_ID,
+                TEST_TELL_HASH,
+                bytes::Bytes::from_static(b"still-alive"),
+            )
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            while delivered.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a permanently parked streaming slice write must not stop the IO task from \
+             processing an already-buffered read: a wedged write direction must not disable \
+             reads on the same connection"
+        );
+
+        writer_peer.shutdown();
+        writer_wedged.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_wedged).await;
+    });
+}
+
 fn reset_io_perf() {
     let _ = IoPerfCounters::global().snapshot_and_reset();
 }
