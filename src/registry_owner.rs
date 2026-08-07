@@ -1420,11 +1420,28 @@ impl PeerRegistryOwner {
         // this here would let repeated DNS lookups for a peer that never
         // actually reconnects keep `release_dead_peer`'s freshness fence
         // perpetually satisfied, the same failure mode a gossip/discovery
-        // claim refreshing it would cause (see `claim`'s doc comment). If
-        // `from` never had direct evidence either, `to` correctly ends up
-        // with none.
-        if let Some(committed_at) = self.claim_committed_at.remove(&from) {
-            self.claim_committed_at.insert(to, committed_at);
+        // claim refreshing it would cause (see `claim`'s doc comment).
+        //
+        // `to` may already be owned by the same identity (the merge case
+        // above), and therefore may already have its OWN, strictly newer
+        // direct-evidence timestamp than `from`'s -- e.g. the peer
+        // independently (re)connected at `to` before this migration ever
+        // ran. Take the newer of the two rather than unconditionally
+        // overwriting: a migration must never make an address look LESS
+        // fresh than it actually is, the same "measuring the wrong event"
+        // shape as a gossip/discovery claim making one look MORE fresh than
+        // it actually is. If `from` never had direct evidence, `to`'s
+        // existing entry (if any) is left untouched; if `to` never had one,
+        // `from`'s is carried forward unchanged.
+        if let Some(from_committed_at) = self.claim_committed_at.remove(&from) {
+            self.claim_committed_at
+                .entry(to)
+                .and_modify(|to_committed_at| {
+                    if from_committed_at > *to_committed_at {
+                        *to_committed_at = from_committed_at;
+                    }
+                })
+                .or_insert(from_committed_at);
         }
         let snapshot = self.snapshot.load_full();
         let snapshot = snapshot
@@ -2089,6 +2106,64 @@ mod tests {
         assert!(
             owner.release(to, node, token.generation()).await.is_none(),
             "the migrated pin must still protect `to` from release"
+        );
+    }
+
+    /// P2 follow-on: `migrate` permits `to` to already be owned by the SAME
+    /// identity (the merge case). If `to` already has its OWN, strictly
+    /// newer direct-evidence timestamp than `from`'s, carrying `from`'s
+    /// (older) timestamp over unconditionally would age `to` BACKWARDS --
+    /// making a genuinely live address look reapable. That inverts the
+    /// property the freshness fence exists for, the same "measuring the
+    /// wrong event" shape as an indirect claim making an address look MORE
+    /// fresh than it actually is. The migration must take the newer of the
+    /// two timestamps instead.
+    #[tokio::test]
+    async fn migrate_never_ages_a_destination_with_newer_direct_evidence_backwards() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("migrate-preserves-newer-destination-evidence");
+        let from = addr(30_016);
+        let to = addr(30_017);
+        let from_session = addr(31_016);
+        let to_session = addr(31_017);
+
+        // `from`'s direct (connection-scoped) claim happens first, and will
+        // be comparatively stale by the time freshness is checked below.
+        owner
+            .claim_connection_scoped(
+                from,
+                claim_of(node.clone(), ClaimKind::Verified),
+                from_session,
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // `to` already has its OWN, strictly newer direct claim -- e.g. the
+        // same peer independently (re)connected there too, before this
+        // migration ever ran.
+        owner
+            .claim_connection_scoped(to, claim_of(node.clone(), ClaimKind::Verified), to_session)
+            .await;
+
+        let source = current_source(&owner, from);
+        assert!(
+            owner.migrate(from, to, source, false).await.moved(),
+            "a same-identity merge onto an already-owned destination must still succeed"
+        );
+
+        // `to`'s freshness must reflect ITS OWN newer evidence, not
+        // `from`'s much older one: a dead_peer_timeout comfortably longer
+        // than `to`'s real age (just now) but shorter than `from`'s (80ms+)
+        // must still refuse to release it.
+        assert!(
+            owner
+                .release_dead_peer(node, to, Duration::from_millis(60))
+                .await
+                .is_none(),
+            "migrate must not age a destination with newer direct evidence backwards to \
+             the source's older timestamp -- a genuinely live address must not become \
+             reapable"
         );
     }
 
