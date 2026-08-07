@@ -27,6 +27,33 @@ const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 /// for when draining never lets it through anyway (the peer is truly gone,
 /// not merely slow): once a slice has made zero progress for that long, the
 /// IO task gives up on the connection instead of retrying forever.
+///
+/// A bounded write alone is not sufficient: the read loop below also used to
+/// refuse to attempt a read at all once `local_streaming_queue.is_full()`
+/// (more than ~`MAX_STREAM_SIZE` retained), regardless of whether the next
+/// frame needed streaming-queue capacity. Two peers that each independently
+/// accumulate that much retained backlog -- a bidirectional large-ask storm,
+/// exactly the scenario this constant exists for -- would stop reading each
+/// other entirely, and a write that keeps retrying into a socket nobody is
+/// draining never resolves either. That pre-check is removed; admission is
+/// bounded per response instead (`can_admit_response` -> `WouldBlock`), so a
+/// read that does not need streaming capacity keeps flowing regardless of
+/// backlog. See the comment at the read loop's `while` condition in
+/// `io_task`.
+///
+/// What is NOT covered by either fix: a partial frame pending together with
+/// `response_batch`/`direct_response_batch` at their own (much smaller, ~8MB)
+/// byte cap still stops reads outright, on purpose -- those batches cannot be
+/// flushed mid-frame without corrupting the wire framing, and unlike
+/// streaming admission they are not individually fallible, so the only other
+/// way to bound them is to stop accepting more work. If both peers reach
+/// *that* specific state simultaneously, this task's periodic write retries
+/// keep attempting (and read gating from `is_full` is no longer a factor),
+/// but if the peer is truly not draining, no attempt makes progress and reads
+/// stay stopped until `STREAM_WRITE_STUCK_TEARDOWN` fires and tears the
+/// connection down. That is a bounded resolution (<= 30s), not a graceful
+/// one -- it is the teardown escape the invariant above allows, not the
+/// backpressure escape the `is_full` fix gives the more common case.
 const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// See `STREAM_WRITE_SLICE_TIMEOUT`.
@@ -2253,8 +2280,21 @@ impl LockFreeStreamHandle {
                 if did_work {
                     let mut reads = 0usize;
                     let mut read_batch_limit = READ_BATCH_LIMIT;
+                    // Deliberately does NOT gate on `local_streaming_queue.is_full()`.
+                    // A connection must never end up with both directions unable to
+                    // read because both are unable to write (see
+                    // `STREAM_WRITE_SLICE_TIMEOUT`); a blanket pre-check here would
+                    // stop every read on this connection -- tells, small asks,
+                    // control frames, all of it -- for as long as the local
+                    // streaming-response backlog stays over its ~64MB reserve, which
+                    // is exactly the state a bidirectional streaming storm leaves
+                    // both peers in. `queue_streaming_response_bytes`/`_pooled`
+                    // already backpressure admission per message
+                    // (`can_admit_response` -> `WouldBlock` ->
+                    // `is_streaming_admission_backpressure` below), so a read that
+                    // does not need streaming-queue capacity keeps flowing while one
+                    // that does still bounds correctly.
                     while reads < read_batch_limit
-                        && !local_streaming_queue.is_full()
                         // A read that dispatches to an unknown actor, a
                         // missing handler, or backpressure can queue a NACK
                         // (`LocalStreamingQueue::queue_ask_nack`). Admitting
@@ -2264,6 +2304,8 @@ impl LockFreeStreamHandle {
                         // (silently losing its terminal outcome) or grow
                         // without bound; stopping here instead lets the
                         // drain at the top of the next turn make room first.
+                        // (Deliberately not also gating on `is_full()` here
+                        // -- see the doc comment above this loop.)
                         && local_streaming_queue.has_room_for_ask_nack()
                         && (pending_stream_cmd.is_none()
                             || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
@@ -2584,8 +2626,10 @@ impl LockFreeStreamHandle {
                             // Drain additional frames non-blocking to batch handler + response writes.
                             let mut drained = 0usize;
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
+                            // See the matching comment on the primary drain loop
+                            // above: no `local_streaming_queue.is_full()` pre-check,
+                            // for the same reason.
                             while drained < drain_batch_limit
-                                && !local_streaming_queue.is_full()
                                 // See the identical check in the primary
                                 // drain loop above.
                                 && local_streaming_queue.has_room_for_ask_nack()

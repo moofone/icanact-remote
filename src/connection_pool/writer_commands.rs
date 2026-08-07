@@ -272,7 +272,11 @@ struct LocalStreamingQueue {
     wire_blocked: bool,
     /// Reserve normal queue room for one configured response frame when
     /// reading another frame. The aggregate stream-sized reservation is
-    /// enforced separately by `is_full`.
+    /// checked separately by `is_full`, which is a queue-level invariant used
+    /// by tests; production admission control is entirely `can_admit_response`
+    /// (`WouldBlock` per response, not a blanket read-loop gate -- see the
+    /// comment on the read loop in `stream_writer.rs::io_task`).
+    #[cfg_attr(not(test), allow(dead_code))]
     response_reserve_bytes: usize,
     /// Reserve command slots for the next maximum-sized response as well as
     /// bytes. The command cap is independent from the retained-payload cap,
@@ -282,9 +286,10 @@ struct LocalStreamingQueue {
     response_reserve_commands: usize,
     /// One response that arrived after the bounded queue filled. Keeping the
     /// complete command batch here preserves the consumed ask's response
-    /// without opening an unbounded side queue; the aggregate hard cap and
-    /// `is_full` stop further reads until the current response drains and
-    /// `pop_front` promotes this batch.
+    /// without opening an unbounded side queue; the aggregate hard cap stops
+    /// further *admission* until the current response drains and `pop_front`
+    /// promotes this batch (reads that do not need streaming-queue capacity
+    /// are unaffected -- see `can_admit_response`).
     deferred: Option<Vec<StreamingCommand>>,
     deferred_bytes: usize,
     /// Backpressure NACKs owed to the peer, queued here instead of written
@@ -317,9 +322,10 @@ const PENDING_ASK_NACK_CAP: usize = 64;
 const STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP: usize =
     crate::MAX_INFLIGHT_STREAM_BYTES.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
-/// Reserve for the largest valid streamed payload when deciding whether the
-/// read side may consume another ask. Stream frame headers are generated on
-/// demand and are not retained by the queue, so only owned payload bytes count.
+/// Reserve for the largest valid streamed payload, used by `is_full`. Stream
+/// frame headers are generated on demand and are not retained by the queue,
+/// so only owned payload bytes count.
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_STREAMING_RESPONSE_RETAINED_BYTES: usize =
     crate::MAX_STREAM_SIZE.saturating_add(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
 
@@ -498,6 +504,14 @@ impl LocalStreamingQueue {
             || self.can_defer_response(command_count, response_bytes)
     }
 
+    /// Whether this queue's retained footprint is at or beyond its aggregate
+    /// reserve. A queue-level invariant checked directly by tests; NOT used to
+    /// gate the IO task's read loop (a blanket pre-check there previously
+    /// stopped every read on the connection -- including ones needing no
+    /// streaming-queue capacity at all -- for as long as this stayed true,
+    /// which is exactly the state a bidirectional streaming storm leaves both
+    /// peers in). Per-response admission is `can_admit_response`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn is_full(&self) -> bool {
         if self.deferred.is_some() {
             return true;
