@@ -3819,23 +3819,39 @@ impl<T: 'static> GossipRegistry<T> {
         peer_id: &crate::PeerId,
         addr: SocketAddr,
     ) {
-        if let Some(token) = self.registry_owner.ownership_token(&addr)
-            && token.owner() == peer_id
-            && let Some(release_seq) = self
-                .registry_owner
-                .release(addr, peer_id.clone(), token.generation())
-                .await
-        {
-            let mut state = self.gossip_state.lock().await;
-            state.tombstone_ownership_projection(addr, release_seq);
-        } else {
-            // Older state may have a pool-only configured route without a
-            // corresponding owner-actor token. Remove only this peer's
-            // stale derived route; never disturb a replacement owner.
-            let _ = self
-                .connection_pool
-                .addr_to_peer_id
-                .remove_if_sync(&addr, |current| current == peer_id);
+        match self.registry_owner.ownership_token(&addr) {
+            Some(token) if token.owner() == peer_id => {
+                // A live, owner-matching token exists. `release` may still
+                // correctly REFUSE -- the address was re-pinned, or its
+                // generation was refreshed by a newer claim, between the
+                // token read above and this call. A refusal here is a
+                // genuine "still owned/protected" answer, not a "nothing to
+                // clean up" one; only a SUCCESSFUL release may retract the
+                // legacy route below. Falling through to the token-less
+                // branch on a refusal would delete a currently owned,
+                // possibly pinned, address's route out from under it.
+                if let Some(release_seq) = self
+                    .registry_owner
+                    .release(addr, peer_id.clone(), token.generation())
+                    .await
+                {
+                    let mut state = self.gossip_state.lock().await;
+                    state.tombstone_ownership_projection(addr, release_seq);
+                }
+            }
+            _ => {
+                // No owner-actor token names `peer_id` as `addr`'s current
+                // owner -- either older state with a pool-only configured
+                // route and no corresponding owner-actor token, or a
+                // different identity now legitimately owns it. Either way
+                // there is nothing for `release` to fence against; remove
+                // only this peer's own stale derived route, never
+                // disturbing a replacement owner.
+                let _ = self
+                    .connection_pool
+                    .addr_to_peer_id
+                    .remove_if_sync(&addr, |current| current == peer_id);
+            }
         }
     }
 
@@ -20614,6 +20630,57 @@ mod tests {
             registry.registry_owner.routes_to(&new_addr),
             Some(peer),
             "reconfiguration must retain the new verified pin"
+        );
+    }
+
+    /// P1 regression: `release_configure_peer_stale_address`'s legacy,
+    /// token-less fallback must never fire for a REFUSED, fenced release of
+    /// a currently owned address -- e.g. because the address is still
+    /// operator-pinned. A refusal there means "still genuinely owned and
+    /// protected", not "nothing left to clean up"; deleting the route
+    /// anyway would leave an owned, pinned address unroutable.
+    #[tokio::test]
+    async fn release_configure_peer_stale_address_does_not_delete_a_pinned_route_on_refusal() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_780), test_config());
+        let peer = test_peer_id("stale-address-refused-release-pinned");
+        let addr = test_addr(20_781);
+
+        registry.configure_peer(peer.clone(), addr).await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(peer.clone())
+        );
+        assert_eq!(
+            registry
+                .connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr, |_, v| v.clone()),
+            Some(peer.clone()),
+            "configure_peer must publish the route"
+        );
+
+        // A best-effort stale-address cleanup call for the SAME,
+        // still-pinned address -- e.g. a delayed or duplicated cleanup call
+        // racing the operator's own reconfiguration back to the same
+        // address. `release` correctly refuses because the address is
+        // still operator-pinned, but that refusal must not be mistaken for
+        // "nothing owns this, safe to erase the legacy route".
+        registry
+            .release_configure_peer_stale_address(&peer, addr)
+            .await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            Some(peer.clone()),
+            "a fenced (pinned) release refusal must not retract the owner's route"
+        );
+        assert_eq!(
+            registry
+                .connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr, |_, v| v.clone()),
+            Some(peer),
+            "a fenced (pinned) release refusal must not delete ConnectionPool's routing entry"
         );
     }
 
