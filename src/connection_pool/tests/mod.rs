@@ -2235,7 +2235,7 @@ fn test_writer_vectored_sequence_header_payload() {
         // control word) can decode to an oversize `body_len` and be
         // rejected before this purely-plumbing ordering check ever runs.
         let header = bytes::Bytes::copy_from_slice(
-            &crate::framing::encode_control(crate::framing::WireKind::Gossip, payload.len())
+            &crate::framing::try_encode_control(crate::framing::WireKind::Gossip, payload.len())
                 .unwrap(),
         );
 
@@ -2603,9 +2603,11 @@ fn stream_direct_ask_throughput_bench() {
                     let payload_len = msg_len - crate::framing::DIRECT_ASK_HEADER_LEN;
                     let payload = &msg[crate::framing::DIRECT_ASK_HEADER_LEN
                         ..crate::framing::DIRECT_ASK_HEADER_LEN + payload_len];
-                    let header =
-                        crate::framing::write_direct_response_header(correlation_id, payload_len)
-                            .unwrap();
+                    let header = crate::framing::try_write_direct_response_header(
+                        correlation_id,
+                        payload_len,
+                    )
+                    .unwrap();
                     tokio::io::AsyncWriteExt::write_all(&mut server_io, &header)
                         .await
                         .unwrap();
@@ -2619,7 +2621,7 @@ fn stream_direct_ask_throughput_bench() {
                     let payload_len = msg_len - crate::framing::ACTOR_ASK_HEADER_LEN;
                     let payload = &msg[crate::framing::ACTOR_ASK_HEADER_LEN
                         ..crate::framing::ACTOR_ASK_HEADER_LEN + payload_len];
-                    let header = crate::framing::write_ask_response_header(
+                    let header = crate::framing::try_write_ask_response_header(
                         crate::MessageType::Response,
                         correlation_id,
                         payload_len,

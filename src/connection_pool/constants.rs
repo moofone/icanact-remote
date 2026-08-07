@@ -291,7 +291,7 @@ where
         "ResponseBatch must keep correlation_ids and payloads in sync"
     );
     if batch.payloads.len() == 1 {
-        let header = crate::framing::write_ask_response_header(
+        let header = crate::framing::try_write_ask_response_header(
             crate::MessageType::Response,
             batch.correlation_ids[0],
             batch.payloads[0].len(),
@@ -331,7 +331,7 @@ where
             let resp_idx = k / 2;
             let is_header = (k & 1) == 0;
             let slice_bytes: &[u8] = if is_header {
-                let header = crate::framing::write_ask_response_header(
+                let header = crate::framing::try_write_ask_response_header(
                     crate::MessageType::Response,
                     batch.correlation_ids[resp_idx],
                     batch.payloads[resp_idx].len(),
@@ -469,7 +469,7 @@ where
         "DirectResponseBatch must keep correlation_ids and payloads in sync"
     );
     if batch.payloads.len() == 1 {
-        let header = crate::framing::write_direct_response_header(
+        let header = crate::framing::try_write_direct_response_header(
             batch.correlation_ids[0],
             batch.payloads[0].len(),
         )?;
@@ -501,7 +501,7 @@ where
             let resp_idx = k / 2;
             let is_header = (k & 1) == 0;
             let slice_bytes: &[u8] = if is_header {
-                let header = crate::framing::write_direct_response_header(
+                let header = crate::framing::try_write_direct_response_header(
                     batch.correlation_ids[resp_idx],
                     batch.payloads[resp_idx].len(),
                 )?;

@@ -103,10 +103,9 @@ fn send_registry_message(
     let payload =
         rkyv::to_bytes::<rkyv::rancor::Error>(&message).expect("serialize registry message");
     let payload = Bytes::from_owner(payload);
-    let header = Bytes::copy_from_slice(
-        &icanact_remote::framing::write_gossip_frame_prefix(payload.len())
-            .expect("gossip header"),
-    );
+    let header = Bytes::copy_from_slice(&icanact_remote::framing::write_gossip_frame_prefix(
+        payload.len(),
+    ));
     sender
         .registry
         .connection_pool

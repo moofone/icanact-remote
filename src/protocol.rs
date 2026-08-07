@@ -1313,7 +1313,7 @@ pub(crate) async fn process_read_result(
             #[cfg(any(test, feature = "test-helpers", debug_assertions))]
             {
                 let header =
-                    crate::framing::write_direct_response_header(correlation_id, payload.len())?;
+                    crate::framing::try_write_direct_response_header(correlation_id, payload.len())?;
 
                 // Send DirectResponse using connection pool
                 let pool = &registry.connection_pool;

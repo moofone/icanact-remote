@@ -66,7 +66,7 @@ async fn send_pooled_via_stream_handle(
         let bytes = pooled_payload_into_bytes(prefix, payload);
         return stream_handle.stream_response_bytes(bytes, correlation_id).await;
     }
-    let header = framing::write_ask_response_header(
+    let header = framing::try_write_ask_response_header(
         crate::MessageType::Response,
         correlation_id,
         payload_len,
@@ -152,7 +152,7 @@ impl AskResponseSink {
         match self {
             Self::StreamHandle(stream_handle) => {
                 reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
-                let header = framing::write_ask_response_header(
+                let header = framing::try_write_ask_response_header(
                     crate::MessageType::Response,
                     correlation_id,
                     payload.len(),
@@ -168,7 +168,7 @@ impl AskResponseSink {
         match self {
             Self::StreamHandle(stream_handle) => {
                 reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
-                let header = framing::write_ask_response_header(
+                let header = framing::try_write_ask_response_header(
                     crate::MessageType::Response,
                     correlation_id,
                     payload.len(),
@@ -557,7 +557,7 @@ impl ResponseWriter {
     fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         let stream_handle = self.stream_handle()?;
         reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
@@ -568,7 +568,7 @@ impl ResponseWriter {
     fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         let stream_handle = self.stream_handle()?;
         reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),

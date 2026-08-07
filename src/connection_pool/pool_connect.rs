@@ -4180,7 +4180,7 @@ async fn answer_inbound_clock_probe(
         debug!(peer = %peer_addr, error = %e, "inline clock-echo response too large to frame");
         return;
     }
-    let header = match framing::write_gossip_frame_prefix(payload.len()) {
+    let header = match framing::try_write_gossip_frame_prefix(payload.len()) {
         Ok(header) => bytes::Bytes::copy_from_slice(&header),
         Err(e) => {
             debug!(peer = %peer_addr, error = %e, "clock-echo response too large to frame");
@@ -4772,7 +4772,7 @@ pub(crate) fn handle_incoming_message(
                             return Ok(());
                         }
                         let header = bytes::Bytes::copy_from_slice(
-                            &framing::write_gossip_frame_prefix(payload.len())?,
+                            &framing::try_write_gossip_frame_prefix(payload.len())?,
                         );
 
                         // Debug: Log what connections we have

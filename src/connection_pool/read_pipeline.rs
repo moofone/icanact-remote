@@ -1413,7 +1413,7 @@ where
                 bytes.len(),
                 max_message_size,
             )?;
-            let header = crate::framing::write_ask_response_header(
+            let header = crate::framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
                 bytes.len(),
@@ -1433,7 +1433,7 @@ where
                 bytes.len(),
                 max_message_size,
             )?;
-            let header = crate::framing::write_ask_response_header(
+            let header = crate::framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
                 bytes.len(),
@@ -1485,7 +1485,7 @@ where
                 actual_len,
                 max_message_size,
             )?;
-            let header = crate::framing::write_ask_response_header(
+            let header = crate::framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
                 actual_len,
