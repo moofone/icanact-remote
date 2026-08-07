@@ -419,9 +419,16 @@ impl<T> ConnectionHandle<T> {
                 correlation_id,
                 payload_len,
             )?;
+            // `header` was built from the caller-declared `payload_len`,
+            // not from `payload` itself -- the two can disagree (that
+            // disagreement is exactly the bug `write_buf_control_checked`
+            // guards against), so this must use the checked form, not the
+            // single-argument one that trusts `payload.remaining()` alone.
             let expected_len = header.len() + payload_len;
             let buf = bytes::Bytes::copy_from_slice(&header).chain(payload); // ALLOW_COPY
-            stream_handle.write_buf_control(buf, expected_len).await
+            stream_handle
+                .write_buf_control_checked(buf, expected_len)
+                .await
         } else {
             let bytes = payload.copy_to_bytes(payload.remaining());
             self.send_response_bytes(correlation_id, bytes).await

@@ -2641,13 +2641,19 @@ impl LockFreeStreamHandle {
     /// caller-facing variant (`write_bytes_control`/`write_bytes_ask`/
     /// `write_bytes_nonblocking`, and everything built on them), so its
     /// content cannot be assumed to be a single well-formed V5 frame -- it
-    /// can be a deliberate fragment of one (`write_chunked_nonblocking`) or
-    /// genuinely unframed opaque bytes. There is no control word to decode
-    /// out of it reliably, so it gets the one check that is still sound
-    /// regardless of content: a bare length ceiling against
-    /// `max_message_size`. That is also sufficient to close the specific
-    /// gap this exemption used to leave open -- a caller handing in a
-    /// complete, self-built V5 frame whose declared body exceeds
+    /// can be one complete frame, several concatenated (a caller pipelining
+    /// more than one send into a single write), a deliberate fragment of a
+    /// larger one (`write_chunked_nonblocking`), or genuinely unframed
+    /// opaque bytes. `reject_oversize_single` (below) decodes as many
+    /// complete frames off the front as the content will yield and checks
+    /// each one's *own* `body_len` against `max_message_size`, so several
+    /// individually-valid frames concatenated together are judged the way
+    /// separate writes would have been, not rejected for their aggregate
+    /// length. Whatever does not decode as a complete frame -- a
+    /// non-frame-shaped remainder, or the whole buffer if none of it looks
+    /// like a frame -- falls back to the bare length ceiling this variant
+    /// always used, which stays sound for content with no control word to
+    /// trust: a complete frame whose declared body exceeds
     /// `max_message_size` is, by construction, at least that many bytes
     /// long in total, so the ceiling catches it without needing to parse
     /// anything.
@@ -2688,23 +2694,7 @@ impl LockFreeStreamHandle {
             return Ok(());
         }
         if let WritePayload::Single(data) = payload {
-            // `max_message_size` bounds `body_len` (the bytes after the
-            // 4-byte length prefix), the same quantity every other
-            // variant's size gate above compares against -- not the total
-            // frame length. Treating `data` as if it were at least a bare
-            // control word keeps this consistent with those checks (a
-            // frame at exactly the boundary is accepted, not rejected one
-            // header short of it) and degrades safely for genuinely
-            // unframed content shorter than 4 bytes (`saturating_sub`
-            // yields 0, so it can never exceed the limit here).
-            let body_len = data.len().saturating_sub(framing::LENGTH_PREFIX_LEN);
-            if body_len > self.max_message_size {
-                return Err(GossipError::MessageTooLarge {
-                    size: body_len,
-                    max: self.max_message_size,
-                });
-            }
-            return Ok(());
+            return self.reject_oversize_single(data);
         }
 
         // Every other variant: pair the header bytes the write loop will
@@ -2804,6 +2794,66 @@ impl LockFreeStreamHandle {
                 size: control.body_len,
                 max: self.max_message_size,
             });
+        }
+        Ok(())
+    }
+
+    /// Size gate for `WritePayload::Single` -- see the note on it above.
+    /// `data` may be one complete V5 frame, several concatenated, a
+    /// deliberate fragment of a larger write (`write_chunked_nonblocking`),
+    /// or opaque bytes with no framing at all, so this walks the buffer
+    /// decoding as many complete frames off the front as it will yield
+    /// instead of assuming any one interpretation.
+    ///
+    /// Each successfully decoded frame is checked against
+    /// `max_message_size` on its own `body_len`, not the buffer's
+    /// aggregate length -- two valid 100-byte frames concatenated into one
+    /// 208-byte `Single` are exactly as acceptable as two separate writes
+    /// of them would have been, even though 208 alone would fail a
+    /// whole-buffer ceiling. The walk stops the moment a control word
+    /// fails to decode, or a decoded frame claims more bytes than remain,
+    /// since at that point the remaining bytes are no longer reliably
+    /// frame-shaped. Whatever is left when the walk stops -- a
+    /// non-frame-shaped remainder, or the entire buffer if it never
+    /// decoded as a frame at all -- gets the bare length ceiling this
+    /// variant always used: still sound for content with no control word
+    /// to trust, since a complete frame whose declared body exceeds
+    /// `max_message_size` is, by construction, at least that many bytes
+    /// long in total.
+    ///
+    /// `offset` strictly increases by at least `LENGTH_PREFIX_LEN` each
+    /// iteration (every decoded frame is at least that many bytes), so
+    /// this terminates in at most `data.len() / LENGTH_PREFIX_LEN`
+    /// iterations -- no adversarially-crafted content can loop it.
+    fn reject_oversize_single(&self, data: &[u8]) -> Result<()> {
+        let mut offset = 0usize;
+        while data.len() - offset >= framing::LENGTH_PREFIX_LEN {
+            let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
+            control_word.copy_from_slice(&data[offset..offset + framing::LENGTH_PREFIX_LEN]);
+            let Some(control) = framing::decode_control(control_word) else {
+                break;
+            };
+            let frame_total = framing::LENGTH_PREFIX_LEN + control.body_len;
+            if data.len() - offset < frame_total {
+                break;
+            }
+            if control.body_len > self.max_message_size {
+                return Err(GossipError::MessageTooLarge {
+                    size: control.body_len,
+                    max: self.max_message_size,
+                });
+            }
+            offset += frame_total;
+        }
+        let remainder = data.len() - offset;
+        if remainder > 0 {
+            let body_len = remainder.saturating_sub(framing::LENGTH_PREFIX_LEN);
+            if body_len > self.max_message_size {
+                return Err(GossipError::MessageTooLarge {
+                    size: body_len,
+                    max: self.max_message_size,
+                });
+            }
         }
         Ok(())
     }
@@ -3264,15 +3314,37 @@ impl LockFreeStreamHandle {
         .await
     }
 
-    /// `expected_len` is the exact byte count the caller declared `buf`
-    /// would produce (see `WritePayload::Buf`). `reject_oversize_write_payload`
-    /// rejects the write outright if `buf.remaining()` disagrees with it --
-    /// a mismatch here means the header this `buf` was chained onto was
-    /// built from a different length than the payload it is actually
-    /// carrying, which would otherwise write bytes past (or short of) the
-    /// frame the header declares and desync the peer's parser, not just
-    /// send an oversize-but-well-formed frame.
-    pub async fn write_buf_control<B>(&self, buf: B, expected_len: usize) -> Result<()>
+    /// Send a generic `Buf` payload, deriving the declared length from
+    /// `buf.remaining()` itself. A single-argument call site cannot express
+    /// the mismatch `reject_oversize_write_payload` guards against: that
+    /// check exists because a header can be built from one length while a
+    /// *separately supplied* `buf` carries a different one, and here there
+    /// is no second, independent length to disagree with `buf` in the
+    /// first place -- `remaining()` *is* the declared length. This is a
+    /// genuinely safe call shape, not a validation-skipping stub. For a
+    /// caller that builds a header from a length declared independently of
+    /// `buf` (see `WritePayload::Buf`), use `write_buf_control_checked`
+    /// instead, which validates the two against each other.
+    pub async fn write_buf_control<B>(&self, buf: B) -> Result<()>
+    where
+        B: Buf + Send + 'static,
+    {
+        let expected_len = buf.remaining();
+        self.enqueue_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
+    }
+
+    /// Checked sibling of `write_buf_control` for a caller that builds its
+    /// header from an `expected_len` declared independently of `buf` (see
+    /// `WritePayload::Buf`). `reject_oversize_write_payload` rejects the
+    /// write outright if `buf.remaining()` disagrees with it -- a mismatch
+    /// here means the header this `buf` was chained onto promises a
+    /// different body than what is actually being written, desyncing the
+    /// peer's parser, not just sending an oversize-but-well-formed frame.
+    pub async fn write_buf_control_checked<B>(&self, buf: B, expected_len: usize) -> Result<()>
     where
         B: Buf + Send + 'static,
     {
@@ -3283,8 +3355,21 @@ impl LockFreeStreamHandle {
         .await
     }
 
-    /// See `write_buf_control`'s `expected_len` doc.
-    pub async fn write_buf_ask<B>(&self, buf: B, expected_len: usize) -> Result<()>
+    /// See `write_buf_control` above.
+    pub async fn write_buf_ask<B>(&self, buf: B) -> Result<()>
+    where
+        B: Buf + Send + 'static,
+    {
+        let expected_len = buf.remaining();
+        self.enqueue_ask_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
+    }
+
+    /// See `write_buf_control_checked` above.
+    pub async fn write_buf_ask_checked<B>(&self, buf: B, expected_len: usize) -> Result<()>
     where
         B: Buf + Send + 'static,
     {
@@ -4636,6 +4721,275 @@ mod write_payload_size_gate_tests {
             .expect("connection must deliver the frame to the peer");
         assert_eq!(received, expected);
 
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 6: two individually-valid frames concatenated
+    /// into one `Single` write must not be rejected just because their
+    /// *aggregate* length exceeds `max_message_size` -- that bound applies
+    /// per frame, the same way it would if these had been two separate
+    /// `write_bytes_nonblocking` calls. This is the shape that distinguishes
+    /// a whole-buffer length ceiling (over-rejects this) from a per-frame
+    /// walk (accepts it): each frame here is exactly at the 64-byte limit
+    /// on its own, but the concatenated buffer is 136 bytes -- comfortably
+    /// past `max_message_size + LENGTH_PREFIX_LEN` (68).
+    #[tokio::test]
+    async fn write_bytes_nonblocking_accepts_two_valid_frames_whose_aggregate_exceeds_max_message_size()
+     {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9955".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9955, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN;
+        let make_frame = |fill: u8| {
+            let payload = vec![fill; payload_len];
+            let header = crate::framing::write_gossip_frame_prefix(payload.len());
+            let mut frame = Vec::with_capacity(header.len() + payload.len());
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&payload);
+            frame
+        };
+        let frame_a = make_frame(1);
+        let frame_b = make_frame(2);
+        assert_eq!(
+            crate::framing::decode_control(frame_a[..4].try_into().unwrap())
+                .unwrap()
+                .body_len,
+            max_message_size,
+            "test setup: each frame's own body must sit exactly at the limit"
+        );
+
+        let mut both = Vec::with_capacity(frame_a.len() + frame_b.len());
+        both.extend_from_slice(&frame_a);
+        both.extend_from_slice(&frame_b);
+        assert!(
+            both.len() > max_message_size + crate::framing::LENGTH_PREFIX_LEN,
+            "test setup: the concatenated buffer must exceed a whole-buffer ceiling"
+        );
+        let expected = both.clone();
+
+        writer
+            .write_bytes_nonblocking(bytes::Bytes::from(both))
+            .expect(
+                "two frames each within max_message_size must be accepted, even though \
+                 their concatenated length is not",
+            );
+
+        let mut received = vec![0u8; expected.len()];
+        AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver both frames to the peer");
+        assert_eq!(received, expected);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The per-frame walk must still catch a genuinely oversize frame when
+    /// it is not alone in the buffer -- proving round 6's fix widens what
+    /// is *accepted*, not what is *checked*. A valid frame followed by one
+    /// whose own declared body exceeds `max_message_size` must still be
+    /// refused, exactly as it would if the oversize frame had been sent by
+    /// itself.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_an_oversize_frame_following_a_valid_one() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9956".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9956, max_message_size)),
+        );
+
+        let valid_payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN;
+        let valid_header = crate::framing::write_gossip_frame_prefix(valid_payload_len);
+        let mut valid_frame = Vec::with_capacity(valid_header.len() + valid_payload_len);
+        valid_frame.extend_from_slice(&valid_header);
+        valid_frame.extend_from_slice(&vec![1u8; valid_payload_len]);
+
+        let oversize_payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let oversize_header = crate::framing::write_gossip_frame_prefix(oversize_payload_len);
+        let mut oversize_frame = Vec::with_capacity(oversize_header.len() + oversize_payload_len);
+        oversize_frame.extend_from_slice(&oversize_header);
+        oversize_frame.extend_from_slice(&vec![2u8; oversize_payload_len]);
+
+        let mut both = Vec::with_capacity(valid_frame.len() + oversize_frame.len());
+        both.extend_from_slice(&valid_frame);
+        both.extend_from_slice(&oversize_frame);
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from(both))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Content that never decodes as a complete V5 frame at all (the
+    /// `write_chunked_nonblocking` fragment case, or genuinely unframed
+    /// opaque bytes) must still fall back to the bare length ceiling --
+    /// round 6's per-frame walk must not accidentally exempt non-frame
+    /// content from size checking entirely.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_oversize_unframed_bytes() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9957".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9957, max_message_size)),
+        );
+
+        // The leading 4 bytes here are not a valid control word (kind bits
+        // 31 has no `WireKind` mapping), so this can never decode as a
+        // frame -- it must be judged by the bare length ceiling on the
+        // whole buffer, like any other opaque blob.
+        let mut opaque = vec![0xFFu8; max_message_size + 32];
+        opaque[0] = 0xFF;
+        assert!(
+            crate::framing::decode_control(opaque[..4].try_into().unwrap()).is_none(),
+            "test setup: the leading bytes must not decode as a valid control word"
+        );
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from(opaque))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 6: `write_buf_control`/`write_buf_ask` regained a
+/// single-argument form (see the doc comment on `write_buf_control` above)
+/// after round 2 had made both two-argument-only, breaking every
+/// single-argument caller's build. These tests exercise that restored
+/// one-argument call shape directly -- nothing else in this crate calls
+/// `write_buf_control`/`write_buf_ask` without the second argument, so
+/// without a test here the arity fix would have no coverage at all.
+#[cfg(test)]
+mod write_buf_control_single_arg_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    fn make_writer(port: u16, max_message_size: usize) -> (LockFreeStreamHandle, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(port, max_message_size)),
+        );
+        (writer, task)
+    }
+
+    /// The one-argument form must derive `expected_len` from `buf.remaining()`
+    /// and still enforce `max_message_size` against it -- proving this is a
+    /// real validating call shape, not a stub that happens to compile.
+    #[tokio::test]
+    async fn write_buf_control_single_arg_rejects_a_buf_over_max_message_size() {
+        let (writer, task) = make_writer(9958, 64);
+        // `body_len` is derived as `buf.remaining() - LENGTH_PREFIX_LEN`
+        // (consistent with every other variant's size gate, which bounds
+        // the post-control-word body, not the raw total) -- 69 remaining
+        // bytes yields body_len 65, one past the 64-byte limit.
+        let buf = bytes::Bytes::from(vec![0u8; 69]);
+        let err = writer.write_buf_control(buf).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { size: 65, max: 64 }),
+            "expected MessageTooLarge{{size: 65, max: 64}} (69 bytes minus the \
+             4-byte length-prefix allowance), got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The one-argument form must still deliver a `buf` within
+    /// `max_message_size` -- the arity restoration must not have turned it
+    /// into an unconditional rejection either.
+    #[tokio::test]
+    async fn write_buf_control_single_arg_accepts_a_buf_within_max_message_size() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9959".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9959, 64)),
+        );
+        let data = vec![9u8; 60];
+        let buf = bytes::Bytes::from(data.clone());
+        writer
+            .write_buf_control(buf)
+            .await
+            .expect("a buf within max_message_size must be accepted");
+
+        let mut received = vec![0u8; data.len()];
+        AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver the buf to the peer");
+        assert_eq!(received, data);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Parity check for the ask-lane sibling: same call shape, same
+    /// derivation, same enforcement.
+    #[tokio::test]
+    async fn write_buf_ask_single_arg_rejects_a_buf_over_max_message_size() {
+        let (writer, task) = make_writer(9960, 64);
+        let buf = bytes::Bytes::from(vec![0u8; 69]);
+        let err = writer.write_buf_ask(buf).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { size: 65, max: 64 }),
+            "expected MessageTooLarge{{size: 65, max: 64}}, got {err:?}"
+        );
         writer.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
