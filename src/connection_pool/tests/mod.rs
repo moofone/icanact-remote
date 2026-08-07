@@ -2219,8 +2219,17 @@ fn test_writer_vectored_sequence_header_payload() {
 
         let first = bytes::Bytes::from_static(b"first");
         let second = bytes::Bytes::from_static(b"second");
-        let header = bytes::Bytes::from_static(b"HEAD");
         let payload = bytes::Bytes::from_static(b"PAYLOAD");
+        // A real V5 control word declaring `payload`'s exact length: the
+        // gate in `enqueue_write_nonblocking` decodes `body_len` from the
+        // header's first four bytes on every `HeaderPayload` write, so an
+        // arbitrary 4-byte placeholder here (as opposed to a genuine
+        // control word) can decode to an oversize `body_len` and be
+        // rejected before this purely-plumbing ordering check ever runs.
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::encode_control(crate::framing::WireKind::Gossip, payload.len())
+                .unwrap(),
+        );
 
         stream_handle
             .write_bytes_nonblocking(first.clone())
