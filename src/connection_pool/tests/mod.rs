@@ -1316,23 +1316,27 @@ fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission(
         .expect("overflow is retained in the deferred response slot");
 }
 
-/// `try_write_ask_backpressure_nack` (the bounded NACK write
-/// `queue_streaming_response_bytes_or_nack`/`_pooled_or_nack` fall back to on
-/// admission backpressure) must produce exactly the frame a peer decodes as
+/// `write_ask_nack_header_bounded` (the bounded single-attempt write
+/// `drain_pending_ask_nacks` uses to flush `LocalStreamingQueue`'s queued
+/// backpressure NACKs) must produce exactly the frame a peer decodes as
 /// `AskNackReason::Backpressure` for the right correlation id, against a
 /// real, healthy transport.
 #[test]
-fn try_write_ask_backpressure_nack_writes_a_decodable_nack_on_a_healthy_stream() {
+fn write_ask_nack_header_bounded_writes_a_decodable_nack_on_a_healthy_stream() {
     run_multi_thread_test(async {
         let (mut server_half, mut client_half) = tokio::io::duplex(4096);
         let bytes_written_counter = Arc::new(AtomicUsize::new(0));
         let mut bytes_since_flush = 0usize;
+        let header = crate::framing::write_ask_nack_header(
+            0x2468_ACE0,
+            crate::framing::AskNackReason::Backpressure,
+        );
 
-        let wrote = try_write_ask_backpressure_nack(
+        let wrote = write_ask_nack_header_bounded(
             &mut server_half,
             &bytes_written_counter,
             &mut bytes_since_flush,
-            0x2468_ACE0,
+            header,
         )
         .await
         .expect("a healthy transport must not error writing a 16-byte NACK");
@@ -1341,25 +1345,28 @@ fn try_write_ask_backpressure_nack_writes_a_decodable_nack_on_a_healthy_stream()
             "a healthy transport must complete the NACK write in one attempt"
         );
 
-        let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
-        tokio::io::AsyncReadExt::read_exact(&mut client_half, &mut header)
+        let mut received = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        tokio::io::AsyncReadExt::read_exact(&mut client_half, &mut received)
             .await
             .expect("the peer must receive the full NACK header");
 
-        let control = crate::framing::decode_control(header[..4].try_into().unwrap())
+        let control = crate::framing::decode_control(received[..4].try_into().unwrap())
             .expect("a NACK header must decode as a valid control word");
         assert_eq!(control.kind, crate::framing::WireKind::Response);
         assert_eq!(
-            u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            u32::from_be_bytes(received[4..8].try_into().unwrap()),
             0x2468_ACE0,
             "the NACK must carry the ask's own correlation id"
         );
         assert_eq!(
-            crate::framing::ask_nack_reason(&header[4..]),
+            crate::framing::ask_nack_reason(&received[4..]),
             Some(crate::framing::AskNackReason::Backpressure)
         );
-        assert_eq!(bytes_written_counter.load(Ordering::Acquire), header.len());
-        assert_eq!(bytes_since_flush, header.len());
+        assert_eq!(
+            bytes_written_counter.load(Ordering::Acquire),
+            received.len()
+        );
+        assert_eq!(bytes_since_flush, received.len());
 
         drop(server_half);
         drop(client_half);
@@ -1381,6 +1388,13 @@ fn try_write_ask_backpressure_nack_writes_a_decodable_nack_on_a_healthy_stream()
 /// the deferred slot. Then call the `_or_nack` wrapper directly with a third
 /// response as if a handler had already produced it -- this isolates the
 /// post-handler path in isolation, with no `io_task` read loop involved.
+///
+/// `queue_streaming_response_bytes_or_nack` only *queues* the NACK
+/// (`LocalStreamingQueue::queue_ask_nack`) rather than writing it, since it
+/// has no way to know whether a partial streaming frame owns the wire right
+/// now -- only `io_task` knows that. This asserts the queuing directly, then
+/// drains it (`drain_pending_ask_nacks`, the same function `io_task` calls
+/// once it has proven the wire free) to confirm the eventual wire content.
 #[test]
 fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_response() {
     run_multi_thread_test(async {
@@ -1404,26 +1418,38 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
         )
         .expect("the second response fills the deferred slot");
 
-        let (mut server_half, mut client_half) = tokio::io::duplex(4096);
-        let bytes_written_counter = Arc::new(AtomicUsize::new(0));
-        let mut bytes_since_flush = 0usize;
         let correlation_id = 3u32;
-
+        assert_eq!(queue.pending_ask_nack_count(), 0);
         queue_streaming_response_bytes_or_nack(
-            &mut server_half,
-            &bytes_written_counter,
-            &mut bytes_since_flush,
             &mut queue,
             correlation_id,
             bytes::Bytes::from(vec![0x33u8; STREAMING_THRESHOLD + 4096]),
             MASTER_BUFFER_SIZE,
             None,
         )
-        .await
         .expect(
-            "admission backpressure must be answered with a NACK, not propagated as an error \
-             that tears down the read loop's current batch",
+            "admission backpressure must queue a NACK, not propagate an error that tears down \
+             the read loop's current batch",
         );
+        assert_eq!(
+            queue.pending_ask_nack_count(),
+            1,
+            "the dropped response's NACK must be queued, not written inline -- this function \
+             cannot know whether a partial streaming frame currently owns the wire"
+        );
+
+        let (mut server_half, mut client_half) = tokio::io::duplex(4096);
+        let bytes_written_counter = Arc::new(AtomicUsize::new(0));
+        let mut bytes_since_flush = 0usize;
+        drain_pending_ask_nacks(
+            &mut server_half,
+            &bytes_written_counter,
+            &mut bytes_since_flush,
+            &mut queue,
+        )
+        .await
+        .expect("draining a queued NACK against a healthy transport must not error");
+        assert_eq!(queue.pending_ask_nack_count(), 0);
 
         let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
         tokio::io::AsyncReadExt::read_exact(&mut client_half, &mut header)
@@ -1443,6 +1469,21 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
         drop(client_half);
     });
 }
+
+// The genuinely-mid-frame "a queued NACK must never splice into a partially
+// written streaming frame" property needs reads to keep flowing while a
+// write is stuck -- otherwise the second/third ask that would trigger the
+// NACK never even gets read off the wire while the first is stalled (this
+// branch, standing alone, still gates all reads behind
+// `local_streaming_queue.is_full()`, the exact behavior
+// `fix/bidirectional-streaming-deadlock` (#186) removes). That end-to-end
+// proof lives there, stacked on this branch, where it holds; see
+// `ask_backpressure_nack_never_splices_into_an_in_flight_streaming_frame`.
+// `write_ask_nack_header_bounded_writes_a_decodable_nack_on_a_healthy_stream`
+// and `streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_response`
+// above already cover the structural piece this branch owns: a NACK is
+// queued, never written inline, by any caller that cannot itself know
+// whether the wire is free.
 
 #[test]
 fn immediate_bytes_response_admission_stays_lazy_for_many_frames() {

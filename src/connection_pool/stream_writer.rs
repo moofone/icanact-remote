@@ -87,10 +87,10 @@ const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
 /// stalls -- the backstop for a peer that is truly gone, not merely slow.
 const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
 
-/// Write an ask-backpressure NACK header without risking parking the
+/// Write one already-built ask-NACK header without risking parking the
 /// caller's read loop on a peer that has stopped draining.
 /// `write_ask_nack_direct` (this file's sibling `read_pipeline.rs`) is the
-/// right shape for the header itself -- reused here via
+/// right shape for the header itself -- built the same way via
 /// `write_ask_nack_header` -- but it writes with a plain `write_all`, which
 /// loops over as many `poll_write` calls as it takes and is therefore unsafe
 /// to cancel: a timeout firing between two of those internal polls would
@@ -108,25 +108,28 @@ const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
 /// elapses with zero further progress, at which point the caller tears the
 /// connection down rather than leaving it wedged mid-frame forever.
 ///
+/// Does **not** decide *when* it is safe to call: that is
+/// `drain_pending_ask_nacks`'s job (only ever called while
+/// `pending_stream_cmd.is_none()`, so no partial streaming frame owns the
+/// wire). Writing here unconditionally would let this NACK's bytes splice
+/// into an in-progress frame's payload and desynchronize every frame after
+/// it -- the same class of bug #183 fixed for `WritePayload::Buf`.
+///
 /// Returns `Ok(true)` if the NACK was written, `Ok(false)` if it was
 /// abandoned cleanly before committing any bytes (the caller should keep
 /// reading either way -- an ask NACK is best-effort, not a delivery
 /// guarantee), or `Err` on a real write error or a stuck mid-frame write
 /// (the caller should tear the connection down, same as any other write
 /// failure in this file).
-async fn try_write_ask_backpressure_nack<S>(
+async fn write_ask_nack_header_bounded<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
-    correlation_id: u32,
+    header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
 ) -> std::io::Result<bool>
 where
     S: AsyncWrite + Unpin,
 {
-    let header = crate::framing::write_ask_nack_header(
-        correlation_id,
-        crate::framing::AskNackReason::Backpressure,
-    );
     let mut offset = 0usize;
     let mut stuck_since: Option<Instant> = None;
     loop {
@@ -160,6 +163,41 @@ where
             }
         }
     }
+}
+
+/// Drain `LocalStreamingQueue`'s queued backpressure NACKs onto the wire.
+/// **Callers must only invoke this while `pending_stream_cmd.is_none()`** --
+/// see `write_ask_nack_header_bounded` and `LocalStreamingQueue::queue_ask_nack`
+/// for why writing during a partial frame would corrupt it. Bounded to a
+/// small burst per call (`MAX_PER_TURN`) so a backlog of queued NACKs cannot
+/// starve the read loop's return to reading; the rest wait for a later call.
+/// Stops (without error) at the first attempt that makes zero progress --
+/// likely the socket itself has no room right now, so further attempts this
+/// turn would just burn through more `STREAM_WRITE_SLICE_TIMEOUT` waits for
+/// the same result. That specific queued NACK is lost (best-effort, not a
+/// delivery guarantee, per `queue_ask_nack`); the rest stay queued for next
+/// time.
+async fn drain_pending_ask_nacks<S>(
+    stream: &mut S,
+    bytes_written_counter: &Arc<AtomicUsize>,
+    bytes_since_flush: &mut usize,
+    local_streaming_queue: &mut LocalStreamingQueue,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    const MAX_PER_TURN: usize = 8;
+    for _ in 0..MAX_PER_TURN {
+        let Some(header) = local_streaming_queue.pop_ask_nack() else {
+            return Ok(());
+        };
+        if !write_ask_nack_header_bounded(stream, bytes_written_counter, bytes_since_flush, header)
+            .await?
+        {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
@@ -1313,6 +1351,24 @@ impl LockFreeStreamHandle {
             // still run below, but no normal/response write can interleave and
             // corrupt the frame boundary.
             if pending_stream_cmd.is_none() {
+                // Queued backpressure NACKs (see `LocalStreamingQueue::queue_ask_nack`)
+                // are only ever safe to write here, now that the wire is
+                // proven free of a partial frame.
+                if let Err(e) = drain_pending_ask_nacks(
+                    &mut stream,
+                    &bytes_written_counter,
+                    &mut bytes_since_flush,
+                    &mut local_streaming_queue,
+                )
+                .await
+                {
+                    warn!(
+                        peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                        error = %e,
+                        "Failed to drain queued ask backpressure NACKs"
+                    );
+                    return;
+                }
                 // ACTOR_REM_2 R8: service the normal write queue when no partial
                 // stream frame is outstanding. The batch remains bounded during
                 // active streaming so control traffic is not starved.

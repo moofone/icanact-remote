@@ -262,7 +262,28 @@ struct LocalStreamingQueue {
     /// `pop_front` promotes this batch.
     deferred: Option<Vec<StreamingCommand>>,
     deferred_bytes: usize,
+    /// Backpressure NACKs owed to the peer, queued here instead of written
+    /// directly. The caller that decides to NACK (deep inside
+    /// `write_ask_disposition_io`, or the pre-dispatch gate in
+    /// `stream_writer.rs::io_task`) cannot know whether a partial streaming
+    /// frame currently owns the wire -- `io_task` is the only place that
+    /// does. Writing there instead of here would risk splicing the NACK's
+    /// bytes into an in-progress frame's payload and desynchronizing every
+    /// frame after it (the same class of bug #183 fixed for
+    /// `WritePayload::Buf`). `io_task` drains this queue only once
+    /// `pending_stream_cmd.is_none()` proves the wire is free. See
+    /// `queue_ask_nack`.
+    pending_ask_nacks:
+        std::collections::VecDeque<[u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]>,
 }
+
+/// Cap on queued-but-not-yet-written backpressure NACKs. Each entry is a
+/// fixed 16-byte header with no payload -- unlike a streaming response, it
+/// never contributes to `retained_bytes`/admission accounting -- so this
+/// bounds a small, fixed footprint (at most `PENDING_ASK_NACK_CAP * 16`
+/// bytes) regardless of how many asks arrive while a streaming frame owns
+/// the wire.
+const PENDING_ASK_NACK_CAP: usize = 64;
 
 /// Keep the local response queue within the normal response-batch cap while
 /// allowing one protocol-sized stream to be retained behind an in-flight
@@ -304,7 +325,35 @@ impl LocalStreamingQueue {
             deferred: None,
             deferred_bytes: 0,
             wire_blocked: false,
+            pending_ask_nacks: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Queue a backpressure NACK header for the peer. Always succeeds --
+    /// never blocks, never fails, never consults `is_full`/admission at
+    /// all, since a fixed 16-byte header cannot meaningfully threaten the
+    /// retention bound those exist to enforce. Under sustained load once
+    /// `PENDING_ASK_NACK_CAP` is reached, the oldest not-yet-written NACK is
+    /// dropped in favor of the newest: best-effort delivery, not a
+    /// guarantee, and no worse than the timeout the peer would otherwise
+    /// see either way.
+    fn queue_ask_nack(&mut self, header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]) {
+        if self.pending_ask_nacks.len() >= PENDING_ASK_NACK_CAP {
+            self.pending_ask_nacks.pop_front();
+        }
+        self.pending_ask_nacks.push_back(header);
+    }
+
+    /// Pop the oldest queued NACK header for `io_task` to attempt writing.
+    /// Callers must only do so when `pending_stream_cmd.is_none()`; see
+    /// `queue_ask_nack`.
+    fn pop_ask_nack(&mut self) -> Option<[u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]> {
+        self.pending_ask_nacks.pop_front()
+    }
+
+    #[cfg(test)]
+    fn pending_ask_nack_count(&self) -> usize {
+        self.pending_ask_nacks.len()
     }
 
     fn pop_front(&mut self) -> Option<StreamingCommand> {

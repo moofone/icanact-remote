@@ -1685,16 +1685,12 @@ where
                     payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
                 if should_stream {
                     queue_streaming_response_bytes_or_nack(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
                         streaming_responses,
                         correlation_id,
                         payload,
                         ctx.max_message_size,
                         schema_hash,
-                    )
-                    .await?;
+                    )?;
                     *wrote_response_bytes = true;
                 } else {
                     response_batch.push_bytes(correlation_id, payload);
@@ -1706,16 +1702,12 @@ where
                 let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
                 if should_stream {
                     queue_streaming_response_bytes_or_nack(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
                         streaming_responses,
                         correlation_id,
                         payload.into_bytes(),
                         ctx.max_message_size,
                         schema_hash,
-                    )
-                    .await?;
+                    )?;
                     *wrote_response_bytes = true;
                 } else {
                     response_batch.push_bytes(correlation_id, payload.into_bytes());
@@ -1737,9 +1729,6 @@ where
                     } = other
                     {
                         queue_streaming_response_pooled_or_nack(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
                             streaming_responses,
                             correlation_id,
                             payload,
@@ -1747,8 +1736,7 @@ where
                             payload_len,
                             ctx.max_message_size,
                             schema_hash,
-                        )
-                        .await?;
+                        )?;
                     } else {
                         let bytes = match other {
                             crate::registry::ActorResponse::Bytes(b) => b,
@@ -1756,16 +1744,12 @@ where
                             crate::registry::ActorResponse::Pooled { .. } => unreachable!(),
                         };
                         queue_streaming_response_bytes_or_nack(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
                             streaming_responses,
                             correlation_id,
                             bytes,
                             ctx.max_message_size,
                             schema_hash,
-                        )
-                        .await?;
+                        )?;
                     }
                     *wrote_response_bytes = true;
                 } else {
@@ -1779,9 +1763,6 @@ where
                             unreachable!("only pooled responses reach the direct branch")
                         };
                         queue_streaming_response_pooled_or_nack(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
                             streaming_responses,
                             correlation_id,
                             payload,
@@ -1789,8 +1770,7 @@ where
                             payload_len,
                             ctx.max_message_size,
                             schema_hash,
-                        )
-                        .await?;
+                        )?;
                     } else {
                         write_actor_response_direct(
                             stream,
@@ -1814,16 +1794,12 @@ where
                 payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
             if should_stream {
                 queue_streaming_response_bytes_or_nack(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
                     streaming_responses,
                     correlation_id,
                     payload,
                     ctx.max_message_size,
                     schema_hash,
-                )
-                .await?;
+                )?;
                 *wrote_response_bytes = true;
             } else {
                 response_batch.push_bytes(correlation_id, payload);
@@ -1835,16 +1811,12 @@ where
             let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
             if should_stream {
                 queue_streaming_response_bytes_or_nack(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
                     streaming_responses,
                     correlation_id,
                     payload.into_bytes(),
                     ctx.max_message_size,
                     schema_hash,
-                )
-                .await?;
+                )?;
                 *wrote_response_bytes = true;
             } else {
                 response_batch.push_bytes(correlation_id, payload.into_bytes());
@@ -1860,9 +1832,6 @@ where
                 payload_len > inline_payload_limit || payload_len > STREAMING_THRESHOLD;
             if should_stream {
                 queue_streaming_response_pooled_or_nack(
-                    stream,
-                    bytes_written_counter,
-                    bytes_since_flush,
                     streaming_responses,
                     correlation_id,
                     payload,
@@ -1870,15 +1839,11 @@ where
                     payload_len,
                     ctx.max_message_size,
                     schema_hash,
-                )
-                .await?;
+                )?;
                 *wrote_response_bytes = true;
             } else {
                 if streaming_responses.wire_blocked() {
                     queue_streaming_response_pooled_or_nack(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
                         streaming_responses,
                         correlation_id,
                         payload,
@@ -1886,8 +1851,7 @@ where
                         payload_len,
                         ctx.max_message_size,
                         schema_hash,
-                    )
-                    .await?;
+                    )?;
                 } else {
                     write_actor_response_direct(
                         stream,
@@ -2061,25 +2025,22 @@ fn queue_streaming_response_pooled(
 /// specifically (`is_streaming_admission_backpressure`) answers the ask with
 /// an `AskNackReason::Backpressure` NACK instead of losing the already
 /// computed response and letting the error propagate out of the read loop.
-/// `try_write_ask_backpressure_nack` is a bounded write (see its own doc
-/// comment for why a plain `write_ask_nack_direct` call is not safe here),
-/// so a wedged connection abandons the NACK cleanly rather than parking.
-/// Every other error -- a genuinely oversized response, a config error, a
-/// real write failure -- is returned unchanged: only admission backpressure
-/// has a safe NACK to fall back to.
-async fn queue_streaming_response_bytes_or_nack<S>(
-    stream: &mut S,
-    bytes_written_counter: &Arc<AtomicUsize>,
-    bytes_since_flush: &mut usize,
+///
+/// Queues the NACK (`LocalStreamingQueue::queue_ask_nack`) rather than
+/// writing it here: this function has no way to know whether a partial
+/// streaming frame currently owns the wire, and writing directly regardless
+/// would risk splicing the NACK's bytes into that frame's payload,
+/// desynchronizing every frame after it. `io_task` drains the queue only
+/// once it has proven the wire free of a partial frame. Every other error --
+/// a genuinely oversized response, a config error -- is returned unchanged:
+/// only admission backpressure has a safe NACK to fall back to.
+fn queue_streaming_response_bytes_or_nack(
     streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
     payload: bytes::Bytes,
     max_message_size: usize,
     schema_hash: Option<u64>,
-) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
+) -> Result<()> {
     match queue_streaming_response_bytes(
         streaming_responses,
         correlation_id,
@@ -2089,13 +2050,10 @@ where
     ) {
         Ok(()) => Ok(()),
         Err(e) if is_streaming_admission_backpressure(&e) => {
-            try_write_ask_backpressure_nack(
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
+            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
-            )
-            .await?;
+                crate::framing::AskNackReason::Backpressure,
+            ));
             Ok(())
         }
         Err(e) => Err(e),
@@ -2103,10 +2061,7 @@ where
 }
 
 /// Pooled-payload counterpart of `queue_streaming_response_bytes_or_nack`.
-async fn queue_streaming_response_pooled_or_nack<S>(
-    stream: &mut S,
-    bytes_written_counter: &Arc<AtomicUsize>,
-    bytes_since_flush: &mut usize,
+fn queue_streaming_response_pooled_or_nack(
     streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
     payload: crate::typed::PooledPayload,
@@ -2114,10 +2069,7 @@ async fn queue_streaming_response_pooled_or_nack<S>(
     payload_len: usize,
     max_message_size: usize,
     schema_hash: Option<u64>,
-) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
+) -> Result<()> {
     match queue_streaming_response_pooled(
         streaming_responses,
         correlation_id,
@@ -2129,13 +2081,10 @@ where
     ) {
         Ok(()) => Ok(()),
         Err(e) if is_streaming_admission_backpressure(&e) => {
-            try_write_ask_backpressure_nack(
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
+            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
-            )
-            .await?;
+                crate::framing::AskNackReason::Backpressure,
+            ));
             Ok(())
         }
         Err(e) => Err(e),
