@@ -5149,13 +5149,28 @@ mod write_chunked_nonblocking_tests {
     /// deterministically reproducing "a later chunk fails after earlier
     /// chunks were already enqueued" without racing a real queue-full
     /// condition.
+    ///
+    /// PR #183 review, round 8: `queue_notify_hook` is process-global and
+    /// fires for *every* queue's push, not just this connection's -- under
+    /// default (parallel) test execution, this test's two siblings in this
+    /// same module also call `write_chunked_nonblocking`, and their pushes
+    /// used to fire this test's hook too, corrupting `successful_pushes`
+    /// and making the `n == 1` trigger race. Two changes close that: this
+    /// connection's own address (`9963`, distinct from every other test in
+    /// this crate) scopes the hook so only *this* queue's pushes can fire
+    /// it, and `queue_notify_hook::lock()` is held for the entire
+    /// install-through-uninstall span so no other hook-installing test can
+    /// overwrite or erase this one's entry in the shared slot while it is
+    /// active. See the module doc comment on `queue_notify_hook` in
+    /// `constants.rs` for the full reasoning.
     #[tokio::test]
     async fn write_chunked_nonblocking_surfaces_a_later_chunk_failure_instead_of_ok() {
         let (client, _peer) = tokio::io::duplex(64 * 1024);
         let max_message_size = 4096;
+        let addr: SocketAddr = "127.0.0.1:9963".parse().unwrap();
         let (writer, task, _) = LockFreeStreamHandle::new(
             client,
-            "127.0.0.1:9963".parse().unwrap(),
+            addr,
             ChannelId::TellAsk,
             BufferConfig::default(),
             None,
@@ -5165,15 +5180,20 @@ mod write_chunked_nonblocking_tests {
         let successful_pushes = Arc::new(AtomicUsize::new(0));
         let exit_flag = writer.exit_flag.clone();
         let successful_pushes_for_hook = successful_pushes.clone();
-        queue_notify_hook::install(Arc::new(move || {
-            let n = successful_pushes_for_hook.fetch_add(1, Ordering::SeqCst);
-            if n == 1 {
-                // Fires after the second chunk's push has already
-                // succeeded -- the third chunk's `enqueue_write_nonblocking`
-                // call must observe this and fail before pushing.
-                exit_flag.store(true, Ordering::Release);
-            }
-        }));
+        let _hook_guard = queue_notify_hook::lock();
+        queue_notify_hook::install(
+            addr,
+            Arc::new(move || {
+                let n = successful_pushes_for_hook.fetch_add(1, Ordering::SeqCst);
+                if n == 1 {
+                    // Fires after the second chunk's push has already
+                    // succeeded -- the third chunk's
+                    // `enqueue_write_nonblocking` call must observe this and
+                    // fail before pushing.
+                    exit_flag.store(true, Ordering::Release);
+                }
+            }),
+        );
 
         // Chunked content is unframed opaque bytes here (no valid V5
         // control word), so the up-front `reject_oversize_single` check
@@ -5184,6 +5204,7 @@ mod write_chunked_nonblocking_tests {
         let result = writer.write_chunked_nonblocking(&data, chunk_size);
 
         queue_notify_hook::uninstall();
+        drop(_hook_guard);
 
         let err = result.unwrap_err();
         assert!(

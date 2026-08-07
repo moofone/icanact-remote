@@ -700,38 +700,94 @@ pub struct BufferConfig {
 /// tests can force a deterministic interleaving of concurrent producers inside
 /// that window. Production builds compile none of this; test builds pay one
 /// atomic load on the notify path while no hook is installed.
+///
+/// PR #183 review, round 8: this instrumentation is process-global, but
+/// `cargo test` runs many unrelated tests concurrently, and *every*
+/// `WriteQueue`/`StreamingQueue` in the process (not just the one under
+/// test) calls `fire()` on every push. Two problems follow, and both are
+/// fixed here rather than by adding more manual serialization at each call
+/// site:
+///
+/// 1. **Cross-firing.** A hook installed for one connection's queue used to
+///    run for *any* connection's push, so an unrelated concurrently-running
+///    test's ordinary write traffic -- which has no reason to know this
+///    hook exists -- could invoke it. `fire`/`install` now carry the
+///    `SocketAddr` of the queue that pushed; a hook only runs for the exact
+///    address it was installed against. Every test in this crate already
+///    constructs its `LockFreeStreamHandle`/`WriteQueue`/`StreamingQueue`
+///    with a distinct address (a unique port per test), so this alone
+///    eliminates cross-test firing between any two tests that use
+///    different addresses.
+/// 2. **Clobbering.** The slot holds exactly one installed hook; two
+///    hook-installing tests running concurrently would silently overwrite
+///    each other's entry, and an `uninstall()` from one would erase the
+///    other's hook mid-test. `lock()` exhaustively serializes the
+///    install-through-uninstall span of every test that uses this hook
+///    (whether or not their addresses differ), so only one such span is
+///    ever open at a time process-wide. Every caller of `install`/
+///    `uninstall` in this crate must hold this guard for that entire span.
 #[cfg(test)]
 mod queue_notify_hook {
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    struct Installed {
+        addr: SocketAddr,
+        hook: Hook,
+    }
 
     /// Fast check so the push path is a single load when no hook is installed.
     static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    fn slot() -> &'static Mutex<Option<Hook>> {
-        static SLOT: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
+    fn slot() -> &'static Mutex<Option<Installed>> {
+        static SLOT: OnceLock<Mutex<Option<Installed>>> = OnceLock::new();
         SLOT.get_or_init(|| Mutex::new(None))
     }
 
+    /// Serializes the install-through-uninstall span of every test that
+    /// installs a hook. See the module doc comment's "Clobbering" note --
+    /// without this, two hook-installing tests running concurrently could
+    /// overwrite or erase each other's entry in `slot()` regardless of
+    /// using different addresses, since there is only one slot.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Fired from the queue notify helpers between push and notify decision.
+    /// `addr` is the pushing queue's own address; the installed hook only
+    /// runs if it was installed scoped to this exact address (see the
+    /// module doc comment's "Cross-firing" note).
     #[inline]
-    pub(crate) fn fire() {
+    pub(crate) fn fire(addr: SocketAddr) {
         if !ACTIVE.load(Ordering::Acquire) {
             return;
         }
-        let hook = slot().lock().expect("queue notify hook lock poisoned").clone();
+        let hook = {
+            let guard = slot().lock().expect("queue notify hook lock poisoned");
+            guard
+                .as_ref()
+                .filter(|installed| installed.addr == addr)
+                .map(|installed| installed.hook.clone())
+        };
         if let Some(hook) = hook {
             hook();
         }
     }
 
-    pub(crate) fn install(hook: Hook) {
-        *slot().lock().expect("queue notify hook lock poisoned") = Some(hook);
+    /// Caller must hold `lock()` for the entire span from this call through
+    /// the matching `uninstall()`.
+    pub(crate) fn install(addr: SocketAddr, hook: Hook) {
+        *slot().lock().expect("queue notify hook lock poisoned") = Some(Installed { addr, hook });
         ACTIVE.store(true, Ordering::Release);
     }
 
+    /// See `install`'s note on holding `lock()`.
     pub(crate) fn uninstall() {
         ACTIVE.store(false, Ordering::Release);
         *slot().lock().expect("queue notify hook lock poisoned") = None;
@@ -785,7 +841,7 @@ impl WriteQueue {
     #[inline]
     fn notify_data(&self) {
         #[cfg(test)]
-        queue_notify_hook::fire();
+        queue_notify_hook::fire(self.addr);
         if !self.data_pending.swap(true, Ordering::AcqRel) {
             self.data_notify.notify_one();
         }
@@ -959,7 +1015,7 @@ impl StreamingQueue {
     #[inline]
     fn notify_data(&self) {
         #[cfg(test)]
-        queue_notify_hook::fire();
+        queue_notify_hook::fire(self.addr);
         if !self.data_pending.swap(true, Ordering::AcqRel) {
             self.data_notify.notify_one();
         }
@@ -1167,17 +1223,8 @@ impl Default for BufferConfig {
 mod queue_notify_tests {
     use super::*;
     use std::future::Future;
-    use std::sync::{Barrier, Mutex, MutexGuard, OnceLock};
+    use std::sync::Barrier;
     use std::task::Waker;
-
-    /// The notify hook is a process-global slot; serialize the tests that
-    /// install one so they cannot observe each other's hooks.
-    fn hook_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     thread_local! {
         /// Marks the producer threads of the rendezvous tests so hook callers
@@ -1192,13 +1239,18 @@ mod queue_notify_tests {
     /// Install a 2-party rendezvous in the push->notify window: both producer
     /// threads must reach the window before either proceeds to the notify
     /// decision.
+    /// Caller must hold `queue_notify_hook::lock()` for the whole span from
+    /// this call through the matching `queue_notify_hook::uninstall()`.
     fn install_two_party_rendezvous() {
         let barrier = Arc::new(Barrier::new(2));
-        queue_notify_hook::install(Arc::new(move || {
-            if HOOK_PARTY.with(|f| f.get()) {
-                barrier.wait();
-            }
-        }));
+        queue_notify_hook::install(
+            test_addr(),
+            Arc::new(move || {
+                if HOOK_PARTY.with(|f| f.get()) {
+                    barrier.wait();
+                }
+            }),
+        );
     }
 
     /// Poll the queue's data notifier once with a no-op waker: a stored wakeup
@@ -1281,7 +1333,7 @@ mod queue_notify_tests {
     /// writer stays parked with frames queued (lost wakeup).
     #[test]
     fn write_queue_concurrent_pushes_into_empty_queue_publish_wakeup() {
-        let _guard = hook_lock();
+        let _guard = queue_notify_hook::lock();
         let queue = WriteQueue::new(128, test_addr());
         install_two_party_rendezvous();
 
@@ -1313,7 +1365,7 @@ mod queue_notify_tests {
     /// public `try_push` path (which notifies internally).
     #[test]
     fn streaming_queue_concurrent_pushes_into_empty_queue_publish_wakeup() {
-        let _guard = hook_lock();
+        let _guard = queue_notify_hook::lock();
         let queue = StreamingQueue::new(64, test_addr());
         install_two_party_rendezvous();
 
