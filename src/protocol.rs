@@ -359,7 +359,7 @@ impl StreamingState {
         match self.begin_v5_stream(header, correlation_id, pool, is_response, first_chunk_len) {
             Ok(reservation) => Ok(Some(reservation)),
             Err(error) if is_resource_busy(&error) => {
-                self.reject_stream(header.stream_id)?;
+                self.reject_stream(header.stream_id);
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -462,24 +462,17 @@ impl StreamingState {
     /// a tombstone this function inserts can never be pruned out from under
     /// a late chunk still arriving for it (see `cleanup_stale_with`'s doc
     /// comment for the failure that TTL-based pruning caused). At capacity,
-    /// this fails closed (`ResourceBusy`, which `begin_v5_stream_or_discard`
-    /// converts into a clean per-stream discard) rather than evicting an
-    /// older entry the way `tombstone_reaped_stream` does: unlike the
-    /// reaper, this has a caller that can handle an error, so there is no
-    /// need to force room by evicting something else that might still be in
-    /// active use.
-    fn reject_stream(&mut self, stream_id: u64) -> Result<()> {
-        if !self.rejected_streams.contains_key(&stream_id)
-            && self.rejected_streams.len() >= MAX_REJECTED_STREAMS
-        {
-            return Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::ResourceBusy,
-                "too many rejected streams",
-            )));
-        }
-        self.rejected_streams
-            .insert(stream_id, std::time::Instant::now());
-        Ok(())
+    /// evicts the oldest tombstone to make room, the same way
+    /// `tombstone_reaped_stream` does, rather than failing: this function's
+    /// only caller, `begin_v5_stream_or_discard`, invokes it via `?`, so a
+    /// `ResourceBusy` here would propagate as a connection-fatal error
+    /// instead of the clean per-stream discard the caller is trying to
+    /// produce. A peer sustaining resource-pressure rejections with no
+    /// intervening reaps must not be able to take the whole connection down
+    /// over tombstone-table upkeep that has nothing to do with the
+    /// stream_id it was trying to reject.
+    fn reject_stream(&mut self, stream_id: u64) {
+        self.tombstone_stream(stream_id);
     }
 
     /// Returns the writable target range for the next read into
@@ -959,12 +952,25 @@ impl StreamingState {
     }
 
     /// Quarantines a reaped stream id the same way `reject_stream` quarantines
-    /// a resource-pressure rejection, but the reaper itself must never fail:
-    /// if the quarantine table is already full, evict the oldest tombstone to
-    /// make room rather than dropping the new one. A recently reaped id is
-    /// exactly the one a sender is about to retry against, so it is the
-    /// tombstone most worth keeping.
+    /// a resource-pressure rejection -- both go through `tombstone_stream`,
+    /// so both share the same never-fails, evict-the-oldest-at-capacity
+    /// bound. A recently reaped id is exactly the one a sender is about to
+    /// retry against, so it is the tombstone most worth keeping.
     fn tombstone_reaped_stream(&mut self, stream_id: u64) {
+        self.tombstone_stream(stream_id);
+    }
+
+    /// Inserts (or refreshes) a tombstone for `stream_id`, evicting the
+    /// oldest entry to make room if `rejected_streams` is already at
+    /// `MAX_REJECTED_STREAMS` capacity. Shared, infallible core of
+    /// `reject_stream` (a new stream rejected for resource pressure) and
+    /// `tombstone_reaped_stream` (an active stream reaped for idle/rate-floor
+    /// violation): both call sites need the identical bound, and neither has
+    /// a good way to spend a caller-visible error on table upkeep -- a
+    /// rejection or a reap must always succeed at quarantining its own
+    /// stream_id, even when the table is momentarily saturated with older
+    /// entries that a real sender may or may not still be retrying against.
+    fn tombstone_stream(&mut self, stream_id: u64) {
         if !self.rejected_streams.contains_key(&stream_id)
             && self.rejected_streams.len() >= MAX_REJECTED_STREAMS
         {
@@ -2479,6 +2485,65 @@ mod tests {
                 .is_none(),
             "the most recently reaped id must be retained, not evicted"
         );
+    }
+
+    /// `reject_stream` must never propagate `ResourceBusy` once its own
+    /// tombstone table is full, even when nothing has ever been reaped.
+    /// `begin_v5_stream_or_discard` calls it via `?`, so a fallible
+    /// `reject_stream` at capacity turns what should be a bounded per-stream
+    /// discard into a connection-fatal error -- a peer sustaining
+    /// resource-pressure rejections with no intervening reaps would take the
+    /// whole connection down over tombstone-table upkeep that has nothing to
+    /// do with the stream_id it was trying to reject.
+    #[test]
+    fn reject_stream_stays_bounded_and_never_fails_with_no_reaps_in_between() {
+        let mut state = StreamingState::new();
+        let pool = Arc::new(crate::AlignedBytesPool::default());
+
+        // Fill max_concurrent_streams (16) with real, tiny active streams so
+        // every further begin_v5_stream_or_discard call hits the
+        // resource-pressure path deterministically.
+        for stream_id in 0..16u64 {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size: 8,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            state
+                .begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8)
+                .expect("connection has room for the first 16 streams")
+                .expect("must be admitted, not discarded");
+        }
+
+        // Every further, distinct stream_id is resource-pressure rejected --
+        // more of them than MAX_REJECTED_STREAMS, and never a single reap in
+        // between.
+        for stream_id in 1000..(1000 + MAX_REJECTED_STREAMS as u64 * 2) {
+            let header = crate::StreamHeader {
+                stream_id,
+                total_size: 8,
+                chunk_size: 8,
+                chunk_index: 0,
+                type_hash: 0,
+                actor_id: 0,
+            };
+            let result = state.begin_v5_stream_or_discard(header, 1, pool.clone(), false, 8);
+            assert!(
+                result.is_ok(),
+                "resource-pressure rejection #{stream_id} must be a clean discard, not a fatal error: {result:?}"
+            );
+            assert!(
+                result.unwrap().is_none(),
+                "a resource-pressure-rejected stream must not be admitted"
+            );
+            assert!(
+                state.rejected_stream_count() <= MAX_REJECTED_STREAMS,
+                "rejected_streams table exceeded its bound"
+            );
+        }
     }
 
     /// A single large chunk that trickles in slowly must not be reaped
