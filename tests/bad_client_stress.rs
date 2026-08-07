@@ -279,6 +279,13 @@ async fn unknown_message_type_is_ignored_and_server_continues() {
 /// build configuration under dispute: a real release binary, not `cargo
 /// test`'s dev profile, and not an emulation via a direct function call
 /// like `handle::tests::raw_ask_with_no_dispatcher_nacks_instead_of_silence`.
+///
+/// This test itself needs `test-helpers` OFF: the server under test is the
+/// same crate build as the test binary, so `cargo test --all-features`
+/// (CI's config) would enable the mock on the server too, and it would
+/// legitimately answer with the ECHOED: transformation instead of a NACK --
+/// that's `test_basic_ask_correlation`'s scenario, not this one.
+#[cfg(not(feature = "test-helpers"))]
 #[tokio::test(flavor = "current_thread")]
 async fn raw_ask_nacks_in_a_true_release_build() {
     let _guard = BAD_CLIENT_TEST_LOCK
