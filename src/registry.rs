@@ -9377,20 +9377,42 @@ impl<T: 'static> GossipRegistry<T> {
         // removal loop; in that case preserve actors, tombstones, and
         // side-table state, not merely the address ownership at the final
         // release step.
+        // Reserve and consume each candidate through the owner before doing
+        // any destructive work. The owner rechecks the causal fence and the
+        // exact ownership/pin/node identity in its serialized mailbox, then
+        // keeps the reservation exclusive until this sweep releases it. A
+        // check-only liveness round trip is insufficient: a reconnect can
+        // commit immediately after that check and before actor removal.
         let mut confirmed_dead = Vec::with_capacity(peers_to_cleanup.len());
         for (peer_addr, node_id, evidence_before) in peers_to_cleanup {
-            if self
+            let expected_ownership = self.registry_owner.ownership_token(&peer_addr);
+            let expected_pin = self.registry_owner.pin_owner(&peer_addr);
+            let reservation = self
                 .registry_owner
-                .has_newer_liveness_evidence_since(peer_addr, evidence_before)
-                .await
-            {
+                .reserve_for_reap(
+                    peer_addr,
+                    evidence_before,
+                    expected_ownership,
+                    expected_pin,
+                    node_id.clone(),
+                )
+                .await;
+            let Some(reservation) = reservation else {
                 debug!(
                     peer = %peer_addr,
-                    "cleanup_dead_peers: preserving candidate with newer owner-side liveness evidence"
+                    "cleanup_dead_peers: owner refused stale candidate reservation"
                 );
                 continue;
+            };
+            if !reservation.try_consume().await {
+                debug!(
+                    peer = %peer_addr,
+                    "cleanup_dead_peers: owner invalidated stale candidate reservation"
+                );
+                reservation.release().await;
+                continue;
             }
-            confirmed_dead.push((peer_addr, node_id, evidence_before));
+            confirmed_dead.push((peer_addr, node_id, evidence_before, reservation));
         }
         let peers_to_cleanup = confirmed_dead;
 
@@ -9401,7 +9423,7 @@ impl<T: 'static> GossipRegistry<T> {
             // Order: actor_state before gossip_state
             let mut gossip_state = self.gossip_state.lock().await;
 
-            for (peer_addr, _, _) in &peers_to_cleanup {
+            for (peer_addr, _, _, _) in &peers_to_cleanup {
                 // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
                 // This allows us to reconnect when the peer comes back online
 
@@ -9496,16 +9518,17 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
-            for (peer_addr, node_id, evidence_before) in &peers_to_cleanup {
-                self.clear_peer_capabilities(peer_addr);
-                self.remove_clock_state_for_addr(peer_addr);
+            for (peer_addr, node_id, evidence_before, reservation) in peers_to_cleanup {
+                self.clear_peer_capabilities(&peer_addr);
+                self.remove_clock_state_for_addr(&peer_addr);
                 // A timed-out peer's connection teardown may never have run,
                 // leaving its owner receipt and address claim behind. Release
                 // both atomically in the owner; configured pins are retained.
-                if let Some(peer_id) = node_id {
-                    self.release_dead_peer_ownership(peer_id, *peer_addr, *evidence_before)
+                if let Some(peer_id) = node_id.as_ref() {
+                    self.release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
                         .await;
                 }
+                reservation.release().await;
             }
 
             // Trigger immediate gossip (outside the gossip_state lock —
