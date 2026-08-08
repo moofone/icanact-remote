@@ -9532,12 +9532,11 @@ impl<T: 'static> GossipRegistry<T> {
         // removal loop; in that case preserve actors, tombstones, and
         // side-table state, not merely the address ownership at the final
         // release step.
-        // Reserve and consume each candidate through the owner before doing
-        // any destructive work. The owner rechecks the causal fence and the
-        // exact ownership/pin/node identity in its serialized mailbox, then
-        // keeps the reservation exclusive until this sweep releases it. A
-        // check-only liveness round trip is insufficient: a reconnect can
-        // commit immediately after that check and before actor removal.
+        // Reserve each candidate through the owner before doing any
+        // destructive work. The reservation blocks ownership claims while
+        // the candidate is being processed; the pure liveness verdict and
+        // one-shot consume authorization happen in the destructive phase,
+        // immediately before that work begins.
         let mut confirmed_dead = Vec::with_capacity(peers_to_cleanup.len());
         for (peer_addr, node_id, evidence_before) in peers_to_cleanup {
             let expected_ownership = self.registry_owner.ownership_token(&peer_addr);
@@ -9559,24 +9558,15 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             };
-            if !reservation.try_consume().await {
-                debug!(
-                    peer = %peer_addr,
-                    "cleanup_dead_peers: owner invalidated stale candidate reservation"
-                );
-                reservation.release().await;
-                continue;
-            }
             confirmed_dead.push((peer_addr, node_id, evidence_before, reservation));
         }
         self.reap_reserved_candidates(confirmed_dead, dead_peer_timeout_secs)
             .await;
     }
 
-    /// Apply the single owner decision for each reserved candidate before any
-    /// actor, tombstone, capability, clock-state, or ownership cleanup. A
-    /// `ProvenAlive` result therefore leaves every destructive projection
-    /// untouched and releases only the reservation.
+    /// Apply the pure owner liveness verdict and one-shot reservation
+    /// authorization before destructive work. Ownership is deliberately
+    /// released last, through its own fresh owner-side causal fence.
     async fn reap_reserved_candidates(
         &self,
         peers_to_cleanup: Vec<(
@@ -9589,17 +9579,19 @@ impl<T: 'static> GossipRegistry<T> {
     ) {
         let mut should_trigger_immediate = false;
         for (peer_addr, node_id, evidence_before, reservation) in peers_to_cleanup {
-            let outcome = match node_id.as_ref() {
-                Some(peer_id) => Some(
-                    self.release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
-                        .await,
-                ),
-                None => None,
+            let Some(peer_id) = node_id.as_ref() else {
+                debug!(
+                    peer = %peer_addr,
+                    "cleanup_dead_peers: no resolved identity; cannot obtain an owner liveness verdict"
+                );
+                reservation.release().await;
+                continue;
             };
-            if matches!(
-                outcome,
-                Some(crate::registry_owner::DeadPeerReleaseOutcome::ProvenAlive)
-            ) {
+            if self
+                .registry_owner
+                .has_newer_liveness_evidence_since(peer_addr, evidence_before)
+                .await
+            {
                 debug!(
                     peer = %peer_addr,
                     "cleanup_dead_peers: newer liveness evidence won; preserving actors and projections"
@@ -9607,10 +9599,20 @@ impl<T: 'static> GossipRegistry<T> {
                 reservation.release().await;
                 continue;
             }
+            if !reservation.try_consume().await {
+                debug!(
+                    peer = %peer_addr,
+                    "cleanup_dead_peers: reservation was invalidated before destructive work"
+                );
+                reservation.release().await;
+                continue;
+            }
 
             // Keep the peer entry itself so a later reconnect can be
-            // recognized, but remove actors and their causal tombstones only
-            // after the owner's final liveness decision above.
+            // recognized. Side tables are non-gossiped and are removed first;
+            // actor/tombstone work follows, and ownership is released last.
+            self.clear_peer_capabilities(&peer_addr);
+            self.remove_clock_state_for_addr(&peer_addr);
             {
                 let mut gossip_state = self.gossip_state.lock().await;
                 if let Some(actor_names) = gossip_state.peer_to_actors.get(&peer_addr).cloned() {
@@ -9681,8 +9683,10 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             }
 
-            self.clear_peer_capabilities(&peer_addr);
-            self.remove_clock_state_for_addr(&peer_addr);
+            let outcome = self
+                .release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
+                .await;
+            debug!(peer = %peer_addr, ?outcome, "cleanup_dead_peers: ownership release outcome");
             reservation.release().await;
         }
         if should_trigger_immediate {
