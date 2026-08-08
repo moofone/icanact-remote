@@ -2708,10 +2708,11 @@ fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission(
 /// `STREAMING_RESPONSE_QUEUE_BYTE_CAP`. This crate's own default
 /// `max_message_size` (10 MiB, `GossipConfig::default`) exceeds that cap
 /// (~8 MiB), so the reserve used to clamp to *exactly* the cap -- making
-/// `queued_bytes + response_reserve_bytes > cap` degenerate to `queued_bytes
-/// > 0`. One connection-local response of any size at all then marked the
-/// queue full for every other concurrently in-flight streaming ask, even
-/// though the aggregate footprint was nowhere near either byte cap.
+/// the `queued_bytes + response_reserve_bytes > cap` check degenerate to
+/// simply `queued_bytes` being nonzero. One connection-local response of
+/// any size at all then marked the queue full for every other concurrently
+/// in-flight streaming ask, even though the aggregate footprint was nowhere
+/// near either byte cap.
 ///
 /// Red (pre-fix) with the old `min(max_message_size.max(STREAM_CHUNK_SIZE),
 /// STREAMING_RESPONSE_QUEUE_BYTE_CAP)` formula: constructing the queue with
