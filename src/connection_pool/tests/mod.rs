@@ -2696,6 +2696,61 @@ fn immediate_streaming_response_queue_bounds_byte_burst_with_deferred_admission(
         .expect("overflow is retained in the deferred response slot");
 }
 
+/// #189 regression: `is_full()` gates the pre-dispatch `AskNackReason::
+/// Backpressure` decision in `stream_writer.rs::io_task` (see
+/// `ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room`
+/// above). Before #189, `is_full()` only paused the read loop's entry gate
+/// (harmless delay); #189 wired it to an immediate per-ask NACK instead, so
+/// any pre-existing over-tight `is_full()` result now fails a live ask
+/// outright rather than merely stalling it.
+///
+/// `with_response_reserve`'s `response_reserve_bytes` used to scale all the
+/// way up to `max_message_size`, clamped only at
+/// `STREAMING_RESPONSE_QUEUE_BYTE_CAP`. This crate's own default
+/// `max_message_size` (10 MiB, `GossipConfig::default`) exceeds that cap
+/// (~8 MiB), so the reserve used to clamp to *exactly* the cap -- making
+/// the `queued_bytes + response_reserve_bytes > cap` check degenerate to
+/// simply `queued_bytes` being nonzero. One connection-local response of
+/// any size at all then marked the queue full for every other concurrently
+/// in-flight streaming ask, even though the aggregate footprint was nowhere
+/// near either byte cap.
+///
+/// Red (pre-fix) with the old `min(max_message_size.max(STREAM_CHUNK_SIZE),
+/// STREAMING_RESPONSE_QUEUE_BYTE_CAP)` formula: constructing the queue with
+/// the crate's real default `max_message_size` and admitting one ~1 MiB
+/// response (a fraction of the ~8 MiB soft cap) already reported `is_full()
+/// == true`. Green with the fix: the reserve is pinned to one response frame
+/// (`STREAM_CHUNK_SIZE`) regardless of `max_message_size`, so the same
+/// one-response queue reports room for more.
+#[test]
+fn concurrent_responses_admit_when_configured_max_message_size_exceeds_the_queue_byte_cap() {
+    let default_max_message_size = crate::GossipConfig::default().max_message_size;
+    assert!(
+        default_max_message_size > STREAMING_RESPONSE_QUEUE_BYTE_CAP,
+        "this test's premise requires the crate's default max_message_size to exceed the \
+         queue's soft byte cap -- otherwise it cannot reproduce the degenerate reserve"
+    );
+
+    let mut queue = LocalStreamingQueue::with_response_reserve(default_max_message_size);
+    let one_response = 1024 * 1024 + 100_000; // matches the streaming regression test's payload
+    queue_streaming_response_bytes(
+        &mut queue,
+        1,
+        bytes::Bytes::from(vec![0xA5u8; one_response]),
+        default_max_message_size,
+        None,
+    )
+    .expect("a single ~1 MiB response must be admitted");
+
+    assert!(
+        !queue.is_full(),
+        "one ~1 MiB response must leave room for a concurrent ask's response under the \
+         crate's own default max_message_size ({default_max_message_size} bytes) -- the byte \
+         reserve must not consume the entire {STREAMING_RESPONSE_QUEUE_BYTE_CAP}-byte soft cap \
+         by itself"
+    );
+}
+
 /// `write_ask_nack_header_bounded` (the bounded single-attempt write
 /// `drain_pending_ask_nacks` uses to flush `LocalStreamingQueue`'s queued
 /// backpressure NACKs) must produce exactly the frame a peer decodes as

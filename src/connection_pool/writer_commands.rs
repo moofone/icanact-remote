@@ -377,10 +377,24 @@ impl LocalStreamingQueue {
     }
 
     fn with_response_reserve(max_message_size: usize) -> Self {
-        let response_reserve_bytes = std::cmp::min(
-            max_message_size.max(STREAM_CHUNK_SIZE),
-            STREAMING_RESPONSE_QUEUE_BYTE_CAP,
-        );
+        // Reserve room for one response *frame* (`STREAM_CHUNK_SIZE`) before
+        // consuming another ask -- not the full configured `max_message_size`.
+        // `max_message_size` bounds an ordinary, non-streaming message; a
+        // streaming response's true worst case is `MAX_STREAM_SIZE` (64 MiB),
+        // already guarded above by the much larger
+        // `STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP` check, with per-response
+        // admission handled by `can_admit_response`'s own
+        // `admit_single_oversize`/`can_defer_response` paths -- not this
+        // pre-dispatch heuristic. Scaling this reserve up to
+        // `max_message_size` instead degenerates as soon as
+        // `max_message_size` reaches `STREAMING_RESPONSE_QUEUE_BYTE_CAP`
+        // (true of this crate's own default config: 10 MiB vs. ~8 MiB): the
+        // reserve alone then consumes the entire soft cap, so `is_full()`'s
+        // byte check trips on *any* nonzero `queued_bytes`, collapsing
+        // "leave room for one more response" into "the queue must be
+        // completely empty" and serializing every concurrent streaming ask
+        // on a connection to one at a time.
+        let response_reserve_bytes = STREAM_CHUNK_SIZE.min(STREAMING_RESPONSE_QUEUE_BYTE_CAP);
         let response_reserve_commands = max_message_size
             .saturating_add(STREAM_CHUNK_SIZE.saturating_sub(1))
             .checked_div(STREAM_CHUNK_SIZE)
