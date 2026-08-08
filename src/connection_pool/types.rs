@@ -262,7 +262,68 @@ impl LockFreeConnection {
 
 /// Payloads for queued writes.
 pub enum WritePayload {
+    /// The public, generic "send these bytes" entry points
+    /// (`write_bytes_control`/`write_bytes_ask`/`write_bytes_nonblocking`,
+    /// `write_vectored_nonblocking`, `write_chunked_nonblocking`, and the
+    /// `ConnectionHandle` methods built on them:
+    /// `send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
+    /// `send_binary_message`) all construct this variant.
+    ///
+    /// PR #183 review, round 12: this crate's wire protocol has no concept
+    /// of *opaque, unframed* bytes for this variant to carry -- round 11
+    /// tried an opaque/framed split on the theory that content cannot
+    /// answer "is this a frame" and the caller should declare it instead,
+    /// which is true about content-sniffing but false about there being a
+    /// legitimate opaque case to declare. Every read path this crate has
+    /// (`read_message_step`/`read_message_step_poll`/
+    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// unconditionally decodes a control word from whatever the peer sends
+    /// and fails the connection if it doesn't decode; there is no
+    /// raw-passthrough mode a sender could target with genuinely unframed
+    /// bytes. So every one of the methods above -- whether or not anything
+    /// in this crate currently calls them -- carries complete frame(s) by
+    /// the only contract this wire format supports.
+    ///
+    /// PR #183 review, round 13: `reject_oversize_single` (in
+    /// `stream_writer.rs`) enforces that contract as a closure property --
+    /// a `Single` write is accepted if and only if it consists of exactly
+    /// N complete V5 frames, N >= 0, each within `max_message_size`, with
+    /// nothing left over. Several valid frames concatenated in one write
+    /// are judged the way separate writes would have been (not rejected
+    /// for their aggregate length), but *any* leftover bytes that are not
+    /// themselves a complete frame -- too short to hold a control word, a
+    /// control word that doesn't decode, or a decoded frame the buffer
+    /// doesn't fully supply -- are refused outright. There is no
+    /// bare-length fallback for undecodable content: see that method's own
+    /// doc comment for the induction argument this closure property makes
+    /// sufficient on its own, independent of how a caller splits its
+    /// writes.
+    ///
+    /// This is deliberately the only variant a caller outside this `impl`
+    /// block can reach with arbitrary content -- see `TrustedFrame` for the
+    /// alternative used by every internal caller that built the bytes
+    /// itself and already knows they are safe. That split, not a comment on
+    /// this variant, is what stops a future generic-bytes call site from
+    /// silently inheriting an exemption it was never entitled to.
     Single(bytes::Bytes),
+    /// A caller-opaque byte blob this crate built and validated itself --
+    /// constructible only via `LockFreeStreamHandle::write_trusted_bytes_control`/
+    /// `write_trusted_bytes_ask`, which are `pub(crate)`: nothing outside this
+    /// crate can produce one. `reject_oversize_write_payload` exempts it
+    /// unconditionally, so every call site that constructs it is exactly as
+    /// trusted as that exemption -- currently: the fixed-size `RouteBind`/
+    /// `StreamAbort` control frames (a handful of bytes, built from
+    /// `framing`'s own header constructors, never a caller-supplied length),
+    /// `ConnectionHandle::ask_batch_deferred`'s pre-concatenated batch
+    /// (each request already passed `reject_oversize_inline` individually
+    /// before concatenation; the aggregate is expected to exceed
+    /// `max_message_size` by design and must not be gated against it), and
+    /// `write_chunked_nonblocking`'s per-chunk fragments (the whole buffer
+    /// is validated once, before chunking, against the same per-frame walk
+    /// `Single` uses -- a fragment has no declared length of its own to
+    /// check, and re-validating one as if it were a complete `Single`
+    /// write could reject a fragment of already-valid content).
+    TrustedFrame(bytes::Bytes),
     HeaderPayload {
         header: bytes::Bytes,
         payload: bytes::Bytes,
@@ -298,13 +359,28 @@ pub enum WritePayload {
         header: [u8; 16], // DIRECT_ASK_FRAME_HEADER_LEN
         payload: bytes::Bytes,
     },
-    Buf(Box<dyn Buf + Send>),
+    /// A generic `Buf` write (header chained with a caller-supplied payload,
+    /// written without concatenating). `expected_len` is the exact byte
+    /// count the caller declared this write would produce -- generally
+    /// `header.len() + payload_len` from whatever `write_*_header` call
+    /// built the frame -- captured separately from `buf` itself precisely
+    /// because `buf.remaining()` is not trustworthy on its own: a caller
+    /// can build a header from one length and chain a `Buf` whose actual
+    /// `remaining()` disagrees with it. See `reject_oversize_write_payload`,
+    /// which is the only place `expected_len` is read.
+    Buf {
+        buf: Box<dyn Buf + Send>,
+        expected_len: usize,
+    },
 }
 
 impl std::fmt::Debug for WritePayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WritePayload::Single(data) => f.debug_tuple("Single").field(&data.len()).finish(),
+            WritePayload::TrustedFrame(data) => {
+                f.debug_tuple("TrustedFrame").field(&data.len()).finish()
+            }
             WritePayload::HeaderPayload { header, payload } => f
                 .debug_struct("HeaderPayload")
                 .field("header_len", &header.len())
@@ -358,7 +434,10 @@ impl std::fmt::Debug for WritePayload {
                 )
                 .field("payload_len", &payload.len())
                 .finish(),
-            WritePayload::Buf(_) => f.debug_tuple("Buf").field(&"<buf>").finish(),
+            WritePayload::Buf { expected_len, .. } => f
+                .debug_struct("Buf")
+                .field("expected_len", expected_len)
+                .finish(),
             WritePayload::DirectAskInline { header: _, payload } => f
                 .debug_struct("DirectAskInline")
                 .field("header_len", &crate::framing::DIRECT_ASK_FRAME_HEADER_LEN)

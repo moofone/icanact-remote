@@ -248,9 +248,10 @@ mod read_pipeline_tests {
         // because this bound is unrealistically generous.
         let idle_timeout = std::time::Duration::from_millis(20);
 
-        let start_header = crate::framing::write_stream_request_start_header(
+        let start_header = crate::framing::try_write_stream_request_start_header(
             stream_id, 0, total_size, 7, 3, STRIDE,
-        );
+        )
+        .unwrap();
         writer.write_all(&start_header).await.unwrap();
         writer.write_all(&[0xA0u8; STRIDE]).await.unwrap();
 
@@ -291,7 +292,8 @@ mod read_pipeline_tests {
             );
 
             let payload = [0xA0u8 + idx as u8; STRIDE];
-            let data_header = crate::framing::write_stream_data_header(false, stream_id, idx, STRIDE);
+            let data_header =
+                crate::framing::try_write_stream_data_header(false, stream_id, idx, STRIDE).unwrap();
             writer.write_all(&data_header).await.unwrap();
             writer.write_all(&payload).await.unwrap();
             expected.extend_from_slice(&payload);
@@ -366,14 +368,15 @@ mod read_pipeline_tests {
         let mut state = super::ReadState::new();
         let mut streams = crate::protocol::StreamingState::new();
 
-        let start_header = crate::framing::write_stream_request_start_header(
+        let start_header = crate::framing::try_write_stream_request_start_header(
             stream_id,
             0,
             total_size,
             1,
             2,
             total_size as usize,
-        );
+        )
+        .unwrap();
         writer.write_all(&start_header).await.unwrap();
         // Only part of the single declared chunk arrives; the rest trickles
         // in later, after the stream has already been reaped out from under
@@ -1603,23 +1606,43 @@ where
     }
 }
 
+/// Writes an actor-generated response directly to the socket, bypassing the
+/// background writer queue entirely -- the low-latency path for a response
+/// produced synchronously inside the read loop.
+///
+/// Every current caller (`write_ask_disposition_io`'s `Immediate`/
+/// `ImmediatePooled` branches) already computes `should_stream` from
+/// `max_message_size` before choosing this path over
+/// `queue_streaming_response_*`, so today this rejection is unreachable in
+/// practice. It still runs here, not only at the caller: this function --
+/// not any one caller -- is the single point every direct (non-streaming,
+/// non-queued) actor response funnels through, so gating here is what makes
+/// an unchecked oversize direct write impossible to express for a future
+/// caller, mirroring the `enqueue_write` choke-point fix on the queued write
+/// path in `stream_writer.rs`.
 async fn write_actor_response_direct<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     correlation_id: u32,
     response: crate::registry::ActorResponse,
+    max_message_size: usize,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     match response {
         crate::registry::ActorResponse::Bytes(bytes) => {
-            let header = crate::framing::write_ask_response_header(
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::ASK_RESPONSE_HEADER_LEN,
+                bytes.len(),
+                max_message_size,
+            )?;
+            let header = crate::framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
                 bytes.len(),
-            );
+            )?;
             write_header_payload_vectored(
                 stream,
                 bytes_written_counter,
@@ -1630,11 +1653,16 @@ where
             .await?;
         }
         crate::registry::ActorResponse::Aligned(bytes) => {
-            let header = crate::framing::write_ask_response_header(
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::ASK_RESPONSE_HEADER_LEN,
+                bytes.len(),
+                max_message_size,
+            )?;
+            let header = crate::framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
                 bytes.len(),
-            );
+            )?;
             write_header_payload_vectored(
                 stream,
                 bytes_written_counter,
@@ -1649,11 +1677,44 @@ where
             prefix,
             payload_len,
         } => {
-            let header = crate::framing::write_ask_response_header(
+            // `payload_len` is caller-supplied and, unlike the `Bytes`/
+            // `Aligned` arms above (where the header is built from the same
+            // value that is written), never independently verified against
+            // what this arm actually writes: `prefix` (when `Some`, always
+            // the full 16-byte array) plus `payload.remaining()`. This path
+            // writes straight to the socket -- it does not go through
+            // `WritePayload`, so it never inherited the declared-vs-actual
+            // check `reject_oversize_write_payload` enforces for every
+            // `WritePayload` variant. A caller-declared `payload_len` that
+            // disagrees with the real total would build a header promising
+            // one body length while this arm writes a different number of
+            // bytes, desyncing the peer's parser exactly like the `Buf`/
+            // `WritePayload` mismatches did -- so compute the actual total
+            // first and gate everything (the mismatch check, and
+            // `max_message_size`) against it, not the declared value.
+            let prefix_len = prefix.map(|p| p.len()).unwrap_or(0);
+            let actual_len = prefix_len + payload.remaining();
+            if actual_len != payload_len {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "pooled response declared {payload_len} bytes (prefix + \
+                         payload) but the buffer actually has {actual_len} -- \
+                         refusing to send a frame whose header would disagree \
+                         with its own body"
+                    ),
+                )));
+            }
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::ASK_RESPONSE_HEADER_LEN,
+                actual_len,
+                max_message_size,
+            )?;
+            let header = crate::framing::try_write_ask_response_header(
                 crate::MessageType::Response,
                 correlation_id,
-                payload_len,
-            );
+                actual_len,
+            )?;
             stream
                 .write_all(&header)
                 .await
@@ -1831,6 +1892,7 @@ where
                             bytes_since_flush,
                             correlation_id,
                             other,
+                            ctx.max_message_size,
                         )
                         .await?;
                     }
@@ -1916,6 +1978,7 @@ where
                             prefix,
                             payload_len,
                         },
+                        ctx.max_message_size,
                     )
                     .await?;
                 }
@@ -2745,5 +2808,205 @@ where
             }))
         }
         ReadIoResult::Generic(other) => Ok(Some(other)),
+    }
+}
+
+/// PR #183 review: `write_actor_response_direct` writes straight to the
+/// socket, bypassing `LockFreeStreamHandle`'s queue (and so the
+/// `enqueue_write` choke point fixed in `stream_writer.rs`) entirely. Both
+/// its current callers already gate on `max_message_size` before choosing
+/// this path, but the function itself did not enforce the limit -- these
+/// tests call it directly, the way a future caller could, to prove the
+/// self-check holds independent of any caller's own gating.
+#[cfg(test)]
+mod write_actor_response_direct_size_gate_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use bytes::Buf;
+
+    const MAX_MESSAGE_SIZE: usize = 64;
+
+    async fn write_bytes_response(
+        response: crate::registry::ActorResponse,
+    ) -> (crate::Result<()>, Vec<u8>) {
+        let (mut client, mut peer) = tokio::io::duplex(4096);
+        let bytes_written_counter = Arc::new(AtomicUsize::new(0));
+        let mut bytes_since_flush = 0usize;
+        let result = super::write_actor_response_direct(
+            &mut client,
+            &bytes_written_counter,
+            &mut bytes_since_flush,
+            1,
+            response,
+            MAX_MESSAGE_SIZE,
+        )
+        .await;
+        drop(client);
+        let mut received = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut peer, &mut received).await;
+        (result, received)
+    }
+
+    /// One byte over `MAX_MESSAGE_SIZE` once `ASK_RESPONSE_HEADER_LEN` is
+    /// added: must be rejected locally, not written to the socket.
+    #[tokio::test]
+    async fn bytes_response_over_max_message_size_is_rejected() {
+        let payload_len = MAX_MESSAGE_SIZE - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
+        let response =
+            crate::registry::ActorResponse::Bytes(bytes::Bytes::from(vec![0u8; payload_len]));
+        let (result, written) = write_bytes_response(response).await;
+        assert!(
+            matches!(result, Err(crate::GossipError::MessageTooLarge { .. })),
+            "expected MessageTooLarge, got {result:?}"
+        );
+        assert!(
+            written.is_empty(),
+            "an oversize direct response must not write anything to the socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_response_over_max_message_size_is_rejected() {
+        let payload_len = MAX_MESSAGE_SIZE - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
+        let payload = crate::typed::PooledPayload::try_from_pooled_bytes(payload_len, |buf| {
+            buf.resize(payload_len, 0u8);
+        })
+        .expect("test payload allocation");
+        assert_eq!(payload.remaining(), payload_len);
+        let response = crate::registry::ActorResponse::Pooled {
+            payload,
+            prefix: None,
+            payload_len,
+        };
+        let (result, written) = write_bytes_response(response).await;
+        assert!(
+            matches!(result, Err(crate::GossipError::MessageTooLarge { .. })),
+            "expected MessageTooLarge, got {result:?}"
+        );
+        assert!(
+            written.is_empty(),
+            "an oversize direct response must not write anything to the socket"
+        );
+    }
+
+    /// A response that fits must still be written correctly -- the gate must
+    /// not false-reject a payload right at the boundary.
+    #[tokio::test]
+    async fn bytes_response_at_max_message_size_is_written() {
+        let payload_len = MAX_MESSAGE_SIZE - crate::framing::ASK_RESPONSE_HEADER_LEN;
+        let response =
+            crate::registry::ActorResponse::Bytes(bytes::Bytes::from(vec![9u8; payload_len]));
+        let (result, written) = write_bytes_response(response).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let control = crate::framing::decode_control(written[..4].try_into().unwrap()).unwrap();
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(
+            control.body_len,
+            crate::framing::ASK_RESPONSE_HEADER_LEN + payload_len
+        );
+    }
+
+    fn pooled_payload(len: usize) -> crate::typed::PooledPayload {
+        crate::typed::PooledPayload::try_from_pooled_bytes(len, |buf| buf.resize(len, 0u8))
+            .expect("test payload allocation")
+    }
+
+    fn assert_mismatch_not_size(result: &crate::Result<()>) {
+        assert!(
+            !matches!(result, Err(crate::GossipError::MessageTooLarge { .. })),
+            "expected the declared-vs-actual mismatch check to reject this, \
+             not the size gate: {result:?}"
+        );
+        assert!(result.is_err(), "expected an error, got {result:?}");
+    }
+
+    /// PR #183 review, round 4: `write_actor_response_direct`'s `Pooled` arm
+    /// trusted the caller-declared `payload_len` instead of verifying it
+    /// against what the arm actually writes (`prefix` +
+    /// `payload.remaining()`). This path writes straight to the socket, so
+    /// it never went through `WritePayload`'s declared-vs-actual check --
+    /// a small declared length next to a much larger actual buffer would
+    /// build a header promising a small body while writing a large one,
+    /// desyncing the peer's parser the same way the `Buf`/`WritePayload`
+    /// mismatches did. Both individually well within `MAX_MESSAGE_SIZE` so
+    /// only the mismatch check can be catching this.
+    #[tokio::test]
+    async fn pooled_response_actual_longer_than_declared_is_rejected() {
+        let declared_payload_len = 8;
+        let response = crate::registry::ActorResponse::Pooled {
+            payload: pooled_payload(20),
+            prefix: None,
+            payload_len: declared_payload_len,
+        };
+        let (result, written) = write_bytes_response(response).await;
+        assert_mismatch_not_size(&result);
+        assert!(
+            written.is_empty(),
+            "a mismatched pooled response must not write anything to the socket"
+        );
+    }
+
+    /// Same gap, the other direction: a declared length larger than the
+    /// actual buffer would leave the frame short of what its own header
+    /// promised the peer.
+    #[tokio::test]
+    async fn pooled_response_actual_shorter_than_declared_is_rejected() {
+        let declared_payload_len = 20;
+        let response = crate::registry::ActorResponse::Pooled {
+            payload: pooled_payload(8),
+            prefix: None,
+            payload_len: declared_payload_len,
+        };
+        let (result, written) = write_bytes_response(response).await;
+        assert_mismatch_not_size(&result);
+        assert!(
+            written.is_empty(),
+            "a mismatched pooled response must not write anything to the socket"
+        );
+    }
+
+    /// The `prefix` (always the full 16-byte array when `Some`) must count
+    /// toward the actual total too, not just `payload.remaining()`: a
+    /// declared length sized for prefix-plus-payload but an actual payload
+    /// that disagrees must still be rejected.
+    #[tokio::test]
+    async fn pooled_response_with_prefix_and_mismatched_payload_is_rejected() {
+        // Declared as if prefix (16) + payload (8) = 24, but the actual
+        // payload is 100 bytes.
+        let response = crate::registry::ActorResponse::Pooled {
+            payload: pooled_payload(100),
+            prefix: Some([0u8; 16]),
+            payload_len: 24,
+        };
+        let (result, written) = write_bytes_response(response).await;
+        assert_mismatch_not_size(&result);
+        assert!(
+            written.is_empty(),
+            "a mismatched pooled response must not write anything to the socket"
+        );
+    }
+
+    /// A matching declared/actual length (including a prefix) must not
+    /// false-reject and must produce a correctly framed response.
+    #[tokio::test]
+    async fn pooled_response_with_prefix_and_matching_length_is_written() {
+        let response = crate::registry::ActorResponse::Pooled {
+            payload: pooled_payload(8),
+            prefix: Some([7u8; 16]),
+            payload_len: 24,
+        };
+        let (result, written) = write_bytes_response(response).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let control = crate::framing::decode_control(written[..4].try_into().unwrap()).unwrap();
+        assert_eq!(control.kind, crate::framing::WireKind::Response);
+        assert_eq!(
+            control.body_len,
+            crate::framing::ASK_RESPONSE_HEADER_LEN + 24
+        );
+        assert_eq!(
+            written.len(),
+            crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN + 24
+        );
     }
 }

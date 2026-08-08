@@ -36,9 +36,16 @@ fn reject_oversize_for_nonblocking_lane(
 /// `send_response_auto_bytes`'s size gate (R-9) instead of duplicating it.
 /// A payload above `MAX_STREAM_SIZE` is rejected locally (every receiver
 /// hard-rejects a larger stream as FATAL); a payload above the streaming
-/// threshold is auto-streamed via `stream_response_bytes` — the same
-/// machinery the `Bytes` reply path uses, reached here via one copy of the
-/// (rare, already-oversized) payload into `Bytes`.
+/// threshold, or whose inline-encoded size would exceed `max_message_size`,
+/// is auto-streamed via `stream_response_bytes` — the same machinery the
+/// `Bytes` reply path uses, reached here via one copy of the (rare,
+/// already-oversized) payload into `Bytes`. Checking only the streaming
+/// threshold here (as this used to) would pick the inline branch below for
+/// a payload the inline gate then has to refuse whenever `max_message_size`
+/// is smaller than the threshold -- streaming can still deliver it in
+/// bounded chunks, so `MessageTooLarge` must stay reserved for payloads
+/// that cannot be sent at all (>= `MAX_STREAM_SIZE`), mirroring
+/// `LockFreeStreamHandle::should_stream_response`.
 async fn send_pooled_via_stream_handle(
     stream_handle: &LockFreeStreamHandle,
     correlation_id: u32,
@@ -52,17 +59,20 @@ async fn send_pooled_via_stream_handle(
             max: crate::MAX_STREAM_SIZE,
         });
     }
-    if payload_len > stream_handle.streaming_threshold() {
+    let inline_payload_limit = stream_handle
+        .max_message_size()
+        .saturating_sub(framing::ASK_RESPONSE_HEADER_LEN);
+    if payload_len > stream_handle.streaming_threshold() || payload_len > inline_payload_limit {
         let bytes = pooled_payload_into_bytes(prefix, payload);
         return stream_handle
             .stream_response_bytes(bytes, correlation_id)
             .await;
     }
-    let header = framing::write_ask_response_header(
+    let header = framing::try_write_ask_response_header(
         crate::MessageType::Response,
         correlation_id,
         payload_len,
-    );
+    )?;
     let prefix_len = prefix.as_ref().map(|bytes| bytes.len()).unwrap_or(0) as u8;
     stream_handle
         .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
@@ -144,11 +154,11 @@ impl AskResponseSink {
         match self {
             Self::StreamHandle(stream_handle) => {
                 reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
-                let header = framing::write_ask_response_header(
+                let header = framing::try_write_ask_response_header(
                     crate::MessageType::Response,
                     correlation_id,
                     payload.len(),
-                );
+                )?;
                 stream_handle
                     .write_header_and_payload_control_inline_nonblocking(header, 16, payload)
             }
@@ -160,11 +170,11 @@ impl AskResponseSink {
         match self {
             Self::StreamHandle(stream_handle) => {
                 reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
-                let header = framing::write_ask_response_header(
+                let header = framing::try_write_ask_response_header(
                     crate::MessageType::Response,
                     correlation_id,
                     payload.len(),
-                );
+                )?;
                 stream_handle.write_header_and_payload_control_inline_immediate_nonblocking(
                     header, 16, payload,
                 )
@@ -549,22 +559,22 @@ impl ResponseWriter {
     fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         let stream_handle = self.stream_handle()?;
         reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
-        );
+        )?;
         stream_handle.write_header_and_payload_control_inline_nonblocking(header, 16, payload)
     }
 
     fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
         let stream_handle = self.stream_handle()?;
         reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
-        );
+        )?;
         stream_handle
             .write_header_and_payload_control_inline_immediate_nonblocking(header, 16, payload)
     }
@@ -806,6 +816,146 @@ mod size_gate_tests {
         assert!(
             matches!(err, crate::GossipError::MessageTooLarge { .. }),
             "expected MessageTooLarge, got {err:?}"
+        );
+
+        stream_handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A handle whose `max_message_size` (via `ReadContext`) sits far below
+    /// the default streaming threshold (~1 MiB, from `BufferConfig::default`)
+    /// -- every reply built from it below is well under the streaming
+    /// threshold and `MAX_STREAM_SIZE`, so it takes the inline branch, not
+    /// `stream_response_bytes`.
+    fn small_message_stream_handle(
+        port: u16,
+        max_message_size: usize,
+    ) -> (
+        Arc<LockFreeStreamHandle>,
+        tokio::task::JoinHandle<()>,
+        tokio::io::DuplexStream,
+    ) {
+        let (client, peer) = tokio::io::duplex(8 * 1024);
+        let read_context = crate::connection_pool::ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        };
+        let (stream_handle, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(read_context),
+        );
+        let stream_handle = Arc::new(stream_handle);
+        assert!(
+            max_message_size < stream_handle.streaming_threshold(),
+            "test setup: max_message_size must sit below the streaming \
+             threshold so the reply below takes the inline path"
+        );
+        (stream_handle, task, peer)
+    }
+
+    /// PR #183 review, round 3: a typed reply that genuinely cannot be sent
+    /// at all -- at or above `MAX_STREAM_SIZE`, so not even streaming can
+    /// deliver it -- must still be rejected locally with `MessageTooLarge`.
+    /// (A payload merely too big for the inline branch but still streamable
+    /// must not be: see
+    /// `qa_re_pooled_reply_streams_when_inline_would_exceed_max_message_size`.)
+    #[tokio::test]
+    async fn qa_re_pooled_reply_over_max_stream_size_is_still_rejected() {
+        let max_message_size = 64;
+        let (stream_handle, task, _peer) = small_message_stream_handle(9993, max_message_size);
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(44, stream_handle.clone(), used);
+
+        let huge = BigReply {
+            data: vec![0u8; crate::MAX_STREAM_SIZE + 1],
+        };
+        let err = responder.reply_typed(&huge).await.unwrap_err();
+        assert!(
+            matches!(err, crate::GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        stream_handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Same gap, the nonblocking `Bytes` reply lane
+    /// (`try_reply_bytes` -> `try_send_response_bytes`): its own
+    /// `reject_oversize_for_nonblocking_lane` pre-check only compares
+    /// against the streaming threshold.
+    #[tokio::test]
+    async fn qa_re_nonblocking_bytes_reply_over_max_message_size_is_rejected() {
+        let max_message_size = 64;
+        let (stream_handle, task, _peer) = small_message_stream_handle(9994, max_message_size);
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(45, stream_handle.clone(), used);
+
+        let payload_len = max_message_size - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
+        let err = responder
+            .try_reply_bytes(Bytes::from(vec![0u8; payload_len]))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        stream_handle.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 3: a typed reply comfortably under the
+    /// streaming threshold but whose inline-encoded size would exceed
+    /// `max_message_size` must still be delivered by streaming, not
+    /// refused -- mirrors
+    /// `LockFreeStreamHandle::auto_response_streams_when_inline_would_exceed_max_message_size`
+    /// for the pooled reply path.
+    #[tokio::test]
+    async fn qa_re_pooled_reply_streams_when_inline_would_exceed_max_message_size() {
+        let max_message_size = 128;
+        let (stream_handle, task, mut peer) = small_message_stream_handle(9995, max_message_size);
+        let used = Arc::new(AtomicBool::new(false));
+        let responder = AskResponder::from_stream_handle(46, stream_handle.clone(), used);
+
+        let payload_len = max_message_size;
+        assert!(
+            crate::framing::ASK_RESPONSE_HEADER_LEN + payload_len > max_message_size,
+            "test setup: payload must not fit inline under max_message_size"
+        );
+        let big = BigReply {
+            data: vec![7u8; payload_len],
+        };
+        responder
+            .reply_typed(&big)
+            .await
+            .expect("a reply streaming can deliver must not be refused");
+
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut ctrl)
+            .await
+            .unwrap();
+        let kind = crate::framing::decode_control(ctrl).unwrap().kind;
+        assert_eq!(
+            kind,
+            crate::framing::WireKind::StreamResponseStart,
+            "must stream, not attempt (and fail) an inline Response frame"
         );
 
         stream_handle.shutdown();

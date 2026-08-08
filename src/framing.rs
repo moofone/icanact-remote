@@ -1,4 +1,4 @@
-use crate::MessageType;
+use crate::{GossipError, MessageType, Result};
 
 /// Every V5 frame begins with one big-endian control word: kind:5 | body_len:27.
 /// body_len counts all bytes after the word.
@@ -160,22 +160,99 @@ pub struct Control {
     pub body_len: usize,
 }
 
+/// Shared `.expect()` message for every infallible wrapper in this file
+/// whose fallible `try_*` sibling is the one every internal caller actually
+/// uses (`checked_body_len`, `encode_control`, and each `write_*_header`/
+/// `write_*_frame_prefix` below except `write_route_bind_header` and
+/// `write_stream_abort_header`, which were never fallible: both take only
+/// fixed-size constants, never a caller-supplied length).
+///
+/// Unlike `write_stream_*_header`'s trusted-invariant panic (genuinely
+/// unreachable, since every internal call site clamps the chunk length to
+/// `max_stream_chunk_size()` first), the panic behind *this* message is
+/// reachable in practice: `payload_len` on these builders is an ordinary,
+/// un-chunked caller payload (`Bytes`/`PooledPayload`) with no upper bound
+/// of its own before the call. That is not a new risk this PR introduces --
+/// it is the exact, unconditional panic every one of these functions
+/// already had before this PR, when there was no fallible alternative at
+/// all. The infallible name stays available only for whatever a
+/// hypothetical caller outside this crate already depends on; every
+/// internal caller uses the `try_*` sibling, which is what actually
+/// enforces the V5 27-bit limit safely (returning `MessageTooLarge`
+/// instead of panicking the sending task and, via `ExitGuard`, tearing the
+/// connection down).
+const FRAME_BODY_LEN_INVARIANT: &str = "frame body length exceeds V5 27-bit limit";
+
+/// Sum a fixed header length with a caller-supplied payload length, bounded
+/// to the V5 27-bit body-length field. See the note on
+/// `FRAME_BODY_LEN_INVARIANT` above.
 #[inline]
 pub fn checked_body_len(fixed_len: usize, payload_len: usize) -> usize {
+    try_checked_body_len(fixed_len, payload_len).expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `checked_body_len` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+#[inline]
+pub fn try_checked_body_len(fixed_len: usize, payload_len: usize) -> Result<usize> {
     fixed_len
         .checked_add(payload_len)
         .filter(|len| *len <= CONTROL_BODY_LEN_MASK as usize)
-        .expect("frame body length exceeds V5 27-bit limit")
+        .ok_or_else(|| GossipError::MessageTooLarge {
+            size: fixed_len.saturating_add(payload_len),
+            max: CONTROL_BODY_LEN_MASK as usize,
+        })
 }
 
+/// See the note on `FRAME_BODY_LEN_INVARIANT` above.
 #[inline]
 pub fn encode_control(kind: WireKind, body_len: usize) -> [u8; LENGTH_PREFIX_LEN] {
-    assert!(
-        body_len <= CONTROL_BODY_LEN_MASK as usize,
-        "frame body length exceeds V5 27-bit limit"
-    );
+    try_encode_control(kind, body_len).expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `encode_control` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+#[inline]
+pub fn try_encode_control(kind: WireKind, body_len: usize) -> Result<[u8; LENGTH_PREFIX_LEN]> {
+    if body_len > CONTROL_BODY_LEN_MASK as usize {
+        return Err(GossipError::MessageTooLarge {
+            size: body_len,
+            max: CONTROL_BODY_LEN_MASK as usize,
+        });
+    }
     let word = ((kind as u32) << CONTROL_BODY_LEN_BITS) | body_len as u32;
-    word.to_be_bytes()
+    Ok(word.to_be_bytes())
+}
+
+/// Local pre-send admission check for an inline (non-streaming) frame: the
+/// peer's configured `max_message_size` is a ceiling on the *encoded* frame
+/// body (this `WireKind`'s fixed header length plus the caller's payload),
+/// not on the payload alone. Comparing payload length by itself under-counts
+/// every structured frame kind by its header size and lets a payload through
+/// this gate that the receiver still hard-rejects as `MessageTooLarge` once
+/// the header is added, tearing the connection down -- exactly what this
+/// check exists to prevent.
+///
+/// `fixed_header_len` must be the same constant (e.g. `ACTOR_TELL_HEADER_LEN`)
+/// the caller's `write_*_header` will add to the payload length. Pass `0` for
+/// the raw-tell/typed-tell paths: their bare-length control word has no
+/// separate structured header, so body_len == payload_len exactly.
+#[inline]
+pub fn reject_oversize_for_inline_send(
+    fixed_header_len: usize,
+    payload_len: usize,
+    max_message_size: usize,
+) -> Result<()> {
+    let body_len = fixed_header_len.saturating_add(payload_len);
+    if body_len > max_message_size {
+        return Err(GossipError::MessageTooLarge {
+            size: body_len,
+            max: max_message_size,
+        });
+    }
+    Ok(())
 }
 
 #[inline]
@@ -189,82 +266,144 @@ pub fn decode_control(bytes: [u8; LENGTH_PREFIX_LEN]) -> Option<Control> {
 }
 
 #[inline]
-fn init_header<const N: usize>(kind: WireKind, body_len: usize) -> [u8; N] {
+fn init_header<const N: usize>(kind: WireKind, body_len: usize) -> Result<[u8; N]> {
     let mut header = [0u8; N];
-    header[..LENGTH_PREFIX_LEN].copy_from_slice(&encode_control(kind, body_len));
-    header
+    header[..LENGTH_PREFIX_LEN].copy_from_slice(&try_encode_control(kind, body_len)?);
+    Ok(header)
 }
 
 /// V5 actor tell header. Payload begins at offset 16 for every inline size.
+/// See the note on `FRAME_BODY_LEN_INVARIANT` above.
 pub fn write_actor_tell_header(
     actor_id: u64,
     type_hash: u32,
     payload_len: usize,
 ) -> [u8; ACTOR_TELL_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(ACTOR_TELL_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::ActorTell, body_len);
+    try_write_actor_tell_header(actor_id, type_hash, payload_len).expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_actor_tell_header` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_actor_tell_header(
+    actor_id: u64,
+    type_hash: u32,
+    payload_len: usize,
+) -> Result<[u8; ACTOR_TELL_FRAME_HEADER_LEN]> {
+    let body_len = try_checked_body_len(ACTOR_TELL_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ACTOR_TELL_FRAME_HEADER_LEN] = init_header(WireKind::ActorTell, body_len)?;
     header[4..12].copy_from_slice(&actor_id.to_be_bytes());
     header[12..16].copy_from_slice(&type_hash.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// V5 actor ask header. The trailing pad preserves a 16-byte payload offset.
+/// See the note on `FRAME_BODY_LEN_INVARIANT` above.
 pub fn write_actor_ask_header(
     correlation_id: u32,
     actor_id: u64,
     type_hash: u32,
     payload_len: usize,
 ) -> [u8; ACTOR_ASK_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(ACTOR_ASK_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::ActorAsk, body_len);
+    try_write_actor_ask_header(correlation_id, actor_id, type_hash, payload_len)
+        .expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_actor_ask_header` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_actor_ask_header(
+    correlation_id: u32,
+    actor_id: u64,
+    type_hash: u32,
+    payload_len: usize,
+) -> Result<[u8; ACTOR_ASK_FRAME_HEADER_LEN]> {
+    let body_len = try_checked_body_len(ACTOR_ASK_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ACTOR_ASK_FRAME_HEADER_LEN] = init_header(WireKind::ActorAsk, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
     header[8..16].copy_from_slice(&actor_id.to_be_bytes());
     header[16..20].copy_from_slice(&type_hash.to_be_bytes());
-    header
+    Ok(header)
 }
 
-/// V5 compact ask after its route was bound on this connection.
+/// V5 compact ask after its route was bound on this connection. See the
+/// note on `FRAME_BODY_LEN_INVARIANT` above.
 pub fn write_routed_actor_ask_header(
     correlation_id: u32,
     route_slot: u32,
     payload_len: usize,
 ) -> [u8; ROUTED_ACTOR_ASK_FRAME_HEADER_LEN] {
-    let mut header = init_header(
-        WireKind::RoutedActorAsk,
-        checked_body_len(ROUTED_ACTOR_ASK_HEADER_LEN, payload_len),
-    );
+    try_write_routed_actor_ask_header(correlation_id, route_slot, payload_len)
+        .expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_routed_actor_ask_header` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_routed_actor_ask_header(
+    correlation_id: u32,
+    route_slot: u32,
+    payload_len: usize,
+) -> Result<[u8; ROUTED_ACTOR_ASK_FRAME_HEADER_LEN]> {
+    let body_len = try_checked_body_len(ROUTED_ACTOR_ASK_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ROUTED_ACTOR_ASK_FRAME_HEADER_LEN] =
+        init_header(WireKind::RoutedActorAsk, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
     header[8..12].copy_from_slice(&route_slot.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// Establishes a connection-scoped slot before a routed ask uses it.
+///
+/// `ROUTE_BIND_HEADER_LEN` is a fixed 20-byte constant, not a caller-supplied
+/// payload length -- it is always far under the V5 27-bit body-length limit,
+/// so this can never fail and stays infallible rather than pushing `?`
+/// through every one of its call sites for a case that cannot occur. This
+/// PR never changed this function's signature, so it has no `try_*` sibling.
 pub fn write_route_bind_header(
     route_slot: u32,
     actor_id: u64,
     type_hash: u32,
 ) -> [u8; ROUTE_BIND_FRAME_HEADER_LEN] {
-    let mut header = init_header(WireKind::RouteBind, ROUTE_BIND_HEADER_LEN);
+    let mut header: [u8; ROUTE_BIND_FRAME_HEADER_LEN] =
+        init_header(WireKind::RouteBind, ROUTE_BIND_HEADER_LEN)
+            .expect("ROUTE_BIND_HEADER_LEN is a fixed constant within the V5 27-bit limit");
     header[4..8].copy_from_slice(&route_slot.to_be_bytes());
     header[8..16].copy_from_slice(&actor_id.to_be_bytes());
     header[16..20].copy_from_slice(&type_hash.to_be_bytes());
     header
 }
 
+/// See the note on `FRAME_BODY_LEN_INVARIANT` above.
 pub fn write_ask_response_header(
     msg_type: MessageType,
     correlation_id: u32,
     payload_len: usize,
 ) -> [u8; ASK_RESPONSE_FRAME_HEADER_LEN] {
+    try_write_ask_response_header(msg_type, correlation_id, payload_len)
+        .expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_ask_response_header` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above. `msg_type` validation is
+/// unrelated to that invariant (a caller programming error, not an
+/// adversarial/oversize payload) and panics in both forms, exactly as it
+/// did before this PR.
+pub fn try_write_ask_response_header(
+    msg_type: MessageType,
+    correlation_id: u32,
+    payload_len: usize,
+) -> Result<[u8; ASK_RESPONSE_FRAME_HEADER_LEN]> {
     let kind = match msg_type {
         MessageType::Ask => WireKind::Ask,
         MessageType::Response => WireKind::Response,
         _ => panic!("ask/response header requires Ask or Response"),
     };
-    let body_len = checked_body_len(ASK_RESPONSE_HEADER_LEN, payload_len);
-    let mut header = init_header(kind, body_len);
+    let body_len = try_checked_body_len(ASK_RESPONSE_HEADER_LEN, payload_len)?;
+    let mut header: [u8; ASK_RESPONSE_FRAME_HEADER_LEN] = init_header(kind, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// Machine-readable reason an ask could not be answered with data. Carried in
@@ -335,16 +474,28 @@ const ASK_NACK_FLAG_SET: u8 = 1;
 
 /// Build a Response frame that NACKs an ask instead of answering it: same
 /// kind and header shape as a normal response, zero-length payload, with the
-/// reason packed into the header's reserved bytes.
+/// reason packed into the header's reserved bytes. See the note on
+/// `FRAME_BODY_LEN_INVARIANT` above.
 pub fn write_ask_nack_header(
     correlation_id: u32,
     reason: AskNackReason,
 ) -> [u8; ASK_RESPONSE_FRAME_HEADER_LEN] {
-    let mut header = init_header(WireKind::Response, ASK_RESPONSE_HEADER_LEN);
+    try_write_ask_nack_header(correlation_id, reason).expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_ask_nack_header` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_ask_nack_header(
+    correlation_id: u32,
+    reason: AskNackReason,
+) -> Result<[u8; ASK_RESPONSE_FRAME_HEADER_LEN]> {
+    let mut header: [u8; ASK_RESPONSE_FRAME_HEADER_LEN] =
+        init_header(WireKind::Response, ASK_RESPONSE_HEADER_LEN)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
     header[LENGTH_PREFIX_LEN + ASK_NACK_FLAG_BODY_OFFSET] = ASK_NACK_FLAG_SET;
     header[LENGTH_PREFIX_LEN + ASK_NACK_REASON_BODY_OFFSET] = reason as u8;
-    header
+    Ok(header)
 }
 
 /// Inspect a Response frame's body (the bytes after the control word,
@@ -369,16 +520,31 @@ pub fn ask_nack_reason(response_fixed_region: &[u8]) -> Option<AskNackReason> {
 }
 
 pub fn write_gossip_frame_prefix(payload_len: usize) -> [u8; GOSSIP_FRAME_HEADER_LEN] {
+    try_write_gossip_frame_prefix(payload_len).expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_gossip_frame_prefix` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_gossip_frame_prefix(payload_len: usize) -> Result<[u8; GOSSIP_FRAME_HEADER_LEN]> {
     init_header(
         WireKind::Gossip,
-        checked_body_len(GOSSIP_HEADER_LEN, payload_len),
+        try_checked_body_len(GOSSIP_HEADER_LEN, payload_len)?,
     )
 }
 
+/// See the note on `FRAME_BODY_LEN_INVARIANT` above.
 pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER_LEN] {
+    try_write_pubsub_frame_prefix(payload_len).expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_pubsub_frame_prefix` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_pubsub_frame_prefix(payload_len: usize) -> Result<[u8; PUBSUB_FRAME_HEADER_LEN]> {
     init_header(
         WireKind::PubSub,
-        checked_body_len(PUBSUB_HEADER_LEN, payload_len),
+        try_checked_body_len(PUBSUB_HEADER_LEN, payload_len)?,
     )
 }
 
@@ -406,16 +572,31 @@ pub fn write_pubsub_frame_prefix(payload_len: usize) -> [u8; PUBSUB_FRAME_HEADER
 /// must be nonzero (see `direct_ask_request_id` on the read side); 0 is
 /// reserved to mean "absent" and is rejected rather than silently accepted
 /// as a valid-looking id that could collide across independent asks.
+///
+/// See the note on `FRAME_BODY_LEN_INVARIANT` above for why this has both an
+/// infallible form and a `try_*` sibling.
 pub fn write_direct_ask_header(
     correlation_id: u32,
     request_id: u64,
     payload_len: usize,
 ) -> [u8; DIRECT_ASK_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(DIRECT_ASK_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::DirectAsk, body_len);
+    try_write_direct_ask_header(correlation_id, request_id, payload_len)
+        .expect(FRAME_BODY_LEN_INVARIANT)
+}
+
+/// Fallible sibling of `write_direct_ask_header` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_direct_ask_header(
+    correlation_id: u32,
+    request_id: u64,
+    payload_len: usize,
+) -> Result<[u8; DIRECT_ASK_FRAME_HEADER_LEN]> {
+    let body_len = try_checked_body_len(DIRECT_ASK_HEADER_LEN, payload_len)?;
+    let mut header: [u8; DIRECT_ASK_FRAME_HEADER_LEN] = init_header(WireKind::DirectAsk, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
     header[8..16].copy_from_slice(&request_id.to_be_bytes());
-    header
+    Ok(header)
 }
 
 /// Read back the stable request id `write_direct_ask_header` wrote, from a
@@ -434,17 +615,57 @@ pub fn direct_ask_request_id(body: &[u8]) -> Option<u64> {
         Some(request_id)
     }
 }
-
 pub fn write_direct_response_header(
     correlation_id: u32,
     payload_len: usize,
 ) -> [u8; DIRECT_RESPONSE_FRAME_HEADER_LEN] {
-    let body_len = checked_body_len(DIRECT_RESPONSE_HEADER_LEN, payload_len);
-    let mut header = init_header(WireKind::DirectResponse, body_len);
-    header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
-    header
+    try_write_direct_response_header(correlation_id, payload_len).expect(FRAME_BODY_LEN_INVARIANT)
 }
 
+/// Fallible sibling of `write_direct_response_header` -- see the note on
+/// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
+/// uses this, not the infallible form above.
+pub fn try_write_direct_response_header(
+    correlation_id: u32,
+    payload_len: usize,
+) -> Result<[u8; DIRECT_RESPONSE_FRAME_HEADER_LEN]> {
+    let body_len = try_checked_body_len(DIRECT_RESPONSE_HEADER_LEN, payload_len)?;
+    let mut header: [u8; DIRECT_RESPONSE_FRAME_HEADER_LEN] =
+        init_header(WireKind::DirectResponse, body_len)?;
+    header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    Ok(header)
+}
+
+/// Shared `.expect()` message for the infallible `write_stream_*_header`
+/// wrappers below -- see the note on `write_stream_request_start_header`.
+const STREAM_CHUNK_INVARIANT: &str =
+    "stream chunk length is bounded by max_stream_chunk_size, always within the V5 27-bit limit";
+
+/// In every current caller (the streaming writer in `connection_pool`),
+/// `first_chunk_len`/`payload_len` here are never the caller's raw,
+/// unbounded payload length -- the streaming writer always clamps every
+/// chunk to `max_stream_chunk_size()` first (itself derived from
+/// `max_message_size`, which config validation already bounds to the V5
+/// 27-bit limit), so `checked_body_len` cannot observe an oversize value on
+/// that path in practice. That evidence hasn't changed across four review
+/// rounds.
+///
+/// codex's objection moved each time a fix landed: `pub(crate)` broke a
+/// hypothetical downstream caller by hiding the function; `pub` + `Result`
+/// broke it anyway by changing the return type, since any expression that
+/// indexed, iterated, or otherwise used the returned array no longer
+/// compiles against a `Result`. The only change that is genuinely
+/// source-compatible with whatever a caller outside this crate could have
+/// written before this PR touched these functions is *no signature change
+/// at all*: these three stay `pub fn (..) -> [u8; N]`, exactly as they
+/// were, and panic via the same trusted-invariant `.expect()` every other
+/// infallible builder in this file uses (`write_route_bind_header`,
+/// `write_stream_abort_header`). `try_write_stream_request_start_header`/
+/// `try_write_stream_response_start_header`/`try_write_stream_data_header`
+/// below are the fallible siblings: every internal caller in this crate
+/// uses those instead, so no panicking path is reachable in practice
+/// despite the infallible signatures staying available for whatever a
+/// hypothetical downstream caller might already depend on.
 pub fn write_stream_request_start_header(
     stream_id: u32,
     correlation_id: u32,
@@ -453,56 +674,107 @@ pub fn write_stream_request_start_header(
     type_hash: u32,
     first_chunk_len: usize,
 ) -> [u8; STREAM_REQUEST_START_FRAME_HEADER_LEN] {
-    let mut header = init_header(
-        WireKind::StreamStart,
-        checked_body_len(STREAM_REQUEST_START_HEADER_LEN, first_chunk_len),
-    );
+    try_write_stream_request_start_header(
+        stream_id,
+        correlation_id,
+        total_size,
+        actor_id,
+        type_hash,
+        first_chunk_len,
+    )
+    .expect(STREAM_CHUNK_INVARIANT)
+}
+
+/// Fallible sibling of `write_stream_request_start_header` -- see the note
+/// there. Every internal caller uses this, not the infallible form above.
+pub fn try_write_stream_request_start_header(
+    stream_id: u32,
+    correlation_id: u32,
+    total_size: u32,
+    actor_id: u64,
+    type_hash: u32,
+    first_chunk_len: usize,
+) -> Result<[u8; STREAM_REQUEST_START_FRAME_HEADER_LEN]> {
+    let body_len = try_checked_body_len(STREAM_REQUEST_START_HEADER_LEN, first_chunk_len)?;
+    let mut header: [u8; STREAM_REQUEST_START_FRAME_HEADER_LEN] =
+        init_header(WireKind::StreamStart, body_len)?;
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&correlation_id.to_be_bytes());
     header[12..16].copy_from_slice(&total_size.to_be_bytes());
     header[16..24].copy_from_slice(&actor_id.to_be_bytes());
     header[24..28].copy_from_slice(&type_hash.to_be_bytes());
-    header
+    Ok(header)
 }
 
+/// See the note on `write_stream_request_start_header` above.
 pub fn write_stream_response_start_header(
     stream_id: u32,
     correlation_id: u32,
     total_size: u32,
     first_chunk_len: usize,
 ) -> [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] {
-    let mut header = init_header(
-        WireKind::StreamResponseStart,
-        checked_body_len(STREAM_RESPONSE_START_HEADER_LEN, first_chunk_len),
-    );
+    try_write_stream_response_start_header(stream_id, correlation_id, total_size, first_chunk_len)
+        .expect(STREAM_CHUNK_INVARIANT)
+}
+
+/// Fallible sibling of `write_stream_response_start_header` -- see the note
+/// on `write_stream_request_start_header` above. Every internal caller uses
+/// this, not the infallible form above.
+pub fn try_write_stream_response_start_header(
+    stream_id: u32,
+    correlation_id: u32,
+    total_size: u32,
+    first_chunk_len: usize,
+) -> Result<[u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN]> {
+    let body_len = try_checked_body_len(STREAM_RESPONSE_START_HEADER_LEN, first_chunk_len)?;
+    let mut header: [u8; STREAM_RESPONSE_START_FRAME_HEADER_LEN] =
+        init_header(WireKind::StreamResponseStart, body_len)?;
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&correlation_id.to_be_bytes());
     header[12..16].copy_from_slice(&total_size.to_be_bytes());
-    header
+    Ok(header)
 }
 
+/// See the note on `write_stream_request_start_header` above.
 pub fn write_stream_data_header(
     response: bool,
     stream_id: u32,
     chunk_index: u32,
     payload_len: usize,
 ) -> [u8; STREAM_DATA_FRAME_HEADER_LEN] {
+    try_write_stream_data_header(response, stream_id, chunk_index, payload_len)
+        .expect(STREAM_CHUNK_INVARIANT)
+}
+
+/// Fallible sibling of `write_stream_data_header` -- see the note on
+/// `write_stream_request_start_header` above. Every internal caller uses
+/// this, not the infallible form above.
+pub fn try_write_stream_data_header(
+    response: bool,
+    stream_id: u32,
+    chunk_index: u32,
+    payload_len: usize,
+) -> Result<[u8; STREAM_DATA_FRAME_HEADER_LEN]> {
     let kind = if response {
         WireKind::StreamResponseData
     } else {
         WireKind::StreamData
     };
-    let mut header = init_header(kind, checked_body_len(STREAM_DATA_HEADER_LEN, payload_len));
+    let body_len = try_checked_body_len(STREAM_DATA_HEADER_LEN, payload_len)?;
+    let mut header: [u8; STREAM_DATA_FRAME_HEADER_LEN] = init_header(kind, body_len)?;
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&chunk_index.to_be_bytes());
-    header
+    Ok(header)
 }
 
+/// `STREAM_DATA_HEADER_LEN` is a fixed 8-byte constant -- this can never fail.
 pub fn write_stream_abort_header(
     stream_id: u32,
     reason: u32,
 ) -> [u8; STREAM_DATA_FRAME_HEADER_LEN] {
-    let mut header = init_header(WireKind::StreamAbort, STREAM_DATA_HEADER_LEN);
+    let mut header: [u8; STREAM_DATA_FRAME_HEADER_LEN] =
+        init_header(WireKind::StreamAbort, STREAM_DATA_HEADER_LEN)
+            .expect("STREAM_DATA_HEADER_LEN is a fixed constant within the V5 27-bit limit");
     header[4..8].copy_from_slice(&stream_id.to_be_bytes());
     header[8..12].copy_from_slice(&reason.to_be_bytes());
     header
@@ -644,14 +916,171 @@ mod tests {
         assert_eq!(u32::from_be_bytes(bind[4..8].try_into().unwrap()), 11);
     }
 
+    /// A body length at exactly the V5 27-bit limit is still representable;
+    /// one byte past it must be rejected, not silently truncated. Exercised
+    /// through `try_checked_body_len`, the form every internal caller uses.
     #[test]
-    fn oversize_body_panics() {
-        assert!(
-            std::panic::catch_unwind(|| {
-                write_actor_tell_header(0, 0, CONTROL_BODY_LEN_MASK as usize)
-            })
-            .is_err()
-        );
+    fn checked_body_len_boundary_at_and_above_27_bits() {
+        let max = CONTROL_BODY_LEN_MASK as usize;
+        assert_eq!(try_checked_body_len(0, max).unwrap(), max);
+        assert_eq!(try_checked_body_len(1, max - 1).unwrap(), max);
+        assert!(try_checked_body_len(0, max + 1).is_err());
+        assert!(try_checked_body_len(1, max).is_err());
+    }
+
+    /// Same boundary, exercised through `try_encode_control` directly (the
+    /// other former panic site): the error must carry the offending size
+    /// and the limit, not just a message.
+    #[test]
+    fn encode_control_boundary_at_and_above_27_bits() {
+        let max = CONTROL_BODY_LEN_MASK as usize;
+        assert!(try_encode_control(WireKind::Gossip, max).is_ok());
+        match try_encode_control(WireKind::Gossip, max + 1) {
+            Err(GossipError::MessageTooLarge { size, max: reported }) => {
+                assert_eq!(size, max + 1);
+                assert_eq!(reported, max);
+            }
+            other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+    }
+
+    /// `max_message_size` bounds the encoded body (fixed header + payload),
+    /// not the payload alone: a payload that fits under the limit by itself
+    /// must still be rejected once its frame's fixed header pushes the
+    /// encoded body over it, and accepted when the same total fits.
+    #[test]
+    fn reject_oversize_for_inline_send_accounts_for_fixed_header_overhead() {
+        let max = 100;
+        assert!(reject_oversize_for_inline_send(12, 90, max).is_err());
+        assert!(reject_oversize_for_inline_send(12, 88, max).is_ok());
+        assert!(reject_oversize_for_inline_send(12, 89, max).is_err());
+        // The raw-tell/typed-tell paths pass 0: body_len == payload_len.
+        assert!(reject_oversize_for_inline_send(0, max, max).is_ok());
+        assert!(reject_oversize_for_inline_send(0, max + 1, max).is_err());
+    }
+
+    /// Every `try_*` writer whose body length is a direct function of a
+    /// caller-supplied payload must return `MessageTooLarge` at and above the
+    /// 27-bit limit instead of panicking `checked_body_len`'s old `.expect`
+    /// or `encode_control`'s old `assert!`. This is the form every internal
+    /// caller in the crate uses.
+    #[test]
+    fn oversize_body_returns_message_too_large_not_panic() {
+        let oversized = CONTROL_BODY_LEN_MASK as usize + 1;
+        assert!(matches!(
+            try_write_actor_tell_header(0, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            try_write_actor_ask_header(0, 0, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            try_write_routed_actor_ask_header(0, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            try_write_ask_response_header(MessageType::Ask, 0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            try_write_gossip_frame_prefix(oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            try_write_pubsub_frame_prefix(oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            try_write_direct_ask_header(0, 1, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            try_write_direct_response_header(0, oversized),
+            Err(GossipError::MessageTooLarge { .. })
+        ));
+    }
+
+    /// The infallible name of every builder above (and `checked_body_len`/
+    /// `encode_control`) stays available only for whatever a hypothetical
+    /// caller outside this crate already depends on -- restored to its
+    /// exact pre-PR signature and behavior. This is the once-per-function
+    /// proof that each one still panics at the same boundary its `try_*`
+    /// sibling reports as `MessageTooLarge`, rather than silently doing
+    /// something else now that the name is shared with a fallible sibling.
+    #[test]
+    fn infallible_wrappers_panic_at_the_same_boundary_their_try_sibling_reports() {
+        let oversized = CONTROL_BODY_LEN_MASK as usize + 1;
+        let cases: [(&str, Box<dyn Fn()>); 10] = [
+            (
+                "checked_body_len",
+                Box::new(move || {
+                    checked_body_len(0, oversized);
+                }),
+            ),
+            (
+                "encode_control",
+                Box::new(move || {
+                    encode_control(WireKind::Gossip, oversized);
+                }),
+            ),
+            (
+                "write_actor_tell_header",
+                Box::new(move || {
+                    write_actor_tell_header(0, 0, oversized);
+                }),
+            ),
+            (
+                "write_actor_ask_header",
+                Box::new(move || {
+                    write_actor_ask_header(0, 0, 0, oversized);
+                }),
+            ),
+            (
+                "write_routed_actor_ask_header",
+                Box::new(move || {
+                    write_routed_actor_ask_header(0, 0, oversized);
+                }),
+            ),
+            (
+                "write_ask_response_header",
+                Box::new(move || {
+                    write_ask_response_header(MessageType::Ask, 0, oversized);
+                }),
+            ),
+            (
+                "write_gossip_frame_prefix",
+                Box::new(move || {
+                    write_gossip_frame_prefix(oversized);
+                }),
+            ),
+            (
+                "write_pubsub_frame_prefix",
+                Box::new(move || {
+                    write_pubsub_frame_prefix(oversized);
+                }),
+            ),
+            (
+                "write_direct_ask_header",
+                Box::new(move || {
+                    write_direct_ask_header(0, 1, oversized);
+                }),
+            ),
+            (
+                "write_direct_response_header",
+                Box::new(move || {
+                    write_direct_response_header(0, oversized);
+                }),
+            ),
+        ];
+        for (name, case) in cases {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(case));
+            assert!(
+                outcome.is_err(),
+                "{name} must panic on an oversize payload (restored pre-PR behavior), not \
+                 silently succeed"
+            );
+        }
     }
 
     #[test]

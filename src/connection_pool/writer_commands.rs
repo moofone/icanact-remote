@@ -116,19 +116,25 @@ impl BytesStreamingResponse {
 
     fn frame_header(&self, frame_index: usize) -> InlineFrameHeader {
         if frame_index == 0 {
-            InlineFrameHeader::from_array(crate::framing::write_stream_response_start_header(
-                self.stream_id,
-                self.correlation_id,
-                self.payload_len as u32,
-                self.frame_payload_len(frame_index),
-            ))
+            InlineFrameHeader::from_array(
+                crate::framing::try_write_stream_response_start_header(
+                    self.stream_id,
+                    self.correlation_id,
+                    self.payload_len as u32,
+                    self.frame_payload_len(frame_index),
+                )
+                .expect(STREAM_CHUNK_INVARIANT),
+            )
         } else {
-            InlineFrameHeader::from_array(crate::framing::write_stream_data_header(
-                true,
-                self.stream_id,
-                frame_index as u32,
-                self.frame_payload_len(frame_index),
-            ))
+            InlineFrameHeader::from_array(
+                crate::framing::try_write_stream_data_header(
+                    true,
+                    self.stream_id,
+                    frame_index as u32,
+                    self.frame_payload_len(frame_index),
+                )
+                .expect(STREAM_CHUNK_INVARIANT),
+            )
         }
     }
 
@@ -136,6 +142,25 @@ impl BytesStreamingResponse {
         self.retained_bytes
     }
 }
+
+/// This crate's only caller of `framing::try_write_stream_response_start_header`/
+/// `try_write_stream_data_header` on the hot per-frame path
+/// (`BytesStreamingResponse`/`PooledStreamingResponse::frame_header`, called
+/// once per streamed frame from `write_bytes_streaming_command_slice`/
+/// `write_pooled_streaming_command_slice`): `frame_payload_len` always
+/// returns a length clamped to `chunk_size`, which the streaming writer
+/// derives from `max_stream_chunk_size()` (itself bounded by
+/// `max_message_size`, which config validation keeps within the V5 27-bit
+/// limit) before either response type is constructed. `checked_body_len`
+/// cannot observe an oversize value on this path, so `frame_header` stays
+/// infallible rather than threading a `Result` through a hot loop that
+/// currently returns a plain `std::io::Result`; the two `try_write_stream_*`
+/// calls above trust that invariant explicitly instead of silently, the
+/// same way `write_route_bind_header`/`write_stream_abort_header` (and
+/// `framing`'s own infallible `write_stream_*_header` wrappers) do for
+/// their own fixed-size invariants.
+const STREAM_CHUNK_INVARIANT: &str =
+    "stream chunk length is bounded by max_stream_chunk_size, always within the V5 27-bit limit";
 
 /// Return a streaming payload together with the allocation footprint retained
 /// by the response command.
@@ -245,19 +270,25 @@ impl PooledStreamingResponse {
 
     fn frame_header(&self, frame_index: usize) -> InlineFrameHeader {
         if frame_index == 0 {
-            InlineFrameHeader::from_array(crate::framing::write_stream_response_start_header(
-                self.stream_id,
-                self.correlation_id,
-                self.payload_len as u32,
-                self.frame_payload_len(frame_index),
-            ))
+            InlineFrameHeader::from_array(
+                crate::framing::try_write_stream_response_start_header(
+                    self.stream_id,
+                    self.correlation_id,
+                    self.payload_len as u32,
+                    self.frame_payload_len(frame_index),
+                )
+                .expect(STREAM_CHUNK_INVARIANT),
+            )
         } else {
-            InlineFrameHeader::from_array(crate::framing::write_stream_data_header(
-                true,
-                self.stream_id,
-                frame_index as u32,
-                self.frame_payload_len(frame_index),
-            ))
+            InlineFrameHeader::from_array(
+                crate::framing::try_write_stream_data_header(
+                    true,
+                    self.stream_id,
+                    frame_index as u32,
+                    self.frame_payload_len(frame_index),
+                )
+                .expect(STREAM_CHUNK_INVARIANT),
+            )
         }
     }
 

@@ -4166,15 +4166,31 @@ async fn answer_inbound_clock_probe(
         }
     };
     let payload = bytes::Bytes::from_owner(response_data);
-    let header = bytes::Bytes::copy_from_slice(&framing::write_gossip_frame_prefix(payload.len()));
-    let pool = &registry.connection_pool;
-    let send_result = match pool.send_to_peer_id_parts(peer_id, header, payload.clone()) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let fallback_header =
-                bytes::Bytes::copy_from_slice(&framing::write_gossip_frame_prefix(payload.len()));
-            pool.send_lock_free_parts(peer_addr, fallback_header, payload)
+    // Locally generated, not gated by any caller: reject here rather than
+    // let `framing` panic (>= 2^27 bytes) or hand the peer a frame it will
+    // hard-reject as MessageTooLarge, tearing the whole connection down.
+    // Goes through the same helper every other inline-send gate uses so the
+    // admission check and `write_gossip_frame_prefix`'s own
+    // `GOSSIP_HEADER_LEN` overhead can't drift apart.
+    if let Err(e) = framing::reject_oversize_for_inline_send(
+        framing::GOSSIP_HEADER_LEN,
+        payload.len(),
+        registry.config.max_message_size,
+    ) {
+        debug!(peer = %peer_addr, error = %e, "inline clock-echo response too large to frame");
+        return;
+    }
+    let header = match framing::try_write_gossip_frame_prefix(payload.len()) {
+        Ok(header) => bytes::Bytes::copy_from_slice(&header),
+        Err(e) => {
+            debug!(peer = %peer_addr, error = %e, "clock-echo response too large to frame");
+            return;
         }
+    };
+    let pool = &registry.connection_pool;
+    let send_result = match pool.send_to_peer_id_parts(peer_id, header.clone(), payload.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) => pool.send_lock_free_parts(peer_addr, header, payload),
     };
     if let Err(e) = send_result {
         debug!(peer = %peer_addr, error = %e, "R16i: could not answer inbound clock probe inline");
@@ -4739,8 +4755,24 @@ pub(crate) fn handle_incoming_message(
                         });
 
                         let payload = bytes::Bytes::from_owner(response_data);
+                        // Locally generated, not gated by any caller: reject
+                        // here rather than let `framing` panic (>= 2^27
+                        // bytes) or hand the peer a frame it will
+                        // hard-reject as MessageTooLarge, tearing the whole
+                        // connection down. Goes through the same helper every
+                        // other inline-send gate uses so the admission check
+                        // and `write_gossip_frame_prefix`'s own
+                        // `GOSSIP_HEADER_LEN` overhead can't drift apart.
+                        if let Err(e) = framing::reject_oversize_for_inline_send(
+                            framing::GOSSIP_HEADER_LEN,
+                            payload.len(),
+                            registry.config.max_message_size,
+                        ) {
+                            warn!(error = %e, "FullSync response too large to frame");
+                            return Ok(());
+                        }
                         let header = bytes::Bytes::copy_from_slice(
-                            &framing::write_gossip_frame_prefix(payload.len()),
+                            &framing::try_write_gossip_frame_prefix(payload.len())?,
                         );
 
                         // Debug: Log what connections we have
@@ -4773,21 +4805,15 @@ pub(crate) fn handle_incoming_message(
                         // Try to send using peer ID
                         let send_result = match pool.send_to_peer_id_parts(
                             &sender_peer_id,
-                            header,
+                            header.clone(),
                             payload.clone(),
                         ) {
                             Ok(()) => Ok(()),
                             Err(e) => {
                                 warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
-                                // Fall back to socket address
-                                let fallback_header = bytes::Bytes::copy_from_slice(
-                                    &framing::write_gossip_frame_prefix(payload.len()),
-                                );
-                                pool.send_lock_free_parts(
-                                    sender_socket_addr,
-                                    fallback_header,
-                                    payload,
-                                )
+                                // Fall back to socket address, reusing the
+                                // already-validated header (same payload).
+                                pool.send_lock_free_parts(sender_socket_addr, header, payload)
                             }
                         };
 

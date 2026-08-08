@@ -1820,7 +1820,9 @@ impl LockFreeStreamHandle {
                             total_bytes_written += bytes_written;
                         }
                         match payload {
-                            WritePayload::Single(data) => write_chunks.push(data),
+                            WritePayload::Single(data) | WritePayload::TrustedFrame(data) => {
+                                write_chunks.push(data)
+                            }
                             WritePayload::HeaderPayload { header, payload } => {
                                 if !direct_ask_headers.is_empty() {
                                     let bytes_written = match flush_direct_ask_batch(
@@ -2335,7 +2337,7 @@ impl LockFreeStreamHandle {
                                     }
                                 }
                             }
-                            WritePayload::Buf(mut buf) => {
+                            WritePayload::Buf { mut buf, .. } => {
                                 if !direct_ask_headers.is_empty() {
                                     let bytes_written = match flush_direct_ask_batch(
                                         &mut stream,
@@ -3286,6 +3288,537 @@ impl LockFreeStreamHandle {
         }
     }
 
+    /// The invariant this method enforces, for every `WritePayload` this
+    /// crate can enqueue: **no frame may be enqueued whose real byte count
+    /// disagrees with its own control word.** Every `write_*_header`
+    /// constructor in `framing.rs` encodes `body_len` as
+    /// `fixed_header_len + payload_len` for the exact lengths it was called
+    /// with (see `checked_body_len`); nothing downstream re-derives or
+    /// re-checks that promise before the bytes actually go on the wire. A
+    /// caller that builds a header from one length and then supplies
+    /// (header, payload) pieces whose real, combined length disagrees would
+    /// desync the peer's frame parser -- worse than a merely oversize
+    /// frame, which the peer at least rejects cleanly as `MessageTooLarge`
+    /// without losing its place in the stream.
+    ///
+    /// This runs once, at the single point every inline (non-streaming)
+    /// write funnels through -- called from all four `enqueue_*` functions
+    /// below -- so it does not matter whether the caller went through
+    /// `ConnectionHandle::reject_oversize_inline`'s pre-check, a narrower
+    /// pre-check (`ask_responder`'s streaming-threshold-only lanes), or no
+    /// pre-check at all: an inline send whose declared and actual lengths
+    /// disagree, or whose declared length exceeds `max_message_size`,
+    /// cannot reach the write queue. A pre-check upstream of this one is
+    /// still worth keeping where it exists (it can reject before spending a
+    /// header build, an `AlignedBytes` conversion, etc.), but none of them
+    /// is load-bearing for correctness anymore -- this is.
+    ///
+    /// For every header-carrying variant, "real byte count" is computed
+    /// from the exact slices the write loop (`io_task`, below) actually
+    /// puts on the wire for that variant -- `header_len`-truncated arrays,
+    /// an optional `prefix`, `Buf::remaining()` for pooled payloads -- not
+    /// just `payload.len()`, so this cannot be fooled by a header/payload
+    /// pair built from two different lengths.
+    ///
+    /// PR #183 review, round 10: this used to be documented as a list of
+    /// call sites (which public method constructs which variant, and what
+    /// each one happens to validate). That list has been revised twice
+    /// across this review, and a path not on it turned up again both
+    /// times, because a hand-maintained list of call sites is exactly as
+    /// complete as its last audit. Stated instead as an exhaustive
+    /// property of `WritePayload` the enum: every variant falls into
+    /// exactly one of two categories, and the `match` a few lines below
+    /// this comment is exhaustive over them -- adding a variant that
+    /// doesn't fit either one fails to compile, not just fails to be
+    /// remembered.
+    ///
+    /// PR #183 review, round 11 introduced (and round 12 retired) an
+    /// opaque-vs-framed split on `Single`, on the theory that content
+    /// cannot answer "is this a frame" and the caller should declare it
+    /// instead. That theory was right about content-sniffing, wrong about
+    /// there being a legitimate opaque case to declare: **this crate's
+    /// wire protocol has no concept of unframed bytes.** Every read path
+    /// (`read_message_step`/`read_message_step_poll`/
+    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// unconditionally decodes a control word from whatever arrives on the
+    /// stream and fails the connection (`"unknown V5 wire kind"`) if it
+    /// doesn't decode -- there is no raw-passthrough read mode a sender
+    /// could target with genuinely opaque bytes. `Single` backs
+    /// `write_bytes_control`/`write_bytes_ask`/`write_bytes_nonblocking`
+    /// and the `ConnectionHandle` methods built on them
+    /// (`send_data`/`send_raw_bytes`/`send_bytes_zero_copy`/
+    /// `send_binary_message`); none of those methods has a caller anywhere
+    /// in this crate today, but every one whose doc comment says anything
+    /// about shape (`send_data`: "pre-serialized data"; `send_binary_message`:
+    /// "already has length prefix") describes a complete frame, and the
+    /// peer-side fact above means that is the *only* coherent contract for
+    /// content these methods put on a V5-framed connection, not a matter
+    /// of which docstring is technically most convenient to read. `Single`
+    /// therefore gets the same per-frame walk `TrustedFrame`'s
+    /// producers already know their bytes would pass, just not the
+    /// exemption from having to prove it.
+    ///
+    /// - **Self-built, trusted bytes: `TrustedFrame`.** Exempt
+    ///   unconditionally. Constructible only via `pub(crate)` methods (see
+    ///   the variant's own doc comment for the exhaustive list of internal
+    ///   call sites), so every possible producer is enumerable by
+    ///   visibility, not by convention, and each one already built the
+    ///   complete, valid bytes itself before enqueueing -- there is
+    ///   nothing left here to check.
+    /// - **Caller-observable bytes: every other variant.** The exact
+    ///   content, or the exact length, was supplied by (or on behalf of) a
+    ///   caller outside this trusted-construction boundary, so it is
+    ///   validated before it can reach the write queue. What "validated"
+    ///   means differs by what each variant structurally has to check
+    ///   against:
+    ///   - `HeaderPayload`/`HeaderInline`/`HeaderInlineAligned`/
+    ///     `HeaderInline32`/`HeaderPooled`/`HeaderInlinePooled`/
+    ///     `DirectAskInline` carry a header slice with its own embedded
+    ///     control word: decode it from the exact bytes the write loop will
+    ///     actually send (`header[..header_len]` for the three variants
+    ///     that truncate a fixed-size array with a separate declared
+    ///     length, the whole slice for the others, which have none), and
+    ///     compare the total it declares against the real total the write
+    ///     loop will produce for that exact command. `HeaderInline`/
+    ///     `HeaderInlineAligned`/`HeaderInlinePooled` additionally
+    ///     bounds-check `header_len` (and `HeaderInlinePooled`'s
+    ///     `prefix_len`) against their backing arrays first -- the write
+    ///     loop slices `&header[header_off..header_len]` unconditionally,
+    ///     so an out-of-range length must be refused here, not left to
+    ///     panic the write loop.
+    ///   - `Buf` carries no header slice of its own, only a caller-declared
+    ///     `expected_len` captured when the header it is chained onto was
+    ///     built: compare that against `buf.remaining()`, then peek
+    ///     `buf.chunk()` (a non-consuming read) for the leading bytes,
+    ///     decode a control word from them, and require its declared total
+    ///     equal `expected_len` exactly -- the same "decode what the wire
+    ///     actually gets" rule as the header-carrying variants, applied to
+    ///     `Buf`'s own leading bytes instead of a separate header field.
+    ///   - `Single` carries no separately-declared length *or* header
+    ///     slice at all -- whatever control word exists is embedded in
+    ///     the content itself, at an offset this method has to walk to
+    ///     find. `reject_oversize_single` (below) enforces a closure
+    ///     property rather than checking a length: a `Single` write is
+    ///     accepted only if it consists of exactly N complete V5 frames,
+    ///     N >= 0, each within `max_message_size`, with nothing left
+    ///     over -- see that method's own doc comment for the full
+    ///     invariant and why it is sufficient on its own.
+    fn reject_oversize_write_payload(&self, payload: &WritePayload) -> Result<()> {
+        // `Buf` has no header slice to decode a control word from; check it
+        // against its own caller-declared `expected_len` and return early.
+        if let WritePayload::Buf { buf, expected_len } = payload {
+            let actual_len = buf.remaining();
+            if actual_len != *expected_len {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Buf write declared {expected_len} bytes but the buffer \
+                         actually has {actual_len} remaining -- refusing to send a \
+                         frame whose header would disagree with its own body"
+                    ),
+                )));
+            }
+
+            // PR #183 review, round 15: `body_len` used to be derived as
+            // `expected_len.saturating_sub(LENGTH_PREFIX_LEN)` -- a bare
+            // arithmetic relationship to the caller's own claimed aggregate
+            // length, never to anything actually embedded in `buf`. That let
+            // two things through: a 1-3 byte `Buf` write, where the
+            // `saturating_sub` silently floors to a `body_len` of 0 with no
+            // control word present at all; and an oversized frame smuggled
+            // across several separate `Buf` calls, since nothing here ever
+            // decoded a real control word to confirm this write's own bytes
+            // are the *whole* frame its length claims, only that the claim
+            // and `buf.remaining()` agree with each other.
+            //
+            // `Buf::chunk()` (unlike `advance()`) takes `&self`, so it can be
+            // called here through the shared reference this method holds
+            // without disturbing the cursor the write loop will actually
+            // consume from later -- this is a peek, not a consume. For the
+            // one production producer (`ConnectionHandle::send_response_buf`,
+            // which chains a freshly built `Bytes` header onto the caller's
+            // payload) the first chunk *is* the complete header, since the
+            // leading `Bytes` component of a `Chain` hasn't been advanced yet
+            // and is handed back whole by `chunk()` while it still has
+            // remaining bytes -- so this reliably sees the real leading bytes
+            // the write loop will send first. A future producer whose `Buf`
+            // impl cannot present at least 4 contiguous leading bytes here is
+            // refused rather than guessed at, the same conservative choice
+            // made for every other variant in this method.
+            let chunk = buf.chunk();
+            if chunk.len() < framing::LENGTH_PREFIX_LEN {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Buf write's first available chunk supplies only {} byte(s), \
+                         too few to contain a complete V5 control word ({} bytes) -- \
+                         refusing a write that is not a whole, verifiable frame",
+                        chunk.len(),
+                        framing::LENGTH_PREFIX_LEN,
+                    ),
+                )));
+            }
+            let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
+            control_word.copy_from_slice(&chunk[..framing::LENGTH_PREFIX_LEN]);
+            let Some(control) = framing::decode_control(control_word) else {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Buf write's leading bytes do not decode as a valid V5 control \
+                     word -- refusing a write that is not a whole, verifiable frame",
+                )));
+            };
+            let declared_total = framing::LENGTH_PREFIX_LEN + control.body_len;
+            if declared_total != actual_len {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Buf write's own control word declares {declared_total} total \
+                         bytes but the write is {actual_len} -- refusing to enqueue a \
+                         write that is not exactly the one complete frame its own \
+                         control word describes"
+                    ),
+                )));
+            }
+            if control.body_len > self.max_message_size {
+                return Err(GossipError::MessageTooLarge {
+                    size: control.body_len,
+                    max: self.max_message_size,
+                });
+            }
+            return Ok(());
+        }
+        if matches!(payload, WritePayload::TrustedFrame(_)) {
+            return Ok(());
+        }
+        if let WritePayload::Single(data) = payload {
+            return self.reject_oversize_single(data);
+        }
+
+        // Every other variant: pair the header bytes the write loop will
+        // actually decode a control word from with the *real* total byte
+        // count (header + optional prefix + payload) that loop will
+        // actually put on the wire for this exact command.
+        let (control_source, actual_total): (&[u8], usize) = match payload {
+            WritePayload::HeaderPayload { header, payload } => {
+                (header.as_ref(), header.len() + payload.len())
+            }
+            WritePayload::HeaderInline {
+                header,
+                header_len,
+                payload,
+            } => {
+                let header_len = *header_len as usize;
+                // PR #183 review, round 15: `header_len` used to be trusted
+                // for `actual_total` but never bounds-checked against
+                // `header`'s own backing array, and the control word used to
+                // be decoded from `&header[..]` (all 16 bytes) regardless of
+                // `header_len` -- but the write loop below (`io_task`'s
+                // `HeaderInline` arm) only ever sends `&header[..header_len]`.
+                // A `header_len` too small to hold a control word (0-3) could
+                // pass with a real-looking decode read from bytes past what
+                // the wire actually gets, and a `header_len` above 16 passed
+                // validation here and then panicked the write loop slicing
+                // `&header[header_off..header_len]` out of a 16-byte array.
+                // Both are refused here now, before either can happen.
+                if header_len > header.len() {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "header_len {header_len} exceeds the {}-byte backing \
+                             array -- refusing a write the write loop would panic \
+                             slicing",
+                            header.len(),
+                        ),
+                    )));
+                }
+                (&header[..header_len], header_len + payload.len())
+            }
+            WritePayload::HeaderInlineAligned {
+                header,
+                header_len,
+                payload,
+            } => {
+                let header_len = *header_len as usize;
+                // Same bounds-check and same-slice-as-the-wire decode as
+                // `HeaderInline` above -- see that arm's comment.
+                if header_len > header.len() {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "header_len {header_len} exceeds the {}-byte backing \
+                             array -- refusing a write the write loop would panic \
+                             slicing",
+                            header.len(),
+                        ),
+                    )));
+                }
+                (&header[..header_len], header_len + payload.len())
+            }
+            WritePayload::HeaderInline32 { header, payload } => {
+                // Always sent as the full fixed-size array -- there is no
+                // `header_len` field because this header kind has no
+                // variable-length inline form (see `write_header_and_payload_control_inline32`).
+                (&header[..], header.len() + payload.len())
+            }
+            WritePayload::HeaderPooled {
+                header,
+                prefix,
+                payload,
+            } => {
+                let prefix_len = prefix.as_ref().map(bytes::Bytes::len).unwrap_or(0);
+                (
+                    header.as_ref(),
+                    header.len() + prefix_len + payload.remaining(),
+                )
+            }
+            WritePayload::HeaderInlinePooled {
+                header,
+                header_len,
+                prefix,
+                prefix_len,
+                payload,
+            } => {
+                let header_len = *header_len as usize;
+                // Same bounds-check and same-slice-as-the-wire decode as
+                // `HeaderInline` above -- see that arm's comment. The write
+                // loop (`io_task`'s `HeaderInlinePooled` arm) slices
+                // `&header[header_off..header_len]` the same way.
+                if header_len > header.len() {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "header_len {header_len} exceeds the {}-byte backing \
+                             array -- refusing a write the write loop would panic \
+                             slicing",
+                            header.len(),
+                        ),
+                    )));
+                }
+                // The write loop only ever sends the prefix bytes when
+                // `prefix` is `Some` (see `io_task`'s `HeaderInlinePooled`
+                // arm) -- a stale, unused `prefix_len` when `prefix` is
+                // `None` must not count toward the real byte total. When it
+                // is `Some`, the write loop slices
+                // `&prefix[prefix_off..prefix_len]` out of the same
+                // fixed-size array, so `prefix_len` needs the identical
+                // bounds-check `header_len` gets above -- an out-of-range
+                // value here panics the write loop exactly the same way.
+                let prefix_len = if let Some(prefix) = prefix {
+                    let prefix_len = *prefix_len as usize;
+                    if prefix_len > prefix.len() {
+                        return Err(GossipError::Network(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "prefix_len {prefix_len} exceeds the {}-byte backing \
+                                 array -- refusing a write the write loop would panic \
+                                 slicing",
+                                prefix.len(),
+                            ),
+                        )));
+                    }
+                    prefix_len
+                } else {
+                    0
+                };
+                (
+                    &header[..header_len],
+                    header_len + prefix_len + payload.remaining(),
+                )
+            }
+            WritePayload::DirectAskInline { header, payload } => {
+                // Always sent as the full fixed-size array (see
+                // `write_direct_ask_inline`) -- no separate length field.
+                (&header[..], header.len() + payload.len())
+            }
+            WritePayload::Single(_) | WritePayload::TrustedFrame(_) | WritePayload::Buf { .. } => {
+                unreachable!(
+                    "Single/TrustedFrame return early above this match; Buf is handled before it"
+                )
+            }
+        };
+
+        // PR #183 review, round 14: the same closure property round 13
+        // applied to `Single` -- "what reaches the wire must be a whole
+        // number of complete frames" -- applies here too, however the
+        // frame was split between `header` and `payload`. A header
+        // shorter than a control word, or one that doesn't decode as one,
+        // used to return `Ok(())` here without inspecting `actual_total`
+        // at all: a caller could hand `write_header_and_payload_control`
+        // an empty or 1-3 byte `header` and put a complete oversized V5
+        // frame in `payload`, and this check would never see it. Both
+        // cases are refused outright now, the same as an unrecognizable
+        // or too-short remainder in `reject_oversize_single`.
+        if control_source.len() < framing::LENGTH_PREFIX_LEN {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "header supplies only {} byte(s), too few to contain a complete V5 \
+                     control word ({} bytes) -- refusing a write that is not a whole \
+                     number of complete frames",
+                    control_source.len(),
+                    framing::LENGTH_PREFIX_LEN,
+                ),
+            )));
+        }
+        let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
+        control_word.copy_from_slice(&control_source[..framing::LENGTH_PREFIX_LEN]);
+        let Some(control) = framing::decode_control(control_word) else {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "header's leading bytes do not decode as a valid V5 control word -- \
+                 refusing a write that is not a whole number of complete frames",
+            )));
+        };
+
+        let expected_total = framing::LENGTH_PREFIX_LEN + control.body_len;
+        if actual_total != expected_total {
+            return Err(GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "frame's control word declares {expected_total} total bytes but \
+                     the write would actually produce {actual_total} -- refusing to \
+                     enqueue a frame whose header disagrees with its own body"
+                ),
+            )));
+        }
+        if control.body_len > self.max_message_size {
+            return Err(GossipError::MessageTooLarge {
+                size: control.body_len,
+                max: self.max_message_size,
+            });
+        }
+        Ok(())
+    }
+
+    /// Size gate for `WritePayload::Single` -- see the note on it above.
+    ///
+    /// PR #183 review, round 13: this enforces a closure property rather
+    /// than a list of blocked shapes -- **a `Single` write is accepted if
+    /// and only if it consists of exactly N complete V5 frames, N >= 0,
+    /// each within `max_message_size`, with nothing left over.** That
+    /// property is sufficient on its own, independent of how a caller
+    /// splits its writes: the concatenation of any sequence of
+    /// closure-satisfying writes is itself a sequence of complete frames
+    /// with no oversized frame among them, by induction on the number of
+    /// writes -- there is no split point across separate calls this
+    /// leaves open, because every accepted write's own bytes are already
+    /// exactly some whole number of frames on their own.
+    ///
+    /// Nine rounds of this review each found a different way to violate
+    /// that property while looking locally harmless: an oversized frame's
+    /// *aggregate* length judged instead of each frame's own (round 6), a
+    /// truncated body (round 7's chunking), a lone header with its body
+    /// supplied later (round 10), and a truncated *control word* -- fewer
+    /// than `LENGTH_PREFIX_LEN` bytes left over, which the previous
+    /// version's `saturating_sub` silently zeroed into "small enough,
+    /// accept it" (this round). Every one of those was the same mistake:
+    /// accepting a remainder that is not itself a whole number of complete
+    /// frames. This version has no remainder-shaped exception -- the walk
+    /// below either consumes `data` exactly via complete frames, or it
+    /// returns an error; there is no bare-length fallback for content that
+    /// fails to decode, because content that fails to decode cannot be
+    /// "N complete frames" for any N, and (per the note on
+    /// `reject_oversize_write_payload` above) this crate's wire protocol
+    /// has no shape such content could legitimately take instead.
+    ///
+    /// Each decoded frame is checked against `max_message_size` on its own
+    /// `body_len`, not the buffer's aggregate length -- two valid 100-byte
+    /// frames concatenated into one 208-byte `Single` are exactly as
+    /// acceptable as two separate writes of them would have been, even
+    /// though 208 alone would fail a whole-buffer ceiling.
+    ///
+    /// `offset` strictly increases by at least `LENGTH_PREFIX_LEN` each
+    /// iteration (every decoded frame is at least that many bytes), so
+    /// this terminates in at most `data.len() / LENGTH_PREFIX_LEN`
+    /// iterations -- no adversarially-crafted content can loop it.
+    fn reject_oversize_single(&self, data: &[u8]) -> Result<()> {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let remaining = data.len() - offset;
+            if remaining < framing::LENGTH_PREFIX_LEN {
+                // PR #183 review, round 13: fewer bytes remain than a
+                // control word needs. A nonempty remainder this short is
+                // not "close enough" to a complete frame to accept --
+                // it is not a whole number of complete frames at all, the
+                // one shape this method exists to guarantee. Without this,
+                // a caller could send the first `remaining` bytes of a
+                // control word declaring an oversized body in one `Single`
+                // write (too short to even attempt a decode, so the old
+                // code fell through to a bare-length check that a 1-3 byte
+                // remainder always passes), then the rest of the control
+                // word plus the body in further writes -- reconstructing
+                // the same split-frame bypass every earlier round closed
+                // for longer remainders.
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{remaining} byte(s) remain at offset {offset}, too few to contain \
+                         a complete V5 control word ({} bytes) -- refusing a Single write \
+                         that is not a whole number of complete frames",
+                        framing::LENGTH_PREFIX_LEN,
+                    ),
+                )));
+            }
+            let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
+            control_word.copy_from_slice(&data[offset..offset + framing::LENGTH_PREFIX_LEN]);
+            let Some(control) = framing::decode_control(control_word) else {
+                // PR #183 review, round 13: enough bytes remain to hold a
+                // control word, but they do not decode as one. This is not
+                // "opaque content, judge it by length instead" (round 12
+                // retired that interpretation crate-wide) -- it is content
+                // that is not a whole number of complete frames, the same
+                // violation as every other rejection in this method, so it
+                // gets the same treatment: refused outright, not
+                // length-bounded and let through.
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{remaining} byte(s) remain at offset {offset}; the leading \
+                         {} bytes do not decode as a valid V5 control word -- refusing \
+                         a Single write that is not a whole number of complete frames",
+                        framing::LENGTH_PREFIX_LEN,
+                    ),
+                )));
+            };
+            let frame_total = framing::LENGTH_PREFIX_LEN + control.body_len;
+            if remaining < frame_total {
+                // PR #183 review, round 10 (reaffirmed rounds 12-13): a
+                // `Single` write that begins a frame it does not complete
+                // is refused outright, not judged as if the missing bytes
+                // simply weren't there -- otherwise a caller could split
+                // one frame's header (declaring an arbitrary, possibly
+                // oversized body) from its body across separate `Single`
+                // writes: each individual call would supply too few bytes
+                // to look like a complete frame, so each one would pass,
+                // while the peer reassembled the whole frame from the
+                // continuous TCP stream anyway (write() boundaries are
+                // invisible on the wire). A `Single` write cannot assert
+                // "the rest is coming in a later call" the way an internal
+                // `TrustedFrame` producer can assert "I already built the
+                // rest myself."
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "control word at offset {offset} declares a {frame_total}-byte \
+                         frame (kind {:?}, body_len {}) but this write only supplies \
+                         {remaining} bytes from that offset -- refusing a Single write \
+                         that begins a frame it does not complete; a frame split across \
+                         separate public calls cannot be validated per-call",
+                        control.kind, control.body_len,
+                    ),
+                )));
+            }
+            if control.body_len > self.max_message_size {
+                return Err(GossipError::MessageTooLarge {
+                    size: control.body_len,
+                    max: self.max_message_size,
+                });
+            }
+            offset += frame_total;
+        }
+        Ok(())
+    }
+
     async fn enqueue_write(&self, payload: WritePayload) -> Result<()> {
         if self.exit_flag.load(Ordering::Acquire) {
             return Err(GossipError::ConnectionClosed(self.addr));
@@ -3293,6 +3826,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         let command = WriteCommand::Payload(payload);
         match self.write_queue.try_push(command) {
@@ -3311,6 +3845,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         let command = WriteCommand::AskPayload(payload);
         match self.write_queue.try_push(command) {
@@ -3329,6 +3864,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         match self.write_queue.try_push(WriteCommand::Payload(payload)) {
             Ok(()) => {
@@ -3346,6 +3882,7 @@ impl LockFreeStreamHandle {
         if self.shutdown_signal.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
+        self.reject_oversize_write_payload(&payload)?;
         self.sequence_counter.fetch_add(1, Ordering::Relaxed);
         match self
             .immediate_write_queue
@@ -3363,6 +3900,18 @@ impl LockFreeStreamHandle {
         self.enqueue_ask_write(WritePayload::Single(data)).await
     }
 
+    /// `pub(crate)`, deliberately not `pub`: constructs `WritePayload::TrustedFrame`,
+    /// which `reject_oversize_write_payload` never validates. See that
+    /// variant's own doc comment for exactly which callers this crate lets
+    /// use it and why each is safe. Nothing outside this crate can reach
+    /// this method, so nothing outside this crate can express an
+    /// unvalidated write this way -- that restriction is enforced by
+    /// visibility, not by a comment asking callers to be careful.
+    pub(crate) async fn write_trusted_bytes_ask(&self, data: bytes::Bytes) -> Result<()> {
+        self.enqueue_ask_write(WritePayload::TrustedFrame(data))
+            .await
+    }
+
     /// Queue a compact ActorAsk, installing its connection-local route first.
     /// Both frames use the one ordered writer queue; the small gate only spans
     /// enqueueing, so no response wait or network I/O is serialized here.
@@ -3375,6 +3924,22 @@ impl LockFreeStreamHandle {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
+        // Fast pre-check before anything else, using the smaller of the two
+        // possible header overheads below (`ROUTED_ACTOR_ASK_HEADER_LEN`):
+        // an inline ask over `max_message_size` gets a fatal `MessageTooLarge`
+        // read error from the receiver, tearing the whole connection down for
+        // every other actor sharing it. This cannot false-reject -- neither
+        // branch below ever needs less than this overhead -- so a clearly
+        // oversized ask never waits on identification or takes the
+        // route-bind gate for nothing. It is not sufficient on its own: the
+        // unbound-route fallback below adds the larger `ACTOR_ASK_HEADER_LEN`
+        // instead, and is re-checked precisely at that point.
+        crate::framing::reject_oversize_for_inline_send(
+            crate::framing::ROUTED_ACTOR_ASK_HEADER_LEN,
+            payload.len(),
+            self.max_message_size,
+        )?;
+
         // A brand-new outbound connection gates this behind its own
         // identifying FullSync (see `begin_identify_gate`/`mark_identified`
         // in `finalize_new_outbound_connection`): a `RouteBind` must never
@@ -3407,8 +3972,23 @@ impl LockFreeStreamHandle {
             // and type_hash directly and needs no connection-local slot at
             // all, so this ask (and every later one on this connection) still
             // succeeds rather than the connection being torn down.
-            let header =
-                crate::framing::write_actor_ask_header(correlation_id, actor_id, type_hash, payload.len());
+            //
+            // This frame's header is `ACTOR_ASK_HEADER_LEN` (28 bytes), wider
+            // than the `ROUTED_ACTOR_ASK_HEADER_LEN` (12 bytes) the pre-check
+            // above allowed for -- re-check precisely against this branch's
+            // real overhead before spending a header build on a payload that
+            // would still exceed `max_message_size` once framed.
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::ACTOR_ASK_HEADER_LEN,
+                payload.len(),
+                self.max_message_size,
+            )?;
+            let header = crate::framing::try_write_actor_ask_header(
+                correlation_id,
+                actor_id,
+                type_hash,
+                payload.len(),
+            )?;
             return self
                 .write_header_and_payload_ask_inline32(header, payload)
                 .await;
@@ -3428,23 +4008,31 @@ impl LockFreeStreamHandle {
                 route_slot,
                 route,
             );
-            if let Err(error) = self.write_bytes_control(bytes::Bytes::copy_from_slice(&bind)).await {
+            if let Err(error) = self
+                .write_trusted_bytes_control(bytes::Bytes::copy_from_slice(&bind))
+                .await
+            {
                 // guard drops armed -> remove_unbound(route_slot, route)
                 return Err(error);
             }
             bind_guard.disarm();
         }
-        let header = crate::framing::write_routed_actor_ask_header(
+        let header = crate::framing::try_write_routed_actor_ask_header(
             correlation_id,
             route_slot,
             payload.len(),
-        );
+        )?;
         self.write_header_and_payload_ask_inline(header, 16, payload)
             .await
     }
 
     pub async fn write_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
         self.enqueue_write(WritePayload::Single(data)).await
+    }
+
+    /// See the note on `write_trusted_bytes_ask` above.
+    pub(crate) async fn write_trusted_bytes_control(&self, data: bytes::Bytes) -> Result<()> {
+        self.enqueue_write(WritePayload::TrustedFrame(data)).await
     }
 
     pub async fn write_header_and_payload_control(
@@ -3687,19 +4275,70 @@ impl LockFreeStreamHandle {
         .await
     }
 
+    /// Send a generic `Buf` payload, deriving the declared length from
+    /// `buf.remaining()` itself. A single-argument call site cannot express
+    /// the mismatch `reject_oversize_write_payload` guards against: that
+    /// check exists because a header can be built from one length while a
+    /// *separately supplied* `buf` carries a different one, and here there
+    /// is no second, independent length to disagree with `buf` in the
+    /// first place -- `remaining()` *is* the declared length. This is a
+    /// genuinely safe call shape, not a validation-skipping stub. For a
+    /// caller that builds a header from a length declared independently of
+    /// `buf` (see `WritePayload::Buf`), use `write_buf_control_checked`
+    /// instead, which validates the two against each other.
     pub async fn write_buf_control<B>(&self, buf: B) -> Result<()>
     where
         B: Buf + Send + 'static,
     {
-        self.enqueue_write(WritePayload::Buf(Box::new(buf))).await
+        let expected_len = buf.remaining();
+        self.enqueue_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
     }
 
+    /// Checked sibling of `write_buf_control` for a caller that builds its
+    /// header from an `expected_len` declared independently of `buf` (see
+    /// `WritePayload::Buf`). `reject_oversize_write_payload` rejects the
+    /// write outright if `buf.remaining()` disagrees with it -- a mismatch
+    /// here means the header this `buf` was chained onto promises a
+    /// different body than what is actually being written, desyncing the
+    /// peer's parser, not just sending an oversize-but-well-formed frame.
+    pub async fn write_buf_control_checked<B>(&self, buf: B, expected_len: usize) -> Result<()>
+    where
+        B: Buf + Send + 'static,
+    {
+        self.enqueue_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
+    }
+
+    /// See `write_buf_control` above.
     pub async fn write_buf_ask<B>(&self, buf: B) -> Result<()>
     where
         B: Buf + Send + 'static,
     {
-        self.enqueue_ask_write(WritePayload::Buf(Box::new(buf)))
-            .await
+        let expected_len = buf.remaining();
+        self.enqueue_ask_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
+    }
+
+    /// See `write_buf_control_checked` above.
+    pub async fn write_buf_ask_checked<B>(&self, buf: B, expected_len: usize) -> Result<()>
+    where
+        B: Buf + Send + 'static,
+    {
+        self.enqueue_ask_write(WritePayload::Buf {
+            buf: Box::new(buf),
+            expected_len,
+        })
+        .await
     }
 
     /// Enqueue bytes for the background writer (non-blocking).
@@ -3764,16 +4403,88 @@ impl LockFreeStreamHandle {
         self.write_bytes_nonblocking(combined_buffer.freeze())
     }
 
-    /// Write large data in chunks to avoid blocking
+    /// Write large data in chunks to avoid blocking.
+    ///
+    /// PR #183 review, round 7: the size gate lives at the granularity of
+    /// one enqueued `WritePayload` -- and each chunk here used to be its
+    /// own separate `Single` write. A chunk holding only the beginning of
+    /// the data has no way to see the whole write's total length; it can
+    /// only see its own (small, chunk-sized) length, so a write whose
+    /// total exceeds `max_message_size` could be split into pieces every
+    /// one of which passed the per-fragment check. A fragment has no
+    /// independent meaning to validate -- the length that matters belongs
+    /// to the whole logical write, so this validates `data` once, as a
+    /// whole, *before* any chunking happens.
+    ///
+    /// PR #183 review, round 11 tried making that up-front check a bare
+    /// length ceiling instead of the per-frame walk, reasoning `data` here
+    /// was as opaque to this method as it is to `write_bytes_nonblocking`.
+    /// Round 12 established that premise was false: this crate's wire
+    /// protocol has no opaque-bytes case at all (see the note on
+    /// `reject_oversize_write_payload`), so `data` here is exactly as
+    /// frame-shaped as any other `Single`-backed write, and gets the same
+    /// `reject_oversize_single` walk (including the incomplete-frame
+    /// rejection) applied to the whole buffer before chunking begins.
+    ///
+    /// Once `data` has passed that check, each chunk is enqueued as
+    /// `TrustedFrame` rather than `Single` -- re-running any size gate on
+    /// an already-validated slice would be meaningless (see above), and
+    /// could even reject a fragment of legitimately-sized content if
+    /// `chunk_size` happened to exceed `max_message_size`. See
+    /// `WritePayload::TrustedFrame`'s doc comment for the other callers
+    /// this same trust boundary applies to.
+    ///
+    /// Returns the first enqueue error encountered, rather than the
+    /// previous unconditional `Ok(())` that discarded every per-chunk
+    /// result -- a discarded `MessageTooLarge`, queue-full, or
+    /// connection-closed error here meant the caller was told a write
+    /// succeeded when part or all of it never reached the wire.
+    ///
+    /// PR #183 review, round 9: if a later chunk fails after earlier chunks
+    /// were already enqueued, those earlier bytes are already queued for
+    /// (or already on) the wire -- the peer has received, or will receive,
+    /// part of a frame it will never get the rest of. Saying "the caller
+    /// must treat this as fatal" in a doc comment does not make it true: a
+    /// caller that merely propagates the error and keeps using this handle
+    /// would let its next write get appended right where this frame's
+    /// missing tail should have been, desyncing the peer's parser exactly
+    /// the way this whole review cycle has been closing off. So this
+    /// enforces it instead of documenting it -- once at least one chunk has
+    /// been enqueued, any later failure calls `shutdown()` before
+    /// returning the error. Every `enqueue_*` method checks
+    /// `shutdown_signal` before doing anything else, so no further write on
+    /// this handle can succeed after that -- the connection is poisoned,
+    /// not merely reported as failed, and the writer task tears it down
+    /// once it observes the signal.
+    ///
+    /// This is the "poison the connection" resolution, not "reserve
+    /// capacity up front": `WriteQueue` (`crossbeam_queue::ArrayQueue`) has
+    /// no reservation primitive, and building one that is actually correct
+    /// against concurrent producers would mean changing the admission
+    /// protocol every `enqueue_*` method shares -- a materially larger,
+    /// riskier change than this call site (which nothing in this crate
+    /// currently calls) justifies. A failure on the very first chunk is
+    /// still a clean pre-write rejection with nothing poisoned, since
+    /// nothing has been enqueued yet.
     pub fn write_chunked_nonblocking(&self, data: &[u8], chunk_size: usize) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
+        self.reject_oversize_single(data)?;
 
+        let mut enqueued_any = false;
         for chunk in data.chunks(chunk_size) {
-            let _ = self.write_bytes_nonblocking(
+            match self.enqueue_write_nonblocking(WritePayload::TrustedFrame(
                 bytes::Bytes::copy_from_slice(chunk), /* ALLOW_COPY */
-            );
+            )) {
+                Ok(()) => enqueued_any = true,
+                Err(err) => {
+                    if enqueued_any {
+                        self.shutdown();
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         Ok(())
@@ -3835,6 +4546,14 @@ impl LockFreeStreamHandle {
     /// queued through the background writer. This is always derived from the buffer size.
     pub fn streaming_threshold(&self) -> usize {
         self.buffer_config.streaming_threshold()
+    }
+
+    /// The peer's configured frame-body-length ceiling (see the `max_message_size`
+    /// field doc). Inline (non-streaming) sends must stay at or under this before
+    /// a header is even built: the receiver hard-rejects anything larger as a
+    /// fatal read error and tears the whole connection down.
+    pub(crate) fn max_message_size(&self) -> usize {
+        self.max_message_size
     }
 
     pub fn schema_hash(&self) -> Option<u64> {
@@ -3903,14 +4622,14 @@ impl LockFreeStreamHandle {
         })?;
         let first_len = payload.len().min(chunk_size);
         self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
-            header: InlineFrameHeader::from_array(crate::framing::write_stream_request_start_header(
+            header: InlineFrameHeader::from_array(crate::framing::try_write_stream_request_start_header(
                 stream_id,
                 0,
                 total_size,
                 actor_id,
                 type_hash,
                 first_len,
-            )),
+            )?),
             payload: payload.slice(..first_len),
         })).await?;
         let mut abort_guard = StreamAbortGuard::new(self, stream_id);
@@ -3919,12 +4638,12 @@ impl LockFreeStreamHandle {
         while offset < payload.len() {
             let end = (offset + chunk_size).min(payload.len());
             self.streaming_queue.push(StreamingCommand::VectoredWrite(VectoredSendItem {
-                header: InlineFrameHeader::from_array(crate::framing::write_stream_data_header(
+                header: InlineFrameHeader::from_array(crate::framing::try_write_stream_data_header(
                     false,
                     stream_id,
                     index,
                     end - offset,
-                )),
+                )?),
                 payload: payload.slice(offset..end),
             })).await?;
             offset = end;
@@ -3990,12 +4709,12 @@ impl LockFreeStreamHandle {
             }
         })?;
         let first_len = payload.len().min(chunk_size);
-        let first_header = crate::framing::write_stream_response_start_header(
+        let first_header = crate::framing::try_write_stream_response_start_header(
             stream_id,
             correlation_id,
             total_size,
             first_len,
-        );
+        )?;
         self.streaming_queue
             .push(StreamingCommand::VectoredWrite(VectoredSendItem {
                 header: InlineFrameHeader::from_array(first_header),
@@ -4007,12 +4726,12 @@ impl LockFreeStreamHandle {
         let mut index = 1u32;
         while offset < payload.len() {
             let end = (offset + chunk_size).min(payload.len());
-            let header = crate::framing::write_stream_data_header(
+            let header = crate::framing::try_write_stream_data_header(
                 true,
                 stream_id,
                 index,
                 end - offset,
-            );
+            )?;
             self.streaming_queue
             .push(StreamingCommand::VectoredWrite(VectoredSendItem {
                     header: InlineFrameHeader::from_array(header),
@@ -4043,13 +4762,34 @@ impl LockFreeStreamHandle {
         payload: bytes::Bytes,
         correlation_id: u32,
     ) -> Result<()> {
-        let header = framing::write_ask_response_header(
+        let header = framing::try_write_ask_response_header(
             crate::MessageType::Response,
             correlation_id,
             payload.len(),
-        );
+        )?;
         self.write_header_and_payload_control_inline(header, 16, payload)
             .await
+    }
+
+    /// R-9: stream whenever the payload exceeds the streaming threshold, OR
+    /// its inline-encoded size (`ASK_RESPONSE_HEADER_LEN` + payload) would
+    /// exceed `max_message_size`. The two thresholds are independent knobs
+    /// (`streaming_threshold` comes from `BufferConfig`, `max_message_size`
+    /// from the peer's negotiated config), so a small `max_message_size`
+    /// alone -- a perfectly ordinary configuration, not an edge case --
+    /// otherwise selects the inline branch for a payload the inline gate
+    /// then has to refuse. That would trade "sends a frame the peer
+    /// rejects" for "refuses to send a response streaming could have
+    /// delivered fine in bounded chunks" -- a capability regression, not a
+    /// fix. `MessageTooLarge` is reserved for what genuinely cannot be sent
+    /// at all: `stream_response_bytes` itself still rejects payloads at or
+    /// above `MAX_STREAM_SIZE`. Mirrors the direct read-loop path's
+    /// `inline_payload_limit`/`should_stream` in `read_pipeline.rs`.
+    fn should_stream_response(&self, payload_len: usize) -> bool {
+        let inline_payload_limit = self
+            .max_message_size
+            .saturating_sub(framing::ASK_RESPONSE_HEADER_LEN);
+        payload_len > self.streaming_threshold() || payload_len > inline_payload_limit
     }
 
     pub async fn send_response_auto(
@@ -4057,12 +4797,7 @@ impl LockFreeStreamHandle {
         payload: bytes::Bytes,
         correlation_id: u32,
     ) -> Result<()> {
-        // R-9: route large deferred replies through streaming, mirroring the
-        // immediate-response path. A single inline Response frame above the
-        // peer's max_message_size is rejected as MessageTooLarge (teardown),
-        // and at >= 2^27 bytes the frame header length check would panic the
-        // responding task.
-        if payload.len() > self.streaming_threshold() {
+        if self.should_stream_response(payload.len()) {
             return self.stream_response_bytes(payload, correlation_id).await;
         }
         self.write_response_inline(payload, correlation_id).await
@@ -4082,9 +4817,7 @@ impl LockFreeStreamHandle {
         correlation_id: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
-        // R-9: route large deferred replies through streaming, mirroring the
-        // immediate-response path (see `send_response_auto`).
-        if payload.len() > self.streaming_threshold() {
+        if self.should_stream_response(payload.len()) {
             return self.stream_response_bytes(payload, correlation_id).await;
         }
         self.write_response_inline(payload, correlation_id).await
@@ -4092,7 +4825,7 @@ impl LockFreeStreamHandle {
 
     /// Cold-path cancellation for a partially queued V5 stream.
     pub async fn abort_stream(&self, stream_id: u32, reason: u32) -> Result<()> {
-        self.write_bytes_control(bytes::Bytes::copy_from_slice(
+        self.write_trusted_bytes_control(bytes::Bytes::copy_from_slice(
             &crate::framing::write_stream_abort_header(stream_id, reason),
         ))
         .await
@@ -4364,9 +5097,8 @@ mod route_interning_tests {
             None,
         );
         let stream_id = 7;
-        let start = crate::framing::write_stream_request_start_header(
-            stream_id, 1, 1, 2, 3, 1,
-        );
+        let start = crate::framing::try_write_stream_request_start_header(stream_id, 1, 1, 2, 3, 1)
+            .unwrap();
         writer
             .streaming_queue
             .push(StreamingCommand::VectoredWrite(VectoredSendItem {
@@ -4581,7 +5313,16 @@ mod route_interning_tests {
         // Saturate the write queue. Each push completes without yielding while
         // there is space; a zero-duration timeout turns the parked (129th) push
         // into a clean "queue is full" signal — no sleep-based synchronization.
-        let pad = bytes::Bytes::from_static(b"padpadpadpad");
+        // PR #183 review, round 12: `write_bytes_control` carries a complete
+        // V5 frame (this crate's wire protocol has no opaque-bytes case --
+        // see the module doc comment above `reject_oversize_write_payload`),
+        // so this must be a genuine, complete frame, not a bare literal.
+        let pad_payload = vec![0u8; 8];
+        let pad_header = crate::framing::write_gossip_frame_prefix(pad_payload.len());
+        let mut pad_bytes = Vec::with_capacity(pad_header.len() + pad_payload.len());
+        pad_bytes.extend_from_slice(&pad_header);
+        pad_bytes.extend_from_slice(&pad_payload);
+        let pad = bytes::Bytes::from(pad_bytes);
         while let Ok(Ok(())) = tokio::time::timeout(
             std::time::Duration::from_millis(0),
             writer.write_bytes_control(pad.clone()),
@@ -4874,5 +5615,1989 @@ mod route_interning_tests {
             Some(t0),
             "a completed flush must not touch an unrelated in-flight write's clock"
         );
+    }
+}
+
+/// PR #183 review: the size gate landed only on `ConnectionHandle`'s entry
+/// points. Every caller that reaches `LockFreeStreamHandle` some other way
+/// (`stream_writer.rs`'s own `write_response_inline`/`send_response_auto*`,
+/// `ask_responder`'s pooled/nonblocking lanes, `pool_connect.rs`'s gossip
+/// responses, the debug-only raw-ask echo in `handle.rs`) built a header via
+/// a `write_*_header` call (which only enforces the V5 27-bit wire ceiling)
+/// and enqueued it directly, with no `max_message_size` check anywhere on
+/// that path. These tests exercise `reject_oversize_write_payload` -- the
+/// backstop in `enqueue_write`/`enqueue_ask_write`/
+/// `enqueue_write_nonblocking`/`enqueue_immediate_write_nonblocking` -- at
+/// the entry points those bypassing callers actually use, so a future
+/// caller added anywhere in the crate inherits the gate automatically
+/// instead of needing its own copy.
+#[cfg(test)]
+mod write_payload_size_gate_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    /// PR #183 review, round 3: `max_message_size` (via `ReadContext`) is
+    /// set far below the default streaming threshold (~1 MiB, from
+    /// `BufferConfig::default`). A payload comfortably under the streaming
+    /// threshold but whose inline-encoded body would exceed
+    /// `max_message_size` must still be *delivered* -- streamed in bounded
+    /// chunks -- not refused. Rejecting it outright (the first version of
+    /// this gate) traded "sends a frame the peer rejects" for "refuses to
+    /// send a response streaming could deliver fine": a capability
+    /// regression, not a fix.
+    #[tokio::test]
+    async fn auto_response_streams_when_inline_would_exceed_max_message_size() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 128;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9950".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9950, max_message_size)),
+        );
+        assert!(
+            max_message_size < writer.streaming_threshold(),
+            "test setup: max_message_size must sit below the streaming \
+             threshold so this is the case that used to reach the inline path"
+        );
+
+        // Comfortably under the streaming threshold, but
+        // ASK_RESPONSE_HEADER_LEN + payload_len > max_message_size.
+        let payload_len = max_message_size;
+        assert!(
+            crate::framing::ASK_RESPONSE_HEADER_LEN + payload_len > max_message_size,
+            "test setup: payload must not fit inline under max_message_size"
+        );
+        let payload = bytes::Bytes::from(vec![7u8; payload_len]);
+        writer
+            .send_response_auto_bytes(1, payload.clone())
+            .await
+            .expect("a payload streaming can deliver must not be refused");
+
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        peer.read_exact(&mut ctrl).await.unwrap();
+        let control = crate::framing::decode_control(ctrl).unwrap();
+        assert_eq!(
+            control.kind,
+            crate::framing::WireKind::StreamResponseStart,
+            "must stream, not attempt (and fail) an inline Response frame"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The other half of the same fix: a payload that genuinely cannot be
+    /// sent at all -- at or above `MAX_STREAM_SIZE`, so not even streaming
+    /// can deliver it -- must still be rejected locally with
+    /// `MessageTooLarge`, exactly as before.
+    #[tokio::test]
+    async fn auto_response_over_max_stream_size_is_still_rejected() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9953".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let oversize = bytes::Bytes::from(vec![0u8; crate::MAX_STREAM_SIZE + 1]);
+        let err = writer
+            .send_response_auto_bytes(1, oversize)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `write_header_and_payload_control` (the `Bytes`-header `HeaderPayload`
+    /// primitive `pool_connect.rs`'s gossip-response sends and the
+    /// debug-only raw-ask echo in `handle.rs` use) has no `max_message_size`
+    /// pre-check of its own anywhere upstream of it -- this proves the same
+    /// backstop covers it too.
+    #[tokio::test]
+    async fn header_payload_over_max_message_size_is_rejected() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9951".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9951, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let payload = bytes::Bytes::from(vec![0u8; payload_len]);
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::try_write_gossip_frame_prefix(payload.len()).unwrap(),
+        );
+        let err = writer
+            .write_header_and_payload_control(header, payload)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 14: the specific shape this round's finding
+    /// described -- an empty `header` and a complete, self-contained,
+    /// oversized V5 frame packed entirely into `payload`. Before this
+    /// round, `control_source.len() < LENGTH_PREFIX_LEN` returned `Ok(())`
+    /// immediately, so `actual_total` (and therefore `payload`'s size) was
+    /// never inspected at all -- the same closure-property violation round
+    /// 13 closed for `Single`, just reached through the header+payload
+    /// variant instead.
+    #[tokio::test]
+    async fn header_payload_rejects_an_empty_header_hiding_an_oversized_payload() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9998".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9998, max_message_size)),
+        );
+
+        // A genuine, complete, self-contained oversized Gossip frame,
+        // packed entirely into `payload` with nothing held back for
+        // `header`.
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let inner_payload = vec![0u8; payload_len];
+        let inner_header = crate::framing::write_gossip_frame_prefix(inner_payload.len());
+        let mut payload = Vec::with_capacity(inner_header.len() + inner_payload.len());
+        payload.extend_from_slice(&inner_header);
+        payload.extend_from_slice(&inner_payload);
+
+        let err = writer
+            .write_header_and_payload_control(bytes::Bytes::new(), bytes::Bytes::from(payload))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the empty-header call to be refused as too short to contain a \
+             control word, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Degenerate case: a 1-3 byte `header`, same reasoning as the empty
+    /// case above -- too short to hold a complete control word, so it must
+    /// be refused rather than silently letting `payload` through
+    /// unvalidated.
+    #[tokio::test]
+    async fn header_payload_rejects_a_three_byte_header_hiding_an_oversized_payload() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9999".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9999, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let inner_payload = vec![0u8; payload_len];
+        let inner_header = crate::framing::write_gossip_frame_prefix(inner_payload.len());
+        let mut payload = Vec::with_capacity(inner_header.len() + inner_payload.len());
+        payload.extend_from_slice(&inner_header);
+        payload.extend_from_slice(&inner_payload);
+
+        let short_header = bytes::Bytes::from_static(&[0x01, 0x02, 0x03]);
+        let err = writer
+            .write_header_and_payload_control(short_header, bytes::Bytes::from(payload))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the 3-byte-header call to be refused as too short to contain a \
+             control word, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A `header` long enough to hold a control word, but whose leading
+    /// bytes don't decode as one, must also be refused -- the other half
+    /// of the same closure-property violation: undecodable content is not
+    /// "a whole number of complete frames" regardless of its length.
+    #[tokio::test]
+    async fn header_payload_rejects_an_undecodable_header_hiding_an_oversized_payload() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9994".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9994, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let inner_payload = vec![0u8; payload_len];
+        let inner_header = crate::framing::write_gossip_frame_prefix(inner_payload.len());
+        let mut payload = Vec::with_capacity(inner_header.len() + inner_payload.len());
+        payload.extend_from_slice(&inner_header);
+        payload.extend_from_slice(&inner_payload);
+
+        // Kind bits 31 has no `WireKind` mapping.
+        let undecodable_header = bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(
+            crate::framing::decode_control(undecodable_header[..4].try_into().unwrap()).is_none(),
+            "test setup: the header must not decode as a valid control word"
+        );
+        let err = writer
+            .write_header_and_payload_control(undecodable_header, bytes::Bytes::from(payload))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the undecodable-header call to be refused, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A rejected oversize write must not bump `sequence_number` -- mirroring
+    /// `raw_tell_oversize_never_enqueues_a_corrupted_frame`
+    /// (`connection_pool/handle.rs`) for this backstop: nothing was ever
+    /// queued, so the observability counter must not move either. Uses
+    /// `write_header_and_payload_control` directly (bypassing
+    /// `send_response_auto_bytes`'s stream-or-inline decision entirely) so
+    /// this stays a test of the `enqueue_write` choke point itself, not of
+    /// which path a caller's payload size happens to route through.
+    #[tokio::test]
+    async fn rejected_oversize_write_does_not_advance_sequence_number() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9952".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9952, max_message_size)),
+        );
+
+        let before = writer.sequence_number();
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let payload = bytes::Bytes::from(vec![0u8; payload_len]);
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::try_write_gossip_frame_prefix(payload.len()).unwrap(),
+        );
+        let err = writer
+            .write_header_and_payload_control(header, payload)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GossipError::MessageTooLarge { .. }));
+        assert_eq!(
+            writer.sequence_number(),
+            before,
+            "an oversized inline write must be rejected before anything is queued"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 5: `WritePayload::Single` -- constructed by the
+    /// public, generic `write_bytes_nonblocking`/`write_bytes_control`/
+    /// `write_bytes_ask` entry points -- used to be exempt from
+    /// `reject_oversize_write_payload` entirely. A caller can hand
+    /// `write_bytes_nonblocking` a complete, well-formed V5 frame (a real
+    /// control word plus a payload) it built by hand; the early-return
+    /// exemption let that frame's declared body exceed `max_message_size`
+    /// and reach the wire regardless, where the peer fatally rejects it.
+    /// This builds exactly that: a genuine self-contained Gossip frame
+    /// whose control word declares a body over `max_message_size`, passed
+    /// as one `Bytes` blob to the public entry point, not to any internal
+    /// primitive.
+    ///
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_a_genuine_oversize_self_contained_frame() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9953".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9953, 64)),
+        );
+
+        let payload_len = 64 - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let payload = vec![0u8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut frame = Vec::with_capacity(header.len() + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+        // Sanity: this really is one genuine, complete, self-contained V5
+        // frame whose declared body exceeds max_message_size -- not just an
+        // oversize blob of unstructured bytes. (Incidental to the
+        // rejection now -- see the doc comment above.)
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap()).unwrap();
+        assert_eq!(control.kind, crate::framing::WireKind::Gossip);
+        assert_eq!(
+            control.body_len,
+            crate::framing::GOSSIP_HEADER_LEN + payload_len
+        );
+        assert!(control.body_len > 64);
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from(frame))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The same gate must not false-reject a normal-size `Single` write --
+    /// proving the fix is a real ceiling, not an unconditional rejection.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_accepts_a_frame_within_max_message_size() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9954".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9954, 64)),
+        );
+
+        let payload_len = 64 - crate::framing::GOSSIP_HEADER_LEN;
+        let payload = vec![7u8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut frame = Vec::with_capacity(header.len() + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&payload);
+        let expected = frame.clone();
+
+        writer
+            .write_bytes_nonblocking(bytes::Bytes::from(frame))
+            .expect("a frame within max_message_size must be accepted");
+
+        let mut received = vec![0u8; expected.len()];
+        AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver the frame to the peer");
+        assert_eq!(received, expected);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 6: two individually-valid frames concatenated
+    /// into one `Single` write must not be rejected just because their
+    /// *aggregate* length exceeds `max_message_size` -- that bound applies
+    /// per frame, the same way it would if these had been two separate
+    /// `write_bytes_nonblocking` calls. This is the shape that distinguishes
+    /// a whole-buffer length ceiling (over-rejects this) from a per-frame
+    /// walk (accepts it): each frame here is exactly at the 64-byte limit
+    /// on its own, but the concatenated buffer is 136 bytes -- comfortably
+    /// past `max_message_size + LENGTH_PREFIX_LEN` (68).
+    ///
+    /// Round 11 briefly moved this behavior to an opt-in `Framed` lane on
+    /// the theory that `Single` should be content-blind; round 12
+    /// established that theory was wrong -- this crate's wire protocol has
+    /// no opaque-bytes case, so `Single` carries frames unconditionally
+    /// and this test lives on it again.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_accepts_two_valid_frames_whose_aggregate_exceeds_max_message_size()
+     {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9955".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9955, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN;
+        let make_frame = |fill: u8| {
+            let payload = vec![fill; payload_len];
+            let header = crate::framing::write_gossip_frame_prefix(payload.len());
+            let mut frame = Vec::with_capacity(header.len() + payload.len());
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&payload);
+            frame
+        };
+        let frame_a = make_frame(1);
+        let frame_b = make_frame(2);
+        assert_eq!(
+            crate::framing::decode_control(frame_a[..4].try_into().unwrap())
+                .unwrap()
+                .body_len,
+            max_message_size,
+            "test setup: each frame's own body must sit exactly at the limit"
+        );
+
+        let mut both = Vec::with_capacity(frame_a.len() + frame_b.len());
+        both.extend_from_slice(&frame_a);
+        both.extend_from_slice(&frame_b);
+        assert!(
+            both.len() > max_message_size + crate::framing::LENGTH_PREFIX_LEN,
+            "test setup: the concatenated buffer must exceed a whole-buffer ceiling"
+        );
+        let expected = both.clone();
+
+        writer
+            .write_bytes_nonblocking(bytes::Bytes::from(both))
+            .expect(
+                "two frames each within max_message_size must be accepted, even though \
+                 their concatenated length is not",
+            );
+
+        let mut received = vec![0u8; expected.len()];
+        AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver both frames to the peer");
+        assert_eq!(received, expected);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The per-frame walk must still catch a genuinely oversize frame when
+    /// it is not alone in the buffer -- proving round 6's fix widens what
+    /// is *accepted*, not what is *checked*. A valid frame followed by one
+    /// whose own declared body exceeds `max_message_size` must still be
+    /// refused, exactly as it would if the oversize frame had been sent by
+    /// itself.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_an_oversize_frame_following_a_valid_one() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9956".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9956, max_message_size)),
+        );
+
+        let valid_payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN;
+        let valid_header = crate::framing::write_gossip_frame_prefix(valid_payload_len);
+        let mut valid_frame = Vec::with_capacity(valid_header.len() + valid_payload_len);
+        valid_frame.extend_from_slice(&valid_header);
+        valid_frame.extend_from_slice(&vec![1u8; valid_payload_len]);
+
+        let oversize_payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let oversize_header = crate::framing::write_gossip_frame_prefix(oversize_payload_len);
+        let mut oversize_frame = Vec::with_capacity(oversize_header.len() + oversize_payload_len);
+        oversize_frame.extend_from_slice(&oversize_header);
+        oversize_frame.extend_from_slice(&vec![2u8; oversize_payload_len]);
+
+        let mut both = Vec::with_capacity(valid_frame.len() + oversize_frame.len());
+        both.extend_from_slice(&valid_frame);
+        both.extend_from_slice(&oversize_frame);
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from(both))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 13: content that never decodes as a complete
+    /// V5 frame at all is refused outright -- it is not "a whole number of
+    /// complete frames" (the closure property `reject_oversize_single`
+    /// enforces), so it gets no bare-length allowance regardless of its
+    /// size. This buffer is comfortably larger than `max_message_size`, so
+    /// the pre-round-13 bare-length fallback would also have rejected it,
+    /// but for the wrong reason (aggregate length) -- see
+    /// `write_bytes_nonblocking_rejects_undecodable_bytes_even_within_max_message_size`
+    /// below for the case that distinguishes "rejected because it's too
+    /// long" from "rejected because it isn't a whole number of frames."
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_oversize_unframed_bytes() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9957".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9957, max_message_size)),
+        );
+
+        // The leading 4 bytes here are not a valid control word (kind bits
+        // 31 has no `WireKind` mapping), so this can never decode as a
+        // frame.
+        let mut opaque = vec![0xFFu8; max_message_size + 32];
+        opaque[0] = 0xFF;
+        assert!(
+            crate::framing::decode_control(opaque[..4].try_into().unwrap()).is_none(),
+            "test setup: the leading bytes must not decode as a valid control word"
+        );
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from(opaque))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected Network(InvalidData) (not a whole number of complete frames), \
+             got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The distinguishing case for the test above: content that does not
+    /// decode as a valid control word must be refused even when it is well
+    /// within `max_message_size` -- proving the rejection is "not a whole
+    /// number of complete frames," not a disguised length check that only
+    /// happens to also catch oversized undecodable content.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_undecodable_bytes_even_within_max_message_size() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9958".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9958, max_message_size)),
+        );
+
+        // 8 bytes, comfortably under max_message_size, but the leading 4
+        // do not decode as a valid control word.
+        let opaque = vec![0xFFu8; 8];
+        assert!(
+            crate::framing::decode_control(opaque[..4].try_into().unwrap()).is_none(),
+            "test setup: the leading bytes must not decode as a valid control word"
+        );
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from(opaque))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected Network(InvalidData) even though this content is well within \
+             max_message_size, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 10 (reaffirmed round 12 after a brief detour
+    /// through an opt-in `Framed` lane in round 11): the adversarial
+    /// sequence that used to defeat the size gate entirely -- enqueue a
+    /// frame's 4-byte control word alone, declaring a body far larger than
+    /// `max_message_size`, then supply the body across separate,
+    /// individually small calls. Each call on its own used to look too
+    /// short to be judged against the declared `body_len` (the walk fell
+    /// through to a bare-length check on whatever few bytes were actually
+    /// present), so every call passed while the peer reassembled the whole
+    /// oversized frame from the continuous TCP stream -- separate `write()`
+    /// calls have no boundary once the bytes are on the wire.
+    ///
+    /// The fix refuses the *first* call outright: a `Single` write whose
+    /// content begins a frame it does not complete is no longer a
+    /// "not enough information yet" case, it is a rejected one. This test
+    /// asserts exactly that -- the header-alone call must fail -- which is
+    /// sufficient to close the sequence, since a caller who never gets past
+    /// the first call can never reach the second.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_a_frame_header_split_from_its_body_across_calls() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9965".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9965, max_message_size)),
+        );
+
+        let oversized_body_len = max_message_size * 100;
+        let header_alone = bytes::Bytes::copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            oversized_body_len,
+        ));
+        assert_eq!(
+            header_alone.len(),
+            crate::framing::LENGTH_PREFIX_LEN,
+            "test setup: this call supplies only the 4-byte control word, no body"
+        );
+
+        let err = writer.write_bytes_nonblocking(header_alone).unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the header-alone call to be refused as an incomplete \
+             frame, got {err:?}"
+        );
+
+        // The exploit's second half -- supplying the declared body across
+        // further small `Single` writes -- is unreachable once the first
+        // call above is refused; a well-behaved caller stops there. Included
+        // only to document the shape this closes, not because reaching it
+        // would be meaningful: a caller that ignored the first error and
+        // sent body fragments anyway would just be sending unrelated,
+        // independently-judged `Single` writes at that point.
+        let body_fragment = bytes::Bytes::from(vec![0u8; 16]);
+        let _ = writer.write_bytes_nonblocking(body_fragment);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Parity for the ask lane: the same header-alone call must be refused
+    /// through `write_bytes_ask`, not just `write_bytes_nonblocking`.
+    #[tokio::test]
+    async fn write_bytes_ask_rejects_a_frame_header_split_from_its_body_across_calls() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9966".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9966, max_message_size)),
+        );
+
+        let oversized_body_len = max_message_size * 100;
+        let header_alone = bytes::Bytes::copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            oversized_body_len,
+        ));
+
+        let err = writer.write_bytes_ask(header_alone).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the header-alone call to be refused as an incomplete \
+             frame, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The rejection is not conditioned on size -- a header declaring a
+    /// body that would itself fit under `max_message_size`, split from its
+    /// body just the same, must also be refused. Otherwise the rule would
+    /// only close the oversized case, leaving the general "frame split
+    /// across public calls" shape open for anything small enough to slip
+    /// under the ceiling.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_an_incomplete_frame_even_when_body_len_is_within_max_message_size()
+     {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9967".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9967, max_message_size)),
+        );
+
+        // Declares a 32-byte body -- comfortably under max_message_size --
+        // but this call supplies only the 4-byte header, not the body.
+        let header_alone = bytes::Bytes::copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            32,
+        ));
+
+        let err = writer.write_bytes_nonblocking(header_alone).unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "an incomplete frame must be refused regardless of whether its \
+             declared body would itself have fit under max_message_size, \
+             got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 13: the specific shape this round's finding
+    /// described -- three bytes of a control word alone in one `Single`
+    /// write, then the fourth byte plus the (oversized) declared body
+    /// through further small writes. Before this round, a 1-3 byte
+    /// remainder fell through `saturating_sub(LENGTH_PREFIX_LEN)` to zero,
+    /// so the bare-length fallback always accepted it -- this is the exact
+    /// gap `stream_writer.rs:3125` (pre-fix) left open. Asserting the
+    /// *first* call is refused is sufficient to close the sequence, the
+    /// same reasoning as round 10's header-alone test: a caller who never
+    /// gets past the first call can never reach the rest.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_three_bytes_of_a_control_word_split_from_the_rest() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9968".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9968, max_message_size)),
+        );
+
+        // A genuine control word declaring an oversized body, truncated to
+        // its first three bytes -- not long enough to even attempt a
+        // decode.
+        let oversized_body_len = max_message_size * 100;
+        let full_control = crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            oversized_body_len,
+        );
+        let three_bytes = bytes::Bytes::copy_from_slice(&full_control[..3]);
+        assert_eq!(three_bytes.len(), 3, "test setup: fewer than LENGTH_PREFIX_LEN bytes");
+
+        let err = writer.write_bytes_nonblocking(three_bytes).unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the 3-byte call to be refused as too short to be a whole \
+             number of complete frames, got {err:?}"
+        );
+
+        // The rest of the exploit -- the fourth control-word byte plus the
+        // declared body, through further small writes -- is unreachable
+        // once the first call above is refused; included only to document
+        // the shape this closes.
+        let rest = bytes::Bytes::copy_from_slice(&full_control[3..]);
+        let _ = writer.write_bytes_nonblocking(rest);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Degenerate case: a single byte can never be a whole number of
+    /// complete frames (it can't even be a partial control word with room
+    /// to spare) -- must be refused, not accepted via the old
+    /// `saturating_sub` underflow-to-zero path.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_a_single_byte_remainder() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9969".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9969, max_message_size)),
+        );
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from_static(&[0x42]))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "a single byte must be refused, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Degenerate case: two bytes, same reasoning as the single-byte case
+    /// above.
+    #[tokio::test]
+    async fn write_bytes_nonblocking_rejects_a_two_byte_remainder() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9970".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9970, max_message_size)),
+        );
+
+        let err = writer
+            .write_bytes_nonblocking(bytes::Bytes::from_static(&[0x42, 0x43]))
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "two bytes must be refused, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 15: `HeaderInline`/`HeaderInlineAligned`/
+/// `HeaderInlinePooled` used to validate a control word decoded from
+/// `&header[..]` -- the entire fixed-size array -- while `io_task`'s write
+/// loop only ever transmits `&header[..header_len]`. Two distinct bugs
+/// followed from that mismatch: a `header_len` short enough to hold no
+/// control word at all (0-3) could still pass validation, because the
+/// bytes actually checked (`header[0..4]`) were not the bytes actually sent
+/// (`header[0..header_len]`); and a `header_len` *longer* than the 16-byte
+/// backing array passed validation cleanly (nothing here ever bounds-checked
+/// it) and then panicked the write loop slicing
+/// `&header[header_off..header_len]` out of the array. Both are fixed the
+/// same way `reject_oversize_write_payload`'s doc comment now describes:
+/// bounds-check `header_len` (and `HeaderInlinePooled`'s `prefix_len`)
+/// against their backing arrays first, then decode the control word from
+/// exactly the slice the write loop will actually send.
+#[cfg(test)]
+mod header_inline_family_bounds_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    fn make_writer(port: u16, max_message_size: usize) -> (LockFreeStreamHandle, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(port, max_message_size)),
+        );
+        (writer, task)
+    }
+
+    fn aligned_payload(len: usize) -> crate::AlignedBytes {
+        let pool = std::sync::Arc::new(crate::AlignedBytesPool::new(1));
+        crate::AlignedBytes::from_pooled_slice(&vec![0u8; len], pool)
+    }
+
+    fn pooled_payload(len: usize) -> crate::typed::PooledPayload {
+        crate::typed::PooledPayload::try_from_pooled_bytes(len, |buf| buf.resize(len, 0u8))
+            .expect("test pooled payload allocation")
+    }
+
+    /// The exact shape the round 15 finding described: a real control word
+    /// (`Gossip`, `body_len: 50`) lives at `header[0..4]`, and `payload` is
+    /// sized so the *declared* total (`header_len + payload.len()`) agrees
+    /// with it exactly -- but `header_len` is 2, so only `header[0..2]`
+    /// ever reaches the write loop. The first four bytes a peer would
+    /// actually decode are `header[0]`, `header[1]`, and `payload`'s own
+    /// first two bytes -- nothing like the control word this validated.
+    #[tokio::test]
+    async fn header_inline_rejects_a_header_len_too_short_to_contain_the_control_word_it_was_validated_against()
+     {
+        let (writer, task) = make_writer(9986, 128);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            50,
+        ));
+        let header_len = 2u8;
+        // 2 (header_len) + 52 (payload) == 54 == 4 (control word) + 50 (declared body_len).
+        let payload = bytes::Bytes::from(vec![0x7Au8; 52]);
+        let err = writer
+            .write_header_and_payload_control_inline(header, header_len, payload)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the 2-byte header_len to be refused as too short to contain \
+             a control word, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `header_len` above the 16-byte backing array must be refused here,
+    /// not left to panic `io_task`'s `&header[header_off..header_len]`
+    /// slice once this queue item is actually written.
+    #[tokio::test]
+    async fn header_inline_rejects_a_header_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9987, 256);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            196,
+        ));
+        let header_len = 200u8; // header.len() == 16
+        let err = writer
+            .write_header_and_payload_control_inline(header, header_len, bytes::Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected header_len(200) > header.len()(16) to be refused before the \
+             write loop could panic slicing it, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Same array-bound bug, `HeaderInlineAligned`'s copy of the same write
+    /// loop shape (`AlignedBytes` payload instead of `Bytes`).
+    #[tokio::test]
+    async fn header_inline_aligned_rejects_a_header_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9988, 256);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            196,
+        ));
+        let header_len = 200u8;
+        let err = writer
+            .write_header_and_payload_control_inline_aligned(header, header_len, aligned_payload(0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected header_len(200) > header.len()(16) to be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `HeaderInlinePooled`'s copy of the short-`header_len` bug: same
+    /// construction as the `HeaderInline` case above, routed through
+    /// `write_pooled_control_inline` with no prefix.
+    #[tokio::test]
+    async fn header_inline_pooled_rejects_a_header_len_too_short_to_contain_the_control_word_it_was_validated_against()
+     {
+        let (writer, task) = make_writer(9989, 128);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            50,
+        ));
+        let header_len = 2u8;
+        let err = writer
+            .write_pooled_control_inline(header, header_len, None, 0, pooled_payload(52))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the 2-byte header_len to be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `HeaderInlinePooled`'s copy of the array-bound bug for `header_len`.
+    #[tokio::test]
+    async fn header_inline_pooled_rejects_a_header_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9990, 256);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            196,
+        ));
+        let header_len = 200u8;
+        let err = writer
+            .write_pooled_control_inline(header, header_len, None, 0, pooled_payload(0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected header_len(200) > header.len()(16) to be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `HeaderInlinePooled` has a *second* fixed-size array with its own
+    /// separate declared length -- `prefix`/`prefix_len` -- that the write
+    /// loop slices exactly the same way (`&prefix[prefix_off..prefix_len]`)
+    /// and needs the identical bounds-check. This must be caught before
+    /// ever reaching the control-word decode, which only inspects `header`.
+    ///
+    /// `header` here declares a genuine control word whose total
+    /// (`header_len + prefix_len + payload.remaining()`) matches the
+    /// out-of-bounds `prefix_len` exactly -- an all-zero header would
+    /// instead be caught by the unrelated declared-vs-actual mismatch
+    /// check (decoding to `Gossip, body_len: 0` against a much larger
+    /// actual total), which would falsely appear to confirm the
+    /// `prefix_len` bounds-check without ever actually exercising it.
+    #[tokio::test]
+    async fn header_inline_pooled_rejects_a_prefix_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9991, 256);
+        let mut header = [0u8; 16];
+        // header_len(16) + prefix_len(200) + payload.remaining()(0) == 216
+        // == 4 (control word) + 212 (declared body_len).
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            212,
+        ));
+        let prefix = Some([0u8; 16]);
+        let prefix_len = 200u8; // prefix's array length is 16
+        let err = writer
+            .write_pooled_control_inline(header, 16, prefix, prefix_len, pooled_payload(0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected prefix_len(200) > 16 to be refused before the write loop \
+             could panic slicing it, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 15: `WritePayload::Buf`'s validation used to derive
+/// `body_len` as `expected_len.saturating_sub(LENGTH_PREFIX_LEN)` -- a bare
+/// arithmetic relationship between the caller's own claimed aggregate length
+/// and `max_message_size`, never anything decoded from `buf`'s actual bytes.
+/// That let a 1-3 byte `Buf` write through with no control word at all (the
+/// `saturating_sub` floors to `body_len: 0`), and let a caller declare an
+/// `expected_len` that agreed with `buf.remaining()` while the buffer's own
+/// leading bytes, if ever decoded, disagreed with that same length --
+/// exactly the gap that would let one logical oversized frame be split
+/// across several individually-small `Buf` calls, since nothing tied any
+/// one call's declared length back to what its own bytes actually encode.
+/// `reject_oversize_write_payload` now peeks `buf.chunk()` (a non-consuming
+/// read) and requires the decoded control word to declare exactly
+/// `expected_len` -- see that method's doc comment on the `Buf` variant.
+#[cfg(test)]
+mod buf_write_payload_closure_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    fn make_writer(port: u16) -> (LockFreeStreamHandle, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(port, 128)),
+        );
+        (writer, task)
+    }
+
+    /// A 1-3 byte `Buf` write used to pass with `body_len` silently floored
+    /// to 0 by `saturating_sub` -- no control word present at all. Two
+    /// bytes here is comfortably inside that former blind spot.
+    #[tokio::test]
+    async fn buf_control_rejects_a_short_buffer_with_no_control_word() {
+        let (writer, task) = make_writer(9992);
+        let buf = bytes::Bytes::from(vec![0u8; 2]);
+        let err = writer.write_buf_control(buf).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "a 2-byte buffer must be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The core of the round 15 finding: `expected_len` (40) genuinely
+    /// agrees with `buf.remaining()` (40), so the pre-existing
+    /// declared-vs-actual check cannot catch this -- but the buffer's own
+    /// leading bytes are a real control word declaring a 12-byte total
+    /// (`Gossip`, `body_len: 8`), not 40. This is precisely the shape that
+    /// would let one oversized logical frame be split across several
+    /// `Buf` calls, each individually claiming (and matching) a small
+    /// `expected_len` unrelated to what its own bytes actually encode.
+    #[tokio::test]
+    async fn buf_control_rejects_declared_length_disagreeing_with_its_own_embedded_control_word() {
+        let (writer, task) = make_writer(9993);
+        let mut data = crate::framing::encode_control(crate::framing::WireKind::Gossip, 8).to_vec();
+        data.extend(vec![0u8; 36]); // 4 + 36 = 40 total, but the control word says 12
+        assert_eq!(data.len(), 40, "test fixture must total 40 bytes");
+        let buf = bytes::Bytes::from(data);
+        let expected_len = buf.len(); // agrees with buf.remaining(), not with the control word
+        let err = writer
+            .write_buf_control_checked(buf, expected_len)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "a buffer whose own control word disagrees with its declared length \
+             must be refused even when the declared length matches buf.remaining(), \
+             got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Demonstrates why splitting an oversized frame across several `Buf`
+    /// calls cannot work: a bare continuation fragment -- raw body bytes
+    /// with no control word of its own, well under any reasonable
+    /// `max_message_size` on its own -- is refused exactly like any other
+    /// content that doesn't decode, independent of whatever a different
+    /// `Buf` write on the same handle claimed to declare.
+    #[tokio::test]
+    async fn buf_control_rejects_a_continuation_fragment_with_no_control_word_of_its_own() {
+        let (writer, task) = make_writer(9895);
+        // Kind bits 29 (0xEE's top 5 bits) has no `WireKind` mapping.
+        let fragment = bytes::Bytes::from(vec![0xEEu8; 16]);
+        let err = writer.write_buf_control(fragment).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "a fragment with no control word of its own must be refused, not \
+             silently accepted as a continuation of some other write, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 6: `write_buf_control`/`write_buf_ask` regained a
+/// single-argument form (see the doc comment on `write_buf_control` above)
+/// after round 2 had made both two-argument-only, breaking every
+/// single-argument caller's build. These tests exercise that restored
+/// one-argument call shape directly -- nothing else in this crate calls
+/// `write_buf_control`/`write_buf_ask` without the second argument, so
+/// without a test here the arity fix would have no coverage at all.
+#[cfg(test)]
+mod write_buf_control_single_arg_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    fn make_writer(port: u16, max_message_size: usize) -> (LockFreeStreamHandle, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(port, max_message_size)),
+        );
+        (writer, task)
+    }
+
+    /// The one-argument form must derive `expected_len` from `buf.remaining()`
+    /// and still enforce `max_message_size` against it -- proving this is a
+    /// real validating call shape, not a stub that happens to compile.
+    ///
+    /// PR #183 review, round 15: this used to fill `buf` with 69 zero bytes
+    /// and rely on `body_len = buf.remaining() - LENGTH_PREFIX_LEN` (a bare
+    /// arithmetic relationship, not a decode) to land on 65. That derivation
+    /// is gone -- `reject_oversize_write_payload` now decodes a real control
+    /// word from `buf`'s own leading bytes and requires it to declare
+    /// exactly `buf`'s length, so the fixture has to be a genuine frame
+    /// (`framing::write_gossip_frame_prefix`) for that decode to succeed at
+    /// all. 69 zero bytes decoded as a *valid* control word (`Gossip`,
+    /// `body_len: 0`) that simply didn't match its own 69-byte length,
+    /// which would now fail on the mismatch check above rather than ever
+    /// reaching `MessageTooLarge` -- the fixture must actually be the
+    /// oversized frame this test claims to send, not bytes that happen to
+    /// total the right length.
+    #[tokio::test]
+    async fn write_buf_control_single_arg_rejects_a_buf_over_max_message_size() {
+        let (writer, task) = make_writer(9958, 64);
+        // GOSSIP_FRAME_HEADER_LEN (16) + 53-byte payload = 69 bytes total,
+        // body_len = GOSSIP_HEADER_LEN (12) + 53 = 65, one past the 64-byte
+        // limit -- same total and same expected size/max as before, now
+        // backed by a real, decodable control word.
+        let mut data = framing::write_gossip_frame_prefix(53).to_vec();
+        data.extend(vec![0u8; 53]);
+        assert_eq!(data.len(), 69, "test fixture must total 69 bytes");
+        let buf = bytes::Bytes::from(data);
+        let err = writer.write_buf_control(buf).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { size: 65, max: 64 }),
+            "expected MessageTooLarge{{size: 65, max: 64}} (69 bytes minus the \
+             4-byte length-prefix allowance), got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The one-argument form must still deliver a `buf` within
+    /// `max_message_size` -- the arity restoration must not have turned it
+    /// into an unconditional rejection either.
+    ///
+    /// PR #183 review, round 15: same fixture change as the rejection test
+    /// above -- a genuine frame is required now that validation decodes a
+    /// real control word from `buf`'s own bytes instead of trusting a bare
+    /// length.
+    #[tokio::test]
+    async fn write_buf_control_single_arg_accepts_a_buf_within_max_message_size() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9959".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9959, 64)),
+        );
+        // GOSSIP_FRAME_HEADER_LEN (16) + 44-byte payload = 60 bytes total,
+        // body_len = GOSSIP_HEADER_LEN (12) + 44 = 56, within the 64-byte
+        // limit -- same total as before, now a real, decodable frame.
+        let mut data = framing::write_gossip_frame_prefix(44).to_vec();
+        data.extend(vec![9u8; 44]);
+        assert_eq!(data.len(), 60, "test fixture must total 60 bytes");
+        let buf = bytes::Bytes::from(data.clone());
+        writer
+            .write_buf_control(buf)
+            .await
+            .expect("a buf within max_message_size must be accepted");
+
+        let mut received = vec![0u8; data.len()];
+        AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver the buf to the peer");
+        assert_eq!(received, data);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Parity check for the ask-lane sibling: same call shape, same
+    /// derivation, same enforcement.
+    #[tokio::test]
+    async fn write_buf_ask_single_arg_rejects_a_buf_over_max_message_size() {
+        let (writer, task) = make_writer(9960, 64);
+        let mut data = framing::write_gossip_frame_prefix(53).to_vec();
+        data.extend(vec![0u8; 53]);
+        let buf = bytes::Bytes::from(data);
+        let err = writer.write_buf_ask(buf).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { size: 65, max: 64 }),
+            "expected MessageTooLarge{{size: 65, max: 64}}, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 7: `write_chunked_nonblocking` used to validate
+/// (and enqueue) each chunk as an independent `Single` write, so a frame
+/// whose declared body exceeded `max_message_size` could be split into
+/// pieces small enough that every individual fragment passed on its own --
+/// and it discarded every per-chunk `Result`, always returning `Ok(())`
+/// regardless of what actually reached the write queue.
+#[cfg(test)]
+mod write_chunked_nonblocking_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    /// A frame whose declared body exceeds `max_message_size` must be
+    /// rejected even when `chunk_size` is small enough that every
+    /// individual fragment would pass the per-`Single` size gate on its
+    /// own -- this is the shape that distinguishes up-front whole-buffer
+    /// validation (rejects this) from the old per-fragment validation
+    /// (every fragment individually looked fine, so nothing ever caught
+    /// it).
+    #[tokio::test]
+    async fn write_chunked_nonblocking_rejects_an_oversize_frame_split_into_small_chunks() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9961".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9961, max_message_size)),
+        );
+
+        let payload_len = max_message_size - crate::framing::GOSSIP_HEADER_LEN + 1;
+        let header = crate::framing::write_gossip_frame_prefix(payload_len);
+        let mut frame = Vec::with_capacity(header.len() + payload_len);
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&vec![0u8; payload_len]);
+        let control = crate::framing::decode_control(frame[..4].try_into().unwrap()).unwrap();
+        assert!(
+            control.body_len > max_message_size,
+            "test setup: the frame's own declared body must exceed the limit"
+        );
+
+        // Every fragment here is far shorter than max_message_size (and
+        // shorter than LENGTH_PREFIX_LEN for most of them), so a
+        // per-fragment-only check would have accepted every single one.
+        let chunk_size = 8;
+        assert!(chunk_size < max_message_size);
+
+        let err = writer
+            .write_chunked_nonblocking(&frame, chunk_size)
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A legitimately-sized buffer must still be delivered intact once
+    /// chunked -- the up-front validation must not have turned this into
+    /// an unconditional rejection.
+    #[tokio::test]
+    async fn write_chunked_nonblocking_delivers_a_buffer_within_max_message_size() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 64;
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9962".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9962, max_message_size)),
+        );
+
+        // PR #183 review, round 12: `write_chunked_nonblocking` carries a
+        // complete V5 frame, the same as `write_bytes_nonblocking` -- this
+        // crate's wire protocol has no opaque-bytes case (see the module
+        // doc comment above `reject_oversize_write_payload`), so this must
+        // be a genuine, complete frame, not an arbitrary byte sequence.
+        let payload_len =
+            40 - crate::framing::LENGTH_PREFIX_LEN - crate::framing::GOSSIP_HEADER_LEN;
+        let payload = vec![7u8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
+        assert_eq!(data.len(), 40, "test setup: a 40-byte complete frame");
+        writer
+            .write_chunked_nonblocking(&data, 6)
+            .expect("a buffer within max_message_size, chunked, must be accepted");
+
+        let mut received = vec![0u8; data.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut received)
+            .await
+            .expect("connection must deliver every chunk to the peer");
+        assert_eq!(received, data);
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A later chunk's enqueue failure must surface as an error, not be
+    /// silently discarded -- proving the caller can tell a chunked write
+    /// only partially reached the wire, instead of being told (incorrectly)
+    /// that it fully succeeded. Uses the queue-notify test hook to force
+    /// `exit_flag` after exactly two chunks have already been pushed,
+    /// deterministically reproducing "a later chunk fails after earlier
+    /// chunks were already enqueued" without racing a real queue-full
+    /// condition.
+    ///
+    /// PR #183 review, round 8: `queue_notify_hook` is process-global and
+    /// fires for *every* queue's push, not just this connection's -- under
+    /// default (parallel) test execution, this test's two siblings in this
+    /// same module also call `write_chunked_nonblocking`, and their pushes
+    /// used to fire this test's hook too, corrupting `successful_pushes`
+    /// and making the `n == 1` trigger race. Two changes close that: this
+    /// connection's own address (`9963`, distinct from every other test in
+    /// this crate) scopes the hook so only *this* queue's pushes can fire
+    /// it, and `queue_notify_hook::lock()` is held for the entire
+    /// install-through-uninstall span so no other hook-installing test can
+    /// overwrite or erase this one's entry in the shared slot while it is
+    /// active. See the module doc comment on `queue_notify_hook` in
+    /// `constants.rs` for the full reasoning.
+    #[tokio::test]
+    async fn write_chunked_nonblocking_surfaces_a_later_chunk_failure_instead_of_ok() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 4096;
+        let addr: SocketAddr = "127.0.0.1:9963".parse().unwrap();
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(9963, max_message_size)),
+        );
+
+        let successful_pushes = Arc::new(AtomicUsize::new(0));
+        let exit_flag = writer.exit_flag.clone();
+        let successful_pushes_for_hook = successful_pushes.clone();
+        let _hook_guard = queue_notify_hook::lock();
+        queue_notify_hook::install(
+            addr,
+            Arc::new(move || {
+                let n = successful_pushes_for_hook.fetch_add(1, Ordering::SeqCst);
+                if n == 1 {
+                    // Fires after the second chunk's push has already
+                    // succeeded -- the third chunk's
+                    // `enqueue_write_nonblocking` call must observe this and
+                    // fail before pushing.
+                    exit_flag.store(true, Ordering::Release);
+                }
+            }),
+        );
+
+        // PR #183 review, round 13: `write_chunked_nonblocking`'s up-front
+        // check requires a whole number of complete frames (see
+        // `reject_oversize_single`'s doc comment), so this must be a
+        // genuine, complete frame -- not unframed bytes, which round 13
+        // now refuses outright regardless of size. This test isolates the
+        // per-chunk enqueue failure, not the size gate, so the frame's own
+        // shape is otherwise incidental.
+        let payload_len =
+            40 - crate::framing::LENGTH_PREFIX_LEN - crate::framing::GOSSIP_HEADER_LEN;
+        let payload = vec![0xABu8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
+        assert_eq!(data.len(), 40, "test setup: a 40-byte complete frame");
+        let chunk_size = 10;
+        let result = writer.write_chunked_nonblocking(&data, chunk_size);
+
+        queue_notify_hook::uninstall();
+        drop(_hook_guard);
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GossipError::ConnectionClosed(_)),
+            "expected the third chunk's enqueue to observe exit_flag and \
+             fail with ConnectionClosed, got {err:?}"
+        );
+        assert_eq!(
+            successful_pushes.load(Ordering::SeqCst),
+            2,
+            "exactly two chunks must have been successfully enqueued before \
+             the failure -- proving this is a *later* chunk failing, not the \
+             first"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// PR #183 review, round 9: a `WriteQueueFull` on a later chunk after
+    /// earlier chunks already succeeded is exactly the "recoverable-looking
+    /// error" the coordinator warned about -- unlike `ConnectionClosed`, a
+    /// caller could reasonably read `WriteQueueFull` as "try again later"
+    /// and keep using this handle, letting its next write land right where
+    /// this frame's missing tail should have been. The connection must
+    /// instead come out of this call already poisoned: a subsequent write
+    /// must fail too, not silently succeed onto a torn stream.
+    ///
+    /// Forces genuine backpressure (not a synthetic flag) by directly
+    /// filling the write queue to exactly one slot short of capacity
+    /// before calling `write_chunked_nonblocking`, on a single-threaded
+    /// test runtime with no `.await` between the fill and the call -- the
+    /// background writer task cannot drain anything in between, so the
+    /// first chunk takes the last slot and the second genuinely finds the
+    /// queue full.
+    #[tokio::test]
+    async fn write_chunked_nonblocking_poisons_the_connection_after_a_later_chunk_fails() {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let max_message_size = 4096;
+        let addr: SocketAddr = "127.0.0.1:9964".parse().unwrap();
+        let buffer_config = BufferConfig::default().with_write_queue_capacity(128);
+        let write_queue_capacity = buffer_config.write_queue_capacity();
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            addr,
+            ChannelId::TellAsk,
+            buffer_config,
+            None,
+            Some(small_message_read_context(9964, max_message_size)),
+        );
+
+        // Leave exactly one free slot: the first chunk below takes it, the
+        // second finds the queue genuinely full.
+        for _ in 0..write_queue_capacity - 1 {
+            writer
+                .write_queue
+                .try_push(WriteCommand::Payload(WritePayload::TrustedFrame(
+                    bytes::Bytes::from_static(b"filler"),
+                )))
+                .expect("test setup: queue has capacity for the filler");
+        }
+
+        // PR #183 review, round 13: `write_chunked_nonblocking`'s up-front
+        // check requires a whole number of complete frames (see
+        // `reject_oversize_single`'s doc comment), so this must be a
+        // genuine, complete frame -- not unframed bytes, which round 13
+        // now refuses outright regardless of size. This test isolates the
+        // per-chunk enqueue failure, not the size gate, so the frame's own
+        // shape is otherwise incidental.
+        let payload_len =
+            20 - crate::framing::LENGTH_PREFIX_LEN - crate::framing::GOSSIP_HEADER_LEN;
+        let payload = vec![0xCDu8; payload_len];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
+        assert_eq!(data.len(), 20, "test setup: a 20-byte complete frame");
+        let chunk_size = 10;
+        let result = writer.write_chunked_nonblocking(&data, chunk_size);
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GossipError::WriteQueueFull),
+            "expected the second chunk to genuinely find the queue full, \
+             got {err:?}"
+        );
+
+        // Drain the queue before checking the follow-up write: without
+        // this, `next` below would fail merely because the queue is still
+        // literally full (a coincidence of this test's setup), not because
+        // the connection was poisoned -- that would pass whether or not
+        // `write_chunked_nonblocking` poisons anything, proving nothing.
+        // Draining leaves room to accept a write, so a subsequent failure
+        // can only be explained by the poison, not by backpressure.
+        while writer.write_queue.pop().is_some() {}
+
+        // The connection must be poisoned, not merely reported as failed:
+        // any further write on this handle must also fail, so nothing can
+        // ever be appended after the torn frame that was already queued.
+        let next = writer.write_bytes_nonblocking(bytes::Bytes::from_static(b"next"));
+        assert!(
+            next.is_err(),
+            "a later write must not succeed onto a connection that already \
+             had a torn frame queued on it, even with queue space free"
+        );
+        assert!(
+            matches!(next.unwrap_err(), GossipError::Shutdown),
+            "the later write must fail specifically because the connection \
+             was poisoned (shutdown_signal), not because of unrelated \
+             backpressure"
+        );
+        assert!(
+            writer.shutdown_signal.load(Ordering::Acquire),
+            "write_chunked_nonblocking must have poisoned the connection by \
+             signaling shutdown once a later chunk failed after earlier \
+             chunks were already enqueued"
+        );
+
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 3: the declared-vs-actual check landed for `Buf`
+/// only. The invariant is general -- **no `WritePayload` may be enqueued
+/// whose real byte count disagrees with its own control word** -- and every
+/// header-carrying variant is equally capable of a caller building a header
+/// from one length while supplying `payload`/`prefix` pieces of a different
+/// actual length. Each of these tests builds exactly that mismatch, in both
+/// directions (actual longer than declared, and actual shorter), through
+/// the real public `write_*` method for that variant, and asserts the
+/// write is refused with something other than `MessageTooLarge` (proving
+/// it is the mismatch check, not the size gate, doing the rejecting: every
+/// payload here is tiny, far under the default `max_message_size`).
+#[cfg(test)]
+mod write_payload_length_mismatch_tests {
+    use super::*;
+
+    fn make_writer(port: u16) -> (LockFreeStreamHandle, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        (writer, task)
+    }
+
+    fn assert_mismatch_not_size(err: &GossipError) {
+        assert!(
+            !matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected the length-mismatch check to reject this, not the \
+             size gate (every payload here is tiny): {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_payload_actual_longer_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9970);
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap(),
+        );
+        let payload = bytes::Bytes::from(vec![0u8; 100]); // header declares 8, actual 100
+        let err = writer
+            .write_header_and_payload_control(header, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_payload_actual_shorter_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9971);
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
+                .unwrap(),
+        );
+        let payload = bytes::Bytes::from(vec![0u8; 8]); // header declares 100, actual 8
+        let err = writer
+            .write_header_and_payload_control(header, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_inline_actual_longer_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9972);
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
+        let payload = bytes::Bytes::from(vec![0u8; 100]);
+        let err = writer
+            .write_header_and_payload_control_inline(header, 16, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_inline_actual_shorter_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9973);
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
+                .unwrap();
+        let payload = bytes::Bytes::from(vec![0u8; 8]);
+        let err = writer
+            .write_header_and_payload_control_inline(header, 16, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    fn aligned_payload(len: usize) -> crate::AlignedBytes {
+        let pool = std::sync::Arc::new(crate::AlignedBytesPool::new(1));
+        crate::AlignedBytes::from_pooled_slice(&vec![0u8; len], pool)
+    }
+
+    #[tokio::test]
+    async fn header_inline_aligned_actual_longer_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9974);
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
+        let err = writer
+            .write_header_and_payload_control_inline_aligned(header, 16, aligned_payload(100))
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_inline_aligned_actual_shorter_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9975);
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
+                .unwrap();
+        let err = writer
+            .write_header_and_payload_control_inline_aligned(header, 16, aligned_payload(8))
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_inline32_actual_longer_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9976);
+        let header = crate::framing::try_write_actor_ask_header(1, 7, 9, 8).unwrap();
+        let payload = bytes::Bytes::from(vec![0u8; 100]);
+        let err = writer
+            .write_header_and_payload_control_inline32(header, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_inline32_actual_shorter_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9977);
+        let header = crate::framing::try_write_actor_ask_header(1, 7, 9, 100).unwrap();
+        let payload = bytes::Bytes::from(vec![0u8; 8]);
+        let err = writer
+            .write_header_and_payload_control_inline32(header, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    fn pooled_payload(len: usize) -> crate::typed::PooledPayload {
+        crate::typed::PooledPayload::try_from_pooled_bytes(len, |buf| buf.resize(len, 0u8))
+            .expect("test pooled payload allocation")
+    }
+
+    #[tokio::test]
+    async fn header_pooled_actual_longer_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9978);
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap(),
+        );
+        let err = writer
+            .write_pooled_control(header, None, pooled_payload(100))
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_pooled_actual_shorter_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9979);
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
+                .unwrap(),
+        );
+        let err = writer
+            .write_pooled_control(header, None, pooled_payload(8))
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `write_pooled_ask_inline` is the exact primitive
+    /// `ask_responder::send_pooled_via_stream_handle` uses in production.
+    #[tokio::test]
+    async fn header_inline_pooled_actual_longer_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9980);
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
+        let err = writer
+            .write_pooled_ask_inline(header, 16, None, 0, pooled_payload(100))
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn header_inline_pooled_actual_shorter_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9981);
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 100)
+                .unwrap();
+        let err = writer
+            .write_pooled_ask_inline(header, 16, None, 0, pooled_payload(8))
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A `prefix` declared `Some` must also be accounted for on its own --
+    /// not just the payload. The header below declares a body sized for a
+    /// 16-byte prefix plus an 8-byte payload; the payload actually matches
+    /// (8 bytes), but `prefix_len` under-declares how much of the 16-byte
+    /// `prefix` array the write loop will actually send (only its first 8
+    /// bytes, per `prefix[prefix_off..prefix_len]` in `io_task`), so the
+    /// real total is short by exactly the missing prefix bytes.
+    #[tokio::test]
+    async fn header_inline_pooled_prefix_len_mismatch_is_rejected() {
+        let (writer, task) = make_writer(9982);
+        // Header declares body_len = ASK_RESPONSE_HEADER_LEN + 16 (intended
+        // prefix) + 8 (payload) = 36.
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 24)
+                .unwrap();
+        let prefix = [0u8; 16];
+        // `prefix_len` claims only 8 of the 16 prefix bytes will be sent --
+        // the payload alone is honest (8 bytes), so only this field is the
+        // lie.
+        let err = writer
+            .write_pooled_ask_inline(header, 16, Some(prefix), 8, pooled_payload(8))
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn direct_ask_inline_actual_longer_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9983);
+        let header = crate::framing::try_write_direct_ask_header(1, 1, 8).unwrap();
+        let payload = bytes::Bytes::from(vec![0u8; 100]);
+        let err = writer
+            .write_direct_ask_inline(header, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn direct_ask_inline_actual_shorter_than_declared_is_rejected() {
+        let (writer, task) = make_writer(9984);
+        let header = crate::framing::try_write_direct_ask_header(1, 1, 100).unwrap();
+        let payload = bytes::Bytes::from(vec![0u8; 8]);
+        let err = writer
+            .write_direct_ask_inline(header, payload)
+            .await
+            .unwrap_err();
+        assert_mismatch_not_size(&err);
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// A matching declared/actual length must not false-reject -- proving
+    /// the mismatch checks above are not simply rejecting every write.
+    #[tokio::test]
+    async fn header_inline_pooled_with_matching_lengths_is_written() {
+        let (writer, task) = make_writer(9985);
+        let header =
+            crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 8)
+                .unwrap();
+        writer
+            .write_pooled_ask_inline(header, 16, None, 0, pooled_payload(8))
+            .await
+            .expect("matching declared and actual lengths must be accepted");
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 }

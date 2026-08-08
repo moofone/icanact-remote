@@ -2613,7 +2613,8 @@ async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
     let queue = StreamingQueue::new(1, "127.0.0.1:40493".parse().unwrap());
     let mut yielded_slot = None;
     let header =
-        crate::framing::write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17);
+        crate::framing::try_write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17)
+            .unwrap();
     let payload = bytes::Bytes::from(vec![0xA7; STREAM_WRITE_SLICE_BYTES + 17]);
     let pending =
         PendingStreamingCommand::shared(StreamingCommand::VectoredWrite(VectoredSendItem {
@@ -3598,24 +3599,30 @@ async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
     logical_payload.extend_from_slice(&prefix);
     logical_payload.extend_from_slice(&payload_bytes);
     let mut expected = Vec::new();
-    expected.extend_from_slice(&crate::framing::write_stream_response_start_header(
-        stream_id,
-        0xC0DE,
-        payload_len as u32,
-        first_len,
-    ));
+    expected.extend_from_slice(
+        &crate::framing::try_write_stream_response_start_header(
+            stream_id,
+            0xC0DE,
+            payload_len as u32,
+            first_len,
+        )
+        .unwrap(),
+    );
     expected.extend_from_slice(&logical_payload[..first_len]);
     let mut wire_offset = first_len;
     let mut chunk_index = 1u32;
     while wire_offset < payload_len {
         let frame_payload_start = wire_offset;
         let frame_payload_end = (wire_offset + chunk_size).min(payload_len);
-        expected.extend_from_slice(&crate::framing::write_stream_data_header(
-            true,
-            stream_id,
-            chunk_index,
-            frame_payload_end - frame_payload_start,
-        ));
+        expected.extend_from_slice(
+            &crate::framing::try_write_stream_data_header(
+                true,
+                stream_id,
+                chunk_index,
+                frame_payload_end - frame_payload_start,
+            )
+            .unwrap(),
+        );
         expected.extend_from_slice(&logical_payload[frame_payload_start..frame_payload_end]);
         wire_offset = frame_payload_end;
         chunk_index += 1;
@@ -3712,23 +3719,24 @@ async fn bytes_streaming_response_writes_frame_order() {
 
     let chunk_size = 64 - crate::framing::STREAM_RESPONSE_START_HEADER_LEN;
     let mut expected = Vec::new();
-    expected.extend_from_slice(&crate::framing::write_stream_response_start_header(
-        stream_id,
-        0xC0DE,
-        payload_len as u32,
-        payload_len.min(chunk_size),
-    ));
+    expected.extend_from_slice(
+        &crate::framing::try_write_stream_response_start_header(
+            stream_id,
+            0xC0DE,
+            payload_len as u32,
+            payload_len.min(chunk_size),
+        )
+        .unwrap(),
+    );
     expected.extend_from_slice(&payload_bytes[..payload_len.min(chunk_size)]);
     let mut offset = payload_len.min(chunk_size);
     let mut chunk_index = 1u32;
     while offset < payload_len {
         let end = (offset + chunk_size).min(payload_len);
-        expected.extend_from_slice(&crate::framing::write_stream_data_header(
-            true,
-            stream_id,
-            chunk_index,
-            end - offset,
-        ));
+        expected.extend_from_slice(
+            &crate::framing::try_write_stream_data_header(true, stream_id, chunk_index, end - offset)
+                .unwrap(),
+        );
         expected.extend_from_slice(&payload_bytes[offset..end]);
         offset = end;
         chunk_index += 1;
@@ -4111,7 +4119,16 @@ fn test_connection_handle_send_data() {
             CorrelationTracker::new(),
         );
 
-        let data = vec![1, 2, 3, 4];
+        // PR #183 review, round 12: `send_data` carries a complete V5
+        // frame -- this crate's wire protocol has no opaque-bytes case
+        // (see the module doc comment above `reject_oversize_write_payload`
+        // in stream_writer.rs), so this must be a genuine, complete frame,
+        // not a bare literal.
+        let payload = vec![9u8; 4];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
         handle.send_data(data.clone()).await.unwrap();
 
         // Allow the background writer to drain the queue
@@ -4136,11 +4153,20 @@ fn test_writer_owner_batch_preserves_order() {
             None,
         );
 
-        let payloads = [
-            bytes::Bytes::from_static(b"one"),
-            bytes::Bytes::from_static(b"two"),
-            bytes::Bytes::from_static(b"three"),
-        ];
+        // PR #183 review, round 12: `write_bytes_nonblocking` carries a
+        // complete V5 frame per call -- this crate's wire protocol has no
+        // opaque-bytes case (see the module doc comment above
+        // `reject_oversize_write_payload` in stream_writer.rs), so each of
+        // these must be a genuine, complete frame, not a bare literal.
+        let make_frame = |fill: u8, len: usize| {
+            let payload = vec![fill; len];
+            let header = crate::framing::write_gossip_frame_prefix(payload.len());
+            let mut frame = Vec::with_capacity(header.len() + payload.len());
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&payload);
+            bytes::Bytes::from(frame)
+        };
+        let payloads = [make_frame(1, 3), make_frame(2, 3), make_frame(3, 5)];
 
         for payload in &payloads {
             stream_handle
@@ -4171,10 +4197,32 @@ fn test_writer_vectored_sequence_header_payload() {
             None,
         );
 
-        let first = bytes::Bytes::from_static(b"first");
-        let second = bytes::Bytes::from_static(b"second");
-        let header = bytes::Bytes::from_static(b"HEAD");
+        // PR #183 review, round 12: same reasoning as `payloads` in
+        // `test_writer_owner_batch_preserves_order` above -- `first`/
+        // `second` go through `write_bytes_nonblocking`, which carries a
+        // complete V5 frame per call, so each must be genuine, not a bare
+        // literal.
+        let make_frame = |fill: u8, len: usize| {
+            let payload = vec![fill; len];
+            let header = crate::framing::write_gossip_frame_prefix(payload.len());
+            let mut frame = Vec::with_capacity(header.len() + payload.len());
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&payload);
+            bytes::Bytes::from(frame)
+        };
+        let first = make_frame(1, 5);
+        let second = make_frame(2, 6);
         let payload = bytes::Bytes::from_static(b"PAYLOAD");
+        // A real V5 control word declaring `payload`'s exact length: the
+        // gate in `enqueue_write_nonblocking` decodes `body_len` from the
+        // header's first four bytes on every `HeaderPayload` write, so an
+        // arbitrary 4-byte placeholder here (as opposed to a genuine
+        // control word) can decode to an oversize `body_len` and be
+        // rejected before this purely-plumbing ordering check ever runs.
+        let header = bytes::Bytes::copy_from_slice(
+            &crate::framing::try_encode_control(crate::framing::WireKind::Gossip, payload.len())
+                .unwrap(),
+        );
 
         stream_handle
             .write_bytes_nonblocking(first.clone())
@@ -4257,7 +4305,19 @@ fn test_connection_handle_send_data_closed() {
             CorrelationTracker::new(),
         );
 
-        let result = handle.send_data(vec![1, 2, 3]).await;
+        // PR #183 review, round 13: `send_data` carries a complete V5
+        // frame (this crate's wire protocol has no opaque-bytes case), so
+        // this must be genuine, complete frame bytes, not a bare 3-byte
+        // literal -- a nonempty remainder shorter than a control word is
+        // now refused regardless of the underlying writer's health, which
+        // isn't what this test is exercising.
+        let payload = vec![9u8; 4];
+        let header = crate::framing::write_gossip_frame_prefix(payload.len());
+        let mut data = Vec::with_capacity(header.len() + payload.len());
+        data.extend_from_slice(&header);
+        data.extend_from_slice(&payload);
+
+        let result = handle.send_data(data).await;
         assert!(result.is_ok());
     });
 }
@@ -4389,14 +4449,25 @@ async fn test_ask_backpressure_no_write_buffer_full() {
         }
     });
 
+    // PR #183 review, round 12: `write_bytes_ask` carries a complete V5
+    // frame -- this crate's wire protocol has no opaque-bytes case (see
+    // the module doc comment above `reject_oversize_write_payload` in
+    // stream_writer.rs), so this must be a genuine, complete frame, not a
+    // bare literal like "ping".
+    let ping_payload = vec![7u8; 4];
+    let ping_header = crate::framing::write_gossip_frame_prefix(ping_payload.len());
+    let mut ping_bytes = Vec::with_capacity(ping_header.len() + ping_payload.len());
+    ping_bytes.extend_from_slice(&ping_header);
+    ping_bytes.extend_from_slice(&ping_payload);
+    let ping = bytes::Bytes::from(ping_bytes);
+
     let mut tasks = Vec::new();
     for _ in 0..100 {
         let handle = handle.clone();
+        let ping = ping.clone();
         tasks.push(tokio::spawn(async move {
             for _ in 0..10 {
-                handle
-                    .write_bytes_ask(bytes::Bytes::from_static(b"ping"))
-                    .await?;
+                handle.write_bytes_ask(ping.clone()).await?;
             }
             Ok::<(), crate::GossipError>(())
         }));
@@ -4540,8 +4611,11 @@ fn stream_direct_ask_throughput_bench() {
                     let payload_len = msg_len - crate::framing::DIRECT_ASK_HEADER_LEN;
                     let payload = &msg[crate::framing::DIRECT_ASK_HEADER_LEN
                         ..crate::framing::DIRECT_ASK_HEADER_LEN + payload_len];
-                    let header =
-                        crate::framing::write_direct_response_header(correlation_id, payload_len);
+                    let header = crate::framing::try_write_direct_response_header(
+                        correlation_id,
+                        payload_len,
+                    )
+                    .unwrap();
                     tokio::io::AsyncWriteExt::write_all(&mut server_io, &header)
                         .await
                         .unwrap();
@@ -4555,11 +4629,12 @@ fn stream_direct_ask_throughput_bench() {
                     let payload_len = msg_len - crate::framing::ACTOR_ASK_HEADER_LEN;
                     let payload = &msg[crate::framing::ACTOR_ASK_HEADER_LEN
                         ..crate::framing::ACTOR_ASK_HEADER_LEN + payload_len];
-                    let header = crate::framing::write_ask_response_header(
+                    let header = crate::framing::try_write_ask_response_header(
                         crate::MessageType::Response,
                         correlation_id,
                         payload_len,
-                    );
+                    )
+                    .unwrap();
                     tokio::io::AsyncWriteExt::write_all(&mut server_io, &header)
                         .await
                         .unwrap();
@@ -5861,7 +5936,7 @@ fn accept_path_streaming_state_handoff_completes_a_stream_split_across_the_first
         // The peer, unaware the accept path already consumed the first
         // frame, sends only the second (and final) chunk.
         let second_header =
-            crate::framing::write_stream_data_header(false, stream_id as u32, 1, STRIDE);
+            crate::framing::try_write_stream_data_header(false, stream_id as u32, 1, STRIDE).unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client_io, &second_header)
             .await
             .unwrap();
@@ -6274,6 +6349,163 @@ async fn full_sync_response_with_remote_loopback_bind_does_not_reindex_connectio
     assert!(
         registry.lookup_actor(actor_name).await.is_none(),
         "actors from a non-dialable FullSyncResponse must not be merged into the registry"
+    );
+}
+
+/// `handle_incoming_message`'s FullSync-response arm gates its outbound send
+/// through `framing::reject_oversize_for_inline_send(GOSSIP_HEADER_LEN, ...)`
+/// (the same helper `ConnectionHandle::reject_oversize_inline` uses), not a
+/// hand-rolled `payload.len() > max_message_size` comparison. This measures
+/// the real, current response size with an effectively unbounded
+/// `max_message_size`, then reconfigures a second registry with
+/// `max_message_size` set to exactly that measured payload length -- a
+/// payload-only check would admit it (`payload.len() == max`), but the
+/// encoded body (`GOSSIP_HEADER_LEN` + payload) exceeds it by exactly the
+/// header size, and must still be rejected locally instead of reaching the
+/// peer and being fatally rejected there.
+#[tokio::test]
+async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_rejected() {
+    async fn registry_with_connection(
+        bind_addr: SocketAddr,
+        key_seed: &str,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        max_message_size: usize,
+    ) -> (Arc<crate::registry::GossipRegistry>, tokio::io::DuplexStream) {
+        let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            bind_addr,
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(key_seed)),
+                max_message_size,
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let (io, peer_io) = tokio::io::duplex(8 * 1024 * 1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            sender_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut connection = LockFreeConnection::new(sender_addr, ConnectionDirection::Inbound);
+        connection.stream_handle = Some(Arc::new(stream_handle));
+        connection.set_state(ConnectionState::Connected);
+        let connection = Arc::new(connection);
+        assert!(registry.connection_pool.add_connection_by_peer_id(
+            sender_peer_id,
+            sender_addr,
+            connection
+        ));
+        (registry, peer_io)
+    }
+
+    fn full_sync_msg(sender_peer_id: crate::PeerId) -> crate::registry::RegistryMessage {
+        // Enough known_actors that the response the registry echoes back is
+        // comfortably larger than a handful of bytes -- the exact size does
+        // not matter, only that it is reproducible across both passes below.
+        let known_actors: Vec<(String, crate::RemoteActorLocation)> = (0..200)
+            .map(|i| {
+                (
+                    format!("full-sync-body-len-boundary-actor-{i:04}"),
+                    crate::RemoteActorLocation::new_with_peer(
+                        "10.0.0.1:9999".parse().unwrap(),
+                        sender_peer_id.clone(),
+                    ),
+                )
+            })
+            .collect();
+        crate::registry::RegistryMessage::FullSync {
+            local_actors: Vec::new(),
+            known_actors,
+            sender_peer_id,
+            sender_bind_addr: None,
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+            extensions: None,
+        }
+    }
+
+    async fn read_gossip_frame(
+        peer_io: &mut tokio::io::DuplexStream,
+    ) -> Option<crate::framing::Control> {
+        let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::io::AsyncReadExt::read_exact(peer_io, &mut ctrl),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        crate::framing::decode_control(ctrl)
+    }
+
+    let sender_keypair =
+        crate::KeyPair::new_for_testing("full-sync-body-len-boundary-remote");
+    let sender_peer_id = sender_keypair.peer_id();
+    let sender_addr: SocketAddr = "10.90.0.9:9401".parse().unwrap();
+
+    // Pass 1: max_message_size effectively unbounded (still within the V5
+    // 27-bit limit), so the response always gets built and sent. Read its
+    // real, current encoded body length off the wire.
+    //
+    // The two registries' bind addresses ("10.90.0.11:9501" /
+    // "10.90.0.12:9501") must be the same *string length*: each registry
+    // embeds its own `advertised_addr().to_string()` as `sender_bind_addr`
+    // in the response it builds, so an address-length mismatch between
+    // passes would change the measured payload by that delta and the test
+    // would no longer isolate GOSSIP_HEADER_LEN -- it would pass or fail for
+    // reasons unrelated to the header-overhead accounting it exists to pin.
+    let (registry_a, mut peer_a) = registry_with_connection(
+        "10.90.0.11:9501".parse().unwrap(),
+        "full-sync-body-len-boundary-local-a",
+        sender_peer_id.clone(),
+        sender_addr,
+        crate::framing::CONTROL_BODY_LEN_MASK as usize,
+    )
+    .await;
+    super::handle_incoming_message(
+        registry_a.clone(),
+        sender_addr,
+        sender_addr,
+        Some(sender_peer_id.clone()),
+        full_sync_msg(sender_peer_id.clone()),
+    )
+    .await
+    .expect("FullSync handling must not error");
+    let control = read_gossip_frame(&mut peer_a)
+        .await
+        .expect("an unbounded max_message_size must let the FullSync response through");
+    assert_eq!(control.kind, crate::framing::WireKind::Gossip);
+    let payload_len = control.body_len - crate::framing::GOSSIP_HEADER_LEN;
+
+    // Pass 2: same message, but max_message_size set to exactly the
+    // measured payload length. A payload-only check (`payload.len() >
+    // max_message_size`) would admit this -- they are equal -- but the
+    // encoded body is `GOSSIP_HEADER_LEN` bytes larger than the limit, so
+    // the response must be rejected locally: nothing reaches the wire.
+    let (registry_b, mut peer_b) = registry_with_connection(
+        "10.90.0.12:9501".parse().unwrap(),
+        "full-sync-body-len-boundary-local-b",
+        sender_peer_id.clone(),
+        sender_addr,
+        payload_len,
+    )
+    .await;
+    super::handle_incoming_message(
+        registry_b.clone(),
+        sender_addr,
+        sender_addr,
+        Some(sender_peer_id.clone()),
+        full_sync_msg(sender_peer_id.clone()),
+    )
+    .await
+    .expect("rejecting an oversize response locally must not surface as an error");
+    assert!(
+        read_gossip_frame(&mut peer_b).await.is_none(),
+        "a FullSync response whose encoded body exceeds max_message_size by \
+         exactly GOSSIP_HEADER_LEN must be rejected locally, not sent"
     );
 }
 
