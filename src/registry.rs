@@ -8199,7 +8199,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// layer, not just the kernel-buffer-accepted layer.
     async fn mark_response_received(&self, peer_addr: SocketAddr, now: u64) {
         self.registry_owner
-            .note_liveness_evidence(peer_addr, std::time::Instant::now());
+            .note_liveness_evidence(peer_addr, std::time::Instant::now())
+            .await;
         let mut gossip_state = self.gossip_state.lock().await;
         if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
             // `now` is captured at the start of the gossip batch; a later
@@ -9470,37 +9471,61 @@ impl<T: 'static> GossipRegistry<T> {
             }
             confirmed_dead.push((peer_addr, node_id, evidence_before, reservation));
         }
-        let peers_to_cleanup = confirmed_dead;
+        self.reap_reserved_candidates(confirmed_dead, dead_peer_timeout_secs)
+            .await;
+    }
 
+    /// Apply the single owner decision for each reserved candidate before any
+    /// actor, tombstone, capability, clock-state, or ownership cleanup. A
+    /// `ProvenAlive` result therefore leaves every destructive projection
+    /// untouched and releases only the reservation.
+    async fn reap_reserved_candidates(
+        &self,
+        peers_to_cleanup: Vec<(
+            SocketAddr,
+            Option<crate::PeerId>,
+            std::time::Instant,
+            crate::registry_owner::ReapReservation,
+        )>,
+        dead_peer_timeout_secs: u64,
+    ) {
         let mut should_trigger_immediate = false;
+        for (peer_addr, node_id, evidence_before, reservation) in peers_to_cleanup {
+            let outcome = match node_id.as_ref() {
+                Some(peer_id) => Some(
+                    self.release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
+                        .await,
+                ),
+                None => None,
+            };
+            if matches!(
+                outcome,
+                Some(crate::registry_owner::DeadPeerReleaseOutcome::ProvenAlive)
+            ) {
+                debug!(
+                    peer = %peer_addr,
+                    "cleanup_dead_peers: newer liveness evidence won; preserving actors and projections"
+                );
+                reservation.release().await;
+                continue;
+            }
 
-        if !peers_to_cleanup.is_empty() {
-            // IMPORTANT: Always acquire locks in consistent order to prevent deadlocks
-            // Order: actor_state before gossip_state
-            let mut gossip_state = self.gossip_state.lock().await;
-
-            for (peer_addr, _, _, _) in &peers_to_cleanup {
-                // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
-                // This allows us to reconnect when the peer comes back online
-
-                // Remove peer's actors from known_actors to free memory. Re-check
-                // current ownership first because peer_to_actors is a side table and
-                // may still contain a stale entry after the actor moved to another peer.
-                if let Some(actor_names) = gossip_state.peer_to_actors.get(peer_addr).cloned() {
-                    let peer_info = gossip_state.peers.get(peer_addr).cloned();
+            // Keep the peer entry itself so a later reconnect can be
+            // recognized, but remove actors and their causal tombstones only
+            // after the owner's final liveness decision above.
+            {
+                let mut gossip_state = self.gossip_state.lock().await;
+                if let Some(actor_names) = gossip_state.peer_to_actors.get(&peer_addr).cloned() {
+                    let peer_info = gossip_state.peers.get(&peer_addr).cloned();
                     let mut actors_removed = 0usize;
                     for actor_name in &actor_names {
-                        // Capture the current location (not just a bool) so a
-                        // confirmed removal can be tombstoned and gossiped with
-                        // the same causal-removal shape every other removal
-                        // path uses (unregister_actor / apply_delta_from).
                         let removal_location = self
                             .actor_state
                             .known_actors
                             .read_sync(actor_name.as_str(), |_, location| {
                                 actor_location_belongs_to_peer(
                                     location,
-                                    *peer_addr,
+                                    peer_addr,
                                     peer_info.as_ref(),
                                 )
                                 .then(|| location.clone())
@@ -9516,23 +9541,12 @@ impl<T: 'static> GossipRegistry<T> {
                             {
                                 gossip_state.release_actor_admission(actor_name);
                                 actors_removed += 1;
-
-                                // Record a peer-death tombstone causally after the
-                                // reaped location, and propagate the removal via
-                                // gossip — otherwise a peer holding a stale cached
-                                // copy of this actor can re-admit it (see R2:
-                                // `current_actor_upsert_plan` only rejects an
-                                // incoming ActorAdded when a dominating tombstone
-                                // exists or a causally-newer entry is present, and
-                                // without this the fast dead-peer reap silently
-                                // degrades to the 24h actor_ttl backstop).
                                 let removal_clock = location.vector_clock.clone();
                                 removal_clock.increment(self.peer_id.to_node_id());
                                 let _ = self.actor_state.removed_actors.upsert_sync(
                                     actor_name.clone(),
                                     RemovedActorTombstone::new(removal_clock.clone()),
                                 );
-
                                 let change = RegistryChange::ActorRemoved {
                                     name: actor_name.clone(),
                                     vector_clock: removal_clock,
@@ -9551,8 +9565,7 @@ impl<T: 'static> GossipRegistry<T> {
                             }
                         }
                     }
-                    gossip_state.peer_to_actors.remove(peer_addr);
-
+                    gossip_state.peer_to_actors.remove(&peer_addr);
                     if actors_removed > 0 {
                         let pubsub_changed = actor_names
                             .iter()
@@ -9560,7 +9573,6 @@ impl<T: 'static> GossipRegistry<T> {
                         self.actor_state
                             .mark_routing_changed_with_pubsub(pubsub_changed);
                     }
-
                     info!(
                         peer = %peer_addr,
                         actors_removed,
@@ -9570,43 +9582,14 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
             }
-            drop(gossip_state);
 
-            // Drop the gossip_state lock before touching out-of-band
-            // tables that have their own locks.
-            for (peer_addr, node_id, evidence_before, reservation) in peers_to_cleanup {
-                // A timed-out peer's connection teardown may never have run,
-                // leaving its owner receipt and address claim behind. Release
-                // both atomically in the owner; configured pins are retained.
-                let side_tables_may_be_removed = match node_id.as_ref() {
-                    Some(peer_id) => {
-                        !matches!(
-                            self.release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
-                                .await,
-                            crate::registry_owner::DeadPeerReleaseOutcome::ProvenAlive
-                        )
-                    }
-                    None => true,
-                };
-                if side_tables_may_be_removed {
-                    self.clear_peer_capabilities(&peer_addr);
-                    self.remove_clock_state_for_addr(&peer_addr);
-                } else {
-                    debug!(
-                        peer = %peer_addr,
-                        "retained dead-peer side tables because newer liveness evidence won the release race"
-                    );
-                }
-                reservation.release().await;
-            }
-
-            // Trigger immediate gossip (outside the gossip_state lock —
-            // trigger_immediate_gossip re-acquires it) if any reaped actor
-            // had a priority requiring urgent propagation.
-            if should_trigger_immediate {
-                if let Err(err) = self.trigger_immediate_gossip().await {
-                    warn!(error = %err, "failed to trigger immediate gossip for dead-peer actor removal");
-                }
+            self.clear_peer_capabilities(&peer_addr);
+            self.remove_clock_state_for_addr(&peer_addr);
+            reservation.release().await;
+        }
+        if should_trigger_immediate {
+            if let Err(err) = self.trigger_immediate_gossip().await {
+                warn!(error = %err, "failed to trigger immediate gossip for dead-peer actor removal");
             }
         }
     }
@@ -25898,6 +25881,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -26006,6 +25990,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,

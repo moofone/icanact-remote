@@ -34,7 +34,6 @@ use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
-use scc::HashMap as SccHashMap;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, trace, warn};
 
@@ -815,6 +814,13 @@ enum OwnerCommand {
         addr: SocketAddr,
         reply: oneshot::Sender<Option<std::time::Instant>>,
     },
+    /// Record direct liveness evidence for `addr`, observed at `at`, through
+    /// the owner's serialized command stream. This keeps the evidence write
+    /// atomic with the dead-peer release decision that consumes it.
+    NoteLivenessEvidence {
+        addr: SocketAddr,
+        at: std::time::Instant,
+    },
 }
 
 /// Shared state behind every [`RegistryOwnerHandle`] clone.
@@ -830,11 +836,6 @@ struct OwnerShared {
     /// concurrently held, not by caller behavior.
     release_tx: mpsc::UnboundedSender<OwnerCommand>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
-    /// Lock-free direct liveness evidence recorded by the registry when an
-    /// application-level response is received on an existing connection.
-    /// This deliberately bypasses the bounded owner mailbox: response
-    /// traffic is hot-path evidence, not an ownership mutation.
-    liveness_evidence_at: Arc<SccHashMap<SocketAddr, std::time::Instant>>,
     /// Exactly-once start latch. The receiving half plus the publisher live
     /// here until the first command, at which point whichever caller wins the
     /// single-slot pop spawns the task. Registry construction is synchronous
@@ -846,7 +847,6 @@ struct StartKit {
     rx: mpsc::Receiver<OwnerCommand>,
     release_rx: mpsc::UnboundedReceiver<OwnerCommand>,
     routing: Weak<dyn RoutingPublisher>,
-    liveness_evidence_at: Arc<SccHashMap<SocketAddr, std::time::Instant>>,
 }
 
 /// Cheap, cloneable handle to the single-owner registry actor.
@@ -872,34 +872,34 @@ impl RegistryOwnerHandle {
     pub fn new(routing: Weak<dyn RoutingPublisher>) -> Self {
         let (tx, rx) = mpsc::channel(OWNER_MAILBOX_CAPACITY);
         let (release_tx, release_rx) = mpsc::unbounded_channel();
-        let liveness_evidence_at = Arc::new(SccHashMap::default());
         let pending_start = ArrayQueue::new(1);
         // Cannot fail: the queue was just created with capacity 1.
         let _ = pending_start.push(StartKit {
             rx,
             release_rx,
             routing,
-            liveness_evidence_at: Arc::clone(&liveness_evidence_at),
         });
         Self {
             shared: Arc::new(OwnerShared {
                 tx,
                 release_tx,
                 snapshot: Arc::new(ArcSwap::from_pointee(RoutingSnapshot::default())),
-                liveness_evidence_at,
                 pending_start,
             }),
         }
     }
 
-    /// Record direct liveness evidence for an address without entering the
-    /// owner mailbox. This is reserved for an application-level response
-    /// actually received from the peer on an existing connection; indirect
-    /// gossip/discovery chatter must not refresh it. The dead-peer release
-    /// command reads this marker synchronously as part of its final causal
-    /// decision, covering a live connection that will not submit a new claim.
-    pub fn note_liveness_evidence(&self, addr: SocketAddr, at: std::time::Instant) {
-        let _ = self.shared.liveness_evidence_at.upsert_sync(addr, at);
+    /// Record direct liveness evidence for an address through the same
+    /// serialized owner mailbox used by dead-peer release. This is reserved
+    /// for an application-level response received from the peer; indirect
+    /// gossip/discovery chatter must not refresh it.
+    pub async fn note_liveness_evidence(&self, addr: SocketAddr, at: std::time::Instant) {
+        self.ensure_started();
+        let _ = self
+            .shared
+            .tx
+            .send(OwnerCommand::NoteLivenessEvidence { addr, at })
+            .await;
     }
 
     /// Current lock-free ownership/routing snapshot.
@@ -1334,14 +1334,13 @@ impl RegistryOwnerHandle {
             rx,
             release_rx,
             routing,
-            liveness_evidence_at,
         }) = self.shared.pending_start.pop()
         {
             let owner = PeerRegistryOwner {
                 addr_ownership: HashMap::new(),
                 claim_generation: HashMap::new(),
                 claim_committed_at: HashMap::new(),
-                liveness_evidence_at,
+                liveness_evidence_at: HashMap::new(),
                 configure_peer_generation: HashMap::new(),
                 connection_scoped_claims: HashMap::new(),
                 operator_pinned: HashMap::new(),
@@ -1577,7 +1576,9 @@ struct PeerRegistryOwner {
     /// Direct liveness evidence from the registry's response path. Kept
     /// outside the owner task's mailbox so an already-claimed connection can
     /// refresh this marker without fabricating a new ownership claim.
-    liveness_evidence_at: Arc<SccHashMap<SocketAddr, std::time::Instant>>,
+    /// Direct liveness evidence recorded only by `NoteLivenessEvidence` in
+    /// this owner's serialized command stream.
+    liveness_evidence_at: HashMap<SocketAddr, std::time::Instant>,
     /// Connection-scoped ownership receipts: which live authenticated
     /// sessions currently back a peer's claim on an address, and at what
     /// owner generation. Keyed by `(peer, session_source, addr)` --
@@ -1778,7 +1779,8 @@ impl PeerRegistryOwner {
                     .is_some_and(|committed_at| *committed_at > evidence_before);
                 let has_newer_response = self
                     .liveness_evidence_at
-                    .read_sync(&addr, |_, observed_at| *observed_at)
+                    .get(&addr)
+                    .copied()
                     .is_some_and(|observed_at| observed_at > evidence_before);
                 let _ = reply.send(has_newer_claim || has_newer_response);
             }
@@ -1840,7 +1842,21 @@ impl PeerRegistryOwner {
             OwnerCommand::InspectClaimCommittedAt { addr, reply } => {
                 let _ = reply.send(self.claim_committed_at.get(&addr).copied());
             }
+            OwnerCommand::NoteLivenessEvidence { addr, at } => {
+                self.note_liveness_evidence(addr, at);
+            }
         }
+    }
+
+    fn note_liveness_evidence(&mut self, addr: SocketAddr, at: std::time::Instant) {
+        self.liveness_evidence_at
+            .entry(addr)
+            .and_modify(|existing| {
+                if at > *existing {
+                    *existing = at;
+                }
+            })
+            .or_insert(at);
     }
 
     fn claim(&mut self, addr: SocketAddr, claim: Claim, is_local_addr: bool) -> ClaimCommit {
@@ -2089,7 +2105,8 @@ impl PeerRegistryOwner {
         }
         if self
             .liveness_evidence_at
-            .read_sync(&addr, |_, observed_at| *observed_at)
+            .get(&addr)
+            .copied()
             .is_some_and(|observed_at| observed_at > evidence_before)
         {
             trace!(
@@ -2550,7 +2567,7 @@ impl PeerRegistryOwner {
     fn retract_owner(&mut self, addr: SocketAddr, owner: Owner) -> CommitSeq {
         self.claim_generation.remove(&addr);
         self.claim_committed_at.remove(&addr);
-        let _ = self.liveness_evidence_at.remove_sync(&addr);
+        self.liveness_evidence_at.remove(&addr);
         self.connection_scoped_claims.retain(|key, _| key.2 != addr);
         let commit_seq = self.advance();
         self.publish_owner_snapshot(addr, None);
@@ -2744,14 +2761,9 @@ impl PeerRegistryOwner {
                 })
                 .or_insert(from_committed_at);
         }
-        if let Some(from_observed_at) = self
-            .liveness_evidence_at
-            .remove_sync(&from)
-            .map(|(_, observed_at)| observed_at)
-        {
-            let _ = self
-                .liveness_evidence_at
-                .entry_sync(to)
+        if let Some(from_observed_at) = self.liveness_evidence_at.remove(&from) {
+            self.liveness_evidence_at
+                .entry(to)
                 .and_modify(|to_observed_at| {
                     if from_observed_at > *to_observed_at {
                         *to_observed_at = from_observed_at;
