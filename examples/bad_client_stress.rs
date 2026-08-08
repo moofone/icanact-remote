@@ -207,6 +207,7 @@ async fn connect_tls(
         negotiated_alpn.as_deref(),
         false, // peer discovery disabled by default in GossipConfig
         None,
+        icanact_remote::handshake::RemoteBootId::new(),
     )
     .await
     .expect("hello handshake");

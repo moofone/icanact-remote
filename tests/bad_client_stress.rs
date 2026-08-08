@@ -50,6 +50,7 @@ async fn connect_tls(
         negotiated_alpn.as_deref(),
         false,
         schema_hash,
+        icanact_remote::handshake::RemoteBootId::new(),
     )
     .await
     .expect("hello handshake");

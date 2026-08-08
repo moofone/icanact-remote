@@ -1815,6 +1815,9 @@ pub struct GossipRegistry<T = ()> {
     // Immutable config
     pub bind_addr: SocketAddr,
     pub peer_id: crate::PeerId, // Unique peer identifier (public key)
+    /// Unique to this running registry instance; shared by all of its TLS
+    /// sessions and regenerated on restart.
+    pub boot_id: crate::handshake::RemoteBootId,
     pub config: GossipConfig,
     pub start_time: u64,
     pub start_instant: Instant,
@@ -2025,9 +2028,11 @@ impl<T: 'static> GossipRegistry<T> {
             })?
             .peer_id();
 
+        let boot_id = crate::handshake::RemoteBootId::new();
         info!(
             bind_addr = %bind_addr,
             peer_id = %peer_id,
+            boot_id = ?boot_id.as_bytes(),
             "creating new gossip registry"
         );
 
@@ -2050,6 +2055,7 @@ impl<T: 'static> GossipRegistry<T> {
         Ok(Self {
             bind_addr,
             peer_id,
+            boot_id,
             config: config.clone(),
             start_time: current_timestamp(),
             start_instant: std::time::Instant::now(),

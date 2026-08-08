@@ -1,7 +1,7 @@
 //! Hello handshake protocol for peer capability negotiation
 //!
 //! This module implements the Hello handshake that establishes peer capabilities
-//! at connection time for V5 peers.
+//! at connection time for V6 peers.
 
 use crate::{GossipError, Result};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -12,13 +12,43 @@ use tracing::debug;
 
 const HELLO_MAX_SIZE: usize = 1024;
 const HELLO_TIMEOUT_MS: u64 = 3_000;
-pub const ALPN_ICANACT_V5: &[u8] = b"icanact-remote-v5";
+pub const ALPN_ICANACT_V6: &[u8] = b"icanact-remote-v6";
 
 /// Protocol version constants
-pub const PROTOCOL_VERSION_V5: u16 = 5;
+pub const PROTOCOL_VERSION_V6: u16 = 6;
 
 /// Current protocol version
-pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V5;
+pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V6;
+
+/// Ephemeral identity for one running remote-node instance.
+///
+/// `PeerId` remains the durable cryptographic identity. This value separates
+/// multiple physical connections from the same process (same boot id) from
+/// two concurrently live processes that reused one long-lived key (different
+/// boot ids). The value is exchanged inside mutually authenticated TLS and is
+/// never accepted as identity proof by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, RkyvSerialize, RkyvDeserialize)]
+pub struct RemoteBootId([u8; 16]);
+
+impl RemoteBootId {
+    pub fn new() -> Self {
+        Self(rand::random())
+    }
+
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl Default for RemoteBootId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Feature flags for capability negotiation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -90,6 +120,8 @@ pub struct Hello {
     /// Deployment compatibility value. It is authenticated by the TLS channel
     /// and compared once during Hello, never copied into data frames.
     pub schema_hash: Option<u64>,
+    /// Per-process incarnation, authenticated by the enclosing TLS channel.
+    pub boot_id: RemoteBootId,
 }
 
 impl Hello {
@@ -99,6 +131,7 @@ impl Hello {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             features: vec![Feature::PeerListGossip, Feature::ClockCalibration],
             schema_hash: None,
+            boot_id: RemoteBootId::new(),
         }
     }
 
@@ -108,6 +141,7 @@ impl Hello {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             features,
             schema_hash: None,
+            boot_id: RemoteBootId::new(),
         }
     }
 }
@@ -118,13 +152,18 @@ impl Default for Hello {
     }
 }
 
-fn hello_for_config(enable_peer_discovery: bool, schema_hash: Option<u64>) -> Hello {
+fn hello_for_config(
+    enable_peer_discovery: bool,
+    schema_hash: Option<u64>,
+    boot_id: RemoteBootId,
+) -> Hello {
     let mut features = vec![Feature::ClockCalibration];
     if enable_peer_discovery {
         features.push(Feature::PeerListGossip);
     }
     let mut hello = Hello::with_features(features);
     hello.schema_hash = schema_hash;
+    hello.boot_id = boot_id;
     hello
 }
 
@@ -135,6 +174,8 @@ pub struct PeerCapabilities {
     pub version: u16,
     /// Features both peers support (intersection)
     pub features: u64,
+    /// Authenticated process incarnation advertised by the remote peer.
+    pub remote_boot_id: RemoteBootId,
 }
 
 impl PeerCapabilities {
@@ -148,12 +189,13 @@ impl PeerCapabilities {
 
     /// Create capabilities from a Hello exchange.
     ///
-    /// Takes the intersection of features for the single V5 wire version.
+    /// Takes the intersection of features for the single V6 wire version.
     pub fn from_hello_exchange(local: &Hello, remote: &Hello) -> Self {
         let features = Self::features_mask(&local.features) & Self::features_mask(&remote.features);
         Self {
-            version: PROTOCOL_VERSION_V5,
+            version: PROTOCOL_VERSION_V6,
             features,
+            remote_boot_id: remote.boot_id,
         }
     }
 
@@ -246,6 +288,7 @@ pub async fn perform_hello_handshake<S>(
     negotiated_alpn: Option<&[u8]>,
     enable_peer_discovery: bool,
     schema_hash: Option<u64>,
+    local_boot_id: RemoteBootId,
 ) -> Result<PeerCapabilities>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -254,14 +297,14 @@ where
         GossipError::TlsHandshakeFailed("missing ALPN negotiation result".to_string())
     })?;
 
-    if alpn != ALPN_ICANACT_V5 {
+    if alpn != ALPN_ICANACT_V6 {
         return Err(GossipError::TlsHandshakeFailed(format!(
             "unsupported ALPN: {}",
             String::from_utf8_lossy(alpn)
         )));
     }
 
-    let local_hello = hello_for_config(enable_peer_discovery, schema_hash);
+    let local_hello = hello_for_config(enable_peer_discovery, schema_hash, local_boot_id);
     send_hello_message(stream, &local_hello).await?;
     let remote_hello = read_hello_message(stream).await?;
     if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
@@ -340,8 +383,9 @@ mod tests {
     #[test]
     fn peer_capabilities_supports_wire_kind_respects_the_mapping() {
         let gated_but_unsupported = PeerCapabilities {
-            version: PROTOCOL_VERSION_V5,
+            version: PROTOCOL_VERSION_V6,
             features: 0,
+            remote_boot_id: RemoteBootId::from_bytes([0; 16]),
         };
         assert!(
             gated_but_unsupported.supports_wire_kind(crate::framing::WireKind::Gossip),
@@ -381,7 +425,7 @@ mod tests {
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
-        assert_eq!(caps.version, PROTOCOL_VERSION_V5);
+        assert_eq!(caps.version, PROTOCOL_VERSION_V6);
         assert!(caps.supports_feature(Feature::PeerListGossip));
         assert!(caps.supports_feature(Feature::ClockCalibration));
         assert!(caps.can_send_peer_list());
@@ -390,8 +434,8 @@ mod tests {
 
     #[test]
     fn test_clock_calibration_negotiates_when_peer_discovery_disabled() {
-        let local = hello_for_config(false, None);
-        let remote = hello_for_config(false, None);
+        let local = hello_for_config(false, None, RemoteBootId::from_bytes([1; 16]));
+        let remote = hello_for_config(false, None, RemoteBootId::from_bytes([2; 16]));
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
@@ -403,14 +447,15 @@ mod tests {
     fn test_peer_capabilities_from_hello_exchange_partial_features() {
         let local = Hello::with_features(vec![Feature::PeerListGossip]);
         let remote = Hello {
-            protocol_version: PROTOCOL_VERSION_V5,
+            protocol_version: PROTOCOL_VERSION_V6,
             features: vec![], // Remote supports no features
             schema_hash: None,
+            boot_id: RemoteBootId::from_bytes([3; 16]),
         };
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
-        assert_eq!(caps.version, PROTOCOL_VERSION_V5);
+        assert_eq!(caps.version, PROTOCOL_VERSION_V6);
         assert_eq!(caps.features, 0); // No common features
         assert!(!caps.can_send_peer_list()); // Needs both version and feature
     }
@@ -476,6 +521,7 @@ mod tests {
                 protocol_version: 0,
                 features: vec![],
                 schema_hash: None,
+                boot_id: RemoteBootId::from_bytes([4; 16]),
             };
             let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy_hello).unwrap();
             server
@@ -485,9 +531,15 @@ mod tests {
             server.write_all(&serialized).await.unwrap();
         });
 
-        let err = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V5), true, None)
-            .await
-            .expect_err("handshake should reject legacy protocol peers");
+        let err = perform_hello_handshake(
+            &mut client,
+            Some(ALPN_ICANACT_V6),
+            true,
+            None,
+            RemoteBootId::from_bytes([5; 16]),
+        )
+        .await
+        .expect_err("handshake should reject legacy protocol peers");
 
         server_task.await.unwrap();
 
@@ -516,6 +568,7 @@ mod tests {
                 protocol_version: CURRENT_PROTOCOL_VERSION,
                 features: vec![],
                 schema_hash: Some(2),
+                boot_id: RemoteBootId::from_bytes([6; 16]),
             };
             let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&remote).unwrap();
             server
@@ -525,9 +578,15 @@ mod tests {
             server.write_all(&bytes).await.unwrap();
         });
 
-        let error = perform_hello_handshake(&mut client, Some(ALPN_ICANACT_V5), false, Some(1))
-            .await
-            .expect_err("different present schema hashes must fail");
+        let error = perform_hello_handshake(
+            &mut client,
+            Some(ALPN_ICANACT_V6),
+            false,
+            Some(1),
+            RemoteBootId::from_bytes([7; 16]),
+        )
+        .await
+        .expect_err("different present schema hashes must fail");
         assert!(error.to_string().contains("schema hash mismatch"));
         server_task.await.unwrap();
     }

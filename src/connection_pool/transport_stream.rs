@@ -614,6 +614,7 @@ impl<T> ConnectionPool<T> {
                         negotiated_alpn.as_deref(),
                         registry_arc.config.enable_peer_discovery,
                         registry_arc.config.schema_hash,
+                        registry_arc.boot_id,
                     )
                     .await
                     {

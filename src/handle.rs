@@ -3551,6 +3551,7 @@ async fn handle_connection(
                     negotiated_alpn.as_deref(),
                     registry.config.enable_peer_discovery,
                     registry.config.schema_hash,
+                    registry.boot_id,
                 ),
             )
             .await
@@ -4162,6 +4163,9 @@ where
         // CRITICAL: Set embedded_peer_id so responses can find the shared correlation tracker
         // even after addr_to_peer_id mapping is migrated from ephemeral to bind address
         connection.embedded_peer_id = Some(peer_id.clone());
+        connection.remote_boot_id = registry
+            .peer_capabilities
+            .read_sync(&peer_addr, |_, caps| caps.remote_boot_id);
 
         let connection_arc = Arc::new(connection);
 
@@ -4243,6 +4247,10 @@ where
                 }
                 Some(existing_conn) => {
                     let existing_usable = existing_conn.has_live_stream();
+                    let duplicate_process = crate::connection_pool::has_conflicting_remote_boot(
+                        &existing_conn,
+                        &connection_arc,
+                    );
                     let keep_existing = existing_usable
                         && registry.should_keep_connection(
                             &peer_id,
@@ -4251,8 +4259,9 @@ where
                         );
                     let keep_new_inbound = registry.should_keep_connection(&peer_id, false);
 
-                    match crate::connection_pool::resolve_connection_conflict(
-                        existing_usable,
+                    match crate::connection_pool::resolve_authenticated_connection_conflict(
+                        &existing_conn,
+                        &connection_arc,
                         keep_existing,
                         keep_new_inbound,
                         crate::connection_pool::incoming_session_is_newer(
@@ -4443,16 +4452,41 @@ where
                             accepted
                         }
                         crate::connection_pool::ConnectionConflictDecision::RejectIncoming => {
-                            info!(
-                                target: "icanact_remote_lifecycle",
-                                peer_id = %peer_id,
-                                addr = %existing_conn.addr,
-                                peer_state_addr = %peer_state_addr,
-                                existing_direction = ?existing_conn.direction,
-                                "inbound_tiebreak_reject_live_duplicate"
-                            );
+                            if duplicate_process {
+                                let incumbent_boot_id = existing_conn
+                                    .remote_boot_id
+                                    .expect("boot conflict requires incumbent boot id");
+                                let rejected_boot_id = connection_arc
+                                    .remote_boot_id
+                                    .expect("boot conflict requires candidate boot id");
+                                warn!(
+                                    target: "icanact_remote_lifecycle",
+                                    peer_id = %peer_id,
+                                    addr = %existing_conn.addr,
+                                    incumbent_boot_id = ?incumbent_boot_id.as_bytes(),
+                                    rejected_boot_id = ?rejected_boot_id.as_bytes(),
+                                    "duplicate_peer_identity_rejected"
+                                );
+                                crate::lifecycle::record_transport_event(
+                                    crate::lifecycle::TransportLifecycleEvent::DuplicateIdentityRejected {
+                                        peer: peer_id.clone(),
+                                        addr: existing_conn.addr,
+                                        incumbent_boot_id,
+                                        rejected_boot_id,
+                                    },
+                                );
+                            } else {
+                                info!(
+                                    target: "icanact_remote_lifecycle",
+                                    peer_id = %peer_id,
+                                    addr = %existing_conn.addr,
+                                    peer_state_addr = %peer_state_addr,
+                                    existing_direction = ?existing_conn.direction,
+                                    "inbound_tiebreak_reject_live_duplicate"
+                                );
+                                registry.note_tie_break_eviction(&peer_id);
+                            }
                             registry.clear_peer_capabilities(&peer_addr);
-                            registry.note_tie_break_eviction(&peer_id);
                             false
                         }
                     }

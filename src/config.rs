@@ -33,7 +33,7 @@ pub const DEFAULT_ASK_WINDOW: usize = 128;
 /// half-speaking two incompatible dialects of the same frame kinds. This is
 /// a flag-day cutover: every node in the fleet must upgrade together.
 pub const DEFAULT_SCHEMA_HASH: u64 =
-    crate::typed::fnv1a_hash("icanact-remote/v3/actor-stream-frame-schema/v2");
+    crate::typed::fnv1a_hash("icanact-remote/v3/actor-stream-frame-schema/v3-boot-id");
 
 /// Default cap on simultaneous in-flight (post-accept, pre-identified) inbound
 /// handshakes. Bounds half-open inbound tasks.
