@@ -814,6 +814,14 @@ enum OwnerCommand {
         addr: SocketAddr,
         reply: oneshot::Sender<Option<std::time::Instant>>,
     },
+    /// Pure, side-effect-free read of whether `addr` currently has a live
+    /// reap reservation held for it. This is test-only observability for
+    /// proving that a sweep reserves one candidate at a time.
+    #[cfg(test)]
+    IsReapReserved {
+        addr: SocketAddr,
+        reply: oneshot::Sender<bool>,
+    },
     /// Record direct liveness evidence for `addr`, observed at `at`, through
     /// the owner's serialized command stream. This keeps the evidence write
     /// atomic with the dead-peer release decision that consumes it.
@@ -1427,6 +1435,25 @@ impl RegistryOwnerHandle {
         response.await.ok().flatten()
     }
 
+    /// Observe whether an address currently has a live reap reservation.
+    /// This read is side-effect-free and exists only for deterministic
+    /// reservation-scope regression tests.
+    #[cfg(test)]
+    pub(crate) async fn is_reap_reserved_for_test(&self, addr: SocketAddr) -> bool {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        if self
+            .shared
+            .tx
+            .send(OwnerCommand::IsReapReserved { addr, reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+
 }
 
 /// One granted reservation's owner-side bookkeeping. `consumed` is the
@@ -1841,6 +1868,10 @@ impl PeerRegistryOwner {
             #[cfg(test)]
             OwnerCommand::InspectClaimCommittedAt { addr, reply } => {
                 let _ = reply.send(self.claim_committed_at.get(&addr).copied());
+            }
+            #[cfg(test)]
+            OwnerCommand::IsReapReserved { addr, reply } => {
+                let _ = reply.send(self.reap_reserved.contains_key(&addr));
             }
             OwnerCommand::NoteLivenessEvidence { addr, at } => {
                 self.note_liveness_evidence(addr, at);

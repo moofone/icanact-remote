@@ -9470,33 +9470,19 @@ impl<T: 'static> GossipRegistry<T> {
     /// released (unconditionally, for every candidate, to avoid leaking
     /// it) and nothing else.
     pub async fn cleanup_dead_peers(&self) {
-        let current_time = current_timestamp();
-        let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
-        // A single reference pairing of the monotonic and wall clocks,
-        // taken once here rather than once per candidate below: both
-        // `current_time` and `now_instant` describe the same instant to
-        // within this function's own setup cost, so every candidate's
-        // `last_failure_time` (wall-clock, whole seconds) converts to an
-        // `Instant` (monotonic, sub-millisecond) through the SAME pairing.
+        let dead_peer_timeout = self.config.dead_peer_timeout;
         let now_instant = std::time::Instant::now();
 
-        // This selection is a `gossip_state` read, not an owner-authority
-        // one, and can go stale relative to the owner in either direction --
-        // see `release_dead_peer_ownership`'s doc comment. `evidence_before`
-        // is derived from EACH candidate's OWN `last_failure_time`, fixed
-        // here in the SAME pass as the "looks dead" decision -- not a
-        // single boundary shared by the whole sweep. A global
-        // `now - dead_peer_timeout` cutoff looks conservative (the
-        // selection filter below already requires the failure to be at
-        // least that old) but is wrong the moment the SWEEP ITSELF runs
-        // long enough after the underlying failure+reconnect: failure at
-        // t0, a direct reconnect shortly after at t1, this sweep finally
-        // running at t2 much later -- the reconnect is causally newer than
-        // the failure it is being judged against (what the fence must
-        // answer), yet a cutoff of `t2 - dead_peer_timeout` can still be
-        // newer than t1, wrongly treating a live reconnect as stale. Only
-        // each peer's own failure time answers the right question.
-        let peers_to_cleanup: Vec<(SocketAddr, Option<crate::PeerId>, std::time::Instant)> = {
+        // Capture each candidate's own monotonic failure instant and the
+        // owner-side identity tokens observed with it. The owner validates
+        // those tokens again atomically when granting the reservation.
+        let peers_to_cleanup: Vec<(
+            SocketAddr,
+            Option<crate::PeerId>,
+            std::time::Instant,
+            Option<crate::registry_owner::OwnershipToken>,
+            Option<crate::PeerId>,
+        )> = {
             let gossip_state = self.gossip_state.lock().await;
             gossip_state
                 .peers
@@ -9504,64 +9490,70 @@ impl<T: 'static> GossipRegistry<T> {
                 .filter(|(_, info)| {
                     // Check if peer has been disconnected for too long
                     info.failures >= self.config.max_peer_failures
-                        && info.last_failure_time.is_some_and(|failure_time| {
-                            current_time.saturating_sub(failure_time) > dead_peer_timeout_secs
+                        && info.last_failure_instant.is_some_and(|failure_instant| {
+                            now_instant.saturating_duration_since(failure_instant)
+                                > dead_peer_timeout
                         })
                 })
-                .map(|(addr, info)| {
-                    // Guaranteed `Some` by the filter above.
-                    let failure_time = info
-                        .last_failure_time
-                        .expect("filtered on last_failure_time.is_some");
-                    let failure_age =
-                        Duration::from_secs(current_time.saturating_sub(failure_time));
-                    let evidence_before =
-                        now_instant.checked_sub(failure_age).unwrap_or(now_instant);
-                    (
-                        *addr,
-                        info.node_id.map(|node_id| node_id.to_peer_id()),
-                        evidence_before,
-                    )
+                .filter_map(|(addr, info)| {
+                    let evidence_before = info
+                        .last_failure_instant
+                        .expect("filtered on last_failure_instant.is_some");
+                    let ownership = self.registry_owner.ownership_token(addr);
+                    let pin_owner = self.registry_owner.pin_owner(addr);
+                    let node_id = info.node_id.map(|node_id| node_id.to_peer_id());
+                    let owner_identity = match ownership.as_ref() {
+                        Some(token) => Some(token.owner().clone()),
+                        None => pin_owner.clone(),
+                    };
+                    if let (Some(candidate_id), Some(owner_id)) = (&node_id, &owner_identity)
+                        && candidate_id != owner_id
+                    {
+                        debug!(
+                            addr = %addr,
+                            "cleanup_dead_peers: selection skipped -- gossip node_id does not \
+                             match the owner's current identity"
+                        );
+                        return None;
+                    }
+                    Some((*addr, node_id, evidence_before, ownership, pin_owner))
                 })
                 .collect()
         };
 
-        // Revalidate the owner's causal liveness fence before any
-        // destructive work. A reconnect can commit after the stale
-        // `gossip_state` selection but before this sweep reaches the actor
-        // removal loop; in that case preserve actors, tombstones, and
-        // side-table state, not merely the address ownership at the final
-        // release step.
-        // Reserve each candidate through the owner before doing any
-        // destructive work. The reservation blocks ownership claims while
-        // the candidate is being processed; the pure liveness verdict and
-        // one-shot consume authorization happen in the destructive phase,
-        // immediately before that work begins.
-        let mut confirmed_dead = Vec::with_capacity(peers_to_cleanup.len());
-        for (peer_addr, node_id, evidence_before) in peers_to_cleanup {
-            let expected_ownership = self.registry_owner.ownership_token(&peer_addr);
-            let expected_pin = self.registry_owner.pin_owner(&peer_addr);
-            let reservation = self
+        if peers_to_cleanup.is_empty() {
+            return;
+        }
+
+        // Reserve, reap, and release one candidate at a time. Holding every
+        // candidate reservation while earlier candidates undergo actor and
+        // tombstone work would unnecessarily block unrelated reconnects and
+        // operator configuration for the rest of the batch.
+        for (peer_addr, node_id, evidence_before, ownership, pin_owner) in peers_to_cleanup {
+            let Some(reservation) = self
                 .registry_owner
                 .reserve_for_reap(
                     peer_addr,
                     evidence_before,
-                    expected_ownership,
-                    expected_pin,
+                    ownership,
+                    pin_owner,
                     node_id.clone(),
                 )
-                .await;
-            let Some(reservation) = reservation else {
+                .await
+            else {
                 debug!(
                     peer = %peer_addr,
-                    "cleanup_dead_peers: owner refused stale candidate reservation"
+                    "cleanup_dead_peers: reap reservation refused -- owner-side identity moved"
                 );
                 continue;
             };
-            confirmed_dead.push((peer_addr, node_id, evidence_before, reservation));
-        }
-        self.reap_reserved_candidates(confirmed_dead, dead_peer_timeout_secs)
+
+            self.reap_reserved_candidates(
+                vec![(peer_addr, node_id, evidence_before, reservation)],
+                dead_peer_timeout,
+            )
             .await;
+        }
     }
 
     /// Apply the pure owner liveness verdict and one-shot reservation
@@ -9575,7 +9567,7 @@ impl<T: 'static> GossipRegistry<T> {
             std::time::Instant,
             crate::registry_owner::ReapReservation,
         )>,
-        dead_peer_timeout_secs: u64,
+        dead_peer_timeout: Duration,
     ) {
         let mut should_trigger_immediate = false;
         for (peer_addr, node_id, evidence_before, reservation) in peers_to_cleanup {
@@ -9677,7 +9669,7 @@ impl<T: 'static> GossipRegistry<T> {
                         peer = %peer_addr,
                         actors_removed,
                         stale_side_table_entries = actor_names.len().saturating_sub(actors_removed),
-                        timeout_minutes = dead_peer_timeout_secs / 60,
+                        timeout_minutes = dead_peer_timeout.as_secs() / 60,
                         "cleaned up actors from long-disconnected peer (peer retained for reconnection)"
                     );
                 }
