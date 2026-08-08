@@ -117,7 +117,7 @@ async fn higher_id_supervisor_reconnect_completes_within_debounce_window() {
             icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
-    let _ = high.registry
+    high.registry
         .configure_peer(low.registry.peer_id.clone(), low.registry.bind_addr)
         .await;
 

@@ -91,7 +91,7 @@ impl PeerDisconnectHandler for ReconnectOnDisconnect {
             let _ = self.current.send(None);
 
             // Best-effort: ensure mapping is set (restart may rebind but in this test we keep the same addr).
-            let _ = self.handle
+            self.handle
                 .registry
                 .configure_peer(self.peer_id.clone(), self.peer_addr)
                 .await;
@@ -180,7 +180,7 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
         .expect("start client"),
     );
 
-    let _ = client
+    client
         .registry
         .configure_peer(server_peer_id.clone(), server_addr)
         .await;

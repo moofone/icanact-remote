@@ -301,8 +301,8 @@ pub async fn connect_bidirectional(a: &TlsHandle, b: &TlsHandle) -> Result<(), D
     let peer_id_a = a.registry.peer_id.clone();
     let peer_id_b = b.registry.peer_id.clone();
 
-    let _ = a.registry.configure_peer(peer_id_b.clone(), addr_b).await;
-    let _ = b.registry.configure_peer(peer_id_a.clone(), addr_a).await;
+    a.registry.configure_peer(peer_id_b.clone(), addr_b).await;
+    b.registry.configure_peer(peer_id_a.clone(), addr_a).await;
 
     let peer_b = a.add_peer(&peer_id_b).await;
     peer_b.connect(&addr_b).await?;

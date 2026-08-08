@@ -1753,7 +1753,7 @@ mod tests {
         // An owner command interleaves BETWEEN the read and the write
         // below, publishing a NEW pin -- exactly what a concurrent
         // `configure_peer` does.
-        let _ = registry
+        registry
             .configure_peer(peer_id.clone(), new_pin_addr)
             .await;
         assert_eq!(
@@ -1814,7 +1814,7 @@ mod tests {
             let registry_for_pin = registry.clone();
             let peer_id_for_pin = peer_id.clone();
             let call_configure = tokio::spawn(async move {
-                let _ = registry_for_pin
+                registry_for_pin
                     .configure_peer(peer_id_for_pin, pin_addr)
                     .await;
             });
@@ -1856,7 +1856,7 @@ mod tests {
         let pinned_addr: SocketAddr = "127.0.0.1:41014".parse().unwrap();
         let declined_addr: SocketAddr = "127.0.0.1:41015".parse().unwrap();
 
-        let _ = registry
+        registry
             .configure_peer(peer_id.clone(), pinned_addr)
             .await;
 
@@ -1952,7 +1952,7 @@ mod tests {
             let registry_for_pin = registry.clone();
             let peer_id_for_pin = peer_id.clone();
             let call_configure = tokio::spawn(async move {
-                let _ = registry_for_pin
+                registry_for_pin
                     .configure_peer(peer_id_for_pin, addr_a)
                     .await;
             });

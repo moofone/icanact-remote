@@ -2562,7 +2562,7 @@ mod tests {
         // not about trusting a self-reported address. Reserve the advertised
         // address as operator-owned so it remains Verified under the address
         // ownership policy.
-        let _ = handle
+        handle
             .registry
             .configure_peer(remote_peer_id.clone(), advertised_bind_addr)
             .await;

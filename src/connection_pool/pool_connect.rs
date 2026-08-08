@@ -518,12 +518,10 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_addr
             .remove_if_sync(&evicted_addr, |connection| {
-                let belongs_to_this_peer = connection.embedded_peer_id.as_ref() == Some(peer_id)
+                connection.embedded_peer_id.as_ref() == Some(peer_id)
                     || current
                         .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(connection, current));
-                let is_genuine_transport_source = connection.addr == evicted_addr;
-                belongs_to_this_peer && !is_genuine_transport_source
+                        .is_some_and(|current| Arc::ptr_eq(connection, current))
             });
     }
 

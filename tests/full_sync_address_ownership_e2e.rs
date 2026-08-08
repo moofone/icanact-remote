@@ -233,7 +233,7 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
     // Operator configuration is independent evidence that the victim owns
     // this listening address. The victim's later inbound self-report may
     // refresh it, but cannot be what creates exclusive ownership.
-    let _ = observer
+    observer
         .registry
         .configure_peer(victim.registry.peer_id.clone(), victim_addr)
         .await;
