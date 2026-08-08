@@ -34,6 +34,7 @@ use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
+use scc::HashMap as SccHashMap;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, trace, warn};
 
@@ -282,6 +283,21 @@ pub enum ClaimRejection {
     /// anything; unlike `ReapInProgress`, not worth retrying, since
     /// generations only increase.
     SupersededByNewerConfiguration,
+}
+
+/// The owner's complete decision for a dead-peer release.
+///
+/// `ProvenAlive` is distinct from `NotApplicable`: the former means direct
+/// or ordinary liveness evidence arrived after the sweep's failure boundary,
+/// so callers must preserve every side table as well as ownership; the latter
+/// means this identity simply has no releasable ownership (for example an
+/// operator pin or an already-displaced owner), so non-owner cleanup may
+/// still proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadPeerReleaseOutcome {
+    Released(CommitSeq),
+    ProvenAlive,
+    NotApplicable,
 }
 
 /// Monotonic position of a committed mutation in the owner task's total
@@ -663,7 +679,7 @@ enum OwnerCommand {
         peer_id: PeerId,
         addr: SocketAddr,
         evidence_before: std::time::Instant,
-        reply: oneshot::Sender<Option<CommitSeq>>,
+        reply: oneshot::Sender<DeadPeerReleaseOutcome>,
     },
     /// Read `ReleaseDeadPeer`'s causal liveness fence without performing
     /// any side effects. Cleanup uses this before destroying actors or
@@ -814,6 +830,11 @@ struct OwnerShared {
     /// concurrently held, not by caller behavior.
     release_tx: mpsc::UnboundedSender<OwnerCommand>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
+    /// Lock-free direct liveness evidence recorded by the registry when an
+    /// application-level response is received on an existing connection.
+    /// This deliberately bypasses the bounded owner mailbox: response
+    /// traffic is hot-path evidence, not an ownership mutation.
+    liveness_evidence_at: Arc<SccHashMap<SocketAddr, std::time::Instant>>,
     /// Exactly-once start latch. The receiving half plus the publisher live
     /// here until the first command, at which point whichever caller wins the
     /// single-slot pop spawns the task. Registry construction is synchronous
@@ -825,6 +846,7 @@ struct StartKit {
     rx: mpsc::Receiver<OwnerCommand>,
     release_rx: mpsc::UnboundedReceiver<OwnerCommand>,
     routing: Weak<dyn RoutingPublisher>,
+    liveness_evidence_at: Arc<SccHashMap<SocketAddr, std::time::Instant>>,
 }
 
 /// Cheap, cloneable handle to the single-owner registry actor.
@@ -850,21 +872,34 @@ impl RegistryOwnerHandle {
     pub fn new(routing: Weak<dyn RoutingPublisher>) -> Self {
         let (tx, rx) = mpsc::channel(OWNER_MAILBOX_CAPACITY);
         let (release_tx, release_rx) = mpsc::unbounded_channel();
+        let liveness_evidence_at = Arc::new(SccHashMap::default());
         let pending_start = ArrayQueue::new(1);
         // Cannot fail: the queue was just created with capacity 1.
         let _ = pending_start.push(StartKit {
             rx,
             release_rx,
             routing,
+            liveness_evidence_at: Arc::clone(&liveness_evidence_at),
         });
         Self {
             shared: Arc::new(OwnerShared {
                 tx,
                 release_tx,
                 snapshot: Arc::new(ArcSwap::from_pointee(RoutingSnapshot::default())),
+                liveness_evidence_at,
                 pending_start,
             }),
         }
+    }
+
+    /// Record direct liveness evidence for an address without entering the
+    /// owner mailbox. This is reserved for an application-level response
+    /// actually received from the peer on an existing connection; indirect
+    /// gossip/discovery chatter must not refresh it. The dead-peer release
+    /// command reads this marker synchronously as part of its final causal
+    /// decision, covering a live connection that will not submit a new claim.
+    pub fn note_liveness_evidence(&self, addr: SocketAddr, at: std::time::Instant) {
+        let _ = self.shared.liveness_evidence_at.upsert_sync(addr, at);
     }
 
     /// Current lock-free ownership/routing snapshot.
@@ -1009,14 +1044,15 @@ impl RegistryOwnerHandle {
     }
 
     /// Release all ownership and connection-scoped receipts that remain for
-    /// `peer_id` at `addr` after a dead-peer sweep. Operator-pinned addresses
-    /// are retained by the owner and therefore return `None`.
+    /// `peer_id` at `addr` after a dead-peer sweep. The outcome distinguishes
+    /// a live peer from an address that simply has nothing applicable to
+    /// release, so callers can gate unrelated side-table destruction safely.
     pub async fn release_dead_peer(
         &self,
         peer_id: PeerId,
         addr: SocketAddr,
         evidence_before: std::time::Instant,
-    ) -> Option<CommitSeq> {
+    ) -> DeadPeerReleaseOutcome {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReleaseDeadPeer {
@@ -1026,9 +1062,11 @@ impl RegistryOwnerHandle {
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
-            return None;
+            return DeadPeerReleaseOutcome::ProvenAlive;
         }
-        response.await.unwrap_or(None)
+        response
+            .await
+            .unwrap_or(DeadPeerReleaseOutcome::ProvenAlive)
     }
 
     /// Read `release_dead_peer`'s causal liveness fence without applying its
@@ -1296,12 +1334,14 @@ impl RegistryOwnerHandle {
             rx,
             release_rx,
             routing,
+            liveness_evidence_at,
         }) = self.shared.pending_start.pop()
         {
             let owner = PeerRegistryOwner {
                 addr_ownership: HashMap::new(),
                 claim_generation: HashMap::new(),
                 claim_committed_at: HashMap::new(),
+                liveness_evidence_at,
                 configure_peer_generation: HashMap::new(),
                 connection_scoped_claims: HashMap::new(),
                 operator_pinned: HashMap::new(),
@@ -1534,6 +1574,10 @@ struct PeerRegistryOwner {
     /// liveness on an already-claimed connection -- a complementary fence
     /// for that is out of this crate's current scope.
     claim_committed_at: HashMap<SocketAddr, std::time::Instant>,
+    /// Direct liveness evidence from the registry's response path. Kept
+    /// outside the owner task's mailbox so an already-claimed connection can
+    /// refresh this marker without fabricating a new ownership claim.
+    liveness_evidence_at: Arc<SccHashMap<SocketAddr, std::time::Instant>>,
     /// Connection-scoped ownership receipts: which live authenticated
     /// sessions currently back a peer's claim on an address, and at what
     /// owner generation. Keyed by `(peer, session_source, addr)` --
@@ -1728,11 +1772,15 @@ impl PeerRegistryOwner {
                 evidence_before,
                 reply,
             } => {
-                let has_newer = self
+                let has_newer_claim = self
                     .claim_committed_at
                     .get(&addr)
                     .is_some_and(|committed_at| *committed_at > evidence_before);
-                let _ = reply.send(has_newer);
+                let has_newer_response = self
+                    .liveness_evidence_at
+                    .read_sync(&addr, |_, observed_at| *observed_at)
+                    .is_some_and(|observed_at| observed_at > evidence_before);
+                let _ = reply.send(has_newer_claim || has_newer_response);
             }
             OwnerCommand::ReserveForReap {
                 addr,
@@ -2026,7 +2074,7 @@ impl PeerRegistryOwner {
         peer_id: &PeerId,
         addr: SocketAddr,
         evidence_before: std::time::Instant,
-    ) -> Option<CommitSeq> {
+    ) -> DeadPeerReleaseOutcome {
         if self
             .claim_committed_at
             .get(&addr)
@@ -2037,22 +2085,36 @@ impl PeerRegistryOwner {
                 peer = %peer_id,
                 "dead-peer release refused: address has direct evidence of life after the failure this reap is acting on"
             );
-            return None;
+            return DeadPeerReleaseOutcome::ProvenAlive;
+        }
+        if self
+            .liveness_evidence_at
+            .read_sync(&addr, |_, observed_at| *observed_at)
+            .is_some_and(|observed_at| observed_at > evidence_before)
+        {
+            trace!(
+                addr = %addr,
+                peer = %peer_id,
+                "dead-peer release refused: address has response evidence of life after the failure this reap is acting on"
+            );
+            return DeadPeerReleaseOutcome::ProvenAlive;
         }
         self.connection_scoped_claims
             .retain(|key, _| !(&key.0 == peer_id && key.2 == addr));
         if self.operator_pinned.contains_key(&addr) {
-            return None;
+            return DeadPeerReleaseOutcome::NotApplicable;
         }
         let still_owned = self
             .addr_ownership
             .get(&addr)
             .is_some_and(|owner| owner.node_id == *peer_id);
         if !still_owned {
-            return None;
+            return DeadPeerReleaseOutcome::NotApplicable;
         }
-        let owner = self.addr_ownership.remove(&addr)?;
-        Some(self.retract_owner(addr, owner))
+        let Some(owner) = self.addr_ownership.remove(&addr) else {
+            return DeadPeerReleaseOutcome::NotApplicable;
+        };
+        DeadPeerReleaseOutcome::Released(self.retract_owner(addr, owner))
     }
 
     /// Invalidate a currently-held, NOT YET CONSUMED reap reservation for
@@ -2488,6 +2550,7 @@ impl PeerRegistryOwner {
     fn retract_owner(&mut self, addr: SocketAddr, owner: Owner) -> CommitSeq {
         self.claim_generation.remove(&addr);
         self.claim_committed_at.remove(&addr);
+        let _ = self.liveness_evidence_at.remove_sync(&addr);
         self.connection_scoped_claims.retain(|key, _| key.2 != addr);
         let commit_seq = self.advance();
         self.publish_owner_snapshot(addr, None);
@@ -2680,6 +2743,21 @@ impl PeerRegistryOwner {
                     }
                 })
                 .or_insert(from_committed_at);
+        }
+        if let Some(from_observed_at) = self
+            .liveness_evidence_at
+            .remove_sync(&from)
+            .map(|(_, observed_at)| observed_at)
+        {
+            let _ = self
+                .liveness_evidence_at
+                .entry_sync(to)
+                .and_modify(|to_observed_at| {
+                    if from_observed_at > *to_observed_at {
+                        *to_observed_at = from_observed_at;
+                    }
+                })
+                .or_insert(from_observed_at);
         }
         let snapshot = self.snapshot.load_full();
         let mut snapshot = snapshot

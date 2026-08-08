@@ -4298,15 +4298,16 @@ impl<T: 'static> GossipRegistry<T> {
         peer_id: &crate::PeerId,
         addr: SocketAddr,
         evidence_before: std::time::Instant,
-    ) {
-        if let Some(release_seq) = self
+    ) -> crate::registry_owner::DeadPeerReleaseOutcome {
+        let outcome = self
             .registry_owner
             .release_dead_peer(peer_id.clone(), addr, evidence_before)
-            .await
-        {
+            .await;
+        if let crate::registry_owner::DeadPeerReleaseOutcome::Released(release_seq) = outcome {
             let mut state = self.gossip_state.lock().await;
             state.tombstone_ownership_projection(addr, release_seq);
         }
+        outcome
     }
 
     /// Add/project a peer and return the owner actor's receipt for this exact
@@ -8197,6 +8198,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// `apply_gossip_results` knows the peer is alive at the application
     /// layer, not just the kernel-buffer-accepted layer.
     async fn mark_response_received(&self, peer_addr: SocketAddr, now: u64) {
+        self.registry_owner
+            .note_liveness_evidence(peer_addr, std::time::Instant::now());
         let mut gossip_state = self.gossip_state.lock().await;
         if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
             // `now` is captured at the start of the gossip batch; a later
@@ -9572,14 +9575,27 @@ impl<T: 'static> GossipRegistry<T> {
             // Drop the gossip_state lock before touching out-of-band
             // tables that have their own locks.
             for (peer_addr, node_id, evidence_before, reservation) in peers_to_cleanup {
-                self.clear_peer_capabilities(&peer_addr);
-                self.remove_clock_state_for_addr(&peer_addr);
                 // A timed-out peer's connection teardown may never have run,
                 // leaving its owner receipt and address claim behind. Release
                 // both atomically in the owner; configured pins are retained.
-                if let Some(peer_id) = node_id.as_ref() {
-                    self.release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
-                        .await;
+                let side_tables_may_be_removed = match node_id.as_ref() {
+                    Some(peer_id) => {
+                        !matches!(
+                            self.release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
+                                .await,
+                            crate::registry_owner::DeadPeerReleaseOutcome::ProvenAlive
+                        )
+                    }
+                    None => true,
+                };
+                if side_tables_may_be_removed {
+                    self.clear_peer_capabilities(&peer_addr);
+                    self.remove_clock_state_for_addr(&peer_addr);
+                } else {
+                    debug!(
+                        peer = %peer_addr,
+                        "retained dead-peer side tables because newer liveness evidence won the release race"
+                    );
                 }
                 reservation.release().await;
             }
