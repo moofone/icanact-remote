@@ -2,6 +2,279 @@
 /// read side. Ordinary tell/ask commands never use this slice machinery.
 const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 
+/// Invariant: a connection must never end up with both directions unable to
+/// read because both are unable to write.
+///
+/// The IO task owns one socket's read and write sides sequentially on one
+/// task: each turn writes at most one bounded slice, then reads. A slice
+/// write is a single `poll_write` -- per the `AsyncWrite` contract it either
+/// completes having written some bytes, or returns `Pending` having written
+/// none -- so it is always safe to bound and retry from the same offset. If
+/// it were left as a plain, unbounded `.await` instead, a peer that has
+/// stopped draining its receive window parks this task inside that await
+/// with no way to return to its own read loop. Both peers running the same
+/// logic then deadlock symmetrically: neither drains its socket, so neither
+/// peer's advertised TCP window ever reopens, so neither blocked write can
+/// ever complete -- a purely application-level circular wait despite both
+/// sockets being perfectly healthy at the transport level.
+///
+/// `STREAM_WRITE_SLICE_TIMEOUT` bounds each attempt so this task always
+/// returns to its read loop on a fixed cadence regardless of how long the
+/// peer takes to drain. That alone breaks the deadlock: draining our own
+/// socket reopens our advertised window, which is exactly the progress the
+/// peer's own blocked write is waiting on, and vice versa -- ordinary TCP
+/// flow control does the rest. `STREAM_WRITE_STUCK_TEARDOWN` is the backstop
+/// for when draining never lets it through anyway (the peer is truly gone,
+/// not merely slow): once a slice has made zero progress for that long, the
+/// IO task gives up on the connection instead of retrying forever.
+///
+/// Both constants are reused by `write_ask_nack_header_bounded` for the same
+/// "how long before we give up on this one write attempt" question, applied
+/// to a queued ask-backpressure NACK instead of a streaming response slice:
+/// a NACK write that parks indefinitely on a peer that has stopped draining
+/// would park this task's read side right along with it, the same shape of
+/// deadlock this constant exists to close for the streaming slice writer.
+/// `STREAM_WRITE_STUCK_TEARDOWN` there is only reached once the NACK write
+/// has already committed some bytes to the wire (so it can no longer be
+/// abandoned without corrupting every later frame on the connection) and
+/// then stalls; a NACK that has not yet written anything is simply
+/// abandoned instead -- best-effort, not a delivery guarantee, unlike a
+/// streaming response frame.
+///
+/// A bounded write alone is not sufficient: the read loop below also used to
+/// refuse to attempt a read at all once `local_streaming_queue.is_full()`
+/// (more than ~`MAX_STREAM_SIZE` retained), regardless of whether the next
+/// frame needed streaming-queue capacity. Two peers that each independently
+/// accumulate that much retained backlog -- a bidirectional large-ask storm,
+/// exactly the scenario this constant exists for -- would stop reading each
+/// other entirely, and a write that keeps retrying into a socket nobody is
+/// draining never resolves either. That pre-check is removed: reading (and
+/// so draining the peer) no longer depends on `is_full` at all. See the
+/// comment at the read loop's `while` condition in `io_task`.
+///
+/// Reading is not the same as dispatching. An `ActorAsk`'s handler runs
+/// before its response size -- and so whether it will need streaming
+/// admission -- is known, so unconditional dispatch would compute a response
+/// this connection cannot currently retain and then discard it
+/// (`can_admit_response` -> `WouldBlock`, the drop documented at
+/// `queue_streaming_response_bytes`/`_pooled`). `actor_ask_correlation_id`
+/// combined with the same `is_full` check gates dispatch specifically (not
+/// the read) at each of `io_task`'s three call sites: an ask's frame is still
+/// read off the wire either way, but once the queue has no room its handler
+/// never runs -- the peer gets an immediate `AskNackReason::Backpressure`
+/// NACK instead, rather than being left to time out or having a computed
+/// answer discarded after the fact. Tells, control frames, and every other
+/// message keep dispatching unconditionally -- that is what actually lets
+/// the queue drain.
+///
+/// What is NOT covered by either fix: a partial frame pending together with
+/// `response_batch`/`direct_response_batch` at their own (much smaller, ~8MB)
+/// byte cap still stops reads outright, on purpose -- those batches cannot be
+/// flushed mid-frame without corrupting the wire framing, and unlike
+/// streaming admission they are not individually fallible, so the only other
+/// way to bound them is to stop accepting more work. If both peers reach
+/// *that* specific state simultaneously, this task's periodic write retries
+/// keep attempting (and read gating from `is_full` is no longer a factor),
+/// but if the peer is truly not draining, no attempt makes progress and reads
+/// stay stopped until `STREAM_WRITE_STUCK_TEARDOWN` fires and tears the
+/// connection down. That is a bounded resolution (<= 30s), not a graceful
+/// one -- it is the teardown escape the invariant above allows, not the
+/// backpressure escape the `is_full` fix gives the more common case.
+///
+/// **Every `.await` that can block on this transport needs one of the two
+/// bounds above (or an equivalent), not just the streaming-slice write this
+/// invariant was first written for.** `bounded_stream_flush` closes the same
+/// hole for the automatic, non-`StreamingCommand::Flush` flushes below (an
+/// ask-latency fast path, a throughput-threshold checkpoint, an
+/// immediate-payload flush, an idle-branch drain): each used to be a plain
+/// `stream.flush().await`, unbounded, reachable after any ordinary write --
+/// the same deadlock shape this invariant closes for a stuck write, just
+/// through a caller `write_streaming_command_slice`'s own bounded flush
+/// never covered. It shares `STREAM_WRITE_SLICE_TIMEOUT` and
+/// `STREAM_FLUSH_STUCK_TEARDOWN` (not `STREAM_WRITE_STUCK_TEARDOWN` --
+/// `poll_flush`'s `Pending` carries none of `poll_write`'s "zero bytes"
+/// guarantee, see that constant's own doc comment) with the explicit
+/// `StreamingCommand::Flush` path, since only one flush-shaped attempt on
+/// this transport is ever outstanding at a time.
+///
+/// **Known gap, not yet closed:** `write_response_batch`,
+/// `write_direct_response_batch`, and `write_chunks_batched` (this
+/// connection's ordinary, non-streaming response/tell writers) still loop
+/// over multiple `poll_write`/`write_vectored` calls with no per-attempt
+/// timeout, and `read_pipeline.rs`'s two `flush_each_actor_response` call
+/// sites are plain unbounded flushes of the same shape this fix closes
+/// here. None of them are individually cancel-safe to wrap in a naive
+/// `tokio::time::timeout` the way this file's slice writers are --
+/// `write_all`-shaped internals mean a cancelled attempt can abandon a
+/// partially-written frame mid-flight and corrupt every later frame on the
+/// connection (see `write_ask_nack_header_bounded`'s doc comment for the
+/// exact failure this already burned once). Closing them needs the same
+/// single-attempt-then-retry redesign `write_vectored_once` gave the
+/// streaming path, not a one-line timeout wrapper; tracked as follow-up
+/// work rather than folded into this fix.
+const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// See `STREAM_WRITE_SLICE_TIMEOUT`.
+const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
+
+/// `StreamingCommand::Flush`'s own stuck-teardown budget, tracked on its own
+/// wedge clock independently of `STREAM_WRITE_STUCK_TEARDOWN` (see
+/// `record_slice_attempt`). Sharing a clock and a budget with the other
+/// `StreamingCommand` variants is wrong for `Flush`, not just imprecise:
+///
+/// - `AsyncWrite::poll_write` guarantees a `Pending` result wrote zero bytes,
+///   which is exactly what lets a `STREAM_WRITE_SLICE_TIMEOUT` miss stand in
+///   for "this attempt made zero progress" for every other variant (see
+///   `write_vectored_once`). `AsyncWrite::poll_flush` carries no equivalent
+///   guarantee: a real implementation (buffered writers, TLS) commonly drains
+///   part of its internal buffer through the underlying transport and *then*
+///   returns `Pending` because more is still queued. Folding that into the
+///   same "zero progress" bucket as a genuinely wedged `poll_write` is simply
+///   the wrong reading of the contract, not a conservative one.
+/// - Buffered/TLS `poll_write` calls typically return `Ready` as soon as the
+///   bytes are copied into the writer's own buffer, well before they have
+///   necessarily reached the peer. The real "wait for a slow socket to
+///   actually drain" time `STREAM_WRITE_STUCK_TEARDOWN` is calibrated to
+///   bound is therefore, for a large buffered backlog, mostly *not* spent
+///   inside any single write slice at all -- it lands on the `Flush` that
+///   follows once every write has already reported `complete`. A `Flush`
+///   finishing a large backlog over a slow-but-healthy link is
+///   disproportionately likely to need longer than any one write ever does,
+///   purely because it is left holding that concentrated wait, not because
+///   anything is actually wrong with the connection.
+///
+/// Set well above `STREAM_WRITE_STUCK_TEARDOWN` accordingly, trading a slower
+/// worst-case detection of a `Flush` stuck on a genuinely dead peer for not
+/// tearing down a connection that is still visibly draining, just slowly.
+const STREAM_FLUSH_STUCK_TEARDOWN: Duration = Duration::from_secs(120);
+
+/// Outcome of one bounded streaming slice attempt (write or flush) that did
+/// not complete within `STREAM_WRITE_SLICE_TIMEOUT`, or that did.
+#[derive(Debug, PartialEq, Eq)]
+enum SliceAttemptOutcome {
+    /// Retry next turn: either the attempt completed/made progress, or it
+    /// timed out but has not yet been wedged long enough to give up.
+    Continue,
+    /// Timed out with zero confirmed progress for at least the applicable
+    /// teardown budget; the caller should tear the connection down.
+    TearDown { stuck_for: Duration },
+}
+
+/// Update the write/flush wedge clocks for one slice attempt's result and
+/// decide whether the applicable kind-specific teardown budget has now
+/// elapsed. `Flush` and every other `StreamingCommand` variant are tracked on
+/// independent clocks against independent budgets (`STREAM_FLUSH_STUCK_TEARDOWN`
+/// vs. `STREAM_WRITE_STUCK_TEARDOWN`) -- see the doc comment on the former for
+/// why conflating them is a correctness bug, not just imprecise accounting.
+///
+/// Takes `now` as an explicit parameter (never calls `Instant::now()` itself)
+/// so this is unit-testable against fabricated instants instead of requiring
+/// callers to wait out the real multi-second/minute budgets end to end.
+fn record_slice_attempt(
+    command_is_flush: bool,
+    attempt_completed: bool,
+    now: Instant,
+    write_wedged_since: &mut Option<Instant>,
+    flush_wedged_since: &mut Option<Instant>,
+) -> SliceAttemptOutcome {
+    let (wedged_since, teardown_budget) = if command_is_flush {
+        (flush_wedged_since, STREAM_FLUSH_STUCK_TEARDOWN)
+    } else {
+        (write_wedged_since, STREAM_WRITE_STUCK_TEARDOWN)
+    };
+    if attempt_completed {
+        *wedged_since = None;
+        return SliceAttemptOutcome::Continue;
+    }
+    let started = *wedged_since.get_or_insert(now);
+    let stuck_for = now.saturating_duration_since(started);
+    if stuck_for >= teardown_budget {
+        SliceAttemptOutcome::TearDown { stuck_for }
+    } else {
+        SliceAttemptOutcome::Continue
+    }
+}
+
+/// Outcome of one bounded automatic-flush attempt (see `bounded_stream_flush`).
+enum AutoFlushOutcome {
+    /// The flush completed: the caller's own "bytes since flush" tracking
+    /// can be reset to zero.
+    Completed,
+    /// The attempt timed out but has not yet been wedged long enough to
+    /// give up. The caller must **not** reset its "bytes since flush"
+    /// tracking here -- doing so would forget that data is still
+    /// unflushed, and nothing would ever retry it.
+    StillPending,
+    /// Timed out and wedged long enough to give up; the error has already
+    /// been logged. The caller must tear the connection down.
+    TearDown,
+}
+
+/// Bounded counterpart to a plain `stream.flush().await`, for the automatic
+/// flush call sites below that are not part of a `StreamingCommand::Flush`
+/// (an ask-latency fast path, a throughput-threshold checkpoint, an
+/// idle-branch drain -- see each call site). Those cannot route through
+/// `write_streaming_command_slice`'s own bounded call directly, since there
+/// is no `PendingStreamingCommand` to attach the flush to, but they share
+/// the exact hazard `STREAM_FLUSH_STUCK_TEARDOWN` exists for: on a
+/// buffered/TLS transport `poll_flush` can stay `Pending` while still
+/// draining the socket, and that `Pending` carries none of `poll_write`'s
+/// "zero bytes" guarantee (see the doc comment on `STREAM_FLUSH_STUCK_TEARDOWN`).
+/// A plain, unbounded `.await` here parks this task -- and so its own read
+/// side -- exactly the shape of deadlock this file's invariant exists to
+/// prevent; closing it only for the `StreamingCommand`-queue write/flush
+/// path left every other flush call site exposed.
+///
+/// Shares `stream_flush_wedged_since` (and so `STREAM_FLUSH_STUCK_TEARDOWN`)
+/// with the explicit `StreamingCommand::Flush` path rather than tracking a
+/// separate clock: only one flush-shaped attempt on this transport is ever
+/// outstanding at a time (every call site below runs only while
+/// `pending_stream_cmd.is_none()`, the same condition that gates an
+/// in-flight `StreamingCommand::Flush`), so one shared clock is exactly
+/// "how long has flushing this transport been stuck", regardless of which
+/// call site is nominally driving the retry from turn to turn.
+///
+/// A genuine flush *error* (as opposed to a timeout) is intentionally
+/// swallowed here, matching every call site's prior `let _ = stream.flush()
+/// .await` -- unchanged behavior, not a new decision this fix makes.
+async fn bounded_stream_flush<S>(
+    stream: &mut S,
+    stream_write_wedged_since: &mut Option<Instant>,
+    stream_flush_wedged_since: &mut Option<Instant>,
+) -> AutoFlushOutcome
+where
+    S: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(STREAM_WRITE_SLICE_TIMEOUT, stream.flush()).await {
+        Ok(_) => {
+            record_slice_attempt(
+                true,
+                true,
+                Instant::now(),
+                stream_write_wedged_since,
+                stream_flush_wedged_since,
+            );
+            AutoFlushOutcome::Completed
+        }
+        Err(_elapsed) => match record_slice_attempt(
+            true,
+            false,
+            Instant::now(),
+            stream_write_wedged_since,
+            stream_flush_wedged_since,
+        ) {
+            SliceAttemptOutcome::TearDown { stuck_for } => {
+                error!(
+                    ?stuck_for,
+                    "automatic stream flush made no progress for too long; tearing down connection"
+                );
+                AutoFlushOutcome::TearDown
+            }
+            SliceAttemptOutcome::Continue => AutoFlushOutcome::StillPending,
+        },
+    }
+}
+
 async fn write_vectored_all<S>(
     stream: &mut S,
     slices: &[std::io::IoSlice<'_>],
@@ -70,22 +343,6 @@ where
     }
     Ok(result)
 }
-
-/// Bound on a single attempt to write an ask-backpressure NACK header (see
-/// `write_ask_nack_header_bounded`). The `io_task` read loop that calls
-/// this owns the connection's socket read side too, so a write that parks
-/// indefinitely on a peer that has stopped draining would park reads with
-/// it -- exactly the shape of deadlock `icanact-remote#186` closes for the
-/// streaming slice writer. A NACK is best-effort, not a delivery guarantee,
-/// so unlike a streaming response frame it can simply be abandoned once an
-/// attempt makes zero progress rather than retried forever.
-const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// See `STREAM_WRITE_SLICE_TIMEOUT`. Only reached once a NACK write has
-/// already committed some bytes to the wire (so it can no longer be
-/// abandoned without corrupting later frames on this connection) and then
-/// stalls -- the backstop for a peer that is truly gone, not merely slow.
-const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
 
 /// Write one already-built ask-NACK header without risking parking the
 /// caller's read loop on a peer that has stopped draining. A plain
@@ -980,6 +1237,28 @@ impl LockFreeStreamHandle {
             }
         }
 
+        /// `Some(correlation_id)` for an `ActorAsk`-shaped read result:
+        /// dispatching it calls an ask handler whose response, depending on
+        /// its size, may need `local_streaming_queue` admission
+        /// (`write_ask_disposition_io` ->
+        /// `queue_streaming_response_bytes`/`_pooled`). `DirectAsk` is
+        /// excluded: it answers through `direct_response_batch`, never
+        /// through the streaming queue, so it has nothing to gate here. The
+        /// correlation id is returned (not just a bool) so a caller that
+        /// decides not to dispatch can still answer the peer with a NACK
+        /// instead of silently dropping the already-read ask.
+        fn actor_ask_correlation_id(result: &ReadIoResult) -> Option<u32> {
+            match result {
+                ReadIoResult::ActorAsk { correlation_id, .. } => Some(*correlation_id),
+                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+                    msg_type,
+                    correlation_id,
+                    ..
+                }) if *msg_type == crate::MessageType::ActorAsk as u8 => Some(*correlation_id),
+                _ => None,
+            }
+        }
+
         struct ExitGuard {
             flag: Arc<AtomicBool>,
             notify: Arc<Notify>,
@@ -1287,6 +1566,15 @@ impl LockFreeStreamHandle {
                 .map(|_| crate::protocol::StreamingState::new()),
         };
         let mut last_cleanup = std::time::Instant::now();
+        // Set on the first streaming slice write that makes zero progress,
+        // cleared on any write that does. See `STREAM_WRITE_SLICE_TIMEOUT`.
+        // `Flush` attempts never touch this clock -- see
+        // `stream_flush_wedged_since` and `STREAM_FLUSH_STUCK_TEARDOWN`.
+        let mut stream_write_wedged_since: Option<Instant> = None;
+        // Same as `stream_write_wedged_since`, but for `StreamingCommand::Flush`
+        // attempts only, against `STREAM_FLUSH_STUCK_TEARDOWN` instead of
+        // `STREAM_WRITE_STUCK_TEARDOWN`. See `record_slice_attempt`.
+        let mut stream_flush_wedged_since: Option<Instant> = None;
 
         while !shutdown_signal.load(Ordering::Acquire) {
             let mut total_bytes_written = 0;
@@ -1349,17 +1637,60 @@ impl LockFreeStreamHandle {
             if let Some(mut pending) = next_stream {
                 did_work = true;
                 let command_is_flush = matches!(&pending.command, StreamingCommand::Flush);
-                let (written, complete) =
-                    match write_streaming_command_slice(&mut stream, &mut pending).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            error!(%error, "streaming write error");
+                // Bounded, not a plain `.await` -- see the invariant on
+                // `STREAM_WRITE_SLICE_TIMEOUT`. A timeout is not an error: it
+                // means this specific attempt made zero progress, which is
+                // exactly what a `Pending` `poll_write` already means, so
+                // `pending` (offset untouched) falls through to the same
+                // "not complete" handling as an ordinary short write and is
+                // retried next turn. `Flush` does not carry that same
+                // `Pending`-means-zero-progress guarantee, so its attempts are
+                // tracked on their own wedge clock and budget -- see
+                // `record_slice_attempt` and `STREAM_FLUSH_STUCK_TEARDOWN`.
+                let (written, complete) = match tokio::time::timeout(
+                    STREAM_WRITE_SLICE_TIMEOUT,
+                    write_streaming_command_slice(&mut stream, &mut pending),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        record_slice_attempt(
+                            command_is_flush,
+                            true,
+                            Instant::now(),
+                            &mut stream_write_wedged_since,
+                            &mut stream_flush_wedged_since,
+                        );
+                        result
+                    }
+                    Ok(Err(error)) => {
+                        error!(%error, "streaming write error");
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        if let SliceAttemptOutcome::TearDown { stuck_for } =
+                            record_slice_attempt(
+                                command_is_flush,
+                                false,
+                                Instant::now(),
+                                &mut stream_write_wedged_since,
+                                &mut stream_flush_wedged_since,
+                            )
+                        {
+                            error!(
+                                ?stuck_for,
+                                command_is_flush,
+                                "streaming slice write made no progress for too long; \
+                                 tearing down connection"
+                            );
                             return;
                         }
-                    };
+                        (0, false)
+                    }
+                };
                 bytes_written_counter.fetch_add(written, Ordering::Relaxed);
                 total_bytes_written += written;
-                if command_is_flush {
+                if command_is_flush && complete {
                     flush_pending.store(false, Ordering::Release);
                     bytes_since_flush = 0;
                 }
@@ -2120,9 +2451,24 @@ impl LockFreeStreamHandle {
                                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                         if is_immediate_payload && total_bytes_written > 0 {
-                            let _ = stream.flush().await;
-                            total_bytes_written = 0;
-                            flush_pending.store(false, Ordering::Release);
+                            match bounded_stream_flush(
+                                &mut stream,
+                                &mut stream_write_wedged_since,
+                                &mut stream_flush_wedged_since,
+                            )
+                            .await
+                            {
+                                AutoFlushOutcome::Completed => {
+                                    total_bytes_written = 0;
+                                    flush_pending.store(false, Ordering::Release);
+                                }
+                                // Leave total_bytes_written untouched: it still
+                                // folds into bytes_since_flush below, so a later
+                                // flush attempt retries these same bytes instead
+                                // of forgetting them.
+                                AutoFlushOutcome::StillPending => {}
+                                AutoFlushOutcome::TearDown => return,
+                            }
                         }
                     }
                 }
@@ -2176,9 +2522,22 @@ impl LockFreeStreamHandle {
                 pending_stream_cmd.as_ref(),
                 yielded_stream_cmd.as_ref(),
             ) {
-                let _ = stream.flush().await;
-                bytes_since_flush = 0;
-                flush_pending.store(false, Ordering::Release);
+                match bounded_stream_flush(
+                    &mut stream,
+                    &mut stream_write_wedged_since,
+                    &mut stream_flush_wedged_since,
+                )
+                .await
+                {
+                    AutoFlushOutcome::Completed => {
+                        bytes_since_flush = 0;
+                        flush_pending.store(false, Ordering::Release);
+                    }
+                    // Leave bytes_since_flush untouched so the next turn's
+                    // check still sees unflushed data and retries.
+                    AutoFlushOutcome::StillPending => {}
+                    AutoFlushOutcome::TearDown => return,
+                }
             }
 
             if let (Some(ctx), Some(state), Some(streaming_state)) = (
@@ -2187,15 +2546,44 @@ impl LockFreeStreamHandle {
                 streaming_state.as_mut(),
             ) {
                 if last_cleanup.elapsed() >= std::time::Duration::from_secs(30) {
-                    streaming_state.cleanup_stale();
+                    // `false` means the aggregate rejected-stream tombstone
+                    // budget was exhausted while reaping: at least one
+                    // stale stream could not be tombstoned, so its trailing
+                    // chunks would otherwise hit the fatal "unknown
+                    // stream_id" path with nothing to catch them. Closing
+                    // the connection here is the explicit failure mode for
+                    // that -- never silently evicting a different,
+                    // unrelated tombstone to make room (see
+                    // `RejectedStreamTombstone`'s invariant in protocol.rs).
+                    if !streaming_state.cleanup_stale() {
+                        warn!(
+                            peer = %ctx.peer_addr,
+                            "Rejected-stream tombstone budget exhausted while reaping stale \
+                             streams; closing connection"
+                        );
+                        return;
+                    }
                     last_cleanup = std::time::Instant::now();
                 }
 
                 if did_work {
                     let mut reads = 0usize;
                     let mut read_batch_limit = READ_BATCH_LIMIT;
+                    // Deliberately does NOT gate on `local_streaming_queue.is_full()`.
+                    // A connection must never end up with both directions unable to
+                    // read because both are unable to write (see
+                    // `STREAM_WRITE_SLICE_TIMEOUT`); a blanket pre-check here would
+                    // stop every read on this connection -- tells, small asks,
+                    // control frames, all of it -- for as long as the local
+                    // streaming-response backlog stays over its ~64MB reserve, which
+                    // is exactly the state a bidirectional streaming storm leaves
+                    // both peers in. `queue_streaming_response_bytes`/`_pooled`
+                    // already backpressure admission per message
+                    // (`can_admit_response` -> `WouldBlock` ->
+                    // `is_streaming_admission_backpressure` below), so a read that
+                    // does not need streaming-queue capacity keeps flowing while one
+                    // that does still bounds correctly.
                     while reads < read_batch_limit
-                        && !local_streaming_queue.is_full()
                         // A read that dispatches to an unknown actor, a
                         // missing handler, or backpressure can queue a NACK
                         // (`LocalStreamingQueue::queue_ask_nack`). Admitting
@@ -2205,6 +2593,8 @@ impl LockFreeStreamHandle {
                         // (silently losing its terminal outcome) or grow
                         // without bound; stopping here instead lets the
                         // drain at the top of the next turn make room first.
+                        // (Deliberately not also gating on `is_full()` here
+                        // -- see the doc comment above this loop.)
                         && local_streaming_queue.has_room_for_ask_nack()
                         && (pending_stream_cmd.is_none()
                             || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
@@ -2277,6 +2667,43 @@ impl LockFreeStreamHandle {
                         if let Some(result) = read_result.result {
                             reads += 1;
                             read_batch_limit = read_batch_limit.max(read_batch_limit_for(&result));
+                            // Read (drain) the ask regardless -- that is what
+                            // keeps the peer able to make progress. But do not
+                            // dispatch it to a handler while the local
+                            // streaming-response queue has no room left for
+                            // even one more protocol-sized response
+                            // (`is_full`): the handler's response size is
+                            // unknown until it runs, so once this is true a
+                            // large response is guaranteed to be rejected by
+                            // `can_admit_response` on the way out, and running
+                            // the handler first would compute an answer this
+                            // connection cannot currently deliver and then
+                            // discard it (the drop this PR documents at
+                            // `queue_streaming_response_bytes`/`_pooled`).
+                            // Skipping dispatch avoids wasting that
+                            // computation, and the peer is answered with a
+                            // best-effort `AskNackReason::Backpressure` NACK
+                            // instead of being left to time out. Queued
+                            // (`LocalStreamingQueue::queue_ask_nack`), not
+                            // written here: this may run while
+                            // `pending_stream_cmd` still owns a partially
+                            // written streaming frame, and writing directly
+                            // would splice the NACK into it. This is
+                            // deliberately conservative: it also NACKs asks
+                            // whose response would have been small enough to
+                            // never need streaming admission at all, since
+                            // that is not knowable before the handler runs.
+                            if local_streaming_queue.is_full()
+                                && let Some(correlation_id) = actor_ask_correlation_id(&result)
+                            {
+                                local_streaming_queue.queue_ask_nack(
+                                    crate::framing::write_ask_nack_header(
+                                        correlation_id,
+                                        crate::framing::AskNackReason::Backpressure,
+                                    ),
+                                );
+                                continue;
+                            }
                             let fast_result = match try_handle_fast_io(
                                 result,
                                 ctx,
@@ -2391,9 +2818,20 @@ impl LockFreeStreamHandle {
             if (wrote_ask_payload || wrote_actor_responses || wrote_fast_responses)
                 && bytes_since_flush > 0
             {
-                let _ = stream.flush().await;
-                bytes_since_flush = 0;
-                flush_pending.store(false, Ordering::Release);
+                match bounded_stream_flush(
+                    &mut stream,
+                    &mut stream_write_wedged_since,
+                    &mut stream_flush_wedged_since,
+                )
+                .await
+                {
+                    AutoFlushOutcome::Completed => {
+                        bytes_since_flush = 0;
+                        flush_pending.store(false, Ordering::Release);
+                    }
+                    AutoFlushOutcome::StillPending => {}
+                    AutoFlushOutcome::TearDown => return,
+                }
             }
 
             if !did_work {
@@ -2445,6 +2883,23 @@ impl LockFreeStreamHandle {
                             }
 
                             if let Some(result) = read_result.result {
+                                // See the matching comment on the primary
+                                // drain loop: do not dispatch an ActorAsk
+                                // while the streaming queue has no room for
+                                // even one more protocol-sized response --
+                                // answer with an `AskNackReason::Backpressure`
+                                // NACK instead.
+                                if local_streaming_queue.is_full()
+                                    && let Some(correlation_id) = actor_ask_correlation_id(&result)
+                                {
+                                    local_streaming_queue.queue_ask_nack(
+                                        crate::framing::write_ask_nack_header(
+                                            correlation_id,
+                                            crate::framing::AskNackReason::Backpressure,
+                                        ),
+                                    );
+                                    continue;
+                                }
                                 let fast_result = match try_handle_fast_io(
                                     result,
                                     ctx,
@@ -2525,8 +2980,10 @@ impl LockFreeStreamHandle {
                             // Drain additional frames non-blocking to batch handler + response writes.
                             let mut drained = 0usize;
                             let mut drain_batch_limit = READ_BATCH_LIMIT;
+                            // See the matching comment on the primary drain loop
+                            // above: no `local_streaming_queue.is_full()` pre-check,
+                            // for the same reason.
                             while drained < drain_batch_limit
-                                && !local_streaming_queue.is_full()
                                 // See the identical check in the primary
                                 // drain loop above.
                                 && local_streaming_queue.has_room_for_ask_nack()
@@ -2597,6 +3054,25 @@ impl LockFreeStreamHandle {
                                     drained += 1;
                                     drain_batch_limit =
                                         drain_batch_limit.max(read_batch_limit_for(&result));
+                                    // See the matching comment on the primary
+                                    // drain loop: do not dispatch an ActorAsk
+                                    // while the streaming queue has no room
+                                    // for even one more protocol-sized
+                                    // response -- answer with an
+                                    // `AskNackReason::Backpressure` NACK
+                                    // instead.
+                                    if local_streaming_queue.is_full()
+                                        && let Some(correlation_id) =
+                                            actor_ask_correlation_id(&result)
+                                    {
+                                        local_streaming_queue.queue_ask_nack(
+                                            crate::framing::write_ask_nack_header(
+                                                correlation_id,
+                                                crate::framing::AskNackReason::Backpressure,
+                                            ),
+                                        );
+                                        continue;
+                                    }
                                     let fast_result = match try_handle_fast_io(
                                         result,
                                         ctx,
@@ -2706,9 +3182,20 @@ impl LockFreeStreamHandle {
                             // quiet links. The idle branch has no outer fast-flush checkpoint
                             // after this select arm, so flush direct/actor responses here.
                             if bytes_since_flush > 0 {
-                                let _ = stream.flush().await;
-                                bytes_since_flush = 0;
-                                flush_pending.store(false, Ordering::Release);
+                                match bounded_stream_flush(
+                                    &mut stream,
+                                    &mut stream_write_wedged_since,
+                                    &mut stream_flush_wedged_since,
+                                )
+                                .await
+                                {
+                                    AutoFlushOutcome::Completed => {
+                                        bytes_since_flush = 0;
+                                        flush_pending.store(false, Ordering::Release);
+                                    }
+                                    AutoFlushOutcome::StillPending => {}
+                                    AutoFlushOutcome::TearDown => return,
+                                }
                             }
                         }
                         // Wake on new outbound writes even if the socket is currently idle for reads.
@@ -4989,6 +5476,145 @@ mod route_interning_tests {
         writer.shutdown();
         drop(peer);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    // `record_slice_attempt` tests below use fabricated `Instant`s (a real
+    // `Instant::now()` plus a synthetic offset) instead of sleeping, so they
+    // exercise the multi-second/minute teardown budgets deterministically and
+    // instantly rather than waiting them out end to end.
+
+    /// A `Flush` attempt that times out must accumulate against its own
+    /// clock, never `stream_write_wedged_since` -- and vice versa for a
+    /// write. Before this fix both kinds shared one clock and one budget
+    /// (`STREAM_WRITE_STUCK_TEARDOWN`), so a write that had already been
+    /// stuck for a while left a `Flush` that started right after it with an
+    /// already-partially-spent budget it never should have inherited.
+    #[test]
+    fn flush_and_write_timeouts_accumulate_on_independent_clocks() {
+        let t0 = Instant::now();
+        let mut write_wedged_since: Option<Instant> = None;
+        let mut flush_wedged_since: Option<Instant> = None;
+
+        // A write has already been stuck for 20s.
+        record_slice_attempt(
+            false,
+            false,
+            t0 + Duration::from_secs(20),
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(write_wedged_since, Some(t0 + Duration::from_secs(20)));
+        assert_eq!(flush_wedged_since, None, "an unrelated write must never set the flush clock");
+
+        // A flush's first timeout arrives right after, at the same instant.
+        // It must start its own clock from *now*, not inherit the write's.
+        record_slice_attempt(
+            true,
+            false,
+            t0 + Duration::from_secs(20),
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            flush_wedged_since,
+            Some(t0 + Duration::from_secs(20)),
+            "flush must start its own wedge clock, not read the write clock"
+        );
+        assert_eq!(
+            write_wedged_since,
+            Some(t0 + Duration::from_secs(20)),
+            "a flush timeout must never touch the write clock"
+        );
+    }
+
+    /// The core regression this fix addresses: a `Flush` that keeps timing
+    /// out past `STREAM_WRITE_STUCK_TEARDOWN` (30s) -- while a *write* stuck
+    /// that long is correctly torn down -- must not be torn down, because
+    /// `poll_flush`'s `Pending` carries no "zero progress" guarantee the way
+    /// `poll_write`'s does. It only gives up once its own, larger
+    /// `STREAM_FLUSH_STUCK_TEARDOWN` budget elapses.
+    #[test]
+    fn flush_outlives_the_write_teardown_budget_but_not_its_own() {
+        let t0 = Instant::now();
+        let mut write_wedged_since: Option<Instant> = None;
+        let mut flush_wedged_since: Option<Instant> = None;
+
+        // First timeout for each, at t0.
+        record_slice_attempt(false, false, t0, &mut write_wedged_since, &mut flush_wedged_since);
+        record_slice_attempt(true, false, t0, &mut write_wedged_since, &mut flush_wedged_since);
+
+        // Exactly at the write budget: a write stuck this long is torn down...
+        let at_write_budget = t0 + STREAM_WRITE_STUCK_TEARDOWN;
+        let write_outcome = record_slice_attempt(
+            false,
+            false,
+            at_write_budget,
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            write_outcome,
+            SliceAttemptOutcome::TearDown {
+                stuck_for: STREAM_WRITE_STUCK_TEARDOWN
+            },
+            "a write stuck for STREAM_WRITE_STUCK_TEARDOWN must still be torn down"
+        );
+
+        // ...but a flush stuck for the exact same duration must not be: it
+        // has not yet reached its own, larger budget.
+        let flush_outcome = record_slice_attempt(
+            true,
+            false,
+            at_write_budget,
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            flush_outcome,
+            SliceAttemptOutcome::Continue,
+            "a flush stuck for only STREAM_WRITE_STUCK_TEARDOWN must not be torn down: \
+             poll_flush's Pending does not mean zero progress the way poll_write's does"
+        );
+
+        // A flush stuck for its own, larger budget is torn down.
+        let at_flush_budget = t0 + STREAM_FLUSH_STUCK_TEARDOWN;
+        let flush_outcome_at_budget = record_slice_attempt(
+            true,
+            false,
+            at_flush_budget,
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(
+            flush_outcome_at_budget,
+            SliceAttemptOutcome::TearDown {
+                stuck_for: STREAM_FLUSH_STUCK_TEARDOWN
+            },
+            "a flush stuck for its own STREAM_FLUSH_STUCK_TEARDOWN budget must be torn down"
+        );
+    }
+
+    /// A completed attempt clears only its own kind's clock, leaving the
+    /// other kind's in-flight wedge state untouched.
+    #[test]
+    fn completed_attempt_clears_only_its_own_clock() {
+        let t0 = Instant::now();
+        let mut write_wedged_since: Option<Instant> = Some(t0);
+        let mut flush_wedged_since: Option<Instant> = Some(t0);
+
+        record_slice_attempt(
+            true,
+            true,
+            t0 + Duration::from_secs(5),
+            &mut write_wedged_since,
+            &mut flush_wedged_since,
+        );
+        assert_eq!(flush_wedged_since, None, "a completed flush must clear the flush clock");
+        assert_eq!(
+            write_wedged_since,
+            Some(t0),
+            "a completed flush must not touch an unrelated in-flight write's clock"
+        );
     }
 }
 
