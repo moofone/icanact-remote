@@ -2887,13 +2887,26 @@ impl LockFreeStreamHandle {
     ///   - `HeaderPayload`/`HeaderInline`/`HeaderInlineAligned`/
     ///     `HeaderInline32`/`HeaderPooled`/`HeaderInlinePooled`/
     ///     `DirectAskInline` carry a header slice with its own embedded
-    ///     control word: decode it, and compare the total it declares
-    ///     against the real total the write loop will produce for that
-    ///     exact command.
-    ///   - `Buf` carries no header slice to decode a control word from,
-    ///     only a caller-declared `expected_len` captured when the header
-    ///     it is chained onto was built: compare that against
-    ///     `buf.remaining()`.
+    ///     control word: decode it from the exact bytes the write loop will
+    ///     actually send (`header[..header_len]` for the three variants
+    ///     that truncate a fixed-size array with a separate declared
+    ///     length, the whole slice for the others, which have none), and
+    ///     compare the total it declares against the real total the write
+    ///     loop will produce for that exact command. `HeaderInline`/
+    ///     `HeaderInlineAligned`/`HeaderInlinePooled` additionally
+    ///     bounds-check `header_len` (and `HeaderInlinePooled`'s
+    ///     `prefix_len`) against their backing arrays first -- the write
+    ///     loop slices `&header[header_off..header_len]` unconditionally,
+    ///     so an out-of-range length must be refused here, not left to
+    ///     panic the write loop.
+    ///   - `Buf` carries no header slice of its own, only a caller-declared
+    ///     `expected_len` captured when the header it is chained onto was
+    ///     built: compare that against `buf.remaining()`, then peek
+    ///     `buf.chunk()` (a non-consuming read) for the leading bytes,
+    ///     decode a control word from them, and require its declared total
+    ///     equal `expected_len` exactly -- the same "decode what the wire
+    ///     actually gets" rule as the header-carrying variants, applied to
+    ///     `Buf`'s own leading bytes instead of a separate header field.
     ///   - `Single` carries no separately-declared length *or* header
     ///     slice at all -- whatever control word exists is embedded in
     ///     the content itself, at an offset this method has to walk to
@@ -2918,10 +2931,70 @@ impl LockFreeStreamHandle {
                     ),
                 )));
             }
-            let body_len = expected_len.saturating_sub(framing::LENGTH_PREFIX_LEN);
-            if body_len > self.max_message_size {
+
+            // PR #183 review, round 15: `body_len` used to be derived as
+            // `expected_len.saturating_sub(LENGTH_PREFIX_LEN)` -- a bare
+            // arithmetic relationship to the caller's own claimed aggregate
+            // length, never to anything actually embedded in `buf`. That let
+            // two things through: a 1-3 byte `Buf` write, where the
+            // `saturating_sub` silently floors to a `body_len` of 0 with no
+            // control word present at all; and an oversized frame smuggled
+            // across several separate `Buf` calls, since nothing here ever
+            // decoded a real control word to confirm this write's own bytes
+            // are the *whole* frame its length claims, only that the claim
+            // and `buf.remaining()` agree with each other.
+            //
+            // `Buf::chunk()` (unlike `advance()`) takes `&self`, so it can be
+            // called here through the shared reference this method holds
+            // without disturbing the cursor the write loop will actually
+            // consume from later -- this is a peek, not a consume. For the
+            // one production producer (`ConnectionHandle::send_response_buf`,
+            // which chains a freshly built `Bytes` header onto the caller's
+            // payload) the first chunk *is* the complete header, since the
+            // leading `Bytes` component of a `Chain` hasn't been advanced yet
+            // and is handed back whole by `chunk()` while it still has
+            // remaining bytes -- so this reliably sees the real leading bytes
+            // the write loop will send first. A future producer whose `Buf`
+            // impl cannot present at least 4 contiguous leading bytes here is
+            // refused rather than guessed at, the same conservative choice
+            // made for every other variant in this method.
+            let chunk = buf.chunk();
+            if chunk.len() < framing::LENGTH_PREFIX_LEN {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Buf write's first available chunk supplies only {} byte(s), \
+                         too few to contain a complete V5 control word ({} bytes) -- \
+                         refusing a write that is not a whole, verifiable frame",
+                        chunk.len(),
+                        framing::LENGTH_PREFIX_LEN,
+                    ),
+                )));
+            }
+            let mut control_word = [0u8; framing::LENGTH_PREFIX_LEN];
+            control_word.copy_from_slice(&chunk[..framing::LENGTH_PREFIX_LEN]);
+            let Some(control) = framing::decode_control(control_word) else {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Buf write's leading bytes do not decode as a valid V5 control \
+                     word -- refusing a write that is not a whole, verifiable frame",
+                )));
+            };
+            let declared_total = framing::LENGTH_PREFIX_LEN + control.body_len;
+            if declared_total != actual_len {
+                return Err(GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Buf write's own control word declares {declared_total} total \
+                         bytes but the write is {actual_len} -- refusing to enqueue a \
+                         write that is not exactly the one complete frame its own \
+                         control word describes"
+                    ),
+                )));
+            }
+            if control.body_len > self.max_message_size {
                 return Err(GossipError::MessageTooLarge {
-                    size: body_len,
+                    size: control.body_len,
                     max: self.max_message_size,
                 });
             }
@@ -2948,7 +3021,30 @@ impl LockFreeStreamHandle {
                 payload,
             } => {
                 let header_len = *header_len as usize;
-                (&header[..], header_len + payload.len())
+                // PR #183 review, round 15: `header_len` used to be trusted
+                // for `actual_total` but never bounds-checked against
+                // `header`'s own backing array, and the control word used to
+                // be decoded from `&header[..]` (all 16 bytes) regardless of
+                // `header_len` -- but the write loop below (`io_task`'s
+                // `HeaderInline` arm) only ever sends `&header[..header_len]`.
+                // A `header_len` too small to hold a control word (0-3) could
+                // pass with a real-looking decode read from bytes past what
+                // the wire actually gets, and a `header_len` above 16 passed
+                // validation here and then panicked the write loop slicing
+                // `&header[header_off..header_len]` out of a 16-byte array.
+                // Both are refused here now, before either can happen.
+                if header_len > header.len() {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "header_len {header_len} exceeds the {}-byte backing \
+                             array -- refusing a write the write loop would panic \
+                             slicing",
+                            header.len(),
+                        ),
+                    )));
+                }
+                (&header[..header_len], header_len + payload.len())
             }
             WritePayload::HeaderInlineAligned {
                 header,
@@ -2956,7 +3052,20 @@ impl LockFreeStreamHandle {
                 payload,
             } => {
                 let header_len = *header_len as usize;
-                (&header[..], header_len + payload.len())
+                // Same bounds-check and same-slice-as-the-wire decode as
+                // `HeaderInline` above -- see that arm's comment.
+                if header_len > header.len() {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "header_len {header_len} exceeds the {}-byte backing \
+                             array -- refusing a write the write loop would panic \
+                             slicing",
+                            header.len(),
+                        ),
+                    )));
+                }
+                (&header[..header_len], header_len + payload.len())
             }
             WritePayload::HeaderInline32 { header, payload } => {
                 // Always sent as the full fixed-size array -- there is no
@@ -2983,16 +3092,51 @@ impl LockFreeStreamHandle {
                 payload,
             } => {
                 let header_len = *header_len as usize;
+                // Same bounds-check and same-slice-as-the-wire decode as
+                // `HeaderInline` above -- see that arm's comment. The write
+                // loop (`io_task`'s `HeaderInlinePooled` arm) slices
+                // `&header[header_off..header_len]` the same way.
+                if header_len > header.len() {
+                    return Err(GossipError::Network(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "header_len {header_len} exceeds the {}-byte backing \
+                             array -- refusing a write the write loop would panic \
+                             slicing",
+                            header.len(),
+                        ),
+                    )));
+                }
                 // The write loop only ever sends the prefix bytes when
                 // `prefix` is `Some` (see `io_task`'s `HeaderInlinePooled`
                 // arm) -- a stale, unused `prefix_len` when `prefix` is
-                // `None` must not count toward the real byte total.
-                let prefix_len = if prefix.is_some() {
-                    *prefix_len as usize
+                // `None` must not count toward the real byte total. When it
+                // is `Some`, the write loop slices
+                // `&prefix[prefix_off..prefix_len]` out of the same
+                // fixed-size array, so `prefix_len` needs the identical
+                // bounds-check `header_len` gets above -- an out-of-range
+                // value here panics the write loop exactly the same way.
+                let prefix_len = if let Some(prefix) = prefix {
+                    let prefix_len = *prefix_len as usize;
+                    if prefix_len > prefix.len() {
+                        return Err(GossipError::Network(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "prefix_len {prefix_len} exceeds the {}-byte backing \
+                                 array -- refusing a write the write loop would panic \
+                                 slicing",
+                                prefix.len(),
+                            ),
+                        )));
+                    }
+                    prefix_len
                 } else {
                     0
                 };
-                (&header[..], header_len + prefix_len + payload.remaining())
+                (
+                    &header[..header_len],
+                    header_len + prefix_len + payload.remaining(),
+                )
             }
             WritePayload::DirectAskInline { header, payload } => {
                 // Always sent as the full fixed-size array (see
@@ -5714,6 +5858,355 @@ mod write_payload_size_gate_tests {
     }
 }
 
+/// PR #183 review, round 15: `HeaderInline`/`HeaderInlineAligned`/
+/// `HeaderInlinePooled` used to validate a control word decoded from
+/// `&header[..]` -- the entire fixed-size array -- while `io_task`'s write
+/// loop only ever transmits `&header[..header_len]`. Two distinct bugs
+/// followed from that mismatch: a `header_len` short enough to hold no
+/// control word at all (0-3) could still pass validation, because the
+/// bytes actually checked (`header[0..4]`) were not the bytes actually sent
+/// (`header[0..header_len]`); and a `header_len` *longer* than the 16-byte
+/// backing array passed validation cleanly (nothing here ever bounds-checked
+/// it) and then panicked the write loop slicing
+/// `&header[header_off..header_len]` out of the array. Both are fixed the
+/// same way `reject_oversize_write_payload`'s doc comment now describes:
+/// bounds-check `header_len` (and `HeaderInlinePooled`'s `prefix_len`)
+/// against their backing arrays first, then decode the control word from
+/// exactly the slice the write loop will actually send.
+#[cfg(test)]
+mod header_inline_family_bounds_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    fn make_writer(port: u16, max_message_size: usize) -> (LockFreeStreamHandle, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(port, max_message_size)),
+        );
+        (writer, task)
+    }
+
+    fn aligned_payload(len: usize) -> crate::AlignedBytes {
+        let pool = std::sync::Arc::new(crate::AlignedBytesPool::new(1));
+        crate::AlignedBytes::from_pooled_slice(&vec![0u8; len], pool)
+    }
+
+    fn pooled_payload(len: usize) -> crate::typed::PooledPayload {
+        crate::typed::PooledPayload::try_from_pooled_bytes(len, |buf| buf.resize(len, 0u8))
+            .expect("test pooled payload allocation")
+    }
+
+    /// The exact shape the round 15 finding described: a real control word
+    /// (`Gossip`, `body_len: 50`) lives at `header[0..4]`, and `payload` is
+    /// sized so the *declared* total (`header_len + payload.len()`) agrees
+    /// with it exactly -- but `header_len` is 2, so only `header[0..2]`
+    /// ever reaches the write loop. The first four bytes a peer would
+    /// actually decode are `header[0]`, `header[1]`, and `payload`'s own
+    /// first two bytes -- nothing like the control word this validated.
+    #[tokio::test]
+    async fn header_inline_rejects_a_header_len_too_short_to_contain_the_control_word_it_was_validated_against()
+     {
+        let (writer, task) = make_writer(9986, 128);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            50,
+        ));
+        let header_len = 2u8;
+        // 2 (header_len) + 52 (payload) == 54 == 4 (control word) + 50 (declared body_len).
+        let payload = bytes::Bytes::from(vec![0x7Au8; 52]);
+        let err = writer
+            .write_header_and_payload_control_inline(header, header_len, payload)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the 2-byte header_len to be refused as too short to contain \
+             a control word, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `header_len` above the 16-byte backing array must be refused here,
+    /// not left to panic `io_task`'s `&header[header_off..header_len]`
+    /// slice once this queue item is actually written.
+    #[tokio::test]
+    async fn header_inline_rejects_a_header_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9987, 256);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            196,
+        ));
+        let header_len = 200u8; // header.len() == 16
+        let err = writer
+            .write_header_and_payload_control_inline(header, header_len, bytes::Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected header_len(200) > header.len()(16) to be refused before the \
+             write loop could panic slicing it, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Same array-bound bug, `HeaderInlineAligned`'s copy of the same write
+    /// loop shape (`AlignedBytes` payload instead of `Bytes`).
+    #[tokio::test]
+    async fn header_inline_aligned_rejects_a_header_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9988, 256);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            196,
+        ));
+        let header_len = 200u8;
+        let err = writer
+            .write_header_and_payload_control_inline_aligned(header, header_len, aligned_payload(0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected header_len(200) > header.len()(16) to be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `HeaderInlinePooled`'s copy of the short-`header_len` bug: same
+    /// construction as the `HeaderInline` case above, routed through
+    /// `write_pooled_control_inline` with no prefix.
+    #[tokio::test]
+    async fn header_inline_pooled_rejects_a_header_len_too_short_to_contain_the_control_word_it_was_validated_against()
+     {
+        let (writer, task) = make_writer(9989, 128);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            50,
+        ));
+        let header_len = 2u8;
+        let err = writer
+            .write_pooled_control_inline(header, header_len, None, 0, pooled_payload(52))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected the 2-byte header_len to be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `HeaderInlinePooled`'s copy of the array-bound bug for `header_len`.
+    #[tokio::test]
+    async fn header_inline_pooled_rejects_a_header_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9990, 256);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            196,
+        ));
+        let header_len = 200u8;
+        let err = writer
+            .write_pooled_control_inline(header, header_len, None, 0, pooled_payload(0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected header_len(200) > header.len()(16) to be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// `HeaderInlinePooled` has a *second* fixed-size array with its own
+    /// separate declared length -- `prefix`/`prefix_len` -- that the write
+    /// loop slices exactly the same way (`&prefix[prefix_off..prefix_len]`)
+    /// and needs the identical bounds-check. This must be caught before
+    /// ever reaching the control-word decode, which only inspects `header`.
+    ///
+    /// `header` here declares a genuine control word whose total
+    /// (`header_len + prefix_len + payload.remaining()`) matches the
+    /// out-of-bounds `prefix_len` exactly -- an all-zero header would
+    /// instead be caught by the unrelated declared-vs-actual mismatch
+    /// check (decoding to `Gossip, body_len: 0` against a much larger
+    /// actual total), which would falsely appear to confirm the
+    /// `prefix_len` bounds-check without ever actually exercising it.
+    #[tokio::test]
+    async fn header_inline_pooled_rejects_a_prefix_len_exceeding_its_backing_array() {
+        let (writer, task) = make_writer(9991, 256);
+        let mut header = [0u8; 16];
+        // header_len(16) + prefix_len(200) + payload.remaining()(0) == 216
+        // == 4 (control word) + 212 (declared body_len).
+        header[..4].copy_from_slice(&crate::framing::encode_control(
+            crate::framing::WireKind::Gossip,
+            212,
+        ));
+        let prefix = Some([0u8; 16]);
+        let prefix_len = 200u8; // prefix's array length is 16
+        let err = writer
+            .write_pooled_control_inline(header, 16, prefix, prefix_len, pooled_payload(0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "expected prefix_len(200) > 16 to be refused before the write loop \
+             could panic slicing it, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
+/// PR #183 review, round 15: `WritePayload::Buf`'s validation used to derive
+/// `body_len` as `expected_len.saturating_sub(LENGTH_PREFIX_LEN)` -- a bare
+/// arithmetic relationship between the caller's own claimed aggregate length
+/// and `max_message_size`, never anything decoded from `buf`'s actual bytes.
+/// That let a 1-3 byte `Buf` write through with no control word at all (the
+/// `saturating_sub` floors to `body_len: 0`), and let a caller declare an
+/// `expected_len` that agreed with `buf.remaining()` while the buffer's own
+/// leading bytes, if ever decoded, disagreed with that same length --
+/// exactly the gap that would let one logical oversized frame be split
+/// across several individually-small `Buf` calls, since nothing tied any
+/// one call's declared length back to what its own bytes actually encode.
+/// `reject_oversize_write_payload` now peeks `buf.chunk()` (a non-consuming
+/// read) and requires the decoded control word to declare exactly
+/// `expected_len` -- see that method's doc comment on the `Buf` variant.
+#[cfg(test)]
+mod buf_write_payload_closure_tests {
+    use super::*;
+
+    fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
+        ReadContext {
+            streaming_state_handoff: None,
+            registry_weak: std::sync::Weak::new(),
+            peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            session_source: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_id: None,
+            max_message_size,
+            expected_schema_hash: None,
+            aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+            inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+            response_correlation: None,
+            response_writer: None,
+            tell_handler_sync: None,
+            tell_handler_sync_context: None,
+            ask_immediate_handler_sync: None,
+            ask_handler_sync: None,
+            sync_actor_handler: None,
+        }
+    }
+
+    fn make_writer(port: u16) -> (LockFreeStreamHandle, JoinHandle<()>) {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            Some(small_message_read_context(port, 128)),
+        );
+        (writer, task)
+    }
+
+    /// A 1-3 byte `Buf` write used to pass with `body_len` silently floored
+    /// to 0 by `saturating_sub` -- no control word present at all. Two
+    /// bytes here is comfortably inside that former blind spot.
+    #[tokio::test]
+    async fn buf_control_rejects_a_short_buffer_with_no_control_word() {
+        let (writer, task) = make_writer(9992);
+        let buf = bytes::Bytes::from(vec![0u8; 2]);
+        let err = writer.write_buf_control(buf).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "a 2-byte buffer must be refused, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// The core of the round 15 finding: `expected_len` (40) genuinely
+    /// agrees with `buf.remaining()` (40), so the pre-existing
+    /// declared-vs-actual check cannot catch this -- but the buffer's own
+    /// leading bytes are a real control word declaring a 12-byte total
+    /// (`Gossip`, `body_len: 8`), not 40. This is precisely the shape that
+    /// would let one oversized logical frame be split across several
+    /// `Buf` calls, each individually claiming (and matching) a small
+    /// `expected_len` unrelated to what its own bytes actually encode.
+    #[tokio::test]
+    async fn buf_control_rejects_declared_length_disagreeing_with_its_own_embedded_control_word() {
+        let (writer, task) = make_writer(9993);
+        let mut data = crate::framing::encode_control(crate::framing::WireKind::Gossip, 8).to_vec();
+        data.extend(vec![0u8; 36]); // 4 + 36 = 40 total, but the control word says 12
+        assert_eq!(data.len(), 40, "test fixture must total 40 bytes");
+        let buf = bytes::Bytes::from(data);
+        let expected_len = buf.len(); // agrees with buf.remaining(), not with the control word
+        let err = writer
+            .write_buf_control_checked(buf, expected_len)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "a buffer whose own control word disagrees with its declared length \
+             must be refused even when the declared length matches buf.remaining(), \
+             got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+
+    /// Demonstrates why splitting an oversized frame across several `Buf`
+    /// calls cannot work: a bare continuation fragment -- raw body bytes
+    /// with no control word of its own, well under any reasonable
+    /// `max_message_size` on its own -- is refused exactly like any other
+    /// content that doesn't decode, independent of whatever a different
+    /// `Buf` write on the same handle claimed to declare.
+    #[tokio::test]
+    async fn buf_control_rejects_a_continuation_fragment_with_no_control_word_of_its_own() {
+        let (writer, task) = make_writer(9895);
+        // Kind bits 29 (0xEE's top 5 bits) has no `WireKind` mapping.
+        let fragment = bytes::Bytes::from(vec![0xEEu8; 16]);
+        let err = writer.write_buf_control(fragment).await.unwrap_err();
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "a fragment with no control word of its own must be refused, not \
+             silently accepted as a continuation of some other write, got {err:?}"
+        );
+        writer.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
+}
+
 /// PR #183 review, round 6: `write_buf_control`/`write_buf_ask` regained a
 /// single-argument form (see the doc comment on `write_buf_control` above)
 /// after round 2 had made both two-argument-only, breaking every
@@ -5762,14 +6255,31 @@ mod write_buf_control_single_arg_tests {
     /// The one-argument form must derive `expected_len` from `buf.remaining()`
     /// and still enforce `max_message_size` against it -- proving this is a
     /// real validating call shape, not a stub that happens to compile.
+    ///
+    /// PR #183 review, round 15: this used to fill `buf` with 69 zero bytes
+    /// and rely on `body_len = buf.remaining() - LENGTH_PREFIX_LEN` (a bare
+    /// arithmetic relationship, not a decode) to land on 65. That derivation
+    /// is gone -- `reject_oversize_write_payload` now decodes a real control
+    /// word from `buf`'s own leading bytes and requires it to declare
+    /// exactly `buf`'s length, so the fixture has to be a genuine frame
+    /// (`framing::write_gossip_frame_prefix`) for that decode to succeed at
+    /// all. 69 zero bytes decoded as a *valid* control word (`Gossip`,
+    /// `body_len: 0`) that simply didn't match its own 69-byte length,
+    /// which would now fail on the mismatch check above rather than ever
+    /// reaching `MessageTooLarge` -- the fixture must actually be the
+    /// oversized frame this test claims to send, not bytes that happen to
+    /// total the right length.
     #[tokio::test]
     async fn write_buf_control_single_arg_rejects_a_buf_over_max_message_size() {
         let (writer, task) = make_writer(9958, 64);
-        // `body_len` is derived as `buf.remaining() - LENGTH_PREFIX_LEN`
-        // (consistent with every other variant's size gate, which bounds
-        // the post-control-word body, not the raw total) -- 69 remaining
-        // bytes yields body_len 65, one past the 64-byte limit.
-        let buf = bytes::Bytes::from(vec![0u8; 69]);
+        // GOSSIP_FRAME_HEADER_LEN (16) + 53-byte payload = 69 bytes total,
+        // body_len = GOSSIP_HEADER_LEN (12) + 53 = 65, one past the 64-byte
+        // limit -- same total and same expected size/max as before, now
+        // backed by a real, decodable control word.
+        let mut data = framing::write_gossip_frame_prefix(53).to_vec();
+        data.extend(vec![0u8; 53]);
+        assert_eq!(data.len(), 69, "test fixture must total 69 bytes");
+        let buf = bytes::Bytes::from(data);
         let err = writer.write_buf_control(buf).await.unwrap_err();
         assert!(
             matches!(err, GossipError::MessageTooLarge { size: 65, max: 64 }),
@@ -5783,6 +6293,11 @@ mod write_buf_control_single_arg_tests {
     /// The one-argument form must still deliver a `buf` within
     /// `max_message_size` -- the arity restoration must not have turned it
     /// into an unconditional rejection either.
+    ///
+    /// PR #183 review, round 15: same fixture change as the rejection test
+    /// above -- a genuine frame is required now that validation decodes a
+    /// real control word from `buf`'s own bytes instead of trusting a bare
+    /// length.
     #[tokio::test]
     async fn write_buf_control_single_arg_accepts_a_buf_within_max_message_size() {
         let (client, mut peer) = tokio::io::duplex(64 * 1024);
@@ -5794,7 +6309,12 @@ mod write_buf_control_single_arg_tests {
             None,
             Some(small_message_read_context(9959, 64)),
         );
-        let data = vec![9u8; 60];
+        // GOSSIP_FRAME_HEADER_LEN (16) + 44-byte payload = 60 bytes total,
+        // body_len = GOSSIP_HEADER_LEN (12) + 44 = 56, within the 64-byte
+        // limit -- same total as before, now a real, decodable frame.
+        let mut data = framing::write_gossip_frame_prefix(44).to_vec();
+        data.extend(vec![9u8; 44]);
+        assert_eq!(data.len(), 60, "test fixture must total 60 bytes");
         let buf = bytes::Bytes::from(data.clone());
         writer
             .write_buf_control(buf)
@@ -5816,7 +6336,9 @@ mod write_buf_control_single_arg_tests {
     #[tokio::test]
     async fn write_buf_ask_single_arg_rejects_a_buf_over_max_message_size() {
         let (writer, task) = make_writer(9960, 64);
-        let buf = bytes::Bytes::from(vec![0u8; 69]);
+        let mut data = framing::write_gossip_frame_prefix(53).to_vec();
+        data.extend(vec![0u8; 53]);
+        let buf = bytes::Bytes::from(data);
         let err = writer.write_buf_ask(buf).await.unwrap_err();
         assert!(
             matches!(err, GossipError::MessageTooLarge { size: 65, max: 64 }),
