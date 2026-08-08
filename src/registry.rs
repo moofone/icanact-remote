@@ -9607,6 +9607,30 @@ impl<T: 'static> GossipRegistry<T> {
             self.remove_clock_state_for_addr(&peer_addr);
             {
                 let mut gossip_state = self.gossip_state.lock().await;
+
+                // `try_consume` authorizes the reservation, but direct
+                // liveness evidence is intentionally allowed to arrive
+                // while the reservation is held. Re-read the owner's
+                // serialized liveness fence after acquiring the shared
+                // state lock and immediately before any actor/tombstone
+                // mutation; otherwise evidence arriving after consume but
+                // before this lock acquisition would still destroy a live
+                // peer's actors and publish an irreversible tombstone.
+                if self
+                    .registry_owner
+                    .has_newer_liveness_evidence_since(peer_addr, evidence_before)
+                    .await
+                {
+                    warn!(
+                        peer = %peer_addr,
+                        "cleanup_dead_peers: fresh liveness evidence arrived after reservation \
+                         consume; preserving actor state and tombstones"
+                    );
+                    drop(gossip_state);
+                    reservation.release().await;
+                    continue;
+                }
+
                 if let Some(actor_names) = gossip_state.peer_to_actors.get(&peer_addr).cloned() {
                     let peer_info = gossip_state.peers.get(&peer_addr).cloned();
                     let mut actors_removed = 0usize;
@@ -9678,7 +9702,16 @@ impl<T: 'static> GossipRegistry<T> {
             let outcome = self
                 .release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
                 .await;
-            debug!(peer = %peer_addr, ?outcome, "cleanup_dead_peers: ownership release outcome");
+            if outcome == crate::registry_owner::DeadPeerReleaseOutcome::ProvenAlive {
+                warn!(
+                    peer = %peer_addr,
+                    ?outcome,
+                    "cleanup_dead_peers: ownership fence found newer liveness after actor \
+                     cleanup; the peer must re-register its actors"
+                );
+            } else {
+                debug!(peer = %peer_addr, ?outcome, "cleanup_dead_peers: ownership release outcome");
+            }
             reservation.release().await;
         }
         if should_trigger_immediate {
@@ -26169,6 +26202,122 @@ mod tests {
     /// must be anchored to THIS peer's own failure time (t0), under which
     /// t1 is still causally newer and the reconnect survives regardless of
     /// how delayed t2 is.
+    /// Evidence may arrive after the reservation's one-shot consume but
+    /// while the destructive phase is blocked on `gossip_state`. The fresh
+    /// owner check immediately after that lock is acquired must still stop
+    /// actor removal and tombstone publication.
+    #[tokio::test]
+    async fn reap_reserved_candidates_preserves_actor_when_liveness_arrives_after_consume() {
+        let mut config = test_config();
+        config.dead_peer_timeout = Duration::from_millis(50);
+        config.max_peer_failures = 3;
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(44_980), config.clone()));
+        let peer_addr = test_addr(44_981);
+        let peer_id = test_peer_id("reap-liveness-between-consume-and-destruction");
+        let session_source = test_addr(44_982);
+        let actor_name = "svc-reap-liveness-between-consume-and-destruction";
+
+        let (claim_outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                peer_addr,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(claim_outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        let evidence_before = std::time::Instant::now();
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp()),
+                    last_failure_instant: Some(evidence_before),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+            gossip_state
+                .peer_to_actors
+                .entry(peer_addr)
+                .or_default()
+                .insert(actor_name.to_string());
+        }
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            actor_name.to_string(),
+            RemoteActorLocation::new_with_peer(peer_addr, peer_id.clone()),
+        );
+
+        let ownership = registry.registry_owner.ownership_token(&peer_addr);
+        let pin_owner = registry.registry_owner.pin_owner(&peer_addr);
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(peer_addr, evidence_before, ownership, pin_owner, Some(peer_id.clone()))
+            .await
+            .expect("a freshly claimed address must be reservable");
+
+        let guard = registry.gossip_state.lock().await;
+        let registry_for_sweep = registry.clone();
+        let peer_id_for_sweep = peer_id.clone();
+        let reap = tokio::spawn(async move {
+            registry_for_sweep
+                .reap_reserved_candidates(
+                    vec![(peer_addr, Some(peer_id_for_sweep), evidence_before, reservation)],
+                    config.dead_peer_timeout,
+                )
+                .await;
+        });
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        registry
+            .registry_owner
+            .note_liveness_evidence(peer_addr, std::time::Instant::now())
+            .await;
+        drop(guard);
+        reap.await.expect("reap task panicked");
+
+        assert!(registry.actor_state.known_actors.contains_sync(actor_name));
+        assert!(registry
+            .actor_state
+            .removed_actors
+            .read_sync(actor_name, |_, _| ())
+            .is_none());
+        assert!(registry
+            .gossip_state
+            .lock()
+            .await
+            .peer_to_actors
+            .contains_key(&peer_addr));
+        assert_eq!(registry.registry_owner.routes_to(&peer_addr), Some(peer_id.clone()));
+
+        registry
+            .release_connection_scoped_claims(&peer_id, session_source)
+            .await;
+        assert_eq!(registry.registry_owner.routes_to(&peer_addr), None);
+    }
+
     #[tokio::test]
     async fn cleanup_dead_peers_uses_each_peers_own_failure_time_not_a_global_sweep_cutoff() {
         let mut config = test_config();
