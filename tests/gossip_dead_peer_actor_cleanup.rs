@@ -465,7 +465,7 @@ fn required_peer_connects_within_one_second_without_waiting_for_discovery_gossip
                 icanact_remote::addr_ownership::ClaimKind::Verified,
             )
             .await;
-        peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
+        let _ = peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
         peer_b
             .registry
             .add_peer_with_node_id(
@@ -474,7 +474,7 @@ fn required_peer_connects_within_one_second_without_waiting_for_discovery_gossip
                 icanact_remote::addr_ownership::ClaimKind::Verified,
             )
             .await;
-        peer_b.registry.configure_peer(id_a.clone(), addr_a).await;
+        let _ = peer_b.registry.configure_peer(id_a.clone(), addr_a).await;
 
         assert!(
             wait_for_lookup_peer(&peer_a, &id_b, Duration::from_secs(1)).await,
@@ -522,7 +522,7 @@ fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() ->
                 icanact_remote::addr_ownership::ClaimKind::Verified,
             )
             .await;
-        peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
+        let _ = peer_a.registry.configure_peer(id_b.clone(), addr_b).await;
         peer_a.registry.connect_to_peer(&id_b).await?;
         assert!(
             peer_a.lookup_peer(&id_b).await.is_ok(),
@@ -1004,7 +1004,7 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 icanact_remote::addr_ownership::ClaimKind::Verified,
             )
             .await;
-        publisher
+        let _ = publisher
             .registry
             .configure_peer(sub_peer_id.clone(), sub_addr)
             .await;

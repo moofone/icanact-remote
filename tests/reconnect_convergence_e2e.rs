@@ -237,7 +237,7 @@ async fn concurrent_same_identity_process_does_not_replace_live_incumbent()
 }
 
 async fn configure_static_peer(left: &TlsHandle, right: &TlsHandle) {
-    left.registry
+    let _ = left.registry
         .configure_peer(right.registry.peer_id.clone(), right.registry.bind_addr)
         .await;
 }

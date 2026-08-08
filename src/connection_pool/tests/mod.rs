@@ -1781,8 +1781,8 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
         let (p1, p2) = (peer_id.clone(), peer_id.clone());
         let call_a = tokio::spawn(async move { r1.configure_peer(p1, addr_a).await });
         let call_b = tokio::spawn(async move { r2.configure_peer(p2, addr_b).await });
-        call_a.await.expect("call_a task panicked");
-        call_b.await.expect("call_b task panicked");
+        let _ = call_a.await.expect("call_a task panicked");
+        let _ = call_b.await.expect("call_b task panicked");
 
         let owner = &registry.registry_owner;
         let winner = match (owner.routes_to(&addr_a), owner.routes_to(&addr_b)) {

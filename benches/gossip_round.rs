@@ -26,7 +26,7 @@ async fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<
             .connection_pool
             .addr_to_peer_id
             .upsert_sync(peer_addr, peer_id.clone());
-        registry.configure_peer(peer_id, peer_addr).await;
+        let _ = registry.configure_peer(peer_id, peer_addr).await;
     }
 
     for idx in 0..actor_count {

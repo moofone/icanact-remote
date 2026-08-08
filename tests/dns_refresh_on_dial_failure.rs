@@ -121,7 +121,7 @@ async fn dial_failure_triggers_dns_refresh_and_reconnect_succeeds() -> icanact_r
             icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
-    a.registry
+    let _ = a.registry
         .configure_peer(b_peer_id.clone(), stale_addr)
         .await;
     a.registry
@@ -174,7 +174,7 @@ async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact
             icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
-    a.registry
+    let _ = a.registry
         .configure_peer(b_peer_id.clone(), stale_addr)
         .await;
     a.registry

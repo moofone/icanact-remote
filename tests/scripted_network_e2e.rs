@@ -272,7 +272,7 @@ fn inbound_preferred_key_pair() -> (KeyPair, KeyPair) {
 }
 
 async fn configure_static_peer(handle: &TlsHandle, peer_id: PeerId, addr: SocketAddr) {
-    handle.registry.configure_peer(peer_id, addr).await;
+    let _ = handle.registry.configure_peer(peer_id, addr).await;
 }
 
 async fn ask_once(from: &TlsHandle, to: &PeerId, payload: &'static [u8], expected: &'static [u8]) {

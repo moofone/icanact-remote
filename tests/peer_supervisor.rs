@@ -60,7 +60,7 @@ async fn supervisor_reports_unreachable_for_down_peer() -> Result<(), Box<dyn st
         .registry
         .set_peer_liveness_handler(sink.clone())
         .await;
-    registry
+    let _ = registry
         .registry
         .configure_peer(peer_id.clone(), dead_addr)
         .await;

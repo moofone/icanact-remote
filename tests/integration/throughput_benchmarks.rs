@@ -4281,7 +4281,7 @@ async fn test_disconnect_connection_by_peer_id_preserves_configured_address() {
 
     let peer_id = receiver.registry.peer_id.clone();
     let target_addr = receiver.registry.bind_addr;
-    sender
+    let _ = sender
         .registry
         .configure_peer(peer_id.clone(), target_addr)
         .await;
