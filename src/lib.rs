@@ -2131,14 +2131,38 @@ mod tests {
         );
     }
 
-    /// If `get_connection` reuses an INBOUND connection for the identity
-    /// (tie-break flipped from the outbound case above), `conn.addr` is
-    /// that connection's raw, ephemeral transport source, not a
-    /// corroborated dial target. Enforced at the type level, not this
-    /// call site: `ResolvedRoute`'s only constructor requires the
-    /// connection's independently-looked-up direction, so an inbound
-    /// source can only ever produce a route flagged unverified, and every
-    /// `PeerInfo` builder reads that flag directly off it.
+    /// P1 finding (review round against 4c41300, `lib.rs:1058`): the
+    /// discovered path converted `get_connection`'s resolved handle into a
+    /// `ResolvedRoute` from `conn.addr` alone, discarding the connection's
+    /// direction entirely. If `get_connection` reuses an INBOUND
+    /// connection for the same identity (the same tie-break-reuse
+    /// mechanism `connect_discovered_marks_the_address_actually_resolved_
+    /// not_the_bare_request` above exercises for an outbound connection,
+    /// here with the ordering flipped so the tie-break keeps the INBOUND
+    /// side instead), `conn.addr` is that connection's raw, ephemeral
+    /// transport source -- and the later insert built a normal `PeerInfo`
+    /// with `transport_source_keyed = false`, making an undialable address
+    /// selectable and gossipable. This is #181's subject matter reaching
+    /// the crate a fourth time (#181 twice, `connect_to_peer` in an
+    /// earlier round of this PR, and here) -- fixed not by patching this
+    /// site but by tightening `ResolvedRoute` itself. Its only constructor
+    /// is now the `pub(crate)` `from_connection` (requires the
+    /// connection's OWN direction, independently looked up -- an inbound
+    /// source can only ever produce a route flagged as unverified). A
+    /// second, unconditionally-`dialable: true` constructor,
+    /// `from_configured`, existed for a while for `connect_to_peer`'s own
+    /// required-peer path, but was itself deleted in a later round (review
+    /// round against `f64f3a9`) once its "trusted independent of
+    /// connection direction" premise turned out not to hold for a
+    /// caller-provided address either -- see `ConnectOutcome`'s own doc
+    /// comment. That case (a live connection exists, but nothing
+    /// corroborates any address as dialable) is represented by
+    /// `ConnectOutcome::ConnectedUnverified` now, a value that never wraps
+    /// a `ResolvedRoute` at all, not reachable through this discovered/
+    /// non-required path at all (only through `connect_to_peer`). Every
+    /// consumer that builds a `PeerInfo` from a `ResolvedRoute` reads its
+    /// dialability directly (`PeerInfo::for_connect_attempt`), so this
+    /// call site cannot forget to flag it even if it tries.
     #[tokio::test]
     async fn connect_discovered_reusing_an_inbound_connection_does_not_mark_the_ephemeral_source_healthy()
      {

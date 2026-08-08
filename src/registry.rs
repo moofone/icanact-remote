@@ -1581,11 +1581,18 @@ impl PeerInfo {
     /// a never-contacted entry behind.
     ///
     /// `transport_source_keyed`/`inbound_observed` are set directly from
-    /// `address.is_dialable()` rather than left for the caller to
-    /// remember (an unverified inbound connection being treated as
-    /// dialable recurred across call sites when this was hand-set) --
-    /// `ResolvedRoute::from_connection` is the only way to build `address`,
-    /// so the flag can't be silently dropped.
+    /// `address.is_dialable()` -- NEVER left to the caller to remember: an
+    /// earlier version required every call site to separately notice when
+    /// its `ResolvedRoute` was backed by an unverified, inbound-sourced
+    /// connection and set these flags by hand, and this is precisely the
+    /// class of bug that let #181's "ephemeral inbound source treated as a
+    /// dialable route" recur through the type itself (twice more, in
+    /// `connect_to_peer` and the discovered path in `lib.rs`) even after
+    /// `ResolvedRoute` existed specifically to prevent misattribution.
+    /// `ResolvedRoute::from_connection` is the only way to construct one
+    /// (a second constructor, `from_configured`, existed for a while but
+    /// was deleted in a later round -- see `ConnectOutcome`'s own doc
+    /// comment), and a caller cannot silently drop the flag it carries.
     pub(crate) fn for_connect_attempt(
         address: ResolvedRoute,
         node_id: Option<crate::GossipNodeId>,
@@ -4287,12 +4294,54 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// Release ownership and any connection-scoped receipts left behind by a
-    /// peer that has exceeded the dead-peer timeout. The owner performs the
-    /// receipt cleanup and ownership decision in one serialized operation.
-    /// `evidence_before` is fixed at the sweep's selection boundary, so a
-    /// reconnect committed after that evidence permanently invalidates this
-    /// reap even if the release command is delayed by queueing or locks.
+    /// Release a dead peer's address ownership, including any
+    /// connection-scoped receipts still recorded for it under ANY session --
+    /// not just the one, if any, whose own teardown already ran. Called from
+    /// `cleanup_dead_peers` once a peer has been gone longer than the
+    /// dead-peer timeout, so a missed or still-in-flight session teardown
+    /// (see `ExitGuard`) cannot leave the address permanently unreachable to
+    /// every other identity. An operator-pinned reservation is exempt: it
+    /// must outlive the peer being offline exactly as it already outlives a
+    /// single session's teardown.
+    ///
+    /// This selection (`cleanup_dead_peers` deciding this peer looks dead)
+    /// can be stale relative to the owner's own state in either direction:
+    /// the same peer can reconnect and commit a fresh connection-scoped
+    /// claim before OR after this selection reads `gossip_state`, since a
+    /// reconnect's `GossipState` liveness update (`mark_peer_connected*`)
+    /// only happens AFTER the owner has already committed that claim.
+    /// `RegistryOwnerHandle::release_dead_peer` does not trust anything this
+    /// caller observed about liveness; it re-derives that answer as a
+    /// CAUSAL fence against the owner's OWN `claim_committed_at` record:
+    /// "did direct evidence of life happen after the failure evidence this
+    /// reap is acting on", not "how long ago was the last commit" and not
+    /// "does a generation snapshot still match". Both of those alternatives
+    /// are temporal/snapshot LEASES that can be satisfied merely by enough
+    /// wall-clock time passing while this command sits queued -- behind
+    /// lock contention, or simply earlier peers in the same sweep each
+    /// doing their own owner round trip first -- even though a reconnect
+    /// landed, and was itself proven live, before that queueing delay ever
+    /// started. `evidence_before` fixes the failure's own Instant-
+    /// equivalent once, at selection time, so this fence cannot expire by
+    /// waiting: a reconnect's `claim_committed_at` causally after it voids
+    /// the reap permanently, regardless of how long this call then took to
+    /// actually run.
+    /// Returns the owner's own atomic decision --
+    /// [`crate::registry_owner::DeadPeerReleaseOutcome`] -- checking BOTH
+    /// `claim_committed_at` and `liveness_evidence_at` (see
+    /// `PeerRegistryOwner::release_dead_peer`), the LAST and most current
+    /// word on whether this candidate is still genuinely dead. Called ONCE,
+    /// FIRST, by `reap_reserved_candidates`, before any destructive work for
+    /// the candidate -- its outcome gates EVERYTHING that follows (actor
+    /// removal, `ActorRemoved` tombstones, capabilities, clock-calibration
+    /// state), not just a remaining subset. An earlier round gated actor
+    /// removal on a separately timed `gossip_state`-based `still_dead`
+    /// recheck instead, decided under a different lock before this call
+    /// ever ran, which could refuse for reasons `still_dead` had no way to
+    /// see; that recheck is gone now, entirely, in favor of this single
+    /// call. The outcome distinguishes "proven alive" (no destruction of
+    /// ANY kind) from "nothing to release here" (safe to still clean up
+    /// transient state).
     async fn release_dead_peer_ownership(
         &self,
         peer_id: &crate::PeerId,
@@ -9367,10 +9416,59 @@ impl<T: 'static> GossipRegistry<T> {
         });
     }
 
-    /// Clean up actors from peers that have been disconnected for longer than
-    /// `dead_peer_timeout`, retaining the peer entry so a later reconnect can
-    /// be observed. Ownership release is coordinated through the owner actor;
-    /// its causal fence is fixed once before the liveness snapshot below.
+    /// Clean up actors from peers that have been disconnected for longer than dead_peer_timeout
+    /// IMPORTANT: We keep the peer itself to allow reconnection, only clean up their actors
+    ///
+    /// RESERVATION SCOPE (`reserve_for_reap`/`ReapReservation`, extended
+    /// three times now by review findings -- stated once, explicitly, here
+    /// rather than left to be reconstructed from those): the reservation
+    /// is an OWNER-side fact. It blocks every NEW address-ownership claim
+    /// for the reserved address outright (`claim`/`claim_connection_scoped`
+    /// refuse unconditionally while a reservation is held -- see
+    /// `PeerRegistryOwner::reap_reserved`'s doc comment) and it is
+    /// atomically revalidated, at the moment it is granted, against the
+    /// exact owner-side identity (ownership token + pin) selection
+    /// observed. What it does NOT block, on its own: an already-connected
+    /// peer delivering ordinary liveness evidence -- no new claim or
+    /// ownership change involved at all. `mark_response_received` records
+    /// that evidence in TWO places: `GossipState`'s own `failures`/
+    /// `last_failure_instant` (used only by `cleanup_dead_peers`'s own,
+    /// EARLIER selection pass below, and by unrelated consumers such as
+    /// peer-status reporting) and, separately, the owner's OWN
+    /// `liveness_evidence_at` (`PeerRegistryOwner`-internal, updated only
+    /// via `OwnerCommand::NoteLivenessEvidence`). It is ONLY the second of
+    /// those -- never `GossipState`'s copy -- that
+    /// `reap_reserved_candidates` below asks the owner about, atomically,
+    /// immediately before doing anything destructive (see
+    /// `release_dead_peer_ownership`'s own doc comment): the reservation
+    /// alone proves identity didn't move, never that liveness evidence
+    /// didn't change, and `GossipState`'s own failure fields are stale the
+    /// moment selection reads them, so only the owner's causally-fenced
+    /// copy may gate destruction.
+    ///
+    /// DESTRUCTIVE ACTIONS, and their single gate: `reap_reserved_candidates`
+    /// asks the owner for ONE outcome per candidate
+    /// (`PeerRegistryOwner::release_dead_peer`, via
+    /// `release_dead_peer_ownership`) and every destructive step for that
+    /// candidate is downstream of it -- none run independently, none run
+    /// on an earlier or separately-timed check:
+    /// - actor removal (`known_actors.remove_sync`) and the `ActorRemoved`
+    ///   tombstone/gossip change it emits -- the step that matters most,
+    ///   since a tombstone already gossiped to another node cannot be
+    ///   recalled;
+    /// - capability side tables (`clear_peer_capabilities`);
+    /// - clock-calibration side tables (`remove_clock_state_for_addr`);
+    /// - connection-scoped receipts and address ownership itself, plus
+    ///   its own ownership-tombstone projection -- all three inside
+    ///   `PeerRegistryOwner::release_dead_peer`/`release_dead_peer_ownership`,
+    ///   already committed by the time the outcome is returned, so
+    ///   ownership release is not merely gated BY the decision, it IS the
+    ///   decision.
+    ///
+    /// A `DeadPeerReleaseOutcome::ProvenAlive` outcome skips every one of
+    /// these for that candidate; only its `ReapReservation` is still
+    /// released (unconditionally, for every candidate, to avoid leaking
+    /// it) and nothing else.
     pub async fn cleanup_dead_peers(&self) {
         let current_time = current_timestamp();
         let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
