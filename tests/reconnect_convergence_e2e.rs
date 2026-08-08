@@ -98,7 +98,7 @@ async fn node_with_keypair(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn newer_authenticated_same_direction_session_replaces_live_incumbent()
+async fn concurrent_same_identity_process_does_not_replace_live_incumbent()
 -> icanact_remote::Result<()> {
     let first = KeyPair::new_for_testing("live-session-replacement-a");
     let second = KeyPair::new_for_testing("live-session-replacement-b");
@@ -154,33 +154,66 @@ async fn newer_authenticated_same_direction_session_replaces_live_incumbent()
     )
     .await
     .map_err(icanact_remote::GossipError::InvalidKeyPair)?;
-    // Start a second live registry with the same authenticated identity. The
-    // old registry deliberately remains alive: the transport must treat this
-    // later, tie-break-correct TLS connection as the next session epoch and
-    // replace the incumbent without an application-side disconnect.
-    let replacement = node_with_keypair(replica_key, "new", new_asks.clone(), quiet_config).await?;
-    replacement
+    // Start a second live registry with the same long-lived identity while the
+    // incumbent remains healthy. This is a concurrent process clone, not a
+    // restart: it must not displace the live handler or churn the published
+    // session merely because its physical stream was created later.
+    let clone = node_with_keypair(replica_key, "clone", new_asks.clone(), quiet_config).await?;
+    clone
         .add_peer(&observer.registry.peer_id)
         .await
         .connect(&observer.registry.bind_addr)
         .await?;
 
-    ask_until_success(
-        &observer,
-        &replacement.registry.peer_id,
-        b"after",
-        b"new:after",
-        Duration::from_secs(2),
-    )
-    .await
-    .map_err(icanact_remote::GossipError::InvalidKeyPair)?;
+    // Keep real actor traffic flowing for the entire admission window. A
+    // one-shot assertion can race ahead of the incoming session publication
+    // and falsely pass while the clone replaces the incumbent moments later.
+    let admission_deadline = Instant::now() + Duration::from_micros(500_000);
+    let mut admission_probes = 0_u64;
+    let mut last_probe_error = None;
+    while Instant::now() < admission_deadline {
+        let probe = async {
+            let peer = observer.lookup_peer(&clone.registry.peer_id).await?;
+            let connection = peer.connection_ref().ok_or_else(|| {
+                icanact_remote::GossipError::InvalidKeyPair(
+                    "incumbent route disappeared during clone admission".to_string(),
+                )
+            })?;
+            connection
+                .ask_actor_frame(
+                    TEST_ACTOR_ID,
+                    TEST_TYPE_HASH,
+                    Bytes::from_static(b"admission"),
+                    ASK_TIMEOUT,
+                )
+                .await
+        }
+        .await;
+        match probe {
+            Ok(reply) => {
+                assert_eq!(
+                    reply.as_ref(),
+                    b"old:admission",
+                    "a concurrently live process clone displaced the healthy incumbent"
+                );
+                admission_probes += 1;
+            }
+            Err(err) => last_probe_error = Some(err.to_string()),
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        admission_probes > 0,
+        "the incumbent delivered no actor probes during clone admission; last error: {}",
+        last_probe_error.as_deref().unwrap_or("none")
+    );
 
-    let old_hits_after_replacement = old_asks.load(Ordering::Acquire);
+    let old_hits_after_clone = old_asks.load(Ordering::Acquire);
     ask_until_success(
         &observer,
-        &replacement.registry.peer_id,
+        &clone.registry.peer_id,
         b"steady",
-        b"new:steady",
+        b"old:steady",
         Duration::from_secs(2),
     )
     .await
@@ -188,15 +221,16 @@ async fn newer_authenticated_same_direction_session_replaces_live_incumbent()
 
     assert_eq!(
         old_asks.load(Ordering::Acquire),
-        old_hits_after_replacement,
-        "post-replacement traffic must not reach the superseded handler"
+        old_hits_after_clone + 1,
+        "the healthy incumbent must keep serving after a clone authenticates"
     );
-    assert!(
-        new_asks.load(Ordering::Acquire) >= 2,
-        "the replacement handler must serve post-restart traffic"
+    assert_eq!(
+        new_asks.load(Ordering::Acquire),
+        0,
+        "a concurrent process clone must not receive incumbent traffic"
     );
 
-    replacement.shutdown_and_wait().await;
+    clone.shutdown_and_wait().await;
     old_replica.shutdown_and_wait().await;
     observer.shutdown_and_wait().await;
     Ok(())

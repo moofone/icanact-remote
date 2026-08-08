@@ -66,6 +66,14 @@ pub enum TransportLifecycleEvent {
         addr: SocketAddr,
         direction: TransportDirection,
     },
+    /// A fully authenticated process reused an already-live peer identity.
+    /// The healthy incumbent remains published; the candidate is rejected.
+    DuplicateIdentityRejected {
+        peer: PeerId,
+        addr: SocketAddr,
+        incumbent_boot_id: crate::handshake::RemoteBootId,
+        rejected_boot_id: crate::handshake::RemoteBootId,
+    },
     /// Fired immediately before an outbound-finalize `AcceptIncoming`
     /// decision attempts to enact its publish via compare-and-publish —
     /// unconditionally, regardless of whether that attempt goes on to

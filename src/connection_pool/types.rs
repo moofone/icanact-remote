@@ -61,6 +61,9 @@ pub struct LockFreeConnection {
     /// IMPORTANT: This allows looking up peer_id for inbound connections even after
     /// addr_to_peer_id mapping has been migrated to bind address (ephemeral port removed)
     pub(crate) embedded_peer_id: Option<crate::PeerId>,
+    /// Authenticated process incarnation from the remote Hello exchange.
+    /// `None` exists only for synthetic/unit connections and pre-Hello paths.
+    pub(crate) remote_boot_id: Option<crate::handshake::RemoteBootId>,
     /// Task tracker for background tasks (writer and reader)
     pub task_tracker: TaskTracker,
     /// R-11: this connection's own session discriminator, mirroring
@@ -99,6 +102,7 @@ impl Clone for LockFreeConnection {
             correlation: self.correlation.clone(),
             direction: self.direction,
             embedded_peer_id: self.embedded_peer_id.clone(),
+            remote_boot_id: self.remote_boot_id,
             // Note: TaskTracker is not cloned - each clone gets a fresh tracker
             // This is intentional: clones are typically used for metadata snapshots,
             // not to transfer task ownership
@@ -121,6 +125,7 @@ impl LockFreeConnection {
             correlation: Some(CorrelationTracker::new()),
             direction,
             embedded_peer_id: None,
+            remote_boot_id: None,
             task_tracker: TaskTracker::new(),
             // Default matches the inbound case (session_source == addr).
             // The one outbound construction site overrides this to the

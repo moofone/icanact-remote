@@ -1584,6 +1584,61 @@ fn resolve_connection_conflict_matches_all_routed_call_sites() {
     // and is intentionally not exercised through this function.
 }
 
+#[tokio::test]
+async fn authenticated_boot_id_separates_socket_dedup_from_process_clone() {
+    use super::ConnectionConflictDecision::*;
+
+    fn live_connection(
+        addr: SocketAddr,
+        boot_byte: u8,
+    ) -> (Arc<LockFreeConnection>, tokio::io::DuplexStream) {
+        let (io, peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        connection.stream_handle = Some(Arc::new(stream_handle));
+        connection.remote_boot_id =
+            Some(crate::handshake::RemoteBootId::from_bytes([boot_byte; 16]));
+        connection.set_state(ConnectionState::Connected);
+        (Arc::new(connection), peer_io)
+    }
+
+    let (incumbent, _incumbent_io) = live_connection("127.0.0.1:40550".parse().unwrap(), 1);
+    let (same_process_socket, _same_process_io) =
+        live_connection("127.0.0.1:40551".parse().unwrap(), 1);
+    let (process_clone, _process_clone_io) = live_connection("127.0.0.1:40552".parse().unwrap(), 2);
+
+    assert_eq!(
+        resolve_authenticated_connection_conflict(
+            &incumbent,
+            &same_process_socket,
+            true,
+            true,
+            true,
+        ),
+        ReplaceExisting,
+        "later sockets from one process retain the existing session-epoch tie-break"
+    );
+    assert_eq!(
+        resolve_authenticated_connection_conflict(&incumbent, &process_clone, false, true, true,),
+        RejectIncoming,
+        "a different live process must not replace the incumbent even when its socket is newer"
+    );
+
+    incumbent.set_state(ConnectionState::Disconnected);
+    assert_eq!(
+        resolve_authenticated_connection_conflict(&incumbent, &process_clone, false, true, true,),
+        AcceptIncoming,
+        "once the incumbent is dead, the next authenticated process may take over"
+    );
+}
+
 #[test]
 fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
@@ -12280,6 +12335,7 @@ async fn connect_via_stream_rejects_self_after_cert_identity_discovery_on_addres
             alpn.as_deref(),
             false,
             None,
+            crate::handshake::RemoteBootId::from_bytes([8; 16]),
         )
         .await;
     });

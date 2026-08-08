@@ -23,19 +23,19 @@ pub(crate) enum ConnectionConflictDecision {
     EvictStaleRejectIncoming,
 }
 
-/// THE single decision authority for connection keep/drop/dedup/replace
-/// outcomes for a verified peer identity.
+/// Socket-level decision authority for connection keep/drop/dedup/replace
+/// outcomes within one authenticated process incarnation. Production call
+/// sites route through [`resolve_authenticated_connection_conflict`], which
+/// first rejects a different live boot and delegates same-boot sockets here.
 ///
 /// Direction remains *purely* identity-derived: `keep_existing` /
 /// `keep_incoming` are the results of
 /// [`GossipRegistry::should_keep_connection`], a pure function of verified
 /// peer NodeId ordering plus connection direction. Within that single valid
 /// direction, `incoming_session_is_newer` orders two fully authenticated
-/// physical sessions by their local, monotonic stream-instance epoch. This is
-/// what lets a restarted process using the same long-lived peer identity
-/// replace a still-live predecessor without making ordinary simultaneous-open
-/// races nondeterministic: an older candidate can never displace a newer
-/// incumbent.
+/// physical sessions from the same process by their local, monotonic
+/// stream-instance epoch. That makes ordinary simultaneous-open races
+/// deterministic without treating another live process as a newer socket.
 ///
 /// There is deliberately **no `SocketAddr` parameter** — this is enforced
 /// structurally (at the type/
@@ -122,6 +122,46 @@ pub(crate) fn resolve_connection_conflict(
     // the newer same-direction session epoch", and the equal/degenerate
     // inputs. In all three cases the live rival survives.
     ConnectionConflictDecision::RejectIncoming
+}
+
+/// Boot-aware admission wrapper around the socket-level tie-break.
+///
+/// Stream epochs are only comparable inside one running process. A later
+/// stream from another process that reused the same long-lived PeerId is a
+/// configuration conflict, not evidence of a restart, while the incumbent
+/// stream remains live.
+pub(crate) fn resolve_authenticated_connection_conflict(
+    existing: &Arc<LockFreeConnection>,
+    incoming: &Arc<LockFreeConnection>,
+    keep_existing: bool,
+    keep_incoming: bool,
+    incoming_session_is_newer: bool,
+) -> ConnectionConflictDecision {
+    if existing.has_live_stream()
+        && matches!(
+            (existing.remote_boot_id, incoming.remote_boot_id),
+            (Some(existing_boot), Some(incoming_boot)) if existing_boot != incoming_boot
+        )
+    {
+        return ConnectionConflictDecision::RejectIncoming;
+    }
+    resolve_connection_conflict(
+        existing.has_live_stream(),
+        keep_existing,
+        keep_incoming,
+        incoming_session_is_newer,
+    )
+}
+
+pub(crate) fn has_conflicting_remote_boot(
+    existing: &Arc<LockFreeConnection>,
+    incoming: &Arc<LockFreeConnection>,
+) -> bool {
+    existing.has_live_stream()
+        && matches!(
+            (existing.remote_boot_id, incoming.remote_boot_id),
+            (Some(existing_boot), Some(incoming_boot)) if existing_boot != incoming_boot
+        )
 }
 
 /// Compare the local authenticated-session epochs of two physical
@@ -821,8 +861,9 @@ impl<T> ConnectionPool<T> {
                     rival.direction == ConnectionDirection::Outbound,
                 );
                 let keep_incoming = registry.should_keep_connection(peer_id, true);
-                resolve_connection_conflict(
-                    rival.has_live_stream(),
+                resolve_authenticated_connection_conflict(
+                    rival,
+                    connection_arc,
                     keep_existing,
                     keep_incoming,
                     // `rival` was observed only after our candidate lost a
@@ -1321,8 +1362,9 @@ impl<T> ConnectionPool<T> {
                 // connection — `is_outbound == false`, mirroring
                 // `handle_incoming_connection_tls`'s own `keep_new_inbound`.
                 let keep_incoming = registry.should_keep_connection(peer_id, false);
-                resolve_connection_conflict(
-                    rival.has_live_stream(),
+                resolve_authenticated_connection_conflict(
+                    rival,
+                    connection_arc,
                     keep_existing,
                     keep_incoming,
                     // Same publication-order rule as outbound finalize: a
@@ -3465,6 +3507,11 @@ impl<T> ConnectionPool<T> {
         }
 
         let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+        conn.remote_boot_id = registry_weak.upgrade().and_then(|registry| {
+            registry
+                .peer_capabilities
+                .read_sync(&addr, |_, caps| caps.remote_boot_id)
+        });
         // R-11: outbound session_source is this socket's own local
         // ephemeral port (unique per connection), not the dial target
         // `addr` this instance was constructed with (the peer's fixed
@@ -3577,8 +3624,9 @@ impl<T> ConnectionPool<T> {
                             existing.direction == ConnectionDirection::Outbound,
                         );
                         let keep_incoming = registry.should_keep_connection(peer_id, true);
-                        resolve_connection_conflict(
-                            existing.has_live_stream(),
+                        resolve_authenticated_connection_conflict(
+                            existing,
+                            &connection_arc,
                             keep_existing,
                             keep_incoming,
                             incoming_session_is_newer(&connection_arc, existing),
