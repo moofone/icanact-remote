@@ -5070,8 +5070,8 @@ impl<T: 'static> GossipRegistry<T> {
         // pin. Updating this after every sub-attempt ensures such a call is
         // correctly detected as `Superseded` on the next sub-attempt.
         let mut current_expected_generation = expected_generation;
-        let (outcome, evicted_release, generation) = loop {
-            let (outcome, _receipt, evicted_release, reap_in_progress, generation, superseded) =
+        let (outcome, receipt, evicted_release, generation) = loop {
+            let (outcome, receipt, evicted_release, reap_in_progress, generation, superseded) =
                 self.add_operator_configured_peer_claim(
                     connect_addr,
                     peer_id.to_node_id(),
@@ -5093,7 +5093,7 @@ impl<T: 'static> GossipRegistry<T> {
                 return (ConfigurePeerOutcome::Superseded, generation);
             }
             if !reap_in_progress {
-                break (outcome, evicted_release, generation);
+                break (outcome, receipt, evicted_release, generation);
             }
             // Checked on every sub-attempt, not just once before this whole
             // call was first reached (`queue_configure_peer_until_applied`'s
@@ -5163,24 +5163,23 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // Operator configuration is itself dialability evidence for
-        // `connect_addr`. Fenced against a concurrent `configure_peer` for
-        // a DIFFERENT identity landing between the owner transaction above
-        // and this `gossip_state` acquisition: `pin_is_current` answers
-        // "did I lose the race" (not "who owns this now"), a lock-free
-        // read of the snapshot just committed, so a losing identity's
-        // stale `PeerInfo` never gets marked dialable. Checked TWICE,
-        // before and after the `gossip_state` wait, which can be long
-        // enough on its own for a repin to land in.
-        //
-        // KNOWN, DEFERRED LIMITATION: the second check narrows this race,
-        // it does not close it -- a plain read is never atomic with a
-        // concurrent write from a separate domain (see `ReapReservation`'s
-        // doc comment). Accepted because the blast radius is small:
-        // `transport_source_keyed` is per-node advisory bookkeeping, never
-        // gossiped, self-correcting on the next classification event.
-        if self.registry_owner.pin_is_current(&connect_addr, &peer_id) {
+        // `connect_addr`. Fence it to the exact owner commit that produced
+        // this configure transaction. A membership-only pin check is
+        // vulnerable to ABA (A -> B -> A): a stale notification could see
+        // the same peer/address membership after a newer pin commit and
+        // mutate state for the old transaction. The receipt is captured from
+        // the owner command itself, so this check cannot accidentally adopt
+        // a newer generation while reading the lock-free snapshot.
+        let notification_generation = receipt.map(|receipt| receipt.generation());
+        if notification_generation.is_some_and(|commit_seq| {
+            self.registry_owner
+                .claim_is_current(&connect_addr, &peer_id, commit_seq)
+        }) {
             let mut gossip_state = self.gossip_state.lock().await;
-            if self.registry_owner.pin_is_current(&connect_addr, &peer_id) {
+            if notification_generation.is_some_and(|commit_seq| {
+                self.registry_owner
+                    .claim_is_current(&connect_addr, &peer_id, commit_seq)
+            }) {
                 if let Some(peer_info) = gossip_state.peers.get_mut(&connect_addr) {
                     peer_info.mark_dialability_confirmed();
                 }
@@ -5197,9 +5196,8 @@ impl<T: 'static> GossipRegistry<T> {
             debug!(
                 peer_id = %peer_id,
                 addr = %connect_addr,
-                "configure_peer: skipped dialability-confirmed marking -- a concurrent \
-                 reconfiguration moved this address's pin elsewhere before this call reached \
-                 gossip_state"
+                "configure_peer: skipped dialability-confirmed marking -- this configure \
+                 transaction is no longer the current owner generation"
             );
         }
 
@@ -5227,8 +5225,24 @@ impl<T: 'static> GossipRegistry<T> {
                  began before it could run"
             );
         } else {
-            self.apply_configure_peer_connection_update(peer_id, connect_addr)
-                .await;
+            match notification_generation {
+                Some(commit_seq) => {
+                    self.apply_configure_peer_connection_update_fenced(
+                        peer_id,
+                        connect_addr,
+                        commit_seq,
+                    )
+                    .await;
+                }
+                None => {
+                    warn!(
+                        peer_id = %peer_id,
+                        addr = %connect_addr,
+                        "configure_peer: accepted without an owner claim receipt; skipping \
+                         connect-handler notification"
+                    );
+                }
+            }
         }
         (ConfigurePeerOutcome::Applied, generation)
     }
@@ -5249,6 +5263,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// leaves nothing to undo; it is not made atomic with a later
     /// concurrent `configure_peer`, so a losing invocation still runs to
     /// completion and must re-validate its own state on completion.
+    #[cfg(test)]
     async fn apply_configure_peer_connection_update(
         &self,
         peer_id: crate::PeerId,
@@ -5265,6 +5280,44 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
+        if let Some(cell) = self.peer_connect_handler.load_full() {
+            cell.handler
+                .handle_peer_connect(connect_addr, Some(peer_id))
+                .await;
+        }
+    }
+
+    /// Notify the connect handler for an accepted operator configuration
+    /// only while the exact owner commit that produced the notification is
+    /// still current. Unlike `pin_is_current`, this generation fence rejects
+    /// an ABA pin cycle (A -> B -> A): the old commit cannot authorize a
+    /// callback after the address has been repinned and returned.
+    async fn apply_configure_peer_connection_update_fenced(
+        &self,
+        peer_id: crate::PeerId,
+        connect_addr: SocketAddr,
+        commit_seq: crate::registry_owner::CommitSeq,
+    ) {
+        if !self
+            .registry_owner
+            .claim_is_current(&connect_addr, &peer_id, commit_seq)
+        {
+            debug!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                commit_seq,
+                "configure_peer stood down before notifying the connect handler: its owner \
+                 commit was superseded"
+            );
+            return;
+        }
+
+        info!(
+            peer_id = %peer_id,
+            addr = %connect_addr,
+            commit_seq,
+            "Configured peer"
+        );
         if let Some(cell) = self.peer_connect_handler.load_full() {
             cell.handler
                 .handle_peer_connect(connect_addr, Some(peer_id))
