@@ -78,11 +78,16 @@ const OUTBOUND_DIAL_RETRY_FLOOR: Duration = Duration::from_secs(1);
 /// callers share it across failed connection instances without retaining an
 /// address-keyed dial gate forever.
 struct OutboundDialRetry {
-    consecutive_failures: AtomicU8,
     // LOCK-RATIONALE: failed-dial control path only; never read on a live
-    // connection or message hot path. `Instant` has no portable atomic form.
-    retry_not_before: std::sync::Mutex<Option<Instant>>,
+    // connection or message hot path. Eligibility and reservation must be one
+    // atomic state transition across every address known for this peer.
+    state: std::sync::Mutex<OutboundDialRetryState>,
     retry_floor: Duration,
+}
+
+struct OutboundDialRetryState {
+    consecutive_failures: u8,
+    retry_not_before: Option<Instant>,
 }
 
 impl OutboundDialRetry {
@@ -92,41 +97,54 @@ impl OutboundDialRetry {
 
     fn with_retry_floor(retry_floor: Duration) -> Self {
         Self {
-            consecutive_failures: AtomicU8::new(0),
-            retry_not_before: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(OutboundDialRetryState {
+                consecutive_failures: 0,
+                retry_not_before: None,
+            }),
             retry_floor,
         }
     }
 
-    fn may_attempt(&self) -> bool {
-        self.retry_not_before
+    fn try_claim_attempt(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none_or(|deadline| Instant::now() >= deadline)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .retry_not_before
+            .is_some_and(|deadline| now < deadline)
+        {
+            return false;
+        }
+
+        // Reserve this peer's slot while the socket attempt is in flight. If
+        // the future is cancelled, the bounded reservation expires by itself.
+        state.retry_not_before = Some(now + self.retry_floor);
+        true
     }
 
     fn record_failure(&self) {
-        let failures = self
-            .consecutive_failures
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        let delay = if failures == 1 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let delay = if state.consecutive_failures == 1 {
             Duration::ZERO
         } else {
             self.retry_floor
         };
-        *self
-            .retry_not_before
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now() + delay);
+        state.retry_not_before = Some(Instant::now() + delay);
     }
 
     fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Release);
-        *self
-            .retry_not_before
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.consecutive_failures = 0;
+        state.retry_not_before = None;
     }
 }
 
