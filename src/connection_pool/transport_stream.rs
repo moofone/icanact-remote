@@ -400,14 +400,18 @@ impl<T> ConnectionPool<T> {
         }
     }
 
-    async fn wait_for_preferred_connection(
+    pub(crate) async fn wait_for_preferred_connection(
         &self,
         remote_peer_id: &crate::PeerId,
         registry: &GossipRegistry,
         timeout: Duration,
     ) -> Option<ConnectionHandle<T>> {
         let deadline = Instant::now() + timeout;
+        let mut routing_revision = self.routing_revision();
         loop {
+            #[cfg(test)]
+            self.preferred_connection_checks
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(conn) = self.get_connection_by_peer_id(remote_peer_id) {
                 let is_outbound = conn.direction == ConnectionDirection::Outbound;
                 if registry.should_keep_connection(remote_peer_id, is_outbound) {
@@ -421,7 +425,14 @@ impl<T> ConnectionPool<T> {
                 return None;
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::select! {
+                next = self.wait_for_routing_change(routing_revision) => {
+                    routing_revision = next;
+                }
+                _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => {
+                    return None;
+                }
+            }
         }
     }
 }

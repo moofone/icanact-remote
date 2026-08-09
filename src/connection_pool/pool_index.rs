@@ -29,6 +29,8 @@ pub struct ConnectionPool<T = ()> {
     connection_counter: AtomicUsize,
     routing_revision: AtomicU64,
     routing_change_notify: Arc<Notify>,
+    #[cfg(test)]
+    preferred_connection_checks: AtomicU64,
     _marker: PhantomData<fn() -> T>,
 }
 
