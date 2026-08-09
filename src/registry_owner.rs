@@ -689,6 +689,23 @@ enum OwnerCommand {
         evidence_before: std::time::Instant,
         reply: oneshot::Sender<bool>,
     },
+    /// Purely read the complete authorization fence for a reserved reap.
+    /// Liveness evidence and operator reconfiguration are independent ways
+    /// for the selection to become stale, so the caller checks both in one
+    /// owner-serialized read immediately before destructive work.
+    ReapAuthorizationIsStale {
+        addr: SocketAddr,
+        peer_id: PeerId,
+        evidence_before: std::time::Instant,
+        baseline_configure_peer_generation: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Read the current operator-configuration generation for `peer_id` so
+    /// a reap can capture a baseline before consuming its reservation.
+    ConfigurePeerGenerationOf {
+        peer_id: PeerId,
+        reply: oneshot::Sender<u64>,
+    },
     /// Atomically checks the causal fence a dead-peer reap also checks
     /// (does `addr` have DIRECT evidence of a live owner causally NEWER
     /// than `evidence_before`?) AND revalidates the full identity selection
@@ -1096,6 +1113,56 @@ impl RegistryOwnerHandle {
             return true;
         }
         response.await.unwrap_or(true)
+    }
+
+    /// Compatibility spelling for callers that ask the same owner-side
+    /// causal fence without the historical `_since` suffix.
+    pub async fn has_newer_liveness_evidence(
+        &self,
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+    ) -> bool {
+        self.has_newer_liveness_evidence_since(addr, evidence_before)
+            .await
+    }
+
+    /// Read the complete authorization fence for a reserved reap. The
+    /// result is stale when either newer direct liveness evidence exists or
+    /// the same peer was operator-reconfigured after the captured baseline.
+    /// An unavailable owner fails closed.
+    pub async fn reap_authorization_is_stale(
+        &self,
+        addr: SocketAddr,
+        peer_id: PeerId,
+        evidence_before: std::time::Instant,
+        baseline_configure_peer_generation: u64,
+    ) -> bool {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::ReapAuthorizationIsStale {
+            addr,
+            peer_id,
+            evidence_before,
+            baseline_configure_peer_generation,
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return true;
+        }
+        response.await.unwrap_or(true)
+    }
+
+    /// Read the current operator-configuration generation for `peer_id`.
+    /// An unavailable owner returns the fail-closed sentinel, which is not a
+    /// real generation and therefore cannot authorize a later reap.
+    pub async fn configure_peer_generation_of(&self, peer_id: PeerId) -> u64 {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::ConfigurePeerGenerationOf { peer_id, reply };
+        if self.shared.tx.send(command).await.is_err() {
+            return u64::MAX;
+        }
+        response.await.unwrap_or(u64::MAX)
     }
 
     /// See `OwnerCommand::ReserveForReap`'s doc comment for the causal
@@ -1811,6 +1878,29 @@ impl PeerRegistryOwner {
                     .is_some_and(|observed_at| observed_at > evidence_before);
                 let _ = reply.send(has_newer_claim || has_newer_response);
             }
+            OwnerCommand::ReapAuthorizationIsStale {
+                addr,
+                peer_id,
+                evidence_before,
+                baseline_configure_peer_generation,
+                reply,
+            } => {
+                let stale = self.reap_authorization_is_stale(
+                    addr,
+                    &peer_id,
+                    evidence_before,
+                    baseline_configure_peer_generation,
+                );
+                let _ = reply.send(stale);
+            }
+            OwnerCommand::ConfigurePeerGenerationOf { peer_id, reply } => {
+                let generation = self
+                    .configure_peer_generation
+                    .get(&peer_id)
+                    .copied()
+                    .unwrap_or(0);
+                let _ = reply.send(generation);
+            }
             OwnerCommand::ReserveForReap {
                 addr,
                 evidence_before,
@@ -1888,6 +1978,32 @@ impl PeerRegistryOwner {
                 }
             })
             .or_insert(at);
+    }
+
+    fn reap_authorization_is_stale(
+        &self,
+        addr: SocketAddr,
+        peer_id: &PeerId,
+        evidence_before: std::time::Instant,
+        baseline_configure_peer_generation: u64,
+    ) -> bool {
+        let has_newer_claim = self
+            .claim_committed_at
+            .get(&addr)
+            .is_some_and(|committed_at| *committed_at > evidence_before);
+        let has_newer_response = self
+            .liveness_evidence_at
+            .get(&addr)
+            .copied()
+            .is_some_and(|observed_at| observed_at > evidence_before);
+        if has_newer_claim || has_newer_response {
+            return true;
+        }
+        self.configure_peer_generation
+            .get(peer_id)
+            .copied()
+            .unwrap_or(0)
+            > baseline_configure_peer_generation
     }
 
     fn claim(&mut self, addr: SocketAddr, claim: Claim, is_local_addr: bool) -> ClaimCommit {

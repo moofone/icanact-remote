@@ -4721,6 +4721,45 @@ pub(crate) fn handle_incoming_message(
                     gossip_state.delta_exchanges += 1;
                 }
 
+                // P1 finding (review round against `67c71c0`,
+                // `connection_pool/pool_connect.rs:4516`): reaching here
+                // means `from_current_session` was true (the block above
+                // returns early otherwise) -- a `DeltaGossip` genuinely
+                // arrived on `sender_peer_id`'s current, authenticated
+                // session, which the block above already used to clear
+                // `gossip_state`'s OWN failure bookkeeping
+                // (`failures`/`last_failure_time`/`last_failure_instant`).
+                // That clearing used to be the ONLY place this evidence
+                // landed: the OWNER's own `liveness_evidence_at` fence --
+                // which `reap_reserved_candidates`'s selection, its early
+                // verdict, AND its fresh pre-destruction `reap_
+                // authorization_is_stale` re-check all actually read, per
+                // this round's own fix -- never heard about it at all.
+                // `cleanup_dead_peers` deliberately stopped re-deriving
+                // liveness from `gossip_state` directly (see `reap_
+                // reserved_candidates`'s own doc comment), so a delta
+                // arriving after this exact peer was already selected as a
+                // dead-peer candidate could leave the owner's fence stale
+                // and let the sweep destroy and irreversibly tombstone
+                // this peer's actors moments after it proved itself alive.
+                //
+                // Fixed by recording this SAME evidence at the owner too,
+                // exactly like `mark_response_received` already does for
+                // an inbound gossip RESPONSE -- direct evidence the peer
+                // occupying `sender_socket_addr` is still there, on a
+                // connection that may have been claimed long ago and will
+                // not claim again just for continuing to answer. Recorded
+                // AFTER releasing `gossip_state`'s lock (the block just
+                // above), not before or while holding it: the owner's own
+                // command channel is an independent synchronization
+                // domain entirely, so there is nothing to protect by
+                // holding this widely shared, frequently contended lock
+                // across it.
+                registry
+                    .registry_owner
+                    .note_liveness_evidence(sender_socket_addr, std::time::Instant::now())
+                    .await;
+
                 // Apply the delta using the canonical registry logic (vector clocks +
                 // deterministic tiebreakers). The previous "inline apply" fast-path had
                 // multiple conflict-resolution implementations depending on lock contention,

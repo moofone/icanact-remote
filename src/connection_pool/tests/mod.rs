@@ -7295,6 +7295,63 @@ async fn delta_gossip_updates_last_response_received_ms() {
     );
 }
 
+#[tokio::test]
+async fn delta_gossip_records_owner_side_liveness_evidence() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_owner_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_owner_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.66:9302".parse().unwrap();
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    assert!(!registry
+        .registry_owner
+        .has_newer_liveness_evidence(peer_addr, evidence_before)
+        .await);
+
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
+
+    super::handle_incoming_message(
+        registry.clone(),
+        peer_addr,
+        peer_addr,
+        Some(peer_id),
+        msg,
+    )
+    .await
+    .expect("handle_incoming_message should succeed");
+
+    assert!(registry
+        .registry_owner
+        .has_newer_liveness_evidence(peer_addr, evidence_before)
+        .await);
+}
+
 /// The `DeltaGossip` arm never
 /// verified `delta.sender_peer_id` -- a SELF-REPORTED wire field, not an
 /// authority for identity -- against the connection's actual authenticated

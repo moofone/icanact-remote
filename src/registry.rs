@@ -9591,6 +9591,15 @@ impl<T: 'static> GossipRegistry<T> {
                 reservation.release().await;
                 continue;
             }
+
+            // Capture the operator-configuration baseline before consuming
+            // the reservation. A configure_peer command that lands after
+            // this read must invalidate the destructive authorization even
+            // when it does not evict this exact address.
+            let baseline_configure_peer_generation = self
+                .registry_owner
+                .configure_peer_generation_of(peer_id.clone())
+                .await;
             if !reservation.try_consume().await {
                 debug!(
                     peer = %peer_addr,
@@ -9618,7 +9627,12 @@ impl<T: 'static> GossipRegistry<T> {
                 // peer's actors and publish an irreversible tombstone.
                 if self
                     .registry_owner
-                    .has_newer_liveness_evidence_since(peer_addr, evidence_before)
+                    .reap_authorization_is_stale(
+                        peer_addr,
+                        peer_id.clone(),
+                        evidence_before,
+                        baseline_configure_peer_generation,
+                    )
                     .await
                 {
                     warn!(
