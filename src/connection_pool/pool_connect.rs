@@ -31,6 +31,7 @@ impl<T> ConnectionPool<T> {
             udp_socket: ArcSwapOption::empty(),
             connection_counter: AtomicUsize::new(0),
             routing_revision: AtomicU64::new(0),
+            routing_change_notify: Arc::new(Notify::new()),
             _marker: PhantomData,
         };
 
@@ -48,8 +49,14 @@ impl<T> ConnectionPool<T> {
     }
 
     #[inline]
+    pub(crate) fn routing_change_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.routing_change_notify)
+    }
+
+    #[inline]
     fn mark_routing_changed(&self) {
         self.routing_revision.fetch_add(1, Ordering::AcqRel);
+        self.routing_change_notify.notify_one();
     }
 
     /// Set the registry reference for handling incoming messages

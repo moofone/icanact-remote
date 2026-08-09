@@ -28,6 +28,7 @@ pub struct ConnectionPool<T = ()> {
     /// Connection counter for load balancing
     connection_counter: AtomicUsize,
     routing_revision: AtomicU64,
+    routing_change_notify: Arc<Notify>,
     _marker: PhantomData<fn() -> T>,
 }
 

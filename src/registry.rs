@@ -15,7 +15,7 @@ use scc::HashMap as SccHashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use rand::seq::SliceRandom;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -1363,6 +1363,7 @@ pub struct ActorState {
     pub known_actors: SccHashMap<String, RemoteActorLocation>,
     pub removed_actors: SccHashMap<String, RemovedActorTombstone>,
     routing_revision: AtomicU64,
+    routing_change_notify: Arc<Notify>,
 }
 
 impl ActorState {
@@ -1372,8 +1373,14 @@ impl ActorState {
     }
 
     #[inline]
+    pub(crate) fn routing_change_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.routing_change_notify)
+    }
+
+    #[inline]
     fn mark_routing_changed(&self) {
         self.routing_revision.fetch_add(1, Ordering::AcqRel);
+        self.routing_change_notify.notify_one();
     }
 }
 
