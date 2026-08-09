@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
@@ -118,6 +120,66 @@ pub fn clear_pubsub_interest_dispatch_hook() {
     PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
 }
 
+/// Process-wide lock serializing every use of the global
+/// [`PUBSUB_INTEREST_DISPATCH_HOOK`]. Mirrors
+/// `lifecycle::RECORDER_INSTALL_LOCK`: the hook is shared, mutable, global
+/// state fired from every `RoutedPubSub` interest-dispatch loop in the
+/// process, and the default parallel test harness runs many
+/// `#[tokio::test]` functions concurrently in that one process. Without a
+/// single shared lock, one test's own interest-dispatch calls can be routed
+/// through a *different*, concurrently running test's hook closure and pause
+/// on a `Notify` that only the other test ever signals — the closure fires
+/// for `(topic_key, present)` regardless of which test's topic it was meant
+/// for, since the hook has no notion of test identity.
+#[cfg(any(test, feature = "test-helpers"))]
+static PUBSUB_INTEREST_DISPATCH_HOOK_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard serializing access to the process-wide pubsub
+/// interest-dispatch hook. Acquires
+/// `PUBSUB_INTEREST_DISPATCH_HOOK_INSTALL_LOCK` for its entire lifetime and
+/// clears the hook on drop, so a test that installs a hook and a test that
+/// merely requires no hook be active can never run concurrently and observe
+/// or interfere with each other's dispatches.
+///
+/// This is the only sanctioned way to touch the hook from a test: acquire
+/// this guard first (via [`Self::install`] or [`Self::exclusive`]), then —
+/// while still holding it — call [`install_pubsub_interest_dispatch_hook`]
+/// directly if the hook itself needs to change partway through the test.
+#[cfg(any(test, feature = "test-helpers"))]
+#[must_use = "the hook is cleared when this guard is dropped"]
+pub struct PubsubInterestDispatchHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl PubsubInterestDispatchHookGuard {
+    /// Acquires exclusive access and installs `hook`.
+    pub fn install(hook: InterestDispatchHook) -> Self {
+        let guard = Self::exclusive();
+        install_pubsub_interest_dispatch_hook(hook);
+        guard
+    }
+
+    /// Acquires exclusive access without installing a hook, clearing any
+    /// leftover one — for a test that requires the hook be absent for its
+    /// own duration (mutual exclusion against a concurrently running
+    /// [`Self::install`]).
+    pub fn exclusive() -> Self {
+        let lock = PUBSUB_INTEREST_DISPATCH_HOOK_INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_pubsub_interest_dispatch_hook();
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PubsubInterestDispatchHookGuard {
+    fn drop(&mut self) {
+        clear_pubsub_interest_dispatch_hook();
+    }
+}
+
 /// Fires the installed interest-dispatch hook, if any, awaiting the future
 /// it returns. Called by `RoutedPubSub`'s interest-dispatch loop
 /// immediately before issuing the register/unregister registry call.
@@ -134,6 +196,53 @@ pub async fn fire_pubsub_interest_dispatch_hook(topic_key: u64, present: bool) {
     if let Some(hook) = hook {
         hook(topic_key, present).await;
     }
+}
+
+/// Test-only seam letting a test atomically overwrite a peer's
+/// `last_response_received_ms` inside `apply_gossip_results`'s own
+/// per-result `gossip_state` lock acquisition, immediately before its
+/// response-asymmetry check reads that field. Exists because backdating the
+/// timestamp from outside that lock — drop the lock, then call
+/// `apply_gossip_results`, which re-acquires it — leaves a window in which a
+/// peer's still-live connection can independently refresh the field before
+/// the call re-acquires the lock. Repeating that outside write immediately
+/// before every round only narrows the window; it can never close it, since
+/// the write and the read it races are still two separate critical sections.
+/// Setting the override here instead, consumed inside the same lock
+/// acquisition `apply_gossip_results` already uses for the read, makes the
+/// two atomic with respect to each other: no concurrent writer holding the
+/// same `gossip_state` mutex can land between them.
+///
+/// One-shot per peer: consumed (removed) the first time it is read, so a
+/// test that wants to backdate multiple rounds must set it again before each
+/// `apply_gossip_results` call.
+#[cfg(any(test, feature = "test-helpers"))]
+static RESPONSE_ASYMMETRY_BACKDATE: OnceLock<Mutex<HashMap<SocketAddr, u64>>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn response_asymmetry_backdate_slot() -> &'static Mutex<HashMap<SocketAddr, u64>> {
+    RESPONSE_ASYMMETRY_BACKDATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Sets the one-shot `last_response_received_ms` override `apply_gossip_
+/// results` applies for `peer_addr` the next time it processes a result for
+/// that peer, atomically with its own response-asymmetry read.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_response_asymmetry_backdate(peer_addr: SocketAddr, last_response_received_ms: u64) {
+    response_asymmetry_backdate_slot()
+        .lock()
+        .expect("response-asymmetry backdate mutex poisoned")
+        .insert(peer_addr, last_response_received_ms);
+}
+
+/// Consumes (removes) the pending backdate override for `peer_addr`, if any.
+/// Called only from `apply_gossip_results`, never from test code directly.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn take_response_asymmetry_backdate(peer_addr: SocketAddr) -> Option<u64> {
+    response_asymmetry_backdate_slot()
+        .lock()
+        .expect("response-asymmetry backdate mutex poisoned")
+        .remove(&peer_addr)
 }
 
 pub async fn wait_for_raw_payload(timeout: Duration) -> Option<Bytes> {

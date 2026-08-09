@@ -1041,26 +1041,48 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 .entry(sub_addr)
                 .or_default()
                 .insert(DEAD_ACTOR_NAME.to_string());
-            // Make the last response older than the normalized liveness window
-            // so the no-response rounds below trip the response-asymmetry
-            // detector even though regular gossip is deliberately quiesced.
-            if let Some(peer) = state.peers.get_mut(&sub_addr) {
-                let silence_ms = u64::try_from(
-                    config
-                        .peer_liveness_window
-                        .saturating_add(Duration::from_millis(1))
-                        .as_millis(),
-                )
-                .unwrap_or(u64::MAX);
-                peer.last_response_received_ms =
-                    icanact_remote::current_timestamp_millis().saturating_sub(silence_ms);
-            }
         }
+
+        // How far in the past to backdate `last_response_received_ms` so the
+        // no-response rounds below trip the response-asymmetry detector.
+        // Older than the normalized liveness window is enough in principle,
+        // but `connect_to_peer`'s own success path (called above, in a loop,
+        // to establish `connected_before`) unconditionally resets this same
+        // field to "now" on every `Ok` — and it is not the only writer: any
+        // inbound payload processed on this real, still-alive TLS connection
+        // (e.g. a one-time handshake-adjacent exchange with the subscriber,
+        // not gated by any of the quiesced background intervals above) can
+        // independently reset it too.
+        //
+        // Backdating from outside `apply_gossip_results`'s own lock
+        // acquisition — drop the lock, then call `apply_gossip_results`,
+        // which re-acquires it — leaves a window between the write and the
+        // response-asymmetry read that any of those writers can land in.
+        // Repeating the write immediately before every round only narrows
+        // that window; it cannot close it, since the write and the read it
+        // races remain two separate critical sections no matter how close
+        // together they run. `set_response_asymmetry_backdate` instead arms
+        // a one-shot override that `apply_gossip_results` itself applies
+        // inside the SAME lock acquisition its response-asymmetry check
+        // reads from, making the two atomic with respect to each other: no
+        // concurrent writer holding that same `gossip_state` mutex can ever
+        // land between them.
+        let silence_ms = u64::try_from(
+            config
+                .peer_liveness_window
+                .saturating_add(Duration::from_millis(1))
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         // Drive the verdict deterministically: the subscriber is alive at the
         // socket level (connection stays "usable") but is treated as having
         // stopped answering at the app level — the UDP black-hole shape.
         for sequence in 0..config.max_peer_failures {
+            icanact_remote::test_helpers::set_response_asymmetry_backdate(
+                sub_addr,
+                icanact_remote::current_timestamp_millis().saturating_sub(silence_ms),
+            );
             publisher
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {

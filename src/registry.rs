@@ -7838,6 +7838,26 @@ impl<T: 'static> GossipRegistry<T> {
                             peer_info.last_attempt = current_time;
                             peer_info.last_sent_sequence = result.sent_sequence;
 
+                            // Test-only: apply a pending response-asymmetry
+                            // backdate override, if a test has armed one for
+                            // this peer, in this same critical section as
+                            // the read a few lines below -- see
+                            // `test_helpers::take_response_asymmetry_
+                            // backdate`'s doc comment for why applying it
+                            // here (rather than in a caller's own separate
+                            // lock acquisition before calling this function)
+                            // is what actually closes that race instead of
+                            // merely narrowing it. No-op unless a test has
+                            // explicitly armed it for this peer.
+                            #[cfg(any(test, feature = "test-helpers"))]
+                            if let Some(backdated) =
+                                crate::test_helpers::take_response_asymmetry_backdate(
+                                    result.peer_addr,
+                                )
+                            {
+                                peer_info.last_response_received_ms = backdated;
+                            }
+
                             // Only update last_success if we're not in a failed state.
                             // Note: with persistent connections, `Ok(_)` doesn't prove
                             // the peer is alive — only that our kernel buffer accepted

@@ -2,14 +2,16 @@ mod common;
 
 use bytes::Bytes;
 use common::{DynError, TlsHandle, connect_bidirectional, create_tls_node, wait_for_condition};
+use icanact_remote::lifecycle::{TransportLifecycleEvent, TransportLifecycleRecorderGuard};
 use icanact_remote::registry::{ActorMessageHandlerSync, ActorResponse, RegistryChange};
 use icanact_remote::{
     AlignedBytes, BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PeerId,
     RegistrationPriority,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
-    Arc, Once,
+    Arc, Mutex, Once, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -91,11 +93,355 @@ async fn wait_connected(from: &TlsHandle, to: &PeerId, timeout: Duration) -> boo
     .await
 }
 
+/// Bounds how many of this file's `node`/`node_at` calls (standing up a real
+/// TLS listener) and `connect_bidirectional_bounded` calls (dialing a real
+/// two-node connection, including whichever direction
+/// `icanact_remote`'s duplicate-connection tie-break drops) may run at once.
+/// This file's 6 tests carry no cross-test lock (unlike e.g.
+/// `scripted_network_e2e.rs`'s `TEST_LOCK`), so the default parallel test
+/// harness runs them fully concurrently, and enough concurrent real-TLS
+/// setups collide on the tie-break's fallback wait
+/// (`DEFAULT_PREFERRED_INBOUND_WAIT_MS`, 500ms default) at once to
+/// occasionally leave a connection that completed setup unusable shortly
+/// after — the same mechanism `icanact-core`'s `remote::network::tests`
+/// module root-caused and mitigated with an identical bound=2 admission
+/// semaphore (`CONNECT_NODES_ADMISSION`; see that constant's doc comment for
+/// the full non-monotonic bound-tuning table — 1 and 8 were both worse than
+/// 2, because a tighter bound trades self-inflicted concurrency for a
+/// longer wall-clock exposure window to ambient host contention). Only the
+/// setup helpers are bounded here, never a test's own post-setup traffic.
+static NODE_SETUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Per-peer count of transport lifecycle events observed by
+/// [`ensure_lifecycle_quiescence_recorder_installed`], since process start.
+/// Keyed by `PeerId` (not globally) so that one pair's settlement wait never
+/// has to wait out unrelated, concurrently-running tests' own ongoing
+/// gossip/reconnect churn (several of this file's configs run peer
+/// supervision on short cadences) — only further lifecycle activity that
+/// actually mentions one of *this* pair's two identities counts as
+/// instability for that pair's own wait.
+static PEER_LIFECYCLE_EVENT_COUNTS: OnceLock<Mutex<HashMap<PeerId, u64>>> = OnceLock::new();
+
+fn peer_lifecycle_event_counts() -> &'static Mutex<HashMap<PeerId, u64>> {
+    PEER_LIFECYCLE_EVENT_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extracts the peer identity a transport lifecycle event is about, if any.
+/// `ConnectionCountMarkerAttempt`/`ConnectionCountIncrementAttempt` are
+/// per-connection-instance instrumentation with no peer identity to key on
+/// and are not relevant to connection tie-break settlement, so they are
+/// intentionally excluded from quiescence tracking.
+fn lifecycle_event_peer(event: &TransportLifecycleEvent) -> Option<&PeerId> {
+    match event {
+        TransportLifecycleEvent::OutboundStart { peer, .. } => peer.as_ref(),
+        TransportLifecycleEvent::ConnectionCountMarkerAttempt { .. }
+        | TransportLifecycleEvent::ConnectionCountIncrementAttempt { .. } => None,
+        TransportLifecycleEvent::OutboundSuppressedWaitInbound { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundReady { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundTimeout { peer, .. }
+        | TransportLifecycleEvent::WrongDirectionEvicted { peer, .. }
+        | TransportLifecycleEvent::InboundReady { peer, .. }
+        | TransportLifecycleEvent::SessionPublished { peer, .. }
+        | TransportLifecycleEvent::DuplicateIdentityRejected { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizePublishAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeClearRaceRetry { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeReplaceExistingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken { peer, .. }
+        | TransportLifecycleEvent::SocketFailureMatchedInstanceTeardownAttempt { peer, .. }
+        | TransportLifecycleEvent::SessionRemoved { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptPublishAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptClearRaceRetry { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptAcceptIncomingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptReplaceExistingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptIndexAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptEphemeralAliasAttempt { peer, .. }
+        | TransportLifecycleEvent::GetConnectionSelfHealClearAttempt { peer, .. }
+        | TransportLifecycleEvent::FullSyncApplyPendingMutation { peer, .. }
+        | TransportLifecycleEvent::DeltaApplyPendingMutation { peer, .. } => Some(peer),
+    }
+}
+
+/// Per-peer count of OUTBOUND-finalize transport lifecycle events, tracked
+/// separately from [`PEER_LIFECYCLE_EVENT_COUNTS`] and keyed by the identity
+/// of the peer being *dialed*. `connect_bidirectional` issues two physically
+/// distinct dials (A to B, and B to A); an outbound-finalize event is
+/// produced only by the dialing side's own registry, keyed by the target's
+/// identity, so an entry here keyed by B's id can only have come from A's
+/// own dial to B, never from B's dial to A. That asymmetry is exactly what
+/// [`wait_for_dial_resolution_entered`] needs: an INBOUND-side event would
+/// not work for this, because A's dial to B produces an inbound-accept event
+/// on B's registry keyed by A's id — the same key B's own dial to A would
+/// also produce evidence under — so counting inbound events here would let
+/// one direction's success alone satisfy "evidence for both directions".
+static PEER_OUTBOUND_DIAL_RESOLUTION_COUNTS: OnceLock<Mutex<HashMap<PeerId, u64>>> =
+    OnceLock::new();
+
+fn peer_outbound_dial_resolution_counts() -> &'static Mutex<HashMap<PeerId, u64>> {
+    PEER_OUTBOUND_DIAL_RESOLUTION_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extracts the dialed peer's identity from an event that proves this
+/// registry's own outbound dial to that peer has entered conflict
+/// resolution, if `event` is such an event. `OutboundStart` fires merely on
+/// dial *attempt*, before any conflict evaluation, so it is excluded.
+/// `WrongDirectionEvicted` is excluded too: unlike the others here, its
+/// `peer`/`direction` fields don't identify which side (inbound-accept or
+/// outbound-finalize) triggered the eviction, so counting it here could
+/// attribute an inbound-side win to the outbound direction.
+/// `OutboundFinalizeExistingSnapshotTaken` alone is sufficient (it fires
+/// unconditionally for every outbound finalize attempt, before the tie-break
+/// decision is computed); the rest are included as belt-and-suspenders
+/// evidence of the same direction.
+fn lifecycle_outbound_dial_resolution_peer(event: &TransportLifecycleEvent) -> Option<&PeerId> {
+    match event {
+        TransportLifecycleEvent::OutboundSuppressedWaitInbound { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundReady { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundTimeout { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizePublishAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeClearRaceRetry { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeReplaceExistingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken { peer, .. } => Some(peer),
+        _ => None,
+    }
+}
+
+/// Installs the process-wide transport lifecycle recorder exactly once, for
+/// the remainder of this test binary's run, so [`wait_for_dial_resolution_
+/// entered`] and [`wait_for_peer_quiescence`] can observe real tie-break/
+/// finalization activity instead of guessing a fixed sleep covers it.
+///
+/// Deliberately never uninstalled: `TransportLifecycleRecorderGuard`'s
+/// uninstall-on-drop exists so concurrently running tests never clobber each
+/// other's recorder, but every test in this file wants the SAME recorder for
+/// its entire run, and each `tests/*.rs` file is its own separate test
+/// binary/process (`lifecycle`'s recorder statics are not shared with any
+/// other file), so there is no other installer here to protect against by
+/// ever uninstalling it.
+fn ensure_lifecycle_quiescence_recorder_installed() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        std::mem::forget(TransportLifecycleRecorderGuard::install(Arc::new(
+            |event: TransportLifecycleEvent| {
+                if let Some(peer) = lifecycle_outbound_dial_resolution_peer(&event) {
+                    let mut counts = peer_outbound_dial_resolution_counts()
+                        .lock()
+                        .expect("peer outbound dial resolution counts mutex poisoned");
+                    *counts.entry(peer.clone()).or_insert(0) += 1;
+                }
+                let Some(peer) = lifecycle_event_peer(&event) else {
+                    return;
+                };
+                let mut counts = peer_lifecycle_event_counts()
+                    .lock()
+                    .expect("peer lifecycle event counts mutex poisoned");
+                *counts.entry(peer.clone()).or_insert(0) += 1;
+            },
+        )));
+    });
+}
+
+/// Snapshots the current outbound-dial-resolution counts for `peer_ids`, to
+/// be passed to [`wait_for_dial_resolution_entered`] as `baseline`. Must be
+/// taken once per connection attempt, immediately before initiating it (see
+/// that function's own doc comment for why an absolute, un-baselined count
+/// is not sound here).
+fn snapshot_outbound_dial_resolution_counts(peer_ids: &[PeerId]) -> Vec<u64> {
+    let counts = peer_outbound_dial_resolution_counts()
+        .lock()
+        .expect("peer outbound dial resolution counts mutex poisoned");
+    peer_ids
+        .iter()
+        .map(|id| counts.get(id).copied().unwrap_or(0))
+        .collect()
+}
+
+/// Waits until the outbound-dial-resolution count (see
+/// [`lifecycle_outbound_dial_resolution_peer`]) for EACH of `peer_ids` has
+/// increased past its corresponding entry in `baseline`, bounded by
+/// `deadline`. Returns `true` once both have increased, `false` on timeout.
+///
+/// `baseline` MUST be captured by [`snapshot_outbound_dial_resolution_counts`]
+/// immediately before the connection attempt this call is guarding, never
+/// once per test or reused across attempts: the underlying counts are
+/// cumulative for the entire process, so an absolute `>= 1` threshold (what
+/// this used to check) is satisfied by ANY prior, already-completed dial
+/// that ever touched one of these identities — not necessarily the one just
+/// started. Concretely, in a test that connects A-B and then reuses B to
+/// connect B-C, B's count is already non-zero from the A-B connection by the
+/// time the B-C attempt begins; an absolute check would pass immediately on
+/// B's side even if B's own reciprocal dial to C has not entered resolution
+/// yet, exactly the "hasn't started" case this precondition exists to rule
+/// out. Requiring a strict increase over a freshly captured baseline ties
+/// the evidence to the specific attempt being waited on, not to ambient
+/// process state that would read the same whether or not that attempt ever
+/// ran.
+///
+/// This is the positive precondition [`wait_for_peer_quiescence`] needs
+/// before its "no new events for a window" check means anything: a
+/// zero-event window is indistinguishable between "already resolved" and
+/// "resolution hasn't started yet" for whichever direction is late under
+/// scheduling contention, so a quiet window can elapse and this helper would
+/// otherwise release the setup permit while a reciprocal dial's tie-break is
+/// still pending. Requiring evidence that *both* of `connect_bidirectional`'s
+/// two physically distinct dials (A to B, and B to A) have individually
+/// entered resolution converts "nothing happened" from being the entire
+/// proof into a secondary confirmation layered on top of an affirmative one.
+async fn wait_for_dial_resolution_entered(
+    peer_ids: &[PeerId],
+    baseline: &[u64],
+    deadline: Duration,
+) -> bool {
+    wait_for_condition(deadline, || async {
+        let counts = peer_outbound_dial_resolution_counts()
+            .lock()
+            .expect("peer outbound dial resolution counts mutex poisoned");
+        peer_ids
+            .iter()
+            .zip(baseline)
+            .all(|(id, &base)| counts.get(id).copied().unwrap_or(0) > base)
+    })
+    .await
+}
+
+/// Waits until no transport lifecycle event mentioning any of `peer_ids` has
+/// fired for a full `window`, proving any in-flight tie-break/finalization
+/// for a just-established connection between them has actually concluded —
+/// rather than sleeping a single fixed duration measured from an arbitrary
+/// point and hoping it covers whatever internal timer the library is
+/// running. Any qualifying event reset the wait to a fresh `window`, so if a
+/// pending resolution (eviction, re-publish, wait-timeout fallback) lands
+/// during the sleep, that activity itself extends the wait past it; only a
+/// window with no such activity at all counts as settled. Bounded by
+/// `deadline` so a genuinely stuck connection still fails the test loudly
+/// instead of hanging it.
+///
+/// Callers MUST establish (via [`wait_for_dial_resolution_entered`] or
+/// equivalent) that resolution has actually started before relying on this
+/// alone: a window with zero events proves settlement only once it is known
+/// that "zero events" isn't just "nothing has happened yet".
+///
+/// Callers MUST also pass a `window` strictly longer than any internal timer
+/// this connection's resolution can still be waiting on (see
+/// [`QUIESCENCE_SETTLE_MARGIN_MS`]'s doc comment) — a `window` merely equal
+/// to such a timer is a same-instant tie with no defined wake order between
+/// this function's own `sleep` and the timer's, so the `after` snapshot can
+/// land before the timer's own callback has run.
+async fn wait_for_peer_quiescence(peer_ids: &[PeerId], window: Duration, deadline: Duration) {
+    let snapshot = |ids: &[PeerId]| -> Vec<u64> {
+        let counts = peer_lifecycle_event_counts()
+            .lock()
+            .expect("peer lifecycle event counts mutex poisoned");
+        ids.iter()
+            .map(|id| counts.get(id).copied().unwrap_or(0))
+            .collect()
+    };
+    let start = Instant::now();
+    loop {
+        let before = snapshot(peer_ids);
+        sleep(window).await;
+        let after = snapshot(peer_ids);
+        if before == after {
+            return;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "transport lifecycle events for {peer_ids:?} never went quiet for a \
+             full {window:?} window"
+        );
+    }
+}
+
+/// How far [`wait_for_peer_quiescence`]'s settle window must exceed
+/// `DEFAULT_PREFERRED_INBOUND_WAIT_MS`, the library's own preferred-inbound
+/// fallback timer.
+///
+/// A window exactly equal to that timer is a same-instant tie: if the
+/// fallback timer becomes due at the same wall-clock point the quiescence
+/// window's own `sleep` does, Tokio has no defined wake order between the
+/// two, so the `after` snapshot can be taken before the fallback-triggered
+/// tie-break task has actually run and recorded its own lifecycle event —
+/// the counts then compare equal while resolution is still in flight. The
+/// margin only needs to cover the wall-clock gap between the fallback
+/// timer's own wake and that task's callback completing (lock acquisition,
+/// scheduling), not another full fallback interval; half of the fallback
+/// timer's own duration is generous slack for that on local loopback, even
+/// under the concurrent-test-binary load this file is designed to run
+/// under.
+const QUIESCENCE_SETTLE_MARGIN_MS: u64 =
+    icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS / 2;
+
+/// `connect_bidirectional` (from `common`) under `NODE_SETUP_ADMISSION` —
+/// see that constant's doc comment.
+///
+/// `connect_bidirectional` returning only proves `active_peers >= 1` on both
+/// sides — evidence a connection exists, not that it has survived whichever
+/// direction `icanact_remote`'s duplicate-connection tie-break drops (the
+/// same distinction documented at the `ask_peer_until_success` call sites
+/// below). Releasing the permit right there, as this function originally
+/// did, stops bounding concurrency for exactly the window the semaphore
+/// exists to bound: up to two *more* setups could start while this one's
+/// tie-break/finalization is still in flight, letting three or more overlap
+/// the same `DEFAULT_PREFERRED_INBOUND_WAIT_MS` fallback window at once.
+///
+/// A fixed sleep after `connect_bidirectional` returns does not actually fix
+/// this, and neither does a bare quiet-window check: `active_peers >= 1` can
+/// become true as soon as this call's OWN outbound dial succeeds, which may
+/// be before the reciprocal direction's connection — and the collision/
+/// tie-break it can trigger — has even arrived, so a quiet window sampled
+/// right away can elapse with zero events simply because that reciprocal
+/// dial's own resolution hasn't started yet, not because it already
+/// finished. [`wait_for_dial_resolution_entered`] closes that gap first,
+/// with a positive precondition proving both of the two dials
+/// `connect_bidirectional` issues have individually entered resolution —
+/// baselined against a snapshot taken here, before either dial starts, so a
+/// peer identity this function has already connected once before in the
+/// same test (several tests below reuse a middle node across two calls)
+/// cannot satisfy that precondition on leftover state from the earlier,
+/// unrelated connection. Only once that holds does [`wait_for_peer_
+/// quiescence`]'s "no further activity" check mean anything, since by
+/// construction it cannot end early relative to whatever internal timer is
+/// still running — any activity from that timer resolving resets the wait,
+/// and the window itself is now strictly longer than that timer (see
+/// [`QUIESCENCE_SETTLE_MARGIN_MS`]) so a same-instant tie between the two
+/// can no longer end the wait early either.
+async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
+    ensure_lifecycle_quiescence_recorder_installed();
+    let _permit = NODE_SETUP_ADMISSION
+        .acquire()
+        .await
+        .expect("NODE_SETUP_ADMISSION is never closed");
+    let peer_ids = [a.registry.peer_id.clone(), b.registry.peer_id.clone()];
+    let outbound_baseline = snapshot_outbound_dial_resolution_counts(&peer_ids);
+    let result = connect_bidirectional(a, b).await;
+    let resolution_entered =
+        wait_for_dial_resolution_entered(&peer_ids, &outbound_baseline, Duration::from_secs(3))
+            .await;
+    assert!(
+        resolution_entered,
+        "outbound dial resolution for {peer_ids:?} never started in at least one direction"
+    );
+    wait_for_peer_quiescence(
+        &peer_ids,
+        Duration::from_millis(
+            icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS + QUIESCENCE_SETTLE_MARGIN_MS,
+        ),
+        Duration::from_secs(5),
+    )
+    .await;
+    result
+}
+
 async fn node(
     config: GossipConfig,
     label: &'static str,
     asks: Arc<AtomicU64>,
 ) -> Result<TlsHandle, DynError> {
+    let _permit = NODE_SETUP_ADMISSION
+        .acquire()
+        .await
+        .expect("NODE_SETUP_ADMISSION is never closed");
     let handle = create_tls_node(config).await?;
     handle
         .registry
@@ -111,6 +457,10 @@ async fn node_at(
     label: &'static str,
     asks: Arc<AtomicU64>,
 ) -> icanact_remote::Result<TlsHandle> {
+    let _permit = NODE_SETUP_ADMISSION
+        .acquire()
+        .await
+        .expect("NODE_SETUP_ADMISSION is never closed");
     CRYPTO_INIT.call_once(icanact_remote::tls::ensure_crypto_provider);
     let handle = GossipRegistryHandle::new_with_transport_stack(
         addr,
@@ -240,7 +590,7 @@ async fn required_peer_actor_route_and_ask_survive_cadence_gap_silence() -> Resu
     let asks_b = Arc::new(AtomicU64::new(0));
     let node_a = node(config.clone(), "a", asks_a).await?;
     let node_b = node(config.clone(), "b", Arc::clone(&asks_b)).await?;
-    connect_bidirectional(&node_a, &node_b).await?;
+    connect_bidirectional_bounded(&node_a, &node_b).await?;
 
     let actor_name = "actor.required.cadence-gap";
     node_b
@@ -302,8 +652,8 @@ async fn required_peer_mesh_does_not_cascade_false_failures_under_jitter() -> Re
     let node_a = node(config.clone(), "a", asks_a).await?;
     let node_b = node(config.clone(), "b", Arc::clone(&asks_b)).await?;
     let node_c = node(config.clone(), "c", asks_c).await?;
-    connect_bidirectional(&node_a, &node_b).await?;
-    connect_bidirectional(&node_b, &node_c).await?;
+    connect_bidirectional_bounded(&node_a, &node_b).await?;
+    connect_bidirectional_bounded(&node_b, &node_c).await?;
 
     let actor_name = "actor.required.mesh-owner-b";
     node_b
@@ -422,14 +772,26 @@ async fn configured_peers_retry_until_late_peer_comes_online() -> Result<(), Dyn
         started.elapsed() <= Duration::from_secs(1),
         "late peer convergence exceeded the 1s required-peer SLA"
     );
+    // `lookup_peer` succeeding above proves both sides observe a connection,
+    // not that it has survived tie-break resolution: both sides configured
+    // each other as peers, so B coming online races A's own retry against
+    // B's own outbound dial, and the loser's session can still be settling
+    // (or a fresh preferred-inbound landing can still be replacing the
+    // other direction) at the exact moment this asks. `ask_peer` (single
+    // attempt) flaked here for that reason; `ask_peer_until_success` is the
+    // established fix for exactly this class of race elsewhere in this file
+    // (see `indirect_peer_is_rediscovered_immediately_when_seen_by_direct_
+    // neighbor`'s doc comment) — it retries at the RPC layer, so a retried
+    // attempt can legitimately deliver even though a prior attempt raced
+    // the connection settling, making this an at-least-once, not
+    // exactly-once, assertion.
     assert_eq!(
-        ask_peer(&node_a, &peer_b_id, b"late-online").await?,
+        ask_peer_until_success(&node_a, &peer_b_id, b"late-online", Duration::from_secs(1)).await?,
         b"b:late-online"
     );
-    assert_eq!(
-        asks_b.load(Ordering::Acquire),
-        1,
-        "late peer actor should receive exactly one post-convergence ask"
+    assert!(
+        asks_b.load(Ordering::Acquire) >= 1,
+        "late peer actor should receive at least one post-convergence ask"
     );
 
     node_a.shutdown().await;
@@ -456,9 +818,19 @@ async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconne
     let asks_b = Arc::new(AtomicU64::new(0));
     let node_a = node(config.clone(), "a", asks_a).await?;
     let node_b = node(config.clone(), "b", Arc::clone(&asks_b)).await?;
-    connect_bidirectional(&node_a, &node_b).await?;
+    connect_bidirectional_bounded(&node_a, &node_b).await?;
+    // `connect_bidirectional` only waits for `active_peers >= 1` on both
+    // sides, which — like `lookup_peer` elsewhere in this file — is
+    // evidence a connection exists, not that it has survived whichever
+    // direction the tie-break dropped. Same fix as the reconnect ask below.
     assert_eq!(
-        ask_peer(&node_a, &node_b.registry.peer_id, b"before-drop").await?,
+        ask_peer_until_success(
+            &node_a,
+            &node_b.registry.peer_id,
+            b"before-drop",
+            Duration::from_secs(1),
+        )
+        .await?,
         b"b:before-drop"
     );
 
@@ -512,13 +884,28 @@ async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconne
         2,
         "successful reconnect must not clear stale same-node-id aliases"
     );
+    // Same class of race as `configured_peers_retry_until_late_peer_comes_
+    // online`: `connect_to_peer` returning above proves the reconnect
+    // attempt succeeded, not that the resulting session has settled past
+    // whatever tie-break/finalization the fresh connection is still
+    // completing. A single `ask_peer` here flaked for exactly that reason;
+    // `ask_peer_until_success` is this file's established fix for asking
+    // through a freshly (re)established connection (see
+    // `indirect_peer_is_rediscovered_immediately_when_seen_by_direct_
+    // neighbor`'s doc comment) — at-least-once, so the ask count below
+    // allows for a legitimate extra retry rather than asserting exactly 2.
     assert_eq!(
-        ask_peer(&node_a, &node_b.registry.peer_id, b"after-reconnect").await?,
+        ask_peer_until_success(
+            &node_a,
+            &node_b.registry.peer_id,
+            b"after-reconnect",
+            Duration::from_secs(1),
+        )
+        .await?,
         b"b:after-reconnect"
     );
-    assert_eq!(
-        asks_b.load(Ordering::Acquire),
-        2,
+    assert!(
+        asks_b.load(Ordering::Acquire) >= 2,
         "actor should receive asks before failure and after reconnect"
     );
 
@@ -647,14 +1034,14 @@ async fn indirect_peer_is_rediscovered_immediately_when_seen_by_direct_neighbor(
     let asks_c = Arc::new(AtomicU64::new(0));
     let node_a = node(config.clone(), "a", asks_a).await?;
     let node_b = node(config.clone(), "b", asks_b).await?;
-    connect_bidirectional(&node_a, &node_b).await?;
+    connect_bidirectional_bounded(&node_a, &node_b).await?;
     assert!(
         wait_connected(&node_a, &node_b.registry.peer_id, Duration::from_secs(1)).await,
         "A and B should be directly connected before C appears"
     );
 
     let node_c = node(config.clone(), "c", Arc::clone(&asks_c)).await?;
-    connect_bidirectional(&node_b, &node_c).await?;
+    connect_bidirectional_bounded(&node_b, &node_c).await?;
     assert!(
         wait_connected(&node_b, &node_c.registry.peer_id, Duration::from_secs(1)).await,
         "B should see C directly before A learns it indirectly"
