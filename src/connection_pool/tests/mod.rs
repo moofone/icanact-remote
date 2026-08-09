@@ -7451,6 +7451,127 @@ async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
     );
 }
 
+/// P1 finding (review round against `7739717`,
+/// `connection_pool/pool_connect.rs:4580`): the `DeltaGossip` arm never
+/// verified `delta.sender_peer_id` -- a SELF-REPORTED wire field, not an
+/// authority for identity -- against the connection's actual authenticated
+/// identity, unlike the `FullSync` arm right below it. An authenticated
+/// peer (the "attacker" here) could send a delta CLAIMING to be a
+/// different peer (the "victim") and, since the previous round's own fix
+/// routes current-session deltas to `registry_owner::note_liveness_
+/// evidence`, indefinitely refresh the OWNER's liveness fence for the
+/// impersonated victim's address -- permanently preventing a genuinely
+/// dead victim from ever being reaped, using nothing but a forged
+/// `sender_peer_id`.
+///
+/// Proves the fix: an authenticated connection for `attacker_id` sends a
+/// `DeltaGossip` claiming `sender_peer_id: victim_id`. Asserts the call
+/// still succeeds (the forged delta is silently ignored, not an error)
+/// but records NEITHER owner-side liveness for the victim's address NOR
+/// clears the victim's `gossip_state` failure bookkeeping -- proving the
+/// whole delta is rejected before ANY of its claimed identity is trusted
+/// for anything, not merely that the one new liveness call is skipped.
+#[tokio::test]
+async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_impersonation_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let attacker_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_attacker");
+    let attacker_id = attacker_keypair.peer_id();
+    let attacker_addr: SocketAddr = "10.77.0.67:9303".parse().unwrap();
+
+    let victim_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_victim");
+    let victim_id = victim_keypair.peer_id();
+    let victim_addr: SocketAddr = "10.77.0.68:9304".parse().unwrap();
+
+    // The registry already knows the victim's real, legitimate address --
+    // exactly what would exist for a genuine peer this node has
+    // previously connected to or verified through other means. Without
+    // this, `resolve_peer_state_addr` cannot resolve the claimed
+    // `sender_peer_id` to any address at all and falls back to the raw
+    // TCP source (the attacker's own address), which would make this
+    // test pass regardless of whether the identity check exists --
+    // proving nothing about the actual finding.
+    let _ = registry
+        .connection_pool
+        .peer_id_to_addr
+        .upsert_sync(victim_id.clone(), victim_addr);
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        // The attacker's own connection, entirely legitimate on its own.
+        state
+            .peers
+            .insert(attacker_addr, stale_peer_info(attacker_addr, stale_time));
+        // The victim: a separate, genuinely dead-looking peer this delta
+        // will try to impersonate liveness evidence for.
+        state
+            .peers
+            .insert(victim_addr, stale_peer_info(victim_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(victim_addr, evidence_before)
+            .await,
+        "sanity: no evidence recorded for the victim's address yet"
+    );
+
+    // The delta arrives on the ATTACKER's authenticated connection but
+    // CLAIMS to be from the victim.
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: victim_id.clone(),
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
+
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_addr,
+        attacker_addr,
+        Some(attacker_id.clone()),
+        msg,
+    )
+    .await
+    .expect("a forged DeltaGossip must be silently ignored, not an error");
+
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(victim_addr, evidence_before)
+            .await,
+        "the victim's address must NOT gain owner-side liveness evidence from a delta the \
+         attacker merely CLAIMED was from the victim -- this would let an authenticated peer \
+         grant an arbitrary other identity permanent reap-immunity"
+    );
+    let state = registry.gossip_state.lock().await;
+    let victim_info = state
+        .peers
+        .get(&victim_addr)
+        .expect("victim's gossip_state entry must survive untouched");
+    assert_eq!(
+        victim_info.failures, 1,
+        "the victim's gossip_state failure bookkeeping must be untouched too -- the whole \
+         forged delta must be rejected, not merely the new liveness call skipped"
+    );
+}
+
 /// DRY consolidation: the per-peer consecutive-timeout streak eviction
 /// mechanism now lives in icanact-remote (the caller supplies only the
 /// classification). Evict only once the streak threshold is reached; a success
