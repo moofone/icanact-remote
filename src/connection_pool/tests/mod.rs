@@ -2,7 +2,7 @@ use super::*;
 use futures::StreamExt;
 use std::io::{Error, ErrorKind};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll};
 use tokio::runtime::Builder;
 use tokio::time::sleep;
@@ -2090,7 +2090,9 @@ fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out(
             response_writer: Some(response_writer.clone()),
             tell_handler_sync: server_registry.actor_tell_handler_sync.load_full(),
             tell_handler_sync_context: server_registry.actor_tell_handler_sync_context.load_full(),
-            ask_immediate_handler_sync: server_registry.actor_ask_immediate_handler_sync.load_full(),
+            ask_immediate_handler_sync: server_registry
+                .actor_ask_immediate_handler_sync
+                .load_full(),
             ask_handler_sync: None,
             sync_actor_handler: None,
         };
@@ -3844,8 +3846,13 @@ async fn bytes_streaming_response_writes_frame_order() {
     while offset < payload_len {
         let end = (offset + chunk_size).min(payload_len);
         expected.extend_from_slice(
-            &crate::framing::try_write_stream_data_header(true, stream_id, chunk_index, end - offset)
-                .unwrap(),
+            &crate::framing::try_write_stream_data_header(
+                true,
+                stream_id,
+                chunk_index,
+                end - offset,
+            )
+            .unwrap(),
         );
         expected.extend_from_slice(&payload_bytes[offset..end]);
         offset = end;
@@ -4196,22 +4203,84 @@ async fn test_outbound_dial_gate_is_released_when_leader_is_cancelled() {
 async fn outbound_retry_allows_one_immediate_retry_then_reopens_after_floor() {
     let retry = OutboundDialRetry::with_retry_floor(Duration::from_millis(10));
 
-    assert!(retry.may_attempt(), "an untouched peer may dial immediately");
+    assert!(
+        retry.try_claim_attempt(),
+        "an untouched peer may dial immediately"
+    );
     retry.record_failure();
-    assert!(retry.may_attempt(), "first retry must be immediate");
+    assert!(retry.try_claim_attempt(), "first retry must be immediate");
     retry.record_failure();
     assert!(
-        !retry.may_attempt(),
+        !retry.try_claim_attempt(),
         "second consecutive failure must arm the retry floor"
+    );
+
+    retry.record_success();
+    assert!(
+        retry.try_claim_attempt(),
+        "success must clear an active retry floor"
+    );
+    retry.record_failure();
+    assert!(
+        retry.try_claim_attempt(),
+        "the first failure after success must regain the immediate retry"
+    );
+    retry.record_failure();
+    assert!(
+        !retry.try_claim_attempt(),
+        "the reset streak's second failure must re-arm the floor"
     );
 
     tokio::time::sleep(Duration::from_millis(15)).await;
     assert!(
-        retry.may_attempt(),
+        retry.try_claim_attempt(),
         "a caller must be able to claim the dial after the floor expires"
     );
-    retry.record_success();
-    assert!(retry.may_attempt(), "success must reset the failure cadence");
+}
+
+#[test]
+fn outbound_retry_claim_is_atomic_per_peer() {
+    const CALLERS: usize = 8;
+    let retry = Arc::new(OutboundDialRetry::with_retry_floor(Duration::from_secs(1)));
+    let checked = Arc::new(Barrier::new(CALLERS));
+    let mut callers = Vec::with_capacity(CALLERS);
+
+    for _ in 0..CALLERS {
+        let retry = Arc::clone(&retry);
+        let checked = Arc::clone(&checked);
+        callers.push(std::thread::spawn(move || {
+            let eligible = retry.try_claim_attempt();
+            checked.wait();
+            if eligible {
+                retry.record_failure();
+            }
+            eligible
+        }));
+    }
+
+    let eligible = callers
+        .into_iter()
+        .map(|caller| caller.join().expect("retry claimant panicked"))
+        .filter(|eligible| *eligible)
+        .count();
+    assert_eq!(
+        eligible, 1,
+        "exactly one caller may claim a peer's dial slot"
+    );
+}
+
+#[test]
+fn outbound_retry_failure_streak_never_wraps_to_an_immediate_retry() {
+    let retry = OutboundDialRetry::with_retry_floor(Duration::from_secs(1));
+
+    for _ in 0..257 {
+        retry.record_failure();
+    }
+
+    assert!(
+        !retry.try_claim_attempt(),
+        "a saturated failure streak must keep the retry floor armed"
+    );
 }
 
 #[tokio::test]
@@ -6068,7 +6137,8 @@ fn accept_path_streaming_state_handoff_completes_a_stream_split_across_the_first
         // The peer, unaware the accept path already consumed the first
         // frame, sends only the second (and final) chunk.
         let second_header =
-            crate::framing::try_write_stream_data_header(false, stream_id as u32, 1, STRIDE).unwrap();
+            crate::framing::try_write_stream_data_header(false, stream_id as u32, 1, STRIDE)
+                .unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client_io, &second_header)
             .await
             .unwrap();
@@ -6521,7 +6591,10 @@ async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_r
         sender_peer_id: crate::PeerId,
         sender_addr: SocketAddr,
         max_message_size: usize,
-    ) -> (Arc<crate::registry::GossipRegistry>, tokio::io::DuplexStream) {
+    ) -> (
+        Arc<crate::registry::GossipRegistry>,
+        tokio::io::DuplexStream,
+    ) {
         let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
             bind_addr,
             crate::GossipConfig {
@@ -6591,8 +6664,7 @@ async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_r
         crate::framing::decode_control(ctrl)
     }
 
-    let sender_keypair =
-        crate::KeyPair::new_for_testing("full-sync-body-len-boundary-remote");
+    let sender_keypair = crate::KeyPair::new_for_testing("full-sync-body-len-boundary-remote");
     let sender_peer_id = sender_keypair.peer_id();
     let sender_addr: SocketAddr = "10.90.0.9:9401".parse().unwrap();
 

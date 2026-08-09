@@ -3381,7 +3381,7 @@ impl<T> ConnectionPool<T> {
                     });
                     if retry_session
                         .as_ref()
-                        .is_some_and(|session| !session.outbound_dial_retry.may_attempt())
+                        .is_some_and(|session| !session.outbound_dial_retry.try_claim_attempt())
                     {
                         // This caller did not attempt a socket, so release the
                         // address ownership gate without extending the peer's
