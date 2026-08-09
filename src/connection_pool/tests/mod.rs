@@ -7082,22 +7082,113 @@ async fn delta_gossip_updates_last_response_received_ms() {
     );
 }
 
-/// The `DeltaGossip` arm never
-/// verified `delta.sender_peer_id` -- a SELF-REPORTED wire field, not an
-/// authority for identity -- against the connection's actual authenticated
-/// identity, unlike the `FullSync` arm right below it. An authenticated
-/// peer (the "attacker" here) could send a delta CLAIMING to be a
-/// different peer (the "victim") and have this arm's failure-bookkeeping
-/// reset attributed to the impersonated victim's address instead of the
-/// connection that actually sent it, using nothing but a forged
-/// `sender_peer_id`.
+/// A current-session `DeltaGossip` already clears `gossip_state`'s own
+/// failure bookkeeping (proven by the sibling test above), but that alone
+/// does not reach the owner's own `liveness_evidence_at` fence --
+/// `reap_reserved_candidates`'s selection, early verdict, and fresh
+/// pre-destruction `reap_baseline_activity_detected` re-check all read
+/// that fence directly, not `gossip_state`. Since `cleanup_dead_peers`
+/// deliberately stopped re-deriving liveness from `gossip_state` for its
+/// own destructive decision, a delta arriving after a peer was already
+/// selected as a dead-peer candidate must still update the owner's fence,
+/// or the sweep could destroy and irreversibly tombstone that peer's
+/// actors moments after it proved itself alive.
+///
+/// Proves the fix directly against the owner's own fence, mirroring
+/// `mark_response_received`'s pattern for gossip responses: captures
+/// `evidence_before` immediately before processing an ordinary
+/// `DeltaGossip` through the real `handle_incoming_message` path, then
+/// asserts `has_newer_liveness_evidence` -- what `reap_reserved_
+/// candidates` itself queries -- now reports fresh evidence.
+#[tokio::test]
+async fn delta_gossip_records_owner_side_liveness_evidence() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_owner_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_owner_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.66:9302".parse().unwrap();
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    // Captured immediately before processing the delta -- exactly what
+    // `reap_reserved_candidates` itself would have captured at selection
+    // time for a candidate that looked dead a moment ago.
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "sanity: no evidence has been recorded for this address yet"
+    );
+
+    // Empty delta: no changes, just proves liveness -- same construction
+    // as the sibling gossip_state test above.
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
+
+    super::handle_incoming_message(
+        registry.clone(),
+        peer_addr,
+        peer_addr,
+        Some(peer_id.clone()),
+        msg,
+    )
+    .await
+    .expect("handle_incoming_message should succeed");
+
+    assert!(
+        registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "a current-session DeltaGossip must record owner-side liveness evidence -- \
+         reap_reserved_candidates' own fresh pre-destruction check reads ONLY the owner's \
+         fence, not gossip_state, so evidence that never reaches the owner is invisible to it"
+    );
+}
+
+/// The `DeltaGossip` arm never verified `delta.sender_peer_id` -- a
+/// SELF-REPORTED wire field, not an authority for identity -- against the
+/// connection's actual authenticated identity, unlike the `FullSync` arm
+/// right below it. An authenticated peer (the "attacker" here) could send
+/// a delta CLAIMING to be a different peer (the "victim") and, since
+/// current-session deltas are routed to `registry_owner::
+/// note_liveness_evidence`, indefinitely refresh the OWNER's liveness
+/// fence for the impersonated victim's address -- permanently preventing
+/// a genuinely dead victim from ever being reaped, using nothing but a
+/// forged `sender_peer_id`.
 ///
 /// Proves the fix: an authenticated connection for `attacker_id` sends a
 /// `DeltaGossip` claiming `sender_peer_id: victim_id`. Asserts the call
-/// still succeeds (the forged delta is silently ignored, not an error) but
-/// leaves the victim's `gossip_state` failure bookkeeping completely
-/// untouched -- proving the whole delta is rejected before ANY of its
-/// claimed identity is trusted for anything.
+/// still succeeds (the forged delta is silently ignored, not an error)
+/// but records NEITHER owner-side liveness for the victim's address NOR
+/// clears the victim's `gossip_state` failure bookkeeping -- proving the
+/// whole delta is rejected before ANY of its claimed identity is trusted
+/// for anything, not merely that the one new liveness call is skipped.
 #[tokio::test]
 async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -7144,6 +7235,15 @@ async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
             .insert(victim_addr, stale_peer_info(victim_addr, stale_time));
     }
 
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(victim_addr, evidence_before)
+            .await,
+        "sanity: no evidence recorded for the victim's address yet"
+    );
+
     // The delta arrives on the ATTACKER's authenticated connection but
     // CLAIMS to be from the victim.
     let delta = crate::registry::RegistryDelta {
@@ -7169,6 +7269,15 @@ async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
     .await
     .expect("a forged DeltaGossip must be silently ignored, not an error");
 
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(victim_addr, evidence_before)
+            .await,
+        "the victim's address must NOT gain owner-side liveness evidence from a delta the \
+         attacker merely CLAIMED was from the victim -- this would let an authenticated peer \
+         grant an arbitrary other identity permanent reap-immunity"
+    );
     let state = registry.gossip_state.lock().await;
     let victim_info = state
         .peers
