@@ -306,8 +306,6 @@ impl<T> ConnectionPool<T> {
             connection_counter: AtomicIsize::new(0),
             #[cfg(test)]
             cleanup_stale_race_hook: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            disconnect_instance_survivor_race_hook: std::sync::Mutex::new(None),
             _marker: PhantomData,
         };
 
@@ -2641,27 +2639,28 @@ impl<T> ConnectionPool<T> {
         // `unpublish_rejected_outbound_candidate`'s identical concern. Only
         // relevant in the `Err(None)` arm below: when the CAS above actually
         // clears the slot (`Ok(())`), `target` WAS the current connection and
-        // nothing else can be depending on the tracker as a live sibling.
-        // Whether the `Err(None)` arm below applies -- deliberately NOT the
-        // survivor decision itself. That decision is deferred to
-        // immediately before the `abort_tasks*` call at the end of this
-        // function: the snapshot it reads is not synchronized with that
-        // call, and everything between here and there (logging, the
-        // lifecycle event, the `connections_by_peer`/`connections_by_addr`
-        // removals below) is a window in which a fresh connection sharing
-        // this same session-level tracker could be published and start an
-        // ask -- deciding `false` here and acting on it after that window
-        // would cancel that fresh ask, not just `target`'s own. Re-checking
-        // right before the action shrinks the window to as little
-        // intervening work as possible.
-        let may_have_survivor = match self
+        // nothing else can be depending on the tracker as a live sibling --
+        // `is_current` records exactly that proof (or its absence) for the
+        // final decision at the end of this function.
+        //
+        // The `Err(None)` case cannot be resolved by a snapshot taken here,
+        // no matter how late: everything between any such snapshot and the
+        // actual `abort_tasks*` call below (logging, the lifecycle event,
+        // the `connections_by_peer`/`connections_by_addr` removals) is a
+        // window in which a fresh connection sharing this tracker could be
+        // published and start an ask. Guessing "no sibling" and acting on
+        // it would cancel that fresh ask. The final decision instead defers
+        // entirely to the IO task's own `ExitGuard`, which re-derives
+        // supersession from FRESH pool state at the actual moment the task
+        // exits — see `abort_tasks_defer_correlation_decision`'s doc.
+        let is_current = match self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
                 session.compare_and_take_current_connection(target)
             })
             .unwrap_or(Err(None))
         {
-            Ok(()) => false,
+            Ok(()) => true,
             Err(Some(_other)) => {
                 debug!(
                     peer_id = %peer_id,
@@ -2686,9 +2685,7 @@ impl<T> ConnectionPool<T> {
                      session (found only via an address/alias fallback); proceeding with its \
                      own instance-scoped teardown"
                 );
-                #[cfg(test)]
-                self.fire_disconnect_instance_survivor_race_hook();
-                true
+                false
             }
         };
 
@@ -2760,28 +2757,14 @@ impl<T> ConnectionPool<T> {
 
         self.release_counted_connection(target);
 
-        // Decided here, immediately before acting on it, not back where
-        // `may_have_survivor` was set — see that comment for why. Comparing
-        // to `target` itself excludes the still-live-sibling-vs-genuinely-
-        // final-teardown ambiguity `target`'s own not-yet-removed
-        // `connections_by_peer`/`connections_by_addr` entries could
-        // otherwise cause (both are gone by this point regardless, but the
-        // guard costs nothing and keeps this identical to the check it
-        // replaced).
-        let keep_correlation = may_have_survivor
-            && self
-                .peer_current_connection_snapshot(peer_id)
-                .is_some_and(|current| {
-                    !Arc::ptr_eq(&current, target)
-                        && current.has_live_stream()
-                        && target.shares_correlation_tracker(&current)
-                });
-
         // H-004: Abort background tasks (writer, reader) to prevent resource leaks.
-        if keep_correlation {
-            target.abort_tasks_keep_correlation();
-        } else {
+        if is_current {
+            // Proven above: `target` WAS the current connection, so nothing
+            // else can be depending on the tracker as a live sibling.
             target.abort_tasks();
+        } else {
+            // Ambiguous -- see the comment on `is_current`'s `match` above.
+            target.abort_tasks_defer_correlation_decision();
         }
         true
     }
@@ -2869,25 +2852,23 @@ impl<T> ConnectionPool<T> {
         // aborting `connection`'s tasks unconditionally below would cancel
         // that live survivor's in-flight asks too — see
         // `unpublish_rejected_outbound_candidate` for the identical concern.
-        // Only relevant when the CAS below does NOT clear the slot: if it
-        // does, `connection` WAS current and nothing else can depend on the
-        // tracker as a live sibling.
-        //
-        // The survivor check itself is deferred to immediately before the
-        // `abort_tasks*` call at the end of this function, exactly like
-        // `disconnect_connection_instance`'s equivalent flag: a snapshot
-        // read here would not be synchronized with that later call, and a
-        // fresh connection sharing this tracker could be published and
-        // start an ask in the gap (logging, the lifecycle event) between
-        // deciding and acting.
-        let mut may_have_survivor = false;
-        if let Some(peer_id) = peer_id_at_addr.clone() {
+        // `is_current` records whether the CAS below proved `connection` WAS
+        // the peer's current connection (no ambiguity possible: nothing
+        // else can then depend on the tracker as a live sibling) for the
+        // final decision at the end of this function. `peer_id_at_addr`
+        // being `None` is equally unambiguous the other way -- with no
+        // peer identity to check a survivor against at all, there is
+        // nothing to defer to either, so this counts as `true` (the
+        // pre-existing behavior for this case, unaffected by this fix).
+        let mut is_current = peer_id_at_addr.is_none();
+        if let Some(peer_id) = peer_id_at_addr {
             let cleared = self
                 .peer_sessions
                 .read_sync(&peer_id, |_, session| {
                     session.compare_and_clear_current_connection(&connection)
                 })
                 .unwrap_or(false);
+            is_current = cleared;
             if cleared {
                 let stream_instance_id = connection
                     .stream_handle
@@ -2919,34 +2900,23 @@ impl<T> ConnectionPool<T> {
                 let _ = self
                     .connections_by_peer
                     .remove_if_sync(&peer_id, |v| Arc::ptr_eq(v, &connection));
-            } else {
-                may_have_survivor = true;
-                #[cfg(test)]
-                self.fire_disconnect_instance_survivor_race_hook();
             }
         }
 
         self.release_counted_connection(&connection);
 
-        // Decided here, immediately before acting on it — see
-        // `may_have_survivor`'s comment above. Same `!Arc::ptr_eq` guard as
-        // `disconnect_connection_instance`: `connections_by_peer` is only
-        // cleared in the `if cleared` branch above, so the snapshot could
-        // otherwise still return `connection` itself.
-        let keep_correlation = may_have_survivor
-            && peer_id_at_addr.as_ref().is_some_and(|peer_id| {
-                self.peer_current_connection_snapshot(peer_id)
-                    .is_some_and(|current| {
-                        !Arc::ptr_eq(&current, &connection)
-                            && current.has_live_stream()
-                            && connection.shares_correlation_tracker(&current)
-                    })
-            });
-
-        if keep_correlation {
-            connection.abort_tasks_keep_correlation();
-        } else {
+        if is_current {
+            // Proven above (or trivially true: no peer identity to defer
+            // to): nothing else can be depending on the tracker as a live
+            // sibling.
             connection.abort_tasks();
+        } else {
+            // Ambiguous -- see `disconnect_connection_instance`'s identical
+            // comment on its own `is_current`. No point-in-time snapshot
+            // here is safe to act on; defer to the IO task's own
+            // `ExitGuard`, which re-derives supersession from FRESH pool
+            // state at the actual moment it exits.
+            connection.abort_tasks_defer_correlation_decision();
         }
         Some(connection)
     }
@@ -4278,26 +4248,6 @@ impl<T> ConnectionPool<T> {
             .cleanup_stale_race_hook
             .lock()
             .expect("cleanup-stale race hook mutex poisoned")
-            .take();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
-    #[cfg(test)]
-    fn set_disconnect_instance_survivor_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
-        *self
-            .disconnect_instance_survivor_race_hook
-            .lock()
-            .expect("disconnect-instance survivor race hook mutex poisoned") = Some(Box::new(hook));
-    }
-
-    #[cfg(test)]
-    fn fire_disconnect_instance_survivor_race_hook(&self) {
-        let hook = self
-            .disconnect_instance_survivor_race_hook
-            .lock()
-            .expect("disconnect-instance survivor race hook mutex poisoned")
             .take();
         if let Some(hook) = hook {
             hook();

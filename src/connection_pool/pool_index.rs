@@ -60,16 +60,6 @@ pub struct ConnectionPool<T = ()> {
     /// technique as `OutboundDialGate`'s `race_hook`.
     #[cfg(test)]
     cleanup_stale_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// Test hook. Fired inside [`ConnectionPool::disconnect_connection_instance`]'s
-    /// `Err(None)` arm and [`ConnectionPool::remove_connection_instance_by_id`]'s
-    /// CAS-declined branch, at exactly the point each's survivor check used
-    /// to run before it was deferred to immediately before the final
-    /// `abort_tasks*` call — so a test can land a concurrent survivor
-    /// publication deterministically in that gap instead of racing for it.
-    /// Shared between both call sites: each test constructs its own pool,
-    /// so there is never more than one hook registered at a time.
-    #[cfg(test)]
-    disconnect_instance_survivor_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     _marker: PhantomData<fn() -> T>,
 }
 

@@ -1874,6 +1874,13 @@ pub struct ActorState {
     /// it — same technique as `OutboundDialGate`'s `race_hook`.
     #[cfg(test)]
     cleanup_stale_actors_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test hook. Fired inside [`GossipRegistry::cleanup_stale_actors`]'s
+    /// `reannouncement_liveness` sweep, after it snapshots which rows look
+    /// orphaned but before the removal loop re-validates and removes them —
+    /// same technique as `cleanup_stale_actors_race_hook`, for the sweep's
+    /// own independent scan-then-remove gap.
+    #[cfg(test)]
+    liveness_sweep_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 #[cfg(test)]
@@ -1893,6 +1900,24 @@ impl ActorState {
             .cleanup_stale_actors_race_hook
             .lock()
             .expect("cleanup-stale-actors race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(crate) fn set_liveness_sweep_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .liveness_sweep_race_hook
+            .lock()
+            .expect("liveness-sweep race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    fn fire_liveness_sweep_race_hook(&self) {
+        let hook = self
+            .liveness_sweep_race_hook
+            .lock()
+            .expect("liveness-sweep race hook mutex poisoned")
             .take();
         if let Some(hook) = hook {
             hook();
@@ -2024,10 +2049,11 @@ impl GossipState {
     /// in `pool_connect.rs` call this once the peer's advertised bind
     /// address is known). No-op if `old_addr` has no entry.
     ///
-    /// If `new_addr` already has an entry, MERGES rather than overwrites it:
-    /// a plain `remove` + `insert` would let a freshly-learned,
-    /// ephemeral-keyed entry -- which has had no chance yet to accumulate
-    /// its own replay high-water mark or armed session -- silently regress
+    /// If `new_addr` already has an entry FOR THE SAME AUTHENTICATED
+    /// IDENTITY (`node_id`), MERGES rather than overwrites it: a plain
+    /// `remove` + `insert` would let a freshly-learned, ephemeral-keyed
+    /// entry -- which has had no chance yet to accumulate its own replay
+    /// high-water mark or armed session -- silently regress
     /// `last_sequence`/`last_sent_sequence` or zero out the
     /// `current_session_epoch` already recorded against the bind address by
     /// an earlier connection. `last_sequence`/`last_sent_sequence` only ever
@@ -2037,6 +2063,17 @@ impl GossipState {
     /// session as a unit -- see `PeerInfo::current_session_epoch`'s doc --
     /// so they are kept or replaced together, from whichever side holds the
     /// more ADVANCED epoch, rather than spliced field-by-field.
+    ///
+    /// An occupied `new_addr` is NOT guaranteed to belong to the same peer
+    /// as `moved`: address reuse or an ownership transfer can leave a stale
+    /// entry from a PREVIOUS, unrelated owner sitting there. Merging
+    /// unconditionally would inherit that unrelated peer's replay state --
+    /// a restarted peer's genuinely low sequence could then be rejected as
+    /// a replay, or an unrelated, long-dead session could be left "armed"
+    /// against the new owner. The merge therefore only applies when both
+    /// sides carry the SAME known `node_id`; otherwise the occupied entry
+    /// is treated as stale and `moved` replaces it outright, carrying over
+    /// no session or replay state at all.
     pub(crate) fn migrate_peer_entry(&mut self, old_addr: SocketAddr, new_addr: SocketAddr) {
         let Some(mut moved) = self.peers.remove(&old_addr) else {
             return;
@@ -2046,14 +2083,18 @@ impl GossipState {
         match self.peers.entry(new_addr) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 let existing = slot.get();
-                moved.last_sequence = moved.last_sequence.max(existing.last_sequence);
-                moved.last_sent_sequence =
-                    moved.last_sent_sequence.max(existing.last_sent_sequence);
-                if existing.current_session_epoch > moved.current_session_epoch {
-                    moved.current_session_source = existing.current_session_source;
-                    moved.current_session_connection = existing.current_session_connection.clone();
-                    moved.current_session_epoch = existing.current_session_epoch;
-                    moved.accept_lower_sequence_from = existing.accept_lower_sequence_from;
+                let same_identity = moved.node_id.is_some() && moved.node_id == existing.node_id;
+                if same_identity {
+                    moved.last_sequence = moved.last_sequence.max(existing.last_sequence);
+                    moved.last_sent_sequence =
+                        moved.last_sent_sequence.max(existing.last_sent_sequence);
+                    if existing.current_session_epoch > moved.current_session_epoch {
+                        moved.current_session_source = existing.current_session_source;
+                        moved.current_session_connection =
+                            existing.current_session_connection.clone();
+                        moved.current_session_epoch = existing.current_session_epoch;
+                        moved.accept_lower_sequence_from = existing.accept_lower_sequence_from;
+                    }
                 }
                 *slot.get_mut() = moved;
             }
@@ -8641,11 +8682,26 @@ impl<T: 'static> GossipRegistry<T> {
                 }
                 true
             });
+        #[cfg(test)]
+        self.actor_state.fire_liveness_sweep_race_hook();
         for name in orphaned_liveness {
-            let _ = self
-                .actor_state
-                .reannouncement_liveness
-                .remove_sync(name.as_str());
+            // Re-check the same condition inside the atomic removal itself
+            // rather than trusting the snapshot above: a concurrent
+            // reannouncement or ownership transfer landing in the gap
+            // between the scan and this loop -- installing a fresh,
+            // owner-matching row -- must not be torn down just because it
+            // *used to* look orphaned. `remove_if_sync` reads the live row
+            // and only removes if the predicate still holds.
+            let _ = self.actor_state.reannouncement_liveness.remove_if_sync(
+                name.as_str(),
+                |(recorded_owner, _)| {
+                    let current_owner = self
+                        .actor_state
+                        .known_actors
+                        .read_sync(name.as_str(), |_, location| location.peer_id.clone());
+                    current_owner.as_ref() != Some(recorded_owner)
+                },
+            );
         }
 
         // Bound peer-death/unregister tombstones. They only need to outlive
@@ -14051,6 +14107,70 @@ mod tests {
         );
     }
 
+    /// An occupied `new_addr` slot is not guaranteed to belong to the same
+    /// peer as `moved` -- address reuse or an ownership transfer can leave
+    /// a stale entry from a PREVIOUS, unrelated owner sitting there. Before
+    /// this fix, `migrate_peer_entry` merged unconditionally on address
+    /// alone, letting a genuinely different, newly-authenticated peer
+    /// inherit the unrelated old owner's sequence high-water marks and
+    /// armed session -- a restarted peer's genuinely low sequence could
+    /// then be wrongly rejected as a replay.
+    #[tokio::test]
+    async fn migrate_peer_entry_does_not_merge_replay_state_across_different_identities() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7501),
+            test_config_with_seed("migrate-peer-entry-identity-guard"),
+        );
+        let stale_node_id = test_peer_id("migrate-guard-old-owner").to_node_id();
+        let fresh_node_id = test_peer_id("migrate-guard-new-owner").to_node_id();
+        let ephemeral_addr = test_addr(9510);
+        let bind_addr = test_addr(9511);
+
+        let mut gossip_state = reg.gossip_state.lock().await;
+
+        // A stale entry from a PREVIOUS, unrelated owner of this address --
+        // high sequence, armed session.
+        let mut stale = peer_info_with_node_id(bind_addr, stale_node_id);
+        stale.last_sequence = 999;
+        stale.last_sent_sequence = 500;
+        stale.current_session_epoch = 9;
+        stale.current_session_source = Some(bind_addr);
+        gossip_state.peers.insert(bind_addr, stale);
+
+        // A genuinely different, newly-authenticated peer whose sequence is
+        // legitimately low (e.g. freshly restarted).
+        let mut fresh = peer_info_with_node_id(ephemeral_addr, fresh_node_id);
+        fresh.last_sequence = 1;
+        gossip_state.peers.insert(ephemeral_addr, fresh);
+
+        gossip_state.migrate_peer_entry(ephemeral_addr, bind_addr);
+
+        let migrated = gossip_state
+            .peers
+            .get(&bind_addr)
+            .expect("bind-keyed entry must still exist after migration");
+        assert_eq!(
+            migrated.node_id,
+            Some(fresh_node_id),
+            "the new owner's identity must win outright"
+        );
+        assert_eq!(
+            migrated.last_sequence, 1,
+            "a genuinely low sequence from a different peer identity must not be inflated by \
+             an unrelated stale owner's high-water mark"
+        );
+        assert_eq!(
+            migrated.current_session_epoch, 0,
+            "an unrelated stale owner's armed session must not be inherited by a different \
+             identity"
+        );
+        assert_eq!(
+            migrated.current_session_source, None,
+            "an unrelated stale owner's session source must not be inherited by a different \
+             identity"
+        );
+    }
+
     /// `mark_transport_source_keyed_fallback`'s gate is a fact its caller
     /// hands it directly (`registry_owner::ClaimReceipt::created_ownership()`),
     /// not an inference drawn from another evidence field -- an earlier
@@ -19290,6 +19410,69 @@ mod tests {
              be swept, not left to linger scoped only to the name -- effective_actor_wall_clock_time \
              already ignores it on read, but leaving it in place indefinitely defeats the point \
              of a bounded side table"
+        );
+    }
+
+    /// The liveness sweep snapshots which rows look orphaned, then removes
+    /// each unconditionally in a separate pass. A concurrent reannouncement
+    /// or ownership transfer landing in that gap -- installing a fresh,
+    /// owner-MATCHING row where the snapshot observed a mismatch -- must not
+    /// be torn down just because it *used to* look orphaned; the next
+    /// cleanup pass would then wrongly reap an actor its owner is actively
+    /// reannouncing (its own stored `wall_clock_time` can intentionally stay
+    /// old, relying entirely on this row for freshness).
+    ///
+    /// Pinned deterministically via the actor-state's own
+    /// `liveness_sweep_race_hook` (fired after the scan, before the removal
+    /// loop) rather than a wall-clock thread race.
+    #[tokio::test]
+    async fn cleanup_stale_actors_revalidates_liveness_rows_before_sweeping_them() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_504),
+            test_config_with_seed("liveness-sweep-race"),
+        );
+        let actor_name = "liveness-sweep-race/service";
+        let owner = test_peer_id("liveness-sweep-race-owner");
+        let stale_recorded_owner = test_peer_id("liveness-sweep-race-stale-owner");
+
+        let location = RemoteActorLocation::new_with_peer(test_addr(20_505), owner.clone());
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), location);
+        // Looks orphaned at scan time: recorded for a DIFFERENT owner than
+        // the one currently in `known_actors`.
+        let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
+            actor_name.to_string(),
+            (stale_recorded_owner, current_timestamp()),
+        );
+
+        let actor_state = registry.actor_state.clone();
+        let owner_for_hook = owner.clone();
+        registry.actor_state.set_liveness_sweep_race_hook(move || {
+            // A concurrent reannouncement lands in the scan-to-removal
+            // gap, replacing the row with fresh, owner-MATCHING
+            // liveness -- exactly what a real, still-live owner's
+            // unchanged re-advertisement would install.
+            let _ = actor_state.reannouncement_liveness.upsert_sync(
+                actor_name.to_string(),
+                (owner_for_hook.clone(), current_timestamp()),
+            );
+        });
+
+        registry.cleanup_stale_actors().await;
+
+        assert!(
+            registry
+                .actor_state
+                .reannouncement_liveness
+                .read_sync(actor_name, |_, (recorded_owner, _)| {
+                    *recorded_owner == owner
+                })
+                .unwrap_or(false),
+            "a row that became owner-matching in the gap between the scan and the removal \
+             loop must survive -- the sweep must re-validate at removal time, never remove \
+             whatever the snapshot observed regardless of what changed since"
         );
     }
 
