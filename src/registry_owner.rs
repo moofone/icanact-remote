@@ -689,11 +689,13 @@ enum OwnerCommand {
         evidence_before: std::time::Instant,
         reply: oneshot::Sender<bool>,
     },
-    /// Purely read the complete authorization fence for a reserved reap.
+    /// Best-effort read of activity since a reserved reap's baseline.
     /// Liveness evidence and operator reconfiguration are independent ways
     /// for the selection to become stale, so the caller checks both in one
-    /// owner-serialized read immediately before destructive work.
-    ReapAuthorizationIsStale {
+    /// owner-serialized read immediately before destructive work. This is a
+    /// mitigation, not an authorization: activity can still commit after
+    /// this read returns and before the caller mutates shared state.
+    ReapBaselineActivityDetected {
         addr: SocketAddr,
         peer_id: PeerId,
         evidence_before: std::time::Instant,
@@ -1126,11 +1128,13 @@ impl RegistryOwnerHandle {
             .await
     }
 
-    /// Read the complete authorization fence for a reserved reap. The
-    /// result is stale when either newer direct liveness evidence exists or
-    /// the same peer was operator-reconfigured after the captured baseline.
-    /// An unavailable owner fails closed.
-    pub async fn reap_authorization_is_stale(
+    /// Read whether activity has been observed since a reserved reap's
+    /// baseline. The result is true when either newer direct liveness
+    /// evidence exists or the same peer was operator-reconfigured after the
+    /// captured baseline. This narrows the post-consume window; it is not an
+    /// atomic authorization for the caller's later mutation. An unavailable
+    /// owner fails closed.
+    pub async fn reap_baseline_activity_detected(
         &self,
         addr: SocketAddr,
         peer_id: PeerId,
@@ -1139,7 +1143,7 @@ impl RegistryOwnerHandle {
     ) -> bool {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
-        let command = OwnerCommand::ReapAuthorizationIsStale {
+        let command = OwnerCommand::ReapBaselineActivityDetected {
             addr,
             peer_id,
             evidence_before,
@@ -1878,20 +1882,20 @@ impl PeerRegistryOwner {
                     .is_some_and(|observed_at| observed_at > evidence_before);
                 let _ = reply.send(has_newer_claim || has_newer_response);
             }
-            OwnerCommand::ReapAuthorizationIsStale {
+            OwnerCommand::ReapBaselineActivityDetected {
                 addr,
                 peer_id,
                 evidence_before,
                 baseline_configure_peer_generation,
                 reply,
             } => {
-                let stale = self.reap_authorization_is_stale(
+                let activity_detected = self.reap_baseline_activity_detected(
                     addr,
                     &peer_id,
                     evidence_before,
                     baseline_configure_peer_generation,
                 );
-                let _ = reply.send(stale);
+                let _ = reply.send(activity_detected);
             }
             OwnerCommand::ConfigurePeerGenerationOf { peer_id, reply } => {
                 let generation = self
@@ -1980,7 +1984,7 @@ impl PeerRegistryOwner {
             .or_insert(at);
     }
 
-    fn reap_authorization_is_stale(
+    fn reap_baseline_activity_detected(
         &self,
         addr: SocketAddr,
         peer_id: &PeerId,

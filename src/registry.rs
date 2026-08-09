@@ -9556,9 +9556,12 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// Apply the pure owner liveness verdict and one-shot reservation
-    /// authorization before destructive work. Ownership is deliberately
-    /// released last, through its own fresh owner-side causal fence.
+    /// Apply the owner liveness verdict and one-shot reservation before
+    /// destructive work. The post-consume owner read is a best-effort
+    /// mitigation that narrows the remaining race; it is not a closing
+    /// authorization because shared-state mutation remains outside the
+    /// owner task. Ownership is deliberately released last, through its own
+    /// fresh owner-side causal fence.
     async fn reap_reserved_candidates(
         &self,
         peers_to_cleanup: Vec<(
@@ -9594,8 +9597,9 @@ impl<T: 'static> GossipRegistry<T> {
 
             // Capture the operator-configuration baseline before consuming
             // the reservation. A configure_peer command that lands after
-            // this read must invalidate the destructive authorization even
-            // when it does not evict this exact address.
+            // this read is activity that should make the best-effort
+            // post-consume mitigation abandon the candidate, even when it
+            // does not evict this exact address.
             let baseline_configure_peer_generation = self
                 .registry_owner
                 .configure_peer_generation_of(peer_id.clone())
@@ -9627,7 +9631,7 @@ impl<T: 'static> GossipRegistry<T> {
                 // peer's actors and publish an irreversible tombstone.
                 if self
                     .registry_owner
-                    .reap_authorization_is_stale(
+                    .reap_baseline_activity_detected(
                         peer_addr,
                         peer_id.clone(),
                         evidence_before,
@@ -9637,8 +9641,8 @@ impl<T: 'static> GossipRegistry<T> {
                 {
                     warn!(
                         peer = %peer_addr,
-                        "cleanup_dead_peers: fresh liveness evidence arrived after reservation \
-                         consume; preserving actor state and tombstones"
+                        "cleanup_dead_peers: activity arrived after the reap baseline; preserving \
+                         actor state and tombstones"
                     );
                     drop(gossip_state);
                     reservation.release().await;
