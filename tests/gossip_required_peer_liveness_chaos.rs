@@ -162,10 +162,55 @@ fn lifecycle_event_peer(event: &TransportLifecycleEvent) -> Option<&PeerId> {
     }
 }
 
+/// Per-peer count of OUTBOUND-finalize transport lifecycle events, tracked
+/// separately from [`PEER_LIFECYCLE_EVENT_COUNTS`] and keyed by the identity
+/// of the peer being *dialed*. `connect_bidirectional` issues two physically
+/// distinct dials (A to B, and B to A); an outbound-finalize event is
+/// produced only by the dialing side's own registry, keyed by the target's
+/// identity, so an entry here keyed by B's id can only have come from A's
+/// own dial to B, never from B's dial to A. That asymmetry is exactly what
+/// [`wait_for_dial_resolution_entered`] needs: an INBOUND-side event would
+/// not work for this, because A's dial to B produces an inbound-accept event
+/// on B's registry keyed by A's id — the same key B's own dial to A would
+/// also produce evidence under — so counting inbound events here would let
+/// one direction's success alone satisfy "evidence for both directions".
+static PEER_OUTBOUND_DIAL_RESOLUTION_COUNTS: OnceLock<Mutex<HashMap<PeerId, u64>>> =
+    OnceLock::new();
+
+fn peer_outbound_dial_resolution_counts() -> &'static Mutex<HashMap<PeerId, u64>> {
+    PEER_OUTBOUND_DIAL_RESOLUTION_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extracts the dialed peer's identity from an event that proves this
+/// registry's own outbound dial to that peer has entered conflict
+/// resolution, if `event` is such an event. `OutboundStart` fires merely on
+/// dial *attempt*, before any conflict evaluation, so it is excluded.
+/// `WrongDirectionEvicted` is excluded too: unlike the others here, its
+/// `peer`/`direction` fields don't identify which side (inbound-accept or
+/// outbound-finalize) triggered the eviction, so counting it here could
+/// attribute an inbound-side win to the outbound direction.
+/// `OutboundFinalizeExistingSnapshotTaken` alone is sufficient (it fires
+/// unconditionally for every outbound finalize attempt, before the tie-break
+/// decision is computed); the rest are included as belt-and-suspenders
+/// evidence of the same direction.
+fn lifecycle_outbound_dial_resolution_peer(event: &TransportLifecycleEvent) -> Option<&PeerId> {
+    match event {
+        TransportLifecycleEvent::OutboundSuppressedWaitInbound { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundReady { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundTimeout { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizePublishAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeClearRaceRetry { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeReplaceExistingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken { peer, .. } => Some(peer),
+        _ => None,
+    }
+}
+
 /// Installs the process-wide transport lifecycle recorder exactly once, for
-/// the remainder of this test binary's run, so [`wait_for_peer_quiescence`]
-/// can observe real tie-break/finalization activity instead of guessing a
-/// fixed sleep covers it.
+/// the remainder of this test binary's run, so [`wait_for_dial_resolution_
+/// entered`] and [`wait_for_peer_quiescence`] can observe real tie-break/
+/// finalization activity instead of guessing a fixed sleep covers it.
 ///
 /// Deliberately never uninstalled: `TransportLifecycleRecorderGuard`'s
 /// uninstall-on-drop exists so concurrently running tests never clobber each
@@ -179,6 +224,12 @@ fn ensure_lifecycle_quiescence_recorder_installed() {
     INSTALLED.call_once(|| {
         std::mem::forget(TransportLifecycleRecorderGuard::install(Arc::new(
             |event: TransportLifecycleEvent| {
+                if let Some(peer) = lifecycle_outbound_dial_resolution_peer(&event) {
+                    let mut counts = peer_outbound_dial_resolution_counts()
+                        .lock()
+                        .expect("peer outbound dial resolution counts mutex poisoned");
+                    *counts.entry(peer.clone()).or_insert(0) += 1;
+                }
                 let Some(peer) = lifecycle_event_peer(&event) else {
                     return;
                 };
@@ -189,6 +240,33 @@ fn ensure_lifecycle_quiescence_recorder_installed() {
             },
         )));
     });
+}
+
+/// Waits until at least one outbound-dial-resolution event (see
+/// [`lifecycle_outbound_dial_resolution_peer`]) has been observed for EACH
+/// of `peer_ids`, bounded by `deadline`. Returns `true` once both are
+/// observed, `false` on timeout.
+///
+/// This is the positive precondition [`wait_for_peer_quiescence`] needs
+/// before its "no new events for a window" check means anything: a
+/// zero-event window is indistinguishable between "already resolved" and
+/// "resolution hasn't started yet" for whichever direction is late under
+/// scheduling contention, so a quiet window can elapse and this helper would
+/// otherwise release the setup permit while a reciprocal dial's tie-break is
+/// still pending. Requiring evidence that *both* of `connect_bidirectional`'s
+/// two physically distinct dials (A to B, and B to A) have individually
+/// entered resolution converts "nothing happened" from being the entire
+/// proof into a secondary confirmation layered on top of an affirmative one.
+async fn wait_for_dial_resolution_entered(peer_ids: &[PeerId], deadline: Duration) -> bool {
+    wait_for_condition(deadline, || async {
+        let counts = peer_outbound_dial_resolution_counts()
+            .lock()
+            .expect("peer outbound dial resolution counts mutex poisoned");
+        peer_ids
+            .iter()
+            .all(|id| counts.get(id).copied().unwrap_or(0) >= 1)
+    })
+    .await
 }
 
 /// Waits until no transport lifecycle event mentioning any of `peer_ids` has
@@ -202,6 +280,11 @@ fn ensure_lifecycle_quiescence_recorder_installed() {
 /// window with no such activity at all counts as settled. Bounded by
 /// `deadline` so a genuinely stuck connection still fails the test loudly
 /// instead of hanging it.
+///
+/// Callers MUST establish (via [`wait_for_dial_resolution_entered`] or
+/// equivalent) that resolution has actually started before relying on this
+/// alone: a window with zero events proves settlement only once it is known
+/// that "zero events" isn't just "nothing has happened yet".
 async fn wait_for_peer_quiescence(peer_ids: &[PeerId], window: Duration, deadline: Duration) {
     let snapshot = |ids: &[PeerId]| -> Vec<u64> {
         let counts = peer_lifecycle_event_counts()
@@ -241,16 +324,19 @@ async fn wait_for_peer_quiescence(peer_ids: &[PeerId], window: Duration, deadlin
 /// the same `DEFAULT_PREFERRED_INBOUND_WAIT_MS` fallback window at once.
 ///
 /// A fixed sleep after `connect_bidirectional` returns does not actually fix
-/// this: `active_peers >= 1` can become true as soon as this call's OWN
-/// outbound dial succeeds, which may be before the reciprocal direction's
-/// connection — and the collision/tie-break it can trigger — has even
-/// arrived, so a timer started at the return point can still elapse before
-/// the library's own internal fallback timer (started later) fires. Instead,
-/// hold the permit until [`wait_for_peer_quiescence`] proves no further
-/// transport lifecycle activity for this exact pair for a full settle
-/// window, which by construction cannot end early relative to whatever
-/// internal timer is still running: any activity from that timer resolving
-/// resets the wait.
+/// this, and neither does a bare quiet-window check: `active_peers >= 1` can
+/// become true as soon as this call's OWN outbound dial succeeds, which may
+/// be before the reciprocal direction's connection — and the collision/
+/// tie-break it can trigger — has even arrived, so a quiet window sampled
+/// right away can elapse with zero events simply because that reciprocal
+/// dial's own resolution hasn't started yet, not because it already
+/// finished. [`wait_for_dial_resolution_entered`] closes that gap first,
+/// with a positive precondition proving both of the two dials
+/// `connect_bidirectional` issues have individually entered resolution; only
+/// once that holds does [`wait_for_peer_quiescence`]'s "no further activity"
+/// check mean anything, since by construction it cannot end early relative
+/// to whatever internal timer is still running — any activity from that
+/// timer resolving resets the wait.
 async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
     ensure_lifecycle_quiescence_recorder_installed();
     let _permit = NODE_SETUP_ADMISSION
@@ -259,6 +345,12 @@ async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(
         .expect("NODE_SETUP_ADMISSION is never closed");
     let result = connect_bidirectional(a, b).await;
     let peer_ids = [a.registry.peer_id.clone(), b.registry.peer_id.clone()];
+    let resolution_entered =
+        wait_for_dial_resolution_entered(&peer_ids, Duration::from_secs(3)).await;
+    assert!(
+        resolution_entered,
+        "outbound dial resolution for {peer_ids:?} never started in at least one direction"
+    );
     wait_for_peer_quiescence(
         &peer_ids,
         Duration::from_millis(icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS),
