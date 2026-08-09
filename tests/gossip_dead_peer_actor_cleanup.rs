@@ -1041,26 +1041,46 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 .entry(sub_addr)
                 .or_default()
                 .insert(DEAD_ACTOR_NAME.to_string());
-            // Make the last response older than the normalized liveness window
-            // so the no-response rounds below trip the response-asymmetry
-            // detector even though regular gossip is deliberately quiesced.
-            if let Some(peer) = state.peers.get_mut(&sub_addr) {
-                let silence_ms = u64::try_from(
-                    config
-                        .peer_liveness_window
-                        .saturating_add(Duration::from_millis(1))
-                        .as_millis(),
-                )
-                .unwrap_or(u64::MAX);
-                peer.last_response_received_ms =
-                    icanact_remote::current_timestamp_millis().saturating_sub(silence_ms);
-            }
         }
+
+        // How far in the past to backdate `last_response_received_ms` so the
+        // no-response rounds below trip the response-asymmetry detector.
+        // Older than the normalized liveness window is enough in principle,
+        // but `connect_to_peer`'s own success path (called above, in a loop,
+        // to establish `connected_before`) unconditionally resets this same
+        // field to "now" on every `Ok` — and it is not the only writer: any
+        // inbound payload processed on this real, still-alive TLS connection
+        // (e.g. a one-time handshake-adjacent exchange with the subscriber,
+        // not gated by any of the quiesced background intervals above) can
+        // independently reset it too. A single backdate write performed once,
+        // before the loop below, races whichever of those last fires — this
+        // was observed failing 1-2/40 both in isolation and under whole-file
+        // concurrency alike (not a concurrency artifact), always at the first
+        // assert below, always fast (~0.01s, i.e. failing before any round
+        // trip that would explain a slow path). Re-asserting the backdate
+        // immediately before every no-response round, rather than once
+        // up front, keeps the exposure window to the gap between that write
+        // and this same round's `apply_gossip_results` call, instead of
+        // however long actor/state setup plus every prior round took.
+        let silence_ms = u64::try_from(
+            config
+                .peer_liveness_window
+                .saturating_add(Duration::from_millis(1))
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         // Drive the verdict deterministically: the subscriber is alive at the
         // socket level (connection stays "usable") but is treated as having
         // stopped answering at the app level — the UDP black-hole shape.
         for sequence in 0..config.max_peer_failures {
+            {
+                let mut state = publisher.registry.gossip_state.lock().await;
+                if let Some(peer) = state.peers.get_mut(&sub_addr) {
+                    peer.last_response_received_ms =
+                        icanact_remote::current_timestamp_millis().saturating_sub(silence_ms);
+                }
+            }
             publisher
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
