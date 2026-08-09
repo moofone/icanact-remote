@@ -2756,7 +2756,19 @@ mod tests {
         let topic = topic_key("interest-convergence-churn");
         let name = interest_name(topic, &pubsub.local_peer_id);
 
-        crate::test_helpers::clear_pubsub_interest_dispatch_hook();
+        // Exclusive access for the whole test. The hook installed below is
+        // filtered to this test's own `topic`, so it no longer pauses an
+        // unrelated test's `note_interest` dispatch — but
+        // `install_pubsub_interest_dispatch_hook` replaces the process-global
+        // hook outright, and `PubsubInterestDispatchHookGuard::exclusive()`
+        // (used by `generations_map_returns_to_baseline_after_topic_churn`
+        // below) unconditionally *clears* it. Without this mutual exclusion,
+        // that guard's clear could tear this hook out from under this test
+        // mid-flight — after `reached_unregister.notified()` below has
+        // returned but before `release_unregister.notify_one()` runs — which
+        // would strand this test's own unregister dispatch parked forever,
+        // regardless of topic filtering.
+        let _hook_guard = crate::test_helpers::PubsubInterestDispatchHookGuard::exclusive();
 
         // Establish one live local subscriber so the topic starts "present"
         // and let the initial registration land (present=true dispatches
@@ -2775,17 +2787,29 @@ mod tests {
         );
 
         // Gate the *unregister* dispatch right before its registry call.
+        //
+        // The closure below only acts on `dispatch_topic_key == topic`: the
+        // hook fires for EVERY `note_interest` register/unregister dispatch
+        // in the process while installed, regardless of which test's
+        // `PubsubInterestDispatchHookGuard` (if any) is currently held —
+        // the guard only serializes installation, it does not scope
+        // invocation. Without this filter, any other test's unregister
+        // dispatch for a *different* topic could park on `release_unregister`
+        // and either consume the sole `notify_one` intended for this test's
+        // own unregister or, worse, leave this test's `reached_unregister`
+        // never signaled at all. Filtering by topic removes that
+        // cross-test interference at the source, independent of the guard.
         let reached_unregister = Arc::new(tokio::sync::Notify::new());
         let release_unregister = Arc::new(tokio::sync::Notify::new());
         {
             let reached = Arc::clone(&reached_unregister);
             let release = Arc::clone(&release_unregister);
             crate::test_helpers::install_pubsub_interest_dispatch_hook(Arc::new(
-                move |_topic_key, present| {
+                move |dispatch_topic_key, present| {
                     let reached = Arc::clone(&reached);
                     let release = Arc::clone(&release);
                     Box::pin(async move {
-                        if !present {
+                        if dispatch_topic_key == topic && !present {
                             reached.notify_one();
                             release.notified().await;
                         }
@@ -2829,7 +2853,19 @@ mod tests {
     #[tokio::test]
     async fn generations_map_returns_to_baseline_after_topic_churn() {
         let pubsub = test_pubsub("pubsub-interest-generations-leak");
-        crate::test_helpers::clear_pubsub_interest_dispatch_hook();
+        // Exclusive access for the whole test. `final_advertised_state_
+        // matches_final_subscriber_state_under_churn`'s hook is filtered to
+        // its own topic, so this loop's differently-keyed churn topics can
+        // never be routed through it even if both tests run concurrently.
+        // This guard's remaining job is `exclusive()`'s own clear: without
+        // it, this call could tear that other test's hook out from under it
+        // mid-flight (after it has parked a dispatch on `release_unregister`
+        // but before that test signals it) instead of blocking until the
+        // other test's own guard releases. `exclusive()` acquiring the same
+        // process-wide install lock the other test's guard holds for its
+        // entire run is what makes these two tests fully serialize against
+        // each other here, not topic scoping.
+        let _hook_guard = crate::test_helpers::PubsubInterestDispatchHookGuard::exclusive();
 
         let baseline_len = {
             let state = pubsub.interest_state.lock().unwrap();
