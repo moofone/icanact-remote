@@ -260,16 +260,37 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
         victim_addr,
         PeerCapabilities::from_hello_exchange(&Hello::new(), &Hello::new()),
     );
-    let extension_precondition = observer
-        .registry
-        .gossip_extensions_for_outbound(victim_addr, icanact_remote::current_timestamp_nanos())
-        .await;
-    assert!(
-        extension_precondition
-            .and_then(|extensions| extensions.clock_echo)
-            .is_none(),
-        "precondition: observer owes no clock echo under the victim address"
-    );
+    // `wait_for_actor` above only proves the victim's connection-establishment
+    // FullSync applied; it says nothing about whether the observer's own
+    // *automatic* reply to that FullSync — which computes its outbound
+    // extensions through this same `gossip_extensions_for_outbound` call and
+    // may still owe (or be about to drain) a legitimate clock echo under
+    // `victim_addr` — has finished. A single immediate check here races that
+    // auto-response. Poll instead: a `Some` echo this early is the observer's
+    // own legitimate exchange still draining, not evidence of anything to
+    // fail on, so keep querying (each call drains whatever is pending) until
+    // it settles to `None`, and only fail if it never does.
+    {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let extensions = observer
+                .registry
+                .gossip_extensions_for_outbound(
+                    victim_addr,
+                    icanact_remote::current_timestamp_nanos(),
+                )
+                .await;
+            if extensions.and_then(|e| e.clock_echo).is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "precondition: observer's own legitimate clock-echo exchange with \
+                 the victim never quiesced"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     let before =
         protected_projection(&observer.registry, victim_addr, &victim.registry.peer_id).await;

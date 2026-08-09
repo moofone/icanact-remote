@@ -2756,7 +2756,13 @@ mod tests {
         let topic = topic_key("interest-convergence-churn");
         let name = interest_name(topic, &pubsub.local_peer_id);
 
-        crate::test_helpers::clear_pubsub_interest_dispatch_hook();
+        // Exclusive access for the whole test: `generations_map_returns_to_
+        // baseline_after_topic_churn` below also requires the process-global
+        // interest-dispatch hook be absent for its entire run, and without
+        // this mutual exclusion the two tests' concurrently-running churn
+        // can be routed through each other's hook state (see
+        // `PubsubInterestDispatchHookGuard`'s doc comment).
+        let _hook_guard = crate::test_helpers::PubsubInterestDispatchHookGuard::exclusive();
 
         // Establish one live local subscriber so the topic starts "present"
         // and let the initial registration land (present=true dispatches
@@ -2829,7 +2835,15 @@ mod tests {
     #[tokio::test]
     async fn generations_map_returns_to_baseline_after_topic_churn() {
         let pubsub = test_pubsub("pubsub-interest-generations-leak");
-        crate::test_helpers::clear_pubsub_interest_dispatch_hook();
+        // Exclusive access for the whole test: this churn loop's own
+        // `note_interest` calls must never be routed through
+        // `final_advertised_state_matches_final_subscriber_state_under_churn`'s
+        // hook, which pauses unregister dispatches on a `Notify` only that
+        // other test ever signals (see `PubsubInterestDispatchHookGuard`'s
+        // doc comment). Without this, a churned topic's dispatch loop can
+        // park forever on the other test's hook and never converge, leaving
+        // a stale `generations` entry behind.
+        let _hook_guard = crate::test_helpers::PubsubInterestDispatchHookGuard::exclusive();
 
         let baseline_len = {
             let state = pubsub.interest_state.lock().unwrap();

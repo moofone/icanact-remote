@@ -118,6 +118,66 @@ pub fn clear_pubsub_interest_dispatch_hook() {
     PUBSUB_INTEREST_DISPATCH_HOOK_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
 }
 
+/// Process-wide lock serializing every use of the global
+/// [`PUBSUB_INTEREST_DISPATCH_HOOK`]. Mirrors
+/// `lifecycle::RECORDER_INSTALL_LOCK`: the hook is shared, mutable, global
+/// state fired from every `RoutedPubSub` interest-dispatch loop in the
+/// process, and the default parallel test harness runs many
+/// `#[tokio::test]` functions concurrently in that one process. Without a
+/// single shared lock, one test's own interest-dispatch calls can be routed
+/// through a *different*, concurrently running test's hook closure and pause
+/// on a `Notify` that only the other test ever signals — the closure fires
+/// for `(topic_key, present)` regardless of which test's topic it was meant
+/// for, since the hook has no notion of test identity.
+#[cfg(any(test, feature = "test-helpers"))]
+static PUBSUB_INTEREST_DISPATCH_HOOK_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard serializing access to the process-wide pubsub
+/// interest-dispatch hook. Acquires
+/// `PUBSUB_INTEREST_DISPATCH_HOOK_INSTALL_LOCK` for its entire lifetime and
+/// clears the hook on drop, so a test that installs a hook and a test that
+/// merely requires no hook be active can never run concurrently and observe
+/// or interfere with each other's dispatches.
+///
+/// This is the only sanctioned way to touch the hook from a test: acquire
+/// this guard first (via [`Self::install`] or [`Self::exclusive`]), then —
+/// while still holding it — call [`install_pubsub_interest_dispatch_hook`]
+/// directly if the hook itself needs to change partway through the test.
+#[cfg(any(test, feature = "test-helpers"))]
+#[must_use = "the hook is cleared when this guard is dropped"]
+pub struct PubsubInterestDispatchHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl PubsubInterestDispatchHookGuard {
+    /// Acquires exclusive access and installs `hook`.
+    pub fn install(hook: InterestDispatchHook) -> Self {
+        let guard = Self::exclusive();
+        install_pubsub_interest_dispatch_hook(hook);
+        guard
+    }
+
+    /// Acquires exclusive access without installing a hook, clearing any
+    /// leftover one — for a test that requires the hook be absent for its
+    /// own duration (mutual exclusion against a concurrently running
+    /// [`Self::install`]).
+    pub fn exclusive() -> Self {
+        let lock = PUBSUB_INTEREST_DISPATCH_HOOK_INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_pubsub_interest_dispatch_hook();
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PubsubInterestDispatchHookGuard {
+    fn drop(&mut self) {
+        clear_pubsub_interest_dispatch_hook();
+    }
+}
+
 /// Fires the installed interest-dispatch hook, if any, awaiting the future
 /// it returns. Called by `RoutedPubSub`'s interest-dispatch loop
 /// immediately before issuing the register/unregister registry call.
