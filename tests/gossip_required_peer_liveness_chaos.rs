@@ -473,8 +473,7 @@ async fn configured_peers_retry_until_late_peer_comes_online() -> Result<(), Dyn
     // the connection settling, making this an at-least-once, not
     // exactly-once, assertion.
     assert_eq!(
-        ask_peer_until_success(&node_a, &peer_b_id, b"late-online", Duration::from_secs(1))
-            .await?,
+        ask_peer_until_success(&node_a, &peer_b_id, b"late-online", Duration::from_secs(1)).await?,
         b"b:late-online"
     );
     assert!(
