@@ -181,30 +181,6 @@ impl LockFreeConnection {
         self.abort_tasks_inner(false);
     }
 
-    /// Same as [`Self::abort_tasks`], but for a caller that cannot prove
-    /// EITHER way whether a live sibling still shares `correlation`: no
-    /// point-in-time snapshot taken before this call is safe to act on,
-    /// because there is always some gap between taking it and this call
-    /// actually running, in which a fresh connection sharing the tracker
-    /// could be published. Calling `abort_tasks()` and guessing "no
-    /// sibling" wrong cancels that fresh connection's in-flight asks;
-    /// calling `abort_tasks_keep_correlation()` and guessing "sibling
-    /// exists" wrong strands this instance's OWN in-flight asks until
-    /// their timeout instead of an immediate `ConnectionDropped`.
-    ///
-    /// This skips the immediate, synchronous `cancel_all()` (like
-    /// `abort_tasks_keep_correlation`) but, unlike it, does NOT set
-    /// `known_superseded` — that flag tells the IO task's own `ExitGuard`
-    /// "trust this, unconditionally do not cancel", which is exactly the
-    /// premature commitment this method exists to avoid. Left unset,
-    /// `ExitGuard` runs its own re-inference at the actual moment the task
-    /// exits — the latest point at which "is there now a live survivor"
-    /// can be answered, reading pool state fresh rather than a snapshot
-    /// this call's own caller took earlier.
-    pub(crate) fn abort_tasks_defer_correlation_decision(&self) {
-        self.abort_tasks_inner(false);
-    }
-
     fn abort_tasks_inner(&self, cancel_correlation: bool) {
         // NOTE: `JoinHandle::abort()` does not run destructors inside the task. Our IO task
         // sets `exit_flag` and cancels all pending correlation slots via an `ExitGuard` in Drop.

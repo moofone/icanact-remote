@@ -306,8 +306,6 @@ impl<T> ConnectionPool<T> {
             connection_counter: AtomicIsize::new(0),
             #[cfg(test)]
             cleanup_stale_race_hook: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            retire_orphan_metadata_race_hook: std::sync::Mutex::new(None),
             _marker: PhantomData,
         };
 
@@ -2635,34 +2633,14 @@ impl<T> ConnectionPool<T> {
         // deliberately no separate check-then-act pair here: a read
         // followed by an unconditional clear has a gap in which exactly
         // that concurrent publish can land and be clobbered.
-        // `target` and the peer's actual current connection can share their
-        // SESSION-level `correlation` tracker BY POINTER (both resolve
-        // through `get_or_create_correlation_tracker(peer_id)`) — see
-        // `unpublish_rejected_outbound_candidate`'s identical concern. Only
-        // relevant in the `Err(None)` arm below: when the CAS above actually
-        // clears the slot (`Ok(())`), `target` WAS the current connection and
-        // nothing else can be depending on the tracker as a live sibling --
-        // `is_current` records exactly that proof (or its absence) for the
-        // final decision at the end of this function.
-        //
-        // The `Err(None)` case cannot be resolved by a snapshot taken here,
-        // no matter how late: everything between any such snapshot and the
-        // actual `abort_tasks*` call below (logging, the lifecycle event,
-        // the `connections_by_peer`/`connections_by_addr` removals) is a
-        // window in which a fresh connection sharing this tracker could be
-        // published and start an ask. Guessing "no sibling" and acting on
-        // it would cancel that fresh ask. The final decision instead defers
-        // entirely to the IO task's own `ExitGuard`, which re-derives
-        // supersession from FRESH pool state at the actual moment the task
-        // exits — see `abort_tasks_defer_correlation_decision`'s doc.
-        let is_current = match self
+        match self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
                 session.compare_and_take_current_connection(target)
             })
             .unwrap_or(Err(None))
         {
-            Ok(()) => true,
+            Ok(()) => {}
             Err(Some(_other)) => {
                 debug!(
                     peer_id = %peer_id,
@@ -2687,9 +2665,8 @@ impl<T> ConnectionPool<T> {
                      session (found only via an address/alias fallback); proceeding with its \
                      own instance-scoped teardown"
                 );
-                false
             }
-        };
+        }
 
         let stream_instance_id = target
             .stream_handle
@@ -2760,14 +2737,7 @@ impl<T> ConnectionPool<T> {
         self.release_counted_connection(target);
 
         // H-004: Abort background tasks (writer, reader) to prevent resource leaks.
-        if is_current {
-            // Proven above: `target` WAS the current connection, so nothing
-            // else can be depending on the tracker as a live sibling.
-            target.abort_tasks();
-        } else {
-            // Ambiguous -- see the comment on `is_current`'s `match` above.
-            target.abort_tasks_defer_correlation_decision();
-        }
+        target.abort_tasks();
         true
     }
 
@@ -2847,22 +2817,6 @@ impl<T> ConnectionPool<T> {
         // actually cleared the slot, never an unconditional
         // peer-id-keyed removal that could delete a newer instance already
         // reinserted under the same `peer_id`.
-        // `connection` is, by the caller's contract, already known to be
-        // superseded. If it still shares its SESSION-level correlation
-        // tracker with whatever the peer's ACTUAL current connection now is
-        // (both resolve through `get_or_create_correlation_tracker(peer_id)`),
-        // aborting `connection`'s tasks unconditionally below would cancel
-        // that live survivor's in-flight asks too — see
-        // `unpublish_rejected_outbound_candidate` for the identical concern.
-        // `is_current` records whether the CAS below proved `connection` WAS
-        // the peer's current connection (no ambiguity possible: nothing
-        // else can then depend on the tracker as a live sibling) for the
-        // final decision at the end of this function. `peer_id_at_addr`
-        // being `None` is equally unambiguous the other way -- with no
-        // peer identity to check a survivor against at all, there is
-        // nothing to defer to either, so this counts as `true` (the
-        // pre-existing behavior for this case, unaffected by this fix).
-        let mut is_current = peer_id_at_addr.is_none();
         if let Some(peer_id) = peer_id_at_addr {
             let cleared = self
                 .peer_sessions
@@ -2870,7 +2824,6 @@ impl<T> ConnectionPool<T> {
                     session.compare_and_clear_current_connection(&connection)
                 })
                 .unwrap_or(false);
-            is_current = cleared;
             if cleared {
                 let stream_instance_id = connection
                     .stream_handle
@@ -2906,20 +2859,7 @@ impl<T> ConnectionPool<T> {
         }
 
         self.release_counted_connection(&connection);
-
-        if is_current {
-            // Proven above (or trivially true: no peer identity to defer
-            // to): nothing else can be depending on the tracker as a live
-            // sibling.
-            connection.abort_tasks();
-        } else {
-            // Ambiguous -- see `disconnect_connection_instance`'s identical
-            // comment on its own `is_current`. No point-in-time snapshot
-            // here is safe to act on; defer to the IO task's own
-            // `ExitGuard`, which re-derives supersession from FRESH pool
-            // state at the actual moment it exits.
-            connection.abort_tasks_defer_correlation_decision();
-        }
+        connection.abort_tasks();
         Some(connection)
     }
 
@@ -4256,26 +4196,6 @@ impl<T> ConnectionPool<T> {
         }
     }
 
-    #[cfg(test)]
-    fn set_retire_orphan_metadata_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
-        *self
-            .retire_orphan_metadata_race_hook
-            .lock()
-            .expect("retire-orphan metadata race hook mutex poisoned") = Some(Box::new(hook));
-    }
-
-    #[cfg(test)]
-    fn fire_retire_orphan_metadata_race_hook(&self) {
-        let hook = self
-            .retire_orphan_metadata_race_hook
-            .lock()
-            .expect("retire-orphan metadata race hook mutex poisoned")
-            .take();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
     /// Clean up stale connections.
     ///
     /// Captures the exact `Arc` each stale peer's session pointed at when
@@ -4306,98 +4226,10 @@ impl<T> ConnectionPool<T> {
         for (peer_id, conn) in stale {
             if self.disconnect_connection_instance(&peer_id, &conn) {
                 debug!(peer_id = %peer_id, "cleaned up disconnected connection (all aliases)");
-                continue;
             }
-            // The CAS in `disconnect_connection_instance` was lost: a fresh
-            // connection already supersedes `conn` in the peer's primary
-            // slot, so that call correctly declined to touch it and left
-            // `conn` completely untouched. But this pass's own scan above
-            // already confirmed `conn` itself is stale, and it is now
-            // unreachable from `peer_sessions` -- no future pass will ever
-            // observe it again through that scan. Retire it directly instead
-            // of leaking its address aliases, counted capacity, and
-            // background tasks forever.
-            //
-            // `remove_connection_instance_by_id(conn.addr, instance_id)`
-            // cannot be used here: the fresh connection that superseded
-            // `conn` commonly reconnects at the SAME address, in which case
-            // `connections_by_addr[conn.addr]` already holds the FRESH
-            // instance by this point, not `conn`. A lookup keyed on
-            // `conn.addr` would then find nothing and return early,
-            // stranding any OTHER alias `conn` still has (an inbound's
-            // ephemeral socket address alongside its bind address, say)
-            // along with its capacity and tasks. `retire_orphaned_stale_instance`
-            // instead sweeps every `connections_by_addr` alias by `conn`'s
-            // own `Arc` identity across the whole map, never gating on a
-            // lookup at one specific address first.
-            self.retire_orphaned_stale_instance(&conn);
-            debug!(
-                peer_id = %peer_id,
-                addr = %conn.addr,
-                "retired a superseded stale connection instance directly"
-            );
         }
 
         self.prune_idle_peer_sessions();
-    }
-
-    /// Retire a connection instance already known (by the caller's
-    /// contract) to be stale and superseded, without assuming its own
-    /// `addr` still indexes it in `connections_by_addr` -- a fresh
-    /// reconnect that superseded it may have already reused that exact
-    /// address. Sweeps every alias of `conn` by `Arc` identity across the
-    /// whole map instead. Takes no `peer_id`: the correlation-cancel
-    /// decision is unconditionally deferred (see below), so nothing here
-    /// needs to resolve the peer's current connection at all.
-    fn retire_orphaned_stale_instance(&self, conn: &Arc<LockFreeConnection>) {
-        let mut alias_addrs: Vec<SocketAddr> = Vec::new();
-        self.connections_by_addr.iter_sync(|addr, v| {
-            if Arc::ptr_eq(v, conn) {
-                alias_addrs.push(*addr);
-            }
-            true
-        });
-        for addr in alias_addrs {
-            let removed = self
-                .connections_by_addr
-                .remove_if_sync(&addr, |v| Arc::ptr_eq(v, conn))
-                .is_some();
-            if removed {
-                #[cfg(test)]
-                self.fire_retire_orphan_metadata_race_hook();
-                // A fresh, entirely unrelated connection can publish at
-                // `addr` in the gap between the `connections_by_addr`
-                // removal just above and this cleanup -- both
-                // `addr_to_peer_id` and per-address capabilities are keyed
-                // on the address alone, not on `conn`'s own identity, so
-                // clearing either unconditionally here would delete that
-                // fresh publisher's own mapping/capabilities, not `conn`'s.
-                // Re-checking immediately before each removal that nothing
-                // has since re-claimed `addr` in `connections_by_addr`
-                // keeps a late publisher's metadata untouched.
-                let _ = self
-                    .addr_to_peer_id
-                    .remove_if_sync(&addr, |_| !self.connections_by_addr.contains_sync(&addr));
-                if !self.connections_by_addr.contains_sync(&addr) {
-                    self.clear_capabilities_for_addr(&addr);
-                }
-            }
-        }
-
-        // `conn` is, by the caller's contract, already superseded and
-        // unreachable via `peer_sessions`. No point-in-time snapshot taken
-        // before this call is safe to act on for the correlation-cancel
-        // decision either: there is always some gap between such a
-        // snapshot and this call actually running, in which a fresh
-        // connection sharing `conn`'s SESSION-level correlation tracker
-        // (both resolve through `get_or_create_correlation_tracker(peer_id)`)
-        // could be published. Defer to the IO task's own `ExitGuard`
-        // instead, which re-infers this from FRESH pool state at the actual
-        // moment the task exits -- see
-        // `LockFreeConnection::abort_tasks_defer_correlation_decision` and
-        // `disconnect_connection_instance`'s identical reasoning.
-        self.release_counted_connection(conn);
-        conn.abort_tasks_defer_correlation_decision();
     }
 
     /// Bound restart-churn state without racing a reconnect. `remove_if_sync`

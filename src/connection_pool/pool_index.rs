@@ -60,14 +60,6 @@ pub struct ConnectionPool<T = ()> {
     /// technique as `OutboundDialGate`'s `race_hook`.
     #[cfg(test)]
     cleanup_stale_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// Test hook. Fired inside [`ConnectionPool::retire_orphaned_stale_instance`]
-    /// immediately after one of its address aliases is removed from
-    /// `connections_by_addr`, but before the corresponding
-    /// `addr_to_peer_id`/capability cleanup for that same address — lands a
-    /// concurrent, unrelated connection publishing at that exact address in
-    /// the gap between the two, deterministically instead of racing for it.
-    #[cfg(test)]
-    retire_orphan_metadata_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     _marker: PhantomData<fn() -> T>,
 }
 
