@@ -260,57 +260,40 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
         victim_addr,
         PeerCapabilities::from_hello_exchange(&Hello::new(), &Hello::new()),
     );
-    // `wait_for_actor` above only proves the victim's connection-establishment
-    // FullSync applied; it says nothing about whether the observer's own
-    // *automatic* reply to that FullSync — which computes its outbound
-    // extensions through this same `gossip_extensions_for_outbound` call and
-    // may still owe (or be about to drain) a legitimate clock echo under
-    // `victim_addr` — has finished. A single immediate check here races that
-    // auto-response.
+    // Drain any clock echo the connection's own bootstrap exchange legitimately
+    // owes the victim before establishing the security-invariant baseline
+    // below, so a later `Some` can only be attributed to the attack.
     //
-    // A single `None` read is NOT proof of quiescence: it is also exactly
-    // what an exchange that hasn't STARTED yet looks like (the inbound
-    // clock_probe that would populate `pending_clock_echoes` may not have
-    // been processed at all yet, e.g. still queued behind the same auto-reply
-    // task this precondition is racing). A probe that happens to land in
-    // that "not started" gap would wrongly read as "already settled," and
-    // the real echo could then still arrive later — during the attack
-    // simulation below, exactly the race this is meant to close. Require a
-    // SUSTAINED quiet interval instead of one empty read: several
-    // consecutive `None`s spaced apart, so a probe landing before the
-    // exchange starts cannot be mistaken for one landing after it ends. Any
-    // `Some` (either a genuine echo, mid-exchange) resets the streak — it is
-    // the observer's own legitimate activity still draining, not evidence to
-    // fail on — so keep querying until the streak requirement is met, and
-    // only fail if it never quiesces within the deadline.
-    {
-        const REQUIRED_QUIET_STREAK: u32 = 5;
-        let deadline = Instant::now() + Duration::from_millis(1_000);
-        let mut quiet_streak = 0u32;
-        loop {
-            let extensions = observer
-                .registry
-                .gossip_extensions_for_outbound(
-                    victim_addr,
-                    icanact_remote::current_timestamp_nanos(),
-                )
-                .await;
-            if extensions.and_then(|e| e.clock_echo).is_none() {
-                quiet_streak += 1;
-                if quiet_streak >= REQUIRED_QUIET_STREAK {
-                    break;
-                }
-            } else {
-                quiet_streak = 0;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "precondition: observer's own legitimate clock-echo exchange with \
-                 the victim never quiesced"
-            );
-            sleep(Duration::from_millis(15)).await;
-        }
-    }
+    // This is NOT a race against an in-flight background computation: the
+    // exchange that could populate `pending_clock_echoes` under `victim_addr`
+    // is `record_inbound_gossip_extensions`, called by whichever of
+    // `handle_incoming_message`'s `FullSync`/`FullSyncResponse` arms actually
+    // processes the victim's side of this connection's bootstrap — and in
+    // BOTH arms that call unconditionally precedes, in the same task and the
+    // same lock, the actor-state merge that makes `VICTIM_ACTOR` visible.
+    // `wait_for_actor` above therefore already proves — by program order, not
+    // by inference from an absent poll result — that any legitimate probe the
+    // victim sent has already been recorded, regardless of which side's
+    // initial `FullSync` happened to reach the other first (that direction is
+    // itself racy, but irrelevant here: either arm's recording step still
+    // precedes the merge `wait_for_actor` waits on).
+    //
+    // What is NOT guaranteed by that ordering is whether anything has since
+    // drained it: `gossip_extensions_for_outbound` only drains `pending_
+    // clock_echoes` once clock calibration is recognized for the peer, so if
+    // the recording above happened before this test's own `set_peer_
+    // capabilities` call just above, nothing else will ever drain it — no
+    // further legitimate traffic exists in this quiesced config. Draining it
+    // explicitly here, once, discarding the result, is therefore this test's
+    // own responsibility, not something to wait for. A concurrent drain by
+    // this registry's own auto-reply computation (if the `FullSync` arm is
+    // what fired) racing this exact call is harmless either way: `SccHashMap::
+    // remove_sync` is atomic, so at most one of the two observes the pending
+    // echo and whichever does not simply finds it already gone.
+    let _ = observer
+        .registry
+        .gossip_extensions_for_outbound(victim_addr, icanact_remote::current_timestamp_nanos())
+        .await;
 
     let before =
         protected_projection(&observer.registry, victim_addr, &victim.registry.peer_id).await;

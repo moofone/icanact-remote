@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
@@ -194,6 +196,53 @@ pub async fn fire_pubsub_interest_dispatch_hook(topic_key: u64, present: bool) {
     if let Some(hook) = hook {
         hook(topic_key, present).await;
     }
+}
+
+/// Test-only seam letting a test atomically overwrite a peer's
+/// `last_response_received_ms` inside `apply_gossip_results`'s own
+/// per-result `gossip_state` lock acquisition, immediately before its
+/// response-asymmetry check reads that field. Exists because backdating the
+/// timestamp from outside that lock — drop the lock, then call
+/// `apply_gossip_results`, which re-acquires it — leaves a window in which a
+/// peer's still-live connection can independently refresh the field before
+/// the call re-acquires the lock. Repeating that outside write immediately
+/// before every round only narrows the window; it can never close it, since
+/// the write and the read it races are still two separate critical sections.
+/// Setting the override here instead, consumed inside the same lock
+/// acquisition `apply_gossip_results` already uses for the read, makes the
+/// two atomic with respect to each other: no concurrent writer holding the
+/// same `gossip_state` mutex can land between them.
+///
+/// One-shot per peer: consumed (removed) the first time it is read, so a
+/// test that wants to backdate multiple rounds must set it again before each
+/// `apply_gossip_results` call.
+#[cfg(any(test, feature = "test-helpers"))]
+static RESPONSE_ASYMMETRY_BACKDATE: OnceLock<Mutex<HashMap<SocketAddr, u64>>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn response_asymmetry_backdate_slot() -> &'static Mutex<HashMap<SocketAddr, u64>> {
+    RESPONSE_ASYMMETRY_BACKDATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Sets the one-shot `last_response_received_ms` override `apply_gossip_
+/// results` applies for `peer_addr` the next time it processes a result for
+/// that peer, atomically with its own response-asymmetry read.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_response_asymmetry_backdate(peer_addr: SocketAddr, last_response_received_ms: u64) {
+    response_asymmetry_backdate_slot()
+        .lock()
+        .expect("response-asymmetry backdate mutex poisoned")
+        .insert(peer_addr, last_response_received_ms);
+}
+
+/// Consumes (removes) the pending backdate override for `peer_addr`, if any.
+/// Called only from `apply_gossip_results`, never from test code directly.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn take_response_asymmetry_backdate(peer_addr: SocketAddr) -> Option<u64> {
+    response_asymmetry_backdate_slot()
+        .lock()
+        .expect("response-asymmetry backdate mutex poisoned")
+        .remove(&peer_addr)
 }
 
 pub async fn wait_for_raw_payload(timeout: Duration) -> Option<Bytes> {

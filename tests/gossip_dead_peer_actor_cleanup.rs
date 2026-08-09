@@ -1052,16 +1052,21 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
         // inbound payload processed on this real, still-alive TLS connection
         // (e.g. a one-time handshake-adjacent exchange with the subscriber,
         // not gated by any of the quiesced background intervals above) can
-        // independently reset it too. A single backdate write performed once,
-        // before the loop below, races whichever of those last fires — this
-        // was observed failing 1-2/40 both in isolation and under whole-file
-        // concurrency alike (not a concurrency artifact), always at the first
-        // assert below, always fast (~0.01s, i.e. failing before any round
-        // trip that would explain a slow path). Re-asserting the backdate
-        // immediately before every no-response round, rather than once
-        // up front, keeps the exposure window to the gap between that write
-        // and this same round's `apply_gossip_results` call, instead of
-        // however long actor/state setup plus every prior round took.
+        // independently reset it too.
+        //
+        // Backdating from outside `apply_gossip_results`'s own lock
+        // acquisition — drop the lock, then call `apply_gossip_results`,
+        // which re-acquires it — leaves a window between the write and the
+        // response-asymmetry read that any of those writers can land in.
+        // Repeating the write immediately before every round only narrows
+        // that window; it cannot close it, since the write and the read it
+        // races remain two separate critical sections no matter how close
+        // together they run. `set_response_asymmetry_backdate` instead arms
+        // a one-shot override that `apply_gossip_results` itself applies
+        // inside the SAME lock acquisition its response-asymmetry check
+        // reads from, making the two atomic with respect to each other: no
+        // concurrent writer holding that same `gossip_state` mutex can ever
+        // land between them.
         let silence_ms = u64::try_from(
             config
                 .peer_liveness_window
@@ -1074,13 +1079,10 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
         // socket level (connection stays "usable") but is treated as having
         // stopped answering at the app level — the UDP black-hole shape.
         for sequence in 0..config.max_peer_failures {
-            {
-                let mut state = publisher.registry.gossip_state.lock().await;
-                if let Some(peer) = state.peers.get_mut(&sub_addr) {
-                    peer.last_response_received_ms =
-                        icanact_remote::current_timestamp_millis().saturating_sub(silence_ms);
-                }
-            }
+            icanact_remote::test_helpers::set_response_asymmetry_backdate(
+                sub_addr,
+                icanact_remote::current_timestamp_millis().saturating_sub(silence_ms),
+            );
             publisher
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {

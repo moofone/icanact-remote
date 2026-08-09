@@ -2,14 +2,16 @@ mod common;
 
 use bytes::Bytes;
 use common::{DynError, TlsHandle, connect_bidirectional, create_tls_node, wait_for_condition};
+use icanact_remote::lifecycle::{TransportLifecycleEvent, TransportLifecycleRecorderGuard};
 use icanact_remote::registry::{ActorMessageHandlerSync, ActorResponse, RegistryChange};
 use icanact_remote::{
     AlignedBytes, BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PeerId,
     RegistrationPriority,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
-    Arc, Once,
+    Arc, Mutex, Once, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -110,6 +112,121 @@ async fn wait_connected(from: &TlsHandle, to: &PeerId, timeout: Duration) -> boo
 /// setup helpers are bounded here, never a test's own post-setup traffic.
 static NODE_SETUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// Per-peer count of transport lifecycle events observed by
+/// [`ensure_lifecycle_quiescence_recorder_installed`], since process start.
+/// Keyed by `PeerId` (not globally) so that one pair's settlement wait never
+/// has to wait out unrelated, concurrently-running tests' own ongoing
+/// gossip/reconnect churn (several of this file's configs run peer
+/// supervision on short cadences) — only further lifecycle activity that
+/// actually mentions one of *this* pair's two identities counts as
+/// instability for that pair's own wait.
+static PEER_LIFECYCLE_EVENT_COUNTS: OnceLock<Mutex<HashMap<PeerId, u64>>> = OnceLock::new();
+
+fn peer_lifecycle_event_counts() -> &'static Mutex<HashMap<PeerId, u64>> {
+    PEER_LIFECYCLE_EVENT_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extracts the peer identity a transport lifecycle event is about, if any.
+/// `ConnectionCountMarkerAttempt`/`ConnectionCountIncrementAttempt` are
+/// per-connection-instance instrumentation with no peer identity to key on
+/// and are not relevant to connection tie-break settlement, so they are
+/// intentionally excluded from quiescence tracking.
+fn lifecycle_event_peer(event: &TransportLifecycleEvent) -> Option<&PeerId> {
+    match event {
+        TransportLifecycleEvent::OutboundStart { peer, .. } => peer.as_ref(),
+        TransportLifecycleEvent::ConnectionCountMarkerAttempt { .. }
+        | TransportLifecycleEvent::ConnectionCountIncrementAttempt { .. } => None,
+        TransportLifecycleEvent::OutboundSuppressedWaitInbound { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundReady { peer, .. }
+        | TransportLifecycleEvent::OutboundSuppressedInboundTimeout { peer, .. }
+        | TransportLifecycleEvent::WrongDirectionEvicted { peer, .. }
+        | TransportLifecycleEvent::InboundReady { peer, .. }
+        | TransportLifecycleEvent::SessionPublished { peer, .. }
+        | TransportLifecycleEvent::DuplicateIdentityRejected { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizePublishAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeClearRaceRetry { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeAcceptIncomingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeReplaceExistingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::OutboundFinalizeExistingSnapshotTaken { peer, .. }
+        | TransportLifecycleEvent::SocketFailureMatchedInstanceTeardownAttempt { peer, .. }
+        | TransportLifecycleEvent::SessionRemoved { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptPublishAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptClearRaceRetry { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptAcceptIncomingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptReplaceExistingRetryAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptIndexAttempt { peer, .. }
+        | TransportLifecycleEvent::InboundAcceptEphemeralAliasAttempt { peer, .. }
+        | TransportLifecycleEvent::GetConnectionSelfHealClearAttempt { peer, .. }
+        | TransportLifecycleEvent::FullSyncApplyPendingMutation { peer, .. }
+        | TransportLifecycleEvent::DeltaApplyPendingMutation { peer, .. } => Some(peer),
+    }
+}
+
+/// Installs the process-wide transport lifecycle recorder exactly once, for
+/// the remainder of this test binary's run, so [`wait_for_peer_quiescence`]
+/// can observe real tie-break/finalization activity instead of guessing a
+/// fixed sleep covers it.
+///
+/// Deliberately never uninstalled: `TransportLifecycleRecorderGuard`'s
+/// uninstall-on-drop exists so concurrently running tests never clobber each
+/// other's recorder, but every test in this file wants the SAME recorder for
+/// its entire run, and each `tests/*.rs` file is its own separate test
+/// binary/process (`lifecycle`'s recorder statics are not shared with any
+/// other file), so there is no other installer here to protect against by
+/// ever uninstalling it.
+fn ensure_lifecycle_quiescence_recorder_installed() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        std::mem::forget(TransportLifecycleRecorderGuard::install(Arc::new(
+            |event: TransportLifecycleEvent| {
+                let Some(peer) = lifecycle_event_peer(&event) else {
+                    return;
+                };
+                let mut counts = peer_lifecycle_event_counts()
+                    .lock()
+                    .expect("peer lifecycle event counts mutex poisoned");
+                *counts.entry(peer.clone()).or_insert(0) += 1;
+            },
+        )));
+    });
+}
+
+/// Waits until no transport lifecycle event mentioning any of `peer_ids` has
+/// fired for a full `window`, proving any in-flight tie-break/finalization
+/// for a just-established connection between them has actually concluded —
+/// rather than sleeping a single fixed duration measured from an arbitrary
+/// point and hoping it covers whatever internal timer the library is
+/// running. Any qualifying event reset the wait to a fresh `window`, so if a
+/// pending resolution (eviction, re-publish, wait-timeout fallback) lands
+/// during the sleep, that activity itself extends the wait past it; only a
+/// window with no such activity at all counts as settled. Bounded by
+/// `deadline` so a genuinely stuck connection still fails the test loudly
+/// instead of hanging it.
+async fn wait_for_peer_quiescence(peer_ids: &[PeerId], window: Duration, deadline: Duration) {
+    let snapshot = |ids: &[PeerId]| -> Vec<u64> {
+        let counts = peer_lifecycle_event_counts()
+            .lock()
+            .expect("peer lifecycle event counts mutex poisoned");
+        ids.iter()
+            .map(|id| counts.get(id).copied().unwrap_or(0))
+            .collect()
+    };
+    let start = Instant::now();
+    loop {
+        let before = snapshot(peer_ids);
+        sleep(window).await;
+        let after = snapshot(peer_ids);
+        if before == after {
+            return;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "transport lifecycle events for {peer_ids:?} never went quiet for a \
+             full {window:?} window"
+        );
+    }
+}
+
 /// `connect_bidirectional` (from `common`) under `NODE_SETUP_ADMISSION` —
 /// see that constant's doc comment.
 ///
@@ -120,21 +237,33 @@ static NODE_SETUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 /// below). Releasing the permit right there, as this function originally
 /// did, stops bounding concurrency for exactly the window the semaphore
 /// exists to bound: up to two *more* setups could start while this one's
-/// tie-break/finalization is still in flight, letting three or more
-/// overlap the same `DEFAULT_PREFERRED_INBOUND_WAIT_MS` fallback window at
-/// once. Hold the permit for that whole known-duration window (not just
-/// until the first liveness signal) before releasing, so the guarded region
-/// actually covers the interval the tie-break fallback can still be
-/// resolving in.
+/// tie-break/finalization is still in flight, letting three or more overlap
+/// the same `DEFAULT_PREFERRED_INBOUND_WAIT_MS` fallback window at once.
+///
+/// A fixed sleep after `connect_bidirectional` returns does not actually fix
+/// this: `active_peers >= 1` can become true as soon as this call's OWN
+/// outbound dial succeeds, which may be before the reciprocal direction's
+/// connection — and the collision/tie-break it can trigger — has even
+/// arrived, so a timer started at the return point can still elapse before
+/// the library's own internal fallback timer (started later) fires. Instead,
+/// hold the permit until [`wait_for_peer_quiescence`] proves no further
+/// transport lifecycle activity for this exact pair for a full settle
+/// window, which by construction cannot end early relative to whatever
+/// internal timer is still running: any activity from that timer resolving
+/// resets the wait.
 async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
+    ensure_lifecycle_quiescence_recorder_installed();
     let _permit = NODE_SETUP_ADMISSION
         .acquire()
         .await
         .expect("NODE_SETUP_ADMISSION is never closed");
     let result = connect_bidirectional(a, b).await;
-    sleep(Duration::from_millis(
-        icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS,
-    ))
+    let peer_ids = [a.registry.peer_id.clone(), b.registry.peer_id.clone()];
+    wait_for_peer_quiescence(
+        &peer_ids,
+        Duration::from_millis(icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS),
+        Duration::from_secs(5),
+    )
     .await;
     result
 }
