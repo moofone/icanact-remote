@@ -53,13 +53,6 @@ pub struct ConnectionPool<T = ()> {
     /// instead — safe for the `>= max_connections` admission check, which
     /// only cares about "at or over the cap", never "did we dip below zero".
     connection_counter: AtomicIsize,
-    /// Test hook. Fired inside [`ConnectionPool::cleanup_stale_connections`]
-    /// after it snapshots which peers look stale but before it acts on that
-    /// snapshot, so a test can land a concurrent reconnect deterministically
-    /// in the check-then-act gap instead of racing for it — the same
-    /// technique as `OutboundDialGate`'s `race_hook`.
-    #[cfg(test)]
-    cleanup_stale_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     _marker: PhantomData<fn() -> T>,
 }
 

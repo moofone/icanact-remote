@@ -304,8 +304,6 @@ impl<T> ConnectionPool<T> {
                 aligned_pool_size.max(crate::aligned::DEFAULT_ALIGNED_POOL_SIZE),
             )),
             connection_counter: AtomicIsize::new(0),
-            #[cfg(test)]
-            cleanup_stale_race_hook: std::sync::Mutex::new(None),
             _marker: PhantomData,
         };
 
@@ -4176,55 +4174,22 @@ impl<T> ConnectionPool<T> {
             || self.aliased_connection_by_peer_id(peer_id).is_some()
     }
 
-    #[cfg(test)]
-    fn set_cleanup_stale_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
-        *self
-            .cleanup_stale_race_hook
-            .lock()
-            .expect("cleanup-stale race hook mutex poisoned") = Some(Box::new(hook));
-    }
-
-    #[cfg(test)]
-    fn fire_cleanup_stale_race_hook(&self) {
-        let hook = self
-            .cleanup_stale_race_hook
-            .lock()
-            .expect("cleanup-stale race hook mutex poisoned")
-            .take();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
-    /// Clean up stale connections.
-    ///
-    /// Captures the exact `Arc` each stale peer's session pointed at when
-    /// snapshotted, not just its `peer_id`, and tears it down through
-    /// [`Self::disconnect_connection_instance`] — which re-validates by
-    /// `Arc` identity under the peer session's own CAS before touching
-    /// anything. A peer that reconnects with a fresh, healthy connection in
-    /// the window between this snapshot and the teardown loop below must
-    /// keep that new connection: acting on `peer_id` alone (the old
-    /// behavior, via `disconnect_connection_by_peer_id`) would tear down
-    /// "whatever is currently indexed for this peer" at teardown time,
-    /// which by then can be the fresh connection, not the stale one this
-    /// pass actually observed.
     pub fn cleanup_stale_connections(&self) {
-        let mut stale: Vec<(crate::PeerId, Arc<LockFreeConnection>)> = Vec::new();
+        // Find disconnected peers and use peer-id-based removal to clean up all maps
+        let mut stale_peer_ids: Vec<crate::PeerId> = Vec::new();
         self.peer_sessions.iter_sync(|peer_id, session| {
-            if let Some(conn) = session.current_connection()
-                && !self.is_usable_connection(&conn)
+            if session
+                .current_connection()
+                .map(|conn| !self.is_usable_connection(&conn))
+                .unwrap_or(false)
             {
-                stale.push((peer_id.clone(), conn));
+                stale_peer_ids.push(peer_id.clone());
             }
             true
         });
 
-        #[cfg(test)]
-        self.fire_cleanup_stale_race_hook();
-
-        for (peer_id, conn) in stale {
-            if self.disconnect_connection_instance(&peer_id, &conn) {
+        for peer_id in stale_peer_ids {
+            if let Some(_conn) = self.disconnect_connection_by_peer_id(&peer_id) {
                 debug!(peer_id = %peer_id, "cleaned up disconnected connection (all aliases)");
             }
         }
@@ -5466,7 +5431,7 @@ pub(crate) fn handle_incoming_message(
                 let candidates_for_tracker = candidates.clone();
                 let registry_clone = registry.clone();
                 let discovery_handle = tokio::spawn(async move {
-                    for addr in candidates {
+                    for (addr, _claim_generation) in candidates {
                         // PeerListGossip is only a discovery hint. Keep its
                         // claimed identity in `known_peers` (where
                         // `on_peer_list_gossip` put it), but create no

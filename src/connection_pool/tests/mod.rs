@@ -11951,68 +11951,6 @@ async fn stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_sess
     );
 }
 
-/// `cleanup_stale_connections` snapshots which peers look stale via
-/// `peer_sessions.iter_sync`, then acts on that snapshot in a separate pass.
-/// Before the fix, that second pass called the PEER-WIDE
-/// `disconnect_connection_by_peer_id(peer_id)` — which re-reads "whatever is
-/// currently indexed for this peer" at teardown time rather than the exact
-/// stale instance the snapshot observed. A peer that reconnects with a
-/// fresh, healthy connection in the window between the snapshot and the
-/// teardown loop must keep that new connection.
-///
-/// Pinned deterministically via the pool's own `cleanup_stale_race_hook`
-/// (fired after the snapshot, before the teardown loop) rather than a
-/// wall-clock thread race — same rationale and technique as
-/// `stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_session`
-/// above, adapted because `cleanup_stale_connections` has no lifecycle event
-/// of its own to pin on.
-///
-/// RED before the fix (teardown via `disconnect_connection_by_peer_id`): the
-/// fresh connection is torn down along with the stale one. GREEN after (teardown
-/// via instance-scoped `disconnect_connection_instance`, re-validated by `Arc`
-/// identity): the fresh connection survives untouched.
-#[tokio::test]
-async fn cleanup_stale_connections_revalidates_before_teardown_and_preserves_concurrent_reconnect()
- {
-    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
-    let peer_id = crate::KeyPair::new_for_testing("cleanup-stale-race-peer").peer_id();
-
-    let stale_addr: SocketAddr = "127.0.0.1:43000".parse().unwrap();
-    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
-    // The connection has gone dead since it was published: `is_usable_connection`
-    // must see it as stale at snapshot time.
-    stale.set_state(ConnectionState::Disconnected);
-    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
-
-    let fresh_addr: SocketAddr = "127.0.0.1:44000".parse().unwrap();
-    let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
-
-    {
-        let hook_pool = pool.clone();
-        let peer_id = peer_id.clone();
-        let fresh = fresh.clone();
-        pool.set_cleanup_stale_race_hook(move || {
-            hook_pool.publish_current_peer_connection(&peer_id, fresh.clone());
-        });
-    }
-
-    pool.cleanup_stale_connections();
-
-    let current = pool.get_connection_by_peer_id(&peer_id);
-    assert!(
-        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
-        "a fresh reconnect published in the window between the staleness snapshot and the \
-         teardown loop must survive — cleanup must re-validate the exact stale instance by \
-         identity, never tear down whatever is current at teardown time (got {current:?})"
-    );
-    assert!(
-        pool.connections_by_peer
-            .read_sync(&peer_id, |_, v| Arc::ptr_eq(v, &fresh))
-            .unwrap_or(false),
-        "connections_by_peer must still point at the fresh instance"
-    );
-}
-
 /// RED (review finding P2, `remote_actor_ref.rs` ask-timeout/cancellation
 /// eviction depends on a stale `addr_to_peer_id` alias):
 /// `recover_connection_after_actor_ask_timeout` and

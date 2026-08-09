@@ -2095,6 +2095,88 @@ impl GossipState {
                         moved.current_session_epoch = existing.current_session_epoch;
                         moved.accept_lower_sequence_from = existing.accept_lower_sequence_from;
                     }
+
+                    // Every remaining field is independent, currently-tracked
+                    // state for the SAME peer, possibly accumulated more
+                    // recently at the bind-keyed address than anything
+                    // `moved` picked up in its brief life at the ephemeral
+                    // source address. Merge each by its own semantics
+                    // instead of letting the trailing struct assignment
+                    // below silently discard `existing`'s side -- a
+                    // fresh-but-behind connection must never regress a
+                    // healthier, more established one. Enumerated
+                    // explicitly (`PeerInfo { .. }` is never used to build
+                    // `moved` or read from `existing` here) so a future
+                    // field addition to `PeerInfo` is a compile error in
+                    // this match, not a silent overwrite.
+                    let PeerInfo {
+                        address: _,
+                        peer_address: _,
+                        inbound_observed: existing_inbound_observed,
+                        outbound_dial_success: existing_outbound_dial_success,
+                        node_id: _,
+                        dns_name: existing_dns_name,
+                        failures: existing_failures,
+                        last_attempt: existing_last_attempt,
+                        last_success: existing_last_success,
+                        last_sequence: _,
+                        last_sent_sequence: _,
+                        consecutive_deltas: existing_consecutive_deltas,
+                        last_failure_time: existing_last_failure_time,
+                        last_dns_refresh_attempt: existing_last_dns_refresh_attempt,
+                        last_response_received_ms: existing_last_response_received_ms,
+                        accept_lower_sequence_from: _,
+                        current_session_source: _,
+                        current_session_connection: _,
+                        current_session_epoch: _,
+                        identity_verified: existing_identity_verified,
+                        transport_source_keyed: _,
+                    } = existing.clone();
+
+                    // Sticky: once true on either side, stays true.
+                    moved.inbound_observed |= existing_inbound_observed;
+                    moved.outbound_dial_success |= existing_outbound_dial_success;
+                    moved.identity_verified |= existing_identity_verified;
+
+                    // A DNS name is effectively static per identity; keep
+                    // whichever side actually resolved one.
+                    if moved.dns_name.is_none() {
+                        moved.dns_name = existing_dns_name;
+                    }
+
+                    // Most-recent-wins for plain freshness timestamps.
+                    moved.last_dns_refresh_attempt = moved
+                        .last_dns_refresh_attempt
+                        .max(existing_last_dns_refresh_attempt);
+                    moved.last_response_received_ms = moved
+                        .last_response_received_ms
+                        .max(existing_last_response_received_ms);
+                    // Never regress a higher exchange streak just because
+                    // the other side has not exchanged anything yet.
+                    moved.consecutive_deltas =
+                        moved.consecutive_deltas.max(existing_consecutive_deltas);
+
+                    // `failures`/`last_failure_time` describe the outcome of
+                    // a specific attempt, so they must come from whichever
+                    // side attempted more recently -- kept as a matched
+                    // pair, never cherry-picked independently, so the
+                    // merged entry can't end up with one side's failure
+                    // count paired with the other side's failure timestamp.
+                    if existing_last_attempt > moved.last_attempt {
+                        moved.failures = existing_failures;
+                        moved.last_failure_time = existing_last_failure_time;
+                    }
+                    moved.last_attempt = moved.last_attempt.max(existing_last_attempt);
+                    moved.last_success = moved.last_success.max(existing_last_success);
+
+                    // `transport_source_keyed` describes whether THIS
+                    // entry's own key (`address`) is a raw ephemeral TCP
+                    // source rather than a dialable address -- `address` is
+                    // always `new_addr` (a resolved bind address) after a
+                    // migration, so the merged entry can never truthfully
+                    // claim this regardless of what either side carried
+                    // beforehand.
+                    moved.transport_source_keyed = false;
                 }
                 *slot.get_mut() = moved;
             }
@@ -10627,7 +10709,20 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Handle incoming peer list gossip
-    /// Returns candidates to connect to
+    /// Returns candidates to connect to, paired with the `Pending`
+    /// `claim_generation` each was freshly assigned by THIS call.
+    ///
+    /// Captured here, under the same `gossip_state` lock acquisition that
+    /// marks each candidate `Pending`, rather than left for a caller to
+    /// re-derive later (e.g. after spawning a dial task and reacquiring the
+    /// lock separately): that gap is exactly where a candidate can resolve
+    /// and be legitimately re-claimed by a different, later round with a
+    /// fresh generation before the original caller gets back to it. A
+    /// caller re-deriving "the current generation" at that later point
+    /// would adopt the NEWER round's generation as if it were its own --
+    /// see `DiscoveryTaskTracker`'s doc for what that breaks when the
+    /// older task is later displaced. Threading the value captured here
+    /// closes that gap structurally instead of narrowing it.
     ///
     /// IMPORTANT: "Don't penalize the messenger" principle (Phase 4):
     /// - Unreachable peers in the list do NOT cause sender to be penalized
@@ -10638,7 +10733,7 @@ impl<T: 'static> GossipRegistry<T> {
         peers: Vec<PeerInfoGossip>,
         sender_addr: &str,
         timestamp: u64,
-    ) -> Vec<SocketAddr> {
+    ) -> Vec<(SocketAddr, u64)> {
         // Resource exhaustion protection - sender is sending suspicious data
         if peers.len() > Self::MAX_PEER_LIST_SIZE {
             warn!(
@@ -10802,7 +10897,21 @@ impl<T: 'static> GossipRegistry<T> {
             // Note: PeerDiscovery filters out unsafe addresses via is_safe_to_dial()
             // but does NOT penalize the sender - only skips unsafe targets
             if let Some(ref mut discovery) = gossip_state.peer_discovery {
-                discovery.on_peer_list_gossip(&peers)
+                let selected = discovery.on_peer_list_gossip(&peers);
+                // Capture each candidate's freshly-assigned generation NOW,
+                // immediately, still under this same lock acquisition --
+                // see this method's own doc for why re-deriving it later
+                // is unsafe.
+                selected
+                    .into_iter()
+                    .map(|addr| {
+                        let claim_generation = discovery
+                            .get_peer_state(&addr)
+                            .and_then(crate::peer_discovery::PeerState::pending_claim_generation)
+                            .unwrap_or(0);
+                        (addr, claim_generation)
+                    })
+                    .collect()
             } else {
                 vec![]
             }
@@ -10827,41 +10936,24 @@ impl<T: 'static> GossipRegistry<T> {
     /// `PeerDiscovery::clear_pending_if_generation` itself. Candidates the
     /// old task had already resolved are harmless no-ops there.
     ///
-    /// Stamps each of THIS task's candidates with its current `Pending`
-    /// `claim_generation` before handing them to `discovery_task.set` -- the
-    /// generation proof `clear_pending_if_generation` needs when this task
-    /// is itself displaced later. Reading that generation and clearing the
-    /// PREVIOUS task's displaced candidates both happen under this same
-    /// `gossip_state` lock acquisition, so there is no gap for a
-    /// concurrent re-claim to land in between.
+    /// `candidates` must be exactly what [`Self::on_peer_list_gossip`]
+    /// returned for this task's own dial round -- each address paired with
+    /// the `claim_generation` captured AT THAT ORIGINAL selection call, not
+    /// re-derived here. Re-deriving it here (a fresh read of `addr`'s
+    /// CURRENT generation) would be reading it after the caller already
+    /// spawned the dial task and after this method separately reacquired
+    /// the gossip lock -- a real gap in which this exact candidate can
+    /// resolve and be legitimately re-claimed by a different, later round
+    /// with a fresh generation. This task would then unwittingly adopt
+    /// that NEWER round's generation as its own and, when later displaced,
+    /// incorrectly clear the newer round's live reservation.
     pub(crate) async fn track_discovery_task(
         &self,
         handle: tokio::task::AbortHandle,
-        candidates: Vec<SocketAddr>,
+        candidates: Vec<(SocketAddr, u64)>,
     ) {
         let mut gossip_state = self.gossip_state.lock().await;
-        let stamped_candidates: Vec<(SocketAddr, u64)> = candidates
-            .into_iter()
-            .map(|addr| {
-                // `unwrap_or(0)` when the candidate is not (or no longer)
-                // Pending at all: `clear_pending_if_generation` only ever
-                // acts on a currently-Pending row, and real generations
-                // start at 1 (`PeerDiscovery::next_claim_generation` is
-                // pre-incremented before its first use), so 0 can never
-                // collide with one -- this just means "never clear" for
-                // that entry, correct, since there was nothing of THIS
-                // task's to strand in the first place.
-                let claim_generation = gossip_state
-                    .peer_discovery
-                    .as_ref()
-                    .and_then(|discovery| discovery.get_peer_state(&addr))
-                    .and_then(crate::peer_discovery::PeerState::pending_claim_generation)
-                    .unwrap_or(0);
-                (addr, claim_generation)
-            })
-            .collect();
-
-        let displaced = self.discovery_task.set(handle, stamped_candidates);
+        let displaced = self.discovery_task.set(handle, candidates);
         if displaced.is_empty() {
             return;
         }
@@ -14340,6 +14432,130 @@ mod tests {
             migrated.current_session_source, None,
             "an unrelated stale owner's session source must not be inherited by a different \
              identity"
+        );
+    }
+
+    /// The `same_identity` merge only spliced `last_sequence`/`last_sent_sequence`
+    /// and the session-arming tuple before this fix; every other field was
+    /// discarded by the trailing `*slot.get_mut() = moved` assigning the
+    /// whole struct. A late FullSync from a draining ephemeral connection
+    /// (`moved`, which has had no chance to accumulate real health history)
+    /// could therefore silently overwrite a newer bind-keyed entry's
+    /// `failures`, `last_success`, `last_response_received_ms`, DNS name,
+    /// and verification/observed flags -- making an actively healthy,
+    /// already-verified peer look failed or stale, or an already-DNS-resolved
+    /// peer look unresolved, purely because of migration timing.
+    #[tokio::test]
+    async fn migrate_peer_entry_merges_remaining_metadata_field_by_field() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7502),
+            test_config_with_seed("migrate-peer-entry-metadata"),
+        );
+        let node_id = test_peer_id("migrate-peer-entry-metadata-remote").to_node_id();
+        let ephemeral_addr = test_addr(9520);
+        let bind_addr = test_addr(9521);
+
+        let mut gossip_state = reg.gossip_state.lock().await;
+
+        // The bind-keyed entry: healthier, more recently active, and
+        // already DNS-resolved/verified.
+        let mut established = peer_info_with_node_id(bind_addr, node_id);
+        established.inbound_observed = false;
+        established.outbound_dial_success = true;
+        established.identity_verified = true;
+        established.dns_name = Some("established.example".to_string());
+        established.failures = 3;
+        established.last_attempt = 200;
+        established.last_success = 150;
+        established.last_failure_time = Some(190);
+        established.last_dns_refresh_attempt = Some(180);
+        established.last_response_received_ms = 5_000;
+        established.consecutive_deltas = 10;
+        established.transport_source_keyed = false;
+        gossip_state.peers.insert(bind_addr, established);
+
+        // The ephemeral-keyed entry being migrated in: freshly authenticated,
+        // has not yet accumulated any real health history, and was itself
+        // keyed by a raw TCP source (not a dialable address) before this
+        // migration.
+        let mut fresh = peer_info_with_node_id(ephemeral_addr, node_id);
+        fresh.inbound_observed = true;
+        fresh.outbound_dial_success = false;
+        fresh.identity_verified = false;
+        fresh.dns_name = None;
+        fresh.failures = 0;
+        fresh.last_attempt = 100;
+        fresh.last_success = 50;
+        fresh.last_failure_time = None;
+        fresh.last_dns_refresh_attempt = None;
+        fresh.last_response_received_ms = 1_000;
+        fresh.consecutive_deltas = 2;
+        fresh.transport_source_keyed = true;
+        gossip_state.peers.insert(ephemeral_addr, fresh);
+
+        gossip_state.migrate_peer_entry(ephemeral_addr, bind_addr);
+
+        let migrated = gossip_state
+            .peers
+            .get(&bind_addr)
+            .expect("bind-keyed entry must still exist after migration");
+
+        assert!(
+            migrated.inbound_observed,
+            "sticky flag: once observed inbound by either side, must stay observed"
+        );
+        assert!(
+            migrated.outbound_dial_success,
+            "sticky flag: once a successful outbound dial by either side, must stay true"
+        );
+        assert!(
+            migrated.identity_verified,
+            "sticky flag: once verified by either side, must stay verified"
+        );
+        assert_eq!(
+            migrated.dns_name.as_deref(),
+            Some("established.example"),
+            "an already-resolved DNS name must not be discarded by a fresher connection \
+             that has not resolved one yet"
+        );
+        assert_eq!(
+            migrated.last_dns_refresh_attempt,
+            Some(180),
+            "most-recent-wins: the later DNS refresh timestamp must survive"
+        );
+        assert_eq!(
+            migrated.last_response_received_ms, 5_000,
+            "most-recent-wins: the later liveness response timestamp must survive"
+        );
+        assert_eq!(
+            migrated.consecutive_deltas, 10,
+            "the higher exchange streak must not be regressed by a connection that has not \
+             exchanged anything yet"
+        );
+        assert_eq!(
+            migrated.last_attempt, 200,
+            "most-recent-wins: the later attempt timestamp must survive"
+        );
+        assert_eq!(
+            migrated.last_success, 150,
+            "most-recent-wins: the later success timestamp must survive"
+        );
+        assert_eq!(
+            migrated.failures, 3,
+            "the health-state triple (failures/last_failure_time) must come from whichever \
+             side attempted more recently, not be silently reset by a fresher connection \
+             that has not attempted anything at this address yet"
+        );
+        assert_eq!(
+            migrated.last_failure_time,
+            Some(190),
+            "must be paired with `failures` from the same (more recently active) side"
+        );
+        assert!(
+            !migrated.transport_source_keyed,
+            "the migrated entry is now keyed by `bind_addr`, a resolved dialable address -- \
+             it can never legitimately claim its key is a raw ephemeral TCP source, \
+             regardless of what either side carried before the merge"
         );
     }
 
@@ -21441,7 +21657,7 @@ mod tests {
             .await;
 
         assert!(
-            !candidates.contains(&self_advertised_addr),
+            !candidates.iter().any(|(addr, _)| *addr == self_advertised_addr),
             "self-connect guard gap: relayed gossip describing this node's own \
              advertised address (node_id == self.peer_id) was returned as a \
              dial candidate instead of being filtered as self. This is what \
@@ -21505,7 +21721,7 @@ mod tests {
             .await;
 
         assert!(
-            !candidates.contains(&bind_addr),
+            !candidates.iter().any(|(addr, _)| *addr == bind_addr),
             "self-connect guard regression: relayed gossip describing this \
              node's own bind_addr with no node_id attached was returned as a \
              dial candidate instead of being filtered as self, even though \
@@ -21545,7 +21761,10 @@ mod tests {
         let first_round = registry
             .on_peer_list_gossip(peers, "127.0.0.1:9997", 1)
             .await;
-        assert_eq!(first_round, vec![stranded_addr]);
+        assert_eq!(
+            first_round.iter().map(|(addr, _)| *addr).collect::<Vec<_>>(),
+            vec![stranded_addr]
+        );
         {
             let gossip_state = registry.gossip_state.lock().await;
             assert!(
@@ -21560,10 +21779,12 @@ mod tests {
         }
 
         // Stands in for the first round's dial task getting killed before it
-        // ever actually reaches `stranded_addr`.
+        // ever actually reaches `stranded_addr`. Passes `first_round`
+        // itself through, exactly as production does -- the generation
+        // captured at selection time, not reconstructed here.
         let first_task = tokio::spawn(std::future::pending::<()>());
         registry
-            .track_discovery_task(first_task.abort_handle(), vec![stranded_addr])
+            .track_discovery_task(first_task.abort_handle(), first_round)
             .await;
 
         // A second gossip round arrives before the first task finishes,
@@ -21571,7 +21792,7 @@ mod tests {
         let unrelated_addr = test_addr(19_202);
         let second_task = tokio::spawn(std::future::pending::<()>());
         registry
-            .track_discovery_task(second_task.abort_handle(), vec![unrelated_addr])
+            .track_discovery_task(second_task.abort_handle(), vec![(unrelated_addr, 0)])
             .await;
 
         assert!(
@@ -21630,10 +21851,13 @@ mod tests {
         let first_round = registry
             .on_peer_list_gossip(peers.clone(), "127.0.0.1:9997", 1)
             .await;
-        assert_eq!(first_round, vec![addr]);
+        assert_eq!(
+            first_round.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![addr]
+        );
         let first_task = tokio::spawn(std::future::pending::<()>());
         registry
-            .track_discovery_task(first_task.abort_handle(), vec![addr])
+            .track_discovery_task(first_task.abort_handle(), first_round)
             .await;
 
         // Stands in for task_A's own dial loop actually resolving `addr`
@@ -21665,13 +21889,13 @@ mod tests {
             .on_peer_list_gossip(peers, "127.0.0.1:9997", 2)
             .await;
         assert_eq!(
-            second_round,
+            second_round.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
             vec![addr],
             "test precondition: the address must be re-selected in round 2"
         );
         let second_task = tokio::spawn(std::future::pending::<()>());
         registry
-            .track_discovery_task(second_task.abort_handle(), vec![addr])
+            .track_discovery_task(second_task.abort_handle(), second_round)
             .await;
 
         let gossip_state = registry.gossip_state.lock().await;
@@ -21685,6 +21909,105 @@ mod tests {
             "round 2's fresh Pending claim must survive track_discovery_task displacing \
              the stale first task -- the first task's own long-since-resolved candidate \
              list must not be used to clear a NEWER task's legitimate reservation"
+        );
+    }
+
+    /// Sibling of the generation test above, but targeting the OTHER half
+    /// of the same bug family: the generation `track_discovery_task` uses
+    /// must be the one `on_peer_list_gossip` captured AT THE ORIGINAL
+    /// selection/mark-Pending call, not one re-derived from `addr`'s state
+    /// at some later point. Before this fix, `track_discovery_task` read
+    /// each candidate's CURRENT generation itself, after the caller had
+    /// already spawned a dial task and reacquired the gossip lock -- a real
+    /// gap in which `addr` could resolve and be legitimately re-claimed by
+    /// a different, later round with a fresh generation. This task would
+    /// then adopt that NEWER round's generation as if it were its own and,
+    /// when later displaced, incorrectly clear the newer round's live
+    /// reservation using a generation that was never actually its own.
+    #[tokio::test]
+    async fn on_peer_list_gossip_returned_generation_survives_state_churn_before_being_consumed()
+     {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            max_peers: 8,
+            ..test_config_with_seed("discovery-generation-capture-timing")
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(19_230), config);
+
+        let addr = test_addr(19_231);
+        let peers = vec![PeerInfoGossip {
+            address: addr.to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 0,
+            last_success: 0,
+            dns_name: None,
+        }];
+
+        let candidates = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9997", 1)
+            .await;
+        assert_eq!(candidates.len(), 1);
+        let (candidate_addr, captured_generation) = candidates[0];
+        assert_eq!(candidate_addr, addr);
+
+        // Stands in for the real gap in production: between
+        // `on_peer_list_gossip` returning and `track_discovery_task` ever
+        // being called with `candidates` (a dial-task spawn plus a
+        // separate lock reacquisition), some OTHER, entirely legitimate
+        // process re-claims the SAME address with a fresh generation --
+        // exactly what a later, concurrent gossip round retrying a
+        // recently-failed address looks like.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peer_discovery.as_mut().unwrap().restore_peer_state(
+                addr,
+                Some(crate::peer_discovery::PeerState::Pending {
+                    since: current_timestamp(),
+                    attempts: 0,
+                    previous_retry_delay_seconds: crate::peer_discovery::MIN_BACKOFF_SECONDS,
+                    claim_generation: captured_generation + 1000,
+                }),
+            );
+        }
+
+        // The pair returned by `on_peer_list_gossip` is a plain `Copy`
+        // value handed back to the caller -- it must still carry the
+        // generation captured at that original call, unaffected by
+        // whatever has since happened to `addr`'s live state.
+        assert_eq!(
+            candidates[0].1, captured_generation,
+            "the generation returned by on_peer_list_gossip must be immutable once handed \
+             back to the caller, regardless of later state changes at that address"
+        );
+
+        // Feeding this (now provably stale) generation into
+        // track_discovery_task must therefore fail to match `addr`'s
+        // CURRENT (newer) claim, and correctly decline to clear it when
+        // this task is later displaced.
+        let first_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(first_task.abort_handle(), candidates)
+            .await;
+        let unrelated_addr = test_addr(19_232);
+        let second_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(second_task.abort_handle(), vec![(unrelated_addr, 0)])
+            .await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state
+                .peer_discovery
+                .as_ref()
+                .unwrap()
+                .get_peer_state(&addr)
+                .is_some_and(crate::peer_discovery::PeerState::is_pending),
+            "the newer claim on `addr` must survive -- track_discovery_task must gate its \
+             displaced-candidate cleanup on the generation captured at the original \
+             selection call, not one it re-derives itself at some later point"
         );
     }
 

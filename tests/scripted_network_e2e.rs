@@ -1147,7 +1147,10 @@ async fn stale_discovered_addr_does_not_override_configured_peer_connection()
             now,
         )
         .await;
-    assert_eq!(candidates, vec![stale_addr]);
+    assert_eq!(
+        candidates.iter().map(|(addr, _)| *addr).collect::<Vec<_>>(),
+        vec![stale_addr]
+    );
 
     let remote_to_local = ScriptedProxy::new(local.registry.bind_addr, Duration::ZERO).await;
     let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
