@@ -2106,12 +2106,13 @@ impl GossipState {
     }
 
     /// The newest ownership commit this projection has *applied* to
-    /// `peer_addr` so far, if any -- a locally cached view that can lag the
-    /// authority (`registry_owner`'s ArcSwap snapshot). Eviction's release
-    /// fence reads the authority directly instead, for exactly that reason;
-    /// this accessor now only backs the compaction/admission assertions
-    /// below.
-    #[cfg(test)]
+    /// `peer_addr` so far, if any. Deliberately NOT a read of
+    /// `registry_owner`'s live ArcSwap snapshot: this is read under the
+    /// SAME `gossip_state` lock as the eviction decision that consumes it
+    /// (see the call in `enforce_bounds`), so it is guaranteed to be exactly
+    /// the generation the entry being evicted actually knew about, never a
+    /// generation a same-owner reconnect has since committed but not yet
+    /// projected here.
     pub(crate) fn ownership_watermark(&self, peer_addr: &SocketAddr) -> Option<CommitSeq> {
         self.ownership_commit_seq.get(peer_addr).copied()
     }
@@ -6276,6 +6277,7 @@ impl<T: 'static> GossipRegistry<T> {
                             self.refresh_wall_clock_on_unchanged_reannouncement(
                                 name.as_str(),
                                 &location,
+                                &sender_peer_id,
                             );
                             continue;
                         };
@@ -6803,23 +6805,35 @@ impl<T: 'static> GossipRegistry<T> {
     /// prefers the other one. Without pinning this to the stored entry's
     /// own owner, a rival's rejected concurrent claim would count as live
     /// confirmation of an actor it was never actually hosting.
+    ///
+    /// `sender_peer_id` -- the AUTHENTICATED identity of whoever sent this
+    /// message, not a field read out of its payload -- must also equal that
+    /// same owner. `location.peer_id == existing.peer_id` alone only proves
+    /// the payload NAMES the right owner; any relay forwarding a cached copy
+    /// of that owner's last-known location satisfies it too. Once the real
+    /// owner is gone, its remaining peers can keep echoing the same cached
+    /// entry to each other forever, each echo re-arming this "still alive"
+    /// signal -- exactly the case TTL exists to catch. Only a message the
+    /// owner itself actually sent is evidence it is still reachable.
     fn refresh_wall_clock_on_unchanged_reannouncement(
         &self,
         name: &str,
         location: &RemoteActorLocation,
+        sender_peer_id: &PeerId,
     ) {
-        let is_same_owner_tie = self
+        let is_owner_issued_tie = self
             .actor_state
             .known_actors
             .read_sync(name, |_, existing| {
                 location.peer_id == existing.peer_id
+                    && *sender_peer_id == existing.peer_id
                     && matches!(
                         location.vector_clock.compare(&existing.vector_clock),
                         crate::ClockOrdering::Equal
                     )
             })
             .unwrap_or(false);
-        if is_same_owner_tie {
+        if is_owner_issued_tie {
             let now = current_timestamp();
             let _ = self
                 .actor_state
@@ -8341,6 +8355,7 @@ impl<T: 'static> GossipRegistry<T> {
                         self.refresh_wall_clock_on_unchanged_reannouncement(
                             name.as_str(),
                             location,
+                            &sender_peer_id,
                         );
                     }
                     continue;
@@ -8562,15 +8577,6 @@ impl<T: 'static> GossipRegistry<T> {
                         });
                 if removed.is_some() {
                     gossip_state.release_actor_admission(name);
-                    // Garbage-collect the liveness side table together with
-                    // the entry it was tracking -- whether or not this exact
-                    // pass is what actually reaped it (any other removal
-                    // path leaves an equally harmless, equally collectible
-                    // orphan here; see the doc on `reannouncement_liveness`).
-                    let _ = self
-                        .actor_state
-                        .reannouncement_liveness
-                        .remove_sync(name.as_str());
                 }
             }
 
@@ -8578,6 +8584,32 @@ impl<T: 'static> GossipRegistry<T> {
             if removed > 0 {
                 info!(removed_count = removed, "cleaned up stale actor entries");
             }
+        }
+
+        // `reannouncement_liveness` rows are orphaned whenever an actor
+        // leaves `known_actors` through ANY path other than the removal
+        // loop just above -- explicit unregister, omission pruning in
+        // `merge_full_sync_from_guarded`, peer death, or an `ActorRemoved`
+        // delta. Rather than one removal call site remembering to clear
+        // this row and every other one risking forgetting to, sweep every
+        // row whose name is no longer present in `known_actors` at all,
+        // regardless of which path (or none yet) actually removed it.
+        // Bounded by the same pass that already walks `known_actors`, so
+        // this never runs more often than the TTL sweep above.
+        let mut orphaned_liveness = Vec::new();
+        self.actor_state
+            .reannouncement_liveness
+            .iter_sync(|name, _| {
+                if !self.actor_state.known_actors.contains_sync(name.as_str()) {
+                    orphaned_liveness.push(name.clone());
+                }
+                true
+            });
+        for name in orphaned_liveness {
+            let _ = self
+                .actor_state
+                .reannouncement_liveness
+                .remove_sync(name.as_str());
         }
 
         // Bound peer-death/unregister tombstones. They only need to outlive
@@ -9830,24 +9862,27 @@ impl<T: 'static> GossipRegistry<T> {
                 // release is scoped to this identity so it can only ever
                 // retract the ownership this eviction actually invalidated.
                 //
-                // The generation comes from `registry_owner`'s own lock-free
-                // ArcSwap snapshot, not `gossip_state.ownership_watermark`
-                // (the newest commit this projection happens to have
-                // *applied* so far, which can lag the authority). A lagging
-                // watermark either misses the release entirely (stale `None`
-                // where the authority already has a generation) or, worse,
-                // targets a generation older than the one actually held.
-                // Cross-checking `owner()` against the evicted entry's own
-                // identity additionally guards against releasing a
-                // generation some OTHER identity already reclaimed for this
-                // address between the snapshot and this read.
+                // The generation comes from `gossip_state.ownership_watermark`
+                // -- read under this SAME lock, so it is exactly the
+                // generation this evicted entry's own projection knew about
+                // -- never from `registry_owner`'s live ArcSwap snapshot read
+                // fresh at this point. The authority can commit a same-owner
+                // reconnect's newer generation for this exact address while
+                // its projection is still queued behind this very lock; owner
+                // identity alone can't tell that apart from the generation
+                // actually being evicted, so a fresh read here would collect
+                // a generation the reconnect currently holds, and
+                // `PeerRegistryOwner::release`'s own exact-match CAS would
+                // then accept it and tear the live claim down. A watermark
+                // captured under this lock cannot suffer that: if a newer
+                // generation has since committed, this one is stale and
+                // `release`'s CAS rejects it as a no-op instead.
+                let evicted_generation = gossip_state.ownership_watermark(addr);
                 let evicted = gossip_state.peers.remove(addr);
-                let evicted_node_id = evicted.and_then(|peer| peer.node_id);
-                if let (Some(node_id), Some(token)) =
-                    (evicted_node_id, self.registry_owner.ownership_token(addr))
-                    && *token.owner() == node_id.to_peer_id()
+                if let (Some(node_id), Some(generation)) =
+                    (evicted.and_then(|peer| peer.node_id), evicted_generation)
                 {
-                    evicted_owners.push((*addr, node_id.to_peer_id(), token.generation()));
+                    evicted_owners.push((*addr, node_id.to_peer_id(), generation));
                 }
                 gossip_state.peer_to_actors.remove(addr);
 
@@ -12290,6 +12325,74 @@ mod tests {
         );
     }
 
+    /// `location.peer_id == existing.peer_id` alone only proves the PAYLOAD
+    /// names the right owner -- it says nothing about who actually sent it.
+    /// A third-party relay forwarding a cached copy of the owner's own last
+    /// full sync (the ordinary shape of multi-hop gossip: nothing changed,
+    /// so the relayed copy is byte-identical) must NOT count as live
+    /// confirmation. Otherwise, once the real owner is gone, its remaining
+    /// peers can keep echoing that same cached entry to each other forever,
+    /// each echo re-arming the "still alive" signal -- exactly the
+    /// unreachable-owner case `actor_ttl` exists to catch, defeated by the
+    /// fix meant to serve it.
+    #[tokio::test]
+    async fn merge_full_sync_relayed_echo_from_a_third_party_does_not_refresh_liveness() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7426),
+            test_config_with_seed("wall-clock-refresh-relay-full-sync"),
+        );
+        let owner = KeyPair::new_for_testing("wall-clock-refresh-relay-owner").peer_id();
+        let relay = KeyPair::new_for_testing("wall-clock-refresh-relay-relay").peer_id();
+        let actor_name = "wall-clock-refresh-relay/service";
+        let owner_addr = test_addr(9412);
+
+        let mut location = RemoteActorLocation::new_with_peer(owner_addr, owner.clone());
+        location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
+        let mut remote_known = HashMap::new();
+        remote_known.insert(actor_name.to_string(), location.clone());
+
+        // Genuine first admission, authenticated as sent by the owner itself.
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            remote_known.clone(),
+            owner,
+            owner_addr,
+            None,
+            None,
+            1,
+            current_timestamp(),
+        )
+        .await;
+        let stored_wall_clock_time = reg
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, existing| existing.wall_clock_time)
+            .expect("first full sync must admit the actor");
+
+        // The identical entry arrives again -- byte-for-byte the same
+        // payload, exact vector-clock tie -- but authenticated as sent by
+        // `relay`, a completely different peer, not the owner it names.
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            remote_known,
+            relay,
+            owner_addr,
+            None,
+            None,
+            2,
+            current_timestamp(),
+        )
+        .await;
+
+        let effective_wall_clock_time = reg.effective_actor_wall_clock_time(actor_name, &location);
+        assert_eq!(
+            effective_wall_clock_time, stored_wall_clock_time,
+            "a relayed echo authenticated as sent by a peer OTHER than the actor's own owner \
+             must not refresh liveness -- only the owner itself re-advertising can prove it is \
+             still reachable"
+        );
+    }
+
     /// Same gap as `merge_full_sync_refreshes_wall_clock_on_unchanged_reannouncement`,
     /// but on the incremental-delta gossip path (`apply_delta_from`) rather
     /// than full sync -- a separate call site with its own admission logic
@@ -12370,6 +12473,74 @@ mod tests {
             "an unchanged re-advertisement via incremental delta gossip must also refresh the \
              actor's EFFECTIVE freshness (got {effective_wall_clock_time}, \
              wanted >= {before_reannounce})"
+        );
+    }
+
+    /// Same relay-echo gap as
+    /// `merge_full_sync_relayed_echo_from_a_third_party_does_not_refresh_liveness`,
+    /// on the incremental-delta gossip path.
+    #[tokio::test]
+    async fn apply_delta_from_relayed_echo_from_a_third_party_does_not_refresh_liveness() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7428),
+            test_config_with_seed("wall-clock-refresh-relay-delta"),
+        );
+        let owner = KeyPair::new_for_testing("wall-clock-refresh-relay-delta-owner").peer_id();
+        let relay = KeyPair::new_for_testing("wall-clock-refresh-relay-delta-relay").peer_id();
+        let actor_name = "wall-clock-refresh-relay-delta/service";
+        let owner_addr = test_addr(9413);
+
+        let mut location = RemoteActorLocation::new_with_peer(owner_addr, owner.clone());
+        location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
+        let change = RegistryChange::ActorAdded {
+            name: actor_name.to_string(),
+            location: location.clone(),
+            priority: RegistrationPriority::Normal,
+        };
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![change.clone()],
+                sender_peer_id: owner,
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stored_wall_clock_time = reg
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, existing| existing.wall_clock_time)
+            .expect("first delta apply must admit the actor");
+
+        // The identical change arrives again, authenticated as sent by
+        // `relay` -- a completely different peer relaying a cached copy of
+        // the owner's own delta, not the owner itself.
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 1,
+                current_sequence: 2,
+                changes: vec![change],
+                sender_peer_id: relay,
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let effective_wall_clock_time = reg.effective_actor_wall_clock_time(actor_name, &location);
+        assert_eq!(
+            effective_wall_clock_time, stored_wall_clock_time,
+            "a relayed echo authenticated as sent by a peer OTHER than the actor's own owner \
+             must not refresh liveness on the incremental-delta path either"
         );
     }
 
@@ -18956,6 +19127,49 @@ mod tests {
         );
     }
 
+    /// `reannouncement_liveness` rows are orphaned whenever an actor leaves
+    /// `known_actors` through ANY path other than `cleanup_stale_actors`'s
+    /// own removal loop -- explicit unregister, omission pruning, peer
+    /// death, or an `ActorRemoved` delta. This test does not construct any
+    /// specific one of those paths -- the whole point of a sweep is that it
+    /// does not need to: it seeds a liveness row for an actor already
+    /// absent from `known_actors` (standing in for "removed by whichever
+    /// path, at some point before this pass ran") and checks it gets swept
+    /// regardless.
+    #[tokio::test]
+    async fn cleanup_stale_actors_sweeps_liveness_rows_orphaned_by_any_removal_path() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_501),
+            test_config_with_seed("liveness-sweep-orphan"),
+        );
+        let orphaned_actor = "liveness-sweep-orphan/service";
+
+        let _ = registry
+            .actor_state
+            .reannouncement_liveness
+            .upsert_sync(orphaned_actor.to_string(), current_timestamp());
+        assert!(
+            !registry
+                .actor_state
+                .known_actors
+                .contains_sync(orphaned_actor),
+            "test precondition: the actor must already be absent from known_actors"
+        );
+
+        registry.cleanup_stale_actors().await;
+
+        assert!(
+            !registry
+                .actor_state
+                .reannouncement_liveness
+                .contains_sync(orphaned_actor),
+            "a liveness row for an actor no longer in known_actors must be swept regardless of \
+             which removal path (or none at all, as here) actually removed the actor -- \
+             otherwise the side table grows unboundedly across every actor a peer ever \
+             mentioned, never bounded the way known_actors itself is"
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_stale_actors_expires_old_tombstones() {
         let mut config = test_config();
@@ -20280,6 +20494,99 @@ mod tests {
             gossip_state.peers.len(),
             10,
             "R-12: enforce_bounds must honour config.max_peers, not a hardcoded 1000"
+        );
+    }
+
+    /// The authority (`registry_owner`) can commit a same-owner reconnect's
+    /// fresh claim while `gossip_state`'s own ownership-commit projection
+    /// for that address is still the OLDER one -- e.g. the reconnect's
+    /// projection update is queued behind this very `gossip_state` lock, the
+    /// ordinary shape of a fast reconnect racing a scheduled `enforce_bounds`
+    /// pass. Reading `registry_owner.ownership_token(addr)` fresh, AFTER
+    /// deciding to evict the stale `gossip_state.peers` entry, would then
+    /// return that NEWER generation; the owner-identity comparison still
+    /// passes (same owner), so a naive fix would call `release` with the
+    /// generation the reconnect actually holds -- and its own exact-match
+    /// CAS in `PeerRegistryOwner::release` would tear the live claim down
+    /// instead of protecting it. The release must use the generation
+    /// `gossip_state`'s own projection knew about at eviction time, which
+    /// `release`'s CAS then safely rejects as stale once a newer claim has
+    /// since committed.
+    #[tokio::test]
+    async fn peer_eviction_does_not_release_a_generation_newer_than_the_evicted_projection() {
+        let config = GossipConfig {
+            max_peers: 1,
+            ..test_config_with_seed("evict-release-race-local")
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(20_400), config);
+        // Deliberately unrelated to the registry's own seed above:
+        // `KeyPair::new_for_testing` truncates/pads a seed to exactly 32
+        // bytes without hashing it, so a seed that is a byte-prefix of
+        // another produces the SAME key pair.
+        let owner = KeyPair::new_for_testing("evict-release-race-remote-owner").peer_id();
+        let owner_node_id = owner.to_node_id();
+        let evicted_addr = test_addr(20_401);
+        let other_addr = test_addr(20_402);
+
+        // Establishes the claim AND projects it into gossip_state (peer
+        // entry + ownership-commit watermark) in one step, exactly like a
+        // real accepted claim -- the generation gossip_state's own
+        // projection knows about, coupled to the entry about to be evicted.
+        let (_, receipt) = registry
+            .add_peer_with_node_id_generation(
+                evicted_addr,
+                Some(owner_node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        let stale_generation = receipt
+            .expect("test setup: first claim must be accepted")
+            .generation();
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            // A newer-contact survivor so eviction (oldest-`last_success`
+            // first, `select_peers_to_evict`) picks `evicted_addr`.
+            let mut other_peer = PeerInfo::local(other_addr);
+            other_peer.last_success = current_timestamp() + 1_000_000;
+            gossip_state.peers.insert(other_addr, other_peer);
+        }
+
+        // A reconnect from the SAME owner commits a fresh generation for the
+        // SAME address before eviction runs, WITHOUT going through
+        // `add_peer_with_node_id` -- gossip_state's projection is not
+        // updated, standing in for it still being queued behind the lock
+        // eviction is about to take.
+        let fresh_commit = registry
+            .registry_owner
+            .claim(
+                evicted_addr,
+                crate::addr_ownership::Claim {
+                    node_id: owner.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        let fresh_generation = fresh_commit
+            .commit_seq()
+            .expect("test setup: the reconnect's claim must be accepted");
+        assert_ne!(
+            stale_generation, fresh_generation,
+            "test precondition: the reconnect must commit a genuinely newer generation"
+        );
+
+        registry.enforce_bounds().await;
+
+        assert_eq!(
+            registry.registry_owner.ownership_token(&evicted_addr),
+            Some(crate::registry_owner::OwnershipToken::new(
+                owner,
+                fresh_generation
+            )),
+            "eviction must not release a generation newer than the one its own stale \
+             projection knew about -- doing so tears down a fresh, still-live claim the \
+             evicted gossip_state entry never actually represented"
         );
     }
 

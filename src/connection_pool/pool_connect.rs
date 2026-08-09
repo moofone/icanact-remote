@@ -2673,7 +2673,19 @@ impl<T> ConnectionPool<T> {
                      session (found only via an address/alias fallback); proceeding with its \
                      own instance-scoped teardown"
                 );
-                if let Some(current) = self.peer_current_connection_snapshot(peer_id) {
+                // `target`'s own `connections_by_peer`/`connections_by_addr`
+                // entries have not been removed yet at this point (that
+                // happens further below in this function), so the snapshot
+                // can still find `target` itself when it is the ONLY
+                // connection ever indexed for this peer -- a genuinely
+                // final teardown, not a displacement with a live sibling.
+                // Comparing to itself would trivially pass both checks
+                // below and wrongly preserve the tracker, leaving an ask
+                // pending only on `target` parked until it times out
+                // instead of cancelled immediately.
+                if let Some(current) = self.peer_current_connection_snapshot(peer_id)
+                    && !Arc::ptr_eq(&current, target)
+                {
                     keep_correlation =
                         current.has_live_stream() && target.shares_correlation_tracker(&current);
                 }
@@ -2882,7 +2894,15 @@ impl<T> ConnectionPool<T> {
                 let _ = self
                     .connections_by_peer
                     .remove_if_sync(&peer_id, |v| Arc::ptr_eq(v, &connection));
-            } else if let Some(current) = self.peer_current_connection_snapshot(&peer_id) {
+            } else if let Some(current) = self.peer_current_connection_snapshot(&peer_id)
+                && !Arc::ptr_eq(&current, &connection)
+            {
+                // Same guard as `disconnect_connection_instance`'s `Err(None)`
+                // arm: `connection`'s `connections_by_addr` aliases are
+                // already gone by this point, but `connections_by_peer` is
+                // only cleared in the `if cleared` branch above, so the
+                // snapshot can still return `connection` itself here when it
+                // was the only connection ever indexed for this peer.
                 keep_correlation =
                     current.has_live_stream() && connection.shares_correlation_tracker(&current);
             }
@@ -4260,6 +4280,30 @@ impl<T> ConnectionPool<T> {
         for (peer_id, conn) in stale {
             if self.disconnect_connection_instance(&peer_id, &conn) {
                 debug!(peer_id = %peer_id, "cleaned up disconnected connection (all aliases)");
+                continue;
+            }
+            // The CAS in `disconnect_connection_instance` was lost: a fresh
+            // connection already supersedes `conn` in the peer's primary
+            // slot, so that call correctly declined to touch it and left
+            // `conn` completely untouched. But this pass's own scan above
+            // already confirmed `conn` itself is stale, and it is now
+            // unreachable from `peer_sessions` -- no future pass will ever
+            // observe it again through that scan. Retire it directly by its
+            // own address+instance identity instead of leaking its address
+            // alias, counted capacity, and background tasks forever.
+            if let Some(instance_id) = conn
+                .stream_handle
+                .as_ref()
+                .map(|handle| handle.instance_id())
+                && self
+                    .remove_connection_instance_by_id(conn.addr, instance_id)
+                    .is_some()
+            {
+                debug!(
+                    peer_id = %peer_id,
+                    addr = %conn.addr,
+                    "retired a superseded stale connection instance directly"
+                );
             }
         }
 

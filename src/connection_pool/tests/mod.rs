@@ -12013,6 +12013,86 @@ async fn cleanup_stale_connections_revalidates_before_teardown_and_preserves_con
     );
 }
 
+/// The other side of the same race: when the CAS in
+/// `disconnect_connection_instance` is LOST (a fresh reconnect supersedes
+/// `stale` in the peer's primary slot before the teardown loop runs),
+/// `stale` itself is left completely untouched by that call -- it declines
+/// entirely rather than partially tearing down someone else's now-current
+/// connection. But `stale` is not nothing: this pass's own snapshot already
+/// confirmed it via `is_usable_connection`, and once a fresher connection
+/// owns the peer's primary slot, `stale` is unreachable from
+/// `peer_sessions` -- no future `cleanup_stale_connections` pass will ever
+/// observe it again through that scan. Before this fix, `stale`'s own
+/// address alias, counted capacity, and background tasks were simply
+/// abandoned forever: a permanent leak, not a transient miss.
+#[tokio::test]
+async fn cleanup_stale_connections_retires_the_stale_instance_when_its_own_cas_is_lost() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("cleanup-stale-cas-loss-peer").peer_id();
+
+    let stale_addr: SocketAddr = "127.0.0.1:43010".parse().unwrap();
+    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    stale.set_state(ConnectionState::Disconnected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
+
+    let fresh_addr: SocketAddr = "127.0.0.1:44010".parse().unwrap();
+    let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+
+    {
+        let hook_pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let fresh = fresh.clone();
+        pool.set_cleanup_stale_race_hook(move || {
+            // Lands the fresh reconnect in the exact gap
+            // `disconnect_connection_instance`'s CAS is meant to detect:
+            // published after the staleness snapshot, before the teardown
+            // loop reaches `stale`.
+            hook_pool.publish_current_peer_connection(&peer_id, fresh.clone());
+        });
+    }
+
+    pool.cleanup_stale_connections();
+
+    assert!(
+        pool.connections_by_addr
+            .read_sync(&stale_addr, |_, v| Arc::ptr_eq(v, &stale))
+            .is_none(),
+        "the superseded stale instance's own address alias must be retired even though the \
+         peer-session CAS declined to touch the peer's (now fresh) current connection"
+    );
+    // `has_live_stream()` also gates on connection state, which this test
+    // already forced to `Disconnected` to be picked up as stale in the
+    // first place -- checking `exit_flag` directly via `wait_for_exit`
+    // (immediately ready once `abort_tasks` has run, since the flag is set
+    // synchronously) is what actually proves the background tasks were
+    // retired, not just that the state looked stale from the start.
+    let stale_stream = stale
+        .stream_handle
+        .as_ref()
+        .expect("a live connection must have a stream handle");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stale_stream.wait_for_exit())
+            .await
+            .is_ok(),
+        "the superseded stale instance's own background tasks must be retired (exit_flag set), \
+         not leaked forever just because it is no longer reachable via peer_sessions"
+    );
+
+    // The fresh connection that won the race must be completely unaffected
+    // by retiring its now-orphaned predecessor.
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+        "the fresh connection that superseded `stale` must survive untouched (got {current:?})"
+    );
+    assert!(
+        pool.connections_by_peer
+            .read_sync(&peer_id, |_, v| Arc::ptr_eq(v, &fresh))
+            .unwrap_or(false),
+        "connections_by_peer must still point at the fresh instance"
+    );
+}
+
 /// RED (review finding P2, `remote_actor_ref.rs` ask-timeout/cancellation
 /// eviction depends on a stale `addr_to_peer_id` alias):
 /// `recover_connection_after_actor_ask_timeout` and
@@ -13460,6 +13540,64 @@ async fn remove_connection_instance_by_id_preserves_shared_correlation_for_a_dif
     guard.disarm();
 }
 
+/// Same latent gap as `disconnect_connection_instance`'s `Err(None)` arm,
+/// in `remove_connection_instance_by_id`'s own survivor check: `connection`'s
+/// `connections_by_addr` aliases are already gone by the time this check
+/// runs, but `connections_by_peer` is only cleared in the CAS-succeeded
+/// branch above it, so the snapshot can still return `connection` itself
+/// when it was the only connection ever indexed for this peer.
+#[tokio::test]
+async fn remove_connection_instance_by_id_cancels_correlation_when_snapshot_is_the_target_itself()
+ {
+    let peer_id = crate::KeyPair::new_for_testing("rc-remove-by-id-self-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7513".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // The ONLY connection ever indexed for this peer -- reachable by address
+    // (what `remove_connection_instance_by_id` looks it up by) AND by the
+    // `connections_by_peer` fallback the survivor check consults, but never
+    // promoted to the primary `peer_sessions` slot.
+    let connection =
+        make_live_connection_with_correlation(addr, ConnectionDirection::Outbound, tracker.clone())
+            .await;
+    let _ = pool.connections_by_addr.upsert_sync(addr, connection.clone());
+    let _ = pool.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+    let _ = pool
+        .connections_by_peer
+        .upsert_sync(peer_id.clone(), connection.clone());
+    let instance_id = connection
+        .stream_handle
+        .as_ref()
+        .map(|handle| handle.instance_id())
+        .expect("live connection must have a stream handle");
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    let removed = pool.remove_connection_instance_by_id(addr, instance_id);
+    assert!(
+        removed.is_some_and(|c| Arc::ptr_eq(&c, &connection)),
+        "the instance must be found and removed by id"
+    );
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_EMPTY,
+        "a genuinely final teardown (the only connection this peer ever had) must still \
+         cancel its own correlation tracker -- comparing the survivor snapshot to the \
+         instance being removed itself must never count as finding a live sibling"
+    );
+
+    guard.disarm();
+}
+
 /// `disconnect_connection_instance`'s `Err(None)` arm proceeds with `target`'s
 /// own teardown when the peer's primary session slot is genuinely empty for
 /// it (`target` was found only via `peer_current_connection_snapshot`'s
@@ -13532,6 +13670,68 @@ async fn disconnect_connection_instance_preserves_shared_correlation_when_target
     assert!(
         current.has_live_stream(),
         "the peer's actual current connection's background tasks must not be touched"
+    );
+
+    guard.disarm();
+}
+
+/// The `Err(None)` arm's survivor check has no guarantee `target` itself
+/// isn't what `peer_current_connection_snapshot` returns: at this point in
+/// `disconnect_connection_instance`, `target`'s own `connections_by_peer`/
+/// `connections_by_addr` entries have not been removed yet (that happens
+/// later in the same function), so if `target` is the ONLY connection ever
+/// indexed for this peer -- a genuinely final teardown, no other instance
+/// exists at all -- the snapshot can return `target` back to itself.
+/// `target.shares_correlation_tracker(&target)` and `target.has_live_stream()`
+/// then both trivially pass, and teardown wrongly takes
+/// `abort_tasks_keep_correlation()` instead of `abort_tasks()`, leaving any
+/// ask pending only on `target`'s own tracker parked until it times out
+/// instead of being cancelled immediately.
+#[tokio::test]
+async fn disconnect_connection_instance_cancels_correlation_when_snapshot_is_the_target_itself() {
+    let peer_id = crate::KeyPair::new_for_testing("rc-disconnect-instance-self-peer").peer_id();
+    let target_addr: SocketAddr = "127.0.0.1:7523".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // `target` is the ONLY connection ever indexed for this peer -- seeded
+    // into `connections_by_peer` directly (one of
+    // `peer_current_connection_snapshot`'s fallbacks) rather than through
+    // `add_connection_by_peer_id`, so the PRIMARY `peer_sessions` slot stays
+    // genuinely empty and the snapshot's only possible answer is `target`
+    // itself.
+    let target = make_live_connection_with_correlation(
+        target_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_peer
+        .upsert_sync(peer_id.clone(), target.clone());
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    let evicted = pool.disconnect_connection_instance(&peer_id, &target);
+    assert!(
+        evicted,
+        "disconnect_connection_instance must proceed with target's own teardown when the \
+         primary slot is genuinely empty for it"
+    );
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_EMPTY,
+        "a genuinely final teardown (the only connection this peer ever had) must still \
+         cancel its own correlation tracker -- comparing the survivor snapshot to `target` \
+         itself must never count as finding a live sibling worth preserving the tracker for"
     );
 
     guard.disarm();
