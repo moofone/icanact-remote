@@ -2862,6 +2862,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         peer_address: None,
         inbound_observed: true,
         outbound_dial_success: true,
+        transport_source_keyed: false,
         node_id: None,
         dns_name: None,
         failures: 1,
@@ -2985,6 +2986,10 @@ async fn authenticated_full_sync_response_with_remote_loopback_bind_uses_transpo
         .expect("authenticated transport source must retain the peer state");
     assert!(peer.inbound_observed);
     assert!(!peer.outbound_dial_success);
+    assert!(
+        peer.transport_source_keyed,
+        "only the explicit authenticated fallback path may suppress reconnects"
+    );
     drop(state);
 
     assert!(
@@ -3006,6 +3011,103 @@ async fn authenticated_full_sync_response_with_remote_loopback_bind_uses_transpo
         .expect("authenticated actor state must not be discarded with a bad address hint");
     assert_eq!(actor.peer_id, peer_id);
     assert_eq!(actor.address, advertised_actor_addr.to_string());
+}
+
+#[tokio::test]
+async fn authenticated_full_sync_with_remote_loopback_bind_restores_transport_route_after_merge() {
+    let bind_addr: SocketAddr = "10.77.0.31:9502".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            enable_peer_discovery: false,
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "remote-loopback-full-sync-local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let peer_id = crate::KeyPair::generate().peer_id();
+    let tcp_source: SocketAddr = "10.77.0.32:47925".parse().unwrap();
+    let advertised_actor_addr: SocketAddr = "10.77.0.32:3885".parse().unwrap();
+    let actor = crate::RemoteActorLocation::new_with_peer(advertised_actor_addr, peer_id.clone());
+    let msg = crate::registry::RegistryMessage::FullSync {
+        local_actors: vec![("authenticated/full-sync/actor".to_string(), actor)],
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some("127.0.0.1:3883".to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, Some(peer_id.clone()), msg)
+        .await
+        .expect("authenticated FullSync should use the transport source");
+
+    assert_eq!(
+        registry
+            .connection_pool
+            .peer_id_to_addr
+            .read_sync(&peer_id, |_, addr| *addr),
+        Some(tcp_source),
+        "actor routes merged from FullSync must not replace the authenticated transport route"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_bad_bind_fallback_preserves_successful_outbound_provenance() {
+    let bind_addr: SocketAddr = "10.77.0.31:9503".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            enable_peer_discovery: false,
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "remote-loopback-proven-outbound-local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let peer_id = crate::KeyPair::generate().peer_id();
+    let tcp_source: SocketAddr = "10.77.0.32:47926".parse().unwrap();
+    {
+        let mut state = registry.gossip_state.lock().await;
+        let mut peer = crate::registry::PeerInfo::local(tcp_source);
+        peer.inbound_observed = true;
+        peer.outbound_dial_success = true;
+        state.peers.insert(tcp_source, peer);
+    }
+    let msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: Some("127.0.0.1:3883".to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), tcp_source, Some(peer_id), msg)
+        .await
+        .expect("authenticated FullSyncResponse should use the existing route");
+
+    let state = registry.gossip_state.lock().await;
+    let peer = state
+        .peers
+        .get(&tcp_source)
+        .expect("peer must remain tracked");
+    assert!(
+        peer.outbound_dial_success,
+        "fallback must not erase a route already proven by an outbound dial"
+    );
+    assert!(
+        !peer.transport_source_keyed,
+        "a proven outbound route must not be classified as an ephemeral source"
+    );
+    drop(state);
+    assert!(
+        registry.should_attempt_outbound_dial(tcp_source).await,
+        "a proven outbound route must remain reconnect-eligible"
+    );
 }
 
 // Regression test for the FullSyncResponse / DeltaGossip / FullSync inbound

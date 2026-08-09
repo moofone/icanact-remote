@@ -2188,6 +2188,7 @@ pub(crate) fn handle_incoming_message(
                                 peer_address: None,
                                 inbound_observed: true,
                                 outbound_dial_success: false,
+                                transport_source_keyed: false,
                                 node_id: None,
                                 dns_name: None,
                                 failures: 0,
@@ -2394,6 +2395,7 @@ pub(crate) fn handle_incoming_message(
                                 peer_address: Some(_peer_addr), // Remember the actual connection address
                                 inbound_observed: true,
                                 outbound_dial_success: false,
+                                transport_source_keyed: false,
                                 node_id: None,
                                 dns_name: None,
                                 failures: 0,
@@ -2412,10 +2414,7 @@ pub(crate) fn handle_incoming_message(
                     if transport_source_fallback
                         && let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr)
                     {
-                        peer_info.address = sender_socket_addr;
-                        peer_info.peer_address = Some(sender_socket_addr);
-                        peer_info.inbound_observed = true;
-                        peer_info.outbound_dial_success = false;
+                        peer_info.mark_transport_source_keyed_fallback();
                     }
 
                     // Update peer info and reset failure state
@@ -2506,6 +2505,17 @@ pub(crate) fn handle_incoming_message(
                         wall_clock_time,
                     )
                     .await;
+
+                // Actor routes learned during merge may advertise a different
+                // address for this peer. The authenticated transport source is
+                // the only valid session route when its bind hint was rejected.
+                if transport_source_fallback {
+                    let pool = &registry.connection_pool;
+                    pool.set_discovered_peer_addr(&sender_peer_id, sender_socket_addr);
+                    let _ = pool
+                        .addr_to_peer_id
+                        .upsert_sync(sender_socket_addr, sender_peer_id.clone());
+                }
 
                 // Send back our state as a response so the sender can receive our actors
                 // This is critical for late-joining nodes (like Node C) to get existing state
@@ -2835,6 +2845,7 @@ pub(crate) fn handle_incoming_message(
                                 peer_address: Some(sender_socket_addr),
                                 inbound_observed: true,
                                 outbound_dial_success: false,
+                                transport_source_keyed: false,
                                 node_id: None,
                                 dns_name: None,
                                 failures: 0,
@@ -2847,10 +2858,7 @@ pub(crate) fn handle_incoming_message(
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
                             });
-                    peer_info.address = sender_socket_addr;
-                    peer_info.peer_address = Some(sender_socket_addr);
-                    peer_info.inbound_observed = true;
-                    peer_info.outbound_dial_success = false;
+                    peer_info.mark_transport_source_keyed_fallback();
                 }
 
                 // Reset failure state for responding peer

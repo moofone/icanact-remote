@@ -1176,6 +1176,10 @@ pub struct PeerInfo {
     pub inbound_observed: bool,
     /// Whether this node has ever established an outbound dial to this peer.
     pub outbound_dial_success: bool,
+    /// Whether this entry is keyed by an authenticated connection's observed
+    /// TCP source because the peer advertised a non-dialable bind address.
+    /// Such a source is valid for the live session but is not a reconnect target.
+    pub transport_source_keyed: bool,
     pub node_id: Option<crate::NodeId>, // NodeId for TLS verification (may be learned on connect)
     /// DNS name for this peer (e.g., "data-feeder-icanact:9400").
     /// When set, the address will be re-resolved via DNS on reconnection attempts.
@@ -1214,6 +1218,7 @@ impl PeerInfo {
             peer_address: None,
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: None,
             failures: 0,
@@ -1245,6 +1250,7 @@ impl PeerInfo {
             peer_address: None,
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: Some(dns_name),
             failures: 0,
@@ -1274,6 +1280,22 @@ impl PeerInfo {
         self.address = new_addr;
     }
 
+    /// Record a successful outbound dial and restore reconnect eligibility.
+    pub(crate) fn mark_outbound_dial_success(&mut self) {
+        self.outbound_dial_success = true;
+        self.transport_source_keyed = false;
+    }
+
+    /// Record that this entry was keyed by the authenticated TCP source.
+    /// Existing outbound proof is authoritative and must never be erased by
+    /// a later inbound FullSync carrying a bad address hint.
+    pub(crate) fn mark_transport_source_keyed_fallback(&mut self) {
+        self.inbound_observed = true;
+        if !self.outbound_dial_success {
+            self.transport_source_keyed = true;
+        }
+    }
+
     /// Convert to gossip-serializable format
     pub fn to_gossip(&self) -> PeerInfoGossip {
         PeerInfoGossip {
@@ -1297,6 +1319,7 @@ impl PeerInfo {
             peer_address,
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: gossip.node_id,
             dns_name: gossip.dns_name.clone(), // DNS names are now gossiped for fault tolerance
             failures: gossip.failures,
@@ -2156,6 +2179,7 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: Some(node_id),
                     dns_name: None,
                     failures: 0,
@@ -2466,6 +2490,7 @@ impl<T: 'static> GossipRegistry<T> {
                             peer_address: None,
                             inbound_observed: false,
                             outbound_dial_success: false,
+                            transport_source_keyed: false,
                             node_id,
                             dns_name,
                             failures: 0,
@@ -2967,7 +2992,7 @@ impl<T: 'static> GossipRegistry<T> {
                 for (peer_addr, peer_info) in gossip_state.peers.iter_mut() {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
-                        peer_info.outbound_dial_success = true;
+                        peer_info.mark_outbound_dial_success();
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
                         peer_info.last_failure_time = None;
@@ -2976,7 +3001,7 @@ impl<T: 'static> GossipRegistry<T> {
                 for (peer_addr, peer_info) in gossip_state.known_peers.iter_mut() {
                     if recovered_addrs.contains(peer_addr) {
                         peer_info.failures = 0;
-                        peer_info.outbound_dial_success = true;
+                        peer_info.mark_outbound_dial_success();
                         peer_info.last_success = now;
                         peer_info.last_response_received_ms = now_ms;
                         peer_info.last_failure_time = None;
@@ -4161,10 +4186,7 @@ impl<T: 'static> GossipRegistry<T> {
         // That source port belongs to this connection, not to a listener. Keep
         // using the live connection, but never turn its ephemeral source into
         // a reconnect target after disconnect.
-        if peer.inbound_observed
-            && !peer.outbound_dial_success
-            && peer.peer_address == Some(peer.address)
-        {
+        if peer.transport_source_keyed && !peer.outbound_dial_success {
             return !self.peer_has_live_connection(peer);
         }
         if !self.config.nat_role_reconnect_enabled {
@@ -4420,6 +4442,7 @@ impl<T: 'static> GossipRegistry<T> {
                         peer_address: None,
                         inbound_observed: false,
                         outbound_dial_success: false,
+                        transport_source_keyed: false,
                         node_id: None,
                         dns_name: None,
                         failures: 0,
@@ -7461,6 +7484,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_address: None,
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: None,
             failures: 0,
@@ -8162,6 +8186,7 @@ mod tests {
             peer_address: Some(test_addr(8081)),
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: None,
             failures: 0,
@@ -8405,6 +8430,7 @@ mod tests {
             peer_address: None,
             inbound_observed: true,
             outbound_dial_success: true,
+            transport_source_keyed: false,
             node_id: Some(node_id),
             dns_name: None,
             failures: 0,
@@ -9024,6 +9050,7 @@ mod tests {
             peer_address: None,
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: None,
             failures: 0,
@@ -9044,6 +9071,7 @@ mod tests {
             peer_address: None,
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: None,
             failures: 0,
@@ -9461,6 +9489,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: Some(peer_id.to_node_id()),
                     dns_name: None,
                     failures: 3,
@@ -9535,6 +9564,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: Some(sender_peer_id.to_node_id()),
                     dns_name: None,
                     failures: 3,
@@ -9652,6 +9682,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: Some(sender_peer_id.to_node_id()),
                     dns_name: None,
                     failures: 3,
@@ -9843,6 +9874,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: Some(dead_peer.to_node_id()),
                     dns_name: None,
                     failures: 3,
@@ -10369,6 +10401,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: Some("localhost:5000".to_string()),
                     failures: 0,
@@ -10426,6 +10459,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 0,
@@ -10473,6 +10507,7 @@ mod tests {
             peer_address: Some(test_addr(8081)),
             inbound_observed: false,
             outbound_dial_success: false,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: None,
             failures: 3,
@@ -10861,6 +10896,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: true,
+                    transport_source_keyed: false,
                     node_id: Some(peer_id.to_node_id()),
                     dns_name: None,
                     failures: 2,
@@ -11262,6 +11298,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 0,
@@ -11401,6 +11438,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 0,
@@ -11442,6 +11480,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: true,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 1,
@@ -11483,6 +11522,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: true,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 1,
@@ -11537,6 +11577,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 1,
@@ -11598,6 +11639,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: idx < 10,
                     outbound_dial_success: idx % 3 == 0 && idx < 10,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 1,
@@ -11692,6 +11734,7 @@ mod tests {
             peer_address: None,
             inbound_observed: false,
             outbound_dial_success: true,
+            transport_source_keyed: false,
             node_id: None,
             dns_name: None,
             failures: 0,
@@ -11748,6 +11791,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: true,
                     outbound_dial_success: true,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 1,
@@ -11827,6 +11871,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: true,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 0,
@@ -11878,6 +11923,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dialable_inbound_peer_is_not_misclassified_from_matching_addresses() {
+        let reg = GossipRegistry::<()>::new(test_addr(8113), test_config());
+        let peer_addr: SocketAddr = "10.1.1.12:9103".parse().unwrap();
+        {
+            let mut state = reg.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(peer_addr);
+            peer.peer_address = Some(peer_addr);
+            peer.inbound_observed = true;
+            peer.outbound_dial_success = false;
+            assert!(!peer.transport_source_keyed);
+            state.peers.insert(peer_addr, peer);
+        }
+
+        assert!(
+            reg.should_attempt_outbound_dial(peer_addr).await,
+            "matching address fields are not proof that a dialable inbound peer used an ephemeral source"
+        );
+    }
+
+    #[tokio::test]
     async fn test_should_attempt_outbound_dial_allows_live_connection_even_if_undialable() {
         let mut cfg = test_config();
         cfg.nat_role_reconnect_enabled = true;
@@ -11893,6 +11958,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: true,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 0,
@@ -11951,6 +12017,7 @@ mod tests {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: true,
+                    transport_source_keyed: false,
                     node_id: None,
                     dns_name: None,
                     failures: 0,
