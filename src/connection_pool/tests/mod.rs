@@ -4193,6 +4193,28 @@ async fn test_outbound_dial_gate_is_released_when_leader_is_cancelled() {
 }
 
 #[tokio::test]
+async fn outbound_retry_allows_one_immediate_retry_then_reopens_after_floor() {
+    let retry = OutboundDialRetry::with_retry_floor(Duration::from_millis(10));
+
+    assert!(retry.may_attempt(), "an untouched peer may dial immediately");
+    retry.record_failure();
+    assert!(retry.may_attempt(), "first retry must be immediate");
+    retry.record_failure();
+    assert!(
+        !retry.may_attempt(),
+        "second consecutive failure must arm the retry floor"
+    );
+
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(
+        retry.may_attempt(),
+        "a caller must be able to claim the dial after the floor expires"
+    );
+    retry.record_success();
+    assert!(retry.may_attempt(), "success must reset the failure cadence");
+}
+
+#[tokio::test]
 async fn test_set_registry() {
     use crate::{GossipConfig, KeyPair, registry::GossipRegistry};
     let pool = ConnectionPool::<()>::new(10, Duration::from_secs(5));
