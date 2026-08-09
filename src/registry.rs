@@ -134,20 +134,15 @@ fn owner_recovery_wins_tombstone(
 
 /// Does `location` (an actor's own, independently current record) still
 /// belong to whoever `peer_info` says currently occupies `peer_addr`?
-/// Exists to filter `peer_to_actors[peer_addr]` -- a side table that can
-/// list an actor which has since relocated to a different peer/address,
-/// left behind because nothing removes it from the OLD address's entry
-/// the moment the actor's own record moves.
+/// Filters `peer_to_actors[peer_addr]`, a side table that can list an
+/// actor which has since relocated, left behind because nothing removes
+/// it from the OLD address's entry the moment the actor's record moves.
 ///
-/// `location` must be read fresh, immediately before this function runs,
-/// not reused from an earlier snapshot: it answers whether THIS actor's
-/// own registration has moved since `peer_to_actors[peer_addr]` was
-/// populated, which a stale `location` cannot answer correctly. Feeding
-/// this function a stale location reintroduces exactly the bug
+/// `location` must be read fresh, immediately before this runs, not
+/// reused from an earlier snapshot -- a stale one reintroduces the bug
 /// `cleanup_dead_peers_does_not_prune_actor_that_moved_to_another_peer`
-/// exists to catch: an actor that has already relocated to a live,
-/// different peer gets pruned anyway because the check compares against
-/// where it USED to be.
+/// catches: an actor already relocated to a live, different peer gets
+/// pruned anyway because the check compares against where it USED to be.
 #[inline]
 fn actor_location_belongs_to_peer(
     location: &RemoteActorLocation,
@@ -861,26 +856,9 @@ pub trait PeerDisconnectHandler: Send + Sync {
     ) -> BoxFuture<'_, ()>;
 }
 
-/// This trait's `handle_peer_connect` used to take a third parameter, a
-/// `ConnectNotificationToken` a WELL-BEHAVED handler could consult to
-/// check whether the reconfiguration it was notified about was still
-/// current before doing expensive or externally-visible work.
-///
-/// The token was, by its own doc comment, "a courtesy, not the safety
-/// mechanism": `icanact` itself never relied on a handler checking it for
-/// correctness, and could not -- once `handle_peer_connect` is called,
-/// the check-before-invoking (`apply_configure_peer_connection_update`'s
-/// own `pin_is_current` guard) has already done everything IT can do,
-/// independent of anything passed to the handler. Unlike `connect_to_peer`
-/// (a function this crate ALSO calls internally with a genuine need for
-/// the richer detail), nothing internal to this crate ever consulted the
-/// token either -- both call sites constructed it purely to hand to the
-/// external handler. There is no internal caller to route a richer,
-/// `pub(crate)` form to; restoring the original two-parameter signature
-/// removes the break outright rather than working around it. The type
-/// itself (`ConnectNotificationToken`/`ConnectNotificationScope`) is
-/// deleted, not merely hidden: an unused mechanism nobody -- internal or
-/// external -- ever needed is a hole waiting to be found again.
+/// Two-parameter signature deliberately: `apply_configure_peer_connection_
+/// update`'s own `pin_is_current` guard already runs before this handler
+/// is invoked, so no notification-token parameter is needed for correctness.
 pub trait PeerConnectHandler: Send + Sync {
     fn handle_peer_connect(
         &self,
@@ -1109,46 +1087,30 @@ pub struct RegistryStats {
     pub tie_break_evictions: u64,
 }
 
-/// Three address concepts share the crate's plumbing, and only one of
-/// them is safe to attribute anything to. **Requested**: a caller's own
-/// input (`*addr`, a discovery hint, a supervisor's configured-peer
-/// snapshot) -- never independently verified, never valid for
-/// attribution; stays a bare `SocketAddr`, since there is nothing to wrap.
-/// **Attempted** (see [`AttemptedRoute`]): the address a connection
-/// attempt actually dialed or looked up against, win or lose -- valid
-/// evidence for a *failure*/backoff claim, since the crate genuinely
-/// tried it, but not for a positive one, since trying is not reaching.
+/// Three address concepts share the crate's plumbing, and only one is
+/// safe to attribute anything to. **Requested**: a caller's own input --
+/// never independently verified, never valid for attribution; stays a
+/// bare `SocketAddr`. **Attempted** (see [`AttemptedRoute`]): the address
+/// a connection attempt actually dialed or looked up against, win or
+/// lose -- valid for a *failure*/backoff claim, not a positive one.
 /// **Resolved** (this type): an address a connection-resolution path
 /// actually reached and verified -- valid for a positive liveness/health
-/// claim. Every `ResolvedRoute` was first an `AttemptedRoute` (see this
-/// type's constructor call sites), but not every attempt succeeds.
+/// claim. Every `ResolvedRoute` was first an `AttemptedRoute`.
 ///
 /// The only constructors are `pub(crate)`: nothing outside this crate can
-/// fabricate one, and within the crate it is built only where a connection
-/// was actually resolved (`connect_to_peer`'s own dial/lookup, or
-/// `ConnectionPool::get_connection`'s resolved `ConnectionHandle`). Every
-/// site that attributes a positive liveness/health outcome to an address --
-/// clearing failure state, inserting a fresh `PeerInfo`, gossiping an
-/// address as reachable -- takes this type instead of a bare `SocketAddr`,
-/// so a caller cannot attribute an outcome to an address it only asked for.
-/// A *negative* claim (marking an address unreachable) makes no such
-/// assertion; see [`AttemptedRoute`] for what it should carry instead of a
-/// bare `SocketAddr` whenever a genuine attempt happened.
+/// fabricate one, and within the crate it is built only where a
+/// connection was actually resolved. Every site that attributes a
+/// positive liveness/health outcome to an address takes this type
+/// instead of a bare `SocketAddr`, so a caller cannot attribute an
+/// outcome to an address it only asked for.
 ///
-/// "An address some connection resolved to" is NOT, on its own, "an
-/// address we can dial" -- an INBOUND connection's `.addr` is its raw,
-/// ephemeral TCP source (a ConnectionHandle carries no direction of its
-/// own; the pool's OWN `LockFreeConnection` does), never a corroborated
-/// dial target, and an undialable address becoming
-/// selectable/gossipable through a fresh, unflagged `PeerInfo` is a
-/// recurring bug class here. This type
-/// therefore also carries whether IT was independently corroborated as
-/// dialable, so that fact cannot be dropped by a caller who forgets to ask
-/// -- `PeerInfo::for_connect_attempt` reads it directly rather than
-/// depending on every construction site to also remember to flag
-/// `transport_source_keyed`/`inbound_observed` by hand, which is exactly
-/// how this bug class kept reaching the type through different call sites
-/// (`connect_to_peer`, the discovered path in `lib.rs`, and others).
+/// "Resolved" is NOT, on its own, "dialable" -- an INBOUND connection's
+/// `.addr` is its raw, ephemeral TCP source, never a corroborated dial
+/// target, and an undialable address becoming selectable/gossipable
+/// through a fresh, unflagged `PeerInfo` is a recurring bug class here.
+/// This type therefore also carries whether IT was independently
+/// corroborated as dialable, so that fact cannot be dropped by a caller
+/// who forgets to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolvedRoute {
     addr: SocketAddr,
@@ -1156,14 +1118,10 @@ pub struct ResolvedRoute {
 }
 
 impl ResolvedRoute {
-    /// Build a `ResolvedRoute` from a live connection. `direction` MUST be
-    /// independently looked up from the connection pool's
-    /// `LockFreeConnection` (a bare `ConnectionHandle` has no direction of
-    /// its own) -- only a genuine OUTBOUND dial corroborates `addr` as
-    /// dialable; an INBOUND connection's own address is its raw, unproven
-    /// transport source. `None` (direction unknown, or the connection was
-    /// not found in the lock-free index at all) is treated the same as
-    /// `Inbound`: conservatively unverified, never assumed dialable.
+    /// `direction` MUST be independently looked up from the connection
+    /// pool's `LockFreeConnection` (a bare `ConnectionHandle` carries none)
+    /// -- only a genuine OUTBOUND dial corroborates `addr` as dialable.
+    /// `None` (unknown, or not found) is treated the same as `Inbound`.
     pub(crate) fn from_connection(
         addr: SocketAddr,
         direction: Option<crate::connection_pool::ConnectionDirection>,
@@ -1174,16 +1132,14 @@ impl ResolvedRoute {
         }
     }
 
-    /// The resolved socket address.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// Whether this address is independently corroborated as dialable --
-    /// see this type's own doc comment. `false` marks an inbound
-    /// connection's raw, unverified transport source; a consumer that
-    /// builds gossip-visible state from this route MUST propagate that
-    /// (`PeerInfo::for_connect_attempt` does so automatically).
+    /// `false` marks an inbound connection's raw, unverified transport
+    /// source; a consumer building gossip-visible state from this route
+    /// MUST propagate that (`PeerInfo::for_connect_attempt` does so
+    /// automatically).
     pub fn is_dialable(&self) -> bool {
         self.dialable
     }
@@ -1207,41 +1163,15 @@ impl PartialEq<ResolvedRoute> for SocketAddr {
     }
 }
 
-/// The outcome of a successful `connect_to_peer`: a live connection for the
-/// peer identity was reached either way, but the two variants distinguish
-/// whether the underlying connection resolution ALSO independently
-/// corroborated a particular address as dialable.
-///
-/// `connect_to_peer` used to wrap `configured_addr` (the peer's currently
-/// configured/required route, from `ConnectionPool`) in a `ResolvedRoute`
-/// via `ResolvedRoute::from_configured` whenever the connection it reused
-/// was not itself a genuine outbound dial -- e.g. reuse of an existing
-/// INBOUND connection at a completely different address A. That
-/// constructor's own premise ("trusted independent of connection
-/// direction... operator- or claim-asserted") does not hold here: for the
-/// `Peer::connect` ORDINARY path, the configured address is whatever the
-/// CALLER most recently asked for via `set_ordinary_connect_route`, which
-/// only refuses on an operator-pin CONFLICT -- it never independently
-/// verifies the address itself. So an arbitrary or stale caller-provided
-/// address could be marked healthy, cleared of failures, and returned as a
-/// *resolved* route purely because the same identity happened to have an
-/// unrelated inbound connection open somewhere -- exactly the value-level
-/// guarantee `ResolvedRoute` exists to prevent, reintroduced through the
-/// one exemption that bypassed it. `from_configured` had exactly one call
-/// site (this one) and no other legitimate use, so it is deleted rather
-/// than narrowed.
-///
-/// The fix: when no dialable address was actually reached this round, do
-/// NO positive address-level bookkeeping at all (no entry created, no
-/// failures cleared, nothing marked successful, for either address), and
-/// do not wrap anything in `ResolvedRoute` -- that type's own contract is
-/// "valid only once genuinely reached" (see its doc comment), which
-/// neither `conn.addr` (often a raw, unverified ephemeral transport
-/// source) nor `configured_addr` (never independently verified by this
-/// call) satisfies. `ConnectedUnverified` carries `configured_addr` purely
-/// as diagnostic/liveness-signal information -- the peer's identity IS
-/// reachable via *some* live connection, which is worth reporting to a
-/// liveness handler -- never as a claim that any address is dialable.
+/// The outcome of a successful `connect_to_peer`: a live connection for
+/// the peer identity was reached either way, but the two variants
+/// distinguish whether the resolution also independently corroborated a
+/// particular address as dialable. Wrapping a stale caller-provided/
+/// configured address in a `ResolvedRoute` just because SOME unrelated
+/// connection for the same identity happened to be open would reintroduce
+/// the exact guarantee `ResolvedRoute` exists to prevent, so when no
+/// dialable address was actually reached, `ConnectedUnverified` carries it
+/// as diagnostic/liveness signal only, never as a dialability claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectOutcome {
     addr: SocketAddr,
@@ -1259,12 +1189,9 @@ impl ConnectOutcome {
         }
     }
 
-    /// A live connection for this peer identity was reused, but nothing
-    /// about this call independently corroborates `addr` -- or any other
-    /// address -- as dialable. `addr` is carried for diagnostic/liveness
-    /// purposes only; see this type's own doc comment. Callers MUST NOT
-    /// perform gossip-visible address bookkeeping (clearing failures,
-    /// marking healthy, gossiping as reachable) keyed to it.
+    /// A live connection was reused but nothing corroborates `addr` as
+    /// dialable. Callers MUST NOT perform gossip-visible address
+    /// bookkeeping (clearing failures, marking healthy) keyed to it.
     pub(crate) fn connected_unverified(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -1298,20 +1225,13 @@ impl std::fmt::Display for ConnectOutcome {
     }
 }
 
-/// An address a connection attempt actually dialed or looked up against --
-/// regardless of whether the attempt succeeded. See [`ResolvedRoute`]'s
-/// doc comment for the full three-concept hierarchy: this is strictly
-/// weaker than `ResolvedRoute` (an attempt is not a success) but strictly
-/// stronger than a bare requested/hinted `SocketAddr` (the crate did
-/// genuinely try this exact address, so a *failure*/backoff claim may
-/// attribute to it -- a caller's own snapshot of what it MEANT to try is
-/// not the same fact, and can be stale relative to what a concurrent
-/// repin actually left this call attempting).
-///
-/// The only constructor is `pub(crate)`, built where a connection
-/// resolution path commits to attempting an address (immediately before
-/// or alongside the dial/lookup itself) -- never from a caller's own,
-/// separately-timed read of the same routing state.
+/// An address a connection attempt actually dialed or looked up against,
+/// regardless of success. See [`ResolvedRoute`]'s doc comment for the full
+/// three-concept hierarchy: weaker than `ResolvedRoute` (an attempt is not
+/// a success) but stronger than a bare requested/hinted `SocketAddr`,
+/// which can be stale relative to what a concurrent repin left in flight.
+/// Only constructor is `pub(crate)`, built where a connection-resolution
+/// path commits to the attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AttemptedRoute(SocketAddr);
 
@@ -1323,7 +1243,6 @@ impl AttemptedRoute {
         Self(addr)
     }
 
-    /// The attempted socket address.
     pub fn addr(&self) -> SocketAddr {
         self.0
     }
@@ -1349,17 +1268,10 @@ impl PartialEq<AttemptedRoute> for SocketAddr {
 
 /// Peer information with failure tracking and delta state
 ///
-/// `#[non_exhaustive]`: this struct already exists on `main`, and its
-/// `last_failure_instant` field is a real, unavoidable break for any
-/// external struct-literal construction or exhaustive destructuring of
-/// it -- adding a field to an all-`pub`-field, non-`#[non_exhaustive]`
-/// public struct always is. Marking it `#[non_exhaustive]` costs existing
-/// consumers nothing further (they already must account for the
-/// new field) while preventing this exact category of silent break from
-/// recurring the next time this struct grows. Has no effect on this
-/// crate's own extensive struct-literal use throughout its test suite --
-/// `#[non_exhaustive]` only restricts construction/exhaustive matching
-/// from OUTSIDE the defining crate.
+/// `#[non_exhaustive]`: `last_failure_instant` is an unavoidable break for
+/// external struct-literal construction of this all-`pub`-field struct;
+/// marking it prevents the same break recurring, with no effect on this
+/// crate's own (unrestricted) struct-literal use.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PeerInfo {
@@ -1618,42 +1530,21 @@ impl PeerInfo {
         }
     }
 
-    /// Create a `PeerInfo` for a peer this node has just attempted (or just
+    /// Create a `PeerInfo` for a peer this node has just attempted (or
     /// resolved an existing connection to) at `address`, for `node_id` if
-    /// known.
-    ///
-    /// The baseline reflects "just added, outcome not yet applied" --
-    /// `failures: 0`, `last_success: 0` -- the same starting shape the
-    /// unconditional pre-dial insert this replaces used to construct.
-    /// Callers apply the actual success/failure fields on top immediately
-    /// after obtaining this via `entry(...).or_insert_with(...)`.
-    ///
-    /// Used exclusively as the "insert if absent" half of connect-attempt
-    /// bookkeeping in `connect_to_peer` and `Peer::connect_with_route_mode`
-    /// -- both of which now key an entry to the address a dial actually
-    /// resolved (or, for the discovered/non-required path, the sole
-    /// unambiguous address it was ever going to be), never to a stale
-    /// request whose acceptance predates the dial by an unbounded amount
-    /// of time. See `connect_to_peer`'s doc comment for the history: an
-    /// earlier version of this bookkeeping ran unconditionally BEFORE the
-    /// dial, keyed to whatever the caller originally asked for, so a
-    /// concurrent `configure_peer` repinning the peer elsewhere in the
-    /// interim left a fresh, never-actually-contacted entry behind
-    /// regardless of where the dial ended up landing.
+    /// known. Baseline reflects "just added, outcome not yet applied"
+    /// (`failures: 0`, `last_success: 0`), with the caller applying the
+    /// real outcome immediately after via `entry(...).or_insert_with(...)`.
+    /// Keys to the address the dial actually resolved, never to a stale
+    /// pre-dial request, so a concurrent repin in the interim can't leave
+    /// a never-contacted entry behind.
     ///
     /// `transport_source_keyed`/`inbound_observed` are set directly from
-    /// `address.is_dialable()` -- NEVER left to the caller to remember: an
-    /// earlier version required every call site to separately notice when
-    /// its `ResolvedRoute` was backed by an unverified, inbound-sourced
-    /// connection and set these flags by hand, and this is precisely the
-    /// class of bug that let an "ephemeral inbound source treated as a
-    /// dialable route" recur through the type itself (in
-    /// `connect_to_peer` and the discovered path in `lib.rs`) even after
-    /// `ResolvedRoute` existed specifically to prevent misattribution.
-    /// `ResolvedRoute::from_connection` is the only way to construct one
-    /// (a second constructor, `from_configured`, existed for a while but
-    /// was deleted -- see `ConnectOutcome`'s own doc
-    /// comment), and a caller cannot silently drop the flag it carries.
+    /// `address.is_dialable()` rather than left for the caller to
+    /// remember (an unverified inbound connection being treated as
+    /// dialable recurred across call sites when this was hand-set) --
+    /// `ResolvedRoute::from_connection` is the only way to build `address`,
+    /// so the flag can't be silently dropped.
     pub(crate) fn for_connect_attempt(
         address: ResolvedRoute,
         node_id: Option<crate::GossipNodeId>,
@@ -1666,19 +1557,10 @@ impl PeerInfo {
         info
     }
 
-    /// Build a skeleton entry for an address a connect attempt FAILED
-    /// against. Unlike `for_connect_attempt`, this takes an
-    /// [`AttemptedRoute`] rather than a [`ResolvedRoute`]: recording that
-    /// an address was tried and failed makes no claim that a connection
-    /// was ever resolved or verified against it, so `ResolvedRoute`'s
-    /// proof is not available here -- but it MUST be the address the
-    /// crate genuinely attempted, never a bare requested/hinted
-    /// `SocketAddr` a caller merely intended to reach, which can be stale
-    /// relative to what a concurrent repin actually left in flight.
-    /// Callers are expected to set failure bookkeeping (`failures`,
-    /// `last_failure_*`) immediately after construction; this never marks
-    /// anything dialable/reachable, and `outbound_dial_success` stays
-    /// `false`.
+    /// Takes an [`AttemptedRoute`], not a [`ResolvedRoute`]: a failed
+    /// attempt makes no claim of resolution, but must still be the address
+    /// genuinely attempted, not a bare requested/hinted `SocketAddr` that
+    /// can be stale relative to what a concurrent repin left in flight.
     pub(crate) fn for_failed_connect_attempt(
         address: AttemptedRoute,
         node_id: Option<crate::GossipNodeId>,
@@ -2286,41 +2168,19 @@ pub struct GossipRegistry<T = ()> {
     pub dns_resolver: Arc<tokio::sync::RwLock<Arc<dyn crate::dns::DnsResolver>>>,
 }
 
-/// Manual, NOT derived. `#[derive
-/// (Clone)]` -- what this struct used to have -- generates `impl<T:
-/// Clone> Clone for GossipRegistry<T>`, bounding EVERY generic parameter
-/// regardless of whether any field actually needs it: a well-known,
-/// long-standing limitation of the derive macro (it does not do
-/// per-field usage analysis). Every field here is either entirely
-/// independent of `T` or reaches it only through `Arc<ConnectionPool<T>>`
-/// -- and `ConnectionPool<T>` itself only ever holds `T` behind
-/// `PhantomData<fn() -> T>` (a marker, never an owned value) -- so cloning
-/// this struct never actually needs to clone a `T`, only to bump `Arc`
-/// reference counts, an operation `Arc<X>::clone` performs unconditionally
-/// for any `X`. The derived bound was pure conservatism, never a genuine
-/// requirement.
-///
-/// That conservatism became a real, breaking cost once `queue_configure_
-/// peer_until_applied` needed `self.clone()` inside a detached
-/// `tokio::spawn`: satisfying the derived bound meant adding `T: Clone`
-/// (and, separately, `Send + Sync` for the spawned task) to
-/// `configure_peer`'s own public signature -- narrowing a `pub` method
-/// that, on `main`, is callable for every `T: 'static`, breaking
-/// compilation for any downstream `GossipRegistry<T>` instantiated with a
-/// payload type that happens not to be `Clone`/`Send`/`Sync`, even though
-/// nothing about this crate's own behavior actually depends on `T` having
-/// any of those properties. This manual impl removes the unnecessary
-/// bound at its source instead of threading a workaround through every
-/// caller that needs to clone a registry: `GossipRegistry<T>: Clone` (and,
-/// by the same reasoning applied transitively, `Send`/`Sync`) now holds
-/// for every `T`, exactly matching `main`'s actual public surface, not
-/// merely restoring source compatibility for the one call site that
-/// happened to expose the gap.
+/// Manual, not derived: `#[derive(Clone)]` would bound EVERY `T` with
+/// `Clone`, even though every field here is either independent of `T` or
+/// reaches it only through `Arc<ConnectionPool<T>>`, which only ever holds
+/// `T` behind `PhantomData<fn() -> T>` -- cloning never needs to clone a
+/// `T`, only bump `Arc` counts. That derived bound became a real cost once
+/// `queue_configure_peer_until_applied` needed `self.clone()` inside a
+/// detached `tokio::spawn`: it would have forced `T: Clone + Send + Sync`
+/// onto `configure_peer`'s public signature. This impl removes the
+/// unnecessary bound at its source, matching `main`'s actual public
+/// surface.
 ///
 /// Field-complete, not field-selective: every field is cloned explicitly,
-/// so adding a new field without extending this impl is a compile error
-/// (a missing-field diagnostic on the struct literal below), never a
-/// silently-incomplete clone.
+/// so adding a new field without extending this impl is a compile error.
 impl<T> Clone for GossipRegistry<T> {
     fn clone(&self) -> Self {
         Self {
@@ -2392,110 +2252,53 @@ impl Drop for DiscoveryTaskTracker {
 }
 
 /// Which owner command `add_peer_with_node_id_generation_inner` submits a
-/// claim through. The three production paths need different atomicity: a
-/// plain claim decides ownership alone; a connection-scoped claim also
-/// commits its session receipt in the same owner step; an operator
-/// configuration also commits its pin (and any evicted pin's release) in
-/// the same owner step. See `PeerRegistryOwner::{claim, claim_connection_scoped,
-/// configure_peer}`.
+/// claim through -- the three production paths need different atomicity.
+/// See `PeerRegistryOwner::{claim, claim_connection_scoped, configure_peer}`.
 enum ClaimSubmission {
     /// Gossip/discovery-derived claims: no receipt, no pin.
     Plain,
-    /// An outbound dial this node completed, or an authenticated inbound
-    /// session: commits the session's connection-scoped receipt atomically
-    /// with the ownership decision.
+    /// An outbound dial or authenticated inbound session: commits the
+    /// session's connection-scoped receipt atomically with the decision.
     ConnectionScoped(SocketAddr),
-    /// `GossipRegistry::configure_peer`: commits the operator pin (and any
-    /// evicted pin's release) atomically with the ownership decision.
-    ///
-    /// Carries the SAME `expected_generation` `PeerRegistryOwner::
-    /// configure_peer` takes -- see `configure_peer_generation`'s own doc
-    /// comment: `None` for a peer's first `configure_peer`
-    /// call, `Some(generation)` for a queued retry presenting a value a
-    /// prior call already established, validated atomically at the owner
-    /// rather than by this caller checking a snapshot of it beforehand.
+    /// `configure_peer`: commits the operator pin (and any evicted pin's
+    /// release) atomically with the decision. `expected_generation` is
+    /// `None` for a peer's first call, `Some(gen)` for a queued retry,
+    /// validated atomically at the owner, not against a caller snapshot.
     OperatorConfigured(Option<u64>),
 }
 
 /// Result of a `GossipRegistry::configure_peer_with_outcome` call -- the
-/// `pub(crate)`, STRICT sibling of the public `configure_peer`, matching
-/// the precedent `connect_to_peer`/`connect_to_peer_with_outcome` already
-/// set: the public form's signature stays stable and unconditionally
-/// applies (see `configure_peer`'s own doc comment for how), while this
-/// richer, honestly-reporting form exists for internal callers -- this
-/// crate's own tests, overwhelmingly -- that need to observe the precise
-/// outcome of exactly one synchronous attempt, including a still-live reap
-/// collision, rather than the public form's stronger but less immediately
-/// observable guarantee.
+/// `pub(crate)` STRICT sibling of the public `configure_peer`: the public
+/// form's signature stays stable, while this richer form exists for
+/// internal callers (mostly tests) that need one attempt's precise outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigurePeerOutcome {
     /// The pin was installed (or already was this exact pin) and every
-    /// follow-up side effect (dialability marking, the connect-handler
-    /// notification) has run.
+    /// follow-up side effect has run.
     Applied,
-    /// The ownership authority permanently refused this claim -- a
-    /// different, verified identity already legitimately owns this
-    /// address. Retrying with the same arguments will not succeed;
-    /// retrying with a different address might.
+    /// Permanently refused -- a different, verified identity already
+    /// legitimately owns this address. Retrying will not succeed.
     Rejected,
-    /// A `cleanup_dead_peers` sweep held a reap reservation for
-    /// `connect_addr` for the full retry budget
-    /// (`CONFIGURE_PEER_REAP_RETRY_BUDGET`); THIS call's own attempt did
-    /// not apply the configuration. Reservations are held only for the
-    /// duration of one sweep's destructive work for a single address,
-    /// brief by construction -- milliseconds, not seconds -- so this
-    /// should be practically unreachable within one attempt; see
-    /// `CONFIGURE_PEER_REAP_RETRY_BUDGET`'s own doc comment. Note this is
-    /// `configure_peer_with_outcome`'s own, single-attempt result: the
-    /// public `configure_peer` treats this as "not yet," not "gave up" --
-    /// see its doc comment.
+    /// A `cleanup_dead_peers` sweep held a reap reservation for the full
+    /// retry budget; nothing applied. The public `configure_peer` treats
+    /// this as "not yet," not "gave up" -- see its own doc comment.
     TemporarilyBlocked,
-    /// A LATER `configure_peer` call for the SAME peer has already been
-    /// made, atomically, at the owner (`ClaimRejection::
-    /// SupersededByNewerConfiguration`) -- this call's own `expected_
-    /// generation` is no longer current. Retrying THIS request would not
-    /// help: a newer one already exists and, by construction, generations
-    /// only increase. Distinct from `Rejected` (a different identity
-    /// legitimately owns the address) -- this is about losing to a NEWER
+    /// A LATER `configure_peer` call for the SAME peer already committed;
+    /// `expected_generation` is stale and generations only increase, so
+    /// retrying won't help. Distinct from `Rejected`: losing to a newer
     /// request for the SAME peer, not to a competing claimant.
     Superseded,
 }
 
-/// Total wall-clock budget a SINGLE `configure_peer_with_outcome` attempt
-/// spends retrying a claim that keeps losing to another caller's live
-/// reap reservation (`ClaimRejection::ReapInProgress`) before reporting
-/// `ConfigurePeerOutcome::TemporarilyBlocked` for that attempt.
-///
-/// An earlier version of this was a small ATTEMPT count (5 tries x 20ms =~
-/// 100ms total) behind a public `configure_peer` that returned `()`
-/// unconditionally, silently discarding the request once the count was
-/// exhausted. The combination was silent data loss: contention while a
-/// reservation holder's destructive work runs can
-/// legitimately run long enough to blow a 100ms budget even though the
-/// reservation is guaranteed to release eventually (every reservation is
-/// released either by the holder's own `reservation.release().await` or, if
-/// its holding task is hard-aborted, by the guard's own `Drop` impl doing a
-/// best-effort synchronous release -- there is no path that leaks one
-/// forever).
-///
-/// This budget is now TIME-based and generous (30s, versus a reservation
-/// holder's actual per-address destructive work, which is in-memory and
-/// brief -- milliseconds) with capped exponential backoff between attempts, so a
-/// reservation racing a real `configure_peer` call clears within ONE
-/// attempt's budget in every case except a genuinely stuck sweep or owner.
-/// It bounds a SINGLE `configure_peer_with_outcome` call, not the public
-/// `configure_peer`'s overall guarantee -- see that method's own doc
-/// comment for why exhausting this budget still does not mean the
-/// operator's request is discarded.
+/// Time-based, not attempt-count-based: an earlier attempt-count version
+/// (~100ms total) silently discarded the request once exhausted -- silent
+/// data loss, since a reservation holder's work can legitimately outlast
+/// 100ms even though every reservation is guaranteed to release
+/// eventually. Bounds a SINGLE `configure_peer_with_outcome` attempt, not
+/// `configure_peer`'s overall guarantee -- see its own doc comment.
 const CONFIGURE_PEER_REAP_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
-/// Starting delay between `configure_peer`'s reap-reservation retries,
-/// doubling (capped at `CONFIGURE_PEER_REAP_RETRY_MAX_BACKOFF`) after each
-/// attempt. Short at first because the work a held reservation is
-/// protecting (actor/tombstone/capability/clock-state clearing for one
-/// address) is in-memory and normally fast, so most races clear within a
-/// handful of short waits; growing afterward avoids hammering the owner
-/// with tight-looped claim attempts for the rare case that goes long.
+/// Doubles after each retry (capped at `CONFIGURE_PEER_REAP_RETRY_MAX_BACKOFF`).
 const CONFIGURE_PEER_REAP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
 
 /// Cap on `configure_peer`'s reap-reservation retry backoff -- see
@@ -3964,12 +3767,10 @@ impl<T: 'static> GossipRegistry<T> {
     /// is deliberately excluded: its ownership is persistent rather than
     /// connection-scoped.
     ///
-    /// The receipt bookkeeping (which live sessions currently back this
-    /// address for this peer, and at what owner generation) lives inside the
-    /// owner actor itself and is committed in the SAME serialized step as the
-    /// ownership decision -- see `PeerRegistryOwner::claim_connection_scoped`.
-    /// Nothing here mutates that bookkeeping directly, so two concurrent
-    /// calls for the same peer+address can never observe or leave behind an
+    /// The receipt bookkeeping lives inside the owner actor and commits in
+    /// the SAME serialized step as the ownership decision -- see
+    /// `PeerRegistryOwner::claim_connection_scoped`. Nothing here mutates
+    /// it directly, so two concurrent calls can never leave an
     /// inconsistent intermediate state.
     pub(crate) async fn add_connection_scoped_peer_claim(
         &self,
@@ -3994,19 +3795,17 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Release all owner claims attributed to one physical session.
     /// `RegistryOwnerHandle::release_session` atomically finds every receipt
-    /// this session holds, removes it, decides -- in that same owner-task
-    /// step -- whether each address is still covered by another live
-    /// session, and retracts the ownership of every address that is not,
-    /// all as ONE owner command (see its doc comment for why splitting the
-    /// retraction into a separately-ordered `release` call stranded
-    /// addresses permanently). The addresses it hands back here are
-    /// therefore already released; this only tombstones this registry's own
-    /// `gossip_state` projection at the resulting commit sequence. An
-    /// operator-pinned address (`GossipRegistry::configure_peer`) never has a
-    /// receipt to hand back in the first place, and `release_session` itself
-    /// refuses to retract a pinned address regardless, so a stale connection
-    /// receipt racing a concurrent `configure_peer` can never retract a pin
-    /// out from under it.
+    /// this session holds, decides whether each address is still covered
+    /// by another live session, and retracts ownership of every address
+    /// that is not -- all as ONE owner command (splitting retraction into
+    /// a separately-ordered `release` call stranded addresses
+    /// permanently). Addresses handed back here are therefore already
+    /// released; this only tombstones this registry's `gossip_state`
+    /// projection at the resulting commit sequence. An operator-pinned
+    /// address never has a receipt to hand back, and `release_session`
+    /// itself refuses to retract a pin regardless, so a stale connection
+    /// receipt racing a concurrent `configure_peer` can never retract a
+    /// pin out from under it.
     pub(crate) async fn release_connection_scoped_claims(
         &self,
         peer_id: &crate::PeerId,
@@ -4047,44 +3846,21 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Claim `peer_addr` for `node_id` with `ClaimKind::Verified`, and
-    /// install it as the operator's pin for this peer in the SAME
-    /// serialized owner step -- see `PeerRegistryOwner::configure_peer`.
-    /// The sole caller is `configure_peer`.
+    /// install it as the operator's pin in the SAME serialized owner step
+    /// -- see `PeerRegistryOwner::configure_peer`. Sole caller:
+    /// `configure_peer`.
     ///
-    /// The second element of the returned tuple is the evicted pin's
-    /// release info (address, release commit position), if installing the
-    /// new pin evicted a DIFFERENT address this same peer was previously
-    /// pinned at AND that eviction also released its ownership in this same
-    /// atomic step (i.e. this peer still genuinely held it). `None` when
-    /// nothing was evicted, or the claim itself was rejected.
-    ///
-    /// Reported regardless of `outcome`: this eviction/release already
-    /// fully committed inside the owner's atomic transaction, which is a
-    /// fact about a DIFFERENT address (the evicted one) than whatever
-    /// `peer_addr`'s own projection outcome below turns out to be. See
-    /// `configure_peer`'s comment on why the caller must apply this
-    /// unconditionally rather than only on `Accepted`.
-    ///
-    /// The third element is `true` when `outcome == Rejected` was
-    /// specifically caused by a temporary `ClaimRejection::ReapInProgress`
-    /// (another caller currently holds a reap reservation for `peer_addr`
-    /// via `RegistryOwnerHandle::reserve_for_reap`) rather than a permanent
-    /// arbitration loss -- see `configure_peer`'s doc comment for why this
-    /// distinction must reach the caller.
-    ///
-    /// `expected_generation`: threaded verbatim to `ClaimSubmission::
-    /// OperatorConfigured`/`PeerRegistryOwner::configure_peer` -- see
-    /// `configure_peer_generation`'s own doc comment. `None` for a peer's
-    /// first `configure_peer` call; `Some(generation)` for a queued
-    /// retry, validated atomically at the owner rather than by this
-    /// caller checking a snapshot of it beforehand.
-    ///
-    /// The fifth element of the returned tuple is this exact transaction's
-    /// resulting `configure_peer_generation` value for this peer (the
-    /// caller's own `expected_generation` if it was accepted as current,
-    /// or the OWNER's freshly bumped value on a first call) -- `None` only
-    /// if the call never reached the owner at all (a local, pre-owner
-    /// rejection above).
+    /// Returns (in order): the claim outcome; the evicted pin's release
+    /// info if installing the new pin evicted a DIFFERENT previously-pinned
+    /// address, reported regardless of `outcome` since the caller must
+    /// apply it unconditionally; whether `Rejected` was a temporary
+    /// `ReapInProgress` rather than a permanent arbitration loss; the
+    /// resulting `configure_peer_generation` (`None` only if the call never
+    /// reached the owner); and whether `Rejected` was specifically
+    /// `SupersededByNewerConfiguration` (mutually exclusive with the
+    /// reap-in-progress element). `expected_generation` threads verbatim to
+    /// `ClaimSubmission::OperatorConfigured`: `None` for a first call,
+    /// `Some(gen)` for a queued retry, validated at the owner.
     async fn add_operator_configured_peer_claim(
         &self,
         peer_addr: SocketAddr,
@@ -4092,21 +3868,12 @@ impl<T: 'static> GossipRegistry<T> {
         expected_generation: Option<u64>,
     ) -> (
         crate::addr_ownership::AddrClaimOutcome,
-        // This exact claim commit's receipt, carrying the generation the
-        // pin it installed is fenced to. `configure_peer` itself no longer
-        // consumes this (see `apply_configure_peer_connection_update`'s
-        // own doc comment for why); kept in this return shape for the
-        // other callers that still do.
+        // This claim commit's receipt; `configure_peer` no longer consumes
+        // it directly, kept for the other callers that still do.
         Option<crate::registry_owner::ClaimReceipt>,
         Option<(SocketAddr, crate::registry_owner::CommitSeq)>,
         bool,
         Option<u64>,
-        // `true` when `outcome == Rejected` was specifically caused by
-        // `ClaimRejection::SupersededByNewerConfiguration` -- see
-        // `configure_peer_generation`'s own doc comment. Always `false`
-        // when `AddrClaimOutcome::Accepted`, and mutually exclusive with
-        // the `reap_in_progress` element above (a claim can only be
-        // rejected for one reason).
         bool,
     ) {
         let (outcome, receipt, evicted_release, reap_in_progress, generation, superseded) = self
@@ -4170,12 +3937,9 @@ impl<T: 'static> GossipRegistry<T> {
         // (irrelevant there: `configure_peer` never calls this function
         // with anything but `OperatorConfigured`, and always needs this).
         Option<u64>,
-        // `true` when `AddrClaimOutcome::Rejected` above was specifically
-        // `ClaimRejection::SupersededByNewerConfiguration` -- see
-        // `configure_peer_generation`'s own doc comment. Only ever `true`
-        // for `ClaimSubmission::OperatorConfigured`; every other
-        // submission kind, and every early-return path that never reaches
-        // the owner, always reports `false`.
+        // `true` only for `ClaimSubmission::OperatorConfigured`, when
+        // `Rejected` above was specifically `SupersededByNewerConfiguration`
+        // -- see `configure_peer_generation`'s doc comment.
         bool,
     ) {
         use crate::addr_ownership::AddrClaimOutcome;
@@ -4227,19 +3991,12 @@ impl<T: 'static> GossipRegistry<T> {
         // commit AND be projected in the meantime; the position is what lets
         // this call detect that and stand down.
         let mut projected_claim: Option<crate::registry_owner::ClaimReceipt> = None;
-        // Set only by `ClaimSubmission::OperatorConfigured`: the evicted
-        // pin's release info from this same atomic `configure_peer`
-        // transaction, if installing the new pin evicted a different
-        // address this peer still genuinely owned. Carried through to every
-        // return point below regardless of how the REST of this call's
-        // gossip_state projection resolves -- the owner-side transaction it
-        // reports on already fully committed, atomically, before this call
-        // ever reached this point.
+        // Both set only by `ClaimSubmission::OperatorConfigured`, and both
+        // carried through to every return point below regardless of how
+        // the REST of this call's gossip_state projection resolves -- the
+        // owner-side `configure_peer` transaction they report on already
+        // fully committed, atomically, before this call reached this point.
         let mut evicted_release: Option<(SocketAddr, crate::registry_owner::CommitSeq)> = None;
-        // Set only by `ClaimSubmission::OperatorConfigured`: this exact
-        // transaction's `configure_peer_generation` value for `peer_id` --
-        // see this function's own return-type doc comment and
-        // `configure_peer_generation`'s.
         let mut configure_peer_generation: Option<u64> = None;
         if let Some(claimed_node_id) = node_id {
             // Decide and publish through the single-owner actor, and do it
@@ -4279,23 +4036,19 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             };
             let receipt = commit.receipt();
-            // Captured before the destructure below discards the
-            // rejection's own reason: `ReapInProgress` is a TEMPORARY
-            // refusal, not a permanent arbitration loss -- see this
-            // function's own doc comment on the 4th return element.
+            // Captured before the destructure below discards the reason:
+            // `ReapInProgress` is a TEMPORARY refusal, not a permanent
+            // arbitration loss -- see the 4th return element's doc.
             let reap_in_progress = matches!(
                 commit,
                 crate::registry_owner::ClaimCommit::Rejected(
                     crate::registry_owner::ClaimRejection::ReapInProgress
                 )
             );
-            // Same capture-before-destructure pattern as `reap_in_progress`
-            // above, for the SAME reason: `ClaimRejection::
-            // SupersededByNewerConfiguration` (only ever produced by
-            // `ClaimSubmission::OperatorConfigured`) is a TEMPORARY-
-            // looking `AddrClaimOutcome::Rejected` that actually means
-            // something entirely different from a permanent arbitration
-            // loss -- see `configure_peer_generation`'s own doc comment.
+            // Same capture-before-destructure pattern, same reason:
+            // `SupersededByNewerConfiguration` is a TEMPORARY-looking
+            // `Rejected` that actually means something else entirely --
+            // see `configure_peer_generation`'s doc comment.
             let superseded = matches!(
                 commit,
                 crate::registry_owner::ClaimCommit::Rejected(
@@ -4359,10 +4112,9 @@ impl<T: 'static> GossipRegistry<T> {
             // conflict. Its state already won the watermark race, so this
             // call must stand down without replaying anything but still tell
             // connection/configuration callers that their claim is valid.
-            // `evicted_release` is still reported regardless: it reflects
-            // THIS call's own atomic `configure_peer` transaction, which
-            // already fully committed inside the owner before this
-            // gossip_state projection was ever attempted.
+            // `evicted_release` is still reported: it reflects THIS call's
+            // own atomic transaction, already committed before this
+            // projection was attempted.
             return if authoritative_owner_unchanged {
                 (
                     AddrClaimOutcome::Accepted,
@@ -4634,68 +4386,21 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Configure a peer by peer ID and its expected connection address.
     ///
-    /// The public signature is `()`, genuinely unchanged from `main`, per
-    /// the same precedent [`Self::connect_to_peer`] /
-    /// [`Self::connect_to_peer_with_outcome`] already established for this
-    /// exact tension: the public signature stays stable, and the richer,
-    /// honestly-reporting form lives under a distinct, `pub(crate)` name
-    /// for callers that need it -- [`Self::configure_peer_with_outcome`].
+    /// The public signature is `()`, unchanged from `main`; the richer,
+    /// honestly-reporting form lives under
+    /// [`Self::configure_peer_with_outcome`].
     ///
-    /// A `()` return alone cannot signal a silently-dropped configuration,
-    /// so `()` here GUARANTEES eventual application rather than merely
-    /// attempting it once.
-    /// [`Self::configure_peer_with_outcome`]'s own `CONFIGURE_PEER_REAP_
-    /// RETRY_BUDGET`-bounded attempt runs first, synchronously, exactly as
-    /// before; if THAT attempt still reports [`ConfigurePeerOutcome::
-    /// TemporarilyBlocked`] (its budget elapsed while still refused by a
-    /// live reap reservation), this call does NOT give up -- it hands the
-    /// same request to [`Self::queue_configure_peer_until_applied`], a
-    /// detached background retry that keeps making fresh
-    /// budget-bounded attempts, indefinitely, until the reservation clears
-    /// and the pin genuinely applies (or the claim is permanently
-    /// rejected, at which point retrying is pointless and it stops). This
-    /// call itself then returns -- it does not block the caller for the
-    /// queued retry's duration, which is unbounded by construction.
-    ///
-    /// Deliberately not "make the caller's own wait unbounded" instead,
-    /// which would hang the CALLER's task forever on a
-    /// genuinely stuck reservation holder. Moving the unbounded part to a detached
-    /// background task removes that risk entirely: nothing about the
-    /// caller's own task, or anything it holds, is at stake once queued,
-    /// while the operator's explicit configuration -- the "operator wins"
-    /// principle already settled for this pin/claim/migrate machinery --
-    /// still always eventually takes effect rather than silently vanishing
-    /// because it raced a heuristic sweep. The one remaining bound is
-    /// `self.shutdown`, checked before queuing and again on every queued
-    /// retry iteration (matching `handle_peer_connection_failure`'s
-    /// existing detached-spawn shutdown gate, see
-    /// `test_post_shutdown_peer_disconnect_handler_is_skipped`): a queued
-    /// retry cannot keep a torn-down registry alive or act past an
-    /// explicit `shutdown_and_wait`, since there is nothing left at that
-    /// point for the configuration to apply to.
-    ///
-    /// An earlier version of this method
-    /// carried a `where T: Send + Sync + Clone` bound, narrower
-    /// than the impl block's own `T: 'static` -- a real, breaking
-    /// narrowing of this `pub` method's public surface, since `main`
-    /// allows every `T: 'static` here. The queued retry clones the whole
-    /// registry (`Self: Clone`) into a detached `'static` task, which also
-    /// requires `Send + Sync` for that task to be spawnable -- but see
-    /// `GossipRegistry<T>`'s own manual `Clone` impl (replacing what used
-    /// to be `#[derive(Clone)]`) for why NONE of that actually requires
-    /// anything of `T` at all: every field is independent of `T` or reaches
-    /// it only through `Arc<ConnectionPool<T>>>`, and `ConnectionPool<T>`
-    /// only ever holds `T` behind a `PhantomData<fn() -> T>` marker, never
-    /// as owned data. `GossipRegistry<T>: Clone + Send + Sync` holds for
-    /// every `T`, so this method needs no extra bound beyond the impl
-    /// block's own `T: 'static`, exactly matching `main`.
+    /// `()` here GUARANTEES eventual application, not a single attempt:
+    /// [`Self::configure_peer_with_outcome`]'s bounded attempt runs first;
+    /// if it still reports [`ConfigurePeerOutcome::TemporarilyBlocked`],
+    /// this hands off to [`Self::queue_configure_peer_until_applied`], a
+    /// detached background retry until the reservation clears (or the
+    /// claim is permanently rejected), without blocking the caller. The
+    /// one bound is `self.shutdown`.
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
         // `None`: this is always a peer's FIRST attempt as far as THIS
         // call is concerned, so it always proceeds and the owner bumps
-        // `configure_peer_generation` to a fresh value -- see
-        // `configure_peer_with_outcome_and_generation`'s own doc comment
-        // for why this is validated at the owner, not
-        // here.
+        // `configure_peer_generation` to a fresh value.
         let (outcome, my_generation) = self
             .configure_peer_with_outcome_and_generation(peer_id.clone(), connect_addr, None)
             .await;
@@ -4710,56 +4415,16 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// Guarantees [`Self::configure_peer`]'s eventual application once its
-    /// own synchronous, `CONFIGURE_PEER_REAP_RETRY_BUDGET`-bounded attempt
-    /// has already reported [`ConfigurePeerOutcome::TemporarilyBlocked`] --
-    /// see that method's own doc comment for the full reasoning.
+    /// bounded attempt reported [`ConfigurePeerOutcome::TemporarilyBlocked`].
+    /// Detached `tokio::spawn`, gated on `self.shutdown` so it can't outlive
+    /// `shutdown_and_wait`. Unbounded in attempt count, but can't hang
+    /// forever on a healthy system: a reap reservation always releases.
     ///
-    /// Detached `tokio::spawn`, gated on `self.shutdown` the same way
-    /// `handle_peer_connection_failure`'s disconnect-handler notification
-    /// already is: checked once before spawning (skip entirely if already
-    /// shutting down -- nothing left to apply this to), and again at the
-    /// top of every loop iteration (bail promptly if shutdown begins while
-    /// a retry is still queued, rather than holding the registry alive or
-    /// mutating it past `shutdown_and_wait`).
-    ///
-    /// The loop re-runs [`Self::configure_peer_with_outcome`] -- itself
-    /// already a `CONFIGURE_PEER_REAP_RETRY_BUDGET`-bounded, capped-backoff
-    /// retry -- as its own unit of work, repeating that whole bounded cycle
-    /// for as long as it keeps reporting `TemporarilyBlocked`. No separate
-    /// backoff is needed here: each inner cycle already paces its own
-    /// underlying claim attempts, so back-to-back cycles impose no tighter
-    /// a rate than the inner budget's own steady state does. This is
-    /// intentionally unbounded in attempt count and elapsed time -- the
-    /// guarantee this exists to provide is only meaningful if exhausting
-    /// it is not itself a way to silently drop the request a third time.
-    /// It cannot hang forever on a healthy system: a reap reservation is
-    /// released either by the sweep's own `reservation.release().await` or,
-    /// if its holding task is hard-aborted, by the guard's own `Drop` impl
-    /// performing a best-effort synchronous release -- there is no path
-    /// that leaks one forever, so this loop's only genuinely unbounded
-    /// case is the registry shutting down first, which the shutdown gate
-    /// already handles by standing down rather than hanging.
-    ///
-    /// This loop must be able to tell whether a LATER `configure_peer` call for
-    /// the SAME peer has already superseded it: configuring P at A, which
-    /// queues because A is temporarily reap-reserved, followed by
-    /// reconsidering and configuring P at B (which succeeds immediately,
-    /// since B is free), must not let the stale, queued A request win
-    /// once its reservation finally clears -- silently evicting the
-    /// operator's own newer, deliberate decision.
-    ///
-    /// A CALLER-side snapshot of `configure_peer_generation` taken
-    /// immediately before each sub-attempt is not enough: a caller-side
-    /// read can
-    /// never be atomic with the owner's own pin-installing decision no
-    /// matter how close to it it is taken. The check instead moves
-    /// to the owner (see `configure_peer_with_outcome_and_
-    /// generation`'s own doc comment): `my_generation`, captured from the
-    /// FIRST call's own owner-established value, is simply threaded
-    /// through as `expected_generation` on every retry below. There is
-    /// nothing left for this loop to check itself -- `ConfigurePeerOutcome
-    /// ::Superseded`, returned once the owner's own atomic validation
-    /// rejects a stale `expected_generation`, is what ends the loop now.
+    /// `my_generation` threads through as `expected_generation` on every
+    /// retry, so a LATER `configure_peer` call for the SAME peer that
+    /// already superseded this one is detected via `Superseded` -- a
+    /// caller-side snapshot could never be atomic with the owner's own
+    /// pin-installing decision.
     fn queue_configure_peer_until_applied(
         &self,
         peer_id: crate::PeerId,
@@ -4825,58 +4490,22 @@ impl<T: 'static> GossipRegistry<T> {
                         );
                         return;
                     }
-                    ConfigurePeerOutcome::TemporarilyBlocked => {
-                        // Still refused after ANOTHER full
-                        // CONFIGURE_PEER_REAP_RETRY_BUDGET; loop immediately
-                        // into the next cycle -- see this function's own
-                        // doc comment for why no additional backoff is
-                        // needed here.
-                    }
+                    ConfigurePeerOutcome::TemporarilyBlocked => {}
                 }
             }
         });
     }
 
     /// The full-featured form of [`Self::configure_peer`], returning
-    /// [`ConfigurePeerOutcome`] -- see that method's own doc comment for
-    /// why this is `pub(crate)` rather than the public entry point.
+    /// [`ConfigurePeerOutcome`]. A `ClaimRejection::ReapInProgress`
+    /// (TEMPORARY) must not collapse into the same `Rejected` a genuine,
+    /// PERMANENT arbitration loss produces -- retried, bounded by
+    /// `CONFIGURE_PEER_REAP_RETRY_BUDGET`; if it elapses still refused,
+    /// returns `TemporarilyBlocked` instead of silently applying nothing.
     ///
-    /// A `ClaimRejection::ReapInProgress` -- a TEMPORARY refusal, since
-    /// another caller currently holds a short-lived reap reservation for
-    /// `connect_addr` -- must not be collapsed indistinguishably
-    /// into the SAME `AddrClaimOutcome::Rejected` a genuine, PERMANENT
-    /// arbitration loss produces and silently discarded: an
-    /// operator's explicit configuration losing a race with a reservation
-    /// that would very likely clear moments later must not leave the
-    /// caller with no way to tell anything went wrong at all.
-    ///
-    /// Retried, bounded by `CONFIGURE_PEER_REAP_RETRY_BUDGET`
-    /// (time-based, capped exponential backoff -- see that constant's own
-    /// doc comment): reservations are held only for the duration of one
-    /// sweep's destructive, in-memory work for a single address, brief by
-    /// construction, so this budget clears almost every genuine collision
-    /// with room to spare. If THIS attempt's budget elapses still refused
-    /// with `ReapInProgress`, this returns [`ConfigurePeerOutcome::
-    /// TemporarilyBlocked`] rather than silently applying nothing --
-    /// distinct from [`ConfigurePeerOutcome::Rejected`] (a permanent
-    /// arbitration loss) so the caller can tell which happened. Note this
-    /// function reports only on ITS OWN one attempt; [`Self::
-    /// configure_peer`], the public caller most external code should use,
-    /// layers a further, unbounded guarantee on top of a `TemporarilyBlocked`
-    /// result from this function -- see its own doc comment.
-    ///
-    /// `#[allow(dead_code)]`: `configure_peer` (the sole intended
-    /// production entry point) now calls `configure_peer_with_outcome_
-    /// and_generation` directly, to obtain the generation value it needs
-    /// to thread through a queued retry -- so every CURRENT caller of
-    /// this specific single-attempt, generation-discarding form is this
-    /// crate's own test suite. Kept anyway, deliberately not deleted: it
-    /// is a genuinely meaningful, self-contained "single attempt, no
-    /// generation bookkeeping" API (matching the `connect_to_peer`/
-    /// `connect_to_peer_with_outcome` precedent this whole PR follows),
-    /// still the natural form for internal callers -- present or future --
-    /// that want [`ConfigurePeerOutcome`] without also needing to reason
-    /// about `configure_peer_generation`.
+    /// `#[allow(dead_code)]`: every current caller of this single-attempt
+    /// form is this crate's own test suite; kept as a self-contained API
+    /// for internal callers that want the outcome directly.
     #[allow(dead_code)]
     pub(crate) async fn configure_peer_with_outcome(
         &self,
@@ -4889,34 +4518,15 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     /// [`Self::configure_peer_with_outcome`]'s actual implementation, also
-    /// returning the [`ConfigurePeerOutcome::Applied`]-independent
-    /// `configure_peer_generation` value this exact call established or
+    /// returning the `configure_peer_generation` this call established or
     /// confirmed.
-    /// `configure_peer_with_outcome` itself passes `None` (a first call)
-    /// and discards the generation, so its behavior for every existing
-    /// caller (overwhelmingly this crate's own tests) is unchanged
-    /// byte-for-byte.
     ///
-    /// A stale queued retry overwriting a newer `configure_peer` call is
-    /// not preventable by any CALLER-side check, no matter how it is
-    /// scheduled: a snapshot of `configure_peer_generation` checked once
-    /// per whole `CONFIGURE_PEER_REAP_RETRY_BUDGET`-bounded cycle, or even
-    /// a check immediately before every sub-attempt, is never atomic with
-    /// the pin update the owner performs on a separate task -- a genuinely
-    /// newer call can always race ahead and commit its own pin between the
-    /// caller's check and its own already-in-flight owner command
-    /// committing.
-    ///
-    /// Fixed by moving `configure_peer_generation` itself to be
-    /// OWNER-side state (see that field's own doc comment on
-    /// `PeerRegistryOwner`) and validating `expected_generation` INSIDE
-    /// the SAME serialized `configure_peer` owner command that installs
-    /// the pin -- see `PeerRegistryOwner::configure_peer`'s own doc
-    /// comment. There is no longer a caller-side check of any kind: every
-    /// sub-attempt this function's own retry loop makes submits `expected_
-    /// generation` fresh, and the owner's response (`ClaimRejection::
-    /// SupersededByNewerConfiguration`, surfaced here as
-    /// [`ConfigurePeerOutcome::Superseded`]) is the one, atomic, always-
+    /// A stale queued retry overwriting a newer `configure_peer` call isn't
+    /// preventable by any CALLER-side check, since a snapshot of
+    /// `configure_peer_generation` is never atomic with the owner's pin
+    /// update. So it lives as OWNER-side state, validated INSIDE the same
+    /// serialized command that installs the pin -- each sub-attempt submits
+    /// `expected_generation` fresh, and `Superseded` is the one atomic,
     /// authoritative answer.
     async fn configure_peer_with_outcome_and_generation(
         &self,
@@ -4924,104 +4534,30 @@ impl<T: 'static> GossipRegistry<T> {
         connect_addr: SocketAddr,
         expected_generation: Option<u64>,
     ) -> (ConfigurePeerOutcome, u64) {
-        // No caller-side lock here (there used to be a per-peer
-        // `tokio::sync::Mutex` held across this whole sequence, including
-        // the connect-handler callback below): `PeerConnectHandler` is a
-        // public, unrestricted async callback, and holding a non-reentrant
-        // lock across a call into foreign code is a self-deadlock waiting
-        // to happen -- a handler that calls `configure_peer` again for the
-        // SAME peer from within its own callback would block forever on a
-        // lock this same call still holds. Ordinary, foreseeable
-        // application code (re-pinning a peer in response to its own
-        // connect notification) can trigger this.
-        //
-        // Instead, `apply_configure_peer_connection_update` revalidates
-        // `pin_is_current` -- the owner's own authoritative pin decision --
-        // immediately before EACH side effect, not once at the start. A
-        // concurrent `configure_peer` for the same peer can still submit
-        // and commit its own transaction while this call's follow-up is in
-        // flight; the versioned re-check is what lets a stale caller
-        // discover it lost and stand down, without ever owning a lock
-        // while foreign code runs. This narrows, but does not eliminate,
-        // the original race to the few instructions between a check and
-        // its matching side effect -- an accepted, explicit trade-off
-        // against deadlock safety.
-        // Operator configuration is verified ownership evidence: claim
-        // `connect_addr` and install it as this peer's operator pin --
-        // evicting whatever address this SAME peer was pinned at
-        // beforehand and, in that SAME atomic owner step, releasing that
-        // evicted address's ownership if this peer still held it. See
-        // `PeerRegistryOwner::configure_peer`.
-        //
-        // Claiming and pinning as ONE serialized owner transaction, rather
-        // than as two separately-ordered commands, is what closes the
-        // window a concurrent `configure_peer`/claim/migrate could
-        // otherwise land in between them: nothing can ever observe (or
-        // act on) a pin with no matching claim behind it, or an eviction
-        // whose ownership release has not landed yet.
+        // No caller-side lock here: `PeerConnectHandler` is a public,
+        // unrestricted async callback, and holding a non-reentrant lock
+        // across a call into foreign code risks self-deadlock.
+        // `apply_configure_peer_connection_update` instead revalidates
+        // `pin_is_current` immediately before EACH side effect.
         //
         // Time-budgeted retry against `ClaimRejection::ReapInProgress`
-        // specifically -- see `CONFIGURE_PEER_REAP_RETRY_BUDGET`'s own doc
-        // comment. Every OTHER outcome (`Accepted`, or `Rejected` for any
-        // other reason) breaks out immediately; only losing to a live reap
-        // reservation is worth retrying, since it is the one rejection
-        // reason known to be temporary and, by construction, guaranteed to
-        // eventually clear.
-        //
-        // `tokio::time::Instant`, not `std::time::Instant`: this must
-        // observe the SAME clock `tokio::time::sleep` advances below, so
-        // that `#[tokio::test(start_paused = true)]` tests can exercise the
-        // full budget by auto-advancing virtual time instead of actually
-        // sleeping 30 real seconds.
+        // specifically -- every other rejection reason breaks out
+        // immediately, since only losing to a live reap reservation is
+        // guaranteed to eventually clear. `tokio::time::Instant`, not
+        // `std::time::Instant`, so `#[tokio::test(start_paused = true)]`
+        // can exercise the full budget via virtual time.
         let retry_started = tokio::time::Instant::now();
         let mut reap_retry_attempt = 0u32;
         let mut reap_retry_backoff = CONFIGURE_PEER_REAP_RETRY_INITIAL_BACKOFF;
-        // Passing the FUNCTION's own `expected_generation`
-        // parameter unchanged to every sub-attempt in the loop below would
-        // be wrong. When
-        // entered with `None` (a peer's first `configure_peer` call, the
-        // common case), that would mean EVERY internal sub-attempt -- not just
-        // the first -- tells the owner "always proceed, bump fresh": if
-        // sub-attempt 1 bumps to generation 5 and then loses to
-        // `ReapInProgress`, sub-attempt 2 (after this loop's own retry
-        // sleep) would present `None` YET AGAIN and bump to 6 regardless
-        // of what happened in between -- including a genuinely NEWER,
-        // unrelated `configure_peer` call for the SAME peer committing
-        // its own generation (say, 6) while sub-attempt 1 was asleep.
-        // Sub-attempt 2 would then bump PAST that newer call's own value
-        // (to 7) and succeed, evicting the newer call's pin -- the exact
-        // "stale request wins" bug this whole generation mechanism exists
-        // to prevent, reintroduced by internal retries
-        // never remembering what generation THEY had already, atomically,
-        // established.
-        //
-        // Uses a MUTABLE local instead, seeded from the parameter but
-        // updated after every sub-attempt to the generation THAT attempt
-        // was told is current: from sub-attempt 2 onward, this loop always
-        // presents `Some(generation)` -- the value sub-attempt 1 (or the
-        // most recent sub-attempt) actually observed -- so a genuinely
-        // newer, concurrent `configure_peer` call committing during this
-        // loop's own sleep is correctly detected as `Superseded` on the
-        // very next sub-attempt, exactly as it would be for a retry
-        // spanning separate top-level calls (`queue_configure_peer_until_
-        // applied`, which already threaded a fixed `my_generation`
-        // correctly -- this loop is the ONE place that did not).
+        // A MUTABLE local, not the function's own fixed `expected_generation`:
+        // if sub-attempt 1 bumps to generation 5 then loses to
+        // `ReapInProgress`, sub-attempt 2 presenting `None` again would bump
+        // PAST a genuinely newer, unrelated `configure_peer` call that
+        // committed generation 6 while sub-attempt 1 slept, evicting its
+        // pin. Updating this after every sub-attempt ensures such a call is
+        // correctly detected as `Superseded` on the next sub-attempt.
         let mut current_expected_generation = expected_generation;
-        // The claim receipt this call used to thread through to
-        // `apply_configure_peer_connection_update` (to build a now-deleted
-        // `ConnectNotificationToken` -- see `PeerConnectHandler`'s own doc
-        // comment) has nothing left to feed; `add_operator_configured_peer_
-        // claim`'s own return shape is unchanged for its other callers.
         let (outcome, evicted_release, generation) = loop {
-            // `expected_generation` is validated FRESH, atomically, INSIDE
-            // this SAME owner call on every single sub-attempt -- see
-            // `configure_peer_generation`'s own doc comment: a caller-side
-            // pre-check taken here,
-            // before submitting the command, could never be atomic with
-            // the pin update the command performs, no matter how close to
-            // it it were taken. There is nothing left for THIS function to
-            // check beforehand; `superseded` below is the owner's own,
-            // already-atomic answer.
             let (outcome, _receipt, evicted_release, reap_in_progress, generation, superseded) =
                 self.add_operator_configured_peer_claim(
                     connect_addr,
@@ -5074,19 +4610,12 @@ impl<T: 'static> GossipRegistry<T> {
             reap_retry_backoff = (reap_retry_backoff * 2).min(CONFIGURE_PEER_REAP_RETRY_MAX_BACKOFF);
         };
 
-        // The evicted pin's release, if any, already fully committed inside
-        // the owner's atomic transaction -- a fact about the EVICTED
-        // address, entirely independent of whatever `connect_addr`'s own
-        // projection outcome below turns out to be. `outcome` can be
-        // `Rejected` here even though the transaction itself was accepted
-        // and did evict+release: that happens when this call's projection
-        // of ITS OWN claim into `gossip_state` was superseded by a
-        // concurrent claim for `connect_addr` before this call got to it
-        // (see `add_peer_with_node_id_generation_inner`'s stale-projection
-        // branch). Applying the tombstone unconditionally, before checking
-        // `outcome`, is what keeps a rejected/stale projection for one
-        // address from leaving a DIFFERENT, genuinely-released address's
-        // ownership watermark stale.
+        // Applied unconditionally, before checking `outcome`: the evicted
+        // pin's release already fully committed inside the owner's atomic
+        // transaction regardless of whether THIS call's own claim
+        // projection was later superseded by a concurrent claim, and
+        // skipping it on `Rejected` would leave a different, genuinely-
+        // released address's watermark stale.
         if let Some((evicted_addr, release_seq)) = evicted_release {
             let mut state = self.gossip_state.lock().await;
             state.tombstone_ownership_projection(evicted_addr, release_seq);
@@ -5102,93 +4631,21 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // Operator configuration is itself dialability evidence for
-        // `connect_addr`, independent of identity verification (see
-        // `add_peer_with_node_id_generation`, which deliberately does NOT
-        // clear this flag from a Verified claim alone -- the
-        // inbound-accept fallback also claims Verified for the raw
-        // observed TCP source, and that must stay excluded). An operator
-        // explicitly vouching for this exact address as a dial target
-        // means any stale `transport_source_keyed` inherited from an
-        // earlier inbound-accept fallback here no longer applies.
+        // `connect_addr`. Fenced against a concurrent `configure_peer` for
+        // a DIFFERENT identity landing between the owner transaction above
+        // and this `gossip_state` acquisition: `pin_is_current` answers
+        // "did I lose the race" (not "who owns this now"), a lock-free
+        // read of the snapshot just committed, so a losing identity's
+        // stale `PeerInfo` never gets marked dialable. Checked TWICE,
+        // before and after the `gossip_state` wait, which can be long
+        // enough on its own for a repin to land in.
         //
-        // This write must not run unconditionally, with no check that
-        // nothing repinned `connect_addr` in the window between the owner
-        // transaction above committing and this `gossip_state` acquisition
-        // actually running (a SEPARATE async step, on a SEPARATE lock the
-        // owner transaction does not hold). A concurrent `configure_peer`
-        // for a DIFFERENT identity landing in that window would leave this
-        // call marking the LOSING identity's now-stale `PeerInfo` entry
-        // dialable -- resurrecting a released address as a selectable
-        // route for an identity that may no longer own it at all.
-        //
-        // "Moving it in" (performing this mutation from inside the
-        // owner's own serialized transaction, the way the reindex and
-        // `RoutingPublisher::set_configured_peer_addr` do) is not
-        // available here, and it is worth saying why rather than fencing
-        // silently: both of those operate on `ConnectionPool`, reachable
-        // SYNCHRONOUSLY from the owner task via `RoutingPublisher`
-        // (`routing: Weak<dyn RoutingPublisher>`, implemented for
-        // `ConnectionPool`, never for `GossipRegistry`). `gossip_state`
-        // lives behind a `tokio::sync::Mutex` the owner's own synchronous
-        // `handle()` has no path to reach at all -- unlike the reindex
-        // case, there is no existing channel from the owner's transaction
-        // to `gossip_state` for this write to move into without giving
-        // the owner task a way to await an async mutex from synchronous
-        // code, a materially bigger change than this finding calls for.
-        //
-        // Fenced instead, the same way `apply_configure_peer_connection_
-        // update` already fences the connect-handler notification just
-        // below: `pin_is_current` is a lock-free read of the SAME
-        // published snapshot the owner transaction above just committed
-        // to, so if a concurrent `configure_peer` for a different
-        // identity has ALREADY landed by the time this runs, this call
-        // sees its own pin decision is no longer current and skips the
-        // write, rather than applying it to whatever `PeerInfo` entry
-        // happens to be at `connect_addr` now.
-        //
-        // Checked TWICE, not once: `gossip_state` is a widely shared,
-        // frequently contended lock, so the wait for it can be long
-        // enough on its own for a repin to land in. The first check
-        // (before even attempting to acquire the lock) avoids paying for
-        // the lock at all once a repin is already known; the second,
-        // immediately before the mutation, narrows the window further.
-        //
-        // KNOWN, DEFERRED LIMITATION: narrowing is all this second check
-        // actually
-        // does. It does not close the gap -- see `ReapReservation`'s own
-        // doc comment for why a plain read, repeated however close to its
-        // mutation, is never atomic with a concurrent write from a
-        // completely separate synchronization domain: `pin_is_current`
-        // reads the OWNER's published pin state, this write mutates
-        // `gossip_state`'s `PeerInfo` map, and nothing links the two.
-        // Unlike the reap-reservation case, this cannot be closed the same
-        // way: there is no single shared atomic both sides already write
-        // to for a `try_consume`-style compare-and-swap to rendezvous on,
-        // and giving the owner a bounded, `RoutingPublisher`-style
-        // synchronous side channel for this specific slice of `PeerInfo`
-        // (mirroring `set_configured_peer_addr`) is real, multi-site
-        // structural work, not a point fix -- tracked as a follow-up, not
-        // attempted here. Nor is an owner-held exclusive lease across the
-        // `gossip_state` acquisition an acceptable substitute: unlike a
-        // reap reservation's hold (bounded, fast, purely in-memory), a
-        // pin-write lease would stay open across an unbounded wait on a
-        // widely shared, frequently contended lock, and could block
-        // OTHER, entirely legitimate, concurrent `configure_peer` calls
-        // for the same address behind it -- trading a bounded, local
-        // inaccuracy for a livelock risk, a worse deal.
-        //
-        // Accepted for now because the blast radius is genuinely small:
-        // `transport_source_keyed` is per-node, advisory dial-selection
-        // bookkeeping, never gossiped (`PeerInfo::to_gossip`/`from_gossip`
-        // do not carry it at all -- verified, not assumed), so a stale
-        // write here cannot corrupt another node's state, only bias this
-        // node's own future dial/gossip-target selection until the next
-        // correct classification event for `connect_addr` (a fresh dial,
-        // a fresh inbound accept, another `configure_peer` call) overwrites
-        // it. Bounded, local, self-correcting -- categorically different
-        // from, and far less severe than, the reap case's irrevocable,
-        // cluster-wide `ActorRemoved` tombstone this same round's other
-        // fix closes.
+        // KNOWN, DEFERRED LIMITATION: the second check narrows this race,
+        // it does not close it -- a plain read is never atomic with a
+        // concurrent write from a separate domain (see `ReapReservation`'s
+        // doc comment). Accepted because the blast radius is small:
+        // `transport_source_keyed` is per-node advisory bookkeeping, never
+        // gossiped, self-correcting on the next classification event.
         if self.registry_owner.pin_is_current(&connect_addr, &peer_id) {
             let mut gossip_state = self.gossip_state.lock().await;
             if self.registry_owner.pin_is_current(&connect_addr, &peer_id) {
@@ -5214,95 +4671,34 @@ impl<T: 'static> GossipRegistry<T> {
             );
         }
 
-        // No `ConnectionPool`-derived "previous address" cleanup here
-        // (there used to be one, reading `get_required_peer_addr` before
-        // the transaction above and best-effort-releasing it afterward).
-        // `required_addr` is not pin state -- it is written by every
-        // ordinary `.connect()` call for a required peer, configured or
-        // not (see `RoutingPublisher::set_configured_peer_addr`'s doc
-        // comment) -- so it is not necessarily this peer's actual previous
-        // OPERATOR PIN. A live connection-scoped session can move
-        // `required_addr` to some address B with no pin ever involved; if
-        // the operator then configures this peer to C, the owner
-        // transaction above evicts whatever the ACTUAL previous pin was
-        // (nothing, if there wasn't one) -- but a `required_addr`-derived
-        // cleanup step would still see B, see it is not what the owner
-        // just evicted, and release B's CURRENT, live ownership anyway,
-        // purging that session's connection-scoped receipt out from under
-        // it and making an actively occupied address reclaimable by
-        // another identity. The owner's own atomic transaction above
-        // (`evicted_release`, already handled) is the ONLY authoritative
-        // source for what this call may release; there is nothing left
-        // for a caller-derived address to legitimately clean up.
+        // No `ConnectionPool`-derived "previous address" cleanup here:
+        // `required_addr` is written by every ordinary `.connect()`, not
+        // just configuration, so it is not necessarily this peer's actual
+        // previous OPERATOR PIN -- deriving cleanup from it could release a
+        // DIFFERENT, actively-occupied address. The owner's own atomic
+        // transaction above (`evicted_release`) is the only authoritative
+        // source for what this call may release.
         self.apply_configure_peer_connection_update(peer_id, connect_addr)
             .await;
         (ConfigurePeerOutcome::Applied, generation)
     }
 
-    /// `configure_peer`'s own follow-up work: notify the connect handler,
-    /// but ONLY if `peer_id` is still the exact identity `connect_addr` is
-    /// operator-pinned for -- i.e. the pin this call installed has not
-    /// since been moved elsewhere by a concurrent `configure_peer`/`migrate`
-    /// for the same peer.
+    /// `configure_peer`'s follow-up: notify the connect handler, but only
+    /// if `peer_id` is still the identity `connect_addr` is pinned for --
+    /// a concurrent `configure_peer`/`migrate` may have moved the pin
+    /// since. The connection-pool reindex itself no longer happens here:
+    /// it runs synchronously INSIDE the owner's own atomic transaction via
+    /// `RoutingPublisher::set_configured_peer_addr`, so the pin decision
+    /// and the route can never observably disagree; nothing is left for
+    /// this caller-side step to redo.
     ///
-    /// The connection-pool reindex this used to also perform here no longer
-    /// lives in this function at all: it now happens synchronously INSIDE
-    /// the owner's own `configure_peer`/`migrate` command, via
-    /// `RoutingPublisher::set_configured_peer_addr` (see its doc comment).
-    /// By the time `add_operator_configured_peer_claim`'s `.await` resolved
-    /// in the caller above, that reindex -- correct as of the exact commit
-    /// that just happened -- has already run or already correctly declined
-    /// (no live connection yet). There is nothing left for a caller-side
-    /// mutation to redo, and reintroducing one here would only reopen the
-    /// race this design closes: three prior versions of this function tried
-    /// progressively tighter caller-side checks before a caller-side
-    /// mutation (a claim-generation fence, `required_addr`, a dedicated but
-    /// still separately-read pin mirror compared just before the write) and
-    /// each still left a real gap, because the check and the mutation were
-    /// never able to share the owner's own serialization -- only observe a
-    /// copy of it. See `RoutingPublisher::set_configured_peer_addr`'s doc
-    /// comment for the full history.
-    ///
-    /// The connect-handler callback is different in kind, not just degree:
-    /// it is the one side effect that genuinely cannot be folded into the
-    /// owner's transaction (it may run arbitrary foreign code, including a
-    /// network dial, and `PeerConnectHandler` is a public, unrestricted
-    /// async callback -- holding a lock across it risks a self-deadlock, a
-    /// handler that calls `configure_peer` again for the same peer from
-    /// within its own callback would block on a lock this call still
-    /// held). Because skipping the callback leaves nothing behind to undo,
-    /// re-checking `pin_is_current` immediately before calling it and
-    /// simply not calling it on a stale pin is sufficient -- unlike a
-    /// mutation, a suppressible side effect only needs to be checked, not
-    /// performed where the decision is made.
-    ///
-    /// Re-checking before the call does NOT make the call itself atomic
-    /// with a concurrent `configure_peer`: another one can still commit a
-    /// different pin while `handle_peer_connect` is running, and the
-    /// losing handler invocation still runs to completion with the
-    /// address it was called with. `PeerConnectHandler` is arbitrary user
-    /// async code; we cannot make it atomic and must not hold a lock
-    /// across it -- that is settled, not a gap to keep chasing here.
-    /// Treat the callback itself as a notification, not a transaction:
-    /// whatever the handler does externally is its business, and this
-    /// function has nothing left to do once it returns -- but if a
-    /// FUTURE change adds a mutation of OUR OWN state that runs after
-    /// this call (something the callback's completion triggers), that
-    /// mutation must be its OWN, independently version-checked owner-fenced
-    /// operation, re-validated at the point IT happens, never gated on
-    /// trusting the `pin_is_current` check made here before the callback
-    /// started -- the same lesson `RoutingPublisher::set_configured_peer_addr`'s
-    /// history teaches for the reindex: a check made before a call is not
-    /// still valid at some later, separately-timed point just because
-    /// nothing appears to run in between.
-    ///
-    /// An earlier version of this
-    /// also took the caller's own `ClaimReceipt`, threaded
-    /// through purely to build a `ConnectNotificationToken` to pass to
-    /// the handler alongside this call's `pin_is_current` guard. That
-    /// token is gone -- see `PeerConnectHandler`'s own doc comment -- and
-    /// nothing else here ever used the receipt, so it is no longer a
-    /// parameter at all.
+    /// The callback itself can't be folded into that transaction -- it may
+    /// run arbitrary foreign code (a network dial), and holding a lock
+    /// across it risks self-deadlock if the handler calls `configure_peer`
+    /// again. A pre-call `pin_is_current` check is enough since skipping it
+    /// leaves nothing to undo; it is not made atomic with a later
+    /// concurrent `configure_peer`, so a losing invocation still runs to
+    /// completion and must re-validate its own state on completion.
     async fn apply_configure_peer_connection_update(
         &self,
         peer_id: crate::PeerId,
@@ -5326,13 +4722,11 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// p2p configured-peer supervisor tick. For every configured (required)
-    /// peer, keep a *direct point-to-point* connection alive: dial only when it
-    /// is down (a no-op when already connected, via pooled reuse), and surface a
-    /// liveness signal from the connect result. Point-to-point only — no gossip,
-    /// no broadcast (≤ N connect-attempts per tick for N configured peers, ~0 in
-    /// steady state). Driven by the background timer at `peer_supervisor_interval`;
-    /// gossip independently and complementarily observes these connections.
+    /// For every configured (required) peer, keep a direct point-to-point
+    /// connection alive: dial only when down (pooled reuse otherwise), and
+    /// surface a liveness signal from the result. No gossip/broadcast here
+    /// -- gossip independently and complementarily observes these
+    /// connections. Driven by `peer_supervisor_interval`.
     pub async fn supervise_configured_peers(&self) {
         let peers = self.connection_pool.list_configured_peers();
         for (peer_id, addr) in peers {
@@ -5344,14 +4738,12 @@ impl<T: 'static> GossipRegistry<T> {
                 .connection_pool
                 .get_connected_connection_to_peer(&peer_id)
             {
-                // Report the connection's OWN resolved address, not `addr`
-                // -- this loop's own snapshot from `list_configured_peers()`
-                // above, which a concurrent `configure_peer` can move the
-                // pin away from between that snapshot and this check.
-                // Direction MUST be looked up independently
-                // (`ConnectionHandle` itself carries none): an INBOUND
-                // connection's `.addr` is its raw, unverified transport
-                // source, not evidence this address is dialable.
+                // Report the connection's OWN resolved address, not this
+                // loop's `list_configured_peers()` snapshot (`addr`), which
+                // a concurrent `configure_peer` can move the pin away from
+                // in between. Direction MUST be looked up independently --
+                // an INBOUND connection's `.addr` alone is not evidence of
+                // dialability.
                 let direction = self
                     .connection_pool
                     .get_lock_free_connection(conn.addr)
@@ -5394,24 +4786,15 @@ impl<T: 'static> GossipRegistry<T> {
             ));
             match tokio::time::timeout(budget, self.connect_to_peer_with_outcome(&peer_id)).await {
                 Ok((_, Ok(route))) => {
-                    // Report the address `connect_to_peer` actually
-                    // resolved, not `addr` -- this loop's own snapshot from
-                    // `list_configured_peers()` above, which a concurrent
-                    // `configure_peer` can move the pin away from between
-                    // that snapshot and `connect_to_peer` actually running.
+                    // The address `connect_to_peer` actually resolved, not
+                    // the (possibly now-stale) `list_configured_peers()`
+                    // snapshot.
                     self.note_peer_reachable(&peer_id, route, "established")
                         .await
                 }
                 Ok((attempted, Err(e))) => {
-                    // Report the address `connect_to_peer` actually
-                    // ATTEMPTED, not `addr` -- the same stale-snapshot
-                    // concern as the success arm above applies here too:
-                    // a concurrent repin between the snapshot and this
-                    // call actually running must not attribute failure to
-                    // an address that was never dialed. `addr` remains
-                    // the only honest choice when `connect_to_peer` had no
-                    // address to attempt at all (no required/configured
-                    // route for this peer).
+                    // Same stale-snapshot concern: report what was
+                    // actually ATTEMPTED; `addr` only when nothing was.
                     let failed_addr = attempted.map(|route| route.addr()).unwrap_or(addr);
                     self.note_peer_unreachable(
                         &peer_id,
@@ -5421,14 +4804,9 @@ impl<T: 'static> GossipRegistry<T> {
                     .await
                 }
                 Err(_) => {
-                    // The supervisor's OWN budget elapsed before
-                    // `connect_to_peer` produced anything at all -- there
-                    // is no attempted address to report because the
-                    // timeout raced the future itself, not a value it
-                    // returned. Falling back to this loop's own
-                    // configured-peer snapshot is the only address
-                    // available here, honestly labeled as a timeout, not
-                    // attributed as a verified attempt.
+                    // Budget elapsed with no attempted address to report;
+                    // falls back to the loop's own snapshot, honestly
+                    // labeled as a timeout, not a verified attempt.
                     self.note_peer_unreachable(&peer_id, addr, "connect timed out")
                         .await
                 }
@@ -5436,15 +4814,11 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// Report a peer as reachable via a live connection. Takes a
-    /// [`ConnectOutcome`] rather than a bare `SocketAddr`: a "reachable"
-    /// signal is a claim backed by real evidence -- either a genuinely
-    /// corroborated, dialable [`ResolvedRoute`], or a live connection
-    /// reused without independently corroborating any particular address
-    /// (`ConnectOutcome::ConnectedUnverified` -- see its own doc comment).
-    /// This is the attribution surface `note_peer_liveness`'s own callers
-    /// used to be able to key to whatever address they merely intended to
-    /// reach; a bare `SocketAddr` here would reopen exactly that.
+    /// Takes a [`ConnectOutcome`], not a bare `SocketAddr`: a "reachable"
+    /// signal must be backed by real evidence -- a corroborated
+    /// [`ResolvedRoute`], or `ConnectedUnverified` for a reused connection
+    /// that corroborated nothing -- not merely the address a caller
+    /// intended to reach.
     async fn note_peer_reachable(
         &self,
         peer_id: &crate::PeerId,
@@ -5455,11 +4829,9 @@ impl<T: 'static> GossipRegistry<T> {
             .await;
     }
 
-    /// Report a peer as unreachable. Takes a plain `SocketAddr`: a negative
-    /// claim asserts nothing was confirmed, so it needs no proof that any
-    /// connection-resolution path actually reached this address -- it may
-    /// be a bare configured-peer snapshot, or the address a timed-out
-    /// attempt was merely aimed at.
+    /// Takes a plain `SocketAddr`: a negative claim needs no proof any
+    /// connection-resolution path reached this address -- it may be a bare
+    /// snapshot, or the address a timed-out attempt was merely aimed at.
     async fn note_peer_unreachable(&self, peer_id: &crate::PeerId, addr: SocketAddr, reason: &str) {
         self.note_peer_liveness(peer_id, addr, false, reason).await;
     }
@@ -5469,9 +4841,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// `not connected; retrying`); the recovery edge logs once. The optional
     /// `PeerLivenessHandler` fires only on reachable<->unreachable edges.
     ///
-    /// Private: reached only through `note_peer_reachable`/
-    /// `note_peer_unreachable` above, which is what enforces that a
-    /// `reachable = true` signal is always backed by a [`ResolvedRoute`].
+    /// Private: reached only through the two callers above, which enforce
+    /// that `reachable = true` is always backed by a [`ResolvedRoute`].
     async fn note_peer_liveness(
         &self,
         peer_id: &crate::PeerId,
@@ -5975,77 +5346,30 @@ impl<T: 'static> GossipRegistry<T> {
     /// form. `pub(crate)`, not `pub`: see [`GossipRegistry::connect_to_peer`]
     /// for the public, stable-signature wrapper.
     ///
-    /// This function itself USED to be the public `connect_to_peer`, until
-    /// its signature changed from a plain
-    /// `Result<()>` to this tuple -- a breaking change for any downstream
-    /// caller of `GossipRegistry::connect_to_peer` directly, not just this
-    /// crate's own call sites (which could be, and were, updated
-    /// mechanically). Resolved the same way as an identical shape of tension
-    /// elsewhere: keep the public signature stable and expose the richer
-    /// result under a distinct, `pub(crate)` name for callers that
-    /// genuinely need the attempted/resolved distinction. The asymmetry is
-    /// deliberate: the INTERNAL API is the strict one, since internal
-    /// callers are where the address-attribution bugs this whole file's
-    /// `AttemptedRoute`/`ResolvedRoute`/`ConnectOutcome` vocabulary exists
-    /// to close were actually found; a public caller doing its own address
-    /// bookkeeping downstream of a bare `Result<()>` was never the failure
-    /// mode.
-    ///
     /// Returns the address this call's own resolution ATTEMPTED, alongside
-    /// the outcome: `Ok` carries a [`ConnectOutcome`] -- either a
-    /// genuinely corroborated [`ResolvedRoute`], or
-    /// `ConnectOutcome::ConnectedUnverified` when a connection was reused
-    /// without independently corroborating any address as dialable (see
-    /// `ConnectOutcome`'s own doc comment); `Err` carries the original
-    /// error. The attempted address is not necessarily whatever the
-    /// caller believes this peer's current route is, since
-    /// `pool.get_connection_to_required_peer` resolves
-    /// `get_required_peer_addr`/`get_configured_peer_addr` fresh, atomically
-    /// alongside the dial/lookup itself, rather than this function trusting
-    /// a separately-timed pre-read of the same pool state. A concurrent
-    /// `configure_peer` can move the pin between whenever a caller last
-    /// checked and this call actually running; the returned address is
-    /// always the one this call's own resolution genuinely used -- both on
-    /// success and on failure. Callers MUST attribute health, gossip, and
-    /// failure state to THIS address, never to whatever address they
-    /// originally intended to reach -- see `Peer::connect_with_route_mode`'s
-    /// doc comment for the bug that shipped from getting this wrong.
+    /// the outcome: `Ok` carries a [`ConnectOutcome`] (a genuinely
+    /// corroborated [`ResolvedRoute`], or `ConnectedUnverified` when a
+    /// reused connection corroborated nothing); `Err` carries the original
+    /// error. The attempted address is not necessarily whatever the caller
+    /// believes this peer's current route is -- `get_connection_to_
+    /// required_peer` resolves the pin fresh, atomically with the dial,
+    /// so a concurrent `configure_peer` can move it first. Callers MUST
+    /// attribute health, gossip, and failure state to THIS returned
+    /// address, never to whatever they originally intended to reach.
     ///
-    /// This function is the SOLE authority for `gossip_state.peers`
-    /// bookkeeping on the required-peer connect path, on BOTH outcomes: it
-    /// inserts an entry for the resolved (or attempted) address if one is
-    /// not already present (see `PeerInfo::for_connect_attempt` and
-    /// `PeerInfo::for_failed_connect_attempt`), rather than only updating
-    /// one that happens to already exist -- a first-ever failed connect to
-    /// a brand-new required peer must still gain failure/backoff state, not
-    /// silently record nothing. A caller-side insert, keyed to whatever
-    /// address the caller originally requested, is exactly the shape of
-    /// bug this function's doc comment above describes -- the peer table
-    /// must only ever gain an entry for an address this call itself
-    /// resolved or attempted a connection to.
+    /// Sole authority for `gossip_state.peers` bookkeeping on the
+    /// required-peer connect path, on BOTH outcomes: inserts an entry for
+    /// the resolved/attempted address if one doesn't already exist. A
+    /// caller-side insert keyed to the caller's originally-requested
+    /// address is exactly the bug this distinction prevents.
     ///
-    /// VOCABULARY, since this distinction has produced bugs in
-    /// several separate places:
-    /// "requested" (a caller's own input, never independently verified,
-    /// never valid for attribution -- stays a bare `SocketAddr`) is
-    /// distinct from "attempted" ([`AttemptedRoute`] -- the address this
-    /// call's own resolution actually dialed or looked up against, valid
-    /// for the failure/backoff arm) which is distinct again from "resolved
-    /// FOR ROUTING" ([`ResolvedRoute`], wrapped in [`ConnectOutcome`] --
-    /// this function's own `preferred_addr`, valid only once genuinely
-    /// reached, for the success arm). "The socket this connection happens
-    /// to be on" (`conn.addr`, a field on the resolved `ConnectionHandle`
-    /// itself, which can be an inbound connection's raw, ephemeral
-    /// transport source still indexed under that source rather than the
-    /// peer's advertised address) is not always the same thing as
-    /// "resolved FOR ROUTING" either. Every `Ok(...)` this function
-    /// returns, every `gossip_state` mutation it performs on success, and
-    /// every log line it emits on success uses `preferred_addr`, wrapped
-    /// as a [`ResolvedRoute`] -- never the bare connection address -- and
-    /// every failure-arm mutation uses the attempted address, wrapped as
-    /// an [`AttemptedRoute`] -- never a caller's stale snapshot -- so that
-    /// callers (the required-peer supervisor's liveness reporting among
-    /// them) can trust the contract without re-deriving it themselves.
+    /// Vocabulary: "requested" (a caller's own unverified input, a bare
+    /// `SocketAddr`) vs. "attempted" ([`AttemptedRoute`], what this call
+    /// actually dialed against, valid for the failure arm) vs. "resolved"
+    /// ([`ResolvedRoute`], valid only once genuinely reached, for the
+    /// success arm) vs. `conn.addr` (the raw connection socket, which for
+    /// an inbound connection can differ from the peer's advertised
+    /// address).
     pub(crate) async fn connect_to_peer_with_outcome(
         &self,
         peer_id: &crate::PeerId,
@@ -6061,18 +5385,10 @@ impl<T: 'static> GossipRegistry<T> {
                     .expect("get_connection_to_required_peer resolved an address on success")
                     .addr();
                 // `get_connection_to_required_peer` can resolve to an
-                // EXISTING connection rather than genuinely dialing out --
-                // including one published by an inbound accept. An
-                // inbound connection is exactly the case
-                // `transport_source_keyed` exists to describe, so scoping
-                // the clear to `conn.addr` alone is not sufficient: it
-                // must also be evidence of an actual outbound dial, not
-                // merely "this function happened to resolve a connection
-                // at this address." `ConnectionHandle` itself carries no
-                // direction -- looked up once, here, from the pool's own
-                // `LockFreeConnection`, and reused for both `dialed_outbound`
-                // below and `conn_route`'s own dialability evidence, so
-                // there is exactly one source of truth for it.
+                // EXISTING connection (including one published by an
+                // inbound accept) rather than genuinely dialing out, so
+                // this must also confirm an actual outbound dial, not just
+                // "resolved a connection at this address."
                 let conn_direction = self
                     .connection_pool
                     .get_lock_free_connection(conn.addr)
@@ -6081,29 +5397,11 @@ impl<T: 'static> GossipRegistry<T> {
                     conn_direction == Some(crate::connection_pool::ConnectionDirection::Outbound);
 
                 if !dialed_outbound {
-                    // This call's own resolution
-                    // reused a connection that is not itself a genuine
-                    // outbound dial -- neither `conn.addr` (often a raw,
-                    // ephemeral inbound transport source) nor
-                    // `configured_addr` (for the `Peer::connect` ORDINARY
-                    // path, whatever the caller most recently asked for
-                    // via `set_ordinary_connect_route`, which only refuses
-                    // on an operator-pin CONFLICT -- never independently
-                    // verified as dialable) was actually reached this
-                    // round. Do NO positive address-level bookkeeping at
-                    // all: no entry created, no failures cleared, nothing
-                    // marked successful, for either address -- and do not
-                    // wrap either in `ResolvedRoute`, whose own contract
-                    // is "valid only once genuinely reached" (see its doc
-                    // comment). `ConnectOutcome::connected_unverified`
-                    // carries `configured_addr` purely as
-                    // diagnostic/liveness-signal information: the peer's
-                    // identity IS reachable via *some* live connection,
-                    // which is worth reporting to a liveness handler,
-                    // never as a claim that any address is dialable. See
-                    // `ConnectOutcome`'s own doc comment for the full
-                    // history (this replaces the previous round's
-                    // `ResolvedRoute::from_configured`, deleted entirely).
+                    // Neither address was independently corroborated as
+                    // dialable this round. No positive address-level
+                    // bookkeeping, and no `ResolvedRoute` (valid only once
+                    // genuinely reached) -- `connected_unverified` carries
+                    // `configured_addr` purely as diagnostic information.
                     debug!(
                         peer_id = %peer_id,
                         configured_addr = %configured_addr,
@@ -6118,11 +5416,8 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
 
-                // From here on, `dialed_outbound` is unconditionally true:
-                // `conn.addr` IS the authoritative, corroborated dialable
-                // address -- we chose to dial exactly it, so there is
-                // nothing to prefer over it (see the `!dialed_outbound`
-                // early return above for the alternative).
+                // From here, `dialed_outbound` is true: `conn.addr` IS the
+                // authoritative, corroborated dialable address.
                 let conn_route = ResolvedRoute::from_connection(conn.addr, conn_direction);
                 let preferred_addr = conn_route.addr();
 
@@ -6131,9 +5426,7 @@ impl<T: 'static> GossipRegistry<T> {
                 let now_ms = crate::current_timestamp_millis();
                 let node_id = Some(peer_id.to_node_id());
                 // `for_connect_attempt` sets `transport_source_keyed`/
-                // `inbound_observed` directly from
-                // `conn_route.is_dialable()` -- no manual flagging needed
-                // here (see `ResolvedRoute`'s own doc comment).
+                // `inbound_observed` directly from `conn_route`.
                 let peer_info = gossip_state
                     .peers
                     .entry(preferred_addr)
@@ -6155,14 +5448,9 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_info.last_failure_time = None;
                     peer_info.last_failure_instant = None;
                 }
-                // `preferred_addr` -- the address resolved FOR ROUTING,
-                // never the bare connection/socket address -- is what
-                // every `gossip_state` mutation above was keyed to; it
-                // must also be what this call logs and returns, or a
-                // caller trusting this function's own contract (see its
-                // doc comment) would still end up attributing liveness to
-                // the wrong address. `conn.addr` is included only as
-                // supplementary diagnostic context, distinctly labeled.
+                // `preferred_addr`, not the bare connection address, is
+                // what every mutation above was keyed to, so it must also
+                // be what this call logs and returns.
                 info!(
                     peer_id = %peer_id,
                     addr = %preferred_addr,
@@ -6175,13 +5463,8 @@ impl<T: 'static> GossipRegistry<T> {
                 // Insert-if-absent, not update-only: the first-ever failed
                 // connect to a brand-new required peer must still gain an
                 // entry, or its failure/backoff state silently never
-                // exists at all -- a caller-visible functional regression
-                // from the update-only `get_mut` this replaced. Keyed to
-                // the address this call actually ATTEMPTED
-                // (`attempted_route`, an `AttemptedRoute` -- the SAME
-                // resolution `get_connection_to_required_peer` used for
-                // the dial itself), never to a bare requested/hinted
-                // address a caller merely intended to reach.
+                // exists. Keyed to `attempted_route` -- the SAME resolution
+                // used for the dial itself -- never a bare requested address.
                 if let Some(attempted) = attempted_route {
                     let mut gossip_state = self.gossip_state.lock().await;
                     let node_id = Some(peer_id.to_node_id());
@@ -7906,22 +7189,16 @@ impl<T: 'static> GossipRegistry<T> {
                                 );
                                 if peer_info.failures == self.config.max_peer_failures {
                                     peer_info.last_failure_time = Some(current_time);
-                                    // Captured HERE, under this exact write,
-                                    // not hoisted from the top of the batch:
-                                    // this loop awaits per-item (below, and
-                                    // in earlier iterations), so a
-                                    // batch-start instant can be arbitrarily
-                                    // stale by the time THIS peer's failure
-                                    // is actually recorded -- the same
-                                    // class of "time value that doesn't
-                                    // correspond to the event it
-                                    // represents" bug as the whole-second
-                                    // `last_failure_time` reconstruction
-                                    // this field replaced. A too-early
-                                    // instant here makes a later, genuinely
-                                    // unrelated reconnect look like it
-                                    // happened after this failure, wrongly
-                                    // and permanently blocking cleanup.
+                                    // Captured HERE, at this exact write, not
+                                    // hoisted from the batch's start: this
+                                    // loop awaits per-item, so a batch-start
+                                    // instant can be arbitrarily stale by the
+                                    // time this peer's failure is actually
+                                    // recorded -- a too-early instant here
+                                    // would make a later, unrelated reconnect
+                                    // look like it happened after this
+                                    // failure, wrongly and permanently
+                                    // blocking cleanup.
                                     peer_info.last_failure_instant =
                                         Some(std::time::Instant::now());
                                     crossed_threshold = true;
@@ -11628,15 +10905,11 @@ impl<T: 'static> GossipRegistry<T> {
     }
 }
 
-/// An earlier version of
-/// `configure_peer` carried `where T: Send + Sync + Clone`, narrower
-/// than `main`'s actual public surface -- every `T: 'static` is callable
-/// there. Compile-time proof this is fixed, not a runtime test: a function
-/// generic over ONLY `T: 'static` (the impl block's own bound, nothing
-/// added here) that calls `configure_peer` on a `GossipRegistry<T>`. This
-/// is never actually invoked -- it would need a concrete, runnable `T` --
-/// its mere existence compiling is the whole proof; if `configure_peer`
-/// ever regains an extra bound, this function stops compiling.
+/// `configure_peer` must be callable for any `T: 'static`, not just
+/// `T: Send + Sync + Clone`. Compile-time proof, not a runtime test: this
+/// function is never actually invoked (it would need a concrete,
+/// runnable `T`) -- its mere existence compiling is the whole proof; if
+/// `configure_peer` ever regains an extra bound, this stops compiling.
 #[allow(dead_code)]
 fn _configure_peer_is_callable_for_any_static_t<T: 'static>(
     registry: &GossipRegistry<T>,
@@ -15233,25 +14506,10 @@ mod tests {
         );
     }
 
-    /// An earlier version applied
-    /// positive bookkeeping to every alias in
-    /// `recovered_routes` (both `conn.addr` and, when it differed, the
-    /// separately-resolved `configured_addr`), not just the one address
-    /// this call's own resolution actually settled on
-    /// (`preferred_route`). When an existing OUTBOUND connection at A is
-    /// reused while this call's OWN resolution ALSO names a different
-    /// configured address B, `preferred_route` correctly becomes A -- but
-    /// B was never contacted this round at all, and the old code still
-    /// cleared B's failures and marked it successful just because it
-    /// shares this peer's identity. Since configuring a peer normally
-    /// creates that very entry, a stale (or malicious) configured address
-    /// became healthy and gossipable purely by this node reusing an
-    /// unrelated connection for the same identity -- the value-level bug
-    /// `ResolvedRoute` closed, recurring at the collection level.
-    ///
-    /// Fixed by removing `recovered_routes` entirely: positive
-    /// bookkeeping (`entry`/`get_mut`, `failures = 0`, `last_success`,
-    /// `outbound_dial_success`) is now scoped to `preferred_addr` alone.
+    /// Positive bookkeeping must be scoped to `preferred_addr` alone, not
+    /// every alias sharing this peer's identity: reusing an OUTBOUND
+    /// connection at A while a different configured address B also names
+    /// this peer must not wrongly clear B's failures too.
     #[tokio::test]
     async fn connect_to_peer_reusing_a_connection_at_a_does_not_mark_a_different_configured_b_healthy()
      {
@@ -15371,26 +14629,19 @@ mod tests {
         );
     }
 
-    /// Earlier fixes to `connect_to_peer`'s handling of
-    /// an INBOUND connection resolved at a raw, ephemeral transport source
-    /// different from the peer's configured/advertised address -- first
-    /// making `gossip_state`'s insert key the configured address rather
-    /// than the ephemeral one, then making the function's OWN return value
-    /// agree -- both still inserted a fresh, zero-failure
-    /// `gossip_state` entry for the configured address and returned it
-    /// wrapped in a (dialable) `ResolvedRoute` -- marking it reachable
-    /// purely because the SAME identity happened to have an unrelated
-    /// inbound connection open somewhere. That is exactly the finding that
-    /// deleted `ResolvedRoute::from_configured` (see `ConnectOutcome`'s own
-    /// doc comment): reusing this connection is not evidence that the
-    /// configured address is dialable at all.
+    /// Earlier fixes to `connect_to_peer`'s handling of an INBOUND
+    /// connection resolved at a raw, ephemeral transport source still
+    /// inserted a fresh, zero-failure `gossip_state` entry for the
+    /// configured address and returned it wrapped in a (dialable)
+    /// `ResolvedRoute` -- marking it reachable purely because the SAME
+    /// identity happened to have an unrelated inbound connection open
+    /// somewhere (see `ConnectOutcome`'s doc comment on why
+    /// `ResolvedRoute::from_configured` was deleted).
     ///
     /// Fixed: no positive `gossip_state` bookkeeping for EITHER address,
     /// and the returned outcome is `ConnectOutcome::ConnectedUnverified`,
-    /// never a `ResolvedRoute` (which would misrepresent the configured
-    /// address as "genuinely reached" -- see that type's own contract).
-    /// The ephemeral connection source still never gains an ordinary
-    /// `gossip_state` entry either.
+    /// never a `ResolvedRoute`. The ephemeral connection source still
+    /// never gains an ordinary `gossip_state` entry either.
     #[tokio::test]
     async fn connect_to_peer_reusing_an_ephemeral_inbound_source_does_no_bookkeeping_for_either_address()
      {
@@ -15405,15 +14656,10 @@ mod tests {
         let ephemeral_addr = test_addr(20_912);
 
         // The peer's required route, set via the SAME owner command
-        // `Peer::connect`'s ordinary (non-`configure_peer`) path submits --
-        // deliberately NOT `configure_peer`, whose own claim step inserts a
-        // zero-failure `gossip_state.peers` entry as a side effect of
-        // establishing ownership (see `connect_to_peer_records_failure_
-        // state_on_a_first_ever_failed_attempt` above), which would mask
-        // the "no entry exists yet at all" starting point this test needs.
-        // This also better matches the finding this test guards: for the
-        // ordinary-connect path, this address is caller-provided and only
-        // refused on a pin CONFLICT -- never independently verified.
+        // `Peer::connect`'s ordinary path submits -- deliberately NOT
+        // `configure_peer`, whose own claim step would insert a
+        // zero-failure `gossip_state.peers` entry and mask the "no entry
+        // exists yet" starting point this test needs.
         assert!(
             registry
                 .registry_owner
@@ -15481,31 +14727,13 @@ mod tests {
     }
 
     /// Reusing an existing INBOUND connection at A for a required route B
-    /// must not be treated the same as a genuine dial of B: an earlier
-    /// version did, because
-    /// `dialed_outbound` being false made this branch fall back to
-    /// `ResolvedRoute::from_configured(B)`, which was unconditionally
-    /// `dialable: true` regardless of how it got there. Worst for the
-    /// ORDINARY `Peer::connect(&B)` path specifically: B there is
-    /// caller-provided, only refused on an operator-pin CONFLICT via
-    /// `set_ordinary_connect_route` -- never independently verified as
-    /// dialable -- so an arbitrary or stale caller-provided address could
-    /// be cleared of failures, marked successful, and returned as a
-    /// *resolved* route purely because the same identity happened to have
-    /// an unrelated inbound connection open somewhere.
-    ///
-    /// Fixed: `ResolvedRoute::from_configured` is deleted outright (it had
-    /// exactly one call site and no legitimate use once its premise did
-    /// not hold there -- see `ConnectOutcome`'s own doc comment). When no
-    /// dialable address is actually reached, `connect_to_peer` performs NO
-    /// positive address-level bookkeeping at all and returns
-    /// `ConnectOutcome::ConnectedUnverified`, never a `ResolvedRoute`.
-    ///
-    /// B carries STALE failure state from a real, previous failed attempt
-    /// -- exactly the `connect_to_peer_reusing_a_connection_at_a_does_not_
-    /// mark_a_different_configured_b_healthy` technique above -- so
-    /// "neither cleared nor marked successful" is actually observable (an
-    /// absent entry would make it trivially true either way).
+    /// must not be treated as a genuine dial of B -- see `ConnectOutcome`'s
+    /// own doc comment for the bug this prevents (an earlier version fell
+    /// back to `ResolvedRoute::from_configured(B)`, unconditionally
+    /// `dialable: true`, wrongly clearing failures for a never-contacted
+    /// caller-provided address). B carries STALE failure state from a real
+    /// previous attempt here, so "neither cleared nor marked successful"
+    /// is actually observable.
     #[tokio::test]
     async fn connect_to_peer_reusing_an_inbound_connection_does_not_resolve_a_different_caller_provided_b()
      {
@@ -15620,29 +14848,19 @@ mod tests {
         );
     }
 
-    /// An earlier version of the
-    /// error arm updated an EXISTING `PeerInfo` entry only
-    /// (`gossip_state.peers.get_mut(&addr)`), so the FIRST-EVER failed
-    /// `connect_to_peer` for a brand-new required peer recorded nothing at
-    /// all -- no entry, no failure state, no backoff. That is a functional
-    /// regression from the earlier fix that removed the pre-dial insert:
-    /// removing the premature insert was right, but leaving the failure
-    /// arm update-only means a peer that has NEVER succeeded even once
-    /// never gains failure/backoff state on its very first attempt.
+    /// An earlier version of the error arm updated an EXISTING `PeerInfo`
+    /// entry only, so the FIRST-EVER failed `connect_to_peer` for a
+    /// brand-new required peer recorded nothing at all -- no entry, no
+    /// failure state, no backoff.
     ///
-    /// Fixed with `entry().or_insert_with(...)`, keyed to the address this
-    /// call actually ATTEMPTED (an `AttemptedRoute`, from the exact same
-    /// resolution the dial itself used), via the new
+    /// Fixed with `entry().or_insert_with(...)`, keyed to the address
+    /// this call actually ATTEMPTED (an `AttemptedRoute`), via
     /// `PeerInfo::for_failed_connect_attempt`.
     ///
-    /// Sets the required route via `RegistryOwnerHandle::
-    /// set_ordinary_connect_route` -- the SAME owner command
-    /// `Peer::connect`'s required-connect path submits -- rather than
-    /// `configure_peer`: the operator-pin path's own claim step inserts a
-    /// zero-failure `gossip_state.peers` entry as a side effect of
-    /// establishing ownership, which would mask exactly the "no entry
-    /// exists yet at all" scenario this test needs, unrelated to this
-    /// finding.
+    /// Uses `set_ordinary_connect_route` rather than `configure_peer`:
+    /// the operator-pin path's own claim step inserts a zero-failure
+    /// entry as a side effect of establishing ownership, which would mask
+    /// the "no entry exists yet" scenario this test needs.
     #[tokio::test]
     async fn connect_to_peer_records_failure_state_on_a_first_ever_failed_attempt() {
         let registry = GossipRegistry::<()>::new(test_addr(20_920), test_config());
@@ -15695,29 +14913,17 @@ mod tests {
         );
     }
 
-    /// `connect_to_peer`'s signature changing from `Result<()>` to
-    /// `(Option<AttemptedRoute>, Result<ConnectOutcome>)` would
-    /// break `.await?`, `.await.unwrap()`, and direct
-    /// returns for any downstream caller of `GossipRegistry::connect_to_
-    /// peer` directly -- this crate's OWN tests needing mechanical `.await.1`
-    /// edits to keep compiling would be exactly the signal that the
-    /// PUBLIC contract had changed underneath existing callers. Resolved
-    /// the same way as an identical shape of tension elsewhere: the public
-    /// signature stays `Result<()>`; the richer tuple lives under a
-    /// distinct, `pub(crate)` name (`connect_to_peer_with_outcome`) for
-    /// the internal callers that actually need the attempted/resolved
-    /// distinction (`Peer::connect_with_route_mode`, `supervise_configured_
-    /// peers`, and this crate's own tests exercising that detail directly).
+    /// `connect_to_peer`'s signature changing from `Result<()>` to a
+    /// tuple would break `.await?`/`.await.unwrap()` for any downstream
+    /// caller. The public signature stays `Result<()>`; the richer tuple
+    /// lives under `connect_to_peer_with_outcome` for internal callers
+    /// that need the attempted/resolved distinction.
     ///
-    /// This is a COMPILE-level check as much as a runtime one: every line
-    /// below is written exactly the way an external, downstream caller of
-    /// `GossipRegistry::connect_to_peer` would write it -- `?` directly on
-    /// the `.await`, inside a function returning this crate's own
-    /// `Result<()>` alias, with NO `.1` extraction anywhere. If the public
-    /// signature ever regresses back to the internal tuple shape, this
-    /// test stops compiling; RED-confirmed exactly that way (see below),
-    /// since a signature mismatch has no meaningful "wrong value at
-    /// runtime" to assert on.
+    /// A COMPILE-level check as much as a runtime one: every line below
+    /// is written exactly as an external caller would -- `?` directly on
+    /// the `.await`, no `.1` extraction anywhere. If the public signature
+    /// ever regresses to the internal tuple shape, this test stops
+    /// compiling.
     #[tokio::test]
     async fn connect_to_peer_public_signature_stays_result_unit() -> Result<()> {
         let registry = GossipRegistry::<()>::new(test_addr(20_925), test_config());
@@ -15768,12 +14974,9 @@ mod tests {
     }
 
     /// `record_peer_discovery_connected`'s early return for a
-    /// transport-source-keyed entry must not just decline to (re-)admit a
-    /// slot -- it must retract one already admitted before the flag was
-    /// known (e.g. `mark_peer_connected` ran before handle.rs learned this
-    /// connection was the inbound-accept fallback). Otherwise a stale
-    /// discovery slot for an address the code has since decided must never
-    /// occupy one stays occupied forever.
+    /// transport-source-keyed entry must retract a slot already admitted
+    /// before the flag was known, not just decline to re-admit -- otherwise
+    /// a stale discovery slot stays occupied forever.
     #[tokio::test]
     async fn marking_transport_source_keyed_after_discovery_admission_clears_the_slot() {
         let mut config = test_config_with_seed("transport-source-keyed-late-mark-clears-slot");
@@ -23031,19 +22234,11 @@ mod tests {
         );
     }
 
-    /// R-16: `ConnectionPool::required_addr` is set by every plain
-    /// `Peer::connect()` call (the supervisor's "keep redialing this
-    /// target" bookkeeping), not only by `GossipRegistry::configure_peer`
-    /// (a genuine operator reservation). Before the owner tracked its own
-    /// `operator_pinned` set, `add_connection_scoped_peer_claim` treated
-    /// `required_addr` alone as proof of a permanent reservation, so an
-    /// ordinary peer reached only via `.connect()` never got a
-    /// connection-scoped receipt at all -- its address ownership survived
-    /// every session teardown by accident, with no `cleanup_dead_peers`
-    /// timeout short enough to ever reclaim it. This is the exact defect
-    /// `test_reconnect_cleanup` and `test_clean_disconnect_releases_ownership_promptly`
-    /// (`tests/connection_lifecycle_test.rs`) exercise end to end over real
-    /// TLS connections; this is the fast, unit-level pin of the same fix.
+    /// `required_addr` is set by every plain `.connect()`, not only by
+    /// `configure_peer`. Treating it alone as proof of a permanent
+    /// reservation let an ordinary `.connect()`-only peer's address
+    /// ownership survive every session teardown by accident. Unit-level
+    /// pin of the same fix `test_reconnect_cleanup` exercises end to end.
     #[tokio::test]
     async fn connection_scoped_claim_releases_even_when_required_addr_is_set_without_configure_peer()
      {
@@ -23292,15 +22487,11 @@ mod tests {
         }
     }
 
-    /// The second interleaving that same earlier design could hit: a
-    /// session's exit racing a
-    /// brand-new claim for the very same peer+address. Under the unsynced
-    /// map, the exit's take-then-compare-and-remove could lose to the
-    /// concurrent claim's generation bump and leave a receipt behind for a
-    /// session that no longer exists -- a ghost that made the map believe
-    /// the address was forever "covered by another session" and refused
-    /// every future release for it, including the survivor's own eventual,
-    /// entirely legitimate exit.
+    /// A session's exit racing a brand-new claim for the same address:
+    /// under an unsynced map, the exit's take-then-compare-and-remove
+    /// could lose to the claim's generation bump and leave a ghost receipt
+    /// for a session that no longer exists, permanently refusing every
+    /// future release for that address.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn session_exit_racing_a_fresh_claim_never_strands_a_ghost_receipt() {
         for round in 0..200u16 {
@@ -23387,44 +22578,11 @@ mod tests {
 
 
 
-    /// The reservation's decision must not be bound only to
-    /// (address, evidence_before) -- the causal fence -- never to the PEER
-    /// IDENTITY a caller's selection actually captured. If the old owner is
-    /// released
-    /// and a DIFFERENT peer claims or is configured onto that same
-    /// address after selection but before the reserve command, the
-    /// causal fence alone does not notice: a plain gossip/discovery claim
-    /// or an operator `configure_peer`, unlike a connection-scoped claim,
-    /// deliberately do NOT refresh `claim_committed_at` (see `claim`'s
-    /// own doc comment). Granting the reservation anyway would authorize a
-    /// caller's later destructive work to run against the actors,
-    /// capabilities, and clock state belonging to the NEW owner, not the
-    /// dead peer the selection actually meant to act on.
-    ///
-    /// Constructs the scenario deterministically rather than racing it:
-    /// a real selection-to-reservation window has no `.await` point at all
-    /// between reading `gossip_state` and submitting the reserve command,
-    /// so nothing can reliably be made to land inside it via ordinary task
-    /// scheduling (the same reason the sibling test above drives the
-    /// reservation by hand instead of trying to hit a precise window in a
-    /// real caller). Captures the identity a selection pass would observe
-    /// for `addr` at the moment it would run --
-    /// unowned, unpinned, since this dead peer is only ever known through
-    /// `GossipState`, never through an owner-level claim, exactly as a
-    /// peer that announced itself over gossip but never actually
-    /// connected, or whose ownership some other path already released,
-    /// would look -- then changes the owner via a PLAIN claim, and
-    /// registers the NEW owner's own actor, capability, and
-    /// clock-calibration state: exactly what a peer that has genuinely
-    /// started using the address would have.
-    ///
-    /// Reserving with the STALE, selection-captured identity must be
-    /// refused. Reserving with the CURRENT, correct identity must
-    /// succeed -- proving the refusal above is specifically about the
-    /// identity mismatch, not some unrelated reason. Throughout, the new
-    /// owner's actor, capability, and clock state are completely
-    /// untouched, because nothing ever authorized destructive work
-    /// against them.
+    /// The reservation's decision must also bind to the PEER IDENTITY
+    /// selection captured, not just the causal fence: a plain claim or
+    /// `configure_peer` deliberately does not refresh `claim_committed_at`,
+    /// so the causal fence alone would not notice a different peer taking
+    /// the address after selection.
     #[tokio::test]
     async fn reap_reservation_refuses_when_a_different_identity_claims_the_address_after_selection()
      {
@@ -23565,42 +22723,10 @@ mod tests {
         fresh_reservation.expect("checked above").release().await;
     }
 
-    /// Selection reads `GossipState`'s `node_id` and the owner's
-    /// `ownership_token`/`pin_owner` from two entirely independent
-    /// synchronization domains, and used to never check they describe the
-    /// SAME peer. If a NEW claim commits for `addr` while a candidate's
-    /// `node_id` (already captured, part of the `gossip_state` snapshot
-    /// selection holds) and its ownership/pin reads (evaluated moments
-    /// later, against the owner's live, independently-updated state)
-    /// straddle the change, selection can pair the OLD failed peer's
-    /// `node_id` with the NEW owner's (now current) token.
-    /// `reserve_for_reap` used to grant on the strength of the
-    /// ownership/pin match alone, since it never looked at `node_id` at
-    /// all -- and the destructive phase would then run with the OLD
-    /// `node_id` against the address's NOW-current (new peer's) side
-    /// tables and actors.
-    ///
-    /// Unlike `reap_reservation_refuses_when_a_different_identity_claims_
-    /// the_address_after_selection` above (which isolates a STALE
-    /// ownership/pin read -- the pre-existing checks already catch that
-    /// on their own), this isolates the specific gap those checks left
-    /// open: `expected_ownership`/`expected_pin` here are the CURRENT,
-    /// correct, freshly-read values -- they would sail through the
-    /// pre-existing checks with no trouble at all. Only `node_id` is
-    /// stale, paired with them by selection's own two-source read having
-    /// straddled the claim. Only the NEW `expected_node_id` check (see
-    /// `PeerRegistryOwner::reserve_for_reap`'s doc comment) closes this.
-    ///
-    /// Reproduced deterministically, not via genuine concurrency:
-    /// `node_id` is captured first (exactly as selection's `GossipState`
-    /// read would, before the race), then the NEW claim commits, then
-    /// `ownership`/`pin_owner` are captured (exactly as selection's
-    /// SEPARATE, later owner reads would, after the race) -- reconstructing
-    /// precisely the tuple a real race would leave, without needing to
-    /// win a scheduling race to prove it. `GossipState`'s own `node_id` is
-    /// then updated to the new identity too, proving the bug is
-    /// specifically about the stale VALUE selection already captured, not
-    /// about `GossipState` never catching up at all.
+    /// Unlike the sibling test above (a stale ownership/pin read), this
+    /// isolates the OTHER gap: `expected_ownership`/`expected_pin` are
+    /// CURRENT here; only `node_id` is stale -- the exact tuple a real
+    /// race would leave. Only `expected_node_id` catches it.
     #[tokio::test]
     async fn reap_reservation_refuses_when_selections_node_id_predates_a_concurrent_claim() {
         let registry = GossipRegistry::<()>::new(test_addr(20_930), test_config());
@@ -23761,35 +22887,12 @@ mod tests {
     }
 
 
-    /// `configure_peer` must not collapse
-    /// `ClaimRejection::ReapInProgress` -- a TEMPORARY refusal, since
-    /// another caller currently holds a short-lived reap reservation for
-    /// the address -- into the SAME
-    /// `AddrClaimOutcome::Rejected` a genuine, PERMANENT arbitration loss
-    /// produces, log it, and return `()`. An operator's explicit
-    /// configuration losing a race against a reservation that would very
-    /// likely clear moments later must not leave the caller with
-    /// absolutely no way to tell anything went wrong.
-    ///
-    /// Proves the fix: holds a reap reservation on `connect_addr` for the
-    /// ENTIRE duration of a `configure_peer` call -- long enough to exhaust
-    /// its full `CONFIGURE_PEER_REAP_RETRY_BUDGET` (30s of retrying) -- and
-    /// asserts the call reports `ConfigurePeerOutcome::TemporarilyBlocked`
-    /// (distinct from `Rejected`) and applies NOTHING: no claim, no pin,
-    /// no `ConnectionPool` route. Then releases the reservation and
-    /// retries the identical call, asserting it now succeeds normally --
-    /// proving the caller was told the truth (nothing happened) rather
-    /// than a permanent-sounding rejection for what was actually a
-    /// short-lived, retryable collision.
-    ///
-    /// `start_paused = true`: exhausting a 30s budget for real would make
-    /// this test glacial. Tokio auto-advances its paused virtual clock
-    /// through `tokio::time::sleep` whenever the runtime has nothing else
-    /// to do but wait one out -- exactly this test's situation, since the
-    /// single `configure_peer_with_outcome` call below is the only work in
-    /// flight -- so the retry loop still observes the full, genuine 30s of
-    /// elapsed (virtual) time between attempts without the test itself
-    /// taking anywhere near that long in real wall-clock time.
+    /// A TEMPORARY `ReapInProgress` refusal must not collapse into the SAME
+    /// `Rejected` a genuine PERMANENT arbitration loss produces. Holds a
+    /// reap reservation long enough to exhaust the retry budget, asserts
+    /// `TemporarilyBlocked`, then releases and retries, asserting success.
+    /// `start_paused = true`: exhausting a 30s budget for real would be
+    /// glacial.
     #[tokio::test(start_paused = true)]
     async fn configure_peer_reports_temporarily_blocked_instead_of_silently_discarding_a_reap_race()
      {
@@ -23849,43 +22952,11 @@ mod tests {
         );
     }
 
-    /// Restoring `configure_peer`'s public signature to `()` discards a
-    /// real failure signal if the retry budget behind it (`ClaimRejection::
-    /// ReapInProgress`) is short enough that ordinary actor cleanup or
-    /// `gossip_state` contention during a reap sweep's destructive phase
-    /// could routinely outlast it -- silently discarding an operator's
-    /// explicit configuration.
-    ///
-    /// A wider, still-bounded
-    /// retry budget plus `Result<(), ConfigurePeerRejection>` is itself
-    /// wrong, for source-compatibility reasons (see `configure_peer`'s own
-    /// doc comment): `()`, unchanged from `main`, is the right signature, and the guarantee moves from "a
-    /// single attempt's typed result" to "the request is queued for
-    /// background retry until it applies" -- see `configure_peer`'s and
-    /// `queue_configure_peer_until_applied`'s own doc comments.
-    ///
-    /// Proves the QUEUEING guarantee specifically, via the PUBLIC
-    /// `configure_peer` (not the `pub(crate)` `_with_outcome` sibling the
-    /// other tests in this module use): holds a reap reservation on
-    /// `connect_addr` for the ENTIRE `CONFIGURE_PEER_REAP_RETRY_BUDGET` of
-    /// `configure_peer`'s own first, synchronous attempt -- long enough
-    /// that attempt reports `TemporarilyBlocked` and this call falls
-    /// through to `queue_configure_peer_until_applied` -- and asserts TWO
-    /// things: first, that the public call itself still RETURNS at that
-    /// point (proving the queueing hand-off does not hang the caller's own
-    /// task waiting out an unbounded retry); second, that the configuration
-    /// is NOT yet applied at that moment (proving this is genuinely queued
-    /// background work, not a lucky synchronous success). Only THEN does
-    /// the test release the reservation and poll for the queued retry to
-    /// notice and apply it -- proving the operator's request survived being
-    /// delayed rather than being dropped when the first attempt's budget
-    /// ran out.
-    ///
-    /// `start_paused = true`: exhausting a real 30s budget for the first
-    /// attempt would make this test glacial; see the sibling
-    /// `configure_peer_reports_temporarily_blocked_instead_of_silently_
-    /// discarding_a_reap_race` for the same technique and its own
-    /// reasoning.
+    /// Proves the QUEUEING guarantee via the PUBLIC `configure_peer`:
+    /// holds a reap reservation for the entire first-attempt budget, then
+    /// asserts the call still RETURNS (no hang) with nothing applied yet,
+    /// then releases the reservation and polls for the queued retry to
+    /// apply it.
     #[tokio::test(start_paused = true)]
     async fn configure_peer_queues_and_eventually_applies_after_the_retry_budget_is_exhausted()
      {
@@ -23910,20 +22981,12 @@ mod tests {
                 .await
         });
 
-        // The reservation is never released during this call, so
-        // `configure_peer`'s own first attempt (`configure_peer_with_
-        // outcome`) exhausts its full `CONFIGURE_PEER_REAP_RETRY_BUDGET`
-        // (auto-advanced via the paused virtual clock) and reports
-        // `TemporarilyBlocked`, which `configure_peer` must turn into a
-        // queued retry rather than propagating a failure. The call must
-        // still complete -- proving the queued hand-off, not an unbounded
-        // wait, is what happens once the first attempt's budget is spent.
+        // Never released during this call, so the first attempt exhausts
+        // its full budget and reports `TemporarilyBlocked`, which must
+        // turn into a queued retry. The call must still complete.
         call.await.expect("configure_peer task panicked");
 
-        // Nothing has actually been applied yet -- the reservation is
-        // STILL held, so if this were already `Some`, the test would be
-        // proving nothing about the queue (either the reservation never
-        // really blocked anything, or some other path applied it).
+        // Nothing applied yet -- the reservation is STILL held.
         assert_eq!(
             registry.connection_pool.get_required_peer_addr(&peer_id),
             None,
@@ -23931,10 +22994,8 @@ mod tests {
              so any success here would not be evidence of the queued retry actually working"
         );
 
-        // Release the reservation. The queued background retry -- already
-        // spawned by the `configure_peer` call above -- must notice this
-        // and apply the configuration on its own, without this test ever
-        // calling `configure_peer` (or anything else) again.
+        // Release the reservation. The queued background retry must
+        // notice and apply the configuration on its own.
         reservation.release().await;
         for _ in 0..200 {
             if registry.connection_pool.get_required_peer_addr(&peer_id) == Some(connect_addr) {
@@ -23955,26 +23016,11 @@ mod tests {
         );
     }
 
-    /// `queue_configure_peer_until_applied` must be able to tell whether a
-    /// LATER `configure_peer` call for the same peer has already
-    /// superseded it. Configure P at A (A is reap-reserved, so this call
-    /// exhausts its synchronous budget and queues a background retry for
-    /// A), then reconsider and configure P at B instead (B is free, so
-    /// this succeeds immediately): once A's reservation finally clears,
-    /// the STALE queued retry must not win the race and evict the
-    /// operator's own newer, deliberate B decision.
-    ///
-    /// Proves the fix: after the newer B call succeeds, releases A's
-    /// reservation and gives the queued A retry scheduling opportunities
-    /// (`yield_now`, not `sleep` -- standing down does not need to wait
-    /// out any timer, only to be polled once), then asserts B is STILL
-    /// the peer's pin -- the queued retry must have recognized the
-    /// `configure_peer_generation` counter moved past its own captured
-    /// value and refused to apply A.
-    ///
-    /// `start_paused = true`: same reasoning as the sibling test above --
-    /// exhausting the first attempt's real 30s budget would make this
-    /// test glacial otherwise.
+    /// Configure P at A (reap-reserved, queues a retry), then reconfigure
+    /// P at B (free, succeeds immediately): once A's reservation clears,
+    /// the stale queued retry must not evict B. Proves it: after B
+    /// succeeds, releases A's reservation and gives the queued retry
+    /// scheduling opportunities, then asserts B is STILL the pin.
     #[tokio::test(start_paused = true)]
     async fn queued_configure_peer_retry_does_not_overwrite_a_newer_configure_peer_call() {
         let registry = GossipRegistry::<()>::new(test_addr(20_935), test_config());
@@ -24052,31 +23098,11 @@ mod tests {
         );
     }
 
-    /// `configure_peer_with_outcome_and_generation`'s OWN internal retry
-    /// loop (retrying a SINGLE call against `ClaimRejection::
-    /// ReapInProgress`) must not pass the FUNCTION's `expected_generation`
-    /// parameter unchanged to every sub-attempt. Entered with `None` (a
-    /// peer's first `configure_peer` call, the ordinary case), if every
-    /// sub-attempt -- not just the first -- told the owner "always
-    /// proceed, bump fresh", a stale sub-attempt could bump PAST a
-    /// genuinely newer, unrelated `configure_peer` call for the SAME peer
-    /// that committed while the stale one was sleeping between its own
-    /// internal retries, and win, evicting the newer call's pin. This is
-    /// the SAME class of bug `queued_configure_peer_retry_does_not_
-    /// overwrite_a_newer_configure_peer_call` already covers for retries
-    /// spanning SEPARATE top-level calls (`queue_configure_peer_until_
-    /// applied`, which already threaded a fixed generation correctly) --
-    /// this is the one place it was missed: retries WITHIN one call.
-    ///
-    /// Proves the fix: configures P at A (reap-reserved, so the FIRST
-    /// internal sub-attempt bumps the generation and starts this call's
-    /// own internal ReapInProgress retry loop), lets it park on its first
-    /// backoff sleep, then -- WHILE it is still asleep, inside that SAME
-    /// top-level `configure_peer` call -- delivers a genuinely newer,
-    /// unrelated `configure_peer` call for the SAME peer to a free
-    /// address B. Once A's reservation clears, the FIRST call's next
-    /// internal sub-attempt must recognize it has been superseded and
-    /// stand down, not evict B's pin.
+    /// Same bug class as the sibling test above, but for the internal
+    /// retry loop WITHIN one call: configures P at A (reap-reserved,
+    /// parks on backoff), then delivers a genuinely newer `configure_peer`
+    /// for the SAME peer to free address B. Once A's reservation clears,
+    /// the first call's next sub-attempt must stand down.
     #[tokio::test(start_paused = true)]
     async fn configure_peer_internal_retry_does_not_overwrite_a_newer_configure_peer_call() {
         let registry = GossipRegistry::<()>::new(test_addr(20_950), test_config());
@@ -24090,11 +23116,10 @@ mod tests {
             .await
             .expect("an unclaimed, unpinned address must be reservable");
 
-        // Call 1: configure P at A. A is reap-reserved, so this call's own
-        // FIRST internal sub-attempt bumps the generation, hits
-        // ReapInProgress, and parks on this call's own internal backoff
-        // sleep -- all still within this ONE top-level configure_peer
-        // call, never reaching the outer queued-retry path at all.
+        // Call 1: A is reap-reserved, so this call's own FIRST internal
+        // sub-attempt bumps the generation, hits ReapInProgress, and parks
+        // on its own internal backoff sleep, never reaching the outer
+        // queued-retry path.
         let registry_for_call1 = registry.clone();
         let peer_id_for_call1 = peer_id.clone();
         let call1 = tokio::spawn(async move {
@@ -24103,20 +23128,13 @@ mod tests {
                 .await;
         });
 
-        // Give call 1 enough scheduling opportunity to make its first
-        // sub-attempt and park on its own internal backoff sleep, without
-        // letting virtual time advance far enough for that sleep to
-        // resolve on its own (nothing here awaits a timer, so the paused
-        // clock has no reason to auto-advance yet).
+        // Give call 1 scheduling opportunity to park on its backoff sleep.
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
 
-        // TOO LATE for call 1's first sub-attempt (already bumped and
-        // parked), but this is exactly the newer, unrelated request the
-        // finding describes: B is free, so this succeeds immediately and
-        // bumps the generation PAST what call 1's first sub-attempt
-        // observed.
+        // TOO LATE for call 1's first sub-attempt: B is free, so this
+        // succeeds immediately and bumps the generation past it.
         registry.configure_peer(peer_id.clone(), addr_b).await;
         assert_eq!(
             registry.registry_owner.routes_to(&addr_b),
@@ -24167,15 +23185,11 @@ mod tests {
         );
     }
 
-    /// Two concurrent `configure_peer` calls for the SAME
-    /// peer, each reconfiguring to a DIFFERENT new address, must never leave
-    /// the owner's pin and `ConnectionPool`'s configured/required route
-    /// disagreeing about which address is current for this peer. Before
-    /// `pin` published the route itself, `configure_peer` made these two
-    /// writes -- the owner's pin decision and `ConnectionPool`'s
-    /// `set_configured_peer_addr` -- as two separately-ordered steps, each
-    /// individually atomic but not atomic with each other; under real
-    /// concurrency they could settle on different addresses.
+    /// Two concurrent `configure_peer` calls for the SAME peer, each to a
+    /// DIFFERENT address, must never leave the owner's pin and
+    /// `ConnectionPool`'s route disagreeing about which address is
+    /// current -- these used to be two separately-ordered, individually
+    /// atomic writes that could settle differently under real concurrency.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_configure_peer_calls_keep_pin_and_configured_route_consistent() {
         for round in 0..200u16 {
@@ -24209,16 +23223,10 @@ mod tests {
             a.expect("task a panicked");
             b.expect("task b panicked");
 
-            // Whichever address `ConnectionPool` reports as this peer's
-            // current configured/required route MUST be exactly the
-            // address the owner actually protects from release. The loser
-            // of the pin race has its ownership fully released by
-            // `configure_peer`'s own stale-address cleanup (see
-            // `reconfiguring_peer_releases_previous_configured_address`),
-            // so it is not a useful thing to assert on here -- the
-            // consistency property under test is entirely about the
-            // WINNER: `ConnectionPool` and the owner must agree on which
-            // address that is.
+            // Whichever address `ConnectionPool` reports as current MUST
+            // be exactly the address the owner actually protects from
+            // release -- the consistency property under test is about the
+            // WINNER: `ConnectionPool` and the owner must agree.
             let configured = registry
                 .connection_pool
                 .get_required_peer_addr(&peer_id)
@@ -24234,13 +23242,8 @@ mod tests {
                 .registry_owner
                 .ownership_token(&configured)
                 .unwrap_or_else(|| panic!("round {round}: still owned"));
-            // The stronger, root-cause property (claim and pin are now one
-            // atomic owner transaction): the pinned/configured address must
-            // actually be OWNED by this exact peer, not merely pinned with
-            // no matching claim behind it -- `release`'s own pin check
-            // alone (below) would return `None` for a pin regardless of who
-            // owns the address, so this checks the ownership token's
-            // identity directly rather than only inferring it indirectly.
+            // The pinned/configured address must actually be OWNED by
+            // this exact peer, not merely pinned with no matching claim.
             assert_eq!(
                 token.owner(),
                 &peer_id,
@@ -24275,29 +23278,12 @@ mod tests {
         }
     }
 
-    /// `configure_peer` must not serialize its whole
-    /// sequence -- including the call into `handle_peer_connect(...).await`
-    /// -- behind a per-peer `tokio::sync::Mutex`: `PeerConnectHandler` is a
-    /// public, unrestricted async callback; a handler that calls
-    /// `configure_peer` again for the SAME peer from within its own
-    /// callback deadlocks on that non-reentrant lock -- the outer call can
-    /// never release it because the outer call is itself waiting for the
-    /// inner (reentrant) call to finish, which is waiting for the very lock
-    /// the outer call still holds. This is ordinary, foreseeable
-    /// application code (e.g. a handler that re-pins a peer in response to
-    /// its own connect notification), not a contrived adversarial input.
-    ///
-    /// The fix removes the lock entirely and instead revalidates
-    /// `pin_is_current` immediately before EACH side effect inside
-    /// `apply_configure_peer_connection_update` -- once before
-    /// `reindex_connection_addr`, again immediately before the handler call
-    /// -- so nothing holds exclusivity while foreign code runs. This proves
-    /// three things: the call completes at all (no deadlock, bounded by a
-    /// generous timeout so a regression fails fast instead of hanging the
-    /// suite); the reentrant (later) call's target wins outright, since it
-    /// is the later owner transaction; and the outer call's own follow-up,
-    /// resuming after the handler returns, has already lost its pin and
-    /// does not undo the reentrant call's result.
+    /// `configure_peer` must not serialize its whole sequence behind a
+    /// per-peer lock: `PeerConnectHandler` is a public callback, and a
+    /// handler that calls `configure_peer` again for the SAME peer would
+    /// deadlock on a non-reentrant lock -- ordinary application code, not
+    /// a contrived input. Fixed by revalidating `pin_is_current` before
+    /// EACH side effect instead of holding a lock.
     #[tokio::test]
     async fn configure_peer_does_not_deadlock_when_its_connect_handler_reenters_it_for_the_same_peer()
      {
@@ -24383,22 +23369,18 @@ mod tests {
     }
 
 
-    /// The atomic owner transaction only makes the COMMIT
-    /// serial; `configure_peer`'s own follow-up work (reindexing the
-    /// connection pool, notifying the connect handler) runs after the
-    /// transaction returns and is not itself serialized. A call whose pin
-    /// was evicted by a concurrent `configure_peer` for the same peer can
-    /// still resume last and act on its now-losing address, with the owner
-    /// and the configured route both already pointing at the winner.
+    /// The atomic owner transaction only makes the COMMIT serial;
+    /// `configure_peer`'s own follow-up (reindexing the connection pool,
+    /// notifying the connect handler) runs after and is not itself
+    /// serialized -- a call whose pin was evicted by a concurrent
+    /// `configure_peer` for the same peer can still resume last and act on
+    /// its now-losing address.
     ///
-    /// Exercises the exact ordering described above -- NOT a race
-    /// that merely happens to reproduce it -- by driving the two halves of
-    /// `configure_peer` by hand: the first call's owner transaction is
-    /// forced to complete (and be evicted) BEFORE the second, winning call
-    /// runs start to finish, and only THEN does the first call's own
-    /// deferred follow-up work run. An ordering achieved by construction is
-    /// the only way to prove this deterministically; a real race could pass
-    /// by accident.
+    /// Drives the two halves of `configure_peer` by hand, by construction
+    /// rather than a real race (which could pass by accident): the first
+    /// call's owner transaction completes and is evicted BEFORE the
+    /// second, winning call runs start to finish, and only then does the
+    /// first call's deferred follow-up run.
     #[tokio::test]
     async fn configure_peer_stands_down_when_its_own_pin_was_evicted_before_it_resumes() {
         let registry = GossipRegistry::<()>::new(test_addr(20_800), test_config());
@@ -24455,19 +23437,11 @@ mod tests {
         );
     }
 
-    /// Whatever closes the race for a concurrent
-    /// `configure_peer` call (the sibling test above) must also close it
-    /// for a concurrent `migrate` -- a DNS re-resolution can move this
-    /// peer's pin just as easily as another `configure_peer` call can.
-    /// `migrate`'s pin carry (`PeerRegistryOwner::migrate`) publishes into
-    /// the SAME `RoutingSnapshot.pin_shards` that `pin_is_current` reads,
-    /// in the SAME atomic step as the address move itself -- so no
-    /// separate locking or version counter is needed for migrate
-    /// specifically; the follow-up's existing `pin_is_current` check
-    /// already answers "is my pin still here" correctly regardless of
-    /// which kind of concurrent event moved it. Driven directly through
-    /// the owner's `migrate` rather than `refresh_peer_dns` so the test
-    /// does not depend on DNS resolution timing.
+    /// Whatever closes the race for a concurrent `configure_peer` (the
+    /// sibling test above) must also close it for `migrate`: its pin carry
+    /// publishes into the SAME `pin_is_current` reads, in the SAME atomic
+    /// step as the address move. Driven through the owner's `migrate`
+    /// directly so the test doesn't depend on DNS timing.
     #[tokio::test]
     async fn configure_peer_stands_down_when_a_migration_moved_its_pin_before_it_resumes() {
         let registry = GossipRegistry::<()>::new(test_addr(20_820), test_config());
@@ -24529,16 +23503,13 @@ mod tests {
         );
     }
 
-    /// The fence must answer "did I lose the
-    /// configuration", not "has anything at all touched this address
-    /// since". Every accepted claim for an address -- including ordinary
-    /// gossip/discovery chatter re-announcing the SAME identity, which
-    /// never touches the pin at all -- advances its general claim
-    /// generation. A test that only exercises the genuine-eviction case
-    /// (the sibling test above) would pass even if the fence were fenced on
-    /// that generation instead of the pin identity, since it never drives
-    /// any unrelated traffic through the window; this drives exactly that
-    /// traffic and asserts the follow-up work still runs.
+    /// The fence must answer "did I lose the configuration", not "has
+    /// anything at all touched this address since". Ordinary gossip
+    /// chatter re-announcing the SAME identity advances the address's
+    /// general claim generation without touching the pin at all; this
+    /// drives exactly that traffic and asserts the follow-up work still
+    /// runs, which a fence keyed to the generation instead of pin identity
+    /// would wrongly abandon.
     #[tokio::test]
     async fn configure_peer_still_resumes_after_unrelated_claim_traffic_for_the_same_address() {
         let registry = GossipRegistry::<()>::new(test_addr(20_810), test_config());
@@ -24596,15 +23567,12 @@ mod tests {
         );
     }
 
-    /// Same fence, different source of unrelated churn: `ConnectionPool`'s
-    /// `required_addr` is not authoritative for the pin either -- it is
-    /// written by every ordinary `.connect()` call, configured or not (see
-    /// `PeerRegistryOwner::operator_pinned`'s doc comment), entirely
-    /// independent of the owner's own pin decision. Drives an ordinary
-    /// connect for a DIFFERENT address into the window before this call's
-    /// follow-up work runs, moving `required_addr` away from the address
-    /// this call actually pinned, and asserts the connect handler still
-    /// fires: the pin itself was never touched.
+    /// Same fence, different source of unrelated churn: `required_addr`
+    /// is not authoritative for the pin -- written by every ordinary
+    /// `.connect()`, configured or not. Drives an ordinary connect for a
+    /// DIFFERENT address into the window, moving `required_addr` away
+    /// from the pinned address, and asserts the connect handler still
+    /// fires since the pin itself was never touched.
     #[tokio::test]
     async fn configure_peer_still_resumes_after_an_unrelated_ordinary_connect_moves_required_addr()
      {
@@ -24660,28 +23628,12 @@ mod tests {
         );
     }
 
-    /// `configure_peer` must not read `ConnectionPool`'s
-    /// `get_required_peer_addr` BEFORE its owner transaction and -- once
-    /// the transaction returns -- best-effort-release that address if it
-    /// differed from `connect_addr` and from whatever the owner's OWN
-    /// transaction actually evicted. `required_addr` is not pin state: it
-    /// is also written by any ordinary `.connect()` call for a required
-    /// peer (see `RoutingPublisher::set_configured_peer_addr`'s doc
-    /// comment), so it can point at an address this peer was never
-    /// operator-pinned to at all.
-    ///
-    /// Drives the exact scenario: a live connection-scoped session at B
-    /// (a real, receipted claim -- not merely `required_addr` pointing
-    /// there) moves `required_addr` to B via the SAME ordinary-connect
-    /// path a ready dial uses. The operator, who never configured this
-    /// peer before, now configures it to C. The owner transaction evicts
-    /// NO pin at all (`pinned_by_peer` had no prior entry for this peer),
-    /// yet the old `required_addr`-derived cleanup still saw B, saw it
-    /// wasn't what the owner evicted, and released B's CURRENT, live
-    /// ownership anyway -- purging B's connection-scoped receipt out from
-    /// under an actively occupied address and leaving it reclaimable by a
-    /// different identity while the session at B is still genuinely
-    /// connected.
+    /// `required_addr` is not pin state -- also written by any ordinary
+    /// `.connect()`, so it can point at an address this peer was never
+    /// operator-pinned to. Drives the scenario: a live connection-scoped
+    /// session at B moves `required_addr` there via the ordinary-connect
+    /// path; the operator then configures this peer to C, evicting no
+    /// pin at all, and B's live session must survive untouched.
     #[tokio::test]
     async fn configure_peer_does_not_release_a_live_session_whose_required_addr_was_never_the_pin()
      {
@@ -24752,25 +23704,19 @@ mod tests {
         );
     }
 
-    /// An ordinary `.connect()` call (`Peer::connect`, via
-    /// `connect_with_route_mode`) writes `ConnectionPool`'s
+    /// An ordinary `.connect()` call writes `ConnectionPool`'s
     /// required/configured route directly -- the SAME fields
-    /// `RoutingPublisher::set_configured_peer_addr`'s trait impl writes
-    /// from INSIDE the owner's serialized `configure_peer`/`migrate`
-    /// commands (see its doc comment). Before this fix, an ordinary
-    /// connect to a DIFFERENT address for an operator-PINNED peer would
-    /// silently overwrite that pin's synchronized route publication --
-    /// the same class of "a non-owner path mutates state the owner
-    /// command just atomically published" bug the reindex fold closed for
-    /// `configure_peer` itself, just reached through a completely
-    /// different, ordinary-connect door instead of a race.
+    /// `set_configured_peer_addr` writes from INSIDE the owner's
+    /// serialized `configure_peer`/`migrate` commands. Before this fix,
+    /// an ordinary connect to a DIFFERENT address for an operator-PINNED
+    /// peer would silently overwrite that pin's synchronized route
+    /// publication.
     ///
     /// Drives it directly: `configure_peer` pins the peer to A, then an
-    /// ordinary `.connect(&B)` call is made for the same peer. The pin
-    /// itself (owner state) is obviously untouched -- `Peer::connect`
-    /// never talks to the owner at all -- but `ConnectionPool`'s
-    /// required/configured route must ALSO still show A, not silently
-    /// have moved to B.
+    /// ordinary `.connect(&B)` call is made for the same peer. The owner
+    /// pin is obviously untouched (`Peer::connect` never talks to the
+    /// owner), but `ConnectionPool`'s required route must ALSO still show
+    /// A, not silently have moved to B.
     #[tokio::test]
     async fn ordinary_connect_does_not_overwrite_an_operator_pinned_required_addr() {
         let registry = Arc::new(GossipRegistry::<()>::new(test_addr(20_840), test_config()));
@@ -24816,36 +23762,13 @@ mod tests {
         );
     }
 
-    /// `set_ordinary_connect_route`'s acceptance boolean (a DECLINE must
-    /// not be silently treated as success) is still
-    /// only accurate at the instant the owner command executes. If it
-    /// accepts B, and a CONCURRENT `configure_peer` then pins the peer to
-    /// A before `connect_with_route_mode` gets to `connect_to_peer`,
-    /// `ConnectionPool`'s required route -- which `connect_to_peer`
-    /// re-reads fresh, at the moment it runs -- points to A: the dial
-    /// genuinely reaches A, but the OLD code still attributed the outcome
-    /// to B (the address originally requested). Success wrongly marked B
-    /// healthy and would gossip it -- a route this node never actually
-    /// contacted; failure would have recorded a spurious failure entry for
-    /// B instead of A.
-    ///
-    /// Fixed by having `connect_to_peer` report the address it ACTUALLY
-    /// resolved and attributing every outcome to THAT address, never to
-    /// whatever the caller originally intended -- no fence, because a
-    /// fence would just be another variant of the same "check, then
-    /// trust it later" shape that recurs throughout this file.
-    ///
-    /// Constructs the exact window deterministically: holds `gossip_state`'s
-    /// lock so the spawned ordinary connect completes its route write
-    /// (accepted -- nothing is pinned yet) and then blocks on this exact
-    /// lock, at its own unconditional `PeerInfo` insert for B -- BEFORE the
-    /// dial has run at all. A concurrent `configure_peer(A)` is spawned
-    /// next; its OWNER transaction -- the part that actually moves
-    /// `ConnectionPool`'s required route to A -- completes and is visible
-    /// before this test releases the guard, so by the time the dial
-    /// actually runs, the pool unambiguously points to A, never B. A
-    /// pre-faked existing outbound connection at A lets `connect_to_peer`
-    /// resolve immediately with no real dial required.
+    /// `set_ordinary_connect_route`'s acceptance boolean is only accurate
+    /// at the instant the owner command executes: if it accepts B, and a
+    /// CONCURRENT `configure_peer` pins the peer to A before the dial
+    /// runs, the dial genuinely reaches A, so every outcome must attribute
+    /// to A, not B. Holds `gossip_state`'s lock so the ordinary connect
+    /// blocks right before the dial, lets `configure_peer(A)` complete,
+    /// then releases so the dial resolves to A.
     #[tokio::test]
     async fn ordinary_connect_attributes_the_outcome_to_the_address_actually_dialed() {
         use crate::connection_pool::{
@@ -24947,11 +23870,10 @@ mod tests {
         );
     }
 
-    /// Inverse of the above: a stale, losing call's own follow-up work must
-    /// not resume merely because an unrelated ordinary connect happens to
-    /// move `ConnectionPool`'s derived `required_addr` back to coincide
-    /// with that call's own (genuinely lost) target. Only the owner's own
-    /// pin decision may authorize the follow-up work to run.
+    /// Inverse of the above: a stale, losing call's follow-up must not
+    /// resume merely because an unrelated ordinary connect moves
+    /// `required_addr` back to coincide with its lost target. Only the
+    /// owner's own pin decision may authorize the follow-up to run.
     #[tokio::test]
     async fn configure_peer_does_not_resume_when_required_addr_coincidentally_matches_a_lost_pin()
      {
@@ -25018,23 +23940,11 @@ mod tests {
         );
     }
 
-    /// `configure_peer` must not early-return on `outcome ==
-    /// Rejected` BEFORE applying the evicted pin's ownership-watermark
-    /// tombstone: `Rejected` and `Some(evicted_release)` genuinely co-occur.
-    /// the owner's atomic transaction can accept the claim and evict+release
-    /// the peer's previous pin while THIS call's own projection of its claim
-    /// into `gossip_state` is separately rejected as stale, because a
-    /// concurrent call for the SAME peer (targeting a different address)
-    /// superseded it. The eviction already genuinely happened inside the
-    /// owner regardless of that unrelated projection outcome, so its
-    /// tombstone must be applied unconditionally.
-    ///
-    /// Forces the exact ordering by construction: call 1's own owner
-    /// transaction (claiming `connect_addr`, evicting `old_addr`) is
-    /// guaranteed to land first, then call 2's owner transaction (evicting
-    /// `connect_addr` itself) runs and its projection is admitted while
-    /// call 1 is blocked acquiring `gossip_state`'s lock, so call 1's own
-    /// projection is guaranteed stale by the time it resumes.
+    /// `configure_peer` must not early-return on `outcome == Rejected`
+    /// BEFORE applying the evicted pin's tombstone: `Rejected` and
+    /// `Some(evicted_release)` genuinely co-occur when a concurrent call
+    /// for the SAME peer supersedes this call's `gossip_state` projection
+    /// even though the owner's transaction already evicted+released.
     #[tokio::test]
     async fn configure_peer_tombstones_an_evicted_release_even_when_its_own_projection_is_rejected()
      {
@@ -25137,54 +24047,16 @@ mod tests {
         );
     }
 
-    /// The
-    /// dialability-confirmed write must not run unconditionally, with no
-    /// check that nothing repinned `connect_addr` in the window between
-    /// the owner transaction committing and this `gossip_state`
-    /// acquisition actually running. A concurrent `configure_peer` that
-    /// moves THIS SAME peer away from `connect_addr` (releasing it) can
-    /// land in that window, and this call would still mark the now
-    /// released address dialable -- resurrecting it as a selectable
-    /// route for an identity that no longer owns it there at all.
-    ///
-    /// (A racing claim from a genuinely DIFFERENT identity cannot reach
-    /// this window at all: `arbitrate` refuses any competing claim
-    /// against an existing Verified owner outright -- see
-    /// `RejectReason::VerifiedOwnerPresent` -- so the only way `addr`
-    /// changes hands out from under a live `configure_peer` call is the
-    /// SAME peer being reconfigured elsewhere, releasing it, exactly as
-    /// constructed below.)
-    ///
-    /// Fixed by fencing on `pin_is_current`, the SAME lock-free check
-    /// `apply_configure_peer_connection_update` already uses for the
-    /// connect-handler notification -- see this file's own
-    /// `configure_peer` doc comment for why "moving it in" (folding the
-    /// mutation into the owner's serialized transaction, the way the
-    /// reindex and `RoutingPublisher::set_configured_peer_addr` do) is
-    /// not available here: `gossip_state` lives behind an async mutex the
-    /// owner's synchronous `handle()` cannot reach at all.
-    ///
-    /// Constructs the exact window deterministically: call 1 (peer A,
-    /// spawned) commits its OWN owner transaction for `connect_addr`
-    /// (claim + pin) instantly -- that step needs no lock -- then blocks
-    /// acquiring `gossip_state` for its OWN routine claim projection (the
-    /// FIRST thing `add_peer_with_node_id_generation_inner` does with the
-    /// lock), held by this test. While call 1 is blocked there, call 2
-    /// reconfigures the SAME peer A to a DIFFERENT address, directly
-    /// through the owner actor -- entirely `gossip_state`-free, so it
-    /// completes immediately even while this test holds the lock,
-    /// evicting (and releasing) A's pin at `connect_addr`. Releasing the
-    /// lock lets call 1 resume: its OWN `gossip_state` projection for
-    /// `connect_addr` still succeeds (nothing has touched `gossip_state`'s
-    /// ownership watermark for `connect_addr` itself yet -- that
-    /// watermark and the owner's OWN authoritative pin are different
-    /// domains, exactly the gap this finding is about), so `outcome` is
-    /// `Accepted`, NOT `Rejected` -- call 1 reaches the
-    /// dialability-confirmed write's own fence rather than being turned
-    /// away earlier by the unrelated stale-projection check.
-    /// `pin_is_current(&connect_addr, &A)` must then correctly read
-    /// `false`, since the owner's own authoritative pin has already moved
-    /// A elsewhere.
+    /// The dialability-confirmed write must not run unconditionally: a
+    /// concurrent `configure_peer` that moves THIS SAME peer away from
+    /// `connect_addr` can land between the owner transaction committing
+    /// and this `gossip_state` acquisition. Fixed by fencing on
+    /// `pin_is_current`, the SAME check `apply_configure_peer_connection_
+    /// update` already uses. Constructs the window deterministically: call
+    /// 1 (peer A) commits instantly then blocks acquiring `gossip_state`;
+    /// while blocked, call 2 reconfigures peer A elsewhere directly
+    /// through the owner actor, evicting A's pin; releasing the lock lets
+    /// call 1 resume and `pin_is_current` must read `false`.
     #[tokio::test]
     async fn configure_peer_does_not_mark_dialability_for_a_released_address_repinned_mid_call() {
         let registry = Arc::new(GossipRegistry::<()>::new(test_addr(20_840), test_config()));
@@ -25289,45 +24161,13 @@ mod tests {
     }
 
 
-    /// Configured addresses get reindexed into `ConnectionPool`'s
-    /// `connections_by_addr`, but the atomic pin-replacement path must not
-    /// release an evicted address's OWNERSHIP without also removing that
-    /// address's `connections_by_addr` alias. Configure a live peer P at A,
-    /// then at B: A becomes claimable by peer Q while `connections_by_addr
-    /// [A]` still points at P's own, still-live connection. A lookup for Q
-    /// keyed on A -- exactly what `get_connection_by_peer_id`'s own
-    /// address-fallback performs whenever Q's peer-indexed session has no
-    /// connection published yet, the ordinary state for a just-claimed,
-    /// not-yet-directly-connected address -- misses Q's own (nonexistent)
-    /// connection and falls through to that stale alias instead, finds it
-    /// live (`is_usable_connection` is a liveness check only, never an
-    /// identity check), and publishes P's connection as Q's own. Not lost
-    /// state: traffic addressed to Q would be delivered over P's actual
-    /// TCP connection.
-    ///
-    /// An earlier
-    /// version of this test built P's connection at a THIRD address,
-    /// distinct from both A and B, to prove `evict_pin_alias` does not
-    /// over-remove a "genuine transport-source" entry. That carve-out
-    /// (`connection.addr == evicted_addr` survives) was itself the bug in
-    /// disguise: for an OUTBOUND connection, `connection.addr` IS the dial
-    /// target, which for a pinned peer is normally the SAME address as the
-    /// pin -- so the common case (P has an outbound connection at A,
-    /// reconfigured from A to B) hit the carve-out every time, and the
-    /// distinct-third-address test could never exercise it. Rebuilt so
-    /// P's connection's own address literally IS A -- the case that
-    /// matters -- so this test fails before the fix and passes after it.
-    ///
-    /// Fixed by `RoutingPublisher::set_configured_peer_addr` also being
-    /// told which address (if any) this SAME pin decision evicted, so
-    /// `ConnectionPool::evict_pin_alias` can remove that address's alias
-    /// atomically, in the same owner-driven call that installs the new
-    /// one, UNCONDITIONALLY whenever it belongs to the evicted peer -- see
-    /// that method's own doc comment for why there is no exception for the
-    /// connection's own address: the atomic eviction already released
-    /// ownership of A, so nothing may resolve P's connection by address A
-    /// again, though P's connection remains fully reachable through the
-    /// identity-aware (`connections_by_peer`) path.
+    /// The atomic pin-replacement path must not release an evicted
+    /// address's OWNERSHIP without also removing its `connections_by_addr`
+    /// alias: configure P at A then B, and without this fix a lookup for a
+    /// new claimant Q at A would fall through to P's still-live connection
+    /// and deliver Q's traffic over P's TCP connection. Fixed by telling
+    /// `set_configured_peer_addr` which address this SAME pin decision
+    /// evicted, so `evict_pin_alias` removes it atomically in the same call.
     #[tokio::test]
     async fn configure_peer_evicts_the_old_pins_stale_connection_alias() {
         let registry = GossipRegistry::<()>::new(test_addr(21_300), test_config());

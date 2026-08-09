@@ -828,46 +828,19 @@ impl<T: 'static> Peer<T> {
         self.connect_with_route_mode(addr, false).await
     }
 
-    /// An earlier version of this function attributed the
-    /// dial's outcome -- healthy/gossiped on success, failed on error -- to
-    /// `addr`, the address the CALLER asked for, regardless of what was
-    /// actually contacted. `set_ordinary_connect_route`'s acceptance
-    /// boolean (checked just below, for `required_peer`) is only accurate
-    /// at the instant the owner command executes: if a concurrent
-    /// `configure_peer` pins this peer to a DIFFERENT address in the window
-    /// between that check and `connect_to_peer` actually resolving a
-    /// connection, the pool routes the real dial to the PIN's address while
-    /// this function would still record the caller's original `addr` --
-    /// advertising a route this node never actually contacted, or (on
-    /// failure) recording a spurious failure for an address nothing ever
-    /// touched. Fencing that gap (a token, a generation, a re-check) is the
-    /// same shape that has repeatedly left a residual window elsewhere in
-    /// this crate; this function instead attributes every outcome to whatever
-    /// `connect_to_peer` reports it ACTUALLY resolved (`effective_addr`
-    /// below), which it re-derives fresh at the moment it runs rather than
-    /// trusting anything observed earlier -- so no interleaving can produce
-    /// a false claim, because nothing here ever claims more than what
-    /// happened.
-    ///
-    /// That fix made the OUTCOME truthful (marking); it did not make the
-    /// ENTRY truthful (existence). The same acceptance
-    /// boolean still gated an UNCONDITIONAL `gossip_state.peers.insert`
-    /// for `addr`, positioned BEFORE the dial: the exact same concurrent
-    /// `configure_peer` race left a fresh, zero-failure entry for `addr`
-    /// sitting in `gossip_state.peers` regardless of where the dial
-    /// actually landed, for the success arm to mark healthy and gossip
-    /// moments later. Every insertion this function performs is now
-    /// likewise deferred until AFTER the dial resolves and keyed to
-    /// whatever address it actually reports -- see each `match` arm below.
-    /// Audited every other pre-dial write in this function for the same
-    /// requested-vs-actual shape while at it: the discovered-route pool
-    /// writes (`set_discovered_peer_addr`/`reindex_connection_addr`) and
-    /// the existing-connection eviction check are both unaffected -- the
-    /// former only ever runs for the non-required path, where `addr` is
-    /// unambiguous and never goes through the owner's pin/route machinery
-    /// at all; the latter operates on whatever connection is CURRENTLY
-    /// published for `self.peer_id`, not on `addr`, so it cannot diverge
-    /// from what it acts on.
+    /// A concurrent `configure_peer` can repin `self.peer_id` to a
+    /// different address between accepting the route below and
+    /// `connect_to_peer` actually resolving a connection, so the dial can
+    /// land somewhere other than the caller's `addr`. Every outcome
+    /// (health marking, gossip, `gossip_state` insertion) is therefore
+    /// attributed to whatever `connect_to_peer` reports it ACTUALLY
+    /// resolved (`effective_addr` below), re-derived fresh rather than
+    /// trusted from an earlier check, and every insertion is deferred
+    /// until after the dial resolves -- see each `match` arm below. The
+    /// discovered-route pool writes and the existing-connection eviction
+    /// check are unaffected: the former never goes through the owner's
+    /// pin/route machinery, and the latter keys off whatever connection is
+    /// currently published, not off `addr`.
     async fn connect_with_route_mode(&self, addr: &SocketAddr, required_peer: bool) -> Result<()> {
         if self.peer_id == self.registry.peer_id {
             tracing::warn!(
@@ -897,51 +870,20 @@ impl<T: 'static> Peer<T> {
 
         // First configure the address for this peer
         if required_peer {
-            // Routed through the owner instead of writing `ConnectionPool`
-            // directly: `ConnectionPool::set_configured_peer_addr` is the
-            // SAME method `RoutingPublisher::set_configured_peer_addr`'s
-            // trait impl calls from INSIDE the owner's serialized
-            // `install_pin`/`migrate` commands. A caller-side read of the
-            // pin (however published, however tightly held next to the
-            // write) is never atomic with a concurrent `configure_peer`/
-            // `migrate` committing a NEW pin in the gap -- an earlier
-            // version of this checked `pinned_addr_for` first and still
-            // had that gap. Submitting this as
-            // `RegistryOwnerHandle::set_ordinary_connect_route` makes the
-            // conflict check and the route write (plus its own reindex)
-            // ONE step in the owner's own serialization, the same fix
-            // that closed this exact class of race for `configure_peer`'s
-            // reindex. This also performs the reindex for this branch;
-            // the discovered-route branch below still does its own.
+            // Routed through the owner (`set_ordinary_connect_route`)
+            // rather than writing `ConnectionPool` directly, so the
+            // pin-conflict check and the route write (plus its reindex)
+            // are one step in the owner's own serialization -- a
+            // caller-side read-then-write of the pin is never atomic with
+            // a concurrent `configure_peer`/`migrate` committing a new pin
+            // in the gap.
             //
-            // The return value MUST be consulted, not discarded: a
-            // `false` means the owner declined -- `self.peer_id` is
-            // operator-pinned to a DIFFERENT address than `addr` --
-            // meaning `addr` is NOT this peer's effective route.
-            // Discarding it and falling through anyway used to insert
-            // `addr` into `gossip_state` regardless, dial the peer (which
-            // actually reaches the PIN's address, since ConnectionPool's
-            // required route was never updated to `addr`), and on that
-            // dial's success mark `addr` itself healthy and gossip it --
-            // advertising a route this node never actually connected to.
-            //
-            // A declined route is NOT treated as "nothing left to do"
-            // here, though: an earlier version of this fix returned
-            // `Ok(())` immediately on decline, which stopped the false
-            // advertisement but ALSO stopped this call from connecting or
-            // reporting failure at all -- `peer.connect(&stale_addr)`
-            // against a peer pinned elsewhere silently reported success
-            // while the pinned peer was never even contacted, a
-            // regression from this function's prior contract (falling
-            // through to `connect_to_peer`, which resolves and dials the
-            // AUTHORITATIVE pinned address and surfaces ITS outcome).
-            // Continuing through is safe now specifically because the
-            // effective-address bookkeeping below already keys every
-            // insert/mark to whatever `connect_to_peer` actually
-            // resolves, never to this stale `addr` -- the original
-            // concern (advertising a route never contacted) was already
-            // closed by that fix, independent of whether this call
-            // returns early or not.
+            // `false` means the owner declined the route (`self.peer_id`
+            // is pinned elsewhere) -- NOT treated as nothing left to do:
+            // this falls through to dial and report on the authoritative
+            // pinned address instead, which is safe because every outcome
+            // below is keyed to whatever `connect_to_peer` actually
+            // resolves, never to this stale `addr`.
             let route_accepted = self
                 .registry
                 .registry_owner
@@ -966,23 +908,11 @@ impl<T: 'static> Peer<T> {
         }
 
         // `gossip_state.peers` is deliberately NOT touched here, before the
-        // dial: an earlier version of this function inserted a fresh entry
-        // for `addr` unconditionally at this point, on the strength of
-        // `route_accepted` above -- accurate only at the instant the owner
-        // command executed. A concurrent `configure_peer` committing a NEW
-        // pin after that check but before the dial below leaves the pool
-        // routing to the pin's address while this entry, keyed to `addr`,
-        // sat in `gossip_state.peers` regardless -- a fresh, zero-failure
-        // entry for an address this node never actually contacted, ready
-        // for the success arm below to mark healthy and gossip. Insertion
-        // is deferred to AFTER the dial resolves and keyed to whatever it
-        // actually reports, in each arm of the `match` below: for
-        // `required_peer`, `connect_to_peer` is now the sole authority for
-        // this bookkeeping (see its doc comment) and this function performs
-        // none of its own; for the discovered/non-required path, `addr` is
-        // unambiguous (it never goes through the owner's pin/route
-        // machinery at all), but the insert still waits for the dial's
-        // outcome rather than assuming one in advance.
+        // dial: `route_accepted` above is only accurate at the instant the
+        // owner command executed, and a concurrent repin before the dial
+        // below would otherwise leave a fresh entry keyed to a stale
+        // `addr`. Insertion is deferred to AFTER the dial resolves, keyed
+        // to whatever it actually reports -- see each `match` arm below.
 
         if let Some(existing_conn) = self
             .registry
@@ -1034,44 +964,26 @@ impl<T: 'static> Peer<T> {
             }
         }
 
-        // Then attempt to connect with enhanced error context. Both arms
-        // now produce the address ACTUALLY contacted, not just `Result<()>`
-        // -- `connect_to_peer` re-derives its own address fresh, at the
-        // moment it runs (see its doc comment); `get_connection(*addr)`
-        // USUALLY resolves exactly `*addr`, but not unconditionally: in a
-        // narrow race (a follower task loses the outbound-dial-gate race
-        // for `*addr`, then on retry resolves an already-published
-        // connection for the SAME peer identity via `get_connection_by_
-        // peer_id` instead), the returned handle's `.addr` can be that
-        // OTHER connection's own address rather than `*addr` -- see the
-        // `Ok` arm below for why this matters.
+        // Both arms produce the address ACTUALLY contacted, not just
+        // `Result<()>`: `get_connection(*addr)` can, in a narrow dial-gate
+        // race, resolve an already-published connection for the same peer
+        // identity at a DIFFERENT address than `*addr` -- see the `Ok` arm
+        // below.
         let connect_result: Result<crate::registry::ConnectOutcome> = if required_peer {
-            // `connect_to_peer_with_outcome` (the `pub(crate)`, detailed
-            // form -- see its own doc comment for why it is not the
-            // public `connect_to_peer`) is the sole authority for its own
-            // gossip_state bookkeeping on BOTH outcomes -- the
-            // attempted-address half of its return value is not needed
-            // here, only the outcome itself. Its `Ok` may be
-            // `ConnectOutcome::ConnectedUnverified` when no address was
-            // independently corroborated as dialable this round -- see
-            // that type's own doc comment; this function does not perform
-            // its own bookkeeping for the required-peer path either way
-            // (see below), so no further handling is needed here.
+            // Sole authority for its own gossip_state bookkeeping on both
+            // outcomes (see its own doc comment); this function does none
+            // of its own for the required-peer path.
             self.registry
                 .connect_to_peer_with_outcome(&self.peer_id)
                 .await
                 .1
         } else {
             self.registry.get_connection(*addr).await.map(|conn| {
-                // `get_connection` can reuse an existing INBOUND
-                // connection for this identity (the dial-gate race
-                // described above): `conn.addr` is then that connection's
-                // raw, ephemeral transport source, not a corroborated
-                // dial target. `ConnectionHandle` itself carries no
-                // direction, so it must be looked up independently from
-                // the pool -- `ResolvedRoute::from_connection` requires
-                // exactly that, rather than accepting a bare `SocketAddr`
-                // with no way to tell the two cases apart.
+                // `conn.addr` may be a reused inbound connection's raw
+                // transport source rather than a corroborated dial target
+                // -- `ResolvedRoute::from_connection` needs the direction,
+                // looked up independently since `ConnectionHandle` itself
+                // doesn't carry it.
                 let direction = self
                     .registry
                     .connection_pool
@@ -1091,45 +1003,16 @@ impl<T: 'static> Peer<T> {
                     effective_addr = %effective_addr,
                     "Successfully connected to peer"
                 );
-                // `connect_to_peer` (required_peer) already performed its
-                // own, more thorough gossip_state bookkeeping internally,
-                // scoped to the address it actually resolved. Duplicating
-                // a narrower version of that here, keyed by whatever this
-                // call was originally asked to try, is exactly the bug
-                // this fix closes (see this function's own doc comment):
-                // only `get_connection` (the discovered/non-required
-                // path) has no bookkeeping of its own, so this remains
-                // the sole place that path's success is recorded.
+                // `connect_to_peer` (required_peer) already did its own
+                // bookkeeping internally; only the discovered/non-required
+                // path has none of its own, so this remains the sole place
+                // that path's success is recorded.
                 if !required_peer {
-                    // Insert-if-absent, not update-only: this is the sole
-                    // bookkeeping site for the discovered/non-required
-                    // path (see this function's own doc comment), so a
-                    // first-ever successful connection to a not-yet-known
-                    // address must still gain an entry, not silently have
-                    // nowhere to record itself.
-                    //
-                    // Keyed to `effective_addr` -- the address `outcome`
-                    // (a `ConnectOutcome`) actually resolved -- never to
-                    // `*addr`, the bare request, when the two differ:
-                    // `get_connection` can reuse an already-published
-                    // connection for the SAME peer identity at a
-                    // DIFFERENT address than this call asked for (see the
-                    // comment above the `match` for the race), and
-                    // marking `*addr` healthy/gossipable in that case
-                    // would attribute reachability to an address this
-                    // call never actually verified anything about -- the
-                    // same confusion between "the address we looked up"
-                    // and "the socket this connection happens to be on"
-                    // that `connect_to_peer`'s own alias
-                    // handling exists to avoid; see
-                    // `PeerInfo::for_connect_attempt`'s doc comment.
-                    //
-                    // The discovered/non-required path above always
-                    // constructs `ConnectOutcome::resolved(...)` -- never
-                    // `ConnectedUnverified`, which only `connect_to_peer`
-                    // (the `required_peer` path, not reachable in this
-                    // branch) ever produces -- so a corroborated
-                    // `ResolvedRoute` is always present here.
+                    // Insert-if-absent, keyed to `effective_addr` (never
+                    // the bare `*addr` request) for the same reason as the
+                    // function's own doc comment. Always `resolved(...)`,
+                    // never `ConnectedUnverified` (only `connect_to_peer`
+                    // produces that), so a route is always present here.
                     let route = outcome.resolved_route().expect(
                         "the discovered/non-required path always constructs \
                          ConnectOutcome::resolved -- see this function's own connect_result \
@@ -1159,19 +1042,12 @@ impl<T: 'static> Peer<T> {
                 );
 
                 // `connect_to_peer` (required_peer) already recorded
-                // failure internally against whatever address it actually
-                // resolved and attempted -- re-derived fresh at the moment
-                // it ran, never trusted from this caller's possibly-stale
-                // `addr`. Recording a SECOND failure here, keyed by `addr`,
-                // would risk a spurious entry for an address that was
-                // never actually contacted at all -- see this function's
-                // own doc comment. `get_connection` (discovered/non-
-                // required) has no bookkeeping of its own, so this remains
-                // the only place that path's failure is ever recorded, and
-                // `addr` is unambiguously what was attempted there.
+                // failure internally against the address it actually
+                // attempted; recording a second one here keyed by `addr`
+                // would risk a spurious entry. Only the discovered/
+                // non-required path has no bookkeeping of its own, and
+                // `addr` is unambiguous for it.
                 if !required_peer {
-                    // Insert-if-absent -- see the success arm above for
-                    // why. `addr` is unambiguous for this path.
                     let mut gossip_state = self.registry.gossip_state.lock().await;
                     let node_id = Some(self.peer_id.to_node_id());
                     let peer_info = gossip_state
@@ -1850,21 +1726,13 @@ mod tests {
         assert!(matches!(err, GossipError::Network(_)));
     }
 
-    /// An EARLIER version of `Peer::connect`'s ordinary
-    /// route update read `RegistryOwnerHandle::pinned_addr_for` and THEN
-    /// wrote `ConnectionPool::set_configured_peer_addr` as a separate
-    /// step. Even held as tightly together as possible on the caller's
-    /// side, that is still "read a published mirror, then act on it" --
-    /// a race no matter how tight, since the read and the write are not
-    /// on the SAME serialization as a concurrent `configure_peer`/
-    /// `migrate` publishing a NEW pin in between.
-    ///
-    /// Reconstructs that exact shape directly against the primitives --
-    /// production code no longer has this shape at all; see
-    /// `RegistryOwnerHandle::set_ordinary_connect_route`'s doc comment --
-    /// to prove the underlying vulnerability class: a pin published
-    /// AFTER the read but BEFORE the write still gets silently
-    /// overwritten.
+    /// A caller-side read-then-write of the pin (`pinned_addr_for` then
+    /// `set_configured_peer_addr`), however tightly held together, is
+    /// still not on the same serialization as a concurrent
+    /// `configure_peer`/`migrate`. Production code no longer has this
+    /// shape (see `set_ordinary_connect_route`'s doc comment); this
+    /// reconstructs it directly against the primitives to prove the
+    /// vulnerability class.
     #[tokio::test]
     async fn a_caller_side_pin_read_then_route_write_is_vulnerable_to_an_interleaved_pin_publish()
      {
@@ -1909,20 +1777,13 @@ mod tests {
         );
     }
 
-    /// The fix: `Peer::connect`'s ordinary route update now goes through
-    /// `RegistryOwnerHandle::set_ordinary_connect_route`, an owner
-    /// command, so the pin-conflict check and the route write are the
-    /// SAME serialized step no concurrent `configure_peer` can land
-    /// inside of. Proves it with a genuine concurrent race: an ordinary
-    /// connect and a `configure_peer` call for the SAME peer, fired at
-    /// the same time. `configure_peer` always installs an actual,
-    /// unconditional pin, so it must win regardless of ordering --
-    /// either the ordinary connect's owner command sees the pin already
-    /// installed and declines to overwrite the route with its own
-    /// address, or it runs first and writes its own address, which
-    /// `configure_peer`'s own atomic pin-install then overwrites
-    /// unconditionally. Either way `ConnectionPool`'s required route
-    /// must end up EXACTLY the pin address, never the ordinary connect's.
+    /// `configure_peer` must always win a concurrent race against an
+    /// ordinary connect for the same peer, regardless of ordering --
+    /// `set_ordinary_connect_route`'s pin-conflict check and the route
+    /// write are one serialized owner step, so either the ordinary
+    /// connect sees the pin already installed and declines, or its write
+    /// is unconditionally overwritten by `configure_peer`'s own atomic
+    /// pin-install.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_ordinary_connect_and_configure_peer_never_disagree_on_the_route() {
         for round in 0..20u16 {
@@ -1974,32 +1835,12 @@ mod tests {
         }
     }
 
-    /// `connect_with_route_mode` originally
-    /// discarded `RegistryOwnerHandle::set_ordinary_connect_route`'s
-    /// return value entirely, unconditionally inserting the REQUESTED
-    /// address into `gossip_state` and marking it healthy on a dial that
-    /// actually reached the PIN's address -- advertising a route this
-    /// node never actually connected to. That was fixed by deferring
-    /// every insert/mark to the dial's actual, resolved address. A LATER
-    /// version of that fix went one step further and returned `Ok(())`
-    /// immediately on a decline, WITHOUT falling through to the dial at
-    /// all -- a functional regression: `peer.connect(&declined_addr)`
-    /// against a peer pinned elsewhere now reported success without
-    /// ever establishing or verifying any connection, when the prior
-    /// contract was to fall through to `connect_to_peer`, which resolves
-    /// and dials the AUTHORITATIVE pinned address and surfaces ITS own
-    /// outcome.
-    ///
-    /// Proves both halves are intact at once: `configure_peer` pins the
-    /// peer to A (nothing listens there in this test), then an ordinary
-    /// `.connect(&B)` is made for the same peer. B must never appear in
-    /// `gossip_state` at all (the original concern -- even a
-    /// present-but-failed entry would still be gossiped as a known
-    /// address for this peer), but the call must ALSO have genuinely
-    /// tried to connect through the pinned route and surfaced ITS
-    /// failure -- proven directly by the call returning `Err`, since
-    /// nothing listens at A either; a call that silently returned
-    /// `Ok(())` without ever dialing anything would not.
+    /// A declined route must both (a) never let the requested address
+    /// appear in `gossip_state`, and (b) still fall through to dial and
+    /// report on the pinned route rather than returning `Ok(())` without
+    /// trying anything: `configure_peer` pins the peer to A (unlistened),
+    /// then `.connect(&B)` must surface an `Err` from actually attempting
+    /// A, not a silent success.
     #[tokio::test]
     async fn ordinary_connect_falls_through_to_the_pinned_route_without_gossiping_the_declined_one()
      {
@@ -2054,34 +1895,14 @@ mod tests {
         );
     }
 
-    /// The outcome-attribution fix above
-    /// made MARKING truthful -- health/failure keyed to the address a dial
-    /// actually resolved -- but the entry's very EXISTENCE was still gated
-    /// on `route_accepted`, a fact only valid at the instant the owner
-    /// command executed. `gossip_state.peers.insert(B, ...)` used to run
-    /// UNCONDITIONALLY, before the dial, regardless of what a CONCURRENT
-    /// `configure_peer` did in the meantime: the dial could resolve A
-    /// while a fresh, zero-failure entry for B sat in `gossip_state.peers`
-    /// regardless, ready for the success arm to mark healthy and gossip --
-    /// exactly what the outcome-attribution fix set out to stop, just
-    /// reached through the entry's EXISTENCE rather than its marking.
-    /// Fixed by deferring every insertion in `connect_with_route_mode`
-    /// until AFTER the dial resolves, keyed to whatever address it
-    /// actually reports.
-    ///
-    /// Proves it with a genuine concurrent race, run over many rounds to
-    /// cover every ordering the owner's serialization can produce: an
-    /// ordinary connect to B and a `configure_peer` pin to A for the SAME
-    /// peer, fired at the same time. Nothing in this bare test listens on
-    /// either address, so every dial genuinely fails regardless of which
-    /// address it targets -- the invariant under test is not "the dial
-    /// succeeds", it is "B never gains a gossip_state entry this node did
-    /// not itself dial", which must hold no matter how the race resolves:
-    /// B's route write can be accepted and then overridden by the pin
-    /// (the dial lands on A instead and fails, and a first-ever failure
-    /// has no existing entry to update -- critically, none for B either),
-    /// or declined outright by an already-installed pin (this call
-    /// returns early, touching nothing at all).
+    /// A concurrent `configure_peer` pin must not leave a gossip_state
+    /// entry for the address it raced out, even though nothing here
+    /// listens on either address (every dial genuinely fails, so the
+    /// property under test is entry existence, not dial success): B's
+    /// route write can be accepted then overridden by the pin, or
+    /// declined outright, but B must never gain an entry either way.
+    /// Run over many rounds to cover every ordering the owner's
+    /// serialization can produce.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ordinary_connect_never_inserts_a_gossip_state_entry_for_an_address_it_did_not_dial()
      {
@@ -2170,34 +1991,17 @@ mod tests {
         );
     }
 
-    /// The discovered-connect success arm explicitly acknowledges
-    /// `effective_addr != *addr` is possible (`get_connection` can resolve
-    /// an already-published connection for the SAME peer identity at a
-    /// DIFFERENT address than the one this call actually asked for --
-    /// `connect_via_stream`'s own duplicate-connection tie-break reuses an
-    /// existing, live OUTBOUND connection for the identity outright,
-    /// before ever dialing the requested address, whenever
-    /// `should_keep_connection` says this side should keep it), yet used
-    /// to insert/mark the REQUESTED address (`*addr`) healthy and
-    /// gossipable unconditionally. That attributes reachability to an
-    /// address this call never contacted or verified anything about -- a
-    /// stale or even malicious discovery hint could be marked healthy and
-    /// gossiped without ever being dialed. Fixed by keying the insert/mark
-    /// to `effective_addr` (wrapped as a `ResolvedRoute`) instead.
-    ///
-    /// Reproduced deterministically, not via scheduler luck: this test
-    /// holds `gossip_state`'s lock across the exact window
-    /// `connect_discovered`'s own `get_connection` call needs it (inside
-    /// `lookup_node_id`'s identity resolution) and only then establishes
-    /// the peer's ONE connection -- at a DIFFERENT address (`A`) than the
-    /// one requested (`B`). The call cannot observe anything past that
-    /// point until the lock is released, by which time `A` is
-    /// unconditionally in place; `connect_via_stream`'s own tie-break then
-    /// reuses it directly rather than dialing `B` at all. The key pair is
-    /// chosen so this side's NodeId sorts below the peer's, which is
-    /// exactly what makes `should_keep_connection` favor keeping an
-    /// existing outbound connection over dialing a new one (see its own
-    /// doc comment).
+    /// `get_connection` can resolve an already-published connection for
+    /// the same peer identity at a different address (`A`) than requested
+    /// (`B`) -- the tie-break reuses an existing outbound connection
+    /// before dialing. The insert/mark must key to `effective_addr`
+    /// (`A`), never the bare request, or a stale/malicious discovery hint
+    /// could be marked healthy and gossiped without ever being dialed.
+    /// Reproduced deterministically by holding `gossip_state`'s lock
+    /// across `connect_discovered`'s own identity-resolution window and
+    /// establishing the peer's one connection at `A` first; the key pair
+    /// is chosen so `should_keep_connection` favors keeping it over
+    /// dialing `B`.
     #[tokio::test]
     async fn connect_discovered_marks_the_address_actually_resolved_not_the_bare_request() {
         use crate::connection_pool::{
@@ -2304,34 +2108,14 @@ mod tests {
         );
     }
 
-    /// The discovered path used to convert `get_connection`'s resolved
-    /// handle into a `ResolvedRoute` from `conn.addr` alone, discarding the
-    /// connection's direction entirely. If `get_connection` reuses an
-    /// INBOUND connection for the same identity (the same tie-break-reuse
-    /// mechanism `connect_discovered_marks_the_address_actually_resolved_
-    /// not_the_bare_request` above exercises for an outbound connection,
-    /// here with the ordering flipped so the tie-break keeps the INBOUND
-    /// side instead), `conn.addr` is that connection's raw, ephemeral
-    /// transport source -- and the later insert built a normal `PeerInfo`
-    /// with `transport_source_keyed = false`, making an undialable address
-    /// selectable and gossipable. Fixed not by patching this
-    /// site but by tightening `ResolvedRoute` itself. Its only constructor
-    /// is now the `pub(crate)` `from_connection` (requires the
-    /// connection's OWN direction, independently looked up -- an inbound
-    /// source can only ever produce a route flagged as unverified). A
-    /// second, unconditionally-`dialable: true` constructor,
-    /// `from_configured`, existed for a while for `connect_to_peer`'s own
-    /// required-peer path, but was itself deleted once its "trusted
-    /// independent of connection direction" premise turned out not to hold
-    /// for a caller-provided address either -- see `ConnectOutcome`'s own doc
-    /// comment. That case (a live connection exists, but nothing
-    /// corroborates any address as dialable) is represented by
-    /// `ConnectOutcome::ConnectedUnverified` now, a value that never wraps
-    /// a `ResolvedRoute` at all, not reachable through this discovered/
-    /// non-required path at all (only through `connect_to_peer`). Every
-    /// consumer that builds a `PeerInfo` from a `ResolvedRoute` reads its
-    /// dialability directly (`PeerInfo::for_connect_attempt`), so this
-    /// call site cannot forget to flag it even if it tries.
+    /// If `get_connection` reuses an INBOUND connection for the identity
+    /// (tie-break flipped from the outbound case above), `conn.addr` is
+    /// that connection's raw, ephemeral transport source, not a
+    /// corroborated dial target. Enforced at the type level, not this
+    /// call site: `ResolvedRoute`'s only constructor requires the
+    /// connection's independently-looked-up direction, so an inbound
+    /// source can only ever produce a route flagged unverified, and every
+    /// `PeerInfo` builder reads that flag directly off it.
     #[tokio::test]
     async fn connect_discovered_reusing_an_inbound_connection_does_not_mark_the_ephemeral_source_healthy()
      {
@@ -2434,20 +2218,14 @@ mod tests {
             "the entry must also carry the inbound-observed evidence, not just the \
              transport-source flag"
         );
-        // NOTE on "gossiped": `select_best_alias_per_identity` (the ranking
-        // both periodic and immediate gossip target selection share)
-        // deliberately still selects a `transport_source_keyed` alias when
-        // it is LIVE and the ONLY alias for its identity -- excluding a
-        // live connection outright would silence gossip about a
-        // genuinely-connected peer entirely, worse than the imprecision
-        // being guarded against. The flag's protective effect is in
-        // RANKING: it always LOSES to a genuinely dialable alias for the
-        // SAME identity the moment one exists (see
+        // `select_best_alias_per_identity` still selects a
+        // `transport_source_keyed` alias when it's the only live one for
+        // its identity (silencing it entirely would be worse); the flag's
+        // protective effect is in ranking, always losing to a dialable
+        // alias once one exists -- covered separately by
         // `gossip_peer_list_target_selection_prefers_live_alias_over_stale`
-        // in registry.rs, which covers exactly that case). This test's own
-        // scope is the flag itself reaching the entry at all -- asserted
-        // above -- not the ranking behavior downstream of it, which is
-        // already covered there.
+        // in registry.rs. This test's scope is the flag reaching the entry
+        // at all.
     }
 
     /// `(local, remote)` such that `local`'s `NodeId` sorts strictly below

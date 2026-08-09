@@ -447,44 +447,22 @@ impl<T> ConnectionPool<T> {
             });
     }
 
-    /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`, if
-    /// any -- called synchronously from `RoutingPublisher::
-    /// set_configured_peer_addr` when a SAME-command pin decision moves
-    /// `peer_id`'s pin AWAY from `evicted_addr`. Without this, traffic
-    /// addressed to a DIFFERENT identity that later claims `evicted_addr`
-    /// would be delivered over THIS peer's still-live connection, because
-    /// nothing else removes the alias `reindex_connection_addr` installed
-    /// for it when it was still this peer's pin.
+    /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`,
+    /// called synchronously from `RoutingPublisher::
+    /// set_configured_peer_addr` when a same-command pin decision moves
+    /// `peer_id`'s pin away from `evicted_addr` -- otherwise traffic to a
+    /// different identity that later claims `evicted_addr` would be
+    /// delivered over this peer's still-live connection.
     ///
-    /// An earlier version of this function ALSO kept the alias when
-    /// `evicted_addr == connection.addr` (the connection's own
-    /// dial-target/observed-source address), reasoning that a "genuine
-    /// transport-source" entry must survive independent of pin state. That
-    /// carve-out preserved exactly the case that matters most: for an
-    /// OUTBOUND connection, `connection.addr` IS the address it was told
-    /// to dial -- which, for a pinned peer, is normally the SAME address as
-    /// the pin itself. So the common case (peer P has an outbound
-    /// connection at A, is reconfigured from A to B) hit the carve-out
-    /// every time, leaving `connections_by_addr[A]` resolving to P's live
-    /// connection after Q legitimately claimed A -- the exact misdelivery
-    /// this function exists to prevent, reintroduced by its own exception.
-    ///
-    /// The correct distinction is not "is this a transport-source entry"
-    /// -- it is "may a lookup keyed by address alone still reach this
-    /// connection after the address changed hands." Once `evicted_addr` is
-    /// evicted, the SAME atomic owner transaction that decided it also
-    /// released `peer_id`'s ownership of `evicted_addr` (see
-    /// `PeerRegistryOwner::configure_peer`/`migrate`) -- `peer_id` no
-    /// longer legitimately holds `evicted_addr` in ANY sense, pin or
-    /// ownership, so there is no remaining case where an address-keyed hit
-    /// on `evicted_addr` should still resolve to `peer_id`'s connection.
-    /// `peer_id`'s connection remains fully reachable through the
-    /// IDENTITY-aware path (`connections_by_peer`, untouched here) exactly
-    /// as `clear_displaced_peer_addr` above already established for
-    /// arbitration displacement -- this function now removes the
-    /// `evicted_addr` alias unconditionally whenever it belongs to
-    /// `peer_id`, matching that function's identity-matching predicate
-    /// exactly, with no exception for the connection's own address.
+    /// Removes the alias unconditionally, with no exception for
+    /// `evicted_addr == connection.addr` (the connection's own dial
+    /// target): the correct question is not "is this a transport-source
+    /// entry" but "may an address-keyed lookup still reach this connection
+    /// after the address changed hands" -- and once evicted, the same
+    /// atomic owner transaction already released `peer_id`'s ownership of
+    /// `evicted_addr` too, so the answer is always no. `peer_id`'s
+    /// connection remains reachable through the identity-aware path
+    /// (`connections_by_peer`, untouched here).
     pub(crate) fn evict_pin_alias(&self, peer_id: &crate::PeerId, evicted_addr: SocketAddr) {
         let current = self
             .connections_by_peer
@@ -1870,17 +1848,14 @@ impl<T> ConnectionPool<T> {
     /// that lookups by the advertised address find the connection.
     ///
     /// Called from `RoutingPublisher::set_configured_peer_addr`'s trait
-    /// impl -- synchronously, from INSIDE the registry owner's serialized
+    /// impl synchronously, from INSIDE the owner's serialized
     /// `install_pin`/`migrate` commands -- as well as directly by ordinary
-    /// connection-establishment paths. The owner-driven call is what keeps
-    /// a pin-motivated reindex atomic with the pin decision itself: no
-    /// caller-side read of the pin followed by a separate call here can be
-    /// truly atomic with a concurrent owner command, since the owner runs
-    /// as its own task and `ConnectionPool`'s maps are not protected by one
-    /// lock spanning a whole owner command. Performing the reindex as part
-    /// of the SAME synchronous call that decides the pin removes that gap
-    /// entirely rather than narrowing it. See
-    /// `RoutingPublisher::set_configured_peer_addr`'s doc comment.
+    /// connection-establishment paths. A caller-side read of the pin
+    /// followed by a separate call here can never be truly atomic with a
+    /// concurrent owner command (the owner runs as its own task;
+    /// `ConnectionPool`'s maps aren't protected by one lock spanning a
+    /// whole owner command); doing the reindex in the SAME synchronous
+    /// call that decides the pin removes that gap entirely.
     pub fn reindex_connection_addr(&self, peer_id: &crate::PeerId, new_addr: SocketAddr) {
         // First, check if this peer still has an active connection
         // This guards against race conditions where disconnect happens between checks
@@ -4409,29 +4384,15 @@ pub(crate) fn handle_incoming_message(
                     "received delta gossip message on bidirectional connection"
                 );
 
-                // Unlike the `FullSync` arm just below (which has always
-                // checked this), this arm never verified `delta.sender_peer_id`
-                // -- a SELF-REPORTED wire field, not an authority for
-                // identity, see `authenticated_peer_id`'s own doc comment
-                // above -- against the connection's actual authenticated
-                // identity. Combined with `peer_info_is_from_current_
-                // session` accepting any source for an unarmed `PeerInfo`
-                // (a brand-new or reset entry), a connected peer could
-                // send deltas CLAIMING another peer's identity and have
-                // this arm's failure-bookkeeping reset (`failures`,
-                // `last_failure_time`, `last_failure_instant`) attributed
-                // to the impersonated victim's address instead of the
-                // connection that actually sent it -- a connected peer
-                // could otherwise manufacture arbitrary liveness signal
-                // for any address of its choosing, using nothing but a
-                // forged `sender_peer_id` on an otherwise-ordinary
-                // authenticated connection.
-                //
-                // Fixed with the SAME authenticated-identity equality
-                // check the `FullSync` arm already performs, moved to the
-                // very top of this arm -- before `resolve_peer_state_addr`,
-                // before the current-session bookkeeping, before anything
-                // at all keyed on the claimed (not authenticated) identity.
+                // Unlike `FullSync` below, this arm didn't verify
+                // `delta.sender_peer_id` -- a self-reported wire field --
+                // against the connection's actual authenticated identity:
+                // an authenticated peer could claim another identity and
+                // get that victim's address's failure-bookkeeping reset,
+                // manufacturing arbitrary liveness signal for any address
+                // of its choosing. Fixed with the same equality check
+                // `FullSync` performs, moved to the very top of this arm --
+                // before anything at all keyed on the claimed identity.
                 let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
                     warn!(
                         tcp_source = %_peer_addr,
