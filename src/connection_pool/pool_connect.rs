@@ -352,6 +352,7 @@ impl<T> ConnectionPool<T> {
             }
             return Some(ConnectionHandle::new_stream(
                 addr,
+                conn.direction,
                 stream_handle.clone(),
                 correlation,
             ));
@@ -3963,6 +3964,7 @@ impl<T> ConnectionPool<T> {
                         // Create a connection handle to send the message
                         let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
                             addr,
+                            connection_arc.direction,
                             stream_handle.clone(),
                             connection_arc
                                 .correlation
@@ -4080,6 +4082,7 @@ impl<T> ConnectionPool<T> {
 
         Ok(ConnectionHandle::new_stream(
             addr,
+            connection_arc.direction,
             stream_handle,
             connection_arc
                 .correlation

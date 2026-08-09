@@ -275,7 +275,7 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
         );
         let writer_a = Arc::new(writer_a);
         let conn_a =
-            ConnectionHandle::<()>::new_stream(addr_b, Arc::clone(&writer_a), correlation_a);
+            ConnectionHandle::<()>::new_stream(addr_b, ConnectionDirection::Outbound, Arc::clone(&writer_a), correlation_a);
         let (writer_b, task_b, _) = LockFreeStreamHandle::new(
             io_b,
             addr_a,
@@ -286,7 +286,7 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
         );
         let writer_b = Arc::new(writer_b);
         let conn_b =
-            ConnectionHandle::<()>::new_stream(addr_a, Arc::clone(&writer_b), correlation_b);
+            ConnectionHandle::<()>::new_stream(addr_a, ConnectionDirection::Outbound, Arc::clone(&writer_b), correlation_b);
 
         let start = Arc::new(tokio::sync::Barrier::new(3));
         let start_a = Arc::clone(&start);
@@ -443,7 +443,7 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_wedged = Arc::new(writer_wedged);
         let conn_wedged = ConnectionHandle::<()>::new_stream(
-            addr_peer,
+            addr_peer, ConnectionDirection::Outbound,
             Arc::clone(&writer_wedged),
             correlation_wedged,
         );
@@ -458,7 +458,7 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged,
+            addr_wedged, ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -633,7 +633,7 @@ fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_wedged = Arc::new(writer_wedged);
         let conn_wedged = ConnectionHandle::<()>::new_stream(
-            addr_peer,
+            addr_peer, ConnectionDirection::Outbound,
             Arc::clone(&writer_wedged),
             correlation_wedged,
         );
@@ -648,7 +648,7 @@ fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged,
+            addr_wedged, ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -795,7 +795,7 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
         // (`writer_peer`) writes normally onto the shared duplex; the wedged
         // side's transport (`writer_wedged`) never sends anything of its own.
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged,
+            addr_wedged, ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -964,7 +964,7 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged,
+            addr_wedged, ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -1279,7 +1279,7 @@ fn ask_backpressure_nack_never_splices_into_an_in_flight_streaming_frame() {
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged,
+            addr_wedged, ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             correlation_peer,
         );
@@ -2092,7 +2092,7 @@ fn deferred_actor_ask_sync_replies_via_responder() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2210,7 +2210,7 @@ fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out(
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2336,7 +2336,7 @@ fn ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2459,7 +2459,7 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2577,7 +2577,7 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -4456,6 +4456,7 @@ fn test_connection_handle_send_data() {
 
         let handle = ConnectionHandle::<()>::new_stream(
             "127.0.0.1:8080".parse().unwrap(),
+            ConnectionDirection::Outbound,
             stream_handle,
             CorrelationTracker::new(),
         );
@@ -4642,6 +4643,7 @@ fn test_connection_handle_send_data_closed() {
 
         let handle = ConnectionHandle::<()>::new_stream(
             "127.0.0.1:8080".parse().unwrap(),
+            ConnectionDirection::Outbound,
             stream_handle,
             CorrelationTracker::new(),
         );
@@ -4921,7 +4923,7 @@ fn stream_direct_ask_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5204,7 +5206,7 @@ fn stream_tell_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             CorrelationTracker::new(),
         );
@@ -5383,7 +5385,7 @@ fn stream_protocol_ask_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5714,7 +5716,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5866,7 +5868,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -6029,7 +6031,7 @@ fn stream_protocol_tell_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr,
+            server_addr, ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             CorrelationTracker::new(),
         );
@@ -11671,6 +11673,80 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
             .is_none(),
         "ephemeral-address addr_to_peer_id row must be removed — no zombie row left \
          pointing at a torn-down instance"
+    );
+}
+
+/// `connections_by_addr` can be reassigned to a DIFFERENT connection
+/// instance after a `ConnectionHandle` was already resolved from it —
+/// pin-alias eviction is one such reassignment. A caller re-deriving
+/// direction from a fresh `get_lock_free_connection(handle.addr)` lookup
+/// at that point gets the NEW occupant's direction, silently misattributed
+/// to the handle it already holds. `ConnectionHandle::direction()` must
+/// keep reporting the direction of the connection this handle was
+/// actually built from, unaffected by whatever the address index moves on
+/// to afterward.
+#[tokio::test]
+async fn connection_handle_direction_survives_a_same_address_reassignment() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let addr: SocketAddr = "127.0.0.1:7441".parse().unwrap();
+    let peer_id = crate::KeyPair::new_for_testing("direction-survives-reassignment").peer_id();
+
+    let (io_inbound, _peer_inbound) = tokio::io::duplex(256);
+    let (inbound_stream, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io_inbound,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut inbound_conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+    inbound_conn.stream_handle = Some(Arc::new(inbound_stream));
+    inbound_conn.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, Arc::new(inbound_conn)));
+
+    let handle = pool
+        .get_existing_connection(addr)
+        .expect("the inbound connection must resolve to a handle");
+    assert_eq!(
+        handle.direction(),
+        ConnectionDirection::Inbound,
+        "sanity: the handle must report the connection it was actually built from"
+    );
+
+    // Reassign the SAME address to a DIFFERENT, outbound connection --
+    // exactly what pin-alias eviction (or any other address-keyed
+    // reindex) can do after `handle` above was already resolved.
+    let (io_outbound, _peer_outbound) = tokio::io::duplex(256);
+    let (outbound_stream, _writer_task2, _reader_task2) = LockFreeStreamHandle::new(
+        io_outbound,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut outbound_conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+    outbound_conn.stream_handle = Some(Arc::new(outbound_stream));
+    outbound_conn.set_state(ConnectionState::Connected);
+    pool.index_connection_by_addr(addr, Arc::new(outbound_conn));
+
+    // The address-keyed index now genuinely reports the NEW occupant --
+    // proving the reassignment is real, not merely assumed.
+    assert_eq!(
+        pool.get_lock_free_connection(addr).map(|c| c.direction),
+        Some(ConnectionDirection::Outbound),
+        "sanity: a fresh address-keyed lookup must now see the reassigned connection"
+    );
+
+    // The ALREADY-HELD handle must still report its own, original
+    // connection's direction -- not the new occupant's.
+    assert_eq!(
+        handle.direction(),
+        ConnectionDirection::Inbound,
+        "a handle's direction must survive the address it was resolved at being \
+         reassigned to a different connection -- re-deriving it from a fresh lookup would \
+         wrongly report the new occupant's direction instead"
     );
 }
 

@@ -1095,12 +1095,19 @@ impl RegistryOwnerHandle {
     ///
     /// `expected_generation`: `None` for a peer's first call (always
     /// applies, bumps `configure_peer_generation`); `Some(generation)` for
-    /// a retry presenting a value a prior call established -- rejected
-    /// atomically with `SupersededByNewerConfiguration` if a newer call
-    /// bumped the generation further in the meantime. See
-    /// `configure_peer_generation`'s own doc comment for why this fences a
-    /// stale retry from overwriting a newer request.
-    pub async fn configure_peer(
+    /// a retry, accepted only when it is EXACTLY the stored generation --
+    /// not merely not-less-than-it. A caller can only ever have legitimately
+    /// learned `generation` from this SAME method's own prior response for
+    /// this peer, so any other value is either stale (rejected as
+    /// `SupersededByNewerConfiguration`, the same as too-small: a newer call
+    /// already moved on) or not a value this fence ever produced at all --
+    /// neither is worth retrying. `pub(crate)`: the retry path this
+    /// parameter exists for is driven internally
+    /// (`GossipRegistry::configure_peer_with_outcome_and_generation`); no
+    /// caller outside this crate has a legitimate `Some(generation)` to
+    /// present. See `configure_peer_generation`'s own doc comment for why
+    /// this fences a stale retry from overwriting a newer request.
+    pub(crate) async fn configure_peer(
         &self,
         addr: SocketAddr,
         peer_id: PeerId,
@@ -1497,8 +1504,12 @@ struct PeerRegistryOwner {
     /// validates a retry's generation in the SAME serialized step that
     /// installs the pin. The FIRST call for a peer bumps this
     /// monotonically and reports the new value back; every retry presents
-    /// that value as `expected_generation`, rejected outright if a newer
-    /// call has since bumped it further.
+    /// that value as `expected_generation`, accepted only on an EXACT
+    /// match -- rejected outright both if a newer call has since bumped it
+    /// further, and if the presented value was never actually stored here
+    /// at all (see `RegistryOwnerHandle::configure_peer`'s own doc
+    /// comment for why accepting the latter used to be a hole in this
+    /// fence).
     configure_peer_generation: HashMap<PeerId, u64>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     routing: Weak<dyn RoutingPublisher>,
@@ -2193,7 +2204,17 @@ impl PeerRegistryOwner {
             .copied()
             .unwrap_or(0);
         let generation = match expected_generation {
-            Some(expected) if expected < current_generation => {
+            // Exact match only -- not merely not-less-than. A caller can
+            // only legitimately have learned a value FROM this same fence's
+            // own prior response for this peer, so anything else is
+            // refused the same way: a value smaller than current is a
+            // stale retry a newer call already superseded; a value LARGER
+            // than current was never actually stored (see this field's own
+            // doc comment) and accepting it here would apply now while
+            // leaving the stored generation behind, permanently valid for
+            // this exact stale value to be replayed against future,
+            // genuinely newer requests.
+            Some(expected) if expected != current_generation => {
                 return ConfigurePeerCommit {
                     claim: ClaimCommit::Rejected(ClaimRejection::SupersededByNewerConfiguration),
                     evicted_pin: None,
@@ -4321,6 +4342,65 @@ mod tests {
             owner.routes_to(&addr_p),
             None,
             "addr_p must remain unowned -- the stale retry must not have claimed it either"
+        );
+    }
+
+    /// `Some(expected)` used to be accepted whenever it was not LESS than
+    /// the stored generation, but a value GREATER than current is never
+    /// actually stored -- so an oversized retry stays "valid" forever,
+    /// able to clobber every later, genuinely newer call. `Some(100)` at
+    /// generation 1 must be refused outright (not silently applied while
+    /// the stored generation stays at 1); a later normal call must still
+    /// advance normally; and the SAME `Some(100)` retry, tried again after
+    /// that, must still be refused rather than now looking "current" by
+    /// coincidence.
+    #[tokio::test]
+    async fn configure_peer_rejects_an_expected_generation_larger_than_current() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("configure-peer-oversized-generation");
+        let addr_a = addr(30_072);
+        let addr_b = addr(30_073);
+
+        let first = owner.configure_peer(addr_a, node.clone(), None).await;
+        assert!(first.claim().is_accepted());
+        assert_eq!(
+            first.generation(),
+            1,
+            "sanity: a peer's first configure_peer call establishes generation 1"
+        );
+
+        let oversized = owner.configure_peer(addr_b, node.clone(), Some(100)).await;
+        assert_eq!(
+            *oversized.claim(),
+            ClaimCommit::Rejected(ClaimRejection::SupersededByNewerConfiguration),
+            "an expected_generation this fence never actually stored must be refused, not \
+             silently applied"
+        );
+        assert_eq!(
+            owner.routes_to(&addr_b),
+            None,
+            "the oversized retry must not have taken effect"
+        );
+
+        let second = owner.configure_peer(addr_a, node.clone(), None).await;
+        assert!(second.claim().is_accepted());
+        assert_eq!(
+            second.generation(),
+            2,
+            "sanity: a normal call still advances to generation 2"
+        );
+
+        let repeat = owner.configure_peer(addr_b, node.clone(), Some(100)).await;
+        assert_eq!(
+            *repeat.claim(),
+            ClaimCommit::Rejected(ClaimRejection::SupersededByNewerConfiguration),
+            "the same oversized value must still be refused after a later call moved the real \
+             generation on -- it was never valid to begin with, not merely stale now"
+        );
+        assert_eq!(
+            owner.routes_to(&addr_b),
+            None,
+            "the oversized retry must still not have taken effect"
         );
     }
 

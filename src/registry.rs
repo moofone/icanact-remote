@@ -4820,13 +4820,14 @@ impl<T: 'static> GossipRegistry<T> {
                 // Report the connection's OWN resolved address, not this
                 // loop's `list_configured_peers()` snapshot (`addr`), which
                 // a concurrent `configure_peer` can move the pin away from
-                // in between. Direction MUST be looked up independently --
-                // an INBOUND connection's `.addr` alone is not evidence of
-                // dialability.
-                let direction = self
-                    .connection_pool
-                    .get_lock_free_connection(conn.addr)
-                    .map(|c| c.direction);
+                // in between. Direction read from `conn` itself (captured
+                // when this exact handle was built), not re-looked-up by
+                // address -- `connections_by_addr` can be evicted or
+                // reassigned to a DIFFERENT connection in between (pin-alias
+                // eviction is one such reassignment), which would attribute
+                // the wrong connection's direction here; an INBOUND
+                // connection's `.addr` alone is not evidence of dialability.
+                let direction = Some(conn.direction());
                 self.note_peer_reachable(
                     &peer_id,
                     ConnectOutcome::resolved(ResolvedRoute::from_connection(conn.addr, direction)),
@@ -5467,13 +5468,15 @@ impl<T: 'static> GossipRegistry<T> {
                 // EXISTING connection (including one published by an
                 // inbound accept) rather than genuinely dialing out, so
                 // this must also confirm an actual outbound dial, not just
-                // "resolved a connection at this address."
-                let conn_direction = self
-                    .connection_pool
-                    .get_lock_free_connection(conn.addr)
-                    .map(|c| c.direction);
+                // "resolved a connection at this address." Read from `conn`
+                // itself, captured when this exact handle was built, not
+                // re-looked-up by address: `connections_by_addr` can be
+                // evicted or reassigned to a DIFFERENT connection in
+                // between (pin-alias eviction is one such reassignment),
+                // which would attribute the wrong connection's direction
+                // here.
                 let dialed_outbound =
-                    conn_direction == Some(crate::connection_pool::ConnectionDirection::Outbound);
+                    conn.direction() == crate::connection_pool::ConnectionDirection::Outbound;
 
                 if !dialed_outbound {
                     // Neither address was independently corroborated as
@@ -5497,7 +5500,8 @@ impl<T: 'static> GossipRegistry<T> {
 
                 // From here, `dialed_outbound` is true: `conn.addr` IS the
                 // authoritative, corroborated dialable address.
-                let conn_route = ResolvedRoute::from_connection(conn.addr, conn_direction);
+                let conn_route =
+                    ResolvedRoute::from_connection(conn.addr, Some(conn.direction()));
                 let preferred_addr = conn_route.addr();
 
                 let mut gossip_state = self.gossip_state.lock().await;

@@ -981,14 +981,14 @@ impl<T: 'static> Peer<T> {
             self.registry.get_connection(*addr).await.map(|conn| {
                 // `conn.addr` may be a reused inbound connection's raw
                 // transport source rather than a corroborated dial target
-                // -- `ResolvedRoute::from_connection` needs the direction,
-                // looked up independently since `ConnectionHandle` itself
-                // doesn't carry it.
-                let direction = self
-                    .registry
-                    .connection_pool
-                    .get_lock_free_connection(conn.addr)
-                    .map(|c| c.direction);
+                // -- `ResolvedRoute::from_connection` needs the direction.
+                // Read from `conn` itself, captured when this exact handle
+                // was built, not re-looked-up by address: `connections_by_
+                // addr` can be evicted or reassigned to a DIFFERENT
+                // connection between resolving `conn` and a fresh lookup
+                // (pin-alias eviction is one such reassignment), which
+                // would attribute the wrong connection's direction here.
+                let direction = Some(conn.direction());
                 crate::registry::ConnectOutcome::resolved(
                     crate::registry::ResolvedRoute::from_connection(conn.addr, direction),
                 )
