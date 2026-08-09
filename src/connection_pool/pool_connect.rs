@@ -415,9 +415,7 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) {
-        self.get_or_create_peer_session(peer_id)
-            .outbound_dial_retry
-            .record_success();
+        let session = self.get_or_create_peer_session(peer_id);
         let stream_instance_id = connection
             .stream_handle
             .as_ref()
@@ -439,7 +437,11 @@ impl<T> ConnectionPool<T> {
                 },
             },
         );
-        self.set_current_peer_connection(peer_id, Some(connection.clone()));
+        // Publish before releasing the peer's retry reservation. Otherwise a
+        // concurrent caller can observe neither a current connection nor an
+        // active retry floor and start a redundant socket attempt.
+        session.set_current_connection(Some(connection.clone()));
+        session.outbound_dial_retry.record_success();
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection);
