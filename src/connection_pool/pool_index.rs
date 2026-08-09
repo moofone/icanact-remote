@@ -69,6 +69,65 @@ struct PeerSession {
     /// the session (which survives reconnects) so the streak is genuinely
     /// per-peer. Reset on a successful ask or on eviction.
     consecutive_ask_timeouts: AtomicU8,
+    outbound_dial_retry: OutboundDialRetry,
+}
+
+const OUTBOUND_DIAL_RETRY_FLOOR: Duration = Duration::from_secs(1);
+
+/// Per-peer cold-path dial cadence. The state lives on `PeerSession`, so all
+/// callers share it across failed connection instances without retaining an
+/// address-keyed dial gate forever.
+struct OutboundDialRetry {
+    consecutive_failures: AtomicU8,
+    // LOCK-RATIONALE: failed-dial control path only; never read on a live
+    // connection or message hot path. `Instant` has no portable atomic form.
+    retry_not_before: std::sync::Mutex<Option<Instant>>,
+    retry_floor: Duration,
+}
+
+impl OutboundDialRetry {
+    fn new() -> Self {
+        Self::with_retry_floor(OUTBOUND_DIAL_RETRY_FLOOR)
+    }
+
+    fn with_retry_floor(retry_floor: Duration) -> Self {
+        Self {
+            consecutive_failures: AtomicU8::new(0),
+            retry_not_before: std::sync::Mutex::new(None),
+            retry_floor,
+        }
+    }
+
+    fn may_attempt(&self) -> bool {
+        self.retry_not_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none_or(|deadline| Instant::now() >= deadline)
+    }
+
+    fn record_failure(&self) {
+        let failures = self
+            .consecutive_failures
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let delay = if failures == 1 {
+            Duration::ZERO
+        } else {
+            self.retry_floor
+        };
+        *self
+            .retry_not_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now() + delay);
+    }
+
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Release);
+        *self
+            .retry_not_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 impl PeerSession {
@@ -81,6 +140,7 @@ impl PeerSession {
             correlation: CorrelationTracker::new(),
             current_connection: ArcSwapOption::empty(),
             consecutive_ask_timeouts: AtomicU8::new(0),
+            outbound_dial_retry: OutboundDialRetry::new(),
         }
     }
 
@@ -244,7 +304,6 @@ impl PeerSession {
 const OUTBOUND_DIAL_PENDING: u8 = 0;
 const OUTBOUND_DIAL_SUCCEEDED: u8 = 1;
 const OUTBOUND_DIAL_FAILED: u8 = 2;
-
 struct OutboundDialGate {
     state: AtomicU8,
     notify: Notify,
