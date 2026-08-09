@@ -242,10 +242,41 @@ fn ensure_lifecycle_quiescence_recorder_installed() {
     });
 }
 
-/// Waits until at least one outbound-dial-resolution event (see
-/// [`lifecycle_outbound_dial_resolution_peer`]) has been observed for EACH
-/// of `peer_ids`, bounded by `deadline`. Returns `true` once both are
-/// observed, `false` on timeout.
+/// Snapshots the current outbound-dial-resolution counts for `peer_ids`, to
+/// be passed to [`wait_for_dial_resolution_entered`] as `baseline`. Must be
+/// taken once per connection attempt, immediately before initiating it (see
+/// that function's own doc comment for why an absolute, un-baselined count
+/// is not sound here).
+fn snapshot_outbound_dial_resolution_counts(peer_ids: &[PeerId]) -> Vec<u64> {
+    let counts = peer_outbound_dial_resolution_counts()
+        .lock()
+        .expect("peer outbound dial resolution counts mutex poisoned");
+    peer_ids
+        .iter()
+        .map(|id| counts.get(id).copied().unwrap_or(0))
+        .collect()
+}
+
+/// Waits until the outbound-dial-resolution count (see
+/// [`lifecycle_outbound_dial_resolution_peer`]) for EACH of `peer_ids` has
+/// increased past its corresponding entry in `baseline`, bounded by
+/// `deadline`. Returns `true` once both have increased, `false` on timeout.
+///
+/// `baseline` MUST be captured by [`snapshot_outbound_dial_resolution_counts`]
+/// immediately before the connection attempt this call is guarding, never
+/// once per test or reused across attempts: the underlying counts are
+/// cumulative for the entire process, so an absolute `>= 1` threshold (what
+/// this used to check) is satisfied by ANY prior, already-completed dial
+/// that ever touched one of these identities — not necessarily the one just
+/// started. Concretely, in a test that connects A-B and then reuses B to
+/// connect B-C, B's count is already non-zero from the A-B connection by the
+/// time the B-C attempt begins; an absolute check would pass immediately on
+/// B's side even if B's own reciprocal dial to C has not entered resolution
+/// yet, exactly the "hasn't started" case this precondition exists to rule
+/// out. Requiring a strict increase over a freshly captured baseline ties
+/// the evidence to the specific attempt being waited on, not to ambient
+/// process state that would read the same whether or not that attempt ever
+/// ran.
 ///
 /// This is the positive precondition [`wait_for_peer_quiescence`] needs
 /// before its "no new events for a window" check means anything: a
@@ -257,14 +288,19 @@ fn ensure_lifecycle_quiescence_recorder_installed() {
 /// two physically distinct dials (A to B, and B to A) have individually
 /// entered resolution converts "nothing happened" from being the entire
 /// proof into a secondary confirmation layered on top of an affirmative one.
-async fn wait_for_dial_resolution_entered(peer_ids: &[PeerId], deadline: Duration) -> bool {
+async fn wait_for_dial_resolution_entered(
+    peer_ids: &[PeerId],
+    baseline: &[u64],
+    deadline: Duration,
+) -> bool {
     wait_for_condition(deadline, || async {
         let counts = peer_outbound_dial_resolution_counts()
             .lock()
             .expect("peer outbound dial resolution counts mutex poisoned");
         peer_ids
             .iter()
-            .all(|id| counts.get(id).copied().unwrap_or(0) >= 1)
+            .zip(baseline)
+            .all(|(id, &base)| counts.get(id).copied().unwrap_or(0) > base)
     })
     .await
 }
@@ -358,23 +394,30 @@ const QUIESCENCE_SETTLE_MARGIN_MS: u64 =
 /// dial's own resolution hasn't started yet, not because it already
 /// finished. [`wait_for_dial_resolution_entered`] closes that gap first,
 /// with a positive precondition proving both of the two dials
-/// `connect_bidirectional` issues have individually entered resolution; only
-/// once that holds does [`wait_for_peer_quiescence`]'s "no further activity"
-/// check mean anything, since by construction it cannot end early relative
-/// to whatever internal timer is still running — any activity from that
-/// timer resolving resets the wait, and the window itself is now strictly
-/// longer than that timer (see [`QUIESCENCE_SETTLE_MARGIN_MS`]) so a
-/// same-instant tie between the two can no longer end the wait early either.
+/// `connect_bidirectional` issues have individually entered resolution —
+/// baselined against a snapshot taken here, before either dial starts, so a
+/// peer identity this function has already connected once before in the
+/// same test (several tests below reuse a middle node across two calls)
+/// cannot satisfy that precondition on leftover state from the earlier,
+/// unrelated connection. Only once that holds does [`wait_for_peer_
+/// quiescence`]'s "no further activity" check mean anything, since by
+/// construction it cannot end early relative to whatever internal timer is
+/// still running — any activity from that timer resolving resets the wait,
+/// and the window itself is now strictly longer than that timer (see
+/// [`QUIESCENCE_SETTLE_MARGIN_MS`]) so a same-instant tie between the two
+/// can no longer end the wait early either.
 async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
     ensure_lifecycle_quiescence_recorder_installed();
     let _permit = NODE_SETUP_ADMISSION
         .acquire()
         .await
         .expect("NODE_SETUP_ADMISSION is never closed");
-    let result = connect_bidirectional(a, b).await;
     let peer_ids = [a.registry.peer_id.clone(), b.registry.peer_id.clone()];
+    let outbound_baseline = snapshot_outbound_dial_resolution_counts(&peer_ids);
+    let result = connect_bidirectional(a, b).await;
     let resolution_entered =
-        wait_for_dial_resolution_entered(&peer_ids, Duration::from_secs(3)).await;
+        wait_for_dial_resolution_entered(&peer_ids, &outbound_baseline, Duration::from_secs(3))
+            .await;
     assert!(
         resolution_entered,
         "outbound dial resolution for {peer_ids:?} never started in at least one direction"
