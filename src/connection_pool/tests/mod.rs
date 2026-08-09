@@ -12161,6 +12161,161 @@ async fn cleanup_stale_connections_retires_the_stale_instance_even_when_its_addr
     );
 }
 
+/// Same TOCTOU family as `disconnect_connection_instance_defers_correlation_decision_when_target_was_never_current`
+/// (below), but for `retire_orphaned_stale_instance`'s own correlation-abort
+/// logic -- reached via `cleanup_stale_connections`'s CAS-loss fallback.
+/// Before this fix it took its own synchronous `peer_current_connection_snapshot`
+/// and branched directly on it (`abort_tasks_keep_correlation` vs
+/// `abort_tasks`); any snapshot taken before the abort call has the same
+/// "sample at T, act at T+n" gap a fresh, tracker-sharing connection can be
+/// published into. The fix removes the branch entirely and always defers to
+/// the IO task's own `ExitGuard`.
+#[tokio::test]
+async fn retire_orphaned_stale_instance_defers_correlation_decision_instead_of_snapshotting()
+ {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("retire-orphan-defer-correlation").peer_id();
+    let stale_tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    let stale_addr: SocketAddr = "127.0.0.1:43040".parse().unwrap();
+    let stale = make_live_connection_with_correlation(
+        stale_addr,
+        ConnectionDirection::Outbound,
+        stale_tracker.clone(),
+    )
+    .await;
+    stale.set_state(ConnectionState::Disconnected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
+
+    // Displace `stale` from the peer's PRIMARY slot via the CAS-loss race
+    // hook, exactly like `cleanup_stale_connections_retires_the_stale_instance_...`
+    // above, so `disconnect_connection_instance` declines and
+    // `retire_orphaned_stale_instance` runs as the fallback. `fresh` is
+    // published directly (bypassing `add_connection_by_peer_id`'s
+    // auto-sharing of the peer's tracker) with its OWN, DIFFERENT tracker --
+    // in the OLD snapshot-based code this makes `shares_correlation_tracker`
+    // false, so it would have called the immediate, unconditional
+    // `abort_tasks()` and cancelled `stale`'s own tracker synchronously.
+    let fresh_addr: SocketAddr = "127.0.0.1:43041".parse().unwrap();
+    let fresh_tracker = CorrelationTracker::new();
+    let fresh =
+        make_live_connection_with_correlation(fresh_addr, ConnectionDirection::Outbound, fresh_tracker)
+            .await;
+    {
+        let hook_pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let fresh = fresh.clone();
+        pool.set_cleanup_stale_race_hook(move || {
+            hook_pool.publish_current_peer_connection(&peer_id, fresh.clone());
+        });
+    }
+
+    let guard = stale_tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        stale_tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    pool.cleanup_stale_connections();
+
+    assert_eq!(
+        stale_tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "retire_orphaned_stale_instance must defer the correlation-cancellation decision to \
+         the IO task's own ExitGuard rather than deciding from a synchronous snapshot -- the \
+         slot must not be cancelled immediately"
+    );
+
+    let stale_stream = stale
+        .stream_handle
+        .as_ref()
+        .expect("a live connection must have a stream handle");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stale_stream.wait_for_exit())
+            .await
+            .is_ok(),
+        "teardown must still proceed (exit_flag set) even though the correlation decision is \
+         deferred"
+    );
+
+    guard.disarm();
+}
+
+/// Sibling of the CAS-loss address-reuse test above, but for the
+/// address-METADATA cleanup inside `retire_orphaned_stale_instance` itself,
+/// not the `connections_by_addr` entry: even after that entry is correctly
+/// retired, `addr_to_peer_id`/capabilities for the same address are cleared
+/// as a SEPARATE step. A fresh, entirely unrelated connection can publish at
+/// that exact address in the gap between the two -- clearing
+/// `addr_to_peer_id` unconditionally would then delete the FRESH
+/// connection's own peer_id mapping, not the stale one's.
+#[tokio::test]
+async fn retire_orphaned_stale_instance_does_not_clear_a_freshly_reused_address_alias() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let stale_peer_id = crate::KeyPair::new_for_testing("retire-orphan-metadata-stale").peer_id();
+    let unrelated_peer_id =
+        crate::KeyPair::new_for_testing("retire-orphan-metadata-unrelated").peer_id();
+
+    let stale_addr: SocketAddr = "127.0.0.1:43050".parse().unwrap();
+    let fresh_a_addr: SocketAddr = "127.0.0.1:43051".parse().unwrap();
+
+    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    stale.set_state(ConnectionState::Disconnected);
+    assert!(pool.add_connection_by_peer_id(stale_peer_id.clone(), stale_addr, stale.clone()));
+
+    // CAS-loss trigger: a fresh reconnect for the SAME peer at a DIFFERENT
+    // address becomes current before the teardown loop reaches `stale`.
+    let fresh_a = make_live_connection(fresh_a_addr, ConnectionDirection::Outbound).await;
+    {
+        let hook_pool = pool.clone();
+        let peer_id = stale_peer_id.clone();
+        let fresh_a = fresh_a.clone();
+        pool.set_cleanup_stale_race_hook(move || {
+            hook_pool.publish_current_peer_connection(&peer_id, fresh_a.clone());
+        });
+    }
+
+    // The fresh, UNRELATED connection that lands at `stale_addr` in the gap
+    // between `retire_orphaned_stale_instance`'s own `connections_by_addr`
+    // removal for that address and its `addr_to_peer_id`/capability cleanup
+    // for the same address.
+    let unrelated_fresh = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    {
+        let hook_pool = pool.clone();
+        let peer_id = unrelated_peer_id.clone();
+        let unrelated_fresh = unrelated_fresh.clone();
+        pool.set_retire_orphan_metadata_race_hook(move || {
+            assert!(
+                hook_pool.add_connection_by_peer_id(
+                    peer_id.clone(),
+                    stale_addr,
+                    unrelated_fresh.clone()
+                ),
+                "test precondition: the unrelated fresh connection must publish at `stale_addr`"
+            );
+        });
+    }
+
+    pool.cleanup_stale_connections();
+
+    assert!(
+        pool.addr_to_peer_id
+            .read_sync(&stale_addr, |_, v| *v == unrelated_peer_id)
+            .unwrap_or(false),
+        "the unrelated fresh connection's own addr_to_peer_id mapping at the reused address \
+         must survive retire_orphaned_stale_instance's metadata cleanup for the stale instance \
+         that used to occupy it"
+    );
+    assert!(
+        pool.connections_by_addr
+            .read_sync(&stale_addr, |_, v| Arc::ptr_eq(v, &unrelated_fresh))
+            .unwrap_or(false),
+        "the unrelated fresh connection must still be indexed at the reused address"
+    );
+}
+
 /// RED (review finding P2, `remote_actor_ref.rs` ask-timeout/cancellation
 /// eviction depends on a stale `addr_to_peer_id` alias):
 /// `recover_connection_after_actor_ask_timeout` and

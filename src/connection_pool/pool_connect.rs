@@ -306,6 +306,8 @@ impl<T> ConnectionPool<T> {
             connection_counter: AtomicIsize::new(0),
             #[cfg(test)]
             cleanup_stale_race_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            retire_orphan_metadata_race_hook: std::sync::Mutex::new(None),
             _marker: PhantomData,
         };
 
@@ -4254,6 +4256,26 @@ impl<T> ConnectionPool<T> {
         }
     }
 
+    #[cfg(test)]
+    fn set_retire_orphan_metadata_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .retire_orphan_metadata_race_hook
+            .lock()
+            .expect("retire-orphan metadata race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn fire_retire_orphan_metadata_race_hook(&self) {
+        let hook = self
+            .retire_orphan_metadata_race_hook
+            .lock()
+            .expect("retire-orphan metadata race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Clean up stale connections.
     ///
     /// Captures the exact `Arc` each stale peer's session pointed at when
@@ -4308,7 +4330,7 @@ impl<T> ConnectionPool<T> {
             // instead sweeps every `connections_by_addr` alias by `conn`'s
             // own `Arc` identity across the whole map, never gating on a
             // lookup at one specific address first.
-            self.retire_orphaned_stale_instance(&peer_id, &conn);
+            self.retire_orphaned_stale_instance(&conn);
             debug!(
                 peer_id = %peer_id,
                 addr = %conn.addr,
@@ -4324,12 +4346,10 @@ impl<T> ConnectionPool<T> {
     /// `addr` still indexes it in `connections_by_addr` -- a fresh
     /// reconnect that superseded it may have already reused that exact
     /// address. Sweeps every alias of `conn` by `Arc` identity across the
-    /// whole map instead.
-    fn retire_orphaned_stale_instance(
-        &self,
-        peer_id: &crate::PeerId,
-        conn: &Arc<LockFreeConnection>,
-    ) {
+    /// whole map instead. Takes no `peer_id`: the correlation-cancel
+    /// decision is unconditionally deferred (see below), so nothing here
+    /// needs to resolve the peer's current connection at all.
+    fn retire_orphaned_stale_instance(&self, conn: &Arc<LockFreeConnection>) {
         let mut alias_addrs: Vec<SocketAddr> = Vec::new();
         self.connections_by_addr.iter_sync(|addr, v| {
             if Arc::ptr_eq(v, conn) {
@@ -4343,34 +4363,41 @@ impl<T> ConnectionPool<T> {
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, conn))
                 .is_some();
             if removed {
-                let _ = self.addr_to_peer_id.remove_sync(&addr);
-                self.clear_capabilities_for_addr(&addr);
+                #[cfg(test)]
+                self.fire_retire_orphan_metadata_race_hook();
+                // A fresh, entirely unrelated connection can publish at
+                // `addr` in the gap between the `connections_by_addr`
+                // removal just above and this cleanup -- both
+                // `addr_to_peer_id` and per-address capabilities are keyed
+                // on the address alone, not on `conn`'s own identity, so
+                // clearing either unconditionally here would delete that
+                // fresh publisher's own mapping/capabilities, not `conn`'s.
+                // Re-checking immediately before each removal that nothing
+                // has since re-claimed `addr` in `connections_by_addr`
+                // keeps a late publisher's metadata untouched.
+                let _ = self
+                    .addr_to_peer_id
+                    .remove_if_sync(&addr, |_| !self.connections_by_addr.contains_sync(&addr));
+                if !self.connections_by_addr.contains_sync(&addr) {
+                    self.clear_capabilities_for_addr(&addr);
+                }
             }
         }
 
         // `conn` is, by the caller's contract, already superseded and
-        // unreachable via `peer_sessions`. If it still shares its
-        // SESSION-level correlation tracker with whatever the peer's
-        // ACTUAL current connection now is (both resolve through
-        // `get_or_create_correlation_tracker(peer_id)`), aborting `conn`'s
-        // tasks unconditionally would cancel that live survivor's in-flight
-        // asks too -- see `disconnect_connection_instance`'s identical
-        // concern, including its `!Arc::ptr_eq` guard against the snapshot
-        // finding `conn` itself.
-        let keep_correlation =
-            self.peer_current_connection_snapshot(peer_id)
-                .is_some_and(|current| {
-                    !Arc::ptr_eq(&current, conn)
-                        && current.has_live_stream()
-                        && conn.shares_correlation_tracker(&current)
-                });
-
+        // unreachable via `peer_sessions`. No point-in-time snapshot taken
+        // before this call is safe to act on for the correlation-cancel
+        // decision either: there is always some gap between such a
+        // snapshot and this call actually running, in which a fresh
+        // connection sharing `conn`'s SESSION-level correlation tracker
+        // (both resolve through `get_or_create_correlation_tracker(peer_id)`)
+        // could be published. Defer to the IO task's own `ExitGuard`
+        // instead, which re-infers this from FRESH pool state at the actual
+        // moment the task exits -- see
+        // `LockFreeConnection::abort_tasks_defer_correlation_decision` and
+        // `disconnect_connection_instance`'s identical reasoning.
         self.release_counted_connection(conn);
-        if keep_correlation {
-            conn.abort_tasks_keep_correlation();
-        } else {
-            conn.abort_tasks();
-        }
+        conn.abort_tasks_defer_correlation_decision();
     }
 
     /// Bound restart-churn state without racing a reconnect. `remove_if_sync`
@@ -4833,6 +4860,15 @@ pub(crate) fn handle_incoming_message(
                         delta,
                         Some(_peer_addr),
                         captured_epoch.map(|generation| (sender_socket_addr, generation)),
+                        // The identity bound to THIS transport by the
+                        // authenticated handshake, independent of whatever
+                        // `delta.sender_peer_id` claims -- gates the
+                        // TTL-liveness refresh on an unchanged
+                        // reannouncement to owner-issued deltas only (see
+                        // `apply_delta_from`'s doc). Everything else in
+                        // this arm keeps using the payload's claimed
+                        // `sender_peer_id`, matching prior behavior.
+                        authenticated_peer_id.as_ref(),
                     )
                     .await?;
 
@@ -5357,6 +5393,7 @@ pub(crate) fn handle_incoming_message(
                         delta,
                         Some(_peer_addr),
                         captured_epoch.map(|generation| (sender_socket_addr, generation)),
+                        authenticated_peer_id.as_ref(),
                     )
                     .await
                 {

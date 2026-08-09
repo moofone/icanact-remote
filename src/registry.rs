@@ -2417,10 +2417,24 @@ impl<T> Clone for GossipRegistry<T> {
 /// One tracked discovery dial task and the candidates it was spawned to
 /// dial. Kept together so a displaced task's candidates can be recovered
 /// when it is aborted — see [`DiscoveryTaskTracker::set`].
+///
+/// Each candidate is paired with the `Pending` `claim_generation` it
+/// carried at the moment THIS task claimed it
+/// (`PeerState::pending_claim_generation`), not just its address. Nothing
+/// updates this tracker when a task finishes naturally -- only the next
+/// `set()` call ever displaces it, which can be arbitrarily later. By then,
+/// a candidate this task once dialed may have already resolved
+/// (Connected/Failed) and been legitimately re-selected and re-marked
+/// `Pending` again by a completely different, newer task. The paired
+/// generation is this task's "generation" proof: a fresh `Pending` marking
+/// always carries a new, strictly increasing generation, so comparing it
+/// lets the displaced cleanup tell "still this task's stale claim" apart
+/// from "a newer task's live reservation" -- see
+/// `PeerDiscovery::clear_pending_if_generation`.
 #[derive(Debug)]
 struct TrackedDiscoveryTask {
     abort: AbortHandle,
-    candidates: Vec<SocketAddr>,
+    candidates: Vec<(SocketAddr, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -2433,11 +2447,18 @@ impl DiscoveryTaskTracker {
     /// tracked. `abort()` kills the old task immediately — nothing inside a
     /// killed task runs to release the `Pending` discovery state it left
     /// behind for candidates it had not yet finished dialing — so this
-    /// returns the displaced task's full candidate list for the caller to
-    /// run back through `PeerDiscovery::clear_pending`. Candidates the old
-    /// task had already resolved (Connected/Failed) are harmless no-ops
-    /// there; only ones still stuck in `Pending` are actually cleared.
-    pub fn set(&self, handle: AbortHandle, candidates: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    /// returns the displaced task's full `(candidate, captured_generation)`
+    /// list for the caller to run back through
+    /// `PeerDiscovery::clear_pending_if_generation`. Candidates the old
+    /// task had already resolved (Connected/Failed), or that a newer task
+    /// has since re-claimed with a fresh generation, are harmless no-ops
+    /// there; only ones still stuck `Pending` with exactly the captured
+    /// generation are actually cleared.
+    pub fn set(
+        &self,
+        handle: AbortHandle,
+        candidates: Vec<(SocketAddr, u64)>,
+    ) -> Vec<(SocketAddr, u64)> {
         let displaced = self.task.swap(Some(Arc::new(TrackedDiscoveryTask {
             abort: handle,
             candidates,
@@ -6177,7 +6198,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// Duplicate deltas whose contents were all suppressed return an empty
     /// list, making delta application observably idempotent.
     pub async fn apply_delta(&self, delta: RegistryDelta) -> Result<Vec<String>> {
-        self.apply_delta_from(delta, None, None).await
+        self.apply_delta_from(delta, None, None, None).await
     }
 
     /// Apply a delta, resolving advertised addresses against the
@@ -6200,14 +6221,33 @@ impl<T: 'static> GossipRegistry<T> {
     /// `None` skips the recheck (no session context to validate against,
     /// e.g. local/test callers), matching the un-gated behavior deltas had
     /// before session scoping existed.
+    ///
+    /// `authenticated_sender_peer_id`, when `Some`, is the identity bound to
+    /// the delivering transport by the authenticated handshake (mirrors
+    /// `handle_incoming_message`'s `authenticated_peer_id` and the check
+    /// `FullSync` already applies before ever reaching `merge_full_sync_from`).
+    /// `delta.sender_peer_id` is wire-controlled payload content, not proof
+    /// of who actually sent it -- any relay can forward a cached delta while
+    /// leaving its `sender_peer_id` field naming the original owner. This
+    /// value is ONLY consulted to gate `refresh_wall_clock_on_unchanged_reannouncement`
+    /// (a live-confirmation signal that must come from the owner itself, not
+    /// from an echo); every other use of `sender_peer_id` in this function
+    /// is unaffected and keeps using the payload field, matching prior
+    /// behavior. `None` (e.g. `apply_delta`'s local/test convenience
+    /// wrapper, or the dead `handle_gossip_response` reply path -- see its
+    /// call site) simply means unchanged reannouncements through that call
+    /// never refresh liveness, which is a strict subset of pre-existing
+    /// behavior, not a regression.
     pub async fn apply_delta_from(
         &self,
         delta: RegistryDelta,
         verified_sender_addr: Option<SocketAddr>,
         session_guard: Option<(SocketAddr, u64)>,
+        authenticated_sender_peer_id: Option<&PeerId>,
     ) -> Result<Vec<String>> {
         let total_changes = delta.changes.len();
         let sender_peer_id = delta.sender_peer_id.clone();
+        let sender_is_authenticated = authenticated_sender_peer_id == Some(&sender_peer_id);
 
         // Pre-compute priority flags to avoid redundant checks
         let has_immediate = delta.changes.iter().any(|change| match change {
@@ -6328,11 +6368,13 @@ impl<T: 'static> GossipRegistry<T> {
                             &location,
                             &sender_peer_id,
                         ) else {
-                            self.refresh_wall_clock_on_unchanged_reannouncement(
-                                name.as_str(),
-                                &location,
-                                &sender_peer_id,
-                            );
+                            if sender_is_authenticated {
+                                self.refresh_wall_clock_on_unchanged_reannouncement(
+                                    name.as_str(),
+                                    &location,
+                                    &sender_peer_id,
+                                );
+                            }
                             continue;
                         };
                         let transfers_admission =
@@ -7757,10 +7799,14 @@ impl<T: 'static> GossipRegistry<T> {
 
                 // `addr` is the verified socket address this response
                 // arrived from — the §1.6 trust anchor for address repair.
-                // No session_guard: this call path is unreachable for real
-                // wire traffic (see the doc comment on the FullSyncResponse
-                // arm below for the full trace).
-                self.apply_delta_from(delta, Some(addr), None).await?;
+                // No session_guard, no authenticated sender identity: this
+                // call path is unreachable for real wire traffic (see the
+                // doc comment on the FullSyncResponse arm below for the
+                // full trace). Passing `None` here rather than trusting
+                // `delta.sender_peer_id` costs nothing reachable and avoids
+                // ever treating unauthenticated payload content as proof of
+                // identity if this path is ever wired to a genuine reply.
+                self.apply_delta_from(delta, Some(addr), None, None).await?;
                 // Don't add peer here - peers are managed through handle_connection
 
                 let now = crate::current_timestamp_millis();
@@ -10778,21 +10824,50 @@ impl<T: 'static> GossipRegistry<T> {
     /// still-running task strands any of its candidates it had not yet
     /// finished dialing in `Pending` forever -- nothing inside a killed task
     /// runs to release them -- so this clears them back out via
-    /// `PeerDiscovery::clear_pending` itself. Candidates the old task had
-    /// already resolved are harmless no-ops there.
+    /// `PeerDiscovery::clear_pending_if_generation` itself. Candidates the
+    /// old task had already resolved are harmless no-ops there.
+    ///
+    /// Stamps each of THIS task's candidates with its current `Pending`
+    /// `claim_generation` before handing them to `discovery_task.set` -- the
+    /// generation proof `clear_pending_if_generation` needs when this task
+    /// is itself displaced later. Reading that generation and clearing the
+    /// PREVIOUS task's displaced candidates both happen under this same
+    /// `gossip_state` lock acquisition, so there is no gap for a
+    /// concurrent re-claim to land in between.
     pub(crate) async fn track_discovery_task(
         &self,
         handle: tokio::task::AbortHandle,
         candidates: Vec<SocketAddr>,
     ) {
-        let displaced = self.discovery_task.set(handle, candidates);
+        let mut gossip_state = self.gossip_state.lock().await;
+        let stamped_candidates: Vec<(SocketAddr, u64)> = candidates
+            .into_iter()
+            .map(|addr| {
+                // `unwrap_or(0)` when the candidate is not (or no longer)
+                // Pending at all: `clear_pending_if_generation` only ever
+                // acts on a currently-Pending row, and real generations
+                // start at 1 (`PeerDiscovery::next_claim_generation` is
+                // pre-incremented before its first use), so 0 can never
+                // collide with one -- this just means "never clear" for
+                // that entry, correct, since there was nothing of THIS
+                // task's to strand in the first place.
+                let claim_generation = gossip_state
+                    .peer_discovery
+                    .as_ref()
+                    .and_then(|discovery| discovery.get_peer_state(&addr))
+                    .and_then(crate::peer_discovery::PeerState::pending_claim_generation)
+                    .unwrap_or(0);
+                (addr, claim_generation)
+            })
+            .collect();
+
+        let displaced = self.discovery_task.set(handle, stamped_candidates);
         if displaced.is_empty() {
             return;
         }
-        let mut gossip_state = self.gossip_state.lock().await;
         if let Some(discovery) = gossip_state.peer_discovery.as_mut() {
-            for addr in &displaced {
-                discovery.clear_pending(addr);
+            for (addr, claim_generation) in &displaced {
+                discovery.clear_pending_if_generation(addr, *claim_generation);
             }
         }
     }
@@ -12563,6 +12638,7 @@ mod tests {
             },
             None,
             None,
+            Some(&owner),
         )
         .await
         .unwrap();
@@ -12583,12 +12659,18 @@ mod tests {
                 since_sequence: 1,
                 current_sequence: 2,
                 changes: vec![change],
-                sender_peer_id: owner,
+                sender_peer_id: owner.clone(),
                 wall_clock_time: current_timestamp(),
                 precise_timing_nanos: 0,
             },
             None,
             None,
+            // The reannouncement arrives on a transport authenticated as
+            // the owner itself -- this is the ONLY case that must refresh
+            // liveness. See `apply_delta_from_forged_sender_field_...`
+            // below for the case where the payload claims the owner but
+            // the transport is not authenticated as it.
+            Some(&owner),
         )
         .await
         .unwrap();
@@ -12639,12 +12721,13 @@ mod tests {
                 since_sequence: 0,
                 current_sequence: 1,
                 changes: vec![change.clone()],
-                sender_peer_id: owner,
+                sender_peer_id: owner.clone(),
                 wall_clock_time: current_timestamp(),
                 precise_timing_nanos: 0,
             },
             None,
             None,
+            Some(&owner),
         )
         .await
         .unwrap();
@@ -12654,20 +12737,26 @@ mod tests {
             .read_sync(actor_name, |_, existing| existing.wall_clock_time)
             .expect("first delta apply must admit the actor");
 
-        // The identical change arrives again, authenticated as sent by
-        // `relay` -- a completely different peer relaying a cached copy of
-        // the owner's own delta, not the owner itself.
+        // The identical change arrives again, both claiming AND
+        // authenticated as sent by `relay` -- a completely different peer
+        // relaying a cached copy of the owner's own delta, not the owner
+        // itself. This exercises the existing-owner check inside
+        // `refresh_wall_clock_on_unchanged_reannouncement` itself, as
+        // opposed to the transport-authentication gate exercised by
+        // `apply_delta_from_forged_sender_field_without_matching_authentication_does_not_refresh_liveness`
+        // below.
         reg.apply_delta_from(
             RegistryDelta {
                 since_sequence: 1,
                 current_sequence: 2,
                 changes: vec![change],
-                sender_peer_id: relay,
+                sender_peer_id: relay.clone(),
                 wall_clock_time: current_timestamp(),
                 precise_timing_nanos: 0,
             },
             None,
             None,
+            Some(&relay),
         )
         .await
         .unwrap();
@@ -12677,6 +12766,89 @@ mod tests {
             effective_wall_clock_time, stored_wall_clock_time,
             "a relayed echo authenticated as sent by a peer OTHER than the actor's own owner \
              must not refresh liveness on the incremental-delta path either"
+        );
+    }
+
+    /// A relay does not need to forward the owner's original bytes to fool a
+    /// naive check -- it can construct its OWN delta whose `sender_peer_id`
+    /// field simply names the owner. If `apply_delta_from` only compared
+    /// that payload field against `known_actors`, this would refresh
+    /// liveness just as effectively as a genuine owner reannouncement,
+    /// letting any peer that ever observed an actor's location keep it
+    /// alive forever by re-sending it under a forged sender field. Only a
+    /// delta whose CLAIMED sender agrees with the delivering transport's
+    /// AUTHENTICATED identity may count as owner-issued.
+    #[tokio::test]
+    async fn apply_delta_from_forged_sender_field_without_matching_authentication_does_not_refresh_liveness()
+     {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7429),
+            test_config_with_seed("wall-clock-refresh-forged-delta"),
+        );
+        let owner = KeyPair::new_for_testing("forged-delta-owner").peer_id();
+        let forger = KeyPair::new_for_testing("forged-delta-forger").peer_id();
+        let actor_name = "wall-clock-refresh-forged-delta/service";
+        let owner_addr = test_addr(9414);
+
+        let mut location = RemoteActorLocation::new_with_peer(owner_addr, owner.clone());
+        location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
+        let change = RegistryChange::ActorAdded {
+            name: actor_name.to_string(),
+            location: location.clone(),
+            priority: RegistrationPriority::Normal,
+        };
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![change.clone()],
+                sender_peer_id: owner.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+        let stored_wall_clock_time = reg
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, existing| existing.wall_clock_time)
+            .expect("first delta apply must admit the actor");
+
+        // The identical change arrives again CLAIMING `sender_peer_id: owner`
+        // -- the payload names the real owner -- but the transport that
+        // actually delivered it is authenticated as `forger`, a different
+        // peer entirely. This is exactly what a relay forwarding a forged
+        // delta (or a malicious peer constructing one) looks like on the
+        // wire: `delta.sender_peer_id == owner` passes a payload-only
+        // check, but `authenticated_sender_peer_id != Some(&owner)` proves
+        // it did not actually come from the owner's own connection.
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 1,
+                current_sequence: 2,
+                changes: vec![change],
+                sender_peer_id: owner,
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+            Some(&forger),
+        )
+        .await
+        .unwrap();
+
+        let effective_wall_clock_time = reg.effective_actor_wall_clock_time(actor_name, &location);
+        assert_eq!(
+            effective_wall_clock_time, stored_wall_clock_time,
+            "a delta whose payload claims the owner but whose delivering transport is \
+             authenticated as a different peer must not refresh liveness -- the claimed \
+             sender field alone is not proof of who actually sent it"
         );
     }
 
@@ -21421,6 +21593,101 @@ mod tests {
         );
     }
 
+    /// `discovery_task` only changes on the next `set()` call -- nothing
+    /// updates it when a tracked task finishes naturally, resolving all its
+    /// own candidates. If one of those candidates later fails, its backoff
+    /// expires, and it is legitimately re-selected and freshly re-marked
+    /// `Pending` by an entirely different, newer task, the tracker is
+    /// STILL holding the original (long-since-finished) task as "current"
+    /// -- so displacing it when the newer task registers returns the
+    /// ORIGINAL task's candidate list, which happens to contain the same
+    /// address the newer task just legitimately claimed. Clearing it
+    /// unconditionally would strand the newer task's reservation as
+    /// untracked, letting a subsequent round redial it and defeating
+    /// pending/`max_peers` accounting for it.
+    #[tokio::test]
+    async fn track_discovery_task_does_not_clear_a_newer_tasks_fresh_pending_claim() {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            max_peers: 8,
+            ..test_config_with_seed("discovery-task-tracker-generation")
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(19_210), config);
+
+        let addr = test_addr(19_211);
+        let peers = vec![PeerInfoGossip {
+            address: addr.to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 0,
+            last_success: 0,
+            dns_name: None,
+        }];
+
+        // Round 1: the candidate is marked Pending and task_A is tracked.
+        let first_round = registry
+            .on_peer_list_gossip(peers.clone(), "127.0.0.1:9997", 1)
+            .await;
+        assert_eq!(first_round, vec![addr]);
+        let first_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(first_task.abort_handle(), vec![addr])
+            .await;
+
+        // Stands in for task_A's own dial loop actually resolving `addr`
+        // (production calls `mark_peer_failed`/`mark_peer_connected` per
+        // candidate) WITHOUT ever calling `track_discovery_task` again --
+        // exactly like the real flow, where nothing re-registers the
+        // tracker just because a task's dials finished. Forced straight to
+        // an already-expired backoff window so round 2 doesn't need to
+        // wait on real time.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peer_discovery.as_mut().unwrap().restore_peer_state(
+                addr,
+                Some(crate::peer_discovery::PeerState::Failed {
+                    since: 0,
+                    attempts: 1,
+                    retry_delay_seconds: 0,
+                }),
+            );
+        }
+
+        // Round 2: the SAME address is legitimately re-selected (Failed,
+        // backoff expired) and freshly re-marked Pending under a NEW
+        // `since` -- a completely different, newer task's own claim. The
+        // tracker still references task_A (nothing has displaced it since
+        // round 1), even though task_A's own dial of `addr` already
+        // resolved above.
+        let second_round = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9997", 2)
+            .await;
+        assert_eq!(
+            second_round,
+            vec![addr],
+            "test precondition: the address must be re-selected in round 2"
+        );
+        let second_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(second_task.abort_handle(), vec![addr])
+            .await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state
+                .peer_discovery
+                .as_ref()
+                .unwrap()
+                .get_peer_state(&addr)
+                .is_some_and(crate::peer_discovery::PeerState::is_pending),
+            "round 2's fresh Pending claim must survive track_discovery_task displacing \
+             the stale first task -- the first task's own long-since-resolved candidate \
+             list must not be used to clear a NEWER task's legitimate reservation"
+        );
+    }
+
     #[tokio::test]
     async fn test_refresh_peer_dns_rejects_unsafe_resolution_results() {
         // Use a non-loopback current address so it won't match localhost results.
@@ -21929,16 +22196,25 @@ mod tests {
                 location: loc,
                 priority: RegistrationPriority::Normal,
             }],
-            sender_peer_id: peer,
+            sender_peer_id: peer.clone(),
             wall_clock_time: 0,
             precise_timing_nanos: 0,
         };
 
-        reg.apply_delta(delta.clone()).await.unwrap();
+        // Authenticated as `peer` itself on both deliveries -- a genuinely
+        // duplicate delivery from the actor's own owner, the only case
+        // `refresh_wall_clock_on_unchanged_reannouncement` may treat as
+        // live confirmation (see `apply_delta_from`'s doc on
+        // `authenticated_sender_peer_id`).
+        reg.apply_delta_from(delta.clone(), None, None, Some(&peer))
+            .await
+            .unwrap();
         let after_first = read_known_actor(&reg, actor).expect("actor should exist");
 
         let before_reannounce = current_timestamp();
-        reg.apply_delta(delta).await.unwrap();
+        reg.apply_delta_from(delta, None, None, Some(&peer))
+            .await
+            .unwrap();
         let after_second = read_known_actor(&reg, actor).expect("actor should exist");
 
         // `known_actors` itself is genuinely idempotent: a duplicate
