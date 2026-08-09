@@ -1834,26 +1834,39 @@ pub struct ActorState {
     pub local_actors: SccHashMap<String, RemoteActorLocation>,
     pub known_actors: SccHashMap<String, RemoteActorLocation>,
     pub removed_actors: SccHashMap<String, RemovedActorTombstone>,
-    /// Local receive time of the most recent unchanged re-advertisement
-    /// from a known actor's OWN owner, confirming it is still reachable and
-    /// gossiping -- kept entirely separate from `known_actors`' own
-    /// `RemoteActorLocation::wall_clock_time`, which doubles as the LWW
-    /// tie-breaker `stable_concurrent_location_wins` uses to resolve
-    /// concurrent claims from DIFFERENT peers. Mutating that shared value
-    /// on a re-advertisement that did not itself win admission -- even
-    /// from the same owner -- would let an unrelated, later delivery-order
-    /// accident decide which of two genuinely concurrent peers' claims
-    /// wins, since a freshly "refreshed" stored entry would always look
-    /// newer than a rival's untouched one regardless of which was actually
-    /// created first. This side table is read only by
-    /// `cleanup_stale_actors`/`lookup_actor`'s TTL freshness checks, never
-    /// fed back into conflict resolution. Entries are garbage-collected by
-    /// `cleanup_stale_actors` for any name no longer present in
-    /// `known_actors`, regardless of which removal path retired it; until
-    /// then a stale entry is harmless (its value is only ever taken as a
-    /// floor via `max`, so it can make an actor look no less fresh than
-    /// its own `wall_clock_time`, never falsely stale).
-    reannouncement_liveness: SccHashMap<String, u64>,
+    /// Owner and local receive time of the most recent unchanged
+    /// re-advertisement from a known actor's OWN owner, confirming it is
+    /// still reachable and gossiping -- kept entirely separate from
+    /// `known_actors`' own `RemoteActorLocation::wall_clock_time`, which
+    /// doubles as the LWW tie-breaker `stable_concurrent_location_wins`
+    /// uses to resolve concurrent claims from DIFFERENT peers. Mutating
+    /// that shared value on a re-advertisement that did not itself win
+    /// admission -- even from the same owner -- would let an unrelated,
+    /// later delivery-order accident decide which of two genuinely
+    /// concurrent peers' claims wins, since a freshly "refreshed" stored
+    /// entry would always look newer than a rival's untouched one
+    /// regardless of which was actually created first. This side table is
+    /// read only by `cleanup_stale_actors`/`lookup_actor`'s TTL freshness
+    /// checks, never fed back into conflict resolution.
+    ///
+    /// The recorded owner matters: `known_actors` is keyed only by actor
+    /// NAME, and a genuine ownership transfer (owner B's location replacing
+    /// owner A's under the same name, via the normal higher-vector-clock
+    /// apply path) upserts in place without clearing this row. A row
+    /// consulted without checking whose liveness it actually recorded would
+    /// let A's last-known-reachable timestamp keep B's now-current, possibly
+    /// long-dead location looking fresh. `effective_actor_wall_clock_time`
+    /// only honours a row whose owner still matches the current entry.
+    ///
+    /// Entries are garbage-collected by `cleanup_stale_actors` for any name
+    /// no longer present in `known_actors`, or whose recorded owner no
+    /// longer matches the current entry there, regardless of which path
+    /// caused either; until then a stale-but-still-matching-owner entry is
+    /// harmless (its value is only ever taken as a floor via `max`, so it
+    /// can make an actor look no less fresh than its own `wall_clock_time`,
+    /// never falsely stale), and an owner-mismatched one is simply ignored
+    /// on read rather than acted on.
+    reannouncement_liveness: SccHashMap<String, (crate::PeerId, u64)>,
     /// Test hook. Fired inside [`GossipRegistry::cleanup_stale_actors`] after
     /// it snapshots which actors look stale but before the removal loop
     /// re-validates and removes them, so a test can land a concurrent
@@ -6835,12 +6848,16 @@ impl<T: 'static> GossipRegistry<T> {
             .unwrap_or(false);
         if is_owner_issued_tie {
             let now = current_timestamp();
+            let owner = location.peer_id.clone();
             let _ = self
                 .actor_state
                 .reannouncement_liveness
                 .entry_sync(name.to_string())
-                .and_modify(|liveness| *liveness = (*liveness).max(now))
-                .or_insert(now);
+                .and_modify(|(recorded_owner, liveness)| {
+                    *recorded_owner = owner.clone();
+                    *liveness = (*liveness).max(now);
+                })
+                .or_insert((owner, now));
         }
     }
 
@@ -8526,11 +8543,21 @@ impl<T: 'static> GossipRegistry<T> {
     /// newer. See `ActorState::reannouncement_liveness`'s doc for why that
     /// confirmation is tracked separately instead of mutating
     /// `wall_clock_time` in place.
+    ///
+    /// The recorded row is honoured only when its owner still matches
+    /// `location.peer_id`: `known_actors` upserts a genuine ownership
+    /// transfer in place without clearing this row, so an unscoped read
+    /// would apply the PREVIOUS owner's liveness to the CURRENT owner's
+    /// entry -- keeping a new, possibly already-dead owner's location
+    /// looking fresh on the strength of evidence that was never about it.
     fn effective_actor_wall_clock_time(&self, name: &str, location: &RemoteActorLocation) -> u64 {
         let liveness = self
             .actor_state
             .reannouncement_liveness
-            .read_sync(name, |_, recorded| *recorded)
+            .read_sync(name, |_, (owner, recorded)| {
+                (*owner == location.peer_id).then_some(*recorded)
+            })
+            .flatten()
             .unwrap_or(0);
         location.wall_clock_time.max(liveness)
     }
@@ -8590,17 +8617,26 @@ impl<T: 'static> GossipRegistry<T> {
         // leaves `known_actors` through ANY path other than the removal
         // loop just above -- explicit unregister, omission pruning in
         // `merge_full_sync_from_guarded`, peer death, or an `ActorRemoved`
-        // delta. Rather than one removal call site remembering to clear
-        // this row and every other one risking forgetting to, sweep every
-        // row whose name is no longer present in `known_actors` at all,
-        // regardless of which path (or none yet) actually removed it.
-        // Bounded by the same pass that already walks `known_actors`, so
-        // this never runs more often than the TTL sweep above.
+        // delta -- or superseded IN PLACE by a genuine ownership transfer
+        // under the same name, which upserts `known_actors` without
+        // clearing this row (`effective_actor_wall_clock_time` ignores an
+        // owner-mismatched row on read, but nothing stops it lingering
+        // here indefinitely otherwise). Rather than one removal/transfer
+        // call site remembering to clear this row and every other one
+        // risking forgetting to, sweep every row that is either absent
+        // from `known_actors` entirely or recorded for a different owner
+        // than the one currently there. Bounded by the same pass that
+        // already walks `known_actors`, so this never runs more often
+        // than the TTL sweep above.
         let mut orphaned_liveness = Vec::new();
         self.actor_state
             .reannouncement_liveness
-            .iter_sync(|name, _| {
-                if !self.actor_state.known_actors.contains_sync(name.as_str()) {
+            .iter_sync(|name, (recorded_owner, _)| {
+                let current_owner = self
+                    .actor_state
+                    .known_actors
+                    .read_sync(name.as_str(), |_, location| location.peer_id.clone());
+                if current_owner.as_ref() != Some(recorded_owner) {
                     orphaned_liveness.push(name.clone());
                 }
                 true
@@ -12228,6 +12264,50 @@ mod tests {
             stored.address,
             SocketAddr::new(verified_addr.ip(), 9400).to_string(),
             "repair must use the verified TCP source IP, not the self-declared bind"
+        );
+    }
+
+    /// `known_actors` is keyed only by actor NAME. A genuine ownership
+    /// transfer -- owner B's location replacing owner A's under the same
+    /// name, via the normal higher-vector-clock apply path -- upserts in
+    /// place without clearing A's `reannouncement_liveness` row. Reading
+    /// that row unscoped would let A's last-known-reachable timestamp keep
+    /// B's now-current entry looking fresh on the strength of evidence that
+    /// was never about B, even if B's own `wall_clock_time` is long past
+    /// `actor_ttl`.
+    #[test]
+    fn effective_actor_wall_clock_time_ignores_a_liveness_row_recorded_for_a_different_owner() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(11_190),
+            test_config_with_seed("owner-scope-registry"),
+        );
+        let actor_name = "owner-scope/service";
+        // Deliberately short, unrelated seeds:
+        // `KeyPair::new_for_testing` truncates/pads a seed to exactly 32
+        // bytes without hashing it, so seeds sharing a long common prefix
+        // (e.g. both starting with the same 32+ byte description before
+        // diverging) collide on the SAME key pair.
+        let displaced_owner = test_peer_id("owner-scope-old");
+        let current_owner = test_peer_id("owner-scope-new");
+
+        let mut current_location =
+            RemoteActorLocation::new_with_peer(test_addr(11_191), current_owner);
+        // Long past any reasonable TTL on its own.
+        current_location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
+
+        // The row A's own reannouncement left behind, recorded under the
+        // same NAME but a DIFFERENT owner -- and deliberately recent, so an
+        // unscoped read would wrongly keep B's entry looking alive.
+        let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
+            actor_name.to_string(),
+            (displaced_owner, current_timestamp()),
+        );
+
+        let effective = registry.effective_actor_wall_clock_time(actor_name, &current_location);
+        assert_eq!(
+            effective, current_location.wall_clock_time,
+            "a liveness row recorded for a DIFFERENT owner than the current entry must be \
+             ignored entirely, not taken as a freshness floor for an owner it was never about"
         );
     }
 
@@ -19143,11 +19223,12 @@ mod tests {
             test_config_with_seed("liveness-sweep-orphan"),
         );
         let orphaned_actor = "liveness-sweep-orphan/service";
+        let stale_owner = test_peer_id("liveness-sweep-orphan-owner");
 
-        let _ = registry
-            .actor_state
-            .reannouncement_liveness
-            .upsert_sync(orphaned_actor.to_string(), current_timestamp());
+        let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
+            orphaned_actor.to_string(),
+            (stale_owner, current_timestamp()),
+        );
         assert!(
             !registry
                 .actor_state
@@ -19167,6 +19248,48 @@ mod tests {
              which removal path (or none at all, as here) actually removed the actor -- \
              otherwise the side table grows unboundedly across every actor a peer ever \
              mentioned, never bounded the way known_actors itself is"
+        );
+    }
+
+    /// The other half of the same GC gap: an actor NAME can stay present in
+    /// `known_actors` while a genuine ownership transfer replaces WHICH
+    /// owner it points to (the normal higher-vector-clock apply path
+    /// upserts in place, it does not clear this row). A liveness row
+    /// recorded for the DISPLACED owner must not linger scoped only to the
+    /// name -- otherwise it would keep the new owner's entry looking fresh
+    /// on the strength of evidence that was never about it, right up until
+    /// this sweep next runs.
+    #[tokio::test]
+    async fn cleanup_stale_actors_sweeps_liveness_rows_recorded_for_a_displaced_owner() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_502),
+            test_config_with_seed("liveness-sweep-displaced"),
+        );
+        let actor_name = "liveness-sweep-displaced/service";
+        let displaced_owner = test_peer_id("liveness-sweep-displaced-old-owner");
+        let current_owner = test_peer_id("liveness-sweep-displaced-new-owner");
+
+        let current_location = RemoteActorLocation::new_with_peer(test_addr(20_503), current_owner);
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), current_location.clone());
+        let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
+            actor_name.to_string(),
+            (displaced_owner, current_timestamp()),
+        );
+
+        registry.cleanup_stale_actors().await;
+
+        assert!(
+            !registry
+                .actor_state
+                .reannouncement_liveness
+                .contains_sync(actor_name),
+            "a liveness row recorded for an owner no longer current for this actor name must \
+             be swept, not left to linger scoped only to the name -- effective_actor_wall_clock_time \
+             already ignores it on read, but leaving it in place indefinitely defeats the point \
+             of a bounded side table"
         );
     }
 
@@ -21630,20 +21753,33 @@ mod tests {
 
         reg.apply_delta(delta.clone()).await.unwrap();
         let after_first = read_known_actor(&reg, actor).expect("actor should exist");
-        reg.apply_delta(delta).await.unwrap();
-        let mut after_second = read_known_actor(&reg, actor).expect("actor should exist");
 
-        // A duplicate delivery from the actor's own owner is live
-        // confirmation it is still reachable and gossiping, so
-        // `wall_clock_time` is expected to advance rather than stay frozen
-        // at first admission (see `refresh_wall_clock_on_unchanged_reannouncement`).
-        // Idempotent otherwise: normalize it before the full comparison.
-        assert!(
-            after_second.wall_clock_time >= after_first.wall_clock_time,
-            "duplicate delivery must refresh wall_clock_time, not leave it frozen"
-        );
-        after_second.wall_clock_time = after_first.wall_clock_time;
+        let before_reannounce = current_timestamp();
+        reg.apply_delta(delta).await.unwrap();
+        let after_second = read_known_actor(&reg, actor).expect("actor should exist");
+
+        // `known_actors` itself is genuinely idempotent: a duplicate
+        // delivery from the actor's own owner never mutates the stored
+        // entry, including `wall_clock_time` (see
+        // `refresh_wall_clock_on_unchanged_reannouncement`'s doc for why --
+        // it doubles as the LWW tie-breaker for concurrent claims from
+        // OTHER peers and must never depend on delivery-order accidents).
         assert_eq!(after_first, after_second);
+
+        // The live confirmation itself DOES register, just in the separate
+        // `reannouncement_liveness` side table `effective_actor_wall_clock_time`
+        // reads alongside `wall_clock_time` -- covered directly by
+        // `apply_delta_from_refreshes_wall_clock_on_unchanged_reannouncement`.
+        // Re-asserted here too since this test's own `loc.wall_clock_time`
+        // (123, fixed by construction) would otherwise make that gap easy
+        // to reintroduce unnoticed.
+        let effective_wall_clock_time = reg.effective_actor_wall_clock_time(actor, &after_second);
+        assert!(
+            effective_wall_clock_time >= before_reannounce,
+            "duplicate delivery must still refresh the actor's EFFECTIVE freshness via the \
+             liveness side table, even though `known_actors` itself stays untouched (got \
+             {effective_wall_clock_time}, wanted >= {before_reannounce})"
+        );
     }
 
     #[tokio::test]

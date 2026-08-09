@@ -12093,6 +12093,74 @@ async fn cleanup_stale_connections_retires_the_stale_instance_when_its_own_cas_i
     );
 }
 
+/// The address-keyed sibling of the CAS-loss leak above: a fresh reconnect
+/// commonly reuses the SAME address `stale` was indexed under (a plain
+/// outbound redial, or an inbound accept from the same peer landing on the
+/// same advertised address). By the time `cleanup_stale_connections`'s
+/// teardown loop reaches `stale`, `connections_by_addr[stale_addr]` already
+/// holds the FRESH instance, not `stale`. A retirement path keyed on
+/// looking `stale` up again by its own address (`remove_connection_instance_by_id(addr, id)`)
+/// would find the fresh instance there instead, fail to match by instance
+/// id, and give up -- leaking `stale`'s counted capacity and background
+/// tasks exactly as before, just via a narrower trigger (same-address reuse
+/// specifically, rather than any supersession at all).
+#[tokio::test]
+async fn cleanup_stale_connections_retires_the_stale_instance_even_when_its_address_is_reused() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("cleanup-stale-addr-reuse-peer").peer_id();
+
+    let shared_addr: SocketAddr = "127.0.0.1:43020".parse().unwrap();
+    let stale = make_live_connection(shared_addr, ConnectionDirection::Outbound).await;
+    stale.set_state(ConnectionState::Disconnected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), shared_addr, stale.clone()));
+
+    let fresh = make_live_connection(shared_addr, ConnectionDirection::Outbound).await;
+
+    {
+        let hook_pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let fresh = fresh.clone();
+        pool.set_cleanup_stale_race_hook(move || {
+            // The fresh reconnect lands at the exact same address, so its
+            // own publication overwrites `connections_by_addr[shared_addr]`
+            // -- `stale`'s only address alias -- before the teardown loop
+            // ever reaches `stale`.
+            let _ = hook_pool
+                .connections_by_addr
+                .upsert_sync(shared_addr, fresh.clone());
+            hook_pool.publish_current_peer_connection(&peer_id, fresh.clone());
+        });
+    }
+
+    pool.cleanup_stale_connections();
+
+    assert!(
+        pool.connections_by_addr
+            .read_sync(&shared_addr, |_, v| Arc::ptr_eq(v, &fresh))
+            .unwrap_or(false),
+        "the fresh instance that reused the address must still be indexed there, untouched"
+    );
+
+    let stale_stream = stale
+        .stream_handle
+        .as_ref()
+        .expect("a live connection must have a stream handle");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stale_stream.wait_for_exit())
+            .await
+            .is_ok(),
+        "the superseded stale instance's own background tasks must still be retired even \
+         though its own address was reused by the fresh reconnect before teardown ran, \
+         leaving it with no `connections_by_addr` alias to be found by at all"
+    );
+
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+        "the fresh connection must survive as the peer's current connection (got {current:?})"
+    );
+}
+
 /// RED (review finding P2, `remote_actor_ref.rs` ask-timeout/cancellation
 /// eviction depends on a stale `addr_to_peer_id` alias):
 /// `recover_connection_after_actor_ask_timeout` and
@@ -13598,6 +13666,73 @@ async fn remove_connection_instance_by_id_cancels_correlation_when_snapshot_is_t
     guard.disarm();
 }
 
+/// Same TOCTOU as `disconnect_connection_instance_preserves_correlation_for_a_survivor_published_mid_teardown`,
+/// in `remove_connection_instance_by_id`'s own CAS-declined branch: the
+/// survivor check used to run immediately, then act on that decision much
+/// later (past logging, the lifecycle event, and the `connections_by_peer`
+/// removal). Pinned deterministically via the same
+/// `disconnect_instance_survivor_race_hook`.
+#[tokio::test]
+async fn remove_connection_instance_by_id_preserves_correlation_for_a_survivor_published_mid_teardown()
+ {
+    let peer_id = crate::KeyPair::new_for_testing("rc-remove-by-id-race-peer").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7526".parse().unwrap();
+    let survivor_addr: SocketAddr = "127.0.0.1:7527".parse().unwrap();
+
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // Indexed by address only, no `peer_sessions` entry at all -- the CAS
+    // in `remove_connection_instance_by_id` naturally finds nothing and
+    // takes the CAS-declined branch.
+    let connection =
+        make_live_connection_with_correlation(addr, ConnectionDirection::Outbound, tracker.clone())
+            .await;
+    let _ = pool.connections_by_addr.upsert_sync(addr, connection.clone());
+    let _ = pool.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+    let instance_id = connection
+        .stream_handle
+        .as_ref()
+        .map(|handle| handle.instance_id())
+        .expect("live connection must have a stream handle");
+
+    let survivor = make_live_connection_with_correlation(
+        survivor_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+
+    {
+        let hook_pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let survivor = survivor.clone();
+        pool.set_disconnect_instance_survivor_race_hook(move || {
+            hook_pool.publish_current_peer_connection(&peer_id, survivor.clone());
+        });
+    }
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    let removed = pool.remove_connection_instance_by_id(addr, instance_id);
+    assert!(removed.is_some_and(|c| Arc::ptr_eq(&c, &connection)));
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "a survivor published mid-teardown (after the initial check used to run, before the \
+         final abort) must still be detected and preserved"
+    );
+
+    guard.disarm();
+}
+
 /// `disconnect_connection_instance`'s `Err(None)` arm proceeds with `target`'s
 /// own teardown when the peer's primary session slot is genuinely empty for
 /// it (`target` was found only via `peer_current_connection_snapshot`'s
@@ -13732,6 +13867,79 @@ async fn disconnect_connection_instance_cancels_correlation_when_snapshot_is_the
         "a genuinely final teardown (the only connection this peer ever had) must still \
          cancel its own correlation tracker -- comparing the survivor snapshot to `target` \
          itself must never count as finding a live sibling worth preserving the tracker for"
+    );
+
+    guard.disarm();
+}
+
+/// The survivor check in `disconnect_connection_instance`'s `Err(None)` arm
+/// used to run immediately, then act on that decision much later (past
+/// logging, the lifecycle event, and the `connections_by_peer`/
+/// `connections_by_addr` removals) — a window in which a fresh connection
+/// sharing `target`'s session-level tracker can be published, standing in
+/// for a reconnect winning arbitration while `target`'s own teardown is
+/// already in flight. Pinned deterministically via the pool's own
+/// `disconnect_instance_survivor_race_hook`, fired at exactly the point the
+/// check used to run, rather than a wall-clock thread race.
+#[tokio::test]
+async fn disconnect_connection_instance_preserves_correlation_for_a_survivor_published_mid_teardown()
+ {
+    let peer_id = crate::KeyPair::new_for_testing("rc-disconnect-instance-race-peer").peer_id();
+    let target_addr: SocketAddr = "127.0.0.1:7524".parse().unwrap();
+    let survivor_addr: SocketAddr = "127.0.0.1:7525".parse().unwrap();
+
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // `target`: never promoted to "current" -- the `Err(None)` shape.
+    let target = make_live_connection_with_correlation(
+        target_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(target_addr, target.clone());
+
+    let survivor = make_live_connection_with_correlation(
+        survivor_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+
+    {
+        let hook_pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let survivor = survivor.clone();
+        pool.set_disconnect_instance_survivor_race_hook(move || {
+            // Stands in for a fresh connection winning arbitration and
+            // being published for this peer WHILE `target`'s own teardown
+            // is already in flight -- no live sibling existed when this
+            // teardown started, but one exists by the time it finishes.
+            hook_pool.publish_current_peer_connection(&peer_id, survivor.clone());
+        });
+    }
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    let evicted = pool.disconnect_connection_instance(&peer_id, &target);
+    assert!(evicted);
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "a survivor published mid-teardown (after the initial check used to run, before the \
+         final abort) must still be detected and preserved -- deciding keep_correlation once, \
+         early, and acting on it after unrelated work in between cancels a genuinely live \
+         sibling's in-flight asks"
     );
 
     guard.disarm();
