@@ -139,59 +139,15 @@ fn owner_recovery_wins_tombstone(
 /// left behind because nothing removes it from the OLD address's entry
 /// the moment the actor's own record moves.
 ///
-/// Design note (review round against `87a692e`, `registry.rs:8653`): both
-/// `location` and `peer_info` are reads outside the set `PeerRegistryOwner::
-/// reserve_for_reap` atomically validates (address, ownership token, pin,
-/// node_id correspondence -- see its own doc comment) -- but only one of
-/// them is a gap-shaped concern, and confusing the two is exactly the
-/// mistake to avoid here:
-///
-/// - `location`'s freshness (`reap_reserved_candidates`'s own
-///   `known_actors.read_sync` call, immediately before this function runs)
-///   is genuinely load-bearing and MUST stay fresh. It answers the one
-///   question the reservation cannot: has THIS actor's own registration
-///   moved since `peer_to_actors[peer_addr]` was populated? A reservation
-///   validated at selection time has no way to know about a move that
-///   happens AFTER selection but before the sweep reaches this actor --
-///   feeding this function a validated-but-now-stale location instead of
-///   a fresh one would reintroduce exactly the bug
-///   `cleanup_dead_peers_does_not_prune_actor_that_moved_to_another_peer`
-///   (`registry.rs:19874`) exists to catch: an actor that has already
-///   relocated to a live, different peer gets pruned anyway because the
-///   check compares against where it USED to be.
-///
-/// - `peer_info`'s freshness, by contrast, is NOT load-bearing here,
-///   verified two ways: empirically (temporarily swapping it for the
-///   reservation-validated `node_id` and re-running the full
-///   `cleanup_dead_peers`/`reap_reserved_candidates` test suite, including
-///   the moved-actor test above, produced zero failures), and by tracing
-///   every write path to `GossipState::PeerInfo::node_id` for an address:
-///   the only one (`add_peer_with_node_id_generation_inner`) writes it
-///   ONLY as a downstream consequence of an ALREADY-ACCEPTED owner-level
-///   claim, and `PeerRegistryOwner::claim`/`claim_connection_scoped`
-///   unconditionally refuse every claim for the entire time this
-///   candidate's reap reservation is held (see `claim`'s own doc comment:
-///   "the sweep's non-owner destructive work is safe to run outside this
-///   task's critical path ONLY because nothing can commit ownership of a
-///   reserved address while the reservation is held"). So `GossipState`'s
-///   `node_id` for this address CANNOT change for the reservation's ENTIRE
-///   holding window -- a fresh read here and the reservation-validated one
-///   are provably identical throughout, by construction of a guarantee
-///   this function does not need to re-derive. Reading it fresh is
-///   harmless, not wrong, but also not a substitute for validation: it
-///   just happens to already equal the validated value, always, given
-///   everything else this PR's reap machinery already enforces.
-///
-/// The general principle, for whoever next audits a read outside a
-/// validated set: the question is not "was this read validated" but "can
-/// the underlying state actually change during the window that matters,
-/// given everything else already enforced." If yes (as for `location`),
-/// freshness is the safety mechanism and validation would be actively
-/// wrong. If no (as for `peer_info`), an "unvalidated" read is just an
-/// accurate read of state that was never going to move -- not a gap, and
-/// not worth pulling into the validated set either: doing so would add a
-/// dependency for zero behavioral change, on a guarantee this function
-/// would then be re-deriving instead of trusting.
+/// `location` must be read fresh, immediately before this function runs,
+/// not reused from an earlier snapshot: it answers whether THIS actor's
+/// own registration has moved since `peer_to_actors[peer_addr]` was
+/// populated, which a stale `location` cannot answer correctly. Feeding
+/// this function a stale location reintroduces exactly the bug
+/// `cleanup_dead_peers_does_not_prune_actor_that_moved_to_another_peer`
+/// exists to catch: an actor that has already relocated to a live,
+/// different peer gets pruned anyway because the check compares against
+/// where it USED to be.
 #[inline]
 fn actor_location_belongs_to_peer(
     location: &RemoteActorLocation,
@@ -905,15 +861,10 @@ pub trait PeerDisconnectHandler: Send + Sync {
     ) -> BoxFuture<'_, ()>;
 }
 
-/// P1 finding (review round against `3e260a9`, `registry.rs:960`): this
-/// trait's `handle_peer_connect` used to take a third parameter, a
+/// This trait's `handle_peer_connect` used to take a third parameter, a
 /// `ConnectNotificationToken` a WELL-BEHAVED handler could consult to
 /// check whether the reconfiguration it was notified about was still
-/// current before doing expensive or externally-visible work. That was
-/// the THIRD public-API break this PR produced (after the framing
-/// builders on #183 and `connect_to_peer`'s tuple return in an earlier
-/// round of this PR) -- any existing downstream implementation of this
-/// `pub trait` failed to compile against the changed signature.
+/// current before doing expensive or externally-visible work.
 ///
 /// The token was, by its own doc comment, "a courtesy, not the safety
 /// mechanism": `icanact` itself never relied on a handler checking it for
@@ -929,8 +880,7 @@ pub trait PeerDisconnectHandler: Send + Sync {
 /// removes the break outright rather than working around it. The type
 /// itself (`ConnectNotificationToken`/`ConnectNotificationScope`) is
 /// deleted, not merely hidden: an unused mechanism nobody -- internal or
-/// external -- ever needed is a hole waiting to be found again, same as
-/// `ResolvedRoute::from_configured`'s deletion two rounds ago.
+/// external -- ever needed is a hole waiting to be found again.
 pub trait PeerConnectHandler: Send + Sync {
     fn handle_peer_connect(
         &self,
@@ -1189,16 +1139,16 @@ pub struct RegistryStats {
 /// address we can dial" -- an INBOUND connection's `.addr` is its raw,
 /// ephemeral TCP source (a ConnectionHandle carries no direction of its
 /// own; the pool's OWN `LockFreeConnection` does), never a corroborated
-/// dial target, and #181's bug was exactly this address becoming
-/// selectable/gossipable through a fresh, unflagged `PeerInfo`. This type
+/// dial target, and an undialable address becoming
+/// selectable/gossipable through a fresh, unflagged `PeerInfo` is a
+/// recurring bug class here. This type
 /// therefore also carries whether IT was independently corroborated as
 /// dialable, so that fact cannot be dropped by a caller who forgets to ask
 /// -- `PeerInfo::for_connect_attempt` reads it directly rather than
 /// depending on every construction site to also remember to flag
 /// `transport_source_keyed`/`inbound_observed` by hand, which is exactly
-/// how this bug reached the type a fourth time (#181 twice,
-/// `connect_to_peer` in an earlier round of this PR, and the discovered
-/// path in `lib.rs`).
+/// how this bug class kept reaching the type through different call sites
+/// (`connect_to_peer`, the discovered path in `lib.rs`, and others).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolvedRoute {
     addr: SocketAddr,
@@ -1262,7 +1212,6 @@ impl PartialEq<ResolvedRoute> for SocketAddr {
 /// whether the underlying connection resolution ALSO independently
 /// corroborated a particular address as dialable.
 ///
-/// P1 finding (review round against `f64f3a9`, `registry.rs:5465`):
 /// `connect_to_peer` used to wrap `configured_addr` (the peer's currently
 /// configured/required route, from `ConnectionPool`) in a `ResolvedRoute`
 /// via `ResolvedRoute::from_configured` whenever the connection it reused
@@ -1400,13 +1349,12 @@ impl PartialEq<AttemptedRoute> for SocketAddr {
 
 /// Peer information with failure tracking and delta state
 ///
-/// `#[non_exhaustive]` (added review round against `c111380`,
-/// `registry.rs:4538`): this struct already exists on `main`, and this
-/// PR's `last_failure_instant` field is a real, unavoidable break for any
+/// `#[non_exhaustive]`: this struct already exists on `main`, and its
+/// `last_failure_instant` field is a real, unavoidable break for any
 /// external struct-literal construction or exhaustive destructuring of
 /// it -- adding a field to an all-`pub`-field, non-`#[non_exhaustive]`
-/// public struct always is. Marking it `#[non_exhaustive]` now costs this
-/// round's consumers nothing further (they already must account for the
+/// public struct always is. Marking it `#[non_exhaustive]` costs existing
+/// consumers nothing further (they already must account for the
 /// new field) while preventing this exact category of silent break from
 /// recurring the next time this struct grows. Has no effect on this
 /// crate's own extensive struct-literal use throughout its test suite --
@@ -1698,13 +1646,13 @@ impl PeerInfo {
     /// earlier version required every call site to separately notice when
     /// its `ResolvedRoute` was backed by an unverified, inbound-sourced
     /// connection and set these flags by hand, and this is precisely the
-    /// class of bug that let #181's "ephemeral inbound source treated as a
-    /// dialable route" recur through the type itself (twice more, in
+    /// class of bug that let an "ephemeral inbound source treated as a
+    /// dialable route" recur through the type itself (in
     /// `connect_to_peer` and the discovered path in `lib.rs`) even after
     /// `ResolvedRoute` existed specifically to prevent misattribution.
     /// `ResolvedRoute::from_connection` is the only way to construct one
     /// (a second constructor, `from_configured`, existed for a while but
-    /// was deleted in a later round -- see `ConnectOutcome`'s own doc
+    /// was deleted -- see `ConnectOutcome`'s own doc
     /// comment), and a caller cannot silently drop the flag it carries.
     pub(crate) fn for_connect_attempt(
         address: ResolvedRoute,
@@ -1867,8 +1815,8 @@ impl PeerInfo {
     /// earlier version of this method did): that field can be `false` for
     /// an entry that is nonetheless not fallback-created, and inferring
     /// "was this entry created by the fallback" from accumulated evidence
-    /// another code path also writes is the exact mistake this PR keeps
-    /// making. `claim_created_ownership` is instead a fact the claim path
+    /// another code path also writes is a recurring mistake in this area
+    /// of the code. `claim_created_ownership` is instead a fact the claim path
     /// itself knows for certain, not an inference.
     ///
     /// Symmetric to `mark_dialability_confirmed` above: that one only ever
@@ -2338,8 +2286,7 @@ pub struct GossipRegistry<T = ()> {
     pub dns_resolver: Arc<tokio::sync::RwLock<Arc<dyn crate::dns::DnsResolver>>>,
 }
 
-/// Manual, NOT derived: see the P1 finding this replaces (review round
-/// against `ded8495`, `registry.rs:4664`) for the full story. `#[derive
+/// Manual, NOT derived. `#[derive
 /// (Clone)]` -- what this struct used to have -- generates `impl<T:
 /// Clone> Clone for GossipRegistry<T>`, bounding EVERY generic parameter
 /// regardless of whether any field actually needs it: a well-known,
@@ -2463,8 +2410,7 @@ enum ClaimSubmission {
     ///
     /// Carries the SAME `expected_generation` `PeerRegistryOwner::
     /// configure_peer` takes -- see `configure_peer_generation`'s own doc
-    /// comment (P1 finding, review round against `ded8495`,
-    /// `registry.rs:4982`): `None` for a peer's first `configure_peer`
+    /// comment: `None` for a peer's first `configure_peer`
     /// call, `Some(generation)` for a queued retry presenting a value a
     /// prior call already established, validated atomically at the owner
     /// rather than by this caller checking a snapshot of it beforehand.
@@ -2504,8 +2450,7 @@ pub(crate) enum ConfigurePeerOutcome {
     /// public `configure_peer` treats this as "not yet," not "gave up" --
     /// see its doc comment.
     TemporarilyBlocked,
-    /// P1 finding (review round against `ded8495`, `registry.rs:4982`): a
-    /// LATER `configure_peer` call for the SAME peer has already been
+    /// A LATER `configure_peer` call for the SAME peer has already been
     /// made, atomically, at the owner (`ClaimRejection::
     /// SupersededByNewerConfiguration`) -- this call's own `expected_
     /// generation` is no longer current. Retrying THIS request would not
@@ -2517,25 +2462,25 @@ pub(crate) enum ConfigurePeerOutcome {
 }
 
 /// Total wall-clock budget a SINGLE `configure_peer_with_outcome` attempt
-/// spends retrying a claim that keeps losing to a live `cleanup_dead_peers`
+/// spends retrying a claim that keeps losing to another caller's live
 /// reap reservation (`ClaimRejection::ReapInProgress`) before reporting
 /// `ConfigurePeerOutcome::TemporarilyBlocked` for that attempt.
 ///
-/// P1 history: this used to be a small ATTEMPT count (5 tries x 20ms =~
+/// An earlier version of this was a small ATTEMPT count (5 tries x 20ms =~
 /// 100ms total) behind a public `configure_peer` that returned `()`
 /// unconditionally, silently discarding the request once the count was
-/// exhausted. The combination was silent data loss: actor cleanup or
-/// `gossip_state` contention during a sweep's destructive phase can
+/// exhausted. The combination was silent data loss: contention while a
+/// reservation holder's destructive work runs can
 /// legitimately run long enough to blow a 100ms budget even though the
 /// reservation is guaranteed to release eventually (every reservation is
-/// released either by the sweep's own `reservation.release().await` or, if
+/// released either by the holder's own `reservation.release().await` or, if
 /// its holding task is hard-aborted, by the guard's own `Drop` impl doing a
 /// best-effort synchronous release -- there is no path that leaks one
 /// forever).
 ///
-/// This budget is now TIME-based and generous (30s, versus the sweep's
-/// actual per-address destructive work, which is in-memory and brief --
-/// milliseconds) with capped exponential backoff between attempts, so a
+/// This budget is now TIME-based and generous (30s, versus a reservation
+/// holder's actual per-address destructive work, which is in-memory and
+/// brief -- milliseconds) with capped exponential backoff between attempts, so a
 /// reservation racing a real `configure_peer` call clears within ONE
 /// attempt's budget in every case except a genuinely stuck sweep or owner.
 /// It bounds a SINGLE `configure_peer_with_outcome` call, not the public
@@ -4056,8 +4001,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// retraction into a separately-ordered `release` call stranded
     /// addresses permanently). The addresses it hands back here are
     /// therefore already released; this only tombstones this registry's own
-    /// `gossip_state` projection at the resulting commit sequence, the same
-    /// as `release_dead_peer_ownership` does for its own return value. An
+    /// `gossip_state` projection at the resulting commit sequence. An
     /// operator-pinned address (`GossipRegistry::configure_peer`) never has a
     /// receipt to hand back in the first place, and `release_session` itself
     /// refuses to retract a pinned address regardless, so a stale connection
@@ -4130,8 +4074,7 @@ impl<T: 'static> GossipRegistry<T> {
     ///
     /// `expected_generation`: threaded verbatim to `ClaimSubmission::
     /// OperatorConfigured`/`PeerRegistryOwner::configure_peer` -- see
-    /// `configure_peer_generation`'s own doc comment (P1 finding, review
-    /// round against `ded8495`, `registry.rs:4982`). `None` for a peer's
+    /// `configure_peer_generation`'s own doc comment. `None` for a peer's
     /// first `configure_peer` call; `Some(generation)` for a queued
     /// retry, validated atomically at the owner rather than by this
     /// caller checking a snapshot of it beforehand.
@@ -4691,42 +4634,16 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Configure a peer by peer ID and its expected connection address.
     ///
-    /// P1 finding (review round against `c111380`, `registry.rs:4538`):
-    /// this used to return [`ConfigurePeerOutcome`] directly -- a public
-    /// return-type change, the fourth public-API break this PR produced
-    /// (after the framing builders on #183, `connect_to_peer`, and
-    /// `PeerConnectHandler`). The remedy applied then was to restore the
-    /// public signature to what it was on `main` (`()`) and move the
-    /// richer outcome to the `pub(crate)` sibling below.
-    ///
-    /// P1 finding, next round (review round against `ba2bff2`,
-    /// `registry.rs:4553`): that remedy went too far and traded away a
-    /// signal that matters more than source compatibility with `main`. A
-    /// `cleanup_dead_peers` reap reservation for `connect_addr` can
-    /// legitimately outlast a short, fixed retry budget whenever actor
-    /// cleanup or `gossip_state` contention runs long; when it did, `()`
-    /// meant the operator's configuration was silently never applied, with
-    /// no way for the caller to tell. Tried reconciling both concerns by
-    /// keeping the generous retry budget below AND changing the public
-    /// return type to `Result<(), ConfigurePeerRejection>`.
-    ///
-    /// P1 finding, third round (review round against `aea7772`,
-    /// `registry.rs:4664`): the `Result` claim of staying source-compatible
-    /// was wrong. The signature on `main` is `()`; `.await?` was never
-    /// existing usage to preserve, and downstream code that forwards the
-    /// awaited value, expects `JoinHandle<()>`, binds `()` explicitly, or
-    /// denies `unused_must_use` all break on a `Result` return that did not
-    /// exist before. Reverted to `()`, genuinely unchanged from `main`, per
+    /// The public signature is `()`, genuinely unchanged from `main`, per
     /// the same precedent [`Self::connect_to_peer`] /
     /// [`Self::connect_to_peer_with_outcome`] already established for this
     /// exact tension: the public signature stays stable, and the richer,
     /// honestly-reporting form lives under a distinct, `pub(crate)` name
-    /// for callers that need it -- [`Self::configure_peer_with_outcome`],
-    /// unchanged in shape from the previous round.
+    /// for callers that need it -- [`Self::configure_peer_with_outcome`].
     ///
-    /// That reopens the silent-drop problem `()` alone cannot signal its
-    /// way out of, so THIS round closes it differently: `()` now GUARANTEES
-    /// eventual application rather than merely attempting it once.
+    /// A `()` return alone cannot signal a silently-dropped configuration,
+    /// so `()` here GUARANTEES eventual application rather than merely
+    /// attempting it once.
     /// [`Self::configure_peer_with_outcome`]'s own `CONFIGURE_PEER_REAP_
     /// RETRY_BUDGET`-bounded attempt runs first, synchronously, exactly as
     /// before; if THAT attempt still reports [`ConfigurePeerOutcome::
@@ -4740,11 +4657,10 @@ impl<T: 'static> GossipRegistry<T> {
     /// call itself then returns -- it does not block the caller for the
     /// queued retry's duration, which is unbounded by construction.
     ///
-    /// This is a deliberately different trade-off from the previous
-    /// round's "make the caller's own wait unbounded" option, which was
-    /// rejected there for hanging the CALLER's task forever on a
-    /// genuinely stuck sweep. Moving the unbounded part to a detached
-    /// background task removes that objection entirely: nothing about the
+    /// Deliberately not "make the caller's own wait unbounded" instead,
+    /// which would hang the CALLER's task forever on a
+    /// genuinely stuck reservation holder. Moving the unbounded part to a detached
+    /// background task removes that risk entirely: nothing about the
     /// caller's own task, or anything it holds, is at stake once queued,
     /// while the operator's explicit configuration -- the "operator wins"
     /// principle already settled for this pin/claim/migrate machinery --
@@ -4758,8 +4674,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// explicit `shutdown_and_wait`, since there is nothing left at that
     /// point for the configuration to apply to.
     ///
-    /// P1 finding (review round against `ded8495`, `registry.rs:4664`):
-    /// this used to carry a `where T: Send + Sync + Clone` bound, narrower
+    /// An earlier version of this method
+    /// carried a `where T: Send + Sync + Clone` bound, narrower
     /// than the impl block's own `T: 'static` -- a real, breaking
     /// narrowing of this `pub` method's public surface, since `main`
     /// allows every `T: 'static` here. The queued retry clones the whole
@@ -4778,7 +4694,7 @@ impl<T: 'static> GossipRegistry<T> {
         // call is concerned, so it always proceeds and the owner bumps
         // `configure_peer_generation` to a fresh value -- see
         // `configure_peer_with_outcome_and_generation`'s own doc comment
-        // for the P1 history of why this is validated at the owner, not
+        // for why this is validated at the owner, not
         // here.
         let (outcome, my_generation) = self
             .configure_peer_with_outcome_and_generation(peer_id.clone(), connect_addr, None)
@@ -4824,22 +4740,20 @@ impl<T: 'static> GossipRegistry<T> {
     /// case is the registry shutting down first, which the shutdown gate
     /// already handles by standing down rather than hanging.
     ///
-    /// P1 finding (review round against `3f9db18`, `registry.rs:4699`):
-    /// this had no way to tell whether a LATER `configure_peer` call for
-    /// the SAME peer had already superseded it. Configuring P at A, which
+    /// This loop must be able to tell whether a LATER `configure_peer` call for
+    /// the SAME peer has already superseded it: configuring P at A, which
     /// queues because A is temporarily reap-reserved, followed by
     /// reconsidering and configuring P at B (which succeeds immediately,
-    /// since B is free), used to still let the stale, queued A request win
-    /// once its reservation finally cleared -- silently evicting the
+    /// since B is free), must not let the stale, queued A request win
+    /// once its reservation finally clears -- silently evicting the
     /// operator's own newer, deliberate decision.
     ///
-    /// P1 finding, second pass (review round against `ded8495`,
-    /// `registry.rs:4982`): the first fix here checked a CALLER-side
-    /// snapshot of `configure_peer_generation` immediately before each
-    /// sub-attempt -- narrower than before, but a caller-side read can
+    /// A CALLER-side snapshot of `configure_peer_generation` taken
+    /// immediately before each sub-attempt is not enough: a caller-side
+    /// read can
     /// never be atomic with the owner's own pin-installing decision no
-    /// matter how close to it it is taken. Fixed by moving the check
-    /// itself to the owner (see `configure_peer_with_outcome_and_
+    /// matter how close to it it is taken. The check instead moves
+    /// to the owner (see `configure_peer_with_outcome_and_
     /// generation`'s own doc comment): `my_generation`, captured from the
     /// FIRST call's own owner-established value, is simply threaded
     /// through as `expected_generation` on every retry below. There is
@@ -4927,17 +4841,16 @@ impl<T: 'static> GossipRegistry<T> {
     /// [`ConfigurePeerOutcome`] -- see that method's own doc comment for
     /// why this is `pub(crate)` rather than the public entry point.
     ///
-    /// P1 history: this used to return `()` unconditionally, and a
-    /// `ClaimRejection::ReapInProgress` -- a TEMPORARY refusal, since
+    /// A `ClaimRejection::ReapInProgress` -- a TEMPORARY refusal, since
     /// another caller currently holds a short-lived reap reservation for
-    /// `connect_addr` -- was collapsed indistinguishably
+    /// `connect_addr` -- must not be collapsed indistinguishably
     /// into the SAME `AddrClaimOutcome::Rejected` a genuine, PERMANENT
-    /// arbitration loss produces, logged, and silently discarded. An
-    /// operator's explicit configuration lost a race with a reservation
-    /// that would very likely have cleared moments later, and had no way
-    /// to tell anything had gone wrong at all.
+    /// arbitration loss produces and silently discarded: an
+    /// operator's explicit configuration losing a race with a reservation
+    /// that would very likely clear moments later must not leave the
+    /// caller with no way to tell anything went wrong at all.
     ///
-    /// Fixed with a retry bounded by `CONFIGURE_PEER_REAP_RETRY_BUDGET`
+    /// Retried, bounded by `CONFIGURE_PEER_REAP_RETRY_BUDGET`
     /// (time-based, capped exponential backoff -- see that constant's own
     /// doc comment): reservations are held only for the duration of one
     /// sweep's destructive, in-memory work for a single address, brief by
@@ -4978,34 +4891,21 @@ impl<T: 'static> GossipRegistry<T> {
     /// [`Self::configure_peer_with_outcome`]'s actual implementation, also
     /// returning the [`ConfigurePeerOutcome::Applied`]-independent
     /// `configure_peer_generation` value this exact call established or
-    /// confirmed -- see this doc comment's own P1 history below for why.
+    /// confirmed.
     /// `configure_peer_with_outcome` itself passes `None` (a first call)
     /// and discards the generation, so its behavior for every existing
     /// caller (overwhelmingly this crate's own tests) is unchanged
     /// byte-for-byte.
     ///
-    /// P1 finding (review round against `3f9db18`, `registry.rs:4699`):
-    /// `queue_configure_peer_until_applied`'s original fix for "a stale
-    /// queued retry can overwrite a newer `configure_peer` call" checked a
-    /// CALLER-side `configure_peer_generation` snapshot once per whole
-    /// `CONFIGURE_PEER_REAP_RETRY_BUDGET`-bounded cycle, before submitting
-    /// each cycle's owner command -- never atomic with the pin update that
-    /// command performed. A reap reservation clearing WHILE a stale
-    /// cycle's own internal sub-attempt loop was already in flight let
-    /// that cycle complete and report `Applied` regardless of a newer
-    /// request having superseded it in the meantime.
-    ///
-    /// P1 finding, second pass (review round against `ded8495`,
-    /// `registry.rs:4982`): threading a `should_abandon` closure into the
-    /// retry loop, checked immediately before every sub-attempt instead of
-    /// once per cycle, narrowed this considerably but did not close it --
-    /// the closure's own check still ran, and could still pass, moments
-    /// before a genuinely newer call raced ahead and committed its own pin
-    /// first, only for this stale attempt's own already-in-flight owner
-    /// command to commit AFTER it and evict it anyway. Any caller-side
-    /// check, no matter how immediately before the send it is taken, is
-    /// fundamentally not atomic with a decision the OWNER makes on a
-    /// separate task.
+    /// A stale queued retry overwriting a newer `configure_peer` call is
+    /// not preventable by any CALLER-side check, no matter how it is
+    /// scheduled: a snapshot of `configure_peer_generation` checked once
+    /// per whole `CONFIGURE_PEER_REAP_RETRY_BUDGET`-bounded cycle, or even
+    /// a check immediately before every sub-attempt, is never atomic with
+    /// the pin update the owner performs on a separate task -- a genuinely
+    /// newer call can always race ahead and commit its own pin between the
+    /// caller's check and its own already-in-flight owner command
+    /// committing.
     ///
     /// Fixed by moving `configure_peer_generation` itself to be
     /// OWNER-side state (see that field's own doc comment on
@@ -5076,13 +4976,13 @@ impl<T: 'static> GossipRegistry<T> {
         let retry_started = tokio::time::Instant::now();
         let mut reap_retry_attempt = 0u32;
         let mut reap_retry_backoff = CONFIGURE_PEER_REAP_RETRY_INITIAL_BACKOFF;
-        // P1 finding (review round against `7739717`, `registry.rs:5163`):
-        // this used to pass the FUNCTION's own `expected_generation`
-        // parameter unchanged to every sub-attempt in the loop below. When
+        // Passing the FUNCTION's own `expected_generation`
+        // parameter unchanged to every sub-attempt in the loop below would
+        // be wrong. When
         // entered with `None` (a peer's first `configure_peer` call, the
-        // common case), that meant EVERY internal sub-attempt -- not just
-        // the first -- told the owner "always proceed, bump fresh": if
-        // sub-attempt 1 bumped to generation 5 and then lost to
+        // common case), that would mean EVERY internal sub-attempt -- not just
+        // the first -- tells the owner "always proceed, bump fresh": if
+        // sub-attempt 1 bumps to generation 5 and then loses to
         // `ReapInProgress`, sub-attempt 2 (after this loop's own retry
         // sleep) would present `None` YET AGAIN and bump to 6 regardless
         // of what happened in between -- including a genuinely NEWER,
@@ -5091,11 +4991,11 @@ impl<T: 'static> GossipRegistry<T> {
         // Sub-attempt 2 would then bump PAST that newer call's own value
         // (to 7) and succeed, evicting the newer call's pin -- the exact
         // "stale request wins" bug this whole generation mechanism exists
-        // to prevent, reintroduced by this loop's own internal retries
+        // to prevent, reintroduced by internal retries
         // never remembering what generation THEY had already, atomically,
         // established.
         //
-        // Fixed with a MUTABLE local, seeded from the parameter but
+        // Uses a MUTABLE local instead, seeded from the parameter but
         // updated after every sub-attempt to the generation THAT attempt
         // was told is current: from sub-attempt 2 onward, this loop always
         // presents `Some(generation)` -- the value sub-attempt 1 (or the
@@ -5115,9 +5015,8 @@ impl<T: 'static> GossipRegistry<T> {
         let (outcome, evicted_release, generation) = loop {
             // `expected_generation` is validated FRESH, atomically, INSIDE
             // this SAME owner call on every single sub-attempt -- see
-            // `configure_peer_generation`'s own doc comment for the P1
-            // finding this closes (review round against `ded8495`,
-            // `registry.rs:4982`): a caller-side pre-check taken here,
+            // `configure_peer_generation`'s own doc comment: a caller-side
+            // pre-check taken here,
             // before submitting the command, could never be atomic with
             // the pin update the command performs, no matter how close to
             // it it were taken. There is nothing left for THIS function to
@@ -5212,8 +5111,7 @@ impl<T: 'static> GossipRegistry<T> {
         // means any stale `transport_source_keyed` inherited from an
         // earlier inbound-accept fallback here no longer applies.
         //
-        // P1 finding (review round against `7cbd1be`, `registry.rs:4655`):
-        // this write used to run unconditionally, with no check that
+        // This write must not run unconditionally, with no check that
         // nothing repinned `connect_addr` in the window between the owner
         // transaction above committing and this `gossip_state` acquisition
         // actually running (a SEPARATE async step, on a SEPARATE lock the
@@ -5255,8 +5153,8 @@ impl<T: 'static> GossipRegistry<T> {
         // the lock at all once a repin is already known; the second,
         // immediately before the mutation, narrows the window further.
         //
-        // KNOWN, DEFERRED LIMITATION (review round against `c48546d`,
-        // `registry.rs:4644`): narrowing is all this second check actually
+        // KNOWN, DEFERRED LIMITATION: narrowing is all this second check
+        // actually
         // does. It does not close the gap -- see `ReapReservation`'s own
         // doc comment for why a plain read, repeated however close to its
         // mutation, is never atomic with a concurrent write from a
@@ -5398,8 +5296,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// still valid at some later, separately-timed point just because
     /// nothing appears to run in between.
     ///
-    /// P1 finding (review round against `3e260a9`, `registry.rs:960`):
-    /// this used to also take the caller's own `ClaimReceipt`, threaded
+    /// An earlier version of this
+    /// also took the caller's own `ClaimReceipt`, threaded
     /// through purely to build a `ConnectNotificationToken` to pass to
     /// the handler alongside this call's `pin_is_current` guard. That
     /// token is gone -- see `PeerConnectHandler`'s own doc comment -- and
@@ -6077,13 +5975,12 @@ impl<T: 'static> GossipRegistry<T> {
     /// form. `pub(crate)`, not `pub`: see [`GossipRegistry::connect_to_peer`]
     /// for the public, stable-signature wrapper.
     ///
-    /// P1 finding (review round against `7cbd1be`, `registry.rs:5507`):
-    /// this function itself USED to be the public `connect_to_peer`, until
-    /// its signature changed (in an earlier round of this PR) from a plain
+    /// This function itself USED to be the public `connect_to_peer`, until
+    /// its signature changed from a plain
     /// `Result<()>` to this tuple -- a breaking change for any downstream
     /// caller of `GossipRegistry::connect_to_peer` directly, not just this
     /// crate's own call sites (which could be, and were, updated
-    /// mechanically). Settled on #183 for the identical shape of tension
+    /// mechanically). Resolved the same way as an identical shape of tension
     /// elsewhere: keep the public signature stable and expose the richer
     /// result under a distinct, `pub(crate)` name for callers that
     /// genuinely need the attempted/resolved distinction. The asymmetry is
@@ -6127,8 +6024,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// must only ever gain an entry for an address this call itself
     /// resolved or attempted a connection to.
     ///
-    /// VOCABULARY, since this distinction has now produced findings in
-    /// several separate places (#181, and multiple rounds of this PR):
+    /// VOCABULARY, since this distinction has produced bugs in
+    /// several separate places:
     /// "requested" (a caller's own input, never independently verified,
     /// never valid for attribution -- stays a bare `SocketAddr`) is
     /// distinct from "attempted" ([`AttemptedRoute`] -- the address this
@@ -6184,8 +6081,7 @@ impl<T: 'static> GossipRegistry<T> {
                     conn_direction == Some(crate::connection_pool::ConnectionDirection::Outbound);
 
                 if !dialed_outbound {
-                    // P1 finding (review round against `f64f3a9`,
-                    // `registry.rs:5465`): this call's own resolution
+                    // This call's own resolution
                     // reused a connection that is not itself a genuine
                     // outbound dial -- neither `conn.addr` (often a raw,
                     // ephemeral inbound transport source) nor
@@ -6306,10 +6202,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// Connect to a configured (required) peer by peer ID -- the PUBLIC,
     /// stable-signature form.
     ///
-    /// P1 finding (review round against `7cbd1be`, `registry.rs:5507`):
-    /// this signature must stay `Result<()>`. See `connect_to_peer_with_
-    /// outcome`'s own doc comment for the full history and the #183
-    /// precedent this follows: the richer `(Option<AttemptedRoute>,
+    /// This signature must stay `Result<()>`. See `connect_to_peer_with_
+    /// outcome`'s own doc comment for the full reasoning: the richer `(Option<AttemptedRoute>,
     /// Result<ConnectOutcome>)` return -- needed internally to attribute
     /// health/gossip/failure state to the address a connection attempt
     /// actually reached, never to a bare request -- is `pub(crate)` under
@@ -9141,20 +9035,17 @@ impl<T: 'static> GossipRegistry<T> {
     /// Clean up actors from peers that have been disconnected for longer than dead_peer_timeout
     /// IMPORTANT: We keep the peer itself to allow reconnection, only clean up their actors
     ///
-    /// SCOPE NOTE (this PR): unchanged from `main`. This PR's own scope is
-    /// connection-scoped ownership release on teardown and `configure_peer`
-    /// atomicity, not dead-peer-timeout reaping -- this function does NOT
+    /// SCOPE NOTE: unchanged from `main`. This function does NOT
     /// release address ownership when a peer times out, and does NOT
     /// re-validate a candidate's liveness/identity between selection and
-    /// destruction. Both are real, separately-tracked gaps (the former is a
+    /// destruction. Both are real, known gaps (the former is a
     /// permanent ownership leak on a dead peer's address with no recovery
-    /// path short of a restart), closed by a follow-up PR that rebuilds this
-    /// function around the `ReapReservation` primitive this PR does add
+    /// path short of a restart) that rebuilding this
+    /// function around the `ReapReservation` primitive
     /// (`RegistryOwnerHandle::reserve_for_reap`/`try_consume`) -- see that
-    /// primitive's own doc comment. Left untouched here deliberately, not
-    /// overlooked: rebuilding this function is exactly the reap-atomicity
-    /// work that follow-up PR is scoped around, and does not belong split
-    /// across two PRs.
+    /// primitive's own doc comment -- would close, as a dedicated piece of
+    /// structural work tracked separately from ownership-release-on-teardown
+    /// and `configure_peer` atomicity.
     pub async fn cleanup_dead_peers(&self) {
         let current_time = current_timestamp();
         let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
@@ -11717,8 +11608,8 @@ impl<T: 'static> GossipRegistry<T> {
     }
 }
 
-/// P1 finding (review round against `ded8495`, `registry.rs:4664`):
-/// `configure_peer` used to carry `where T: Send + Sync + Clone`, narrower
+/// An earlier version of
+/// `configure_peer` carried `where T: Send + Sync + Clone`, narrower
 /// than `main`'s actual public surface -- every `T: 'static` is callable
 /// there. Compile-time proof this is fixed, not a runtime test: a function
 /// generic over ONLY `T: 'static` (the impl block's own bound, nothing
@@ -15322,8 +15213,8 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against 09f6a7e, `registry.rs:5469`):
-    /// positive bookkeeping used to be applied to every alias in
+    /// An earlier version applied
+    /// positive bookkeeping to every alias in
     /// `recovered_routes` (both `conn.addr` and, when it differed, the
     /// separately-resolved `configured_addr`), not just the one address
     /// this call's own resolution actually settled on
@@ -15460,13 +15351,12 @@ mod tests {
         );
     }
 
-    /// P1 regression history, since superseded (review round against
-    /// `f64f3a9`): two earlier rounds fixed `connect_to_peer`'s handling of
+    /// Earlier fixes to `connect_to_peer`'s handling of
     /// an INBOUND connection resolved at a raw, ephemeral transport source
     /// different from the peer's configured/advertised address -- first
     /// making `gossip_state`'s insert key the configured address rather
     /// than the ephemeral one, then making the function's OWN return value
-    /// agree. Both of those fixes still inserted a fresh, zero-failure
+    /// agree -- both still inserted a fresh, zero-failure
     /// `gossip_state` entry for the configured address and returned it
     /// wrapped in a (dialable) `ResolvedRoute` -- marking it reachable
     /// purely because the SAME identity happened to have an unrelated
@@ -15480,8 +15370,7 @@ mod tests {
     /// never a `ResolvedRoute` (which would misrepresent the configured
     /// address as "genuinely reached" -- see that type's own contract).
     /// The ephemeral connection source still never gains an ordinary
-    /// `gossip_state` entry either, preserving the ORIGINAL #181-era
-    /// concern this test traces back to.
+    /// `gossip_state` entry either.
     #[tokio::test]
     async fn connect_to_peer_reusing_an_ephemeral_inbound_source_does_no_bookkeeping_for_either_address()
      {
@@ -15571,9 +15460,9 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against `f64f3a9`, `registry.rs:5465`):
-    /// reusing an existing INBOUND connection at A for a required route B
-    /// used to be treated the same as a genuine dial of B, because
+    /// Reusing an existing INBOUND connection at A for a required route B
+    /// must not be treated the same as a genuine dial of B: an earlier
+    /// version did, because
     /// `dialed_outbound` being false made this branch fall back to
     /// `ResolvedRoute::from_configured(B)`, which was unconditionally
     /// `dialable: true` regardless of how it got there. Worst for the
@@ -15711,8 +15600,8 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against 6b056ae, `registry.rs:5417`): the
-    /// error arm used to update an EXISTING `PeerInfo` entry only
+    /// An earlier version of the
+    /// error arm updated an EXISTING `PeerInfo` entry only
     /// (`gossip_state.peers.get_mut(&addr)`), so the FIRST-EVER failed
     /// `connect_to_peer` for a brand-new required peer recorded nothing at
     /// all -- no entry, no failure state, no backoff. That is a functional
@@ -15786,15 +15675,14 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against `7cbd1be`, `registry.rs:5507`):
     /// `connect_to_peer`'s signature changing from `Result<()>` to
-    /// `(Option<AttemptedRoute>, Result<ConnectOutcome>)`, in an earlier
-    /// round of this PR, broke `.await?`, `.await.unwrap()`, and direct
+    /// `(Option<AttemptedRoute>, Result<ConnectOutcome>)` would
+    /// break `.await?`, `.await.unwrap()`, and direct
     /// returns for any downstream caller of `GossipRegistry::connect_to_
-    /// peer` directly -- this crate's OWN tests needed mechanical `.await.1`
-    /// edits to keep compiling, which is exactly the signal that the
-    /// PUBLIC contract had changed underneath existing callers. Settled on
-    /// #183 for the identical shape of tension elsewhere: the public
+    /// peer` directly -- this crate's OWN tests needing mechanical `.await.1`
+    /// edits to keep compiling would be exactly the signal that the
+    /// PUBLIC contract had changed underneath existing callers. Resolved
+    /// the same way as an identical shape of tension elsewhere: the public
     /// signature stays `Result<()>`; the richer tuple lives under a
     /// distinct, `pub(crate)` name (`connect_to_peer_with_outcome`) for
     /// the internal callers that actually need the attempted/resolved
@@ -23300,7 +23188,8 @@ mod tests {
         );
     }
 
-    /// PR #178's connection-scoped receipts lived in a plain map mutated by
+    /// An earlier design kept connection-scoped receipts in a plain map
+    /// mutated by
     /// each caller after its own claim round-trip to the owner actor
     /// returned, with no coordination between two concurrent callers. Two
     /// genuinely concurrent claims for the same peer+address from different
@@ -23383,7 +23272,8 @@ mod tests {
         }
     }
 
-    /// The second interleaving PR #178 could hit: a session's exit racing a
+    /// The second interleaving that same earlier design could hit: a
+    /// session's exit racing a
     /// brand-new claim for the very same peer+address. Under the unsynced
     /// map, the exit's take-then-compare-and-remove could lose to the
     /// concurrent claim's generation bump and leave a receipt behind for a
@@ -23477,32 +23367,28 @@ mod tests {
 
 
 
-    /// P1 regression: the reservation's decision used to be bound only to
+    /// The reservation's decision must not be bound only to
     /// (address, evidence_before) -- the causal fence -- never to the PEER
-    /// IDENTITY selection actually captured. If the old owner is released
+    /// IDENTITY a caller's selection actually captured. If the old owner is
+    /// released
     /// and a DIFFERENT peer claims or is configured onto that same
     /// address after selection but before the reserve command, the
     /// causal fence alone does not notice: a plain gossip/discovery claim
     /// or an operator `configure_peer`, unlike a connection-scoped claim,
     /// deliberately do NOT refresh `claim_committed_at` (see `claim`'s
-    /// own doc comment). The reservation was still granted, and
-    /// `cleanup_dead_peers`'s destructive work would then run against the
-    /// actors, capabilities, and clock state belonging to the NEW owner,
-    /// not the dead peer selection actually meant to reap.
-    /// `release_dead_peer`'s later peer-id check protects OWNERSHIP from
-    /// being wrongly retracted, but by then the actor/capability/
-    /// clock-state destruction the reservation authorized has already
-    /// happened -- it cannot be undone.
+    /// own doc comment). Granting the reservation anyway would authorize a
+    /// caller's later destructive work to run against the actors,
+    /// capabilities, and clock state belonging to the NEW owner, not the
+    /// dead peer the selection actually meant to act on.
     ///
     /// Constructs the scenario deterministically rather than racing it:
-    /// the real selection-to-reservation window inside
-    /// `cleanup_dead_peers` has no `.await` point at all between reading
-    /// `gossip_state` and submitting the reserve command, so nothing can
-    /// reliably be made to land inside it via ordinary task scheduling
-    /// (the same reason the sibling test above drives the reservation by
-    /// hand instead of trying to hit a precise window in the real
-    /// function). Captures the identity `cleanup_dead_peers`'s own
-    /// selection would observe for `addr` at the moment it would run --
+    /// a real selection-to-reservation window has no `.await` point at all
+    /// between reading `gossip_state` and submitting the reserve command,
+    /// so nothing can reliably be made to land inside it via ordinary task
+    /// scheduling (the same reason the sibling test above drives the
+    /// reservation by hand instead of trying to hit a precise window in a
+    /// real caller). Captures the identity a selection pass would observe
+    /// for `addr` at the moment it would run --
     /// unowned, unpinned, since this dead peer is only ever known through
     /// `GossipState`, never through an owner-level claim, exactly as a
     /// peer that announced itself over gossip but never actually
@@ -23659,8 +23545,7 @@ mod tests {
         fresh_reservation.expect("checked above").release().await;
     }
 
-    /// P1 finding (review round against `a147603`, `registry.rs:8653`):
-    /// selection reads `GossipState`'s `node_id` and the owner's
+    /// Selection reads `GossipState`'s `node_id` and the owner's
     /// `ownership_token`/`pin_owner` from two entirely independent
     /// synchronization domains, and used to never check they describe the
     /// SAME peer. If a NEW claim commits for `addr` while a candidate's
@@ -23856,15 +23741,15 @@ mod tests {
     }
 
 
-    /// P1 regression: `configure_peer` used to collapse
+    /// `configure_peer` must not collapse
     /// `ClaimRejection::ReapInProgress` -- a TEMPORARY refusal, since
     /// another caller currently holds a short-lived reap reservation for
     /// the address -- into the SAME
     /// `AddrClaimOutcome::Rejected` a genuine, PERMANENT arbitration loss
-    /// produces, logged it, and returned `()`. An operator's explicit
-    /// configuration lost a race against a reservation that would very
-    /// likely have cleared moments later, and had absolutely no way to
-    /// tell anything had gone wrong.
+    /// produces, log it, and return `()`. An operator's explicit
+    /// configuration losing a race against a reservation that would very
+    /// likely clear moments later must not leave the caller with
+    /// absolutely no way to tell anything went wrong.
     ///
     /// Proves the fix: holds a reap reservation on `connect_addr` for the
     /// ENTIRE duration of a `configure_peer` call -- long enough to exhaust
@@ -23944,20 +23829,17 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against `ba2bff2`, `registry.rs:4553`):
-    /// restoring `configure_peer`'s public signature to `()` (per the
-    /// PREVIOUS round's finding) discarded a real failure signal, since the
-    /// OLD retry budget (`ClaimRejection::ReapInProgress`, 5 attempts x
-    /// 20ms =~ 100ms) was short enough that ordinary actor cleanup or
+    /// Restoring `configure_peer`'s public signature to `()` discards a
+    /// real failure signal if the retry budget behind it (`ClaimRejection::
+    /// ReapInProgress`) is short enough that ordinary actor cleanup or
     /// `gossip_state` contention during a reap sweep's destructive phase
     /// could routinely outlast it -- silently discarding an operator's
     /// explicit configuration.
     ///
-    /// P1 finding, next round (review round against `aea7772`,
-    /// `registry.rs:4664`): the fix for that -- a wider, still-bounded
-    /// retry budget plus `Result<(), ConfigurePeerRejection>` -- was itself
+    /// A wider, still-bounded
+    /// retry budget plus `Result<(), ConfigurePeerRejection>` is itself
     /// wrong, for source-compatibility reasons (see `configure_peer`'s own
-    /// doc comment). Reverted to `()`, and the guarantee moved from "a
+    /// doc comment): `()`, unchanged from `main`, is the right signature, and the guarantee moves from "a
     /// single attempt's typed result" to "the request is queued for
     /// background retry until it applies" -- see `configure_peer`'s and
     /// `queue_configure_peer_until_applied`'s own doc comments.
@@ -24053,14 +23935,13 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against `3f9db18`, `registry.rs:4699`):
-    /// `queue_configure_peer_until_applied` had no way to tell whether a
-    /// LATER `configure_peer` call for the same peer had already
+    /// `queue_configure_peer_until_applied` must be able to tell whether a
+    /// LATER `configure_peer` call for the same peer has already
     /// superseded it. Configure P at A (A is reap-reserved, so this call
     /// exhausts its synchronous budget and queues a background retry for
     /// A), then reconsider and configure P at B instead (B is free, so
     /// this succeeds immediately): once A's reservation finally clears,
-    /// the STALE queued retry used to still win the race and evict the
+    /// the STALE queued retry must not win the race and evict the
     /// operator's own newer, deliberate B decision.
     ///
     /// Proves the fix: after the newer B call succeeds, releases A's
@@ -24151,14 +24032,13 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against `7739717`, `registry.rs:5163`):
     /// `configure_peer_with_outcome_and_generation`'s OWN internal retry
     /// loop (retrying a SINGLE call against `ClaimRejection::
-    /// ReapInProgress`) used to pass the FUNCTION's `expected_generation`
+    /// ReapInProgress`) must not pass the FUNCTION's `expected_generation`
     /// parameter unchanged to every sub-attempt. Entered with `None` (a
-    /// peer's first `configure_peer` call, the ordinary case), every
+    /// peer's first `configure_peer` call, the ordinary case), if every
     /// sub-attempt -- not just the first -- told the owner "always
-    /// proceed, bump fresh": a stale sub-attempt could bump PAST a
+    /// proceed, bump fresh", a stale sub-attempt could bump PAST a
     /// genuinely newer, unrelated `configure_peer` call for the SAME peer
     /// that committed while the stale one was sleeping between its own
     /// internal retries, and win, evicting the newer call's pin. This is
@@ -24267,7 +24147,7 @@ mod tests {
         );
     }
 
-    /// P2 regression: two concurrent `configure_peer` calls for the SAME
+    /// Two concurrent `configure_peer` calls for the SAME
     /// peer, each reconfiguring to a DIFFERENT new address, must never leave
     /// the owner's pin and `ConnectionPool`'s configured/required route
     /// disagreeing about which address is current for this peer. Before
@@ -24375,9 +24255,9 @@ mod tests {
         }
     }
 
-    /// P2 regression: `configure_peer` used to serialize its whole
+    /// `configure_peer` must not serialize its whole
     /// sequence -- including the call into `handle_peer_connect(...).await`
-    /// -- behind a per-peer `tokio::sync::Mutex`. `PeerConnectHandler` is a
+    /// -- behind a per-peer `tokio::sync::Mutex`: `PeerConnectHandler` is a
     /// public, unrestricted async callback; a handler that calls
     /// `configure_peer` again for the SAME peer from within its own
     /// callback deadlocks on that non-reentrant lock -- the outer call can
@@ -24483,7 +24363,7 @@ mod tests {
     }
 
 
-    /// P1 regression: the atomic owner transaction only makes the COMMIT
+    /// The atomic owner transaction only makes the COMMIT
     /// serial; `configure_peer`'s own follow-up work (reindexing the
     /// connection pool, notifying the connect handler) runs after the
     /// transaction returns and is not itself serialized. A call whose pin
@@ -24491,7 +24371,7 @@ mod tests {
     /// still resume last and act on its now-losing address, with the owner
     /// and the configured route both already pointing at the winner.
     ///
-    /// Exercises the exact ordering the finding describes -- NOT a race
+    /// Exercises the exact ordering described above -- NOT a race
     /// that merely happens to reproduce it -- by driving the two halves of
     /// `configure_peer` by hand: the first call's owner transaction is
     /// forced to complete (and be evicted) BEFORE the second, winning call
@@ -24555,8 +24435,7 @@ mod tests {
         );
     }
 
-    /// P1 regression (finding 2 of the round that removed `configure_peer`'s
-    /// per-peer lock): whatever closes the race for a concurrent
+    /// Whatever closes the race for a concurrent
     /// `configure_peer` call (the sibling test above) must also close it
     /// for a concurrent `migrate` -- a DNS re-resolution can move this
     /// peer's pin just as easily as another `configure_peer` call can.
@@ -24630,7 +24509,7 @@ mod tests {
         );
     }
 
-    /// P1 regression companion: the fence must answer "did I lose the
+    /// The fence must answer "did I lose the
     /// configuration", not "has anything at all touched this address
     /// since". Every accepted claim for an address -- including ordinary
     /// gossip/discovery chatter re-announcing the SAME identity, which
@@ -24697,7 +24576,7 @@ mod tests {
         );
     }
 
-    /// P1 regression, second attempt at the same fence: `ConnectionPool`'s
+    /// Same fence, different source of unrelated churn: `ConnectionPool`'s
     /// `required_addr` is not authoritative for the pin either -- it is
     /// written by every ordinary `.connect()` call, configured or not (see
     /// `PeerRegistryOwner::operator_pinned`'s doc comment), entirely
@@ -24761,9 +24640,9 @@ mod tests {
         );
     }
 
-    /// P1 regression: `configure_peer` used to read `ConnectionPool`'s
-    /// `get_required_peer_addr` BEFORE its owner transaction, and -- once
-    /// the transaction returned -- best-effort-release that address if it
+    /// `configure_peer` must not read `ConnectionPool`'s
+    /// `get_required_peer_addr` BEFORE its owner transaction and -- once
+    /// the transaction returns -- best-effort-release that address if it
     /// differed from `connect_addr` and from whatever the owner's OWN
     /// transaction actually evicted. `required_addr` is not pin state: it
     /// is also written by any ordinary `.connect()` call for a required
@@ -24853,7 +24732,7 @@ mod tests {
         );
     }
 
-    /// P1 regression: an ordinary `.connect()` call (`Peer::connect`, via
+    /// An ordinary `.connect()` call (`Peer::connect`, via
     /// `connect_with_route_mode`) writes `ConnectionPool`'s
     /// required/configured route directly -- the SAME fields
     /// `RoutingPublisher::set_configured_peer_addr`'s trait impl writes
@@ -24917,9 +24796,8 @@ mod tests {
         );
     }
 
-    /// P1 regression, 7th iteration of this class on this PR:
-    /// `set_ordinary_connect_route`'s acceptance boolean (fixed last round
-    /// so a DECLINE is no longer silently treated as success) is still
+    /// `set_ordinary_connect_route`'s acceptance boolean (a DECLINE must
+    /// not be silently treated as success) is still
     /// only accurate at the instant the owner command executes. If it
     /// accepts B, and a CONCURRENT `configure_peer` then pins the peer to
     /// A before `connect_with_route_mode` gets to `connect_to_peer`,
@@ -24933,10 +24811,9 @@ mod tests {
     ///
     /// Fixed by having `connect_to_peer` report the address it ACTUALLY
     /// resolved and attributing every outcome to THAT address, never to
-    /// whatever the caller originally intended -- no fence, because the
-    /// fence would just be an eighth variant of the same "check, then
-    /// trust it later" shape every other race on this PR has broken
-    /// through.
+    /// whatever the caller originally intended -- no fence, because a
+    /// fence would just be another variant of the same "check, then
+    /// trust it later" shape that recurs throughout this file.
     ///
     /// Constructs the exact window deterministically: holds `gossip_state`'s
     /// lock so the spawned ordinary connect completes its route write
@@ -25121,9 +24998,9 @@ mod tests {
         );
     }
 
-    /// P2 regression: `configure_peer` early-returned on `outcome ==
+    /// `configure_peer` must not early-return on `outcome ==
     /// Rejected` BEFORE applying the evicted pin's ownership-watermark
-    /// tombstone. `Rejected` and `Some(evicted_release)` genuinely co-occur:
+    /// tombstone: `Rejected` and `Some(evicted_release)` genuinely co-occur.
     /// the owner's atomic transaction can accept the claim and evict+release
     /// the peer's previous pin while THIS call's own projection of its claim
     /// into `gossip_state` is separately rejected as stale, because a
@@ -25240,8 +25117,8 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against `7cbd1be`, `registry.rs:4655`): the
-    /// dialability-confirmed write used to run unconditionally, with no
+    /// The
+    /// dialability-confirmed write must not run unconditionally, with no
     /// check that nothing repinned `connect_addr` in the window between
     /// the owner transaction committing and this `gossip_state`
     /// acquisition actually running. A concurrent `configure_peer` that
@@ -25392,10 +25269,9 @@ mod tests {
     }
 
 
-    /// P1 finding (review round against `ba2bff2`, `registry_owner.rs:615`):
-    /// configured addresses get reindexed into `ConnectionPool`'s
-    /// `connections_by_addr`, but the atomic pin-replacement path used to
-    /// release an evicted address's OWNERSHIP without removing that
+    /// Configured addresses get reindexed into `ConnectionPool`'s
+    /// `connections_by_addr`, but the atomic pin-replacement path must not
+    /// release an evicted address's OWNERSHIP without also removing that
     /// address's `connections_by_addr` alias. Configure a live peer P at A,
     /// then at B: A becomes claimable by peer Q while `connections_by_addr
     /// [A]` still points at P's own, still-live connection. A lookup for Q
@@ -25409,7 +25285,7 @@ mod tests {
     /// state: traffic addressed to Q would be delivered over P's actual
     /// TCP connection.
     ///
-    /// P1 finding, second pass (review round against `aea7772`): the first
+    /// An earlier
     /// version of this test built P's connection at a THIRD address,
     /// distinct from both A and B, to prove `evict_pin_alias` does not
     /// over-remove a "genuine transport-source" entry. That carve-out

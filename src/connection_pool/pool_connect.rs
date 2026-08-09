@@ -450,17 +450,14 @@ impl<T> ConnectionPool<T> {
     /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`, if
     /// any -- called synchronously from `RoutingPublisher::
     /// set_configured_peer_addr` when a SAME-command pin decision moves
-    /// `peer_id`'s pin AWAY from `evicted_addr`. See that trait method's
-    /// own doc comment for the P1 finding this closes (review round
-    /// against `ba2bff2`, `registry_owner.rs:615`): traffic addressed to a
-    /// DIFFERENT identity that later claims `evicted_addr` was being
-    /// delivered over THIS peer's still-live connection, because nothing
-    /// ever removed the alias `reindex_connection_addr` installed for it
-    /// when it was still this peer's pin.
+    /// `peer_id`'s pin AWAY from `evicted_addr`. Without this, traffic
+    /// addressed to a DIFFERENT identity that later claims `evicted_addr`
+    /// would be delivered over THIS peer's still-live connection, because
+    /// nothing else removes the alias `reindex_connection_addr` installed
+    /// for it when it was still this peer's pin.
     ///
-    /// P1 history, this same finding, second pass (review round against
-    /// `aea7772`): the first version of this function ALSO kept the alias
-    /// when `evicted_addr == connection.addr` (the connection's own
+    /// An earlier version of this function ALSO kept the alias when
+    /// `evicted_addr == connection.addr` (the connection's own
     /// dial-target/observed-source address), reasoning that a "genuine
     /// transport-source" entry must survive independent of pin state. That
     /// carve-out preserved exactly the case that matters most: for an
@@ -471,9 +468,6 @@ impl<T> ConnectionPool<T> {
     /// every time, leaving `connections_by_addr[A]` resolving to P's live
     /// connection after Q legitimately claimed A -- the exact misdelivery
     /// this function exists to prevent, reintroduced by its own exception.
-    /// (The regression test that shipped alongside it used a THIRD address
-    /// for the connection's own address, distinct from both pin addresses,
-    /// which cannot exercise this path at all.)
     ///
     /// The correct distinction is not "is this a transport-source entry"
     /// -- it is "may a lookup keyed by address alone still reach this
@@ -2792,8 +2786,8 @@ impl<T> ConnectionPool<T> {
         // to `connection`, and only afterward (past a log line and a
         // lifecycle-event construction — a real gap) stores `None`
         // unconditionally. A fresh publish for this peer landing in that gap
-        // was clobbered — the exact collateral-teardown/reconnect-thrash race
-        // this PR closes, reopened through this one call site. The CAS
+        // was clobbered — a collateral-teardown/reconnect-thrash race
+        // reopened through this one call site. The CAS
         // closes the gap completely: it either finds `connection` still
         // installed and atomically clears it, or finds something else — a
         // concurrent publish already superseded it — and leaves the slot
@@ -3651,17 +3645,17 @@ impl<T> ConnectionPool<T> {
         //    risks it returning the brand new connection as its own
         //    "existing rival" — capturing the snapshot before the candidate
         //    is indexed closes that.
-        // 2. (reviewer finding P1, this fix) `get_connection_by_peer_id` is
-        //    ALSO not pure with respect to the candidate's own peer session:
-        //    when the primary slot holds an unusable connection it
-        //    self-heal-clears it as a side effect of being READ. A decision
-        //    snapshot must never mutate — if a PREFERRED inbound is
-        //    published for this peer in the internal check-then-clear gap of
-        //    that self-heal, the unconditional clear erases the fresh
-        //    session, `existing_before` comes back `None`, and the decision
-        //    below proceeds as if there were no rival at all, recreating the
-        //    exact collateral teardown this PR removes. A pure snapshot can
-        //    never trigger that clear in the first place, mutation or not.
+        // 2. `get_connection_by_peer_id` is ALSO not pure with respect to the
+        //    candidate's own peer session: when the primary slot holds an
+        //    unusable connection it self-heal-clears it as a side effect of
+        //    being READ. A decision snapshot must never mutate — if a
+        //    PREFERRED inbound is published for this peer in the internal
+        //    check-then-clear gap of that self-heal, the unconditional clear
+        //    erases the fresh session, `existing_before` comes back `None`,
+        //    and the decision below proceeds as if there were no rival at
+        //    all, recreating the exact collateral teardown this fixes. A
+        //    pure snapshot can never trigger that clear in the first place,
+        //    mutation or not.
         //
         // Capturing the rival here, while the candidate is still unindexed
         // and via a snapshot that cannot itself mutate anything, guarantees
@@ -4415,10 +4409,8 @@ pub(crate) fn handle_incoming_message(
                     "received delta gossip message on bidirectional connection"
                 );
 
-                // P1 finding (review round against `7739717`,
-                // `connection_pool/pool_connect.rs:4580`): unlike the
-                // `FullSync` arm just below (which has always checked
-                // this), this arm never verified `delta.sender_peer_id`
+                // Unlike the `FullSync` arm just below (which has always
+                // checked this), this arm never verified `delta.sender_peer_id`
                 // -- a SELF-REPORTED wire field, not an authority for
                 // identity, see `authenticated_peer_id`'s own doc comment
                 // above -- against the connection's actual authenticated

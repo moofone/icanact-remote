@@ -1660,7 +1660,7 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
 }
 
-/// P1 regression: two prior versions of `configure_peer`'s follow-up
+/// Earlier versions of `configure_peer`'s follow-up
 /// checked the pin, then separately (even if compare-and-applied against
 /// a dedicated mirror updated in the same owner command) mutated
 /// `ConnectionPool`'s index. Neither was actually atomic WITH the owner's
@@ -6968,8 +6968,7 @@ async fn delta_gossip_updates_last_response_received_ms() {
     );
 }
 
-/// P1 finding (review round against `7739717`,
-/// `connection_pool/pool_connect.rs:4580`): the `DeltaGossip` arm never
+/// The `DeltaGossip` arm never
 /// verified `delta.sender_peer_id` -- a SELF-REPORTED wire field, not an
 /// authority for identity -- against the connection's actual authenticated
 /// identity, unlike the `FullSync` arm right below it. An authenticated
@@ -9666,19 +9665,19 @@ fn hi_lo_keypairs(a: &str, b: &str) -> (crate::KeyPair, crate::KeyPair) {
     }
 }
 
-/// RED (review finding P1, outbound-finalize `AcceptIncoming` publish gap
-/// AND its CAS-lost re-resolve reject arm): when `existing_before` is `None`
+/// Exercises the outbound-finalize `AcceptIncoming` publish gap and its
+/// CAS-lost re-resolve reject arm: when `existing_before` is `None`
 /// at snapshot time, the outbound-finalize decision is unconditionally
 /// `AcceptIncoming`. That decision is enacted via
 /// `publish_outbound_or_reresolve`'s compare-and-publish against the
 /// `existing_before` snapshot — never an unconditional publish — so a
 /// PREFERRED rival published for the same peer in the gap between that
-/// snapshot and this call is never silently overwritten (the original P1
-/// finding this test's name references). This test's remote peer / local
-/// identity ordering additionally makes the re-resolved, address-blind
-/// tie-break come back `RejectIncoming` against that concurrently published
-/// rival (the rival is INBOUND and preferred; this candidate is OUTBOUND and
-/// not) — the SECOND half of the P1 finding: before the fix,
+/// snapshot and this call is never silently overwritten. This test's remote
+/// peer / local identity ordering additionally makes the re-resolved,
+/// address-blind tie-break come back `RejectIncoming` against that
+/// concurrently published rival (the rival is INBOUND and preferred; this
+/// candidate is OUTBOUND and not) — a second failure mode this test also
+/// covers: before the fix,
 /// `publish_outbound_or_reresolve`'s `RejectIncoming`/
 /// `EvictStaleRejectIncoming` re-resolve arms only `debug!`-logged and
 /// returned `()`, so `finalize_new_outbound_connection` fell straight
@@ -11563,8 +11562,8 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
     );
 }
 
-/// Reviewer finding (P2, `remove_connection_instance_by_id`'s defensive
-/// current-session clear): the stale-instance cleanup path called
+/// `remove_connection_instance_by_id`'s defensive
+/// current-session clear: the stale-instance cleanup path called
 /// `clear_current_peer_connection_if_matches`, which is a genuine
 /// check-then-act pair — it reads the peer session's current connection,
 /// `Arc::ptr_eq`-compares it against the retiring instance, and only THEN
@@ -11576,9 +11575,9 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
 /// stale instance still current, but before the unconditional store — is
 /// clobbered: the fresh session is erased and its `connections_by_peer` entry
 /// removed, even though the cleanup was only ever supposed to retire the
-/// stale, already-superseded instance. This is exactly the
-/// collateral-teardown/reconnect-thrash race this PR closes, reopened through
-/// this one remaining check-then-clear call site.
+/// stale, already-superseded instance. This is the same
+/// collateral-teardown/reconnect-thrash race class closed elsewhere in this
+/// file, reopened through this one remaining check-then-clear call site.
 ///
 /// Rather than chase the check-then-clear gap with a wall-clock OS-thread
 /// race (unreliable here: `remove_connection_instance_by_id` does real

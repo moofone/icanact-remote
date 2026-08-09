@@ -828,7 +828,7 @@ impl<T: 'static> Peer<T> {
         self.connect_with_route_mode(addr, false).await
     }
 
-    /// P1 history: an earlier version of this function attributed the
+    /// An earlier version of this function attributed the
     /// dial's outcome -- healthy/gossiped on success, failed on error -- to
     /// `addr`, the address the CALLER asked for, regardless of what was
     /// actually contacted. `set_ordinary_connect_route`'s acceptance
@@ -841,8 +841,8 @@ impl<T: 'static> Peer<T> {
     /// advertising a route this node never actually contacted, or (on
     /// failure) recording a spurious failure for an address nothing ever
     /// touched. Fencing that gap (a token, a generation, a re-check) is the
-    /// same shape that has repeatedly left a residual window on this PR;
-    /// this function instead attributes every outcome to whatever
+    /// same shape that has repeatedly left a residual window elsewhere in
+    /// this crate; this function instead attributes every outcome to whatever
     /// `connect_to_peer` reports it ACTUALLY resolved (`effective_addr`
     /// below), which it re-derives fresh at the moment it runs rather than
     /// trusting anything observed earlier -- so no interleaving can produce
@@ -850,7 +850,7 @@ impl<T: 'static> Peer<T> {
     /// happened.
     ///
     /// That fix made the OUTCOME truthful (marking); it did not make the
-    /// ENTRY truthful (existence). A later round found the same acceptance
+    /// ENTRY truthful (existence). The same acceptance
     /// boolean still gated an UNCONDITIONAL `gossip_state.peers.insert`
     /// for `addr`, positioned BEFORE the dial: the exact same concurrent
     /// `configure_peer` race left a fresh, zero-failure entry for `addr`
@@ -1120,8 +1120,8 @@ impl<T: 'static> Peer<T> {
                     // call never actually verified anything about -- the
                     // same confusion between "the address we looked up"
                     // and "the socket this connection happens to be on"
-                    // that #181 (and `connect_to_peer`'s own alias
-                    // handling) exists to avoid; see
+                    // that `connect_to_peer`'s own alias
+                    // handling exists to avoid; see
                     // `PeerInfo::for_connect_attempt`'s doc comment.
                     //
                     // The discovered/non-required path above always
@@ -1850,7 +1850,7 @@ mod tests {
         assert!(matches!(err, GossipError::Network(_)));
     }
 
-    /// P1 regression: an EARLIER version of `Peer::connect`'s ordinary
+    /// An EARLIER version of `Peer::connect`'s ordinary
     /// route update read `RegistryOwnerHandle::pinned_addr_for` and THEN
     /// wrote `ConnectionPool::set_configured_peer_addr` as a separate
     /// step. Even held as tightly together as possible on the caller's
@@ -1974,7 +1974,7 @@ mod tests {
         }
     }
 
-    /// P1 regression history: `connect_with_route_mode` originally
+    /// `connect_with_route_mode` originally
     /// discarded `RegistryOwnerHandle::set_ordinary_connect_route`'s
     /// return value entirely, unconditionally inserting the REQUESTED
     /// address into `gossip_state` and marking it healthy on a dial that
@@ -2054,7 +2054,7 @@ mod tests {
         );
     }
 
-    /// P1 regression: the outcome-attribution fix above (a round earlier)
+    /// The outcome-attribution fix above
     /// made MARKING truthful -- health/failure keyed to the address a dial
     /// actually resolved -- but the entry's very EXISTENCE was still gated
     /// on `route_accepted`, a fact only valid at the instant the owner
@@ -2170,8 +2170,7 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against a3301b9, `lib.rs:1097`): the
-    /// discovered-connect success arm explicitly acknowledges
+    /// The discovered-connect success arm explicitly acknowledges
     /// `effective_addr != *addr` is possible (`get_connection` can resolve
     /// an already-published connection for the SAME peer identity at a
     /// DIFFERENT address than the one this call actually asked for --
@@ -2305,30 +2304,26 @@ mod tests {
         );
     }
 
-    /// P1 finding (review round against 4c41300, `lib.rs:1058`): the
-    /// discovered path converted `get_connection`'s resolved handle into a
-    /// `ResolvedRoute` from `conn.addr` alone, discarding the connection's
-    /// direction entirely. If `get_connection` reuses an INBOUND
-    /// connection for the same identity (the same tie-break-reuse
+    /// The discovered path used to convert `get_connection`'s resolved
+    /// handle into a `ResolvedRoute` from `conn.addr` alone, discarding the
+    /// connection's direction entirely. If `get_connection` reuses an
+    /// INBOUND connection for the same identity (the same tie-break-reuse
     /// mechanism `connect_discovered_marks_the_address_actually_resolved_
     /// not_the_bare_request` above exercises for an outbound connection,
     /// here with the ordering flipped so the tie-break keeps the INBOUND
     /// side instead), `conn.addr` is that connection's raw, ephemeral
     /// transport source -- and the later insert built a normal `PeerInfo`
     /// with `transport_source_keyed = false`, making an undialable address
-    /// selectable and gossipable. This is #181's subject matter reaching
-    /// the crate a fourth time (#181 twice, `connect_to_peer` in an
-    /// earlier round of this PR, and here) -- fixed not by patching this
+    /// selectable and gossipable. Fixed not by patching this
     /// site but by tightening `ResolvedRoute` itself. Its only constructor
     /// is now the `pub(crate)` `from_connection` (requires the
     /// connection's OWN direction, independently looked up -- an inbound
     /// source can only ever produce a route flagged as unverified). A
     /// second, unconditionally-`dialable: true` constructor,
     /// `from_configured`, existed for a while for `connect_to_peer`'s own
-    /// required-peer path, but was itself deleted in a later round (review
-    /// round against `f64f3a9`) once its "trusted independent of
-    /// connection direction" premise turned out not to hold for a
-    /// caller-provided address either -- see `ConnectOutcome`'s own doc
+    /// required-peer path, but was itself deleted once its "trusted
+    /// independent of connection direction" premise turned out not to hold
+    /// for a caller-provided address either -- see `ConnectOutcome`'s own doc
     /// comment. That case (a live connection exists, but nothing
     /// corroborates any address as dialable) is represented by
     /// `ConnectOutcome::ConnectedUnverified` now, a value that never wraps
