@@ -2426,6 +2426,22 @@ impl PeerRegistryOwner {
         // for one peer (see `pin`'s doc comment).
         let migrated_pin = self.operator_pinned.remove(&from);
         if let Some(pinned_peer) = migrated_pin.clone() {
+            // If a DIFFERENT peer was already pinned at `to` (a standalone
+            // pin the migrating peer's own pin is about to displace), its
+            // reverse entry must be dropped too -- the same
+            // `operator_pinned`/`pinned_by_peer` desync `install_pin`
+            // guards against for its own overwrite, one function over: see
+            // its own doc comment for the full reasoning.
+            let stale_destination_occupant = self
+                .operator_pinned
+                .get(&to)
+                .filter(|occupant| **occupant != pinned_peer)
+                .cloned();
+            if let Some(occupant) = stale_destination_occupant
+                && self.pinned_by_peer.get(&occupant) == Some(&to)
+            {
+                self.pinned_by_peer.remove(&occupant);
+            }
             self.operator_pinned.insert(to, pinned_peer.clone());
             self.pinned_by_peer.insert(pinned_peer.clone(), to);
             // The pin's `ConnectionPool` route must move with it in this
@@ -4489,6 +4505,62 @@ mod tests {
             Some(a),
             "Q's pin at A must survive P being pinned elsewhere -- A was never P's own \
              address to evict"
+        );
+    }
+
+    /// Same `operator_pinned`/`pinned_by_peer` desync as `install_pin`'s
+    /// own overwrite, one function over: `migrate` carrying a pin onto a
+    /// DIFFERENT peer's already-pinned destination must drop that peer's
+    /// reverse entry too, or its own ordinary route updates are wrongly
+    /// refused afterward, and a later pin for it can evict the
+    /// destination and clobber the migrated pin there.
+    #[tokio::test]
+    async fn migrate_drops_the_destinations_previous_occupants_reverse_entry_on_conflict() {
+        let (owner, _publisher) = owner_handle();
+        let p = peer("mig-pin-p");
+        let q = peer("mig-pin-q");
+        let from = addr(30_470);
+        let to = addr(30_471);
+        let elsewhere = addr(30_472);
+
+        // Q is pinned at `to`, independent of ownership -- exactly what
+        // the standalone `pin` API allows for an otherwise-unowned
+        // address.
+        owner.pin(to, q.clone()).await;
+
+        // P owns and is pinned at `from`.
+        let outcome = owner.configure_peer(from, p.clone(), None).await;
+        assert!(
+            outcome.claim.is_accepted(),
+            "sanity: P's claim and pin at from must succeed"
+        );
+        let source = current_source(&owner, from);
+
+        // `from` migrates to `to`, carrying P's pin onto Q's
+        // already-pinned destination.
+        let result = owner.migrate(from, to, source, false).await;
+        assert!(
+            result.moved(),
+            "sanity: migrate must succeed onto an otherwise-unowned destination"
+        );
+
+        // The observable consequence: Q's own ordinary route update must
+        // succeed -- Q is not actually pinned anywhere anymore.
+        assert!(
+            owner.set_ordinary_connect_route(q.clone(), elsewhere).await,
+            "Q's ordinary route update must succeed -- Q is not actually pinned anywhere \
+             after the migrated pin displaced it at the destination"
+        );
+
+        // And a later pin for Q must not evict the destination and
+        // clobber P's migrated pin there.
+        let other = addr(30_473);
+        owner.pin(other, q.clone()).await;
+        assert_eq!(
+            owner.pinned_addr_for(&p),
+            Some(to),
+            "P's migrated pin must survive Q being pinned elsewhere -- the destination was \
+             never Q's own address to evict"
         );
     }
 

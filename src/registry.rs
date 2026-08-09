@@ -2166,6 +2166,15 @@ pub struct GossipRegistry<T = ()> {
 
     /// Injectable DNS resolver used for deterministic tests and uniform reconnect behavior.
     pub dns_resolver: Arc<tokio::sync::RwLock<Arc<dyn crate::dns::DnsResolver>>>,
+
+    /// Detached `configure_peer` retry tasks (`queue_configure_peer_until_
+    /// applied`), tracked so `shutdown` can abort them along with the
+    /// registry's other background work instead of leaving them to run
+    /// out their own bounded retry budget after `shutdown_and_wait` has
+    /// already returned. A dynamic set, not a single slot like
+    /// `discovery_task`: distinct peers can each have their own retry
+    /// in flight at once.
+    configure_peer_retry_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 /// Manual, not derived: `#[derive(Clone)]` would bound EVERY `T` with
@@ -2222,6 +2231,7 @@ impl<T> Clone for GossipRegistry<T> {
             discovery_task: self.discovery_task.clone(),
             peer_gossip_notify: self.peer_gossip_notify.clone(),
             dns_resolver: self.dns_resolver.clone(),
+            configure_peer_retry_tasks: self.configure_peer_retry_tasks.clone(),
         }
     }
 }
@@ -2529,6 +2539,7 @@ impl<T: 'static> GossipRegistry<T> {
                 crate::TokioDnsResolver::default(),
             )
                 as Arc<dyn crate::dns::DnsResolver>)),
+            configure_peer_retry_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         })
     }
 
@@ -4416,9 +4427,15 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Guarantees [`Self::configure_peer`]'s eventual application once its
     /// bounded attempt reported [`ConfigurePeerOutcome::TemporarilyBlocked`].
-    /// Detached `tokio::spawn`, gated on `self.shutdown` so it can't outlive
-    /// `shutdown_and_wait`. Unbounded in attempt count, but can't hang
-    /// forever on a healthy system: a reap reservation always releases.
+    /// Spawned INTO `configure_peer_retry_tasks`, not a bare detached
+    /// `tokio::spawn`: checking `self.shutdown` cooperatively (both here and
+    /// inside every retry sub-attempt) only ever narrows the window a
+    /// shutdown beginning mid-sleep or mid-owner-round-trip can land in, it
+    /// cannot close it -- `shutdown`'s own `abort_all()` on this same set is
+    /// what makes "no configure_peer retry outlives `shutdown_and_wait`" a
+    /// guarantee rather than a probability. Unbounded in attempt count, but
+    /// can't hang forever on a healthy system: a reap reservation always
+    /// releases.
     ///
     /// `my_generation` threads through as `expected_generation` on every
     /// retry, so a LATER `configure_peer` call for the SAME peer that
@@ -4436,7 +4453,17 @@ impl<T: 'static> GossipRegistry<T> {
         }
         let registry = self.clone();
         let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
+        let mut tasks = self
+            .configure_peer_retry_tasks
+            .lock()
+            .expect("configure_peer_retry_tasks mutex");
+        // Opportunistic, non-blocking: reaps whatever already finished
+        // since the last spawn so this set does not grow without bound
+        // over a long-running process. Never blocks waiting for one still
+        // in flight -- `try_join_next` only returns already-completed
+        // entries.
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
             let mut cycle: u64 = 0;
             loop {
                 if shutdown.load(Ordering::Acquire) {
@@ -8620,6 +8647,18 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
             gossip_state.shutdown = true;
         }
+
+        // Abort every in-flight `configure_peer` retry task -- see
+        // `configure_peer_retry_tasks`'s own doc comment for why this, not
+        // the cooperative `self.shutdown` checks inside those tasks, is
+        // what makes "none outlives this call" a guarantee. `abort_all`
+        // does not wait for the aborted tasks to actually stop; nothing
+        // here needs to, since none of them hold a lock or resource this
+        // function's own cleanup below depends on.
+        self.configure_peer_retry_tasks
+            .lock()
+            .expect("configure_peer_retry_tasks mutex")
+            .abort_all();
 
         // Break callback -> client/router -> registry ownership cycles before
         // connection teardown can emit any terminal disconnect notifications.
@@ -23145,6 +23184,66 @@ mod tests {
             recorder.calls.lock().expect("recorder mutex").is_empty(),
             "the connect handler must not be invoked once shutdown has begun, even though the \
              pin itself was applied"
+        );
+    }
+
+    /// A detached retry task's own cooperative `self.shutdown` checks only
+    /// narrow the window a shutdown beginning mid-sleep or
+    /// mid-owner-round-trip can land in -- they cannot close it: after
+    /// waking from its backoff sleep, the task attempts the next owner
+    /// command before checking `shutdown` again, so a reservation that
+    /// clears in that exact gap still gets applied. `shutdown`'s own
+    /// `abort_all()` on `configure_peer_retry_tasks` is what makes "no
+    /// queued retry outlives this call" structural rather than
+    /// probabilistic. Proven by starting the retry, letting it reach its
+    /// own sleep, shutting down while it is still asleep, THEN releasing
+    /// the reservation it was waiting on -- if the task were still alive,
+    /// waking up would find the address free and apply the configuration.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_a_queued_configure_peer_retry_asleep_between_sub_attempts() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_994), test_config());
+        let peer_id = test_peer_id("configure-peer-shutdown-aborts-queued-retry");
+        let connect_addr = test_addr(20_995);
+
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(connect_addr, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        registry.queue_configure_peer_until_applied(peer_id.clone(), connect_addr, 0);
+
+        // Let the spawned task reach its own retry loop and its first
+        // sleep -- no fixed wall-clock wait needed under paused time:
+        // yielding gives it every opportunity to run up to (but not past)
+        // that pending timer.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        registry.shutdown().await;
+
+        // Released only AFTER shutdown -- if the task were still alive and
+        // asleep, waking up would find this and apply it.
+        reservation.release().await;
+
+        // Advance well past both the backoff the task would have woken up
+        // at and the full retry budget besides, giving an unaborted task
+        // every opportunity to retry, succeed, and apply.
+        tokio::time::advance(CONFIGURE_PEER_REAP_RETRY_BUDGET * 2).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            None,
+            "an aborted retry task must never install a pin after shutdown returned"
+        );
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            None,
+            "an aborted retry task must never mutate routing after shutdown returned"
         );
     }
 
