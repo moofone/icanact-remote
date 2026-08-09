@@ -4075,38 +4075,15 @@ async fn send_gossip_message_zero_copy(
         return Ok(());
     }
 
-    // CRITICAL: Set precise timing RIGHT BEFORE TCP write to exclude all scheduling delays
-    // Update wall_clock_time in delta changes to current time for accurate propagation measurement
-    let _current_time_secs = crate::current_timestamp();
+    // Set transport timing immediately before the write. Actor-location
+    // timestamps are immutable conflict-resolution data: rewriting one here
+    // makes an unchanged actor win LWW again on every gossip hop and prevents
+    // the registry from ever becoming quiescent.
     let current_time_nanos = crate::current_timestamp_nanos();
-
-    // Debug: Check if there's a delay in the task creation vs sending
-    if let crate::registry::RegistryMessage::DeltaGossip { delta, .. } = &task.message {
-        for change in &delta.changes {
-            if let crate::registry::RegistryChange::ActorAdded { location, .. } = change {
-                let creation_time_nanos = location.wall_clock_time as u128 * 1_000_000_000;
-                let delay_nanos = current_time_nanos as u128 - creation_time_nanos;
-                let _delay_ms = delay_nanos as f64 / 1_000_000.0;
-                // eprintln!("🔍 DELTA_SEND_DELAY: {}ms between delta creation and sending", delay_ms);
-            }
-        }
-    }
 
     match &mut task.message {
         crate::registry::RegistryMessage::DeltaGossip { delta, extensions } => {
             delta.precise_timing_nanos = current_time_nanos;
-            // Update wall_clock_time in all changes to current time for accurate propagation measurement
-            for change in &mut delta.changes {
-                match change {
-                    crate::registry::RegistryChange::ActorAdded { location, .. } => {
-                        // Set wall_clock_time to nanoseconds for consistent timing measurements
-                        location.wall_clock_time = current_time_nanos / 1_000_000_000;
-                    }
-                    crate::registry::RegistryChange::ActorRemoved { .. } => {
-                        // No wall_clock_time to update
-                    }
-                }
-            }
             *extensions = registry
                 .gossip_extensions_for_outbound(task.peer_addr, current_time_nanos)
                 .await;

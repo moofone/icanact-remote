@@ -33,6 +33,22 @@ pub const CLOCK_CALIBRATION_INTERVAL_NS: u64 = 60_000_000_000;
 pub const CLOCK_CALIBRATION_PROBE_TIMEOUT_NS: u64 = 1_000_000_000;
 pub const CLOCK_CALIBRATION_STALE_AFTER_NS: u64 = 180_000_000_000;
 
+#[inline]
+fn plausible_transport_propagation_ns(
+    received_timestamp: u128,
+    sent_timestamp: u64,
+    max_propagation: Duration,
+) -> std::result::Result<u128, i128> {
+    let received = i128::try_from(received_timestamp).unwrap_or(i128::MAX);
+    let delta = received - sent_timestamp as i128;
+    let max_delta = i128::try_from(max_propagation.as_nanos()).unwrap_or(i128::MAX);
+    if delta < 0 || delta > max_delta {
+        Err(delta)
+    } else {
+        Ok(delta as u128)
+    }
+}
+
 /// Classify a `GossipError` as a hard transport failure that proves the
 /// remote socket is gone (BrokenPipe / ConnectionReset / ConnectionAborted
 /// / NotConnected / ConnectionRefused). Used by `apply_gossip_results` to
@@ -3601,32 +3617,37 @@ impl<T: 'static> GossipRegistry<T> {
             log_adds
         };
 
-        // Emit per-actor timing logs outside the critical section.
-        //
-        // All three timestamps are sourced from `SystemTime::now()` on
-        // different machines, so clock skew between sender and receiver can
-        // make `received_timestamp` less than either reference, which would
-        // wrap a `u128` subtraction to ~2^128 and produce nonsense values
-        // (e.g. ~3.4e32 ms). Compute as `i128` to detect skew, clamp negative
-        // values to zero, and annotate the log so dashboards can filter.
+        // Emit per-actor transport timing outside the critical section. The
+        // actor's registration timestamp is version metadata, not the start of
+        // this network hop; subtracting it reports actor age as propagation.
+        // The delta send timestamp is refreshed immediately before the TCP
+        // write and is the only valid reference for this measurement.
         for (name, location) in log_adds {
-            let propagation_delta_ns =
-                received_timestamp as i128 - location.local_registration_time as i128;
-            let network_delta_ns = received_timestamp as i128 - delta.precise_timing_nanos as i128;
-            let clock_skew = propagation_delta_ns < 0 || network_delta_ns < 0;
-            let propagation_time_ms = propagation_delta_ns.max(0) as f64 / 1_000_000.0;
-            let network_processing_time_ms = network_delta_ns.max(0) as f64 / 1_000_000.0;
-            let processing_only_time_ms =
-                (propagation_time_ms - network_processing_time_ms).max(0.0);
-            info!(
-                actor_name = %name,
-                priority = ?location.priority,
-                propagation_time_ms = propagation_time_ms,
-                network_processing_time_ms = network_processing_time_ms,
-                processing_only_time_ms = processing_only_time_ms,
-                clock_skew = clock_skew,
-                "RECEIVED_ACTOR"
-            );
+            match plausible_transport_propagation_ns(
+                received_timestamp,
+                delta.precise_timing_nanos,
+                self.config.response_timeout,
+            ) {
+                Err(timing_delta_ns) => {
+                    info!(
+                        actor_name = %name,
+                        priority = ?location.priority,
+                        timing_delta_ns = timing_delta_ns,
+                        max_plausible_ms = self.config.response_timeout.as_secs_f64() * 1_000.0,
+                        clock_skew = true,
+                        "RECEIVED_ACTOR"
+                    );
+                }
+                Ok(propagation_ns) => {
+                    info!(
+                        actor_name = %name,
+                        priority = ?location.priority,
+                        propagation_time_ms = propagation_ns as f64 / 1_000_000.0,
+                        clock_skew = false,
+                        "RECEIVED_ACTOR"
+                    );
+                }
+            }
         }
 
         let peer_actor_changes = peer_actors_added.len() + peer_actors_removed.len();
@@ -4135,6 +4156,17 @@ impl<T: 'static> GossipRegistry<T> {
 
     #[inline]
     fn should_suppress_outbound_retry_for_peer(&self, peer: &PeerInfo) -> bool {
+        // When an authenticated peer advertises a non-dialable bind, FullSync
+        // state is keyed by the observed transport source so it is not lost.
+        // That source port belongs to this connection, not to a listener. Keep
+        // using the live connection, but never turn its ephemeral source into
+        // a reconnect target after disconnect.
+        if peer.inbound_observed
+            && !peer.outbound_dial_success
+            && peer.peer_address == Some(peer.address)
+        {
+            return !self.peer_has_live_connection(peer);
+        }
         if !self.config.nat_role_reconnect_enabled {
             return false;
         }
@@ -7618,6 +7650,26 @@ mod tests {
                 crate::handshake::Feature::ClockCalibration,
             ]),
         )
+    }
+
+    #[test]
+    fn transport_propagation_uses_send_timestamp_and_rejects_implausible_epochs() {
+        let max = Duration::from_secs(5);
+        assert_eq!(
+            plausible_transport_propagation_ns(1_007_000_000, 1_000_000_000, max),
+            Ok(7_000_000)
+        );
+        assert_eq!(
+            plausible_transport_propagation_ns(1_000_000_000, 1_007_000_000, max),
+            Err(-7_000_000)
+        );
+
+        let thirty_one_day_delta_ns = 2_747_975_628_000_000;
+        assert_eq!(
+            plausible_transport_propagation_ns(thirty_one_day_delta_ns, 0, max),
+            Err(thirty_one_day_delta_ns as i128),
+            "a stale or mismatched epoch must never self-certify as plausible propagation"
+        );
     }
 
     #[test]

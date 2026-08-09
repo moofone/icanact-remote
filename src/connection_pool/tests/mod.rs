@@ -2908,7 +2908,7 @@ async fn full_sync_with_remote_loopback_bind_does_not_poison_peer_state() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), tcp_source, msg)
+    super::handle_incoming_message(registry.clone(), tcp_source, None, msg)
         .await
         .expect("non-dialable FullSync should be ignored without crashing");
 
@@ -2938,8 +2938,8 @@ async fn full_sync_with_remote_loopback_bind_does_not_poison_peer_state() {
 }
 
 #[tokio::test]
-async fn full_sync_response_with_remote_loopback_bind_does_not_reindex_connection() {
-    let bind_addr: SocketAddr = "10.77.0.32:9501".parse().unwrap();
+async fn authenticated_full_sync_response_with_remote_loopback_bind_uses_transport_source() {
+    let bind_addr: SocketAddr = "10.77.0.31:9501".parse().unwrap();
     let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
         bind_addr,
         crate::GossipConfig {
@@ -2950,17 +2950,18 @@ async fn full_sync_response_with_remote_loopback_bind_does_not_reindex_connectio
         },
     ));
 
-    let peer_keypair = crate::KeyPair::new_for_testing("remote-loopback-full-sync-response-remote");
+    let peer_keypair = crate::KeyPair::generate();
     let peer_id = peer_keypair.peer_id();
     let tcp_source: SocketAddr = "10.77.0.32:47924".parse().unwrap();
     let loopback_bind = "127.0.0.1:3883";
     let synthesized_self_host_addr: SocketAddr = "10.77.0.32:3883".parse().unwrap();
-    let actor_name = "poisoned/full-sync-response/actor";
-    let poisoned_actor =
-        crate::RemoteActorLocation::new_with_peer(synthesized_self_host_addr, peer_id.clone());
+    let actor_name = "authenticated/full-sync-response/actor";
+    let advertised_actor_addr: SocketAddr = "10.77.0.32:3884".parse().unwrap();
+    let advertised_actor =
+        crate::RemoteActorLocation::new_with_peer(advertised_actor_addr, peer_id.clone());
 
     let msg = crate::registry::RegistryMessage::FullSyncResponse {
-        local_actors: vec![(actor_name.to_string(), poisoned_actor)],
+        local_actors: vec![(actor_name.to_string(), advertised_actor)],
         known_actors: Vec::new(),
         sender_peer_id: peer_id.clone(),
         sender_bind_addr: Some(loopback_bind.to_string()),
@@ -2969,29 +2970,42 @@ async fn full_sync_response_with_remote_loopback_bind_does_not_reindex_connectio
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), tcp_source, msg)
+    super::handle_incoming_message(registry.clone(), tcp_source, Some(peer_id.clone()), msg)
         .await
-        .expect("non-dialable FullSyncResponse should be ignored without crashing");
+        .expect("authenticated FullSyncResponse should use the transport source");
 
     let state = registry.gossip_state.lock().await;
     assert!(
         !state.peers.contains_key(&synthesized_self_host_addr),
         "remote loopback response bind must not be synthesized into a same-host peer entry"
     );
+    let peer = state
+        .peers
+        .get(&tcp_source)
+        .expect("authenticated transport source must retain the peer state");
+    assert!(peer.inbound_observed);
+    assert!(!peer.outbound_dial_success);
     drop(state);
+
+    assert!(
+        !registry.should_attempt_outbound_dial(tcp_source).await,
+        "an observed TCP source is not a listener and must not become a reconnect target"
+    );
 
     assert!(
         registry
             .connection_pool
             .peer_id_to_addr
             .read_sync(&peer_id, |_, addr| *addr)
-            .is_none(),
-        "remote loopback response bind must not reindex peer_id_to_addr"
+            .is_some_and(|addr| addr == tcp_source),
+        "the invalid self-report must not replace the authenticated transport source"
     );
-    assert!(
-        registry.lookup_actor(actor_name).await.is_none(),
-        "actors from a non-dialable FullSyncResponse must not be merged into the registry"
-    );
+    let actor = registry
+        .lookup_actor(actor_name)
+        .await
+        .expect("authenticated actor state must not be discarded with a bad address hint");
+    assert_eq!(actor.peer_id, peer_id);
+    assert_eq!(actor.address, advertised_actor_addr.to_string());
 }
 
 // Regression test for the FullSyncResponse / DeltaGossip / FullSync inbound
@@ -3050,7 +3064,7 @@ async fn full_sync_response_updates_last_response_received_ms() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+    super::handle_incoming_message(registry.clone(), peer_addr, None, msg)
         .await
         .expect("handle_incoming_message should succeed");
 
@@ -3105,7 +3119,7 @@ async fn full_sync_updates_last_response_received_ms() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+    super::handle_incoming_message(registry.clone(), peer_addr, None, msg)
         .await
         .expect("handle_incoming_message should succeed");
 
@@ -3164,7 +3178,7 @@ async fn delta_gossip_updates_last_response_received_ms() {
         extensions: None,
     };
 
-    super::handle_incoming_message(registry.clone(), peer_addr, msg)
+    super::handle_incoming_message(registry.clone(), peer_addr, None, msg)
         .await
         .expect("handle_incoming_message should succeed");
 
