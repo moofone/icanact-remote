@@ -1898,11 +1898,21 @@ mod tests {
     /// A concurrent `configure_peer` pin must not leave a gossip_state
     /// entry for the address it raced out, even though nothing here
     /// listens on either address (every dial genuinely fails, so the
-    /// property under test is entry existence, not dial success): B's
+    /// property under test is entry attribution, not dial success). B's
     /// route write can be accepted then overridden by the pin, or
-    /// declined outright, but B must never gain an entry either way.
-    /// Run over many rounds to cover every ordering the owner's
-    /// serialization can produce.
+    /// declined outright, depending on which owner command the race
+    /// resolves first -- and when B's route IS accepted first, the
+    /// connect task genuinely dials B, gets an immediate
+    /// connection-refused, and a `PeerInfo` entry for B is the correct,
+    /// expected record of that real attempt, not a bug. So the property
+    /// under test is not "B never gains an entry" (which depends on
+    /// scheduler timing this test cannot control), but "an entry for B
+    /// only exists because B was actually the resolved, attempted
+    /// address" -- verified directly against the `AttemptedRoute`
+    /// `connect_to_peer_with_outcome` itself resolves and dials against,
+    /// not inferred from which address happened to win the race. Run
+    /// over many rounds to cover every ordering the owner's serialization
+    /// can produce.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ordinary_connect_never_inserts_a_gossip_state_entry_for_an_address_it_did_not_dial()
      {
@@ -1922,12 +1932,22 @@ mod tests {
             let addr_b: SocketAddr = format!("127.0.0.1:{}", 41_500 + round).parse().unwrap();
             let addr_a: SocketAddr = format!("127.0.0.1:{}", 41_600 + round).parse().unwrap();
 
-            let peer = Peer {
-                peer_id: peer_id.clone(),
-                registry: registry.clone(),
-            };
+            let registry_for_connect = registry.clone();
+            let peer_id_for_connect = peer_id.clone();
             let call_connect = tokio::spawn(async move {
-                let _ = peer.connect(&addr_b).await;
+                // Mirrors `Peer::connect`'s own required-peer path exactly
+                // (route write, then dial), just keeping the
+                // `AttemptedRoute` that path would otherwise discard, so
+                // this test can check the actual fact instead of an
+                // assumption about which address the race resolved to.
+                let _ = registry_for_connect
+                    .registry_owner
+                    .set_ordinary_connect_route(peer_id_for_connect.clone(), addr_b)
+                    .await;
+                registry_for_connect
+                    .connect_to_peer_with_outcome(&peer_id_for_connect)
+                    .await
+                    .0
             });
             let registry_for_pin = registry.clone();
             let peer_id_for_pin = peer_id.clone();
@@ -1936,16 +1956,19 @@ mod tests {
                     .configure_peer(peer_id_for_pin, addr_a)
                     .await;
             });
-            call_connect.await.expect("call_connect task panicked");
+            let attempted = call_connect.await.expect("call_connect task panicked");
             call_configure.await.expect("call_configure task panicked");
 
             let gossip_state = registry.gossip_state.lock().await;
-            assert!(
-                !gossip_state.peers.contains_key(&addr_b),
-                "round {round}: B must never gain a gossip_state entry unless this node \
-                 actually dialed it -- got {:?}",
-                gossip_state.peers.get(&addr_b)
-            );
+            if gossip_state.peers.contains_key(&addr_b) {
+                assert_eq!(
+                    attempted.map(|route| route.addr()),
+                    Some(addr_b),
+                    "round {round}: B must never gain a gossip_state entry unless B was \
+                     actually the resolved, attempted address -- got {:?}",
+                    gossip_state.peers.get(&addr_b)
+                );
+            }
         }
     }
 

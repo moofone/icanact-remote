@@ -10710,6 +10710,7 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
             peer_info.failures = peer_info.failures.saturating_add(1);
             peer_info.last_failure_time = Some(now);
+            peer_info.last_failure_instant = Some(std::time::Instant::now());
             peer_info.last_attempt = now;
         }
 
@@ -16413,6 +16414,65 @@ mod tests {
             failed_state_before.as_ref(),
             "a clear for a peer that has genuinely transitioned away from Connected must not \
              disturb its Failed backoff state"
+        );
+    }
+
+    /// `last_failure_instant`'s own doc comment promises it is kept in
+    /// lockstep with `last_failure_time` at every write site. `mark_peer_
+    /// failed` is a production writer of `last_failure_time` (on
+    /// `known_peers`, not `peers`) that must uphold that promise too, or a
+    /// caller fencing a decision on the instant sees it stale or absent for
+    /// a peer this function just marked failed.
+    #[tokio::test]
+    async fn mark_peer_failed_keeps_last_failure_instant_in_lockstep_with_last_failure_time() {
+        let registry = GossipRegistry::<()>::new(test_addr(7911), test_config());
+        let peer_addr = test_addr(9921);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.known_peers.put(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: None,
+                    dns_name: None,
+                    failures: 0,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: None,
+                    last_failure_instant: None,
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        registry.mark_peer_failed(peer_addr).await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .known_peers
+            .peek(&peer_addr)
+            .expect("known_peers entry must still exist after mark_peer_failed");
+        assert!(
+            peer_info.last_failure_time.is_some(),
+            "sanity: last_failure_time must be recorded"
+        );
+        assert!(
+            peer_info.last_failure_instant.is_some(),
+            "last_failure_instant must be recorded in lockstep with last_failure_time"
         );
     }
 

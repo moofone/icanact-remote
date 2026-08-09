@@ -1951,11 +1951,14 @@ impl PeerRegistryOwner {
 
     /// Atomically install `peer_id`'s operator pin at `addr`, evicting
     /// whatever address `pinned_by_peer` shows this SAME peer pinned at
-    /// beforehand (if different). The eviction is keyed off
+    /// beforehand (if different), AND whatever different peer `addr`
+    /// itself was previously pinned to. The first eviction is keyed off
     /// `pinned_by_peer`, not an address the caller believes was previously
     /// configured (which can be stale by the time this runs): consulting
     /// the owner's own authoritative reverse map guarantees at most one
-    /// pinned address per peer at every instant.
+    /// pinned address per peer at every instant. The second keeps
+    /// `operator_pinned` and `pinned_by_peer` from disagreeing about who
+    /// holds `addr` after a standalone conflicting pin.
     ///
     /// Returns the evicted address, if any -- the caller's cue to also
     /// release its ownership; `configure_peer` below does so in the SAME
@@ -1970,6 +1973,27 @@ impl PeerRegistryOwner {
     /// against. Deliberately separate from `ConnectionPool`'s route and
     /// the ownership generation: neither answers the pin question.
     fn install_pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
+        // If a DIFFERENT peer is currently pinned at `addr` (a standalone
+        // pin conflict, not this peer's own address move), its reverse
+        // entry must be dropped too, mirroring what `RoutingSnapshot::
+        // with_pin` already does for the published snapshot below.
+        // Otherwise `operator_pinned[addr]` moves to `peer_id` here while
+        // `pinned_by_peer[previous_occupant]` keeps claiming that peer is
+        // still pinned at `addr` -- the two maps disagree from this point
+        // on, wrongly refusing that peer's own ordinary route updates and
+        // letting a later pin for it evict `addr` out from under whoever
+        // holds it by then.
+        let stale_occupant = self
+            .operator_pinned
+            .get(&addr)
+            .filter(|occupant| **occupant != peer_id)
+            .cloned();
+        if let Some(occupant) = stale_occupant
+            && self.pinned_by_peer.get(&occupant) == Some(&addr)
+        {
+            self.pinned_by_peer.remove(&occupant);
+        }
+
         let previous = self.pinned_by_peer.insert(peer_id.clone(), addr);
         let evicted = previous.filter(|previous_addr| *previous_addr != addr);
         if let Some(evicted_addr) = evicted {
@@ -4174,6 +4198,52 @@ mod tests {
                  while pinned"
             );
         }
+    }
+
+    /// A standalone `pin` for one peer at an address a DIFFERENT peer is
+    /// already pinned at must not leave the owner's own reverse map
+    /// (`pinned_by_peer`) disagreeing with the address-keyed map
+    /// (`operator_pinned`) it just overwrote. The disagreement has two
+    /// observable consequences: the displaced peer's own ordinary route
+    /// updates get wrongly refused (the stale entry makes it still look
+    /// pinned), and a later pin for that peer mistakes the old address for
+    /// its own previous one and evicts whoever now legitimately holds it.
+    #[tokio::test]
+    async fn install_pin_drops_the_previous_occupants_reverse_entry_on_conflict() {
+        let (owner, _publisher) = owner_handle();
+        let p = peer("pin-conflict-p");
+        let q = peer("pin-conflict-q");
+        let a = addr(55_000);
+        let elsewhere = addr(55_001);
+
+        owner.pin(a, p.clone()).await;
+        owner.pin(a, q.clone()).await;
+
+        assert_eq!(
+            owner.pinned_addr_for(&p),
+            None,
+            "P must no longer be reported as pinned anywhere once Q's pin displaced it at A"
+        );
+        assert_eq!(
+            owner.pinned_addr_for(&q),
+            Some(a),
+            "Q must be A's current pin"
+        );
+
+        assert!(
+            owner.set_ordinary_connect_route(p.clone(), elsewhere).await,
+            "P's ordinary route update must succeed -- P is not actually pinned anywhere \
+             after Q's conflicting pin displaced it"
+        );
+
+        let other = addr(55_002);
+        owner.pin(other, p.clone()).await;
+        assert_eq!(
+            owner.pinned_addr_for(&q),
+            Some(a),
+            "Q's pin at A must survive P being pinned elsewhere -- A was never P's own \
+             address to evict"
+        );
     }
 
     /// A DNS-triggered `migrate` (which carries a pin from its
