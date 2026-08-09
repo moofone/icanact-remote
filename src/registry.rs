@@ -4582,6 +4582,25 @@ impl<T: 'static> GossipRegistry<T> {
             if !reap_in_progress {
                 break (outcome, evicted_release, generation);
             }
+            // Checked on every sub-attempt, not just once before this whole
+            // call was first reached (`queue_configure_peer_until_applied`'s
+            // own gate at cycle entry): this call is itself the detached
+            // background retry's entire body, and a shutdown beginning
+            // partway through its up-to-30s budget must not let it keep
+            // sleeping and retrying past `shutdown_and_wait` returning. Only
+            // reached here between sub-attempts, never mid-attempt, so
+            // there is nothing partially applied to unwind -- a rejected
+            // `ReapInProgress` attempt mutates nothing.
+            if self.shutdown.load(Ordering::Acquire) {
+                info!(
+                    peer_id = %peer_id,
+                    addr = %connect_addr,
+                    attempt = reap_retry_attempt,
+                    "configure_peer: retry standing down -- shutdown began while still \
+                     reap-reserved; nothing was applied"
+                );
+                return (ConfigurePeerOutcome::TemporarilyBlocked, generation);
+            }
             let elapsed = retry_started.elapsed();
             if elapsed >= CONFIGURE_PEER_REAP_RETRY_BUDGET {
                 error!(
@@ -4678,8 +4697,26 @@ impl<T: 'static> GossipRegistry<T> {
         // DIFFERENT, actively-occupied address. The owner's own atomic
         // transaction above (`evicted_release`) is the only authoritative
         // source for what this call may release.
-        self.apply_configure_peer_connection_update(peer_id, connect_addr)
-            .await;
+        //
+        // Skipped once shutdown has begun: the pin/claim above already
+        // committed at the owner regardless (that transaction cannot be
+        // partially applied), but the connect handler is a public,
+        // unrestricted callback that may dial out -- arbitrary foreign
+        // code with no bound on how long it runs, which `shutdown_and_wait`
+        // does not wait for. Calling it after shutdown started risks it
+        // still running, holding this cloned registry, after
+        // `shutdown_and_wait` has already returned to its caller.
+        if self.shutdown.load(Ordering::Acquire) {
+            info!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                "configure_peer: pin applied, connect-handler notification skipped -- shutdown \
+                 began before it could run"
+            );
+        } else {
+            self.apply_configure_peer_connection_update(peer_id, connect_addr)
+                .await;
+        }
         (ConfigurePeerOutcome::Applied, generation)
     }
 
@@ -23009,6 +23046,105 @@ mod tests {
         assert_eq!(
             registry.registry_owner.routes_to(&connect_addr),
             Some(peer_id)
+        );
+    }
+
+    /// A detached background retry (`queue_configure_peer_until_applied`)
+    /// only checked `shutdown` before each call into this retry loop, not
+    /// on every sub-attempt inside it -- so a shutdown beginning partway
+    /// through the up-to-30s budget let it keep sleeping and retrying well
+    /// past `shutdown_and_wait` returning. Drives the retry loop directly
+    /// via `configure_peer_with_outcome` (not the queued wrapper) with
+    /// shutdown already set, so the ONLY thing that can make this return
+    /// promptly is the retry loop's own internal check, not the wrapper's
+    /// cycle-entry gate.
+    #[tokio::test(start_paused = true)]
+    async fn configure_peer_retry_stands_down_promptly_once_shutdown_begins() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_990), test_config());
+        let peer_id = test_peer_id("configure-peer-shutdown-mid-retry");
+        let connect_addr = test_addr(20_991);
+
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(connect_addr, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        registry
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let started = tokio::time::Instant::now();
+        let outcome = registry
+            .configure_peer_with_outcome(peer_id.clone(), connect_addr)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            ConfigurePeerOutcome::TemporarilyBlocked,
+            "a retry that discovers shutdown mid-loop must report TemporarilyBlocked, the same \
+             not-applied signal the budget-exhausted case reports"
+        );
+        assert!(
+            elapsed < CONFIGURE_PEER_REAP_RETRY_BUDGET,
+            "shutdown must cut the retry short well before the full budget elapses -- got \
+             {elapsed:?}"
+        );
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            None,
+            "nothing must have been applied"
+        );
+        assert_eq!(registry.registry_owner.routes_to(&connect_addr), None);
+
+        reservation.release().await;
+    }
+
+    /// The owner-level claim/pin transaction cannot be partially applied,
+    /// so it still commits even once shutdown has begun -- but the connect
+    /// handler that follows it is a public, unrestricted callback that may
+    /// dial out, arbitrary foreign code `shutdown_and_wait` does not wait
+    /// for. Invoking it after shutdown started risks it still running,
+    /// holding this cloned registry, after `shutdown_and_wait` has already
+    /// returned to its caller -- so it must be skipped, even though the
+    /// pin itself genuinely applies.
+    #[tokio::test]
+    async fn configure_peer_skips_the_connect_handler_once_shutdown_has_begun() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_992), test_config());
+        let peer_id = test_peer_id("configure-peer-shutdown-skip-handler");
+        let connect_addr = test_addr(20_993);
+
+        let recorder = Arc::new(RecordingConnectHandler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry
+            .set_peer_connect_handler(recorder.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        registry
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let outcome = registry
+            .configure_peer_with_outcome(peer_id.clone(), connect_addr)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ConfigurePeerOutcome::Applied,
+            "the owner-level claim/pin must still apply during shutdown -- that atomic \
+             transaction cannot be partially applied"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            Some(peer_id),
+            "ownership must be genuinely committed"
+        );
+        assert!(
+            recorder.calls.lock().expect("recorder mutex").is_empty(),
+            "the connect handler must not be invoked once shutdown has begun, even though the \
+             pin itself was applied"
         );
     }
 

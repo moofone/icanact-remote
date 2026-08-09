@@ -705,6 +705,15 @@ enum OwnerCommand {
         /// one flag. `None` when refused.
         reply: oneshot::Sender<Option<Arc<AtomicBool>>>,
     },
+    /// One-shot, owner-coordinated authorization for a granted
+    /// reservation's destructive work -- see `ReapReservation::
+    /// try_consume`'s own doc comment for why this must be an owner round
+    /// trip rather than a client-side CAS. `true` exactly once per
+    /// reservation; `false` for a missing or already-consumed entry.
+    ConsumeReapReservation {
+        addr: SocketAddr,
+        reply: oneshot::Sender<bool>,
+    },
     /// Release a reservation `ReserveForReap` granted, whether the sweep
     /// used it to reap the address or is abandoning the candidate for
     /// some other reason. Always succeeds (removing an absent key is a
@@ -1018,6 +1027,24 @@ impl RegistryOwnerHandle {
         })
     }
 
+    /// `ReapReservation::try_consume`'s owner round trip -- see that
+    /// method's own doc comment. `false` on an unreachable owner, the same
+    /// fail-closed default as every other "cannot obtain a decision" path.
+    async fn consume_reap_reservation(&self, addr: SocketAddr) -> bool {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        if self
+            .shared
+            .tx
+            .send(OwnerCommand::ConsumeReapReservation { addr, reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+
     /// Enqueue an `OwnerCommand::ReleaseReapReservation` on the dedicated
     /// unbounded release channel -- see `OwnerShared::release_tx`'s doc
     /// comment. Deliberately synchronous, not `async`, so it is callable
@@ -1259,6 +1286,19 @@ impl RegistryOwnerHandle {
 
 }
 
+/// One granted reservation's owner-side bookkeeping. `consumed` is the
+/// owner-authoritative record of whether `ConsumeReapReservation` has
+/// already granted this entry's destructive-work authorization -- a plain
+/// `bool`, not an atomic, since only the owner's own serialized command
+/// processing ever reads or writes it. `valid` is a separate,
+/// shared `Arc<AtomicBool>`, cloned to the matching `ReapReservation`
+/// guard purely for that guard's cheap, external, non-authoritative
+/// `is_still_valid()` peek.
+struct ReapReservationEntry {
+    valid: Arc<AtomicBool>,
+    consumed: bool,
+}
+
 /// RAII guard for one reservation `RegistryOwnerHandle::reserve_for_reap`
 /// granted -- the type system, not just documentation, enforces that a
 /// caller either releases it or has `Drop` do so.
@@ -1278,19 +1318,23 @@ impl RegistryOwnerHandle {
 /// sweep just skips that candidate); failing to RELEASE one is not, since
 /// every later claim for that address is refused forever.
 ///
-/// `valid` is the SAME `Arc<AtomicBool>` `PeerRegistryOwner::reap_reserved`
-/// holds, flipped to `false` the instant an owner command invalidates the
-/// reservation. A plain `load()` cannot close a check-then-act gap no
-/// matter how close to the mutation it guards: an invalidating
-/// `store(false)` can always land in the interval between the load and
-/// whatever irreversible write follows it. [`Self::try_consume`] closes it
-/// with a genuine CAS on this same atomic -- Rust's memory model totally
-/// orders every operation on one atomic object, so the CAS and a
-/// concurrent invalidating store are already linearized for free.
-/// [`Self::is_still_valid`] remains a cheap, read-only peek, but must
-/// never gate a destructive step: after a successful `try_consume`, every
-/// later `is_still_valid()` read is unconditionally `false` and would
-/// wrongly look like a live race to abandon.
+/// [`Self::try_consume`] is an owner round trip
+/// (`OwnerCommand::ConsumeReapReservation`), not a client-side
+/// compare-and-swap on `valid`: a bare CAS on a caller-held atomic races
+/// an invalidating owner command (`configure_peer` evicting this address
+/// from a pin) from a completely separate synchronization domain --
+/// whichever runs "second" by wall-clock time still only ever sees a
+/// plain store/CAS result, with no way to tell a reservation it just
+/// invalidated was already consumed a moment earlier by the other side.
+/// Routing consumption through the owner's own serialized command stream
+/// instead means whichever the owner actually dequeues first -- the
+/// consume or the invalidation -- is authoritative, and the loser can
+/// observe that fact instead of silently believing it won:
+/// `configure_peer`'s own handler checks `ReapReservationEntry::consumed`
+/// before evicting a pin, refusing rather than invalidating out from under
+/// an already-authorized reap. `valid` remains a shared `Arc<AtomicBool>`,
+/// kept in step for [`Self::is_still_valid`]'s cheap, external,
+/// non-authoritative peek -- but it no longer authorizes anything itself.
 pub struct ReapReservation {
     owner: RegistryOwnerHandle,
     addr: SocketAddr,
@@ -1299,8 +1343,9 @@ pub struct ReapReservation {
 }
 
 impl ReapReservation {
-    /// Cheap, synchronous, no `.await` -- see this type's own doc comment
-    /// for why this must never gate a destructive step on its own.
+    /// Cheap, synchronous, no `.await` -- advisory only. See this type's
+    /// own doc comment for why this must never gate a destructive step;
+    /// [`Self::try_consume`] is the actual authorization.
     pub fn is_still_valid(&self) -> bool {
         self.valid.load(Ordering::Acquire)
     }
@@ -1308,17 +1353,15 @@ impl ReapReservation {
     /// One-shot, race-free authorization for this reservation's
     /// RESERVATION-gated destructive work (not address-ownership
     /// retraction, which keeps its own separate, always-fresh fence -- see
-    /// this type's own doc comment). A CAS on the same atomic
-    /// `is_still_valid` reads, not a second load: `true` means this call,
+    /// this type's own doc comment). An owner round trip, not a local CAS
+    /// -- see the type's own doc comment for why. `true` means this call,
     /// and only this call, is authorized; `false` means something already
     /// invalidated the reservation and the candidate must be abandoned.
     /// Call exactly once per candidate, as the single gate for its whole
     /// sequence -- never per-step alongside a later `is_still_valid()`
     /// check treated as a second authorization.
-    pub fn try_consume(&self) -> bool {
-        self.valid
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    pub async fn try_consume(&self) -> bool {
+        self.owner.consume_reap_reservation(self.addr).await
     }
 
     /// Release this reservation. The normal path: call once the sweep's
@@ -1430,13 +1473,20 @@ struct PeerRegistryOwner {
     /// other's destructive work still relied on it.
     ///
     /// The VALUE is what makes this a LIVE authority, not just a presence
-    /// check: a shared `Arc<AtomicBool>`, cloned to the matching
-    /// [`ReapReservation`] guard, flipped `false` by
-    /// `invalidate_reap_reservation` whenever an owner command establishes
-    /// a fact that makes the reservation stale (currently `configure_peer`
-    /// evicting a reserved address from a peer's pin). See
-    /// `ReapReservation`'s own doc comment for the CAS-vs-load reasoning.
-    reap_reserved: HashMap<SocketAddr, Arc<AtomicBool>>,
+    /// check. `consumed` is the owner-authoritative record of whether
+    /// `ConsumeReapReservation` has already granted this entry's
+    /// destructive-work authorization -- read here, from within the SAME
+    /// serialized command stream, by anything that would otherwise
+    /// invalidate the reservation (currently `configure_peer` evicting a
+    /// reserved address from a peer's pin), so an already-consumed entry
+    /// is never mistaken for one a fresh invalidation can still stop.
+    /// `valid` is a shared `Arc<AtomicBool>`, cloned to the matching
+    /// [`ReapReservation`] guard, for that guard's own cheap, external,
+    /// non-authoritative `is_still_valid()` peek; kept in step with
+    /// `consumed` but never itself the authority for either consumption
+    /// or invalidation. See `ReapReservation`'s own doc comment for why
+    /// consumption is an owner command rather than a client-side CAS.
+    reap_reserved: HashMap<SocketAddr, ReapReservationEntry>,
     /// `GossipRegistry`'s own caller-side generation fence for
     /// `configure_peer`'s queued retry was not atomic with the pin update
     /// it guarded -- a newer call could bump the caller-side counter and
@@ -1572,6 +1622,10 @@ impl PeerRegistryOwner {
                     expected_node_id,
                 );
                 let _ = reply.send(granted);
+            }
+            OwnerCommand::ConsumeReapReservation { addr, reply } => {
+                let consumed = self.consume_reap_reservation(addr);
+                let _ = reply.send(consumed);
             }
             OwnerCommand::ReleaseReapReservation { addr, reply } => {
                 self.reap_reserved.remove(&addr);
@@ -1833,19 +1887,31 @@ impl PeerRegistryOwner {
         released
     }
 
-    /// Invalidate a currently-held reap reservation for `addr`, if one
-    /// exists (a no-op otherwise). Cheap and synchronous: flips the SAME
-    /// `Arc<AtomicBool>` `reap_reserved` shares with the matching
-    /// `ReapReservation` guard, from within this task's own serialized
-    /// command stream.
+    /// Invalidate a currently-held, NOT YET CONSUMED reap reservation for
+    /// `addr`. Returns `true` when it did -- the caller's cue that it
+    /// genuinely prevented that reservation's destructive work from ever
+    /// being authorized. Returns `false` for both a missing entry and,
+    /// critically, an already-consumed one: `ConsumeReapReservation` may
+    /// have granted authorization for this exact address moments earlier,
+    /// from within this SAME serialized command stream, and a `store`
+    /// here cannot retroactively revoke it -- the caller must not treat
+    /// that as "successfully stopped," or it proceeds as if the
+    /// reservation's destructive work will never run, while it may
+    /// already be committed to running regardless.
     ///
     /// Any owner command that commits a fact making `addr` no longer
     /// genuinely worth reaping should call this as part of that SAME
     /// atomic commit. Currently only `configure_peer` does, the instant an
-    /// operator's own reconfiguration evicts `addr` from a peer's pin.
-    fn invalidate_reap_reservation(&self, addr: SocketAddr) {
-        if let Some(valid) = self.reap_reserved.get(&addr) {
-            valid.store(false, Ordering::Release);
+    /// operator's own reconfiguration evicts `addr` from a peer's pin --
+    /// and it consults the return value precisely because of the case
+    /// above.
+    fn invalidate_reap_reservation(&self, addr: SocketAddr) -> bool {
+        match self.reap_reserved.get(&addr) {
+            Some(entry) if !entry.consumed => {
+                entry.valid.store(false, Ordering::Release);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1945,8 +2011,33 @@ impl PeerRegistryOwner {
             return None;
         }
         let valid = Arc::new(AtomicBool::new(true));
-        self.reap_reserved.insert(addr, valid.clone());
+        self.reap_reserved.insert(
+            addr,
+            ReapReservationEntry {
+                valid: valid.clone(),
+                consumed: false,
+            },
+        );
         Some(valid)
+    }
+
+    /// `OwnerCommand::ConsumeReapReservation`'s handler -- the owner round
+    /// trip [`ReapReservation::try_consume`] performs instead of a
+    /// client-side CAS. `false` when there is no entry (already released
+    /// or invalidated) or it is already consumed (a second consume attempt
+    /// for the same reservation, which must never succeed twice). `true`
+    /// exactly once per reservation: sets `consumed` and mirrors the flip
+    /// into `valid` so the guard's own external `is_still_valid()` peek
+    /// stays accurate without a second round trip.
+    fn consume_reap_reservation(&mut self, addr: SocketAddr) -> bool {
+        match self.reap_reserved.get_mut(&addr) {
+            Some(entry) if !entry.consumed => {
+                entry.consumed = true;
+                entry.valid.store(false, Ordering::Release);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Atomically install `peer_id`'s operator pin at `addr`, evicting
@@ -2064,18 +2155,28 @@ impl PeerRegistryOwner {
     /// previously pinned at, that address's ownership is released in the
     /// SAME step too, when `peer_id` still holds it.
     ///
-    /// The evicted address's own `ReapReservation`, if held, is also
-    /// invalidated here (unconditional on `evicted_pin` alone, since it's
-    /// the pin move, not the ownership fact, that makes a sweep's verdict
-    /// stale) -- otherwise a caller already mid-destruction for the
-    /// evicted address would carry on deleting a peer's actors and
-    /// emitting tombstones for a peer the operator is actively
-    /// reconfiguring elsewhere. Invalidating rather than refusing (as
-    /// `migrate` does when either endpoint is reap-reserved) is correct
-    /// here specifically because an operator reconfiguration is an
+    /// The evicted address's own `ReapReservation`, if held and NOT YET
+    /// consumed, is also invalidated here (unconditional on `evicted_pin`
+    /// alone, since it's the pin move, not the ownership fact, that makes
+    /// a sweep's verdict stale) -- otherwise a caller already
+    /// mid-destruction for the evicted address would carry on deleting a
+    /// peer's actors and emitting tombstones for a peer the operator is
+    /// actively reconfiguring elsewhere. Invalidating rather than refusing
+    /// (as `migrate` does when either endpoint is reap-reserved) is
+    /// correct here specifically because an operator reconfiguration is an
     /// explicit human action and a reap is only a heuristic sweep: this
     /// lets the operator win outright, discovered by the sweep's own
     /// `is_still_valid()` re-check before every irreversible step.
+    ///
+    /// If the evicted address's reservation is ALREADY consumed, though,
+    /// there is no "invalidate" left to do -- the reap's destructive work
+    /// is already authorized and may already be running. Checked BEFORE
+    /// `claim`/`install_pin` run, so a refusal here needs no rollback: if
+    /// `peer_id`'s current pin names a different, already-consumed
+    /// address, the whole call is refused with the same
+    /// `ClaimRejection::ReapInProgress` a direct claim against a reserved
+    /// address gets, rather than proceeding to evict an address a reap is
+    /// already committed to destructively acting on.
     ///
     /// `expected_generation` is validated FIRST, atomically, before the
     /// claim is even attempted -- see `configure_peer_generation`'s own
@@ -2107,6 +2208,37 @@ impl PeerRegistryOwner {
                 bumped
             }
         };
+        // What `install_pin` below would evict for `peer_id`, checked
+        // before any mutation: `pinned_by_peer` is untouched by anything
+        // between this read and `install_pin`'s own (`claim` never writes
+        // it), so this is exactly the address `install_pin`'s `evicted`
+        // return will name.
+        let would_evict = self
+            .pinned_by_peer
+            .get(&peer_id)
+            .copied()
+            .filter(|previous| *previous != addr);
+        if let Some(previous) = would_evict
+            && self
+                .reap_reserved
+                .get(&previous)
+                .is_some_and(|entry| entry.consumed)
+        {
+            trace!(
+                addr = %addr,
+                peer_id = %peer_id,
+                evicted_addr = %previous,
+                "configure_peer refused: peer's previous pinned address is already committed \
+                 to a reap's destructive work; evicting it now would race that work instead of \
+                 stopping it"
+            );
+            return ConfigurePeerCommit {
+                claim: ClaimCommit::Rejected(ClaimRejection::ReapInProgress),
+                evicted_pin: None,
+                evicted_release_seq: None,
+                generation,
+            };
+        }
         let claim = Claim {
             node_id: peer_id.clone(),
             kind: ClaimKind::Verified,
@@ -2122,7 +2254,16 @@ impl PeerRegistryOwner {
         }
         let evicted_pin = self.install_pin(addr, peer_id.clone());
         if let Some(evicted_addr) = evicted_pin {
-            self.invalidate_reap_reservation(evicted_addr);
+            // Cannot be the already-consumed case checked above:
+            // `evicted_addr` is exactly `would_evict`, already confirmed
+            // not consumed, and nothing since then (all synchronous, no
+            // `.await`, within this one command) can have consumed it.
+            let invalidated = self.invalidate_reap_reservation(evicted_addr);
+            debug_assert!(
+                invalidated || !self.reap_reserved.contains_key(&evicted_addr),
+                "evicted_addr's reservation must not have become consumed between the \
+                 pre-install_pin check above and this call"
+            );
         }
         let evicted_release_seq = evicted_pin.and_then(|evicted_addr| {
             // Ghost connection-scoped receipts for the evicted address must
@@ -3542,10 +3683,10 @@ mod tests {
     }
 
     /// Direct, whitebox proof of `try_consume`'s one-shot semantics --
-    /// see `ReapReservation`'s own doc comment for the full reasoning
-    /// (why a compare-and-swap closes the check-then-act gap a plain
-    /// `is_still_valid()` load, repeated however many times, cannot).
-    /// The FIRST call against a fresh, still-valid reservation must
+    /// see `ReapReservation`'s own doc comment for the full reasoning (why
+    /// the owner's own serialized check-and-set closes the check-then-act
+    /// gap a plain `is_still_valid()` load, repeated however many times,
+    /// cannot). The FIRST call against a fresh, still-valid reservation must
     /// succeed; every call after that, against the SAME reservation, must
     /// fail -- proving this is a genuine one-shot claim, not a repeatable
     /// read that merely happens to answer `true` the first time.
@@ -3565,11 +3706,11 @@ mod tests {
              invalidates it"
         );
         assert!(
-            reservation.try_consume(),
+            reservation.try_consume().await,
             "the first try_consume against a valid, unconsumed reservation must succeed"
         );
         assert!(
-            !reservation.try_consume(),
+            !reservation.try_consume().await,
             "a SECOND try_consume against the SAME, already-consumed reservation must fail -- \
              otherwise this is a repeatable read, not a one-shot claim, and two callers could \
              both believe they alone were authorized to proceed"
@@ -3585,9 +3726,9 @@ mod tests {
 
     /// Companion to the sequential proof above: under GENUINE concurrent
     /// contention (many tasks racing `try_consume` against ONE shared
-    /// reservation), still exactly one winner -- what backs the claim in
-    /// `ReapReservation`'s own doc comment that the CAS needs no owner
-    /// round trip or lock to be race-free.
+    /// reservation, each its own owner round trip), still exactly one
+    /// winner -- the owner's own serialized command processing is what
+    /// makes this exclusive now, not a lock-free CAS the callers share.
     #[tokio::test]
     async fn try_consume_is_exclusive_under_genuinely_concurrent_attempts() {
         let (owner, _publisher) = owner_handle();
@@ -3603,7 +3744,7 @@ mod tests {
         let mut tasks = Vec::new();
         for _ in 0..16 {
             let reservation = reservation.clone();
-            tasks.push(tokio::spawn(async move { reservation.try_consume() }));
+            tasks.push(tokio::spawn(async move { reservation.try_consume().await }));
         }
 
         let mut successes = 0usize;
@@ -3628,6 +3769,111 @@ mod tests {
         let reservation = std::sync::Arc::into_inner(reservation)
             .expect("no task should retain its clone past awaiting its own JoinHandle");
         reservation.release().await;
+    }
+
+    /// If a reservation's destructive work is already authorized
+    /// (`try_consume` succeeded), a `configure_peer` call that would
+    /// otherwise evict that same address from the peer's pin must not
+    /// silently "invalidate" it: there is no live authorization left to
+    /// revoke, so pretending to would let the reap's destructive work run
+    /// concurrently with whatever `configure_peer` does next. Refused
+    /// outright with the same rejection a direct claim against a reserved
+    /// address gets, before any state mutates.
+    #[tokio::test]
+    async fn configure_peer_refuses_to_evict_an_already_consumed_reservation() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("configure-peer-vs-consumed-reservation");
+        let addr_a = addr(30_460);
+        let addr_b = addr(30_461);
+
+        let outcome = owner.configure_peer(addr_a, node.clone(), None).await;
+        assert!(outcome.claim.is_accepted(), "sanity: initial pin at A must succeed");
+        assert_eq!(owner.pinned_addr_for(&node), Some(addr_a));
+
+        // A dead-peer sweep reserves A exactly as `cleanup_dead_peers`'s
+        // own selection phase would, using the identity it just observed.
+        let ownership = owner.ownership_token(&addr_a);
+        let pin_owner = owner.pin_owner(&addr_a);
+        let reservation = owner
+            .reserve_for_reap(
+                addr_a,
+                std::time::Instant::now(),
+                ownership,
+                pin_owner,
+                Some(node.clone()),
+            )
+            .await
+            .expect("a freshly, unconflictedly claimed address must be reservable");
+
+        assert!(
+            reservation.try_consume().await,
+            "sanity: consumption of a fresh reservation must succeed"
+        );
+
+        // The operator tries to move the SAME peer to B, which would
+        // ordinarily evict A from the pin.
+        let outcome = owner.configure_peer(addr_b, node.clone(), None).await;
+
+        assert_eq!(
+            outcome.claim,
+            ClaimCommit::Rejected(ClaimRejection::ReapInProgress),
+            "configure_peer must refuse rather than evict an address whose reservation is \
+             already consumed"
+        );
+        assert_eq!(
+            owner.pinned_addr_for(&node),
+            Some(addr_a),
+            "a refused configure_peer call must leave the peer's pin completely untouched"
+        );
+        assert_eq!(
+            owner.routes_to(&addr_b),
+            None,
+            "B must not have been claimed either -- the whole call was refused before any \
+             mutation, not merely the pin-eviction step"
+        );
+
+        reservation.release().await;
+    }
+
+    /// Companion to the test above: when the evicted address's reservation
+    /// is still live (not yet consumed), `configure_peer` must invalidate
+    /// it and proceed normally -- the fix above narrows the refusal to
+    /// exactly the already-consumed case, not every reservation.
+    #[tokio::test]
+    async fn configure_peer_invalidates_a_still_live_reservation_and_proceeds() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("configure-peer-vs-live-reservation");
+        let addr_a = addr(30_462);
+        let addr_b = addr(30_463);
+
+        let outcome = owner.configure_peer(addr_a, node.clone(), None).await;
+        assert!(outcome.claim.is_accepted(), "sanity: initial pin at A must succeed");
+
+        let ownership = owner.ownership_token(&addr_a);
+        let pin_owner = owner.pin_owner(&addr_a);
+        let reservation = owner
+            .reserve_for_reap(
+                addr_a,
+                std::time::Instant::now(),
+                ownership,
+                pin_owner,
+                Some(node.clone()),
+            )
+            .await
+            .expect("a freshly, unconflictedly claimed address must be reservable");
+
+        let outcome = owner.configure_peer(addr_b, node.clone(), None).await;
+
+        assert!(
+            outcome.claim.is_accepted(),
+            "configure_peer must succeed against a reservation that was never consumed"
+        );
+        assert_eq!(owner.pinned_addr_for(&node), Some(addr_b));
+        assert!(
+            !reservation.is_still_valid(),
+            "the still-live reservation must have been genuinely invalidated, not left \
+             dangling"
+        );
     }
 
     /// Release is enqueued through the dedicated unbounded `release_tx`,
