@@ -11951,6 +11951,68 @@ async fn stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_sess
     );
 }
 
+/// `cleanup_stale_connections` snapshots which peers look stale via
+/// `peer_sessions.iter_sync`, then acts on that snapshot in a separate pass.
+/// Before the fix, that second pass called the PEER-WIDE
+/// `disconnect_connection_by_peer_id(peer_id)` — which re-reads "whatever is
+/// currently indexed for this peer" at teardown time rather than the exact
+/// stale instance the snapshot observed. A peer that reconnects with a
+/// fresh, healthy connection in the window between the snapshot and the
+/// teardown loop must keep that new connection.
+///
+/// Pinned deterministically via the pool's own `cleanup_stale_race_hook`
+/// (fired after the snapshot, before the teardown loop) rather than a
+/// wall-clock thread race — same rationale and technique as
+/// `stale_instance_cleanup_uses_atomic_cas_and_preserves_fresh_current_session`
+/// above, adapted because `cleanup_stale_connections` has no lifecycle event
+/// of its own to pin on.
+///
+/// RED before the fix (teardown via `disconnect_connection_by_peer_id`): the
+/// fresh connection is torn down along with the stale one. GREEN after (teardown
+/// via instance-scoped `disconnect_connection_instance`, re-validated by `Arc`
+/// identity): the fresh connection survives untouched.
+#[tokio::test]
+async fn cleanup_stale_connections_revalidates_before_teardown_and_preserves_concurrent_reconnect()
+ {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("cleanup-stale-race-peer").peer_id();
+
+    let stale_addr: SocketAddr = "127.0.0.1:43000".parse().unwrap();
+    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    // The connection has gone dead since it was published: `is_usable_connection`
+    // must see it as stale at snapshot time.
+    stale.set_state(ConnectionState::Disconnected);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
+
+    let fresh_addr: SocketAddr = "127.0.0.1:44000".parse().unwrap();
+    let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+
+    {
+        let hook_pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let fresh = fresh.clone();
+        pool.set_cleanup_stale_race_hook(move || {
+            hook_pool.publish_current_peer_connection(&peer_id, fresh.clone());
+        });
+    }
+
+    pool.cleanup_stale_connections();
+
+    let current = pool.get_connection_by_peer_id(&peer_id);
+    assert!(
+        current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &fresh)),
+        "a fresh reconnect published in the window between the staleness snapshot and the \
+         teardown loop must survive — cleanup must re-validate the exact stale instance by \
+         identity, never tear down whatever is current at teardown time (got {current:?})"
+    );
+    assert!(
+        pool.connections_by_peer
+            .read_sync(&peer_id, |_, v| Arc::ptr_eq(v, &fresh))
+            .unwrap_or(false),
+        "connections_by_peer must still point at the fresh instance"
+    );
+}
+
 /// RED (review finding P2, `remote_actor_ref.rs` ask-timeout/cancellation
 /// eviction depends on a stale `addr_to_peer_id` alias):
 /// `recover_connection_after_actor_ask_timeout` and
@@ -13242,6 +13304,234 @@ async fn disconnect_connection_by_peer_id_still_cancels_correlation_on_final_tea
         SLOT_EMPTY,
         "a genuinely final teardown (no surviving sibling instance) must still cancel the \
          connection's correlation tracker"
+    );
+
+    guard.disarm();
+}
+
+/// `unpublish_rejected_outbound_candidate`'s `_` (fallback) match arm covers
+/// the far more common reject shape -- a still-live rival that lives at a
+/// DIFFERENT address than the candidate's own dial address, so there is no
+/// index row to restore (see the function's own doc). Before this fix, that
+/// arm left `keep_correlation` at its default `false`, so discarding the
+/// candidate unconditionally cancelled the shared, SESSION-level correlation
+/// tracker -- cancelling the still-live rival's in-flight asks too, even
+/// though the rival itself was never touched.
+///
+/// RED (pre-fix): the rival's in-flight slot is cancelled back to
+/// `SLOT_EMPTY`. GREEN (post-fix): the slot survives, still `SLOT_WAITING`.
+#[tokio::test]
+async fn unpublish_rejected_outbound_candidate_preserves_shared_correlation_for_rival_at_different_address()
+ {
+    let peer_id = crate::KeyPair::new_for_testing("rc-unpublish-diff-addr-peer").peer_id();
+    let rival_addr: SocketAddr = "127.0.0.1:7501".parse().unwrap();
+    let candidate_addr: SocketAddr = "127.0.0.1:7502".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // The still-live rival, indexed and published at its OWN address --
+    // different from the candidate's dial address below.
+    let rival = make_live_connection_with_correlation(
+        rival_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), rival_addr, rival.clone()));
+
+    // The rejected outbound candidate, provisionally indexed at its OWN dial
+    // address, sharing the same peer-session tracker every connection
+    // attempt for this peer gets from `get_or_create_correlation_tracker`.
+    let candidate = make_live_connection_with_correlation(
+        candidate_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(candidate_addr, candidate.clone());
+
+    // An in-flight ask slot on the shared tracker, as if the RIVAL had an ask
+    // in flight when the candidate's connection attempt was rejected.
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    pool.unpublish_rejected_outbound_candidate(candidate_addr, &candidate, &peer_id, Some(&rival));
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "discarding the rejected candidate cancelled the shared correlation tracker's in-flight \
+         slot -- this kills the still-live rival's in-flight asks, even though the rival lives \
+         at a different address and was never itself touched"
+    );
+    assert!(
+        rival.has_live_stream(),
+        "the still-live rival's own background tasks must not be touched by the reject"
+    );
+
+    guard.disarm();
+}
+
+/// `remove_connection_instance_by_id` retires an instance already known (by
+/// the caller's contract) to be superseded -- e.g.
+/// `finish_indexing_accepted_connection`'s revalidation-failure path, when a
+/// concurrent evict/supersede raced a just-indexed candidate out of the peer
+/// session before it was durably indexed. Before this fix, its final
+/// `abort_tasks()` call was unconditional even when the peer's ACTUAL current
+/// connection is a different, live instance sharing the same session-level
+/// tracker -- cancelling that survivor's in-flight asks.
+///
+/// RED (pre-fix): the survivor's in-flight slot is cancelled back to
+/// `SLOT_EMPTY`. GREEN (post-fix): the slot survives, still `SLOT_WAITING`.
+#[tokio::test]
+async fn remove_connection_instance_by_id_preserves_shared_correlation_for_a_different_current_connection()
+ {
+    let peer_id = crate::KeyPair::new_for_testing("rc-remove-by-id-peer").peer_id();
+    let current_addr: SocketAddr = "127.0.0.1:7511".parse().unwrap();
+    let superseded_addr: SocketAddr = "127.0.0.1:7512".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // The peer's ACTUAL current session -- a different, live connection
+    // sharing the same session-level tracker.
+    let current = make_live_connection_with_correlation(
+        current_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), current_addr, current.clone()));
+
+    // The already-superseded instance being retired by instance id -- indexed
+    // at its own (different) address, sharing the tracker, but never the
+    // peer's current connection.
+    let superseded = make_live_connection_with_correlation(
+        superseded_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(superseded_addr, superseded.clone());
+    let _ = pool
+        .addr_to_peer_id
+        .upsert_sync(superseded_addr, peer_id.clone());
+    let instance_id = superseded
+        .stream_handle
+        .as_ref()
+        .map(|handle| handle.instance_id())
+        .expect("live connection must have a stream handle");
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    let removed = pool.remove_connection_instance_by_id(superseded_addr, instance_id);
+    assert!(
+        removed.is_some_and(|c| Arc::ptr_eq(&c, &superseded)),
+        "the superseded instance must be found and removed by id"
+    );
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "retiring the superseded instance by id cancelled the shared correlation tracker's \
+         in-flight slot -- this kills the peer's actual CURRENT connection's in-flight asks"
+    );
+    assert!(
+        current.has_live_stream(),
+        "the peer's actual current connection's background tasks must not be touched"
+    );
+
+    guard.disarm();
+}
+
+/// `disconnect_connection_instance`'s `Err(None)` arm proceeds with `target`'s
+/// own teardown when the peer's primary session slot is genuinely empty for
+/// it (`target` was found only via `peer_current_connection_snapshot`'s
+/// address/alias fallback, never promoted to "current"). Before this fix,
+/// the final `abort_tasks()` call was unconditional even when the peer's
+/// ACTUAL current connection -- found via that very same fallback -- is a
+/// different, live instance sharing the same session-level tracker.
+///
+/// RED (pre-fix): the survivor's in-flight slot is cancelled back to
+/// `SLOT_EMPTY`. GREEN (post-fix): the slot survives, still `SLOT_WAITING`.
+#[tokio::test]
+async fn disconnect_connection_instance_preserves_shared_correlation_when_target_was_never_current()
+ {
+    let peer_id = crate::KeyPair::new_for_testing("rc-disconnect-instance-peer").peer_id();
+    let current_addr: SocketAddr = "127.0.0.1:7521".parse().unwrap();
+    let target_addr: SocketAddr = "127.0.0.1:7522".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // The peer's actual current session -- seeded directly into the
+    // secondary `connections_by_peer` index (one of
+    // `peer_current_connection_snapshot`'s fallbacks) rather than through
+    // `add_connection_by_peer_id`, so the PRIMARY `peer_sessions` slot stays
+    // genuinely empty -- the exact shape `target` below needs to hit the
+    // `Err(None)` arm.
+    let current = make_live_connection_with_correlation(
+        current_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_peer
+        .upsert_sync(peer_id.clone(), current.clone());
+
+    // `target`: never promoted to "current", sharing the same tracker.
+    let target = make_live_connection_with_correlation(
+        target_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(target_addr, target.clone());
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    let evicted = pool.disconnect_connection_instance(&peer_id, &target);
+    assert!(
+        evicted,
+        "disconnect_connection_instance must proceed with target's own teardown when the \
+         primary slot is genuinely empty for it"
+    );
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "tearing down a target that was never the peer's current connection cancelled the \
+         shared correlation tracker's in-flight slot -- this kills the peer's actual CURRENT \
+         connection's in-flight asks"
+    );
+    assert!(
+        current.has_live_stream(),
+        "the peer's actual current connection's background tasks must not be touched"
     );
 
     guard.disarm();

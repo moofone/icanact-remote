@@ -1100,6 +1100,10 @@ pub struct RegistryStats {
     pub relayed_addr_kept: u64,
     /// Duplicate-connection tie-break evictions/rejections observed.
     pub tie_break_evictions: u64,
+    /// Inbound `Response`/`AskNack` frames whose `correlation_id` matched no
+    /// pending ask slot in any of the three lookup tiers (see
+    /// `note_unmatched_response`).
+    pub unmatched_responses: u64,
 }
 
 /// Three address concepts share the crate's plumbing, and only one is
@@ -1830,6 +1834,57 @@ pub struct ActorState {
     pub local_actors: SccHashMap<String, RemoteActorLocation>,
     pub known_actors: SccHashMap<String, RemoteActorLocation>,
     pub removed_actors: SccHashMap<String, RemovedActorTombstone>,
+    /// Local receive time of the most recent unchanged re-advertisement
+    /// from a known actor's OWN owner, confirming it is still reachable and
+    /// gossiping -- kept entirely separate from `known_actors`' own
+    /// `RemoteActorLocation::wall_clock_time`, which doubles as the LWW
+    /// tie-breaker `stable_concurrent_location_wins` uses to resolve
+    /// concurrent claims from DIFFERENT peers. Mutating that shared value
+    /// on a re-advertisement that did not itself win admission -- even
+    /// from the same owner -- would let an unrelated, later delivery-order
+    /// accident decide which of two genuinely concurrent peers' claims
+    /// wins, since a freshly "refreshed" stored entry would always look
+    /// newer than a rival's untouched one regardless of which was actually
+    /// created first. This side table is read only by
+    /// `cleanup_stale_actors`/`lookup_actor`'s TTL freshness checks, never
+    /// fed back into conflict resolution. Entries are garbage-collected by
+    /// `cleanup_stale_actors` for any name no longer present in
+    /// `known_actors`, regardless of which removal path retired it; until
+    /// then a stale entry is harmless (its value is only ever taken as a
+    /// floor via `max`, so it can make an actor look no less fresh than
+    /// its own `wall_clock_time`, never falsely stale).
+    reannouncement_liveness: SccHashMap<String, u64>,
+    /// Test hook. Fired inside [`GossipRegistry::cleanup_stale_actors`] after
+    /// it snapshots which actors look stale but before the removal loop
+    /// re-validates and removes them, so a test can land a concurrent
+    /// refresh/reconnect deterministically in that gap instead of racing for
+    /// it — same technique as `OutboundDialGate`'s `race_hook`.
+    #[cfg(test)]
+    cleanup_stale_actors_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+#[cfg(test)]
+impl ActorState {
+    pub(crate) fn set_cleanup_stale_actors_race_hook(
+        &self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        *self
+            .cleanup_stale_actors_race_hook
+            .lock()
+            .expect("cleanup-stale-actors race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    fn fire_cleanup_stale_actors_race_hook(&self) {
+        let hook = self
+            .cleanup_stale_actors_race_hook
+            .lock()
+            .expect("cleanup-stale-actors race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// Gossip coordination state for write-heavy operations
@@ -1951,6 +2006,50 @@ impl GossipState {
         true
     }
 
+    /// Migrate a `peers` entry from an ephemeral TCP-source key to its
+    /// resolved bind-address key (the `FullSync`/`FullSyncResponse` handlers
+    /// in `pool_connect.rs` call this once the peer's advertised bind
+    /// address is known). No-op if `old_addr` has no entry.
+    ///
+    /// If `new_addr` already has an entry, MERGES rather than overwrites it:
+    /// a plain `remove` + `insert` would let a freshly-learned,
+    /// ephemeral-keyed entry -- which has had no chance yet to accumulate
+    /// its own replay high-water mark or armed session -- silently regress
+    /// `last_sequence`/`last_sent_sequence` or zero out the
+    /// `current_session_epoch` already recorded against the bind address by
+    /// an earlier connection. `last_sequence`/`last_sent_sequence` only ever
+    /// advance, so the merge takes the max of each side. The session-arming
+    /// fields (`current_session_source`/`current_session_connection`/
+    /// `current_session_epoch`/`accept_lower_sequence_from`) describe ONE
+    /// session as a unit -- see `PeerInfo::current_session_epoch`'s doc --
+    /// so they are kept or replaced together, from whichever side holds the
+    /// more ADVANCED epoch, rather than spliced field-by-field.
+    pub(crate) fn migrate_peer_entry(&mut self, old_addr: SocketAddr, new_addr: SocketAddr) {
+        let Some(mut moved) = self.peers.remove(&old_addr) else {
+            return;
+        };
+        moved.address = new_addr;
+        moved.peer_address = Some(old_addr);
+        match self.peers.entry(new_addr) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let existing = slot.get();
+                moved.last_sequence = moved.last_sequence.max(existing.last_sequence);
+                moved.last_sent_sequence =
+                    moved.last_sent_sequence.max(existing.last_sent_sequence);
+                if existing.current_session_epoch > moved.current_session_epoch {
+                    moved.current_session_source = existing.current_session_source;
+                    moved.current_session_connection = existing.current_session_connection.clone();
+                    moved.current_session_epoch = existing.current_session_epoch;
+                    moved.accept_lower_sequence_from = existing.accept_lower_sequence_from;
+                }
+                *slot.get_mut() = moved;
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(moved);
+            }
+        }
+    }
+
     /// Record that ownership of `peer_addr` was retracted or moved away at
     /// `commit_seq`, as a monotonic floor rather than a deletion.
     ///
@@ -2006,9 +2105,13 @@ impl GossipState {
         }
     }
 
-    /// The newest ownership commit applied to `peer_addr`, if any. Lifecycle
-    /// cleanup captures this under the same guard as the peer entry it is
-    /// retiring, then presents it as the exact generation release fence.
+    /// The newest ownership commit this projection has *applied* to
+    /// `peer_addr` so far, if any -- a locally cached view that can lag the
+    /// authority (`registry_owner`'s ArcSwap snapshot). Eviction's release
+    /// fence reads the authority directly instead, for exactly that reason;
+    /// this accessor now only backs the compaction/admission assertions
+    /// below.
+    #[cfg(test)]
     pub(crate) fn ownership_watermark(&self, peer_addr: &SocketAddr) -> Option<CommitSeq> {
         self.ownership_commit_seq.get(peer_addr).copied()
     }
@@ -2157,6 +2260,11 @@ pub struct GossipRegistry<T = ()> {
     /// Duplicate-connection tie-break evictions/rejections observed
     /// (`note_tie_break_eviction`) — the storm signature counter.
     pub(crate) tie_break_evictions: Arc<AtomicU64>,
+    /// Inbound `Response`/`AskNack` frames that matched no pending ask slot
+    /// in any lookup tier (`note_unmatched_response`) — an unexpected-message
+    /// bookkeeping counter, not itself an error (the ask may simply have
+    /// already timed out and been evicted before the response arrived).
+    pub(crate) unmatched_responses: Arc<AtomicU64>,
 
     // Actor message handler callback
     pub actor_message_handler: Arc<ArcSwapOption<ActorMessageHandlerCell>>,
@@ -2251,21 +2359,46 @@ impl<T> Clone for GossipRegistry<T> {
     }
 }
 
+/// One tracked discovery dial task and the candidates it was spawned to
+/// dial. Kept together so a displaced task's candidates can be recovered
+/// when it is aborted — see [`DiscoveryTaskTracker::set`].
+#[derive(Debug)]
+struct TrackedDiscoveryTask {
+    abort: AbortHandle,
+    candidates: Vec<SocketAddr>,
+}
+
 #[derive(Debug, Default)]
 pub struct DiscoveryTaskTracker {
-    handle: ArcSwapOption<AbortHandle>,
+    task: ArcSwapOption<TrackedDiscoveryTask>,
 }
 
 impl DiscoveryTaskTracker {
-    pub fn set(&self, handle: AbortHandle) {
-        if let Some(old) = self.handle.swap(Some(Arc::new(handle))) {
-            old.abort();
+    /// Replace the tracked dial task, aborting whichever one was previously
+    /// tracked. `abort()` kills the old task immediately — nothing inside a
+    /// killed task runs to release the `Pending` discovery state it left
+    /// behind for candidates it had not yet finished dialing — so this
+    /// returns the displaced task's full candidate list for the caller to
+    /// run back through `PeerDiscovery::clear_pending`. Candidates the old
+    /// task had already resolved (Connected/Failed) are harmless no-ops
+    /// there; only ones still stuck in `Pending` are actually cleared.
+    pub fn set(&self, handle: AbortHandle, candidates: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        let displaced = self.task.swap(Some(Arc::new(TrackedDiscoveryTask {
+            abort: handle,
+            candidates,
+        })));
+        match displaced {
+            Some(old) => {
+                old.abort.abort();
+                old.candidates.clone()
+            }
+            None => Vec::new(),
         }
     }
 
     pub fn abort(&self) {
-        if let Some(handle) = self.handle.swap(None) {
-            handle.abort();
+        if let Some(task) = self.task.swap(None) {
+            task.abort.abort();
         }
     }
 }
@@ -2537,6 +2670,7 @@ impl<T: 'static> GossipRegistry<T> {
             addr_substitutions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             relayed_unusable_addr_kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tie_break_evictions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            unmatched_responses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             actor_message_handler: Arc::new(ArcSwapOption::empty()),
             actor_tell_handler_sync: Arc::new(ArcSwapOption::empty()),
             actor_tell_handler_sync_context: Arc::new(ArcSwapOption::empty()),
@@ -5859,7 +5993,8 @@ impl<T: 'static> GossipRegistry<T> {
             .read_sync(name, |_, location| location.clone())
         {
             let now = current_timestamp();
-            let age_secs = now.saturating_sub(location.wall_clock_time);
+            let age_secs =
+                now.saturating_sub(self.effective_actor_wall_clock_time(name, &location));
             if age_secs < self.config.actor_ttl.as_secs()
                 // R-1: a connected owner's actor is reachable regardless of
                 // wall-clock age; TTL only gates actors of unreachable peers.
@@ -5976,6 +6111,7 @@ impl<T: 'static> GossipRegistry<T> {
             addr_substitutions: self.addr_substitutions.load(Ordering::Relaxed),
             relayed_addr_kept: self.relayed_unusable_addr_kept.load(Ordering::Relaxed),
             tie_break_evictions: self.tie_break_evictions.load(Ordering::Relaxed),
+            unmatched_responses: self.unmatched_responses.load(Ordering::Relaxed),
         }
     }
 
@@ -6137,6 +6273,10 @@ impl<T: 'static> GossipRegistry<T> {
                             &location,
                             &sender_peer_id,
                         ) else {
+                            self.refresh_wall_clock_on_unchanged_reannouncement(
+                                name.as_str(),
+                                &location,
+                            );
                             continue;
                         };
                         let transfers_admission =
@@ -6632,6 +6772,61 @@ impl<T: 'static> GossipRegistry<T> {
                 debug!(actor_name = %name, "applying new actor");
                 Some((clear_tombstone, false))
             }
+        }
+    }
+
+    /// Record live confirmation of an already-known actor when a
+    /// re-advertisement from its OWN owner is an exact tie with what is
+    /// already known. `current_actor_upsert_plan` treats an exact tie
+    /// (`ClockOrdering::Equal`) the same as a genuinely stale echo
+    /// (`Before`) or a losing concurrent tie-break -- all "no upsert" -- but
+    /// an unchanged re-advertisement from the SAME owner is live
+    /// confirmation that owner is still reachable and gossiping, unlike the
+    /// other two. Without this, an actor known only via multi-hop gossip
+    /// (never directly connected, so the connected-owner TTL exemption
+    /// never applies) ages past `actor_ttl` and gets reaped even while its
+    /// owner keeps re-advertising it unchanged every round, only to
+    /// reappear on the next gossip pass -- a reap/re-add flap.
+    ///
+    /// Deliberately does NOT touch `known_actors`' own
+    /// `RemoteActorLocation::wall_clock_time` -- see
+    /// `ActorState::reannouncement_liveness`'s doc for why mutating that
+    /// shared LWW tie-break value here would make conflict resolution
+    /// between two genuinely different, concurrent peers' claims depend on
+    /// unrelated delivery-order accidents.
+    ///
+    /// The `peer_id == existing.peer_id` guard matters beyond the doc
+    /// above: two DISTINCT, never-yet-incremented locations from two
+    /// different concurrent claimants both compare `Equal` to each other
+    /// (an unincremented `VectorClock` carries no evidence to prefer
+    /// either), and reach this same `None` branch when the tie-break
+    /// prefers the other one. Without pinning this to the stored entry's
+    /// own owner, a rival's rejected concurrent claim would count as live
+    /// confirmation of an actor it was never actually hosting.
+    fn refresh_wall_clock_on_unchanged_reannouncement(
+        &self,
+        name: &str,
+        location: &RemoteActorLocation,
+    ) {
+        let is_same_owner_tie = self
+            .actor_state
+            .known_actors
+            .read_sync(name, |_, existing| {
+                location.peer_id == existing.peer_id
+                    && matches!(
+                        location.vector_clock.compare(&existing.vector_clock),
+                        crate::ClockOrdering::Equal
+                    )
+            })
+            .unwrap_or(false);
+        if is_same_owner_tie {
+            let now = current_timestamp();
+            let _ = self
+                .actor_state
+                .reannouncement_liveness
+                .entry_sync(name.to_string())
+                .and_modify(|liveness| *liveness = (*liveness).max(now))
+                .or_insert(now);
         }
     }
 
@@ -8143,6 +8338,10 @@ impl<T: 'static> GossipRegistry<T> {
                     // must not create phantom peer_to_actors entries.
                     if known_exists {
                         peer_actors.insert(name.clone());
+                        self.refresh_wall_clock_on_unchanged_reannouncement(
+                            name.as_str(),
+                            location,
+                        );
                     }
                     continue;
                 }
@@ -8305,6 +8504,22 @@ impl<T: 'static> GossipRegistry<T> {
             .is_some()
     }
 
+    /// The freshness timestamp TTL/lookup gates should actually judge `name`
+    /// against: `location`'s own `wall_clock_time`, or a later live
+    /// confirmation recorded by `refresh_wall_clock_on_unchanged_reannouncement`
+    /// for an unchanged re-advertisement from the same owner -- whichever is
+    /// newer. See `ActorState::reannouncement_liveness`'s doc for why that
+    /// confirmation is tracked separately instead of mutating
+    /// `wall_clock_time` in place.
+    fn effective_actor_wall_clock_time(&self, name: &str, location: &RemoteActorLocation) -> u64 {
+        let liveness = self
+            .actor_state
+            .reannouncement_liveness
+            .read_sync(name, |_, recorded| *recorded)
+            .unwrap_or(0);
+        location.wall_clock_time.max(liveness)
+    }
+
     pub async fn cleanup_stale_actors(&self) {
         let now = current_timestamp();
         let ttl_secs = self.config.actor_ttl.as_secs();
@@ -8315,7 +8530,7 @@ impl<T: 'static> GossipRegistry<T> {
 
             let mut to_remove = Vec::new();
             self.actor_state.known_actors.iter_sync(|k, location| {
-                if now.saturating_sub(location.wall_clock_time) >= ttl_secs
+                if now.saturating_sub(self.effective_actor_wall_clock_time(k, location)) >= ttl_secs
                     // R-1: do not TTL-reap an actor whose owning peer is
                     // currently connected -- TTL then only governs actors of
                     // unreachable peers.
@@ -8326,15 +8541,36 @@ impl<T: 'static> GossipRegistry<T> {
                 true
             });
 
+            #[cfg(test)]
+            self.actor_state.fire_cleanup_stale_actors_race_hook();
+
             let mut gossip_state = self.gossip_state.lock().await;
             for name in &to_remove {
-                if self
-                    .actor_state
-                    .known_actors
-                    .remove_sync(name.as_str())
-                    .is_some()
-                {
+                // Re-check the same staleness condition inside the atomic
+                // removal itself rather than trusting the snapshot above: a
+                // re-advertisement or an owner reconnect landing in the gap
+                // between the scan and this loop must not be torn down just
+                // because it *used to* look stale. `remove_if_sync` reads the
+                // live entry and only removes if the predicate still holds.
+                let removed =
+                    self.actor_state
+                        .known_actors
+                        .remove_if_sync(name.as_str(), |current| {
+                            now.saturating_sub(self.effective_actor_wall_clock_time(name, current))
+                                >= ttl_secs
+                                && !self.owner_peer_is_connected(current)
+                        });
+                if removed.is_some() {
                     gossip_state.release_actor_admission(name);
+                    // Garbage-collect the liveness side table together with
+                    // the entry it was tracking -- whether or not this exact
+                    // pass is what actually reaped it (any other removal
+                    // path leaves an equally harmless, equally collectible
+                    // orphan here; see the doc on `reannouncement_liveness`).
+                    let _ = self
+                        .actor_state
+                        .reannouncement_liveness
+                        .remove_sync(name.as_str());
                 }
             }
 
@@ -9593,12 +9829,25 @@ impl<T: 'static> GossipRegistry<T> {
                 // peer may legitimately have re-claimed the address; the
                 // release is scoped to this identity so it can only ever
                 // retract the ownership this eviction actually invalidated.
-                let evicted_generation = gossip_state.ownership_watermark(addr);
+                //
+                // The generation comes from `registry_owner`'s own lock-free
+                // ArcSwap snapshot, not `gossip_state.ownership_watermark`
+                // (the newest commit this projection happens to have
+                // *applied* so far, which can lag the authority). A lagging
+                // watermark either misses the release entirely (stale `None`
+                // where the authority already has a generation) or, worse,
+                // targets a generation older than the one actually held.
+                // Cross-checking `owner()` against the evicted entry's own
+                // identity additionally guards against releasing a
+                // generation some OTHER identity already reclaimed for this
+                // address between the snapshot and this read.
                 let evicted = gossip_state.peers.remove(addr);
-                if let (Some(node_id), Some(generation)) =
-                    (evicted.and_then(|peer| peer.node_id), evicted_generation)
+                let evicted_node_id = evicted.and_then(|peer| peer.node_id);
+                if let (Some(node_id), Some(token)) =
+                    (evicted_node_id, self.registry_owner.ownership_token(addr))
+                    && *token.owner() == node_id.to_peer_id()
                 {
-                    evicted_owners.push((*addr, node_id.to_peer_id(), generation));
+                    evicted_owners.push((*addr, node_id.to_peer_id(), token.generation()));
                 }
                 gossip_state.peer_to_actors.remove(addr);
 
@@ -10397,6 +10646,30 @@ impl<T: 'static> GossipRegistry<T> {
         candidates
     }
 
+    /// Track a newly spawned discovery dial task (H-004: keep at most one
+    /// alive), retiring whichever task was previously tracked. Aborting a
+    /// still-running task strands any of its candidates it had not yet
+    /// finished dialing in `Pending` forever -- nothing inside a killed task
+    /// runs to release them -- so this clears them back out via
+    /// `PeerDiscovery::clear_pending` itself. Candidates the old task had
+    /// already resolved are harmless no-ops there.
+    pub(crate) async fn track_discovery_task(
+        &self,
+        handle: tokio::task::AbortHandle,
+        candidates: Vec<SocketAddr>,
+    ) {
+        let displaced = self.discovery_task.set(handle, candidates);
+        if displaced.is_empty() {
+            return;
+        }
+        let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(discovery) = gossip_state.peer_discovery.as_mut() {
+            for addr in &displaced {
+                discovery.clear_pending(addr);
+            }
+        }
+    }
+
     /// Prune stale peers from known_peers based on TTLs
     pub async fn prune_stale_peers(&self) {
         let now = current_timestamp();
@@ -10998,6 +11271,17 @@ impl<T: 'static> GossipRegistry<T> {
         self.tie_break_cooldown_until
             .read_sync(remote_peer_id, |_, deadline| Instant::now() < *deadline)
             .unwrap_or(false)
+    }
+
+    /// Record an inbound `Response`/`AskNack` frame whose `correlation_id`
+    /// matched no pending ask slot in any of the three lookup tiers
+    /// (connection-scoped explicit tracker, connection's embedded tracker,
+    /// shared-by-peer-id fallback). Not itself an error — the ask may simply
+    /// have already timed out and been evicted before the response arrived
+    /// — but a sustained rate is a useful signal for a peer whose asks are
+    /// timing out faster than its responses return.
+    pub(crate) fn note_unmatched_response(&self) {
+        self.unmatched_responses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Check if we already have a connection to a peer by peer ID
@@ -11909,6 +12193,183 @@ mod tests {
             stored.address,
             SocketAddr::new(verified_addr.ip(), 9400).to_string(),
             "repair must use the verified TCP source IP, not the self-declared bind"
+        );
+    }
+
+    /// An actor known only via multi-hop gossip is never directly
+    /// connected, so `owner_peer_is_connected`'s TTL exemption never
+    /// applies to it -- freshness is its only protection from
+    /// `cleanup_stale_actors`. Before the fix, an unchanged
+    /// re-advertisement (`ClockOrdering::Equal`, the ordinary shape of
+    /// periodic gossip once an actor's state has stopped changing) was
+    /// treated identically to a rejected stale echo:
+    /// `current_actor_upsert_plan` returns `None` either way, and the
+    /// caller skipped past `known_actors` without recording anything. The
+    /// entry's effective freshness then stayed frozen at whatever it was
+    /// on first admission, so it crossed `actor_ttl` and got reaped even
+    /// while its owner kept re-advertising it every round -- only to
+    /// reappear on the very next gossip pass. A reap/re-add flap.
+    ///
+    /// Also pins the design constraint the redesign exists for: the fix
+    /// must NOT touch `known_actors`' own stored `wall_clock_time`, which
+    /// doubles as the LWW tie-breaker for concurrent claims from different
+    /// peers (see `ActorState::reannouncement_liveness`'s doc) -- only the
+    /// separate liveness side table advances.
+    #[tokio::test]
+    async fn merge_full_sync_refreshes_wall_clock_on_unchanged_reannouncement() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7424),
+            test_config_with_seed("wall-clock-refresh-full-sync"),
+        );
+        let owner = KeyPair::new_for_testing("wall-clock-refresh-owner").peer_id();
+        let actor_name = "wall-clock-refresh/service";
+        let owner_addr = test_addr(9410);
+
+        let mut location = RemoteActorLocation::new_with_peer(owner_addr, owner.clone());
+        // Old enough that, without a refresh, a second identical round
+        // would already have crossed any reasonable `actor_ttl`.
+        location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
+        let mut remote_known = HashMap::new();
+        remote_known.insert(actor_name.to_string(), location.clone());
+
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            remote_known.clone(),
+            owner.clone(),
+            owner_addr,
+            None,
+            None,
+            1,
+            current_timestamp(),
+        )
+        .await;
+
+        let stored_wall_clock_time = reg
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, existing| existing.wall_clock_time)
+            .expect("first full sync must admit the actor");
+        assert_eq!(
+            stored_wall_clock_time, location.wall_clock_time,
+            "test precondition: first admission stores the incoming wall_clock_time verbatim"
+        );
+
+        let before_reannounce = current_timestamp();
+        reg.merge_full_sync_from(
+            HashMap::new(),
+            remote_known,
+            owner,
+            owner_addr,
+            None,
+            None,
+            2,
+            current_timestamp(),
+        )
+        .await;
+
+        let unchanged_wall_clock_time = reg
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, existing| existing.wall_clock_time)
+            .expect("actor must still be known after an unchanged re-advertisement");
+        assert_eq!(
+            unchanged_wall_clock_time, stored_wall_clock_time,
+            "the unchanged re-advertisement's live confirmation must never mutate the stored \
+             wall_clock_time, which doubles as the LWW tie-breaker for concurrent claims from \
+             OTHER peers -- doing so would make conflict resolution between two genuinely \
+             different peers depend on unrelated delivery-order accidents"
+        );
+        let effective_wall_clock_time = reg.effective_actor_wall_clock_time(actor_name, &location);
+        assert!(
+            effective_wall_clock_time >= before_reannounce,
+            "an unchanged re-advertisement (exact vector-clock tie) must refresh the \
+             actor's EFFECTIVE freshness (via the separate liveness side table) so a \
+             multi-hop-only actor does not age past actor_ttl while its owner keeps \
+             re-advertising it every round (got {effective_wall_clock_time}, \
+             wanted >= {before_reannounce})"
+        );
+    }
+
+    /// Same gap as `merge_full_sync_refreshes_wall_clock_on_unchanged_reannouncement`,
+    /// but on the incremental-delta gossip path (`apply_delta_from`) rather
+    /// than full sync -- a separate call site with its own admission logic
+    /// that hits the identical `current_actor_upsert_plan` `None` branch on
+    /// an unchanged re-advertisement.
+    #[tokio::test]
+    async fn apply_delta_from_refreshes_wall_clock_on_unchanged_reannouncement() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7425),
+            test_config_with_seed("wall-clock-refresh-delta"),
+        );
+        let owner = KeyPair::new_for_testing("wall-clock-refresh-delta-owner").peer_id();
+        let actor_name = "wall-clock-refresh-delta/service";
+        let owner_addr = test_addr(9411);
+
+        let mut location = RemoteActorLocation::new_with_peer(owner_addr, owner.clone());
+        location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
+        let change = RegistryChange::ActorAdded {
+            name: actor_name.to_string(),
+            location: location.clone(),
+            priority: RegistrationPriority::Normal,
+        };
+
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![change.clone()],
+                sender_peer_id: owner.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored_wall_clock_time = reg
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, existing| existing.wall_clock_time)
+            .expect("first delta apply must admit the actor");
+        assert_eq!(
+            stored_wall_clock_time, location.wall_clock_time,
+            "test precondition: first admission stores the incoming wall_clock_time verbatim"
+        );
+
+        let before_reannounce = current_timestamp();
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 1,
+                current_sequence: 2,
+                changes: vec![change],
+                sender_peer_id: owner,
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let unchanged_wall_clock_time = reg
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, existing| existing.wall_clock_time)
+            .expect("actor must still be known after an unchanged re-advertisement");
+        assert_eq!(
+            unchanged_wall_clock_time, stored_wall_clock_time,
+            "the unchanged re-advertisement's live confirmation must never mutate the stored \
+             wall_clock_time (LWW tie-breaker for concurrent claims from other peers)"
+        );
+        let effective_wall_clock_time = reg.effective_actor_wall_clock_time(actor_name, &location);
+        assert!(
+            effective_wall_clock_time >= before_reannounce,
+            "an unchanged re-advertisement via incremental delta gossip must also refresh the \
+             actor's EFFECTIVE freshness (got {effective_wall_clock_time}, \
+             wanted >= {before_reannounce})"
         );
     }
 
@@ -12923,6 +13384,7 @@ mod tests {
             addr_substitutions: 0,
             relayed_addr_kept: 0,
             tie_break_evictions: 0,
+            unmatched_responses: 0,
         };
 
         assert_eq!(stats.local_actors, 5);
@@ -13271,6 +13733,71 @@ mod tests {
             identity_verified: true,
             transport_source_keyed: false,
         }
+    }
+
+    /// A bind-keyed `peers` entry can already have accumulated a real
+    /// replay high-water mark and an armed session by the time a SEPARATE,
+    /// still-draining ephemeral-keyed connection for the same peer finally
+    /// resolves its bind address and triggers a migration into that same
+    /// key. Before `GossipState::migrate_peer_entry` merged instead of
+    /// overwrote, that migration silently regressed `last_sequence` back
+    /// toward the freshly-learned entry's `0` and zeroed
+    /// `current_session_epoch`, un-arming the session gate the OLD entry
+    /// never actually earned.
+    #[tokio::test]
+    async fn migrate_peer_entry_preserves_bind_keyed_session_state() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7500),
+            test_config_with_seed("migrate-peer-entry-preserve"),
+        );
+        let node_id = test_peer_id("migrate-peer-entry-preserve-remote").to_node_id();
+        let ephemeral_addr = test_addr(9500);
+        let bind_addr = test_addr(9501);
+
+        let mut gossip_state = reg.gossip_state.lock().await;
+
+        // The bind-keyed entry already has a real high-water mark and an
+        // armed session from an earlier, still-current connection.
+        let mut established = peer_info_with_node_id(bind_addr, node_id);
+        established.last_sequence = 42;
+        established.last_sent_sequence = 17;
+        established.current_session_epoch = 5;
+        established.current_session_source = Some(bind_addr);
+        gossip_state.peers.insert(bind_addr, established);
+
+        // A separate, freshly-authenticated connection only just learned the
+        // peer's identity over its own ephemeral TCP source and has not yet
+        // exchanged anything -- last_sequence 0, no session armed.
+        let fresh = peer_info_with_node_id(ephemeral_addr, node_id);
+        gossip_state.peers.insert(ephemeral_addr, fresh);
+
+        gossip_state.migrate_peer_entry(ephemeral_addr, bind_addr);
+
+        let migrated = gossip_state
+            .peers
+            .get(&bind_addr)
+            .expect("bind-keyed entry must still exist after migration");
+        assert_eq!(
+            migrated.last_sequence, 42,
+            "migration must not lower the replay high-water mark"
+        );
+        assert_eq!(
+            migrated.last_sent_sequence, 17,
+            "migration must not lower last_sent_sequence"
+        );
+        assert_eq!(
+            migrated.current_session_epoch, 5,
+            "migration must not zero an already-armed session epoch"
+        );
+        assert_eq!(
+            migrated.current_session_source,
+            Some(bind_addr),
+            "migration must not clear an already-armed session source"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&ephemeral_addr),
+            "the ephemeral-keyed entry must be consumed by the migration"
+        );
     }
 
     /// `mark_transport_source_keyed_fallback`'s gate is a fact its caller
@@ -18375,6 +18902,60 @@ mod tests {
         assert!(!registry.actor_state.known_actors.contains_sync("old_actor"));
     }
 
+    /// `cleanup_stale_actors` snapshots which actors look stale via
+    /// `known_actors.iter_sync`, then acts on that snapshot in a separate
+    /// pass. Before the fix, that second pass unconditionally
+    /// `remove_sync`'d every snapshotted name, so a re-advertisement landing
+    /// in the gap between the snapshot and the removal loop -- refreshing
+    /// `wall_clock_time` past the TTL -- was torn down anyway, discarding the
+    /// refresh it just received.
+    ///
+    /// Pinned deterministically via the actor-state's own
+    /// `cleanup_stale_actors_race_hook` (fired after the snapshot, before the
+    /// removal loop) rather than a wall-clock thread race, matching
+    /// `OutboundDialGate`'s `race_hook` technique.
+    #[tokio::test]
+    async fn cleanup_stale_actors_revalidates_before_removal_and_preserves_concurrent_refresh() {
+        let mut config = test_config();
+        // Whole seconds, unlike the sibling `test_cleanup_stale_actors`
+        // above: `actor_ttl.as_secs()` truncates a sub-second TTL to `0`,
+        // under which every wall-clock age (including a just-refreshed one)
+        // reads as "stale" and the race this test targets could never be
+        // observed either way.
+        config.actor_ttl = Duration::from_secs(60);
+        let registry = GossipRegistry::<()>::new(test_addr(8095), config);
+
+        let mut stale_location = test_location(test_addr(9095));
+        stale_location.wall_clock_time = current_timestamp() - 100;
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync("flaky_actor".to_string(), stale_location.clone());
+
+        let actor_state = registry.actor_state.clone();
+        registry
+            .actor_state
+            .set_cleanup_stale_actors_race_hook(move || {
+                let mut refreshed = stale_location.clone();
+                refreshed.wall_clock_time = current_timestamp();
+                let _ = actor_state
+                    .known_actors
+                    .upsert_sync("flaky_actor".to_string(), refreshed);
+            });
+
+        registry.cleanup_stale_actors().await;
+
+        assert!(
+            registry
+                .actor_state
+                .known_actors
+                .contains_sync("flaky_actor"),
+            "a re-advertisement that refreshed wall_clock_time in the snapshot-to-removal gap \
+             must survive -- cleanup must re-validate staleness at removal time, never remove \
+             whatever the snapshot observed regardless of what changed since"
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_stale_actors_expires_old_tombstones() {
         let mut config = test_config();
@@ -20148,6 +20729,85 @@ mod tests {
         );
     }
 
+    /// `DiscoveryTaskTracker::set` aborts whichever dial task was previously
+    /// tracked when a new `PeerListGossip` round replaces it. Before the
+    /// fix, the killed task's own candidates -- whichever it had not yet
+    /// finished dialing -- were simply abandoned in `Pending` forever, since
+    /// nothing inside an aborted task runs to release them (`clear_pending`,
+    /// defined for exactly this cleanup, had zero production callers). That
+    /// permanently blocks rediscovery of those addresses via gossip and
+    /// occupies a `pending_peer_count()` slot toward `max_peers` forever.
+    #[tokio::test]
+    async fn track_discovery_task_clears_pending_state_for_a_displaced_tasks_candidates() {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            max_peers: 8,
+            ..test_config_with_seed("discovery-task-tracker-clears-pending")
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(19_200), config);
+
+        let stranded_addr = test_addr(19_201);
+        let peers = vec![PeerInfoGossip {
+            address: stranded_addr.to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 0,
+            last_success: 0,
+            dns_name: None,
+        }];
+        let first_round = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9997", 1)
+            .await;
+        assert_eq!(first_round, vec![stranded_addr]);
+        {
+            let gossip_state = registry.gossip_state.lock().await;
+            assert!(
+                gossip_state
+                    .peer_discovery
+                    .as_ref()
+                    .unwrap()
+                    .get_peer_state(&stranded_addr)
+                    .is_some_and(crate::peer_discovery::PeerState::is_pending),
+                "test precondition: the gossip round must mark its candidate Pending"
+            );
+        }
+
+        // Stands in for the first round's dial task getting killed before it
+        // ever actually reaches `stranded_addr`.
+        let first_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(first_task.abort_handle(), vec![stranded_addr])
+            .await;
+
+        // A second gossip round arrives before the first task finishes,
+        // tracking an unrelated candidate and displacing the first task.
+        let unrelated_addr = test_addr(19_202);
+        let second_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(second_task.abort_handle(), vec![unrelated_addr])
+            .await;
+
+        assert!(
+            first_task.await.unwrap_err().is_cancelled(),
+            "test precondition: the displaced task must actually be aborted"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state
+                .peer_discovery
+                .as_ref()
+                .unwrap()
+                .get_peer_state(&stranded_addr)
+                .is_none(),
+            "the displaced task's own candidate was abandoned in Pending -- \
+             track_discovery_task must clear it back out via clear_pending \
+             when the task tracking it is aborted"
+        );
+    }
+
     #[tokio::test]
     async fn test_refresh_peer_dns_rejects_unsafe_resolution_results() {
         // Use a non-loopback current address so it won't match localhost results.
@@ -20664,7 +21324,18 @@ mod tests {
         reg.apply_delta(delta.clone()).await.unwrap();
         let after_first = read_known_actor(&reg, actor).expect("actor should exist");
         reg.apply_delta(delta).await.unwrap();
-        let after_second = read_known_actor(&reg, actor).expect("actor should exist");
+        let mut after_second = read_known_actor(&reg, actor).expect("actor should exist");
+
+        // A duplicate delivery from the actor's own owner is live
+        // confirmation it is still reachable and gossiping, so
+        // `wall_clock_time` is expected to advance rather than stay frozen
+        // at first admission (see `refresh_wall_clock_on_unchanged_reannouncement`).
+        // Idempotent otherwise: normalize it before the full comparison.
+        assert!(
+            after_second.wall_clock_time >= after_first.wall_clock_time,
+            "duplicate delivery must refresh wall_clock_time, not leave it frozen"
+        );
+        after_second.wall_clock_time = after_first.wall_clock_time;
         assert_eq!(after_first, after_second);
     }
 

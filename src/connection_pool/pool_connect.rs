@@ -304,6 +304,8 @@ impl<T> ConnectionPool<T> {
                 aligned_pool_size.max(crate::aligned::DEFAULT_ALIGNED_POOL_SIZE),
             )),
             connection_counter: AtomicIsize::new(0),
+            #[cfg(test)]
+            cleanup_stale_race_hook: std::sync::Mutex::new(None),
             _marker: PhantomData,
         };
 
@@ -2560,6 +2562,17 @@ impl<T> ConnectionPool<T> {
                 _ => {
                     let _ = self.addr_to_peer_id.remove_sync(&addr);
                     self.clear_capabilities_for_addr(&addr);
+                    // The far more common reject shape: a rival that lives at
+                    // some OTHER address entirely (see this function's doc),
+                    // so there is no index row to restore here — but it may
+                    // still be alive and share `candidate`'s SESSION-level
+                    // correlation tracker (both resolve through
+                    // `get_or_create_correlation_tracker(peer_id)`).
+                    // Discarding this slot must not silently cancel that
+                    // still-live sibling's in-flight asks.
+                    keep_correlation = existing_before.is_some_and(|existing| {
+                        existing.has_live_stream() && candidate.shares_correlation_tracker(existing)
+                    });
                 }
             }
         }
@@ -2620,6 +2633,14 @@ impl<T> ConnectionPool<T> {
         // deliberately no separate check-then-act pair here: a read
         // followed by an unconditional clear has a gap in which exactly
         // that concurrent publish can land and be clobbered.
+        // `target` and the peer's actual current connection can share their
+        // SESSION-level `correlation` tracker BY POINTER (both resolve
+        // through `get_or_create_correlation_tracker(peer_id)`) — see
+        // `unpublish_rejected_outbound_candidate`'s identical concern. Only
+        // relevant in the `Err(None)` arm below: when the CAS above actually
+        // clears the slot (`Ok(())`), `target` WAS the current connection and
+        // nothing else can be depending on the tracker as a live sibling.
+        let mut keep_correlation = false;
         match self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
@@ -2652,6 +2673,10 @@ impl<T> ConnectionPool<T> {
                      session (found only via an address/alias fallback); proceeding with its \
                      own instance-scoped teardown"
                 );
+                if let Some(current) = self.peer_current_connection_snapshot(peer_id) {
+                    keep_correlation =
+                        current.has_live_stream() && target.shares_correlation_tracker(&current);
+                }
             }
         }
 
@@ -2724,7 +2749,11 @@ impl<T> ConnectionPool<T> {
         self.release_counted_connection(target);
 
         // H-004: Abort background tasks (writer, reader) to prevent resource leaks.
-        target.abort_tasks();
+        if keep_correlation {
+            target.abort_tasks_keep_correlation();
+        } else {
+            target.abort_tasks();
+        }
         true
     }
 
@@ -2804,7 +2833,18 @@ impl<T> ConnectionPool<T> {
         // actually cleared the slot, never an unconditional
         // peer-id-keyed removal that could delete a newer instance already
         // reinserted under the same `peer_id`.
-        if let Some(peer_id) = peer_id_at_addr {
+        // `connection` is, by the caller's contract, already known to be
+        // superseded. If it still shares its SESSION-level correlation
+        // tracker with whatever the peer's ACTUAL current connection now is
+        // (both resolve through `get_or_create_correlation_tracker(peer_id)`),
+        // aborting `connection`'s tasks unconditionally below would cancel
+        // that live survivor's in-flight asks too — see
+        // `unpublish_rejected_outbound_candidate` for the identical concern.
+        // Only relevant when the CAS below does NOT clear the slot: if it
+        // does, `connection` WAS current and nothing else can depend on the
+        // tracker as a live sibling.
+        let mut keep_correlation = false;
+        if let Some(peer_id) = peer_id_at_addr.clone() {
             let cleared = self
                 .peer_sessions
                 .read_sync(&peer_id, |_, session| {
@@ -2842,11 +2882,18 @@ impl<T> ConnectionPool<T> {
                 let _ = self
                     .connections_by_peer
                     .remove_if_sync(&peer_id, |v| Arc::ptr_eq(v, &connection));
+            } else if let Some(current) = self.peer_current_connection_snapshot(&peer_id) {
+                keep_correlation =
+                    current.has_live_stream() && connection.shares_correlation_tracker(&current);
             }
         }
 
         self.release_counted_connection(&connection);
-        connection.abort_tasks();
+        if keep_correlation {
+            connection.abort_tasks_keep_correlation();
+        } else {
+            connection.abort_tasks();
+        }
         Some(connection)
     }
 
@@ -4163,23 +4210,55 @@ impl<T> ConnectionPool<T> {
             || self.aliased_connection_by_peer_id(peer_id).is_some()
     }
 
-    /// Clean up stale connections
+    #[cfg(test)]
+    fn set_cleanup_stale_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .cleanup_stale_race_hook
+            .lock()
+            .expect("cleanup-stale race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn fire_cleanup_stale_race_hook(&self) {
+        let hook = self
+            .cleanup_stale_race_hook
+            .lock()
+            .expect("cleanup-stale race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Clean up stale connections.
+    ///
+    /// Captures the exact `Arc` each stale peer's session pointed at when
+    /// snapshotted, not just its `peer_id`, and tears it down through
+    /// [`Self::disconnect_connection_instance`] — which re-validates by
+    /// `Arc` identity under the peer session's own CAS before touching
+    /// anything. A peer that reconnects with a fresh, healthy connection in
+    /// the window between this snapshot and the teardown loop below must
+    /// keep that new connection: acting on `peer_id` alone (the old
+    /// behavior, via `disconnect_connection_by_peer_id`) would tear down
+    /// "whatever is currently indexed for this peer" at teardown time,
+    /// which by then can be the fresh connection, not the stale one this
+    /// pass actually observed.
     pub fn cleanup_stale_connections(&self) {
-        // Find disconnected peers and use peer-id-based removal to clean up all maps
-        let mut stale_peer_ids: Vec<crate::PeerId> = Vec::new();
+        let mut stale: Vec<(crate::PeerId, Arc<LockFreeConnection>)> = Vec::new();
         self.peer_sessions.iter_sync(|peer_id, session| {
-            if session
-                .current_connection()
-                .map(|conn| !self.is_usable_connection(&conn))
-                .unwrap_or(false)
+            if let Some(conn) = session.current_connection()
+                && !self.is_usable_connection(&conn)
             {
-                stale_peer_ids.push(peer_id.clone());
+                stale.push((peer_id.clone(), conn));
             }
             true
         });
 
-        for peer_id in stale_peer_ids {
-            if let Some(_conn) = self.disconnect_connection_by_peer_id(&peer_id) {
+        #[cfg(test)]
+        self.fire_cleanup_stale_race_hook();
+
+        for (peer_id, conn) in stale {
+            if self.disconnect_connection_instance(&peer_id, &conn) {
                 debug!(peer_id = %peer_id, "cleaned up disconnected connection (all aliases)");
             }
         }
@@ -4776,23 +4855,23 @@ pub(crate) fn handle_incoming_message(
                         crate::current_timestamp_nanos(),
                     );
 
-                    // FIX: If the resolved bind address differs from the TCP source address,
-                    // migrate the PeerInfo from the ephemeral port entry to the bind address.
-                    // This preserves node_id, sequence, and failure state learned during TLS handshake.
+                    // If the resolved bind address differs from the TCP source address,
+                    // migrate the PeerInfo from the ephemeral port entry to the bind
+                    // address. `migrate_peer_entry` merges rather than overwrites when
+                    // a bind-keyed entry already exists, so an already-established
+                    // replay high-water mark / armed session there is never regressed.
                     if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                        if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
+                        if let Some(node_id) =
+                            gossip_state.peers.get(&_peer_addr).and_then(|p| p.node_id)
+                        {
                             info!(
                                 old_addr = %_peer_addr,
                                 new_addr = %sender_socket_addr,
-                                node_id = ?old_peer_info.node_id,
+                                node_id = ?node_id,
                                 "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSync"
                             );
-                            // Update the address field and preserve the connection address
-                            old_peer_info.address = sender_socket_addr;
-                            old_peer_info.peer_address = Some(_peer_addr);
-                            // Insert with new key (bind address), preserving all state
-                            gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                         }
+                        gossip_state.migrate_peer_entry(_peer_addr, sender_socket_addr);
                     }
 
                     // Add the sender as a peer if not already present (inlined to avoid separate lock)
@@ -5320,23 +5399,23 @@ pub(crate) fn handle_incoming_message(
                     );
                 }
 
-                // FIX: If the resolved bind address differs from the TCP source address,
-                // migrate the PeerInfo from the ephemeral port entry to the bind address.
-                // This preserves node_id, sequence, and failure state learned during TLS handshake.
+                // If the resolved bind address differs from the TCP source address,
+                // migrate the PeerInfo from the ephemeral port entry to the bind
+                // address. `migrate_peer_entry` merges rather than overwrites when
+                // a bind-keyed entry already exists, so an already-established
+                // replay high-water mark / armed session there is never regressed.
                 if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                    if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
+                    if let Some(node_id) =
+                        gossip_state.peers.get(&_peer_addr).and_then(|p| p.node_id)
+                    {
                         info!(
                             old_addr = %_peer_addr,
                             new_addr = %sender_socket_addr,
-                            node_id = ?old_peer_info.node_id,
+                            node_id = ?node_id,
                             "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSyncResponse"
                         );
-                        // Update the address field and preserve the connection address
-                        old_peer_info.address = sender_socket_addr;
-                        old_peer_info.peer_address = Some(_peer_addr);
-                        // Insert with new key (bind address), preserving all state
-                        gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                     }
+                    gossip_state.migrate_peer_entry(_peer_addr, sender_socket_addr);
                 }
 
                 // Failure/health bookkeeping must only be attributable to
@@ -5408,6 +5487,7 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 }
 
+                let candidates_for_tracker = candidates.clone();
                 let registry_clone = registry.clone();
                 let discovery_handle = tokio::spawn(async move {
                     for addr in candidates {
@@ -5431,8 +5511,9 @@ pub(crate) fn handle_incoming_message(
                     }
                 });
 
-                // Track the discovery task (H-004): keep at most one dial task alive.
-                registry.discovery_task.set(discovery_handle.abort_handle());
+                registry
+                    .track_discovery_task(discovery_handle.abort_handle(), candidates_for_tracker)
+                    .await;
 
                 Ok(())
             }

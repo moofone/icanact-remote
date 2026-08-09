@@ -923,6 +923,17 @@ pub struct LockFreeStreamHandle {
     /// `begin_identify_gate`, immediately after construction and before
     /// the handle is shared with anything that could enqueue onto it.
     identify_ready: Arc<AtomicBool>,
+    /// Test hook. Fired inside [`Self::wait_for_exit`]'s loop after
+    /// observing `exit_flag` still clear but before awaiting the
+    /// notification, so a test can land a concurrent exit (`exit_flag`
+    /// store + `notify_waiters`) deterministically in that exact window
+    /// instead of racing for it — same technique as `OutboundDialGate`'s
+    /// `race_hook`. `Arc`-wrapped (unlike `OutboundDialGate`'s own,
+    /// non-`Clone` field) so every `#[derive(Clone)]` copy of this handle
+    /// shares the one hook, matching how `exit_flag`/`exit_notify` are
+    /// already shared.
+    #[cfg(test)]
+    wait_for_exit_race_hook: Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
 }
 
 impl LockFreeStreamHandle {
@@ -1120,6 +1131,8 @@ impl LockFreeStreamHandle {
                 max_message_size,
                 schema_hash,
                 identify_ready: Arc::new(AtomicBool::new(true)),
+                #[cfg(test)]
+                wait_for_exit_race_hook: Arc::new(std::sync::Mutex::new(None)),
             },
             writer_handle,
             None,
@@ -3207,12 +3220,16 @@ impl LockFreeStreamHandle {
                         _ = write_queue.data_notify.notified() => {
                             pending_cmd = write_queue.pop();
                         }
-                        _ = immediate_write_queue.space_notify.notified() => {
-                            // Producer wakeup only; no action needed.
-                        }
-                        _ = write_queue.space_notify.notified() => {
-                            // Producer wakeup only; no action needed.
-                        }
+                        // Deliberately NOT also waiting on either queue's
+                        // `space_notify` here: this task is the consumer,
+                        // not a producer, so it has nothing to do when space
+                        // frees up. `notify_space()` wakes with `notify_one`
+                        // (one permit per freed slot, see `constants.rs`),
+                        // which delivers to whichever waiter registered
+                        // earliest -- a no-op branch re-registered on every
+                        // idle-loop iteration would repeatedly steal that
+                        // permit from an actually-blocked producer parked in
+                        // `push()`, starving it under sustained backpressure.
                         _ = streaming_queue.data_notify.notified() => {
                             // Wake on streaming commands; drained at the top of the loop.
                         }
@@ -3241,12 +3258,11 @@ impl LockFreeStreamHandle {
                         _ = write_queue.data_notify.notified() => {
                             pending_cmd = write_queue.pop();
                         }
-                        _ = immediate_write_queue.space_notify.notified() => {
-                            // Producer wakeup only; no action needed.
-                        }
-                        _ = write_queue.space_notify.notified() => {
-                            // Producer wakeup only; no action needed.
-                        }
+                        // See the read-armed variant above: this consumer
+                        // task must not also register on either queue's
+                        // `space_notify`, or its no-op wakeup can steal the
+                        // single-permit `notify_one` meant for a genuinely
+                        // blocked producer.
                     }
                 }
             }
@@ -4596,11 +4612,52 @@ impl LockFreeStreamHandle {
         self.signal_shutdown();
     }
 
-    /// Wait until the IO task exits.
+    /// Wait until the IO task exits. Same subscribe-before-check shape as
+    /// [`Self::wait_until_identified`]: checking `exit_flag` and only then
+    /// awaiting `notified()` leaves a window in which a `notify_waiters()`
+    /// landing between the check and the await is missed, hanging this
+    /// call forever. Subscribing first means any notification from that
+    /// point on is observed, even one delivered before it is polled.
     pub async fn wait_for_exit(&self) {
-        while !self.exit_flag.load(Ordering::Acquire) {
-            self.exit_notify.notified().await;
+        loop {
+            let notified = self.exit_notify.notified();
+            if self.exit_flag.load(Ordering::Acquire) {
+                return;
+            }
+            #[cfg(test)]
+            self.fire_wait_for_exit_race_hook();
+            notified.await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wait_for_exit_race_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .wait_for_exit_race_hook
+            .lock()
+            .expect("wait-for-exit race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn fire_wait_for_exit_race_hook(&self) {
+        let hook = self
+            .wait_for_exit_race_hook
+            .lock()
+            .expect("wait-for-exit race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Directly signal exit the way the IO task's own `ExitGuard` normally
+    /// would on real teardown, without spinning up (and racing) a real IO
+    /// task -- lets a test land this exact state transition deterministically
+    /// from a synchronous hook.
+    #[cfg(test)]
+    pub(crate) fn force_exit_signal_for_test(&self) {
+        self.exit_flag.store(true, Ordering::Release);
+        self.exit_notify.notify_waiters();
     }
 
     /// Get the streaming threshold for this connection
@@ -5179,6 +5236,41 @@ mod route_interning_tests {
         assert!(
             exited.is_ok(),
             "shutdown() must wake a writer parked in the idle select (R-2)"
+        );
+    }
+
+    /// `wait_for_exit` must not miss a notification that lands after it has
+    /// observed `exit_flag` still clear but before it starts awaiting —
+    /// pinned deterministically via the handle's own race hook (fired at
+    /// exactly that point) rather than a wall-clock thread race, so the
+    /// interleaving is exercised every run instead of only occasionally.
+    /// Before subscribing to `exit_notify` ahead of the check, a
+    /// `notify_waiters()` landing in that window was simply lost and the
+    /// caller hung forever even though the exit it was waiting for had
+    /// already happened.
+    #[tokio::test]
+    async fn wait_for_exit_observes_a_signal_that_lands_between_its_check_and_its_await() {
+        let (client, _peer) = tokio::io::duplex(128);
+        let (writer, _task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9906".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+
+        let hook_writer = writer.clone();
+        writer.set_wait_for_exit_race_hook(move || {
+            hook_writer.force_exit_signal_for_test();
+        });
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(3), writer.wait_for_exit()).await;
+        assert!(
+            outcome.is_ok(),
+            "wait_for_exit must observe an exit signalled between its check and its await, \
+             not hang forever waiting on a notification that already fired"
         );
     }
 

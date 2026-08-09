@@ -35,7 +35,7 @@ use std::sync::{Arc, Weak};
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::PeerId;
 use crate::addr_ownership::{
@@ -1248,7 +1248,41 @@ impl RegistryOwnerHandle {
                 routing,
                 commit_seq: 0,
             };
-            tokio::spawn(owner.run(rx, release_rx));
+            let owner_task = tokio::spawn(owner.run(rx, release_rx));
+            tokio::spawn(Self::watch_owner_task(owner_task));
+        }
+    }
+
+    /// Every `claim`/`release`/`migrate` already fails closed, independently,
+    /// the moment its own send hits a closed mailbox -- but each of those
+    /// sites logs a generic "unavailable" warning with no way to tell a
+    /// panic apart from ordinary shutdown (`run`'s own `while let Some(..) =
+    /// rx.recv()` loop exits cleanly, at `debug!`, once every handle is
+    /// dropped). This watches the task itself for the one signal that
+    /// distinguishes them: `JoinHandle::await` returning `Err` only on panic
+    /// or external cancellation, never on a clean exit.
+    async fn watch_owner_task(owner_task: tokio::task::JoinHandle<()>) {
+        if let Err(join_error) = owner_task.await {
+            error!(
+                error = %join_error,
+                "registry owner task exited unexpectedly (panic, not a clean shutdown); \
+                 every subsequent claim/release/migrate will fail closed for the rest of \
+                 this process's lifetime"
+            );
+            // Opt-in only: a dead owner silently wedges address arbitration
+            // for good, which is far more likely to be mistaken for a hang
+            // than diagnosed from a log line, so an operator who would
+            // rather crash loudly and get restarted (under a supervisor)
+            // than run on in this state can ask for that explicitly.
+            // Defaulting to *off* means this can never surprise a test
+            // suite or a deployment that has not opted in -- unlike
+            // `panic!()`, which a detached task like this one would only
+            // ever have tokio print and move past, `abort()` is the one
+            // primitive that reliably takes the whole process down from
+            // here, so the check is worth the environment read.
+            if std::env::var_os("ICANACT_REMOTE_ABORT_ON_REGISTRY_OWNER_DEATH").is_some() {
+                std::process::abort();
+            }
         }
     }
 
