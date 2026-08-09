@@ -304,6 +304,7 @@ impl<T> ConnectionPool<T> {
                 aligned_pool_size.max(crate::aligned::DEFAULT_ALIGNED_POOL_SIZE),
             )),
             connection_counter: AtomicIsize::new(0),
+            routing_revision: AtomicU64::new(0),
             _marker: PhantomData,
         };
 
@@ -313,6 +314,16 @@ impl<T> ConnectionPool<T> {
             &pool as *const _
         );
         pool
+    }
+
+    #[inline]
+    pub(crate) fn routing_revision(&self) -> u64 {
+        self.routing_revision.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn mark_routing_changed(&self) {
+        self.routing_revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Set the registry reference for handling incoming messages
@@ -563,6 +574,7 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection);
+        self.mark_routing_changed();
     }
 
     /// Compare-and-publish counterpart to `publish_current_peer_connection`:
@@ -609,6 +621,7 @@ impl<T> ConnectionPool<T> {
                 let _ = self
                     .connections_by_peer
                     .upsert_sync(peer_id.clone(), connection);
+                self.mark_routing_changed();
                 return Ok(());
             }
             return Err(current);
@@ -668,6 +681,7 @@ impl<T> ConnectionPool<T> {
         if let Some(expected) = expected {
             self.retire_displaced_expected(expected, &connection);
         }
+        self.mark_routing_changed();
         Ok(())
     }
 
@@ -1584,7 +1598,9 @@ impl<T> ConnectionPool<T> {
 
     pub(crate) fn clear_current_peer_connection(&self, peer_id: &crate::PeerId) {
         self.set_current_peer_connection(peer_id, None);
-        let _ = self.connections_by_peer.remove_sync(peer_id);
+        if self.connections_by_peer.remove_sync(peer_id).is_some() {
+            self.mark_routing_changed();
+        }
     }
 
     /// Check-then-unconditional-clear: reads `current_connection`,
@@ -1707,6 +1723,7 @@ impl<T> ConnectionPool<T> {
             let _ = self
                 .connections_by_peer
                 .remove_if_sync(peer_id, |v| Arc::ptr_eq(v, candidate));
+            self.mark_routing_changed();
         }
         cleared
     }

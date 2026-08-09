@@ -1912,6 +1912,10 @@ pub struct ActorState {
     /// revalidation that can trigger its rollback.
     #[cfg(test)]
     reannouncement_refresh_race_hook: std::sync::Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>,
+    /// Monotonic revision of actor-routing state. PubSub uses this to avoid
+    /// re-publishing an unchanged route snapshot while still waking when a
+    /// local actor or remote actor route genuinely changes.
+    routing_revision: AtomicU64,
 }
 
 #[cfg(test)]
@@ -1974,6 +1978,19 @@ impl ActorState {
         if let Some(hook) = hook {
             hook(now);
         }
+}
+
+}
+
+impl ActorState {
+    #[inline]
+    pub(crate) fn routing_revision(&self) -> u64 {
+        self.routing_revision.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn mark_routing_changed(&self) {
+        self.routing_revision.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -3188,6 +3205,9 @@ impl<T: 'static> GossipRegistry<T> {
                     let _ = self.actor_state.known_actors.remove_sync(name);
                 }
             }
+        }
+        if !snapshot.known_actor_locations.is_empty() {
+            self.actor_state.mark_routing_changed();
         }
 
         for (address, caps) in &snapshot.peer_capabilities {
@@ -4749,11 +4769,16 @@ impl<T: 'static> GossipRegistry<T> {
             // owner. Each removal atomically compares the exact location
             // captured while the displacement guard was held; a concurrent
             // refresh or transfer of the same actor name therefore survives.
+            let mut removed_any = false;
             for (actor_name, displaced_location) in &actor_locations {
-                let _ = self
+                removed_any |= self
                     .actor_state
                     .known_actors
-                    .remove_if_sync(actor_name.as_str(), |current| current == displaced_location);
+                    .remove_if_sync(actor_name.as_str(), |current| current == displaced_location)
+                    .is_some();
+            }
+            if removed_any {
+                self.actor_state.mark_routing_changed();
             }
         }
 
@@ -5958,6 +5983,7 @@ impl<T: 'static> GossipRegistry<T> {
             .remove_sync(name.as_str())
             .is_some()
         {
+            self.actor_state.mark_routing_changed();
             let mut gossip_state = self.gossip_state.lock().await;
             gossip_state.release_actor_admission(&name);
         }
@@ -6006,6 +6032,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(name.as_str())
                     .is_some()
                 {
+                    self.actor_state.mark_routing_changed();
                     let mut gossip_state = self.gossip_state.lock().await;
                     gossip_state.release_actor_admission(&name);
                 }
@@ -6082,6 +6109,7 @@ impl<T: 'static> GossipRegistry<T> {
                 false
             }
         };
+        self.actor_state.mark_routing_changed();
 
         if priority.should_trigger_immediate_gossip() {
             let gossip_trigger_time = crate::current_timestamp_nanos();
@@ -6127,6 +6155,9 @@ impl<T: 'static> GossipRegistry<T> {
             .local_actors
             .remove_sync(name)
             .map(|(_, v)| v);
+        if removed.is_some() {
+            self.actor_state.mark_routing_changed();
+        }
 
         // If we learned our own actor via gossip (e.g., peers reflecting state back),
         // clear the known_actors entry too so re-register behaves as expected.
@@ -6138,6 +6169,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             if loc.node_id == self_node_id {
                 if self.actor_state.known_actors.remove_sync(name).is_some() {
+                    self.actor_state.mark_routing_changed();
                     let mut gossip_state = self.gossip_state.lock().await;
                     gossip_state.release_actor_admission(name);
                 }
@@ -6698,6 +6730,9 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         let peer_actor_changes = peer_actor_names_changed.len();
+        if applied_count > 0 {
+            self.actor_state.mark_routing_changed();
+        }
 
         debug!(
             sender = %sender_peer_id,
@@ -8565,6 +8600,7 @@ impl<T: 'static> GossipRegistry<T> {
 
         let mut new_actors = 0;
         let mut updated_actors = 0;
+        let mut removed_actors = 0;
         let mut peer_actors = std::collections::HashSet::new();
 
         // Collect wire candidates outside the lock; validate current state while applying.
@@ -8835,6 +8871,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(actor_name.as_str())
                     .is_some()
                 {
+                    removed_actors += 1;
                     gossip_state.release_actor_admission(actor_name);
                     info!(
                         actor_name = %actor_name,
@@ -8885,6 +8922,10 @@ impl<T: 'static> GossipRegistry<T> {
             }
             // _gossip_state guard drops here.
             let _ = gossip_state;
+        }
+
+        if new_actors + updated_actors + removed_actors > 0 {
+            self.actor_state.mark_routing_changed();
         }
 
         debug!(
@@ -8986,6 +9027,7 @@ impl<T: 'static> GossipRegistry<T> {
 
             let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
             if removed > 0 {
+                self.actor_state.mark_routing_changed();
                 info!(removed_count = removed, "cleaned up stale actor entries");
             }
         }
@@ -9252,6 +9294,10 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                     gossip_state.peer_to_actors.remove(peer_addr);
 
+                    if actors_removed > 0 {
+                        self.actor_state.mark_routing_changed();
+                    }
+
                     info!(
                         peer = %peer_addr,
                         actors_removed,
@@ -9416,8 +9462,13 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Clear actor state
         {
+            let had_actors = !self.actor_state.local_actors.is_empty()
+                || !self.actor_state.known_actors.is_empty();
             self.actor_state.local_actors.clear_sync();
             self.actor_state.known_actors.clear_sync();
+            if had_actors {
+                self.actor_state.mark_routing_changed();
+            }
         }
 
         // Clear gossip state

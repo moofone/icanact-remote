@@ -1798,6 +1798,23 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
              have run, using that command's own, correct pin decision"
         );
     }
+
+#[test]
+fn routing_revision_tracks_connection_publish_and_removal() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("routing_revision").peer_id();
+    let addr: SocketAddr = "127.0.0.1:40554".parse().unwrap();
+    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    connection.set_state(ConnectionState::Connected);
+
+    let initial = pool.routing_revision();
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
+    let published = pool.routing_revision();
+    assert!(published > initial);
+
+    pool.disconnect_connection_by_peer_id(&peer_id)
+        .expect("expected connection to be removed");
+    assert!(pool.routing_revision() > published);
 }
 
 #[tokio::test]

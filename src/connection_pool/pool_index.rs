@@ -53,6 +53,7 @@ pub struct ConnectionPool<T = ()> {
     /// instead — safe for the `>= max_connections` admission check, which
     /// only cares about "at or over the cap", never "did we dip below zero".
     connection_counter: AtomicIsize,
+    routing_revision: AtomicU64,
     _marker: PhantomData<fn() -> T>,
 }
 
