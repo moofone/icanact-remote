@@ -388,22 +388,50 @@ fn session_published_count(
         .count()
 }
 
-/// The direction of the most recent `SessionPublished` event recorded for
-/// `peer_id`, or `None` if it was never published at all. Unlike
-/// `session_published_count`, which counts every publish over the event
-/// log's whole history, this reflects only the *converged* state — see its
-/// call sites in `simultaneous_connect_collision_keeps_one_preferred_direction`
-/// for why that distinction matters.
-fn last_session_published_direction(
+/// The direction of the currently LIVE session for `peer_id`, reconstructed
+/// by replaying every `SessionPublished`/`SessionRemoved` event for that
+/// peer IN ORDER — not just the most recent `SessionPublished`.
+///
+/// Reverse-searching `SessionPublished` alone is wrong: the publication it
+/// finds can have a later `SessionRemoved` for that exact session, with no
+/// replacement ever published afterward. That removal would be silently
+/// ignored, so the check could pass on a preferred-direction session that
+/// is no longer live at all — masking that a different (unwanted-direction)
+/// session survived instead, or that no session survived. Tracks "current"
+/// as `(addr, direction)` and only lets a `SessionRemoved` clear it when
+/// the removed event's `addr` matches the currently-tracked session's own
+/// `addr` — i.e. it is removing the exact session believed live, not some
+/// older one a later publish already superseded (a `SessionRemoved` for an
+/// already-superseded session, arriving out of order, must not clobber a
+/// newer publish it has nothing to do with).
+///
+/// Returns `None` if the peer was never published, or if its last-known
+/// session was removed and never replaced — both real "not converged"
+/// outcomes a caller must fail on, not conflate with a wrong direction.
+fn converged_session_direction(
     events: &[TransportLifecycleEvent],
     peer_id: &PeerId,
 ) -> Option<TransportDirection> {
-    events.iter().rev().find_map(|event| match event {
-        TransportLifecycleEvent::SessionPublished {
-            peer, direction, ..
-        } if peer == peer_id => Some(*direction),
-        _ => None,
-    })
+    let mut current: Option<(SocketAddr, TransportDirection)> = None;
+    for event in events {
+        match event {
+            TransportLifecycleEvent::SessionPublished {
+                peer,
+                addr,
+                direction,
+            } if peer == peer_id => {
+                current = Some((*addr, *direction));
+            }
+            TransportLifecycleEvent::SessionRemoved { peer, addr, .. }
+                if peer == peer_id
+                    && current.is_some_and(|(current_addr, _)| current_addr == *addr) =>
+            {
+                current = None;
+            }
+            _ => {}
+        }
+    }
+    current.map(|(_, direction)| direction)
 }
 
 fn session_removed_count(
@@ -694,12 +722,12 @@ async fn simultaneous_connect_collision_keeps_one_preferred_direction() -> icana
         // cumulative) direction instead of a zero-transient-occurrences
         // count.
         assert_eq!(
-            last_session_published_direction(events, &remote.registry.peer_id),
+            converged_session_direction(events, &remote.registry.peer_id),
             Some(TransportDirection::Inbound),
             "inbound-preferred side's session must converge to inbound"
         );
         assert_eq!(
-            last_session_published_direction(events, &local.registry.peer_id),
+            converged_session_direction(events, &local.registry.peer_id),
             Some(TransportDirection::Outbound),
             "outbound owner's session must converge to outbound"
         );

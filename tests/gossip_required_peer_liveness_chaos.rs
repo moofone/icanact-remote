@@ -112,12 +112,31 @@ static NODE_SETUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 
 /// `connect_bidirectional` (from `common`) under `NODE_SETUP_ADMISSION` —
 /// see that constant's doc comment.
+///
+/// `connect_bidirectional` returning only proves `active_peers >= 1` on both
+/// sides — evidence a connection exists, not that it has survived whichever
+/// direction `icanact_remote`'s duplicate-connection tie-break drops (the
+/// same distinction documented at the `ask_peer_until_success` call sites
+/// below). Releasing the permit right there, as this function originally
+/// did, stops bounding concurrency for exactly the window the semaphore
+/// exists to bound: up to two *more* setups could start while this one's
+/// tie-break/finalization is still in flight, letting three or more
+/// overlap the same `DEFAULT_PREFERRED_INBOUND_WAIT_MS` fallback window at
+/// once. Hold the permit for that whole known-duration window (not just
+/// until the first liveness signal) before releasing, so the guarded region
+/// actually covers the interval the tie-break fallback can still be
+/// resolving in.
 async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
     let _permit = NODE_SETUP_ADMISSION
         .acquire()
         .await
         .expect("NODE_SETUP_ADMISSION is never closed");
-    connect_bidirectional(a, b).await
+    let result = connect_bidirectional(a, b).await;
+    sleep(Duration::from_millis(
+        icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS,
+    ))
+    .await;
+    result
 }
 
 async fn node(
