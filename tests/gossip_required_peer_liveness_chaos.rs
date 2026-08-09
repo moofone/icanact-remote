@@ -285,6 +285,13 @@ async fn wait_for_dial_resolution_entered(peer_ids: &[PeerId], deadline: Duratio
 /// equivalent) that resolution has actually started before relying on this
 /// alone: a window with zero events proves settlement only once it is known
 /// that "zero events" isn't just "nothing has happened yet".
+///
+/// Callers MUST also pass a `window` strictly longer than any internal timer
+/// this connection's resolution can still be waiting on (see
+/// [`QUIESCENCE_SETTLE_MARGIN_MS`]'s doc comment) — a `window` merely equal
+/// to such a timer is a same-instant tie with no defined wake order between
+/// this function's own `sleep` and the timer's, so the `after` snapshot can
+/// land before the timer's own callback has run.
 async fn wait_for_peer_quiescence(peer_ids: &[PeerId], window: Duration, deadline: Duration) {
     let snapshot = |ids: &[PeerId]| -> Vec<u64> {
         let counts = peer_lifecycle_event_counts()
@@ -309,6 +316,25 @@ async fn wait_for_peer_quiescence(peer_ids: &[PeerId], window: Duration, deadlin
         );
     }
 }
+
+/// How far [`wait_for_peer_quiescence`]'s settle window must exceed
+/// `DEFAULT_PREFERRED_INBOUND_WAIT_MS`, the library's own preferred-inbound
+/// fallback timer.
+///
+/// A window exactly equal to that timer is a same-instant tie: if the
+/// fallback timer becomes due at the same wall-clock point the quiescence
+/// window's own `sleep` does, Tokio has no defined wake order between the
+/// two, so the `after` snapshot can be taken before the fallback-triggered
+/// tie-break task has actually run and recorded its own lifecycle event —
+/// the counts then compare equal while resolution is still in flight. The
+/// margin only needs to cover the wall-clock gap between the fallback
+/// timer's own wake and that task's callback completing (lock acquisition,
+/// scheduling), not another full fallback interval; half of the fallback
+/// timer's own duration is generous slack for that on local loopback, even
+/// under the concurrent-test-binary load this file is designed to run
+/// under.
+const QUIESCENCE_SETTLE_MARGIN_MS: u64 =
+    icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS / 2;
 
 /// `connect_bidirectional` (from `common`) under `NODE_SETUP_ADMISSION` —
 /// see that constant's doc comment.
@@ -336,7 +362,9 @@ async fn wait_for_peer_quiescence(peer_ids: &[PeerId], window: Duration, deadlin
 /// once that holds does [`wait_for_peer_quiescence`]'s "no further activity"
 /// check mean anything, since by construction it cannot end early relative
 /// to whatever internal timer is still running — any activity from that
-/// timer resolving resets the wait.
+/// timer resolving resets the wait, and the window itself is now strictly
+/// longer than that timer (see [`QUIESCENCE_SETTLE_MARGIN_MS`]) so a
+/// same-instant tie between the two can no longer end the wait early either.
 async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
     ensure_lifecycle_quiescence_recorder_installed();
     let _permit = NODE_SETUP_ADMISSION
@@ -353,7 +381,9 @@ async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(
     );
     wait_for_peer_quiescence(
         &peer_ids,
-        Duration::from_millis(icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS),
+        Duration::from_millis(
+            icanact_remote::config::DEFAULT_PREFERRED_INBOUND_WAIT_MS + QUIESCENCE_SETTLE_MARGIN_MS,
+        ),
         Duration::from_secs(5),
     )
     .await;
