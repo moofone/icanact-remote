@@ -306,6 +306,8 @@ impl<T> ConnectionPool<T> {
             connection_counter: AtomicIsize::new(0),
             routing_revision: AtomicU64::new(0),
             routing_change_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            preferred_connection_checks: AtomicU64::new(0),
             _marker: PhantomData,
         };
 

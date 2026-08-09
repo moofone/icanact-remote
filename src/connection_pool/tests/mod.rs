@@ -1823,6 +1823,79 @@ async fn routing_revision_tracks_connection_publish_and_removal() {
         .expect("connection removal must wake route refresh");
 }
 
+#[tokio::test(start_paused = true)]
+async fn preferred_connection_wait_parks_until_connection_state_changes() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let remote = crate::KeyPair::new_for_testing("preferred_wait_parks").peer_id();
+    let mut config = crate::GossipConfig::default();
+    config.key_pair = Some(crate::KeyPair::new_for_testing("preferred_wait_registry"));
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    ));
+    let waiting_pool = Arc::clone(&pool);
+    let waiter = tokio::spawn(async move {
+        waiting_pool
+            .wait_for_preferred_connection(
+                &remote,
+                registry.as_ref(),
+                Duration::from_millis(100),
+            )
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(waiter.await.unwrap().is_none());
+    let checks = pool.preferred_connection_checks.load(Ordering::Relaxed);
+    assert!(checks <= 2, "idle preferred wait checked {checks} times");
+}
+
+#[tokio::test(start_paused = true)]
+async fn preferred_connection_publication_wakes_wait_without_advancing_time() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let remote = crate::KeyPair::new_for_testing("preferred_wait_publication").peer_id();
+    let mut config = crate::GossipConfig::default();
+    config.key_pair = Some(crate::KeyPair::new_for_testing(
+        "preferred_wait_publication_registry",
+    ));
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    ));
+    let waiting_pool = Arc::clone(&pool);
+    let waiting_registry = Arc::clone(&registry);
+    let waiting_remote = remote.clone();
+    let waiter = tokio::spawn(async move {
+        waiting_pool
+            .wait_for_preferred_connection(
+                &waiting_remote,
+                waiting_registry.as_ref(),
+                Duration::from_secs(60),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let direction = if registry.should_keep_connection(&remote, true) {
+        ConnectionDirection::Outbound
+    } else {
+        ConnectionDirection::Inbound
+    };
+    let addr: SocketAddr = "127.0.0.1:40555".parse().unwrap();
+    let connection = Arc::new(LockFreeConnection::new(addr, direction));
+    connection.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(remote, addr, connection));
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        pool.preferred_connection_checks.load(Ordering::Relaxed) >= 2,
+        "connection publication did not wake waiter"
+    );
+    waiter.abort();
+}
+
 #[tokio::test]
 async fn disconnect_by_peer_id_removes_configured_addr_connection_without_alias_row() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
