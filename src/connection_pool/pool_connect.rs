@@ -30,6 +30,7 @@ impl<T> ConnectionPool<T> {
             )),
             udp_socket: ArcSwapOption::empty(),
             connection_counter: AtomicUsize::new(0),
+            routing_revision: AtomicU64::new(0),
             _marker: PhantomData,
         };
 
@@ -39,6 +40,16 @@ impl<T> ConnectionPool<T> {
             &pool as *const _
         );
         pool
+    }
+
+    #[inline]
+    pub(crate) fn routing_revision(&self) -> u64 {
+        self.routing_revision.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn mark_routing_changed(&self) {
+        self.routing_revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Set the registry reference for handling incoming messages
@@ -249,11 +260,14 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection);
+        self.mark_routing_changed();
     }
 
     pub(crate) fn clear_current_peer_connection(&self, peer_id: &crate::PeerId) {
         self.set_current_peer_connection(peer_id, None);
-        let _ = self.connections_by_peer.remove_sync(peer_id);
+        if self.connections_by_peer.remove_sync(peer_id).is_some() {
+            self.mark_routing_changed();
+        }
     }
 
     pub(crate) fn clear_current_peer_connection_if_matches(

@@ -1362,6 +1362,19 @@ pub struct ActorState {
     pub local_actors: SccHashMap<String, RemoteActorLocation>,
     pub known_actors: SccHashMap<String, RemoteActorLocation>,
     pub removed_actors: SccHashMap<String, RemovedActorTombstone>,
+    routing_revision: AtomicU64,
+}
+
+impl ActorState {
+    #[inline]
+    pub(crate) fn routing_revision(&self) -> u64 {
+        self.routing_revision.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn mark_routing_changed(&self) {
+        self.routing_revision.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// Gossip coordination state for write-heavy operations
@@ -3067,7 +3080,9 @@ impl<T: 'static> GossipRegistry<T> {
             .read_sync(name.as_str(), |_, location| location.clone())
         {
             if loc.node_id == self_node_id {
-                let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+                if self.actor_state.known_actors.remove_sync(name.as_str()).is_some() {
+                    self.actor_state.mark_routing_changed();
+                }
             }
         }
 
@@ -3141,6 +3156,7 @@ impl<T: 'static> GossipRegistry<T> {
                 false
             }
         };
+        self.actor_state.mark_routing_changed();
 
         if priority.should_trigger_immediate_gossip() {
             let gossip_trigger_time = std::time::SystemTime::now()
@@ -3189,6 +3205,9 @@ impl<T: 'static> GossipRegistry<T> {
             .local_actors
             .remove_sync(name)
             .map(|(_, v)| v);
+        if removed.is_some() {
+            self.actor_state.mark_routing_changed();
+        }
 
         // If we learned our own actor via gossip (e.g., peers reflecting state back),
         // clear the known_actors entry too so re-register behaves as expected.
@@ -3199,7 +3218,9 @@ impl<T: 'static> GossipRegistry<T> {
             .read_sync(name, |_, location| location.clone())
         {
             if loc.node_id == self_node_id {
-                let _ = self.actor_state.known_actors.remove_sync(name);
+                if self.actor_state.known_actors.remove_sync(name).is_some() {
+                    self.actor_state.mark_routing_changed();
+                }
             }
         }
 
@@ -3562,6 +3583,9 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         let peer_actor_changes = peer_actors_added.len() + peer_actors_removed.len();
+        if applied_count > 0 {
+            self.actor_state.mark_routing_changed();
+        }
 
         debug!(
             sender = %sender_peer_id,
@@ -4812,6 +4836,7 @@ impl<T: 'static> GossipRegistry<T> {
 
         let mut new_actors = 0;
         let mut updated_actors = 0;
+        let mut removed_actors = 0;
         let mut peer_actors = std::collections::HashSet::new();
 
         // Collect wire candidates outside the lock; validate current state while applying.
@@ -4940,6 +4965,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(actor_name.as_str())
                     .is_some()
                 {
+                    removed_actors += 1;
                     info!(
                         actor_name = %actor_name,
                         peer = %sender_addr,
@@ -4965,6 +4991,10 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_addr = %addr,
                 "Recorded learned direct route for actor's host"
             );
+        }
+
+        if new_actors + updated_actors + removed_actors > 0 {
+            self.actor_state.mark_routing_changed();
         }
 
         debug!(
@@ -4999,6 +5029,7 @@ impl<T: 'static> GossipRegistry<T> {
 
             let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
             if removed > 0 {
+                self.actor_state.mark_routing_changed();
                 info!(removed_count = removed, "cleaned up stale actor entries");
             }
         }
@@ -5156,6 +5187,10 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                     gossip_state.peer_to_actors.remove(peer_addr);
 
+                    if actors_removed > 0 {
+                        self.actor_state.mark_routing_changed();
+                    }
+
                     info!(
                         peer = %peer_addr,
                         actors_removed,
@@ -5311,8 +5346,13 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Clear actor state
         {
+            let had_actors = !self.actor_state.local_actors.is_empty()
+                || !self.actor_state.known_actors.is_empty();
             self.actor_state.local_actors.clear_sync();
             self.actor_state.known_actors.clear_sync();
+            if had_actors {
+                self.actor_state.mark_routing_changed();
+            }
         }
 
         // Clear gossip state
@@ -6557,6 +6597,10 @@ impl<T: 'static> GossipRegistry<T> {
             }
             removed
         };
+
+        if removed_count > 0 {
+            self.actor_state.mark_routing_changed();
+        }
 
         info!(
             failed_peer = %failed_peer_addr,

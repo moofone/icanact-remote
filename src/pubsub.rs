@@ -376,6 +376,10 @@ pub struct RoutedPubSub {
     next_sub_id: AtomicU64,
     next_msg_id: AtomicU64,
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
+    route_provider_revision: AtomicU64,
+    last_actor_routing_revision: AtomicU64,
+    last_connection_routing_revision: AtomicU64,
+    last_route_provider_revision: AtomicU64,
 }
 
 impl RoutedPubSub {
@@ -401,6 +405,10 @@ impl RoutedPubSub {
             next_sub_id: AtomicU64::new(1),
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
+            route_provider_revision: AtomicU64::new(0),
+            last_actor_routing_revision: AtomicU64::new(u64::MAX),
+            last_connection_routing_revision: AtomicU64::new(u64::MAX),
+            last_route_provider_revision: AtomicU64::new(u64::MAX),
         });
         this.registry
             .set_pubsub_ingress_handler(Arc::clone(&this))
@@ -411,6 +419,7 @@ impl RoutedPubSub {
 
     pub fn set_route_provider(&self, provider: Arc<dyn PubSubRouteProvider>) {
         self.route_provider.store(Arc::new(Some(provider)));
+        self.route_provider_revision.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn stats(&self) -> PubSubIngressStats {
@@ -844,6 +853,20 @@ impl RoutedPubSub {
     }
 
     pub async fn refresh_control_plane(&self) {
+        let actor_revision = self.registry.actor_state.routing_revision();
+        let connection_revision = self.registry.connection_pool.routing_revision();
+        let provider_revision = self.route_provider_revision.load(Ordering::Acquire);
+        if self.last_actor_routing_revision.load(Ordering::Acquire) == actor_revision
+            && self
+                .last_connection_routing_revision
+                .load(Ordering::Acquire)
+                == connection_revision
+            && self.last_route_provider_revision.load(Ordering::Acquire) == provider_revision
+            && self.conns.load().values().all(|conn| !conn.is_closed())
+        {
+            return;
+        }
+
         let mut interests: HashMap<TopicKey, HashSet<PeerId>> = HashMap::new();
         for (name, _) in self.registry.snapshot_known_actors() {
             if let Some((topic, peer)) = parse_interest_name(&name) {
@@ -930,6 +953,12 @@ impl RoutedPubSub {
         self.refresh_hot_route_groups(&next_routes, &next_conns);
         self.route_groups.store(Arc::new(next_routes));
         self.conns.store(Arc::new(next_conns));
+        self.last_actor_routing_revision
+            .store(actor_revision, Ordering::Release);
+        self.last_connection_routing_revision
+            .store(connection_revision, Ordering::Release);
+        self.last_route_provider_revision
+            .store(provider_revision, Ordering::Release);
     }
 
     fn refresh_hot_route_groups(
@@ -1774,6 +1803,10 @@ mod tests {
             next_sub_id: AtomicU64::new(1),
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
+            route_provider_revision: AtomicU64::new(0),
+            last_actor_routing_revision: AtomicU64::new(u64::MAX),
+            last_connection_routing_revision: AtomicU64::new(u64::MAX),
+            last_route_provider_revision: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -1787,6 +1820,51 @@ mod tests {
             Arc::from(vec![SubscriberEntry::new(1, deliver)].into_boxed_slice()),
         );
         pubsub.subscribers.store(Arc::new(next));
+    }
+
+    #[tokio::test]
+    async fn unchanged_control_plane_tick_reuses_published_routes() {
+        let pubsub = test_pubsub("pubsub-idle-control-plane");
+
+        pubsub.refresh_control_plane().await;
+        let first = pubsub.route_groups.load_full();
+        pubsub.refresh_control_plane().await;
+        let second = pubsub.route_groups.load_full();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged 25 ms control-plane tick must not rebuild and republish route state"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_directory_change_invalidates_idle_control_plane_snapshot() {
+        let pubsub = test_pubsub("pubsub-control-plane-actor-change");
+        pubsub.refresh_control_plane().await;
+        let before = pubsub.route_groups.load_full();
+
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-control-plane-interested-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor_with_priority(
+                interest_name(topic_key("control-plane-change"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19001".parse().unwrap(),
+                    pubsub.local_peer_id.clone(),
+                ),
+                RegistrationPriority::Normal,
+            )
+            .await
+            .unwrap();
+
+        pubsub.refresh_control_plane().await;
+        let after_change = pubsub.route_groups.load_full();
+        assert!(!Arc::ptr_eq(&before, &after_change));
+
+        pubsub.refresh_control_plane().await;
+        let after_idle_tick = pubsub.route_groups.load_full();
+        assert!(Arc::ptr_eq(&after_change, &after_idle_tick));
     }
 
     #[test]

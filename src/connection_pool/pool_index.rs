@@ -27,6 +27,7 @@ pub struct ConnectionPool<T = ()> {
     udp_socket: ArcSwapOption<UdpSocket>,
     /// Connection counter for load balancing
     connection_counter: AtomicUsize,
+    routing_revision: AtomicU64,
     _marker: PhantomData<fn() -> T>,
 }
 
