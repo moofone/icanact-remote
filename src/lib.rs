@@ -828,6 +828,46 @@ impl<T: 'static> Peer<T> {
         self.connect_with_route_mode(addr, false).await
     }
 
+    /// P1 history: an earlier version of this function attributed the
+    /// dial's outcome -- healthy/gossiped on success, failed on error -- to
+    /// `addr`, the address the CALLER asked for, regardless of what was
+    /// actually contacted. `set_ordinary_connect_route`'s acceptance
+    /// boolean (checked just below, for `required_peer`) is only accurate
+    /// at the instant the owner command executes: if a concurrent
+    /// `configure_peer` pins this peer to a DIFFERENT address in the window
+    /// between that check and `connect_to_peer` actually resolving a
+    /// connection, the pool routes the real dial to the PIN's address while
+    /// this function would still record the caller's original `addr` --
+    /// advertising a route this node never actually contacted, or (on
+    /// failure) recording a spurious failure for an address nothing ever
+    /// touched. Fencing that gap (a token, a generation, a re-check) is the
+    /// same shape that has repeatedly left a residual window on this PR;
+    /// this function instead attributes every outcome to whatever
+    /// `connect_to_peer` reports it ACTUALLY resolved (`effective_addr`
+    /// below), which it re-derives fresh at the moment it runs rather than
+    /// trusting anything observed earlier -- so no interleaving can produce
+    /// a false claim, because nothing here ever claims more than what
+    /// happened.
+    ///
+    /// That fix made the OUTCOME truthful (marking); it did not make the
+    /// ENTRY truthful (existence). A later round found the same acceptance
+    /// boolean still gated an UNCONDITIONAL `gossip_state.peers.insert`
+    /// for `addr`, positioned BEFORE the dial: the exact same concurrent
+    /// `configure_peer` race left a fresh, zero-failure entry for `addr`
+    /// sitting in `gossip_state.peers` regardless of where the dial
+    /// actually landed, for the success arm to mark healthy and gossip
+    /// moments later. Every insertion this function performs is now
+    /// likewise deferred until AFTER the dial resolves and keyed to
+    /// whatever address it actually reports -- see each `match` arm below.
+    /// Audited every other pre-dial write in this function for the same
+    /// requested-vs-actual shape while at it: the discovered-route pool
+    /// writes (`set_discovered_peer_addr`/`reindex_connection_addr`) and
+    /// the existing-connection eviction check are both unaffected -- the
+    /// former only ever runs for the non-required path, where `addr` is
+    /// unambiguous and never goes through the owner's pin/route machinery
+    /// at all; the latter operates on whatever connection is CURRENTLY
+    /// published for `self.peer_id`, not on `addr`, so it cannot diverge
+    /// from what it acts on.
     async fn connect_with_route_mode(&self, addr: &SocketAddr, required_peer: bool) -> Result<()> {
         if self.peer_id == self.registry.peer_id {
             tracing::warn!(
@@ -856,74 +896,93 @@ impl<T: 'static> Peer<T> {
         }
 
         // First configure the address for this peer
-        {
-            let pool = &self.registry.connection_pool;
-            if required_peer {
-                pool.set_configured_peer_addr(&self.peer_id, *addr);
-            } else {
-                pool.set_discovered_peer_addr(&self.peer_id, *addr);
-                let _ = pool
-                    .addr_to_peer_id
-                    .upsert_sync(*addr, self.peer_id.clone());
+        if required_peer {
+            // Routed through the owner instead of writing `ConnectionPool`
+            // directly: `ConnectionPool::set_configured_peer_addr` is the
+            // SAME method `RoutingPublisher::set_configured_peer_addr`'s
+            // trait impl calls from INSIDE the owner's serialized
+            // `install_pin`/`migrate` commands. A caller-side read of the
+            // pin (however published, however tightly held next to the
+            // write) is never atomic with a concurrent `configure_peer`/
+            // `migrate` committing a NEW pin in the gap -- an earlier
+            // version of this checked `pinned_addr_for` first and still
+            // had that gap. Submitting this as
+            // `RegistryOwnerHandle::set_ordinary_connect_route` makes the
+            // conflict check and the route write (plus its own reindex)
+            // ONE step in the owner's own serialization, the same fix
+            // that closed this exact class of race for `configure_peer`'s
+            // reindex. This also performs the reindex for this branch;
+            // the discovered-route branch below still does its own.
+            //
+            // The return value MUST be consulted, not discarded: a
+            // `false` means the owner declined -- `self.peer_id` is
+            // operator-pinned to a DIFFERENT address than `addr` --
+            // meaning `addr` is NOT this peer's effective route.
+            // Discarding it and falling through anyway used to insert
+            // `addr` into `gossip_state` regardless, dial the peer (which
+            // actually reaches the PIN's address, since ConnectionPool's
+            // required route was never updated to `addr`), and on that
+            // dial's success mark `addr` itself healthy and gossip it --
+            // advertising a route this node never actually connected to.
+            //
+            // A declined route is NOT treated as "nothing left to do"
+            // here, though: an earlier version of this fix returned
+            // `Ok(())` immediately on decline, which stopped the false
+            // advertisement but ALSO stopped this call from connecting or
+            // reporting failure at all -- `peer.connect(&stale_addr)`
+            // against a peer pinned elsewhere silently reported success
+            // while the pinned peer was never even contacted, a
+            // regression from this function's prior contract (falling
+            // through to `connect_to_peer`, which resolves and dials the
+            // AUTHORITATIVE pinned address and surfaces ITS outcome).
+            // Continuing through is safe now specifically because the
+            // effective-address bookkeeping below already keys every
+            // insert/mark to whatever `connect_to_peer` actually
+            // resolves, never to this stale `addr` -- the original
+            // concern (advertising a route never contacted) was already
+            // closed by that fix, independent of whether this call
+            // returns early or not.
+            let route_accepted = self
+                .registry
+                .registry_owner
+                .set_ordinary_connect_route(self.peer_id.clone(), *addr)
+                .await;
+            if !route_accepted {
+                tracing::warn!(
+                    peer_id = %self.peer_id,
+                    addr = %addr,
+                    "ordinary connect declined: peer is operator-pinned to a different \
+                     address; continuing through the pinned route instead of the requested \
+                     one"
+                );
             }
+        } else {
+            let pool = &self.registry.connection_pool;
+            pool.set_discovered_peer_addr(&self.peer_id, *addr);
+            let _ = pool
+                .addr_to_peer_id
+                .upsert_sync(*addr, self.peer_id.clone());
             pool.reindex_connection_addr(&self.peer_id, *addr);
         }
 
-        // Add the peer to gossip state so it can be selected for gossip rounds
-        {
-            tracing::debug!(
-                "🎯 Peer::connect - About to add peer {} to gossip state",
-                self.peer_id
-            );
-            let mut gossip_state = self.registry.gossip_state.lock().await;
-            let current_time = crate::current_timestamp();
-            let current_time_ms = crate::current_timestamp_millis();
-            let peers_before = gossip_state.peers.len();
-
-            // Convert PeerId to GossipNodeId for TLS
-            let node_id = Some(self.peer_id.to_node_id());
-            if node_id.is_some() {
-                tracing::debug!(
-                    "🔐 Converted PeerId {} to GossipNodeId for TLS",
-                    self.peer_id
-                );
-            }
-
-            gossip_state.peers.insert(
-                *addr,
-                crate::registry::PeerInfo {
-                    address: *addr,
-                    peer_address: None,
-                    inbound_observed: false,
-                    outbound_dial_success: false,
-                    node_id,                    // Set the GossipNodeId for TLS verification
-                    dns_name: None,             // Will be set via set_dns_name() if needed
-                    failures: 0,                // Start with 0 failures
-                    last_attempt: current_time, // Set last_attempt to now
-                    last_success: 0,
-                    last_sequence: 0,
-                    last_sent_sequence: 0,
-                    consecutive_deltas: 0,
-                    last_failure_time: None,
-                    last_dns_refresh_attempt: None,
-                    last_response_received_ms: current_time_ms,
-                    accept_lower_sequence_from: None,
-                    current_session_source: None,
-                    current_session_connection: None,
-                    current_session_epoch: 0,
-                    identity_verified: false,
-                    transport_source_keyed: false,
-                },
-            );
-            let peers_after = gossip_state.peers.len();
-            tracing::debug!(
-              peer_id = %self.peer_id,
-              addr = %addr,
-              peers_before = peers_before,
-              peers_after = peers_after,
-              "🎯 Added peer to gossip state for gossip rounds"
-            );
-        }
+        // `gossip_state.peers` is deliberately NOT touched here, before the
+        // dial: an earlier version of this function inserted a fresh entry
+        // for `addr` unconditionally at this point, on the strength of
+        // `route_accepted` above -- accurate only at the instant the owner
+        // command executed. A concurrent `configure_peer` committing a NEW
+        // pin after that check but before the dial below leaves the pool
+        // routing to the pin's address while this entry, keyed to `addr`,
+        // sat in `gossip_state.peers` regardless -- a fresh, zero-failure
+        // entry for an address this node never actually contacted, ready
+        // for the success arm below to mark healthy and gossip. Insertion
+        // is deferred to AFTER the dial resolves and keyed to whatever it
+        // actually reports, in each arm of the `match` below: for
+        // `required_peer`, `connect_to_peer` is now the sole authority for
+        // this bookkeeping (see its doc comment) and this function performs
+        // none of its own; for the discovered/non-required path, `addr` is
+        // unambiguous (it never goes through the owner's pin/route
+        // machinery at all), but the insert still waits for the dial's
+        // outcome rather than assuming one in advance.
 
         if let Some(existing_conn) = self
             .registry
@@ -975,27 +1034,117 @@ impl<T: 'static> Peer<T> {
             }
         }
 
-        // Then attempt to connect with enhanced error context.
-        let connect_result = if required_peer {
-            self.registry.connect_to_peer(&self.peer_id).await
+        // Then attempt to connect with enhanced error context. Both arms
+        // now produce the address ACTUALLY contacted, not just `Result<()>`
+        // -- `connect_to_peer` re-derives its own address fresh, at the
+        // moment it runs (see its doc comment); `get_connection(*addr)`
+        // USUALLY resolves exactly `*addr`, but not unconditionally: in a
+        // narrow race (a follower task loses the outbound-dial-gate race
+        // for `*addr`, then on retry resolves an already-published
+        // connection for the SAME peer identity via `get_connection_by_
+        // peer_id` instead), the returned handle's `.addr` can be that
+        // OTHER connection's own address rather than `*addr` -- see the
+        // `Ok` arm below for why this matters.
+        let connect_result: Result<crate::registry::ConnectOutcome> = if required_peer {
+            // `connect_to_peer_with_outcome` (the `pub(crate)`, detailed
+            // form -- see its own doc comment for why it is not the
+            // public `connect_to_peer`) is the sole authority for its own
+            // gossip_state bookkeeping on BOTH outcomes -- the
+            // attempted-address half of its return value is not needed
+            // here, only the outcome itself. Its `Ok` may be
+            // `ConnectOutcome::ConnectedUnverified` when no address was
+            // independently corroborated as dialable this round -- see
+            // that type's own doc comment; this function does not perform
+            // its own bookkeeping for the required-peer path either way
+            // (see below), so no further handling is needed here.
+            self.registry
+                .connect_to_peer_with_outcome(&self.peer_id)
+                .await
+                .1
         } else {
-            self.registry.get_connection(*addr).await.map(|_| ())
+            self.registry.get_connection(*addr).await.map(|conn| {
+                // `get_connection` can reuse an existing INBOUND
+                // connection for this identity (the dial-gate race
+                // described above): `conn.addr` is then that connection's
+                // raw, ephemeral transport source, not a corroborated
+                // dial target. `ConnectionHandle` itself carries no
+                // direction, so it must be looked up independently from
+                // the pool -- `ResolvedRoute::from_connection` requires
+                // exactly that, rather than accepting a bare `SocketAddr`
+                // with no way to tell the two cases apart.
+                let direction = self
+                    .registry
+                    .connection_pool
+                    .get_lock_free_connection(conn.addr)
+                    .map(|c| c.direction);
+                crate::registry::ConnectOutcome::resolved(
+                    crate::registry::ResolvedRoute::from_connection(conn.addr, direction),
+                )
+            })
         };
         match connect_result {
-            Ok(()) => {
+            Ok(outcome) => {
+                let effective_addr = outcome.addr();
                 tracing::info!(
                     peer_id = %self.peer_id,
-                    addr = %addr,
+                    requested_addr = %addr,
+                    effective_addr = %effective_addr,
                     "Successfully connected to peer"
                 );
-                {
+                // `connect_to_peer` (required_peer) already performed its
+                // own, more thorough gossip_state bookkeeping internally,
+                // scoped to the address it actually resolved. Duplicating
+                // a narrower version of that here, keyed by whatever this
+                // call was originally asked to try, is exactly the bug
+                // this fix closes (see this function's own doc comment):
+                // only `get_connection` (the discovered/non-required
+                // path) has no bookkeeping of its own, so this remains
+                // the sole place that path's success is recorded.
+                if !required_peer {
+                    // Insert-if-absent, not update-only: this is the sole
+                    // bookkeeping site for the discovered/non-required
+                    // path (see this function's own doc comment), so a
+                    // first-ever successful connection to a not-yet-known
+                    // address must still gain an entry, not silently have
+                    // nowhere to record itself.
+                    //
+                    // Keyed to `effective_addr` -- the address `outcome`
+                    // (a `ConnectOutcome`) actually resolved -- never to
+                    // `*addr`, the bare request, when the two differ:
+                    // `get_connection` can reuse an already-published
+                    // connection for the SAME peer identity at a
+                    // DIFFERENT address than this call asked for (see the
+                    // comment above the `match` for the race), and
+                    // marking `*addr` healthy/gossipable in that case
+                    // would attribute reachability to an address this
+                    // call never actually verified anything about -- the
+                    // same confusion between "the address we looked up"
+                    // and "the socket this connection happens to be on"
+                    // that #181 (and `connect_to_peer`'s own alias
+                    // handling) exists to avoid; see
+                    // `PeerInfo::for_connect_attempt`'s doc comment.
+                    //
+                    // The discovered/non-required path above always
+                    // constructs `ConnectOutcome::resolved(...)` -- never
+                    // `ConnectedUnverified`, which only `connect_to_peer`
+                    // (the `required_peer` path, not reachable in this
+                    // branch) ever produces -- so a corroborated
+                    // `ResolvedRoute` is always present here.
+                    let route = outcome.resolved_route().expect(
+                        "the discovered/non-required path always constructs \
+                         ConnectOutcome::resolved -- see this function's own connect_result \
+                         construction above",
+                    );
                     let mut gossip_state = self.registry.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(addr) {
-                        peer_info.failures = 0;
-                        peer_info.last_failure_time = None;
-                        peer_info.last_success = crate::current_timestamp();
-                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
-                    }
+                    let node_id = Some(self.peer_id.to_node_id());
+                    let peer_info = gossip_state.peers.entry(effective_addr).or_insert_with(|| {
+                        crate::registry::PeerInfo::for_connect_attempt(route, node_id)
+                    });
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
+                    peer_info.last_success = crate::current_timestamp();
+                    peer_info.last_response_received_ms = crate::current_timestamp_millis();
                 }
                 // Trigger an immediate gossip round to sync
                 let _ = self.registry.trigger_immediate_gossip().await;
@@ -1009,19 +1158,38 @@ impl<T: 'static> Peer<T> {
                     "Network error connecting to peer"
                 );
 
-                // Update peer failure state in gossip state
-                {
+                // `connect_to_peer` (required_peer) already recorded
+                // failure internally against whatever address it actually
+                // resolved and attempted -- re-derived fresh at the moment
+                // it ran, never trusted from this caller's possibly-stale
+                // `addr`. Recording a SECOND failure here, keyed by `addr`,
+                // would risk a spurious entry for an address that was
+                // never actually contacted at all -- see this function's
+                // own doc comment. `get_connection` (discovered/non-
+                // required) has no bookkeeping of its own, so this remains
+                // the only place that path's failure is ever recorded, and
+                // `addr` is unambiguously what was attempted there.
+                if !required_peer {
+                    // Insert-if-absent -- see the success arm above for
+                    // why. `addr` is unambiguous for this path.
                     let mut gossip_state = self.registry.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(addr) {
-                        peer_info.failures = self.registry.config.max_peer_failures;
-                        peer_info.last_failure_time = Some(crate::current_timestamp());
-                        tracing::debug!(
-                            peer_id = %self.peer_id,
-                            addr = %addr,
-                            failures = peer_info.failures,
-                            "Updated peer failure state after connection error"
-                        );
-                    }
+                    let node_id = Some(self.peer_id.to_node_id());
+                    let peer_info = gossip_state
+                        .peers
+                        .entry(*addr)
+                        .or_insert_with(|| crate::registry::PeerInfo::for_failed_connect_attempt(
+                            crate::registry::AttemptedRoute::new(*addr),
+                            node_id,
+                        ));
+                    peer_info.failures = self.registry.config.max_peer_failures;
+                    peer_info.last_failure_time = Some(crate::current_timestamp());
+                    peer_info.last_failure_instant = Some(std::time::Instant::now());
+                    tracing::debug!(
+                        peer_id = %self.peer_id,
+                        addr = %addr,
+                        failures = peer_info.failures,
+                        "Updated peer failure state after connection error"
+                    );
                 }
 
                 Err(GossipError::Network(std::io::Error::new(
@@ -1039,13 +1207,21 @@ impl<T: 'static> Peer<T> {
                     "Connection timeout when connecting to peer"
                 );
 
-                // Update peer failure state in gossip state
-                {
+                // See the Network arm above for why this is conditional
+                // and insert-if-absent.
+                if !required_peer {
                     let mut gossip_state = self.registry.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(addr) {
-                        peer_info.failures = self.registry.config.max_peer_failures;
-                        peer_info.last_failure_time = Some(crate::current_timestamp());
-                    }
+                    let node_id = Some(self.peer_id.to_node_id());
+                    let peer_info = gossip_state
+                        .peers
+                        .entry(*addr)
+                        .or_insert_with(|| crate::registry::PeerInfo::for_failed_connect_attempt(
+                            crate::registry::AttemptedRoute::new(*addr),
+                            node_id,
+                        ));
+                    peer_info.failures = self.registry.config.max_peer_failures;
+                    peer_info.last_failure_time = Some(crate::current_timestamp());
+                    peer_info.last_failure_instant = Some(std::time::Instant::now());
                 }
 
                 Err(GossipError::Network(std::io::Error::new(
@@ -1674,6 +1850,284 @@ mod tests {
         assert!(matches!(err, GossipError::Network(_)));
     }
 
+    /// P1 regression: an EARLIER version of `Peer::connect`'s ordinary
+    /// route update read `RegistryOwnerHandle::pinned_addr_for` and THEN
+    /// wrote `ConnectionPool::set_configured_peer_addr` as a separate
+    /// step. Even held as tightly together as possible on the caller's
+    /// side, that is still "read a published mirror, then act on it" --
+    /// a race no matter how tight, since the read and the write are not
+    /// on the SAME serialization as a concurrent `configure_peer`/
+    /// `migrate` publishing a NEW pin in between.
+    ///
+    /// Reconstructs that exact shape directly against the primitives --
+    /// production code no longer has this shape at all; see
+    /// `RegistryOwnerHandle::set_ordinary_connect_route`'s doc comment --
+    /// to prove the underlying vulnerability class: a pin published
+    /// AFTER the read but BEFORE the write still gets silently
+    /// overwritten.
+    #[tokio::test]
+    async fn a_caller_side_pin_read_then_route_write_is_vulnerable_to_an_interleaved_pin_publish()
+     {
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41010".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(KeyPair::new_for_testing("ordinary-connect-race-local")),
+                ..GossipConfig::default()
+            },
+        ));
+        let peer_id = KeyPair::new_for_testing("ordinary-connect-race-remote").peer_id();
+        let stale_addr: SocketAddr = "127.0.0.1:41011".parse().unwrap();
+        let new_pin_addr: SocketAddr = "127.0.0.1:41012".parse().unwrap();
+
+        // The "read": no pin published yet.
+        assert_eq!(registry.registry_owner.pinned_addr_for(&peer_id), None);
+
+        // An owner command interleaves BETWEEN the read and the write
+        // below, publishing a NEW pin -- exactly what a concurrent
+        // `configure_peer` does.
+        registry
+            .configure_peer(peer_id.clone(), new_pin_addr)
+            .await;
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(new_pin_addr)
+        );
+
+        // The stale "write" proceeds anyway, using the read from before
+        // the interleaved publish -- exactly what the OLD ordinary-
+        // connect path did.
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer_id, stale_addr);
+
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(stale_addr),
+            "the stale write overwrites the newly-published pin's route anyway -- proving \
+             a caller-side read-then-write, however tight, is not the same as one atomic \
+             step with respect to owner commands"
+        );
+    }
+
+    /// The fix: `Peer::connect`'s ordinary route update now goes through
+    /// `RegistryOwnerHandle::set_ordinary_connect_route`, an owner
+    /// command, so the pin-conflict check and the route write are the
+    /// SAME serialized step no concurrent `configure_peer` can land
+    /// inside of. Proves it with a genuine concurrent race: an ordinary
+    /// connect and a `configure_peer` call for the SAME peer, fired at
+    /// the same time. `configure_peer` always installs an actual,
+    /// unconditional pin, so it must win regardless of ordering --
+    /// either the ordinary connect's owner command sees the pin already
+    /// installed and declines to overwrite the route with its own
+    /// address, or it runs first and writes its own address, which
+    /// `configure_peer`'s own atomic pin-install then overwrites
+    /// unconditionally. Either way `ConnectionPool`'s required route
+    /// must end up EXACTLY the pin address, never the ordinary connect's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ordinary_connect_and_configure_peer_never_disagree_on_the_route() {
+        for round in 0..20u16 {
+            let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+                format!("127.0.0.1:{}", 41_100 + round).parse().unwrap(),
+                GossipConfig {
+                    key_pair: Some(KeyPair::new_for_testing(format!(
+                        "concurrent-ordinary-connect-local-{round}"
+                    ))),
+                    connection_timeout: Duration::from_millis(10),
+                    ..GossipConfig::default()
+                },
+            ));
+            let peer_id =
+                KeyPair::new_for_testing(format!("concurrent-ordinary-connect-remote-{round}"))
+                    .peer_id();
+            let ordinary_addr: SocketAddr =
+                format!("127.0.0.1:{}", 41_200 + round).parse().unwrap();
+            let pin_addr: SocketAddr = format!("127.0.0.1:{}", 41_300 + round).parse().unwrap();
+
+            let peer = Peer {
+                peer_id: peer_id.clone(),
+                registry: registry.clone(),
+            };
+            let call_connect = tokio::spawn(async move {
+                let _ = peer.connect(&ordinary_addr).await;
+            });
+            let registry_for_pin = registry.clone();
+            let peer_id_for_pin = peer_id.clone();
+            let call_configure = tokio::spawn(async move {
+                registry_for_pin
+                    .configure_peer(peer_id_for_pin, pin_addr)
+                    .await;
+            });
+            call_connect.await.expect("call_connect task panicked");
+            call_configure.await.expect("call_configure task panicked");
+
+            assert_eq!(
+                registry.connection_pool.get_required_peer_addr(&peer_id),
+                Some(pin_addr),
+                "round {round}: ConnectionPool's required route must end up exactly the pin \
+                 address regardless of race ordering"
+            );
+            assert_eq!(
+                registry.registry_owner.pinned_addr_for(&peer_id),
+                Some(pin_addr),
+                "round {round}: sanity -- the owner's own pin must agree"
+            );
+        }
+    }
+
+    /// P1 regression history: `connect_with_route_mode` originally
+    /// discarded `RegistryOwnerHandle::set_ordinary_connect_route`'s
+    /// return value entirely, unconditionally inserting the REQUESTED
+    /// address into `gossip_state` and marking it healthy on a dial that
+    /// actually reached the PIN's address -- advertising a route this
+    /// node never actually connected to. That was fixed by deferring
+    /// every insert/mark to the dial's actual, resolved address. A LATER
+    /// version of that fix went one step further and returned `Ok(())`
+    /// immediately on a decline, WITHOUT falling through to the dial at
+    /// all -- a functional regression: `peer.connect(&declined_addr)`
+    /// against a peer pinned elsewhere now reported success without
+    /// ever establishing or verifying any connection, when the prior
+    /// contract was to fall through to `connect_to_peer`, which resolves
+    /// and dials the AUTHORITATIVE pinned address and surfaces ITS own
+    /// outcome.
+    ///
+    /// Proves both halves are intact at once: `configure_peer` pins the
+    /// peer to A (nothing listens there in this test), then an ordinary
+    /// `.connect(&B)` is made for the same peer. B must never appear in
+    /// `gossip_state` at all (the original concern -- even a
+    /// present-but-failed entry would still be gossiped as a known
+    /// address for this peer), but the call must ALSO have genuinely
+    /// tried to connect through the pinned route and surfaced ITS
+    /// failure -- proven directly by the call returning `Err`, since
+    /// nothing listens at A either; a call that silently returned
+    /// `Ok(())` without ever dialing anything would not.
+    #[tokio::test]
+    async fn ordinary_connect_falls_through_to_the_pinned_route_without_gossiping_the_declined_one()
+     {
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41013".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(KeyPair::new_for_testing("declined-route-local")),
+                connection_timeout: Duration::from_millis(10),
+                ..GossipConfig::default()
+            },
+        ));
+        let peer_id = KeyPair::new_for_testing("declined-route-remote").peer_id();
+        let pinned_addr: SocketAddr = "127.0.0.1:41014".parse().unwrap();
+        let declined_addr: SocketAddr = "127.0.0.1:41015".parse().unwrap();
+
+        registry
+            .configure_peer(peer_id.clone(), pinned_addr)
+            .await;
+
+        let peer = Peer {
+            peer_id: peer_id.clone(),
+            registry: registry.clone(),
+        };
+        let err = peer
+            .connect(&declined_addr)
+            .await
+            .expect_err(
+                "a declined ordinary connect must still fall through to the pinned route and \
+                 surface ITS failure -- nothing listens at the pin either, so silently \
+                 returning Ok(()) here would prove the fallthrough never happened",
+            );
+        assert!(
+            matches!(err, GossipError::Network(_)),
+            "the surfaced error must come from actually attempting the pinned route, not some \
+             unrelated failure -- got {err:?}"
+        );
+
+        {
+            let gossip_state = registry.gossip_state.lock().await;
+            assert!(
+                !gossip_state.peers.contains_key(&declined_addr),
+                "an address the owner declined to route to must never be inserted into \
+                 gossip_state at all -- present-but-unhealthy would still be gossiped as a \
+                 known peer address, which is exactly the original bug: advertising a route \
+                 this node never actually connected to"
+            );
+        }
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(pinned_addr),
+            "sanity: the pin's route must still be the only one ConnectionPool reports"
+        );
+    }
+
+    /// P1 regression: the outcome-attribution fix above (a round earlier)
+    /// made MARKING truthful -- health/failure keyed to the address a dial
+    /// actually resolved -- but the entry's very EXISTENCE was still gated
+    /// on `route_accepted`, a fact only valid at the instant the owner
+    /// command executed. `gossip_state.peers.insert(B, ...)` used to run
+    /// UNCONDITIONALLY, before the dial, regardless of what a CONCURRENT
+    /// `configure_peer` did in the meantime: the dial could resolve A
+    /// while a fresh, zero-failure entry for B sat in `gossip_state.peers`
+    /// regardless, ready for the success arm to mark healthy and gossip --
+    /// exactly what the outcome-attribution fix set out to stop, just
+    /// reached through the entry's EXISTENCE rather than its marking.
+    /// Fixed by deferring every insertion in `connect_with_route_mode`
+    /// until AFTER the dial resolves, keyed to whatever address it
+    /// actually reports.
+    ///
+    /// Proves it with a genuine concurrent race, run over many rounds to
+    /// cover every ordering the owner's serialization can produce: an
+    /// ordinary connect to B and a `configure_peer` pin to A for the SAME
+    /// peer, fired at the same time. Nothing in this bare test listens on
+    /// either address, so every dial genuinely fails regardless of which
+    /// address it targets -- the invariant under test is not "the dial
+    /// succeeds", it is "B never gains a gossip_state entry this node did
+    /// not itself dial", which must hold no matter how the race resolves:
+    /// B's route write can be accepted and then overridden by the pin
+    /// (the dial lands on A instead and fails, and a first-ever failure
+    /// has no existing entry to update -- critically, none for B either),
+    /// or declined outright by an already-installed pin (this call
+    /// returns early, touching nothing at all).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordinary_connect_never_inserts_a_gossip_state_entry_for_an_address_it_did_not_dial()
+     {
+        for round in 0..20u16 {
+            let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+                format!("127.0.0.1:{}", 41_400 + round).parse().unwrap(),
+                GossipConfig {
+                    key_pair: Some(KeyPair::new_for_testing(format!(
+                        "insert-attribution-local-{round}"
+                    ))),
+                    connection_timeout: Duration::from_millis(10),
+                    ..GossipConfig::default()
+                },
+            ));
+            let peer_id =
+                KeyPair::new_for_testing(format!("insert-attribution-remote-{round}")).peer_id();
+            let addr_b: SocketAddr = format!("127.0.0.1:{}", 41_500 + round).parse().unwrap();
+            let addr_a: SocketAddr = format!("127.0.0.1:{}", 41_600 + round).parse().unwrap();
+
+            let peer = Peer {
+                peer_id: peer_id.clone(),
+                registry: registry.clone(),
+            };
+            let call_connect = tokio::spawn(async move {
+                let _ = peer.connect(&addr_b).await;
+            });
+            let registry_for_pin = registry.clone();
+            let peer_id_for_pin = peer_id.clone();
+            let call_configure = tokio::spawn(async move {
+                registry_for_pin
+                    .configure_peer(peer_id_for_pin, addr_a)
+                    .await;
+            });
+            call_connect.await.expect("call_connect task panicked");
+            call_configure.await.expect("call_configure task panicked");
+
+            let gossip_state = registry.gossip_state.lock().await;
+            assert!(
+                !gossip_state.peers.contains_key(&addr_b),
+                "round {round}: B must never gain a gossip_state entry unless this node \
+                 actually dialed it -- got {:?}",
+                gossip_state.peers.get(&addr_b)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn peer_connect_refuses_self_peer_without_configuring_or_dialing() {
         let local_key = KeyPair::new_for_testing("self-peer-connect-guard");
@@ -1714,6 +2168,312 @@ mod tests {
             !gossip_state.peers.contains_key(&registry.bind_addr),
             "self peers must not enter gossip peer state"
         );
+    }
+
+    /// P1 finding (review round against a3301b9, `lib.rs:1097`): the
+    /// discovered-connect success arm explicitly acknowledges
+    /// `effective_addr != *addr` is possible (`get_connection` can resolve
+    /// an already-published connection for the SAME peer identity at a
+    /// DIFFERENT address than the one this call actually asked for --
+    /// `connect_via_stream`'s own duplicate-connection tie-break reuses an
+    /// existing, live OUTBOUND connection for the identity outright,
+    /// before ever dialing the requested address, whenever
+    /// `should_keep_connection` says this side should keep it), yet used
+    /// to insert/mark the REQUESTED address (`*addr`) healthy and
+    /// gossipable unconditionally. That attributes reachability to an
+    /// address this call never contacted or verified anything about -- a
+    /// stale or even malicious discovery hint could be marked healthy and
+    /// gossiped without ever being dialed. Fixed by keying the insert/mark
+    /// to `effective_addr` (wrapped as a `ResolvedRoute`) instead.
+    ///
+    /// Reproduced deterministically, not via scheduler luck: this test
+    /// holds `gossip_state`'s lock across the exact window
+    /// `connect_discovered`'s own `get_connection` call needs it (inside
+    /// `lookup_node_id`'s identity resolution) and only then establishes
+    /// the peer's ONE connection -- at a DIFFERENT address (`A`) than the
+    /// one requested (`B`). The call cannot observe anything past that
+    /// point until the lock is released, by which time `A` is
+    /// unconditionally in place; `connect_via_stream`'s own tie-break then
+    /// reuses it directly rather than dialing `B` at all. The key pair is
+    /// chosen so this side's NodeId sorts below the peer's, which is
+    /// exactly what makes `should_keep_connection` favor keeping an
+    /// existing outbound connection over dialing a new one (see its own
+    /// doc comment).
+    #[tokio::test]
+    async fn connect_discovered_marks_the_address_actually_resolved_not_the_bare_request() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let (local_key, remote_key) = outbound_reuse_key_pair();
+        let peer_id = remote_key.peer_id();
+
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41010".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(local_key),
+                connection_timeout: Duration::from_millis(200),
+                ..GossipConfig::default()
+            },
+        ));
+        // `get_connection`'s identity-resolution fallback (`lookup_node_id`)
+        // upgrades a weak back-reference to the owning registry; without
+        // wiring it, that resolution silently no-ops and this call would
+        // fall straight through to a real dial instead of exercising the
+        // reuse path under test.
+        registry.connection_pool.set_registry(registry.clone());
+
+        // A -- where the peer's only connection actually lives.
+        let existing_addr: SocketAddr = "127.0.0.1:41011".parse().unwrap();
+        // B -- a discovery hint this call is told to reach; never itself
+        // dialed, since the tie-break below resolves via `A` first.
+        let requested_addr: SocketAddr = "127.0.0.1:41012".parse().unwrap();
+
+        let peer = Peer {
+            peer_id: peer_id.clone(),
+            registry: registry.clone(),
+        };
+
+        // Hold `gossip_state`'s lock across the window `connect_discovered`'s
+        // own `get_connection` call needs it, inside `lookup_node_id`'s
+        // identity resolution.
+        let guard = registry.gossip_state.lock().await;
+
+        let connect_task = {
+            let peer = peer.clone();
+            tokio::spawn(async move { peer.connect_discovered(&requested_addr).await })
+        };
+
+        // Let the spawned task run until it genuinely blocks on the lock
+        // this test still holds -- deterministic on the current-thread
+        // runtime `#[tokio::test]` defaults to: nothing else can make
+        // progress until this task yields, and there is no `.await` point
+        // between `connect_discovered`'s entry and that lock acquisition
+        // for it to have reached instead.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Establish peer_id's ONLY connection -- an OUTBOUND connection at
+        // `A`, never at `B` -- while the discovered call is provably
+        // blocked before it can observe it.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            existing_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(existing_addr, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(std::sync::Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = std::sync::Arc::new(conn);
+        registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            existing_addr,
+            conn.clone(),
+        );
+
+        drop(guard);
+
+        connect_task
+            .await
+            .expect("connect_discovered task must not panic")
+            .expect("must resolve the peer's existing outbound connection without a real dial");
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state
+                .peers
+                .get(&requested_addr)
+                .is_none_or(|info| info.last_success == 0),
+            "the requested address must never be marked healthy/gossipable -- this call \
+             never actually verified anything about it, it reused a pre-existing outbound \
+             connection at a completely different address instead: {:?}",
+            gossip_state.peers.get(&requested_addr)
+        );
+        let existing_entry = gossip_state
+            .peers
+            .get(&existing_addr)
+            .expect("the address actually resolved must gain a gossip_state entry");
+        assert!(
+            existing_entry.last_success > 0,
+            "the address ACTUALLY resolved must be the one marked healthy"
+        );
+    }
+
+    /// P1 finding (review round against 4c41300, `lib.rs:1058`): the
+    /// discovered path converted `get_connection`'s resolved handle into a
+    /// `ResolvedRoute` from `conn.addr` alone, discarding the connection's
+    /// direction entirely. If `get_connection` reuses an INBOUND
+    /// connection for the same identity (the same tie-break-reuse
+    /// mechanism `connect_discovered_marks_the_address_actually_resolved_
+    /// not_the_bare_request` above exercises for an outbound connection,
+    /// here with the ordering flipped so the tie-break keeps the INBOUND
+    /// side instead), `conn.addr` is that connection's raw, ephemeral
+    /// transport source -- and the later insert built a normal `PeerInfo`
+    /// with `transport_source_keyed = false`, making an undialable address
+    /// selectable and gossipable. This is #181's subject matter reaching
+    /// the crate a fourth time (#181 twice, `connect_to_peer` in an
+    /// earlier round of this PR, and here) -- fixed not by patching this
+    /// site but by tightening `ResolvedRoute` itself. Its only constructor
+    /// is now the `pub(crate)` `from_connection` (requires the
+    /// connection's OWN direction, independently looked up -- an inbound
+    /// source can only ever produce a route flagged as unverified). A
+    /// second, unconditionally-`dialable: true` constructor,
+    /// `from_configured`, existed for a while for `connect_to_peer`'s own
+    /// required-peer path, but was itself deleted in a later round (review
+    /// round against `f64f3a9`) once its "trusted independent of
+    /// connection direction" premise turned out not to hold for a
+    /// caller-provided address either -- see `ConnectOutcome`'s own doc
+    /// comment. That case (a live connection exists, but nothing
+    /// corroborates any address as dialable) is represented by
+    /// `ConnectOutcome::ConnectedUnverified` now, a value that never wraps
+    /// a `ResolvedRoute` at all, not reachable through this discovered/
+    /// non-required path at all (only through `connect_to_peer`). Every
+    /// consumer that builds a `PeerInfo` from a `ResolvedRoute` reads its
+    /// dialability directly (`PeerInfo::for_connect_attempt`), so this
+    /// call site cannot forget to flag it even if it tries.
+    #[tokio::test]
+    async fn connect_discovered_reusing_an_inbound_connection_does_not_mark_the_ephemeral_source_healthy()
+     {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        // Flipped from `outbound_reuse_key_pair`: `should_keep_connection`
+        // keeps an existing INBOUND connection only when THIS side's
+        // NodeId sorts ABOVE the peer's (see its own doc comment: `Greater
+        // => !is_outbound`, and `is_outbound` is `false` for an inbound
+        // existing connection).
+        let (local_key, remote_key) = inbound_preferred_key_pair();
+        let peer_id = remote_key.peer_id();
+
+        let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
+            "127.0.0.1:41020".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(local_key),
+                connection_timeout: Duration::from_millis(200),
+                enable_peer_discovery: true,
+                allow_loopback_discovery: true,
+                ..GossipConfig::default()
+            },
+        ));
+        registry.connection_pool.set_registry(registry.clone());
+
+        // A -- the peer's only connection, INBOUND: its own address is a
+        // raw, ephemeral transport source, never a corroborated dial
+        // target.
+        let existing_addr: SocketAddr = "127.0.0.1:41021".parse().unwrap();
+        // B -- a discovery hint this call is told to reach; never itself
+        // dialed, since the tie-break below resolves via `A` first.
+        let requested_addr: SocketAddr = "127.0.0.1:41022".parse().unwrap();
+
+        let peer = Peer {
+            peer_id: peer_id.clone(),
+            registry: registry.clone(),
+        };
+
+        let guard = registry.gossip_state.lock().await;
+
+        let connect_task = {
+            let peer = peer.clone();
+            tokio::spawn(async move { peer.connect_discovered(&requested_addr).await })
+        };
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            existing_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(existing_addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(std::sync::Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = std::sync::Arc::new(conn);
+        registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            existing_addr,
+            conn.clone(),
+        );
+
+        drop(guard);
+
+        connect_task
+            .await
+            .expect("connect_discovered task must not panic")
+            .expect("must resolve the peer's existing inbound connection without a real dial");
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            gossip_state
+                .peers
+                .get(&requested_addr)
+                .is_none_or(|info| info.last_success == 0),
+            "the requested address must never be marked healthy/gossipable: {:?}",
+            gossip_state.peers.get(&requested_addr)
+        );
+        let existing_entry = gossip_state
+            .peers
+            .get(&existing_addr)
+            .expect("the address actually resolved must gain a gossip_state entry");
+        assert!(
+            existing_entry.transport_source_keyed,
+            "an inbound connection's raw, ephemeral source must never be recorded as an \
+             ordinary, dialable route -- the flag connect_to_peer already preserves for its \
+             own inbound-reuse case must carry through the discovered path too"
+        );
+        assert!(
+            existing_entry.inbound_observed,
+            "the entry must also carry the inbound-observed evidence, not just the \
+             transport-source flag"
+        );
+        // NOTE on "gossiped": `select_best_alias_per_identity` (the ranking
+        // both periodic and immediate gossip target selection share)
+        // deliberately still selects a `transport_source_keyed` alias when
+        // it is LIVE and the ONLY alias for its identity -- excluding a
+        // live connection outright would silence gossip about a
+        // genuinely-connected peer entirely, worse than the imprecision
+        // being guarded against. The flag's protective effect is in
+        // RANKING: it always LOSES to a genuinely dialable alias for the
+        // SAME identity the moment one exists (see
+        // `gossip_peer_list_target_selection_prefers_live_alias_over_stale`
+        // in registry.rs, which covers exactly that case). This test's own
+        // scope is the flag itself reaching the entry at all -- asserted
+        // above -- not the ranking behavior downstream of it, which is
+        // already covered there.
+    }
+
+    /// `(local, remote)` such that `local`'s `NodeId` sorts strictly below
+    /// `remote`'s -- the ordering `should_keep_connection` uses to decide
+    /// this side should KEEP an existing outbound connection to `remote`
+    /// rather than treat it as wrong-direction and evict it. See
+    /// `inbound_preferred_key_pair` below for the opposite ordering.
+    fn outbound_reuse_key_pair() -> (KeyPair, KeyPair) {
+        let first = KeyPair::new_for_testing("outbound-reuse-key-a");
+        let second = KeyPair::new_for_testing("outbound-reuse-key-b");
+        if first
+            .peer_id()
+            .to_node_id()
+            .as_bytes()
+            .cmp(second.peer_id().to_node_id().as_bytes())
+            .is_lt()
+        {
+            (first, second)
+        } else {
+            (second, first)
+        }
     }
 
     fn inbound_preferred_key_pair() -> (KeyPair, KeyPair) {

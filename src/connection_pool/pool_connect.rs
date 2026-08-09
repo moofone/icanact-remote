@@ -447,6 +447,64 @@ impl<T> ConnectionPool<T> {
             });
     }
 
+    /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`, if
+    /// any -- called synchronously from `RoutingPublisher::
+    /// set_configured_peer_addr` when a SAME-command pin decision moves
+    /// `peer_id`'s pin AWAY from `evicted_addr`. See that trait method's
+    /// own doc comment for the P1 finding this closes (review round
+    /// against `ba2bff2`, `registry_owner.rs:615`): traffic addressed to a
+    /// DIFFERENT identity that later claims `evicted_addr` was being
+    /// delivered over THIS peer's still-live connection, because nothing
+    /// ever removed the alias `reindex_connection_addr` installed for it
+    /// when it was still this peer's pin.
+    ///
+    /// P1 history, this same finding, second pass (review round against
+    /// `aea7772`): the first version of this function ALSO kept the alias
+    /// when `evicted_addr == connection.addr` (the connection's own
+    /// dial-target/observed-source address), reasoning that a "genuine
+    /// transport-source" entry must survive independent of pin state. That
+    /// carve-out preserved exactly the case that matters most: for an
+    /// OUTBOUND connection, `connection.addr` IS the address it was told
+    /// to dial -- which, for a pinned peer, is normally the SAME address as
+    /// the pin itself. So the common case (peer P has an outbound
+    /// connection at A, is reconfigured from A to B) hit the carve-out
+    /// every time, leaving `connections_by_addr[A]` resolving to P's live
+    /// connection after Q legitimately claimed A -- the exact misdelivery
+    /// this function exists to prevent, reintroduced by its own exception.
+    /// (The regression test that shipped alongside it used a THIRD address
+    /// for the connection's own address, distinct from both pin addresses,
+    /// which cannot exercise this path at all.)
+    ///
+    /// The correct distinction is not "is this a transport-source entry"
+    /// -- it is "may a lookup keyed by address alone still reach this
+    /// connection after the address changed hands." Once `evicted_addr` is
+    /// evicted, the SAME atomic owner transaction that decided it also
+    /// released `peer_id`'s ownership of `evicted_addr` (see
+    /// `PeerRegistryOwner::configure_peer`/`migrate`) -- `peer_id` no
+    /// longer legitimately holds `evicted_addr` in ANY sense, pin or
+    /// ownership, so there is no remaining case where an address-keyed hit
+    /// on `evicted_addr` should still resolve to `peer_id`'s connection.
+    /// `peer_id`'s connection remains fully reachable through the
+    /// IDENTITY-aware path (`connections_by_peer`, untouched here) exactly
+    /// as `clear_displaced_peer_addr` above already established for
+    /// arbitration displacement -- this function now removes the
+    /// `evicted_addr` alias unconditionally whenever it belongs to
+    /// `peer_id`, matching that function's identity-matching predicate
+    /// exactly, with no exception for the connection's own address.
+    pub(crate) fn evict_pin_alias(&self, peer_id: &crate::PeerId, evicted_addr: SocketAddr) {
+        let current = self
+            .connections_by_peer
+            .read_sync(peer_id, |_, connection| connection.clone());
+        let _ = self
+            .connections_by_addr
+            .remove_if_sync(&evicted_addr, |connection| {
+                connection.embedded_peer_id.as_ref() == Some(peer_id)
+                    || current
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(connection, current))
+            });
+    }
+
     pub(crate) fn is_required_peer(&self, peer_id: &crate::PeerId) -> bool {
         self.peer_sessions
             .read_sync(peer_id, |_, session| session.is_required_peer())
@@ -1816,6 +1874,19 @@ impl<T> ConnectionPool<T> {
     /// This is needed when a peer connects FROM an ephemeral TCP port but advertises
     /// a different bind address in gossip. We need to update `connections_by_addr` so
     /// that lookups by the advertised address find the connection.
+    ///
+    /// Called from `RoutingPublisher::set_configured_peer_addr`'s trait
+    /// impl -- synchronously, from INSIDE the registry owner's serialized
+    /// `install_pin`/`migrate` commands -- as well as directly by ordinary
+    /// connection-establishment paths. The owner-driven call is what keeps
+    /// a pin-motivated reindex atomic with the pin decision itself: no
+    /// caller-side read of the pin followed by a separate call here can be
+    /// truly atomic with a concurrent owner command, since the owner runs
+    /// as its own task and `ConnectionPool`'s maps are not protected by one
+    /// lock spanning a whole owner command. Performing the reindex as part
+    /// of the SAME synchronous call that decides the pin removes that gap
+    /// entirely rather than narrowing it. See
+    /// `RoutingPublisher::set_configured_peer_addr`'s doc comment.
     pub fn reindex_connection_addr(&self, peer_id: &crate::PeerId, new_addr: SocketAddr) {
         // First, check if this peer still has an active connection
         // This guards against race conditions where disconnect happens between checks
@@ -3218,21 +3289,39 @@ impl<T> ConnectionPool<T> {
         self.get_connection_to_peer_at(peer_id, addr).await
     }
 
+    /// Resolves the peer's required/configured address and dials/reuses a
+    /// connection to it, atomically -- both happen against the SAME lookup,
+    /// with no `.await` between resolving `addr` and using it. The
+    /// attempted address is always returned alongside the dial result,
+    /// including on failure, so a caller never needs its own separate,
+    /// independently re-resolved read of the same pool state to learn what
+    /// was attempted: a concurrent repin between a caller's own pre-read
+    /// and this call actually running used to leave the caller
+    /// attributing the outcome to a since-superseded address. `None` only
+    /// when no required/configured address exists for this peer at all --
+    /// nothing was resolved, and nothing was attempted.
     pub(crate) async fn get_connection_to_required_peer(
         &self,
         peer_id: &crate::PeerId,
-    ) -> Result<ConnectionHandle<T>> {
-        let addr = self
+    ) -> (
+        Option<crate::registry::AttemptedRoute>,
+        Result<ConnectionHandle<T>>,
+    ) {
+        let Some(addr) = self
             .get_required_peer_addr(peer_id)
             .or_else(|| self.get_configured_peer_addr(peer_id))
-            .ok_or_else(|| {
-                crate::GossipError::Network(std::io::Error::new(
+        else {
+            return (
+                None,
+                Err(crate::GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("No required address configured for peer '{}'", peer_id),
-                ))
-            })?;
+                ))),
+            );
+        };
 
-        self.get_connection_to_peer_at(peer_id, addr).await
+        let result = self.get_connection_to_peer_at(peer_id, addr).await;
+        (Some(crate::registry::AttemptedRoute::new(addr)), result)
     }
 
     async fn get_connection_to_peer_at(
@@ -3964,6 +4053,7 @@ impl<T> ConnectionPool<T> {
                                   "✅ Successfully established outgoing connection - resetting failure state");
                         peer_info.failures = 0;
                         peer_info.last_failure_time = None;
+                        peer_info.last_failure_instant = None;
                     }
                     peer_info.last_success = crate::current_timestamp();
                 }
@@ -4325,6 +4415,50 @@ pub(crate) fn handle_incoming_message(
                     "received delta gossip message on bidirectional connection"
                 );
 
+                // P1 finding (review round against `7739717`,
+                // `connection_pool/pool_connect.rs:4580`): unlike the
+                // `FullSync` arm just below (which has always checked
+                // this), this arm never verified `delta.sender_peer_id`
+                // -- a SELF-REPORTED wire field, not an authority for
+                // identity, see `authenticated_peer_id`'s own doc comment
+                // above -- against the connection's actual authenticated
+                // identity. Combined with `peer_info_is_from_current_
+                // session` accepting any source for an unarmed `PeerInfo`
+                // (a brand-new or reset entry), a connected peer could
+                // send deltas CLAIMING another peer's identity and have
+                // this arm's failure-bookkeeping reset (`failures`,
+                // `last_failure_time`, `last_failure_instant`) attributed
+                // to the impersonated victim's address instead of the
+                // connection that actually sent it -- a connected peer
+                // could otherwise manufacture arbitrary liveness signal
+                // for any address of its choosing, using nothing but a
+                // forged `sender_peer_id` on an otherwise-ordinary
+                // authenticated connection.
+                //
+                // Fixed with the SAME authenticated-identity equality
+                // check the `FullSync` arm already performs, moved to the
+                // very top of this arm -- before `resolve_peer_state_addr`,
+                // before the current-session bookkeeping, before anything
+                // at all keyed on the claimed (not authenticated) identity.
+                let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_sender = %delta.sender_peer_id,
+                        "Ignoring DeltaGossip without an authenticated transport identity"
+                    );
+                    return Ok(());
+                };
+                if authenticated_sender_peer_id != &delta.sender_peer_id {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        authenticated_sender = %authenticated_sender_peer_id,
+                        claimed_sender = %delta.sender_peer_id,
+                        "Ignoring DeltaGossip whose claimed sender does not match the \
+                         authenticated transport"
+                    );
+                    return Ok(());
+                }
+
                 let sender_socket_addr =
                     resolve_peer_state_addr(&registry, Some(&delta.sender_peer_id), _peer_addr)
                         .await;
@@ -4367,6 +4501,7 @@ pub(crate) fn handle_incoming_message(
                                 last_sent_sequence: 0,
                                 consecutive_deltas: 0,
                                 last_failure_time: None,
+                                last_failure_instant: None,
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
@@ -4422,6 +4557,7 @@ pub(crate) fn handle_incoming_message(
                               "🔄 Resetting failure state after receiving DeltaGossip");
                                 peer_info.failures = 0;
                                 peer_info.last_failure_time = None;
+                                peer_info.last_failure_instant = None;
                             }
                             peer_info.last_success = crate::current_timestamp();
                             // Inbound payload from peer — proves app-level liveness.
@@ -4637,6 +4773,7 @@ pub(crate) fn handle_incoming_message(
                                 last_sent_sequence: 0,
                                 consecutive_deltas: 0,
                                 last_failure_time: None,
+                                last_failure_instant: None,
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
@@ -4725,6 +4862,7 @@ pub(crate) fn handle_incoming_message(
                               "🔄 Resetting failure state after receiving FullSync");
                             peer_info.failures = 0;
                             peer_info.last_failure_time = None;
+                            peer_info.last_failure_instant = None;
                         }
                         peer_info.last_success = crate::current_timestamp();
                         // Inbound payload from peer — proves app-level liveness.
@@ -5171,6 +5309,7 @@ pub(crate) fn handle_incoming_message(
                                 "resetting failure state after receiving FullSyncResponse");
                             peer_info.failures = 0;
                             peer_info.last_failure_time = None;
+                            peer_info.last_failure_instant = None;
                         }
                         peer_info.last_success = crate::current_timestamp();
                         // Inbound payload from peer — proves app-level liveness.

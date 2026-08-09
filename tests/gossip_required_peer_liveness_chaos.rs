@@ -494,6 +494,7 @@ async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconne
         alias.address = stale_alias;
         alias.failures = 2;
         alias.last_failure_time = Some(icanact_remote::current_timestamp());
+        alias.last_failure_instant = Some(std::time::Instant::now());
         state.peers.insert(stale_alias, alias);
     }
 

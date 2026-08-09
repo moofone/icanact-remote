@@ -1660,6 +1660,146 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
 }
 
+/// P1 regression: two prior versions of `configure_peer`'s follow-up
+/// checked the pin, then separately (even if compare-and-applied against
+/// a dedicated mirror updated in the same owner command) mutated
+/// `ConnectionPool`'s index. Neither was actually atomic WITH the owner's
+/// commands: the owner runs as its own task, and `ConnectionPool`'s maps
+/// are not protected by one lock spanning a whole owner command, so a
+/// caller-side read-then-mutate pair can still straddle a DIFFERENT owner
+/// command's commit and publish a losing alias that no later pin check
+/// can retract (`connections_by_addr` aliases are never un-published just
+/// because a pin moved).
+///
+/// Reconstructs that exact shape directly against the primitives (the
+/// production caller-side check-then-mutate this demonstrates no longer
+/// exists at all -- see `RoutingPublisher::set_configured_peer_addr`'s doc
+/// comment): a "check" read of the pin passes, then a genuine pin move
+/// (mirroring what an interleaved owner `configure_peer` command does)
+/// lands, then the stale "mutate" proceeds anyway using the
+/// already-invalidated check. The losing address ends up reachable via
+/// `connections_by_addr` regardless.
+#[tokio::test]
+async fn a_caller_side_check_then_mutate_reindex_is_vulnerable_to_an_interleaved_pin_move() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("pin-races-reindex").peer_id();
+    // The connection's own raw (e.g. ephemeral inbound source) address --
+    // distinct from either candidate advertised address below, mirroring
+    // the real "reindex under the advertised bind address" use case. Kept
+    // separate so `has_connection(&losing_addr)` below can only become
+    // true via the reindex this test is about, not via the connection's
+    // own initial placement.
+    let raw_addr: SocketAddr = "127.0.0.1:40559".parse().unwrap();
+    let losing_addr: SocketAddr = "127.0.0.1:40560".parse().unwrap();
+    let winning_addr: SocketAddr = "127.0.0.1:40561".parse().unwrap();
+
+    let connection = qa_r11_generation_race_connection(raw_addr);
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), raw_addr, connection));
+    assert!(!pool.has_connection(&losing_addr), "precondition");
+
+    // The "check": the pin is losing_addr right now -- general ownership
+    // agrees too, exactly as it would immediately after a real
+    // `configure_peer(peer_id, losing_addr)` commit and BEFORE any later
+    // command's eviction has retracted it.
+    let _ = pool.addr_to_peer_id.upsert_sync(losing_addr, peer_id.clone());
+    pool.set_configured_peer_addr(&peer_id, losing_addr);
+    assert_eq!(pool.get_required_peer_addr(&peer_id), Some(losing_addr));
+
+    // An owner command interleaves BETWEEN the check and the mutate below,
+    // moving the pin to winning_addr -- exactly what a concurrent
+    // configure_peer/migrate does. Mirrors `install_pin`'s own ordering:
+    // the `ConnectionPool` mirror for the NEW pin is updated before the
+    // OLD address's ownership is retracted, so `addr_to_peer_id[losing_addr]`
+    // deliberately still shows `peer_id` here, unretracted -- the exact
+    // window the coordinator's ordering question asked about.
+    pool.set_configured_peer_addr(&peer_id, winning_addr);
+
+    // The stale "mutate" proceeds anyway, using the check from before the
+    // interleaved move -- exactly what a caller-side compare-and-apply
+    // amounts to once its own read is separated from the mutation by
+    // ANYTHING that isn't the owner's own serialization.
+    pool.reindex_connection_addr(&peer_id, losing_addr);
+
+    assert!(
+        pool.has_connection(&losing_addr),
+        "the losing address ends up reachable via connections_by_addr anyway -- proving \
+         a caller-side check-then-mutate, however tight, is not the same as one atomic \
+         step with respect to owner commands"
+    );
+}
+
+/// The fix: the reindex now happens synchronously INSIDE the owner's own
+/// `configure_peer` command (`RoutingPublisher::set_configured_peer_addr`,
+/// called from `PeerRegistryOwner::install_pin`), so there is no
+/// caller-side check-then-mutate left to race at all. Proves it with a
+/// genuine concurrent race through the real production path: two
+/// `configure_peer` calls for the SAME peer, different addresses, fired
+/// at the same time. Regardless of which the owner actually serializes
+/// first (and last -- the pin, and therefore the reindex, belongs to
+/// whichever command the owner processes LAST), the connection must end
+/// up reachable at the address that currently wins the pin.
+///
+/// Deliberately does NOT assert the loser's address is unreachable:
+/// `connections_by_addr` aliases are never removed just because a pin
+/// later moved away from them (see `reindex_connection_addr`'s "both
+/// addresses are valid for this peer" comment) -- that is a separate,
+/// pre-existing, intentional property unrelated to this fix, and an
+/// address that validly won the pin at the time ITS OWN command ran is
+/// correctly reindexed then, even though a later command goes on to evict
+/// it. What this fix rules out is a DIFFERENT thing: a reindex for an
+/// address that ALREADY lost the pin race before its own reindex call
+/// ever ran, which the scratch reconstruction above proves was possible
+/// under the old caller-side shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner() {
+    use std::sync::Arc;
+
+    for round in 0..20 {
+        let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+            format!("127.0.0.1:{}", 41_000 + round).parse().unwrap(),
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing(format!(
+                    "concurrent-configure-local-{round}"
+                ))),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let peer_id = crate::KeyPair::new_for_testing(format!("concurrent-configure-{round}"))
+            .peer_id();
+        let addr_a: SocketAddr = format!("127.0.0.1:{}", 41_100 + round).parse().unwrap();
+        let addr_b: SocketAddr = format!("127.0.0.1:{}", 41_200 + round).parse().unwrap();
+
+        let raw_addr: SocketAddr = format!("127.0.0.1:{}", 41_300 + round).parse().unwrap();
+        let connection = qa_r11_generation_race_connection(raw_addr);
+        assert!(registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            raw_addr,
+            connection
+        ));
+
+        let (r1, r2) = (registry.clone(), registry.clone());
+        let (p1, p2) = (peer_id.clone(), peer_id.clone());
+        let call_a = tokio::spawn(async move { r1.configure_peer(p1, addr_a).await });
+        let call_b = tokio::spawn(async move { r2.configure_peer(p2, addr_b).await });
+        call_a.await.expect("call_a task panicked");
+        call_b.await.expect("call_b task panicked");
+
+        let owner = &registry.registry_owner;
+        let winner = match (owner.routes_to(&addr_a), owner.routes_to(&addr_b)) {
+            (Some(p), None) if p == peer_id => addr_a,
+            (None, Some(p)) if p == peer_id => addr_b,
+            other => panic!("round {round}: expected exactly one address to win, got {other:?}"),
+        };
+
+        assert!(
+            registry.connection_pool.has_connection(&winner),
+            "round {round}: the connection must be reachable at the current pin winner \
+             {winner} -- the reindex for whichever command the owner processed LAST must \
+             have run, using that command's own, correct pin decision"
+        );
+    }
+}
+
 #[tokio::test]
 async fn disconnect_by_peer_id_removes_configured_addr_connection_without_alias_row() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
@@ -6321,6 +6461,7 @@ fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerIn
         last_sent_sequence: 0,
         consecutive_deltas: 0,
         last_failure_time: None,
+        last_failure_instant: None,
         last_dns_refresh_attempt: None,
         last_response_received_ms: stale_time,
         accept_lower_sequence_from: None,
@@ -6824,6 +6965,106 @@ async fn delta_gossip_updates_last_response_received_ms() {
         info.last_response_received_ms,
         test_start,
         stale_time,
+    );
+}
+
+/// P1 finding (review round against `7739717`,
+/// `connection_pool/pool_connect.rs:4580`): the `DeltaGossip` arm never
+/// verified `delta.sender_peer_id` -- a SELF-REPORTED wire field, not an
+/// authority for identity -- against the connection's actual authenticated
+/// identity, unlike the `FullSync` arm right below it. An authenticated
+/// peer (the "attacker" here) could send a delta CLAIMING to be a
+/// different peer (the "victim") and have this arm's failure-bookkeeping
+/// reset attributed to the impersonated victim's address instead of the
+/// connection that actually sent it, using nothing but a forged
+/// `sender_peer_id`.
+///
+/// Proves the fix: an authenticated connection for `attacker_id` sends a
+/// `DeltaGossip` claiming `sender_peer_id: victim_id`. Asserts the call
+/// still succeeds (the forged delta is silently ignored, not an error) but
+/// leaves the victim's `gossip_state` failure bookkeeping completely
+/// untouched -- proving the whole delta is rejected before ANY of its
+/// claimed identity is trusted for anything.
+#[tokio::test]
+async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_impersonation_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let attacker_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_attacker");
+    let attacker_id = attacker_keypair.peer_id();
+    let attacker_addr: SocketAddr = "10.77.0.67:9303".parse().unwrap();
+
+    let victim_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_victim");
+    let victim_id = victim_keypair.peer_id();
+    let victim_addr: SocketAddr = "10.77.0.68:9304".parse().unwrap();
+
+    // The registry already knows the victim's real, legitimate address --
+    // exactly what would exist for a genuine peer this node has
+    // previously connected to or verified through other means. Without
+    // this, `resolve_peer_state_addr` cannot resolve the claimed
+    // `sender_peer_id` to any address at all and falls back to the raw
+    // TCP source (the attacker's own address), which would make this
+    // test pass regardless of whether the identity check exists --
+    // proving nothing about the actual finding.
+    let _ = registry
+        .connection_pool
+        .peer_id_to_addr
+        .upsert_sync(victim_id.clone(), victim_addr);
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        // The attacker's own connection, entirely legitimate on its own.
+        state
+            .peers
+            .insert(attacker_addr, stale_peer_info(attacker_addr, stale_time));
+        // The victim: a separate, genuinely dead-looking peer this delta
+        // will try to impersonate liveness evidence for.
+        state
+            .peers
+            .insert(victim_addr, stale_peer_info(victim_addr, stale_time));
+    }
+
+    // The delta arrives on the ATTACKER's authenticated connection but
+    // CLAIMS to be from the victim.
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: victim_id.clone(),
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
+
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_addr,
+        attacker_addr,
+        Some(attacker_id.clone()),
+        msg,
+    )
+    .await
+    .expect("a forged DeltaGossip must be silently ignored, not an error");
+
+    let state = registry.gossip_state.lock().await;
+    let victim_info = state
+        .peers
+        .get(&victim_addr)
+        .expect("victim's gossip_state entry must survive untouched");
+    assert_eq!(
+        victim_info.failures, 1,
+        "the victim's gossip_state failure bookkeeping must be untouched too -- the whole \
+         forged delta must be rejected, not merely the new liveness call skipped"
     );
 }
 
@@ -8865,6 +9106,7 @@ async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_book
             .expect("peer must be tracked");
         peer_info.failures = 3;
         peer_info.last_failure_time = Some(stale_last_failure_time);
+        peer_info.last_failure_instant = Some(std::time::Instant::now());
         peer_info.last_success = 0;
         peer_info.last_response_received_ms = stale_last_response_ms;
         peer_info.consecutive_deltas = 7;
@@ -8939,6 +9181,10 @@ async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_book
         peer_info.last_failure_time,
         Some(stale_last_failure_time),
         "R-11: a stale FullSync/FullSyncResponse must not clear `last_failure_time`"
+    );
+    assert!(
+        peer_info.last_failure_instant.is_some(),
+        "R-11: a stale FullSync/FullSyncResponse must not clear `last_failure_instant` either"
     );
     assert_eq!(
         peer_info.last_response_received_ms, stale_last_response_ms,
