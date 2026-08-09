@@ -1372,15 +1372,23 @@ impl ActorState {
         self.routing_revision.load(Ordering::Acquire)
     }
 
-    #[inline]
-    pub(crate) fn routing_change_notifier(&self) -> Arc<Notify> {
-        Arc::clone(&self.routing_change_notify)
+    pub(crate) async fn wait_for_routing_change(&self, after: u64) -> u64 {
+        loop {
+            let notified = self.routing_change_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.routing_revision();
+            if current != after {
+                return current;
+            }
+            notified.await;
+        }
     }
 
     #[inline]
     fn mark_routing_changed(&self) {
         self.routing_revision.fetch_add(1, Ordering::AcqRel);
-        self.routing_change_notify.notify_one();
+        self.routing_change_notify.notify_waiters();
     }
 }
 
@@ -4131,6 +4139,20 @@ impl<T: 'static> GossipRegistry<T> {
         let mut out: Vec<(String, RemoteActorLocation)> = merged.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Monotonic revision of the actor directory used by route consumers.
+    #[inline]
+    pub fn actor_directory_revision(&self) -> u64 {
+        self.actor_state.routing_revision()
+    }
+
+    /// Wait until the actor directory moves beyond `after`.
+    ///
+    /// The revision check and notification registration are race-free, so
+    /// callers can park without polling and without missing a mutation.
+    pub async fn wait_for_actor_directory_change(&self, after: u64) -> u64 {
+        self.actor_state.wait_for_routing_change(after).await
     }
 
     /// Prepare gossip round with consistent lock ordering to prevent deadlocks
@@ -7547,6 +7569,28 @@ mod tests {
 
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    #[tokio::test]
+    async fn actor_routing_change_wakes_every_control_plane_consumer() {
+        let actor_state = Arc::new(ActorState::default());
+        let after = actor_state.routing_revision();
+        let first = Arc::clone(&actor_state);
+        let second = Arc::clone(&actor_state);
+        let first_waiter =
+            tokio::spawn(async move { first.wait_for_routing_change(after).await });
+        let second_waiter =
+            tokio::spawn(async move { second.wait_for_routing_change(after).await });
+        tokio::task::yield_now().await;
+
+        actor_state.mark_routing_changed();
+
+        tokio::time::timeout(Duration::from_millis(10), async {
+            first_waiter.await.unwrap();
+            second_waiter.await.unwrap();
+        })
+        .await
+        .expect("one actor change must wake every route snapshot consumer");
     }
 
     fn test_peer_id(seed: &str) -> PeerId {

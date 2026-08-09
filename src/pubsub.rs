@@ -1224,8 +1224,8 @@ impl RoutedPubSub {
 
     fn spawn_control_plane(this: &Arc<Self>) {
         let weak = Arc::downgrade(this);
-        let actor_changed = this.registry.actor_state.routing_change_notifier();
-        let connection_changed = this.registry.connection_pool.routing_change_notifier();
+        let actor_state = Arc::clone(&this.registry.actor_state);
+        let connection_pool = Arc::clone(&this.registry.connection_pool);
         let provider_changed = Arc::clone(&this.route_provider_change_notify);
         tokio::spawn(async move {
             if let Some(this) = weak.upgrade() {
@@ -1234,10 +1234,13 @@ impl RoutedPubSub {
                 return;
             }
 
+            let mut actor_revision = actor_state.routing_revision();
+            let mut connection_revision = connection_pool.routing_revision();
+
             loop {
                 tokio::select! {
-                    _ = actor_changed.notified() => {}
-                    _ = connection_changed.notified() => {}
+                    _ = actor_state.wait_for_routing_change(actor_revision) => {}
+                    _ = connection_pool.wait_for_routing_change(connection_revision) => {}
                     _ = provider_changed.notified() => {}
                     _ = tokio::time::sleep(CONTROL_PLANE_FALLBACK_INTERVAL) => {}
                 }
@@ -1245,6 +1248,8 @@ impl RoutedPubSub {
                     return;
                 };
                 this.refresh_control_plane().await;
+                actor_revision = actor_state.routing_revision();
+                connection_revision = connection_pool.routing_revision();
             }
         });
     }

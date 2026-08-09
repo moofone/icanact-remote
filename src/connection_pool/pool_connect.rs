@@ -48,15 +48,23 @@ impl<T> ConnectionPool<T> {
         self.routing_revision.load(Ordering::Acquire)
     }
 
-    #[inline]
-    pub(crate) fn routing_change_notifier(&self) -> Arc<Notify> {
-        Arc::clone(&self.routing_change_notify)
+    pub(crate) async fn wait_for_routing_change(&self, after: u64) -> u64 {
+        loop {
+            let notified = self.routing_change_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.routing_revision();
+            if current != after {
+                return current;
+            }
+            notified.await;
+        }
     }
 
     #[inline]
     fn mark_routing_changed(&self) {
         self.routing_revision.fetch_add(1, Ordering::AcqRel);
-        self.routing_change_notify.notify_one();
+        self.routing_change_notify.notify_waiters();
     }
 
     /// Set the registry reference for handling incoming messages
