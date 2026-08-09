@@ -571,10 +571,9 @@ pub trait RoutingPublisher: Send + Sync + 'static {
     ///
     /// `evicted_addr`, `Some` whenever this SAME command's pin decision
     /// evicted a DIFFERENT address from `peer_id`'s pin (see `install_pin`/
-    /// `migrate`, the two callers), is what P1 review (round against
-    /// `ba2bff2`, `registry_owner.rs:615`) found missing: `connections_by_
-    /// addr` aliases used to be "never un-published just because a pin
-    /// moved" (this doc comment's own prior wording) -- but that is not a
+    /// `migrate`, the two callers), matters because `connections_by_
+    /// addr` aliases must not be "never un-published just because a pin
+    /// moved" -- but that is not a
     /// property to preserve, it is the bug. `reindex_connection_addr`
     /// installs `addr` as a NEW alias for `peer_id`'s connection in this
     /// same call; without also being told which address to evict, nothing
@@ -591,7 +590,7 @@ pub trait RoutingPublisher: Send + Sync + 'static {
     /// identity is delivered over the old identity's actual TCP stream.
     /// Not lost state: misdelivery.
     ///
-    /// P1 review, second pass (round against `aea7772`): the first
+    /// An earlier
     /// implementation of the eviction this triggers
     /// (`ConnectionPool::evict_pin_alias`) reintroduced the exact
     /// misdelivery above for the common case of an OUTBOUND connection
@@ -1613,11 +1612,12 @@ pub struct ReapReservation {
 }
 
 impl ReapReservation {
-    /// Cheap, synchronous, no `.await`: `false` once DIRECT liveness
-    /// evidence for this reservation's address has committed through the
-    /// owner's own serialized command stream (`note_liveness_evidence`)
+    /// Cheap, synchronous, no `.await`: `false` once some owner command has
+    /// invalidated this reservation (currently `configure_peer`'s own
+    /// eviction path -- see `invalidate_reap_reservation`'s doc comment)
     /// since the reservation was granted. See this type's own doc comment
-    /// for why the destructive phase must re-check this immediately
+    /// for why a caller performing destructive work under a reservation
+    /// must re-check this immediately
     /// before every irreversible step it takes, not just once at the
     /// start.
     pub fn is_still_valid(&self) -> bool {
@@ -2328,13 +2328,12 @@ impl PeerRegistryOwner {
     /// command stream (see `reap_reserved`'s own doc comment for why the
     /// write must happen here, never from outside).
     ///
-    /// Every owner command that commits a fact making `addr` no longer
-    /// genuinely worth reaping -- direct liveness evidence
-    /// (`note_liveness_evidence`), or an operator's own explicit
-    /// reconfiguration evicting `addr` from a peer's pin
-    /// (`configure_peer`) -- calls this as part of that SAME atomic
-    /// commit, so the destructive phase's own `is_still_valid()`
-    /// re-checks see it as early as physically possible.
+    /// Any owner command that commits a fact making `addr` no longer
+    /// genuinely worth reaping should call this as part of that SAME atomic
+    /// commit, so a caller's own `is_still_valid()`
+    /// re-checks see it as early as physically possible. Currently only
+    /// `configure_peer` does, the instant an operator's own explicit
+    /// reconfiguration evicts `addr` from a peer's pin.
     fn invalidate_reap_reservation(&self, addr: SocketAddr) {
         if let Some(valid) = self.reap_reserved.get(&addr) {
             valid.store(false, Ordering::Release);
@@ -3888,8 +3887,7 @@ mod tests {
              the pin itself moves in -- and must name `from` as the evicted \
              address, so the SAME call also evicts its now-stale \
              connections_by_addr alias (see RoutingPublisher::\
-             set_configured_peer_addr's own doc comment, P1 review round \
-             against ba2bff2)"
+             set_configured_peer_addr's own doc comment)"
         );
 
         // The pin itself must have moved: `to` now refuses release, `from`
@@ -3901,7 +3899,7 @@ mod tests {
         );
     }
 
-    /// P2 follow-on: `migrate` permits `to` to already be owned by the SAME
+    /// `migrate` permits `to` to already be owned by the SAME
     /// identity (the merge case). If `to` already has its OWN, strictly
     /// newer direct-evidence timestamp than `from`'s, carrying `from`'s
     /// (older) timestamp over unconditionally would age `to` BACKWARDS --
@@ -4024,19 +4022,19 @@ mod tests {
         assert_eq!(publisher.events(), events_before);
     }
 
-    /// P1 follow-up regression: `migrate` mutates `addr_ownership` and
+    /// `migrate` mutates `addr_ownership` and
     /// `claim_committed_at` for BOTH addresses directly -- it does not go
-    /// through `claim`, so it used to be the one owner command that could
+    /// through `claim`, so it must not be the one owner command that can
     /// reach those tables without ever consulting `reap_reserved`. A
-    /// `cleanup_dead_peers` sweep relies on nothing being able to move
+    /// reservation holder relies on nothing being able to move
     /// ownership onto or off of a reserved address for the duration of its
-    /// non-owner destructive work; a migration was the one door left
+    /// non-owner destructive work; a migration must not be a door left
     /// unlocked. Proves both ends: a reservation held on the SOURCE refuses
-    /// the move (ownership must not be moved away out from under a sweep
+    /// the move (ownership must not be moved away out from under a holder
     /// about to release or has already started destroying that peer's
     /// state), and a reservation held on the DESTINATION refuses it too
     /// (fresh ownership must not be installed on an address a DIFFERENT
-    /// sweep is relying on staying exactly as it observed it) -- in both
+    /// holder is relying on staying exactly as it observed it) -- in both
     /// cases with `MigrateOutcome::ReapInProgress` specifically, not some
     /// other refusal, and with ownership at both addresses completely
     /// unchanged.
@@ -4116,20 +4114,20 @@ mod tests {
         }
     }
 
-    /// P1 follow-up regression: `reserve_for_reap` used to return a plain
-    /// `bool`. Nothing enforced that a caller holding `true` ever called the
-    /// matching release, and nothing ran on its behalf if the caller's task
+    /// `reserve_for_reap` must not return a plain
+    /// `bool`: nothing would enforce that a caller holding `true` ever calls the
+    /// matching release, and nothing would run on its behalf if the caller's task
     /// ended before reaching it -- in particular, a hard
     /// `JoinHandle::abort()` of the task holding the reservation (NOT
-    /// `select!` cancellation, which `cleanup_dead_peers` is already safe
-    /// against -- see its own doc comment) used to drop the reservation's
+    /// ordinary `select!` cancellation, which a well-behaved caller can
+    /// already guard against) would drop the reservation's
     /// `bool` on the floor with no side effect at all, leaving
     /// `reap_reserved` holding the address forever: every future claim for
     /// it refused permanently, a worse outcome than the race the
-    /// reservation exists to prevent. `GossipRegistryHandle::shutdown` and
-    /// `shutdown_and_wait` both abort the exact task that runs
-    /// `cleanup_dead_peers` in production, so this is not a hypothetical
-    /// path.
+    /// reservation exists to prevent. Any caller whose task can be aborted
+    /// externally (`GossipRegistryHandle::shutdown`/`shutdown_and_wait`
+    /// abort tasks unconditionally) needs this guarantee, not just a
+    /// caller that happens to be careful.
     ///
     /// Proves the RAII guard closes it: a task is spawned holding a granted
     /// `ReapReservation`, never explicitly released, and parked so it is
@@ -4976,7 +4974,7 @@ mod tests {
         }
     }
 
-    /// P2 companion: a DNS-triggered `migrate` (which carries a pin from its
+    /// A DNS-triggered `migrate` (which carries a pin from its
     /// source to its destination) racing a concurrent `configure_peer`
     /// `pin` for the SAME peer must not leave two pins standing either --
     /// `migrate`'s pin-carry updates the same `pinned_by_peer` reverse map
