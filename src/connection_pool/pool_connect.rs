@@ -513,6 +513,7 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) {
+        let session = self.get_or_create_peer_session(peer_id);
         let stream_instance_id = connection
             .stream_handle
             .as_ref()
@@ -534,7 +535,11 @@ impl<T> ConnectionPool<T> {
                 },
             },
         );
-        self.set_current_peer_connection(peer_id, Some(connection.clone()));
+        // Publish before releasing the peer's retry reservation. Otherwise a
+        // concurrent caller can observe neither a current connection nor an
+        // active retry floor and start a redundant socket attempt.
+        session.set_current_connection(Some(connection.clone()));
+        session.outbound_dial_retry.record_success();
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection);
@@ -578,6 +583,7 @@ impl<T> ConnectionPool<T> {
                 .as_ref()
                 .is_some_and(|cur| Arc::ptr_eq(cur, &connection))
             {
+                session.outbound_dial_retry.record_success();
                 let _ = self
                     .connections_by_peer
                     .upsert_sync(peer_id.clone(), connection);
@@ -585,6 +591,8 @@ impl<T> ConnectionPool<T> {
             }
             return Err(current);
         }
+
+        session.outbound_dial_retry.record_success();
 
         let stream_instance_id = connection
             .stream_handle
@@ -3428,6 +3436,22 @@ impl<T> ConnectionPool<T> {
                 OutboundDialLease::Leader(gate) => {
                     let mut gate_completion =
                         OutboundDialGateCompletion::new(self, addr, gate.clone());
+                    let retry_session = resolved_node_id.as_ref().map(|node_id| {
+                        self.get_or_create_peer_session(&crate::PeerId::from(node_id))
+                    });
+                    if retry_session
+                        .as_ref()
+                        .is_some_and(|session| !session.outbound_dial_retry.try_claim_attempt())
+                    {
+                        // This caller did not attempt a socket, so release the
+                        // address ownership gate without extending the peer's
+                        // failure streak/deadline.
+                        gate_completion.finish(true);
+                        return Err(crate::GossipError::Network(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "outbound retry floor active",
+                        )));
+                    }
                     let result = self
                         .connect_via_stream(
                             addr,
@@ -3437,6 +3461,19 @@ impl<T> ConnectionPool<T> {
                             registry_weak.clone(),
                         )
                         .await;
+                    if let Some(session) = retry_session {
+                        match &result {
+                            Ok(_) => session.outbound_dial_retry.record_success(),
+                            Err(crate::GossipError::Network(error))
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::InvalidInput
+                                ) => {}
+                            Err(crate::GossipError::Shutdown) => {}
+                            Err(_) => session.outbound_dial_retry.record_failure(),
+                        }
+                    }
                     gate_completion.finish(result.is_ok());
                     return result;
                 }
@@ -4312,48 +4349,56 @@ async fn answer_inbound_clock_probe(
 /// route merely because it appeared in a frame.
 async fn claim_authenticated_gossip_addr(
     registry: &GossipRegistry,
-    advertised_addr: SocketAddr,
+    advertised_addr: Option<SocketAddr>,
     observed_addr: SocketAddr,
     peer_id: &crate::PeerId,
     session_source: SocketAddr,
 ) -> Option<(SocketAddr, crate::registry_owner::CommitSeq)> {
-    let claim_kind = if advertised_addr == observed_addr {
-        crate::addr_ownership::ClaimKind::Verified
-    } else {
-        crate::addr_ownership::ClaimKind::Provisional
-    };
-    let commit = registry
-        .add_connection_scoped_peer_claim(
-            advertised_addr,
-            peer_id.to_node_id(),
-            claim_kind,
-            session_source,
-        )
-        .await;
-    if let Some(receipt) = commit.1 {
-        return Some((advertised_addr, receipt.generation()));
+    if let Some(advertised_addr) = advertised_addr {
+        let claim_kind = if advertised_addr == observed_addr {
+            crate::addr_ownership::ClaimKind::Verified
+        } else {
+            crate::addr_ownership::ClaimKind::Provisional
+        };
+        let commit = registry
+            .add_connection_scoped_peer_claim(
+                advertised_addr,
+                peer_id.to_node_id(),
+                claim_kind,
+                session_source,
+            )
+            .await;
+        if let Some(receipt) = commit.1 {
+            return Some((advertised_addr, receipt.generation()));
+        }
+        if advertised_addr == observed_addr {
+            return None;
+        }
+
+        debug!(
+            peer = %peer_id,
+            advertised_addr = %advertised_addr,
+            observed_addr = %observed_addr,
+            "provisional gossip address was not admitted; binding frame to authenticated transport source"
+        );
     }
 
-    if advertised_addr == observed_addr {
-        return None;
-    }
-
-    debug!(
-        peer = %peer_id,
-        advertised_addr = %advertised_addr,
-        observed_addr = %observed_addr,
-        "provisional gossip address was not admitted; binding frame to authenticated transport source"
-    );
-    registry
+    let (_, receipt) = registry
         .add_connection_scoped_peer_claim(
             observed_addr,
             peer_id.to_node_id(),
             crate::addr_ownership::ClaimKind::Verified,
             session_source,
         )
-        .await
-        .1
-        .map(|receipt| (observed_addr, receipt.generation()))
+        .await;
+    let receipt = receipt?;
+    {
+        let mut state = registry.gossip_state.lock().await;
+        if let Some(peer) = state.peers.get_mut(&observed_addr) {
+            peer.mark_transport_source_keyed_fallback(receipt.created_ownership());
+        }
+    }
+    Some((observed_addr, receipt.generation()))
 }
 
 /// Handle an incoming message on a bidirectional connection
@@ -4613,17 +4658,16 @@ pub(crate) fn handle_incoming_message(
                 // Use the peer's advertised listening address when it is dialable.
                 // Remote loopback binds are local-only and must not be rewritten into
                 // remote-ip:ephemeral-port peer entries.
-                let Some(advertised_sender_addr) =
-                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
-                else {
+                let advertised_sender_addr =
+                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr);
+                if advertised_sender_addr.is_none() {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
                         sender_bind_addr = ?sender_bind_addr,
-                        "Ignoring FullSync from peer with non-dialable advertised bind address"
+                        "Ignoring non-dialable FullSync bind hint; binding authenticated payload to transport source"
                     );
-                    return Ok(());
-                };
+                }
 
                 // Claim before ANY address-keyed mutation. A mismatched
                 // advertised bind is only a self-report; if it cannot create
@@ -4641,7 +4685,7 @@ pub(crate) fn handle_incoming_message(
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
-                        claimed_addr = %advertised_sender_addr,
+                        claimed_addr = ?advertised_sender_addr,
                         "Rejecting FullSync address claim: ownership conflict"
                     );
                     return Ok(());
@@ -5117,17 +5161,16 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 }
 
-                let Some(advertised_sender_addr) =
-                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
-                else {
+                let advertised_sender_addr =
+                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr);
+                if advertised_sender_addr.is_none() {
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
                         sender_bind_addr = ?sender_bind_addr,
-                        "Ignoring FullSyncResponse from peer with non-dialable advertised bind address"
+                        "Ignoring non-dialable FullSyncResponse bind hint; binding authenticated payload to transport source"
                     );
-                    return Ok(());
-                };
+                }
 
                 let Some((sender_socket_addr, commit_seq)) = claim_authenticated_gossip_addr(
                     &registry,
@@ -5141,7 +5184,7 @@ pub(crate) fn handle_incoming_message(
                     warn!(
                         tcp_source = %_peer_addr,
                         sender = %sender_peer_id,
-                        claimed_addr = %advertised_sender_addr,
+                        claimed_addr = ?advertised_sender_addr,
                         "Rejecting FullSyncResponse address claim: ownership conflict"
                     );
                     return Ok(());
