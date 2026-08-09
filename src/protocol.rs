@@ -323,9 +323,13 @@ pub(crate) async fn process_read_result(
                 return Ok(());
             }
 
-            if let Err(e) =
-                crate::connection_pool::handle_incoming_message(registry.clone(), peer_addr, msg)
-                    .await
+            if let Err(e) = crate::connection_pool::handle_incoming_message(
+                registry.clone(),
+                peer_addr,
+                authenticated_peer_id.cloned(),
+                msg,
+            )
+            .await
             {
                 warn!(error = %e, "Failed to process gossip message");
             }

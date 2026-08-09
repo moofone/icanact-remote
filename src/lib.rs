@@ -884,6 +884,7 @@ impl<T: 'static> Peer<T> {
                     peer_address: None,
                     inbound_observed: false,
                     outbound_dial_success: false,
+                    transport_source_keyed: false,
                     node_id,                    // Set the NodeId for TLS verification
                     dns_name: None,             // Will be set via set_dns_name() if needed
                     failures: 0,                // Start with 0 failures

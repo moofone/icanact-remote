@@ -2133,10 +2133,24 @@ async fn resolve_peer_state_addr(
     socket_addr
 }
 
+fn resolve_full_sync_sender_addr(
+    sender_bind_addr: Option<&str>,
+    tcp_source_addr: SocketAddr,
+    claimed_peer_id: &crate::PeerId,
+    authenticated_peer_id: Option<&crate::PeerId>,
+) -> Option<(SocketAddr, bool)> {
+    match resolve_peer_addr_checked(sender_bind_addr, tcp_source_addr) {
+        Some(addr) => Some((addr, false)),
+        None if authenticated_peer_id == Some(claimed_peer_id) => Some((tcp_source_addr, true)),
+        None => None,
+    }
+}
+
 /// Handle an incoming message on a bidirectional connection
 pub(crate) fn handle_incoming_message(
     registry: Arc<GossipRegistry>,
     _peer_addr: SocketAddr,
+    authenticated_peer_id: Option<crate::PeerId>,
     msg: RegistryMessage,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
@@ -2174,6 +2188,7 @@ pub(crate) fn handle_incoming_message(
                                 peer_address: None,
                                 inbound_observed: true,
                                 outbound_dial_success: false,
+                                transport_source_keyed: false,
                                 node_id: None,
                                 dns_name: None,
                                 failures: 0,
@@ -2306,8 +2321,13 @@ pub(crate) fn handle_incoming_message(
                 // Use the peer's advertised listening address when it is dialable.
                 // Remote loopback binds are local-only and must not be rewritten into
                 // remote-ip:ephemeral-port peer entries.
-                let Some(sender_socket_addr) =
-                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
+                let Some((sender_socket_addr, transport_source_fallback)) =
+                    resolve_full_sync_sender_addr(
+                        sender_bind_addr.as_deref(),
+                        _peer_addr,
+                        &sender_peer_id,
+                        authenticated_peer_id.as_ref(),
+                    )
                 else {
                     warn!(
                         tcp_source = %_peer_addr,
@@ -2317,6 +2337,14 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
+                if transport_source_fallback {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        sender_bind_addr = ?sender_bind_addr,
+                        "Using authenticated transport source for FullSync with non-dialable advertised bind address"
+                    );
+                }
                 registry.record_inbound_gossip_extensions(
                     sender_socket_addr,
                     extensions,
@@ -2367,6 +2395,7 @@ pub(crate) fn handle_incoming_message(
                                 peer_address: Some(_peer_addr), // Remember the actual connection address
                                 inbound_observed: true,
                                 outbound_dial_success: false,
+                                transport_source_keyed: false,
                                 node_id: None,
                                 dns_name: None,
                                 failures: 0,
@@ -2380,6 +2409,12 @@ pub(crate) fn handle_incoming_message(
                                 last_response_received_ms: current_time_ms,
                             });
                         }
+                    }
+
+                    if transport_source_fallback
+                        && let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr)
+                    {
+                        peer_info.mark_transport_source_keyed_fallback();
                     }
 
                     // Update peer info and reset failure state
@@ -2470,6 +2505,17 @@ pub(crate) fn handle_incoming_message(
                         wall_clock_time,
                     )
                     .await;
+
+                // Actor routes learned during merge may advertise a different
+                // address for this peer. The authenticated transport source is
+                // the only valid session route when its bind hint was rejected.
+                if transport_source_fallback {
+                    let pool = &registry.connection_pool;
+                    pool.set_discovered_peer_addr(&sender_peer_id, sender_socket_addr);
+                    let _ = pool
+                        .addr_to_peer_id
+                        .upsert_sync(sender_socket_addr, sender_peer_id.clone());
+                }
 
                 // Send back our state as a response so the sender can receive our actors
                 // This is critical for late-joining nodes (like Node C) to get existing state
@@ -2683,8 +2729,13 @@ pub(crate) fn handle_incoming_message(
                 wall_clock_time,
                 extensions,
             } => {
-                let Some(sender_socket_addr) =
-                    resolve_peer_addr_checked(sender_bind_addr.as_deref(), _peer_addr)
+                let Some((sender_socket_addr, transport_source_fallback)) =
+                    resolve_full_sync_sender_addr(
+                        sender_bind_addr.as_deref(),
+                        _peer_addr,
+                        &sender_peer_id,
+                        authenticated_peer_id.as_ref(),
+                    )
                 else {
                     warn!(
                         tcp_source = %_peer_addr,
@@ -2694,6 +2745,14 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 };
+                if transport_source_fallback {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        sender = %sender_peer_id,
+                        sender_bind_addr = ?sender_bind_addr,
+                        "Using authenticated transport source for FullSyncResponse with non-dialable advertised bind address"
+                    );
+                }
                 registry.record_inbound_gossip_extensions(
                     sender_socket_addr,
                     extensions,
@@ -2772,6 +2831,34 @@ pub(crate) fn handle_incoming_message(
                         // Also clean up pending failures for the old address
                         gossip_state.pending_peer_failures.remove(&_peer_addr);
                     }
+                }
+
+                if transport_source_fallback {
+                    let current_time = crate::current_timestamp();
+                    let current_time_ms = crate::current_timestamp_millis();
+                    let peer_info =
+                        gossip_state
+                            .peers
+                            .entry(sender_socket_addr)
+                            .or_insert_with(|| crate::registry::PeerInfo {
+                                address: sender_socket_addr,
+                                peer_address: Some(sender_socket_addr),
+                                inbound_observed: true,
+                                outbound_dial_success: false,
+                                transport_source_keyed: false,
+                                node_id: None,
+                                dns_name: None,
+                                failures: 0,
+                                last_attempt: current_time,
+                                last_success: current_time,
+                                last_sequence: 0,
+                                last_sent_sequence: 0,
+                                consecutive_deltas: 0,
+                                last_failure_time: None,
+                                last_dns_refresh_attempt: None,
+                                last_response_received_ms: current_time_ms,
+                            });
+                    peer_info.mark_transport_source_keyed_fallback();
                 }
 
                 // Reset failure state for responding peer
