@@ -14,7 +14,7 @@ use tracing::warn;
 
 use crate::{GossipError, PeerId, RegistrationPriority, RemoteActorLocation, Result};
 
-const CONTROL_PLANE_INTERVAL: Duration = Duration::from_millis(25);
+const CONTROL_PLANE_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_TTL: u8 = 8;
 const SEEN_MESSAGE_CAPACITY: usize = 16_384;
 const INTEREST_PREFIX: &str = "icanact/pubsub/interest/v1";
@@ -468,9 +468,12 @@ pub struct RoutedPubSub {
     next_msg_id: AtomicU64,
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
     route_provider_revision: AtomicU64,
+    route_provider_change_notify: Arc<tokio::sync::Notify>,
     last_actor_routing_revision: AtomicU64,
     last_connection_routing_revision: AtomicU64,
     last_route_provider_revision: AtomicU64,
+    #[cfg(test)]
+    control_plane_refreshes: AtomicU64,
 }
 
 /// Fires the test-only subscriber-map RMW hook (see
@@ -525,9 +528,12 @@ impl RoutedPubSub {
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
             route_provider_revision: AtomicU64::new(0),
+            route_provider_change_notify: Arc::new(tokio::sync::Notify::new()),
             last_actor_routing_revision: AtomicU64::new(u64::MAX),
             last_connection_routing_revision: AtomicU64::new(u64::MAX),
             last_route_provider_revision: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            control_plane_refreshes: AtomicU64::new(0),
         });
         this.registry
             .set_pubsub_ingress_handler(Arc::clone(&this))
@@ -539,6 +545,7 @@ impl RoutedPubSub {
     pub fn set_route_provider(&self, provider: Arc<dyn PubSubRouteProvider>) {
         self.route_provider.store(Arc::new(Some(provider)));
         self.route_provider_revision.fetch_add(1, Ordering::AcqRel);
+        self.route_provider_change_notify.notify_one();
     }
 
     fn next_msg_id(&self) -> u128 {
@@ -1046,6 +1053,9 @@ impl RoutedPubSub {
     }
 
     pub async fn refresh_control_plane(&self) {
+        #[cfg(test)]
+        self.control_plane_refreshes.fetch_add(1, Ordering::Relaxed);
+
         let actor_revision = self.registry.actor_state.routing_revision();
         let connection_revision = self.registry.connection_pool.routing_revision();
         let provider_revision = self.route_provider_revision.load(Ordering::Acquire);
@@ -1093,8 +1103,8 @@ impl RoutedPubSub {
             // `pool.get_connection_to_peer` → `get_connection_by_peer_id`,
             // which warn-logs the "No connection found for peer" pair on
             // every miss (`connection_pool::pool_connect.rs:669-682`).
-            // With this refresh ticking at `CONTROL_PLANE_INTERVAL`
-            // (25 ms), an unreachable peer whose interest entry is being
+            // Before route changes became event-driven, this refresh ticked
+            // every 25 ms. An unreachable peer whose interest entry is being
             // re-gossiped to us produces ~80 warn lines/sec — observed on
             // `stratum-devnet-a` 2026-05-11.
             //
@@ -1522,10 +1532,23 @@ impl RoutedPubSub {
 
     fn spawn_control_plane(this: &Arc<Self>) {
         let weak = Arc::downgrade(this);
+        let actor_changed = this.registry.actor_state.routing_change_notifier();
+        let connection_changed = this.registry.connection_pool.routing_change_notifier();
+        let provider_changed = Arc::clone(&this.route_provider_change_notify);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(CONTROL_PLANE_INTERVAL);
+            if let Some(this) = weak.upgrade() {
+                this.refresh_control_plane().await;
+            } else {
+                return;
+            }
+
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = actor_changed.notified() => {}
+                    _ = connection_changed.notified() => {}
+                    _ = provider_changed.notified() => {}
+                    _ = tokio::time::sleep(CONTROL_PLANE_FALLBACK_INTERVAL) => {}
+                }
                 let Some(this) = weak.upgrade() else {
                     return;
                 };
@@ -2003,9 +2026,11 @@ mod tests {
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
             route_provider_revision: AtomicU64::new(0),
+            route_provider_change_notify: Arc::new(tokio::sync::Notify::new()),
             last_actor_routing_revision: AtomicU64::new(u64::MAX),
             last_connection_routing_revision: AtomicU64::new(u64::MAX),
             last_route_provider_revision: AtomicU64::new(u64::MAX),
+            control_plane_refreshes: AtomicU64::new(0),
         })
     }
 
@@ -2040,6 +2065,50 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "an unchanged 25 ms control-plane tick must not rebuild and republish route state"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_control_plane_parks_instead_of_ticking_every_25_ms() {
+        let pubsub = test_pubsub("pubsub-idle-control-plane-parks");
+        RoutedPubSub::spawn_control_plane(&pubsub);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(150)).await;
+        tokio::task::yield_now().await;
+
+        let refreshes = pubsub.control_plane_refreshes.load(Ordering::Relaxed);
+        assert!(
+            refreshes <= 1,
+            "idle control plane refreshed {refreshes} times in 150 ms"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actor_change_wakes_parked_control_plane_without_waiting_for_fallback() {
+        let pubsub = test_pubsub("pubsub-control-plane-notify");
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        tokio::task::yield_now().await;
+        let before = pubsub.control_plane_refreshes.load(Ordering::Relaxed);
+
+        pubsub
+            .registry
+            .register_actor(
+                "control-plane-notify-probe".to_owned(),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19002".parse().unwrap(),
+                    pubsub.local_peer_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            pubsub.control_plane_refreshes.load(Ordering::Relaxed),
+            before + 1,
+            "actor mutation must wake route refresh immediately without advancing time"
         );
     }
 

@@ -1799,9 +1799,10 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
         );
     }
 
-#[test]
-fn routing_revision_tracks_connection_publish_and_removal() {
+#[tokio::test]
+async fn routing_revision_tracks_connection_publish_and_removal() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let routing_changed = pool.routing_change_notifier();
     let peer_id = crate::KeyPair::new_for_testing("routing_revision").peer_id();
     let addr: SocketAddr = "127.0.0.1:40554".parse().unwrap();
     let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
@@ -1811,10 +1812,16 @@ fn routing_revision_tracks_connection_publish_and_removal() {
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
     let published = pool.routing_revision();
     assert!(published > initial);
+    tokio::time::timeout(Duration::from_millis(10), routing_changed.notified())
+        .await
+        .expect("connection publication must wake route refresh");
 
     pool.disconnect_connection_by_peer_id(&peer_id)
         .expect("expected connection to be removed");
     assert!(pool.routing_revision() > published);
+    tokio::time::timeout(Duration::from_millis(10), routing_changed.notified())
+        .await
+        .expect("connection removal must wake route refresh");
 }
 
 #[tokio::test]

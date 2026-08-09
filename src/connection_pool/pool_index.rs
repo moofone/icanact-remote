@@ -54,6 +54,7 @@ pub struct ConnectionPool<T = ()> {
     /// only cares about "at or over the cap", never "did we dip below zero".
     connection_counter: AtomicIsize,
     routing_revision: AtomicU64,
+    routing_change_notify: Arc<Notify>,
     _marker: PhantomData<fn() -> T>,
 }
 

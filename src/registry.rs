@@ -1916,6 +1916,7 @@ pub struct ActorState {
     /// re-publishing an unchanged route snapshot while still waking when a
     /// local actor or remote actor route genuinely changes.
     routing_revision: AtomicU64,
+    routing_change_notify: Arc<Notify>,
 }
 
 #[cfg(test)]
@@ -1989,8 +1990,14 @@ impl ActorState {
     }
 
     #[inline]
+    pub(crate) fn routing_change_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.routing_change_notify)
+    }
+
+    #[inline]
     fn mark_routing_changed(&self) {
         self.routing_revision.fetch_add(1, Ordering::AcqRel);
+        self.routing_change_notify.notify_one();
     }
 }
 
