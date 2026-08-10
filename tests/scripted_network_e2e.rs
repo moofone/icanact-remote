@@ -1000,19 +1000,20 @@ async fn dropped_transport_during_actor_ask_self_heals_and_reconnects() -> icana
     wait_until_connected(&local, &remote.registry.peer_id).await?;
 
     let remote_ref = local.lookup_peer(&remote.registry.peer_id).await?;
-    // `RemoteActorRef` now self-heals a transport drop mid-ask: it
-    // re-resolves the peer and retries once, rather than surfacing
-    // `ConnectionDropped` to the caller. The dead transport session is still
-    // torn down and replaced underneath - see the `session_removed_count`/
-    // `session_published_count` assertions below - only the ref-level
-    // contract (fail vs. transparently recover) changed.
-    //
-    // The single retry-once self-heal is best-effort, not a guarantee: if the
-    // pool hasn't yet fully retired the dead instance by the time the retry
-    // resolves the peer, the retry can land on that same dying connection and
-    // fail again - so either a healed success or a transport-class error is
-    // an acceptable outcome here. What must never happen is success with the
-    // wrong payload, or a non-transport error.
+    // A transport-class failure on `ask_actor_frame` is never replayed by
+    // `RemoteActorRef` itself: the request may already have reached the
+    // remote, so the original error is always what this call returns: only
+    // the *cached slot* gets repaired underneath, for the NEXT call (see
+    // `tests/remote_actor_ref_self_heal.rs`). This call's own outcome
+    // instead races the scripted proxy's forced close against the ask's own
+    // request/response round trip: `Ok` means the round trip completed
+    // before the close took effect, a transport-class `Err` means it did
+    // not - both are legitimate depending on exactly when the close lands.
+    // The dead transport session is still torn down and replaced underneath
+    // regardless of which one this run hits - see the
+    // `session_removed_count`/`session_published_count` assertions below.
+    // What must never happen is success with the wrong payload, or a
+    // non-transport error.
     let dropped = remote_ref
         .ask_actor_frame(
             TEST_ACTOR_ID,
