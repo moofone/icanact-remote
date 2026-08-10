@@ -135,9 +135,13 @@ fn owner_recovery_wins_tombstone(
     if location.peer_id != *sender_peer_id {
         return false;
     }
-    if location.vector_clock.get(&location.node_id) >= tombstone.vector_clock.get(&location.node_id)
-    {
+    let owner_clock = location.vector_clock.get(&location.node_id);
+    let tombstone_owner_clock = tombstone.vector_clock.get(&location.node_id);
+    if owner_clock > tombstone_owner_clock {
         return true;
+    }
+    if owner_clock == tombstone_owner_clock {
+        return tombstone.kind == TombstoneKind::PeerDeath;
     }
 
     // Below this point the owner's clock component is LOWER than the
@@ -24580,6 +24584,28 @@ mod tests {
         assert_eq!(
             merge_tombstone_kind(None, TombstoneKind::ExplicitUnregister),
             TombstoneKind::ExplicitUnregister
+        );
+    }
+
+    /// Equal owner-clock components are not actual advancement. They may
+    /// retain the historical peer-death recovery behavior, but must never
+    /// clear an explicit-unregister tombstone through delayed/replayed data.
+    #[test]
+    fn owner_recovery_rejects_equal_clock_for_explicit_unregister() {
+        let owner = test_peer_id("equal-clock-explicit-owner");
+        let location = RemoteActorLocation::new_with_peer(test_addr(9437), owner.clone());
+        let equal_clock = location.vector_clock.clone();
+
+        let explicit = RemovedActorTombstone::new_explicit_unregister(equal_clock.clone());
+        assert!(
+            !owner_recovery_wins_tombstone(&location, &owner, &explicit, false),
+            "equal owner-clock data must not clear an explicit-unregister tombstone"
+        );
+
+        let peer_death = RemovedActorTombstone::new(equal_clock);
+        assert!(
+            owner_recovery_wins_tombstone(&location, &owner, &peer_death, false),
+            "peer-death equality recovery retains the established compatibility behavior"
         );
     }
 
