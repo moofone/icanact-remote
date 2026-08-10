@@ -2080,6 +2080,18 @@ impl GossipState {
         };
         moved.address = new_addr;
         moved.peer_address = Some(old_addr);
+        // `transport_source_keyed` describes whether THIS entry's own key
+        // (`address`) is a raw ephemeral TCP source rather than a dialable
+        // address. `address` is unconditionally `new_addr` (a resolved
+        // bind address) from the assignment just above, in EVERY branch
+        // below -- the same-identity merge, the different-identity
+        // replace, and the vacant insert alike -- so the migrated entry
+        // can never truthfully claim this regardless of what `moved`
+        // carried from its ephemeral-source origin, or what (if anything)
+        // `existing` carried. This is a self-correction on `moved` alone,
+        // not a merge against `existing` -- unlike every other invariant
+        // below, it must not be scoped to the same-identity branch.
+        moved.transport_source_keyed = false;
         match self.peers.entry(new_addr) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 let existing = slot.get();
@@ -2168,15 +2180,6 @@ impl GossipState {
                     }
                     moved.last_attempt = moved.last_attempt.max(existing_last_attempt);
                     moved.last_success = moved.last_success.max(existing_last_success);
-
-                    // `transport_source_keyed` describes whether THIS
-                    // entry's own key (`address`) is a raw ephemeral TCP
-                    // source rather than a dialable address -- `address` is
-                    // always `new_addr` (a resolved bind address) after a
-                    // migration, so the merged entry can never truthfully
-                    // claim this regardless of what either side carried
-                    // beforehand.
-                    moved.transport_source_keyed = false;
                 }
                 *slot.get_mut() = moved;
             }
@@ -14556,6 +14559,95 @@ mod tests {
             "the migrated entry is now keyed by `bind_addr`, a resolved dialable address -- \
              it can never legitimately claim its key is a raw ephemeral TCP source, \
              regardless of what either side carried before the merge"
+        );
+    }
+
+    /// Sibling of `migrate_peer_entry_merges_remaining_metadata_field_by_field`
+    /// covering the DIFFERENT-IDENTITY replace branch: before this fix,
+    /// `transport_source_keyed` was only ever cleared inside the
+    /// `same_identity` merge block, so a migrated entry that replaces an
+    /// unrelated owner outright still carried whatever value `moved`
+    /// brought from its ephemeral-source origin. `moved.address` is
+    /// unconditionally `new_addr` (a resolved bind address) in this branch
+    /// too, so the flag must be false here as well -- a stale `true` here
+    /// gets the entry suppressed from gossip (`peers_snapshot`), treated as
+    /// non-dialable (`select_best_alias_per_identity`), and retracted from
+    /// discovery (`record_peer_discovery_connected`).
+    #[tokio::test]
+    async fn migrate_peer_entry_clears_transport_source_keyed_on_different_identity_replace() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7503),
+            test_config_with_seed("migrate-peer-entry-tsk-replace"),
+        );
+        let stale_node_id = test_peer_id("migrate-tsk-replace-old-owner").to_node_id();
+        let fresh_node_id = test_peer_id("migrate-tsk-replace-new-owner").to_node_id();
+        let ephemeral_addr = test_addr(9530);
+        let bind_addr = test_addr(9531);
+
+        let mut gossip_state = reg.gossip_state.lock().await;
+
+        let stale = peer_info_with_node_id(bind_addr, stale_node_id);
+        gossip_state.peers.insert(bind_addr, stale);
+
+        // A genuinely different, newly-authenticated peer, still carrying
+        // `transport_source_keyed = true` from its own ephemeral-source
+        // origin (the inbound-accept fallback path in `handle.rs`).
+        let mut fresh = peer_info_with_node_id(ephemeral_addr, fresh_node_id);
+        fresh.transport_source_keyed = true;
+        gossip_state.peers.insert(ephemeral_addr, fresh);
+
+        gossip_state.migrate_peer_entry(ephemeral_addr, bind_addr);
+
+        let migrated = gossip_state
+            .peers
+            .get(&bind_addr)
+            .expect("bind-keyed entry must still exist after migration");
+        assert_eq!(
+            migrated.node_id,
+            Some(fresh_node_id),
+            "test precondition: the different-identity replace branch must have run"
+        );
+        assert!(
+            !migrated.transport_source_keyed,
+            "the migrated entry is now keyed by `bind_addr`, a resolved dialable address, \
+             even on the different-identity replace path -- it can never legitimately claim \
+             its key is a raw ephemeral TCP source"
+        );
+    }
+
+    /// Sibling of the two `transport_source_keyed` tests above covering the
+    /// VACANT-INSERT branch: `new_addr` has no existing entry at all, so
+    /// `moved` is inserted directly. `moved.address` is still
+    /// unconditionally `new_addr` here too, so the flag must be cleared
+    /// even though there is no `existing` to reason about at all.
+    #[tokio::test]
+    async fn migrate_peer_entry_clears_transport_source_keyed_on_vacant_insert() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7504),
+            test_config_with_seed("migrate-peer-entry-tsk-vacant"),
+        );
+        let node_id = test_peer_id("migrate-tsk-vacant-owner").to_node_id();
+        let ephemeral_addr = test_addr(9540);
+        let bind_addr = test_addr(9541);
+
+        let mut gossip_state = reg.gossip_state.lock().await;
+
+        // No entry at `bind_addr` at all -- the Vacant branch.
+        let mut fresh = peer_info_with_node_id(ephemeral_addr, node_id);
+        fresh.transport_source_keyed = true;
+        gossip_state.peers.insert(ephemeral_addr, fresh);
+
+        gossip_state.migrate_peer_entry(ephemeral_addr, bind_addr);
+
+        let migrated = gossip_state
+            .peers
+            .get(&bind_addr)
+            .expect("bind-keyed entry must exist after a vacant-slot migration");
+        assert!(
+            !migrated.transport_source_keyed,
+            "the migrated entry is now keyed by `bind_addr`, a resolved dialable address, \
+             even on the vacant-insert path -- it can never legitimately claim its key is a \
+             raw ephemeral TCP source"
         );
     }
 
