@@ -7,14 +7,12 @@
 //! variable inside `ask_actor_frame`'s Timeout-retry branch, which was never
 //! written back. These tests hold this claim to its word.
 
-mod common;
-
-use common::wait_for_condition;
 use icanact_remote::registry::{ActorMessageFuture, ActorMessageHandler};
 use icanact_remote::{ConnectionRecoveryPolicy, GossipConfig, GossipRegistryHandle, KeyPair};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, sleep};
 
 const TEST_THREAD_STACK: usize = 8 * 1024 * 1024;
@@ -160,10 +158,16 @@ fn held_ref_recovers_after_peer_restart() {
     });
 }
 
-/// Actor handler that always answers immediately with `pong`.
-struct PongHandler;
+/// Actor handler whose first invocation deliberately outlasts the caller's
+/// ask timeout, and every invocation after that answers immediately. Keyed
+/// on invocation count rather than payload content, since a retried ask
+/// resends the identical bytes.
+struct DelayFirstThenFastHandler {
+    calls: Arc<AtomicU64>,
+    first_call_delay: Duration,
+}
 
-impl ActorMessageHandler for PongHandler {
+impl ActorMessageHandler for DelayFirstThenFastHandler {
     fn handle_actor_message(
         &self,
         _actor_id: u64,
@@ -171,7 +175,12 @@ impl ActorMessageHandler for PongHandler {
         _payload: icanact_remote::AlignedBytes,
         correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
+        let calls = self.calls.clone();
+        let first_call_delay = self.first_call_delay;
         Box::pin(async move {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                sleep(first_call_delay).await;
+            }
             if correlation_id.is_some() {
                 Ok(Some(b"pong".to_vec().into()))
             } else {
@@ -181,21 +190,22 @@ impl ActorMessageHandler for PongHandler {
     }
 }
 
-/// `ask_actor_frame` must persist a repaired connection after an ambiguous
-/// failure, while returning that failure instead of replaying the request.
-///
-/// This deliberately reuses the `held_ref_recovers_after_peer_restart`
-/// topology (kill + restart the peer with the same identity/address) rather
-/// than trying to provoke the Timeout branch against a peer that stays
-/// continuously alive: the connection pool intentionally maintains a
-/// reciprocal session in both directions once two live registries connect,
-/// so forcing *this* ref to evict-and-redial while the peer is still up
-/// races against the framework's own duplicate-connection tie-break for that
-/// reciprocal session - a pre-existing, independent behavior unrelated to
-/// `RemoteActorRef` self-healing. A genuine peer restart sidesteps that
-/// entirely (the restarted peer has no reciprocal session yet), which is
-/// also the realistic production scenario the self-healing doc block on
-/// `RemoteActorRef` describes.
+/// `ask_actor_frame`'s Timeout branch must actually retry a timed-out ask on
+/// the connection `recover_connection_after_actor_ask_timeout` just healed,
+/// and that healed connection must then be the one persisted into the ref -
+/// not merely reachable in principle. This exercises
+/// `evict_peer_on_ask_timeout = true` together with
+/// `retry_actor_ask_once_after_timeout = true`
+/// (`aggressive_ask_timeout_recovery()`) against a peer that stays
+/// continuously alive (never restarted): a peer-restart topology reliably
+/// produces a transport-class failure on the stale connection instead
+/// (`ConnectionClosed`/`ConnectionReset`), which is caught by
+/// `is_transport_failure` and routed through the ambiguous-failure path
+/// (`preserve_ambiguous_ask_error`, which never replays), so it can never
+/// enter the `Err(GossipError::Timeout)` arm this test is named for. Forcing
+/// a genuine `Timeout` instead requires the connection itself to stay
+/// healthy while only the response is late, which is exactly what
+/// `DelayFirstThenFastHandler` is for.
 #[test]
 fn timeout_retry_persists_recovered_connection() {
     run_async_test("timeout-retry-persists-connection", async {
@@ -204,7 +214,12 @@ fn timeout_retry_persists_recovered_connection() {
 
         let (key_pair_a, key_pair_b) =
             key_pair_ordered_for_outbound_a("selfheal_timeout_a", "selfheal_timeout_b");
+        let peer_id_a = key_pair_a.peer_id();
         let peer_id_b = key_pair_b.peer_id();
+        assert_ne!(
+            peer_id_a, peer_id_b,
+            "distinct test seeds must not collapse to the same PeerId"
+        );
 
         let config = GossipConfig {
             gossip_interval: Duration::from_secs(300),
@@ -225,14 +240,18 @@ fn timeout_retry_persists_recovered_connection() {
         let handle_b = GossipRegistryHandle::new_with_transport_stack(
             addr_b,
             key_pair_b.to_secret_key(),
-            Some(config.clone()),
+            Some(config),
             icanact_remote::BuilderTlsBootstrap,
         )
         .await
         .unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
         handle_b
             .registry
-            .set_actor_message_handler(Arc::new(PongHandler))
+            .set_actor_message_handler(Arc::new(DelayFirstThenFastHandler {
+                calls: calls.clone(),
+                first_call_delay: Duration::from_millis(1_500),
+            }))
             .await;
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -244,81 +263,49 @@ fn timeout_retry_persists_recovered_connection() {
             .await
             .expect("initial lookup_peer should succeed");
 
-        // Sanity: ask_actor_frame works before the restart.
-        let before = remote_actor
-            .ask_actor_frame(
-                TEST_ACTOR_ID,
-                TEST_TYPE_HASH,
-                bytes::Bytes::from_static(b"before"),
-                Duration::from_secs(2),
-            )
-            .await
-            .expect("ask_actor_frame() should work before restart");
-        assert_eq!(before.as_ref(), b"pong");
-
-        // Keep our own handle to the pre-restart connection so we can prove,
+        // Keep our own handle to the pre-timeout connection so we can prove,
         // via its *public* `is_closed()`, that it was actually evicted - and
         // that the ref itself no longer points at it afterwards.
         let before_conn = remote_actor
             .connection_ref()
             .expect("connection should be cached");
 
-        // Kill B - genuinely, no reciprocal session survives this.
-        handle_b.shutdown().await;
-        sleep(Duration::from_secs(2)).await;
-
-        // Restart B with the SAME identity at the SAME address. Do NOT touch
-        // `handle_a` here - no add_peer, no connect, no re-lookup.
-        let handle_b2 = GossipRegistryHandle::new_with_transport_stack(
-            addr_b,
-            key_pair_b.to_secret_key(),
-            Some(config),
-            icanact_remote::BuilderTlsBootstrap,
-        )
-        .await
-        .unwrap();
-        handle_b2
-            .registry
-            .set_actor_message_handler(Arc::new(PongHandler))
-            .await;
-        sleep(Duration::from_millis(300)).await;
-
-        let ambiguous = remote_actor
+        // B is still fully alive throughout - only its first response is
+        // late. The ask's own budget (600ms) is comfortably shorter than
+        // the handler's first-call delay (1.5s), so this must time out
+        // locally rather than ever observe the eventual reply.
+        let retried = remote_actor
             .ask_actor_frame(
                 TEST_ACTOR_ID,
                 TEST_TYPE_HASH,
-                bytes::Bytes::from_static(b"after"),
-                Duration::from_secs(2),
+                bytes::Bytes::from_static(b"slow-then-fast"),
+                Duration::from_millis(600),
             )
             .await;
+        assert_eq!(
+            retried.as_deref().ok(),
+            Some(b"pong".as_slice()),
+            "with retry_actor_ask_once_after_timeout enabled, the timed-out ask must be \
+             retried on the recovered connection and succeed, got: {:?}",
+            retried
+        );
         assert!(
-            ambiguous.is_err(),
-            "the ambiguous actor ask must not be replayed, got: {:?}",
-            ambiguous
+            calls.load(Ordering::SeqCst) >= 2,
+            "the handler must have observed both the original attempt and the retry, got {} calls",
+            calls.load(Ordering::SeqCst)
         );
 
-        let after = remote_actor
-            .ask_actor_frame(
-                TEST_ACTOR_ID,
-                TEST_TYPE_HASH,
-                bytes::Bytes::from_static(b"after-heal"),
-                Duration::from_secs(2),
-            )
-            .await
-            .expect("the next actor ask should use the healed connection");
-        assert_eq!(after.as_ref(), b"pong");
-
         assert!(
-            wait_for_condition(Duration::from_secs(2), || async { before_conn.is_closed() }).await,
-            "the pre-restart connection instance should have been evicted/closed"
+            before_conn.is_closed(),
+            "the timed-out connection instance should have been evicted/closed"
         );
         let after_conn = remote_actor
             .connection_ref()
             .expect("connection should still be cached");
         assert!(
             !after_conn.is_closed(),
-            "the connection recovered by ask_actor_frame's own recovery path must be persisted \
-             into the ref (found the ref still pointing at the closed pre-restart connection)"
+            "the connection the retry actually succeeded on must be persisted into the ref \
+             (found the ref still pointing at the closed pre-timeout connection)"
         );
 
         // The real assertion: a subsequent, unrelated call on the SAME ref
@@ -329,7 +316,7 @@ fn timeout_retry_persists_recovered_connection() {
             .await;
         assert!(
             follow_up.is_ok(),
-            "a subsequent ask() must not use the dead pre-restart connection, got: {:?}",
+            "a subsequent ask() must not use the dead pre-timeout connection, got: {:?}",
             follow_up
         );
         assert_eq!(follow_up.unwrap().as_ref(), b"ECHOED:after-timeout-retry");
@@ -339,12 +326,12 @@ fn timeout_retry_persists_recovered_connection() {
             .await;
         assert!(
             tell_result.is_ok(),
-            "a subsequent tell() must not use the dead pre-restart connection, got: {:?}",
+            "a subsequent tell() must not use the dead pre-timeout connection, got: {:?}",
             tell_result
         );
 
         handle_a.shutdown().await;
-        handle_b2.shutdown().await;
+        handle_b.shutdown().await;
     });
 }
 
