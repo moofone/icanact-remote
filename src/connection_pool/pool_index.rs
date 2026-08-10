@@ -53,6 +53,10 @@ pub struct ConnectionPool<T = ()> {
     /// instead — safe for the `>= max_connections` admission check, which
     /// only cares about "at or over the cap", never "did we dip below zero".
     connection_counter: AtomicIsize,
+    routing_revision: AtomicU64,
+    routing_change_notify: Arc<Notify>,
+    #[cfg(test)]
+    preferred_connection_checks: AtomicU64,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -285,6 +289,10 @@ impl PeerSession {
 
     fn set_current_connection(&self, connection: Option<Arc<LockFreeConnection>>) {
         self.current_connection.store(connection);
+    }
+
+    fn take_current_connection(&self) -> Option<Arc<LockFreeConnection>> {
+        self.current_connection.swap(None)
     }
 
     /// Atomically clear the current connection iff it is still exactly

@@ -1912,6 +1912,13 @@ pub struct ActorState {
     /// revalidation that can trigger its rollback.
     #[cfg(test)]
     reannouncement_refresh_race_hook: std::sync::Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>,
+    /// Monotonic revision of actor-routing state. PubSub uses this to avoid
+    /// re-publishing an unchanged route snapshot while still waking when a
+    /// local actor or remote actor route genuinely changes.
+    routing_revision: AtomicU64,
+    routing_change_notify: Arc<Notify>,
+    pubsub_routing_revision: AtomicU64,
+    pubsub_routing_change_notify: Arc<Notify>,
 }
 
 #[cfg(test)]
@@ -1974,6 +1981,65 @@ impl ActorState {
         if let Some(hook) = hook {
             hook(now);
         }
+}
+
+}
+
+impl ActorState {
+    #[inline]
+    pub(crate) fn routing_revision(&self) -> u64 {
+        self.routing_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_routing_change(&self, after: u64) -> u64 {
+        loop {
+            let notified = self.routing_change_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.routing_revision();
+            if current != after {
+                return current;
+            }
+            notified.await;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn pubsub_routing_revision(&self) -> u64 {
+        self.pubsub_routing_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_pubsub_routing_change(&self, after: u64) -> u64 {
+        loop {
+            let notified = self.pubsub_routing_change_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.pubsub_routing_revision();
+            if current != after {
+                return current;
+            }
+            notified.await;
+        }
+    }
+
+    #[inline]
+    fn mark_routing_changed(&self) {
+        self.routing_revision.fetch_add(1, Ordering::AcqRel);
+        self.routing_change_notify.notify_waiters();
+    }
+
+    #[inline]
+    fn mark_routing_changed_with_pubsub(&self, pubsub_changed: bool) {
+        self.mark_routing_changed();
+        if pubsub_changed {
+            self.pubsub_routing_revision.fetch_add(1, Ordering::AcqRel);
+            self.pubsub_routing_change_notify.notify_waiters();
+        }
+    }
+
+    #[inline]
+    fn mark_routing_changed_for_actor(&self, name: &str) {
+        self.mark_routing_changed_with_pubsub(crate::pubsub::is_interest_actor_name(name));
     }
 }
 
@@ -3176,6 +3242,10 @@ impl<T: 'static> GossipRegistry<T> {
             true
         };
 
+        let pubsub_actors_changed = snapshot
+            .known_actor_locations
+            .iter()
+            .any(|(name, _)| crate::pubsub::is_interest_actor_name(name));
         for (name, location) in &snapshot.known_actor_locations {
             match location {
                 Some(location) => {
@@ -3188,6 +3258,10 @@ impl<T: 'static> GossipRegistry<T> {
                     let _ = self.actor_state.known_actors.remove_sync(name);
                 }
             }
+        }
+        if !snapshot.known_actor_locations.is_empty() {
+            self.actor_state
+                .mark_routing_changed_with_pubsub(pubsub_actors_changed);
         }
 
         for (address, caps) in &snapshot.peer_capabilities {
@@ -3308,6 +3382,15 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
             }
+        }
+        if !snapshot.pool.is_empty() {
+            // The projection restore above intentionally writes the pool's
+            // lock-free indexes directly so the speculative claim can be
+            // rolled back as one coherent snapshot. Publish one connection
+            // revision only after every index has been restored; otherwise a
+            // waiter can consume the speculative notification, observe the
+            // partially restored state, and park with the stale route.
+            self.connection_pool.mark_routing_changed();
         }
 
         still_candidate
@@ -4749,11 +4832,20 @@ impl<T: 'static> GossipRegistry<T> {
             // owner. Each removal atomically compares the exact location
             // captured while the displacement guard was held; a concurrent
             // refresh or transfer of the same actor name therefore survives.
+            let mut removed_any = false;
+            let mut pubsub_removed = false;
             for (actor_name, displaced_location) in &actor_locations {
-                let _ = self
+                let removed = self
                     .actor_state
                     .known_actors
-                    .remove_if_sync(actor_name.as_str(), |current| current == displaced_location);
+                    .remove_if_sync(actor_name.as_str(), |current| current == displaced_location)
+                    .is_some();
+                removed_any |= removed;
+                pubsub_removed |= removed && crate::pubsub::is_interest_actor_name(actor_name);
+            }
+            if removed_any {
+                self.actor_state
+                    .mark_routing_changed_with_pubsub(pubsub_removed);
             }
         }
 
@@ -5958,6 +6050,7 @@ impl<T: 'static> GossipRegistry<T> {
             .remove_sync(name.as_str())
             .is_some()
         {
+            self.actor_state.mark_routing_changed_for_actor(&name);
             let mut gossip_state = self.gossip_state.lock().await;
             gossip_state.release_actor_admission(&name);
         }
@@ -6006,6 +6099,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(name.as_str())
                     .is_some()
                 {
+                    self.actor_state.mark_routing_changed_for_actor(&name);
                     let mut gossip_state = self.gossip_state.lock().await;
                     gossip_state.release_actor_admission(&name);
                 }
@@ -6039,9 +6133,19 @@ impl<T: 'static> GossipRegistry<T> {
             return Err(GossipError::ActorAlreadyExists(name));
         }
 
+        // The lock-free actor insertion is visible to route readers before
+        // the gossip-state commit below. Publish that visibility at the
+        // mutation boundary, and publish every compensating removal in the
+        // rollback paths below as well. Keep this after `insert_sync`: a
+        // control-plane refresh that observes this revision must also be able
+        // to observe the actor it is meant to route.
+        self.actor_state.mark_routing_changed_for_actor(&name);
+
         // If a remote actor raced in concurrently, roll back and preserve original semantics.
         if self.actor_state.known_actors.contains_sync(name.as_str()) {
-            let _ = self.actor_state.local_actors.remove_sync(name.as_str());
+            if self.actor_state.local_actors.remove_sync(name.as_str()).is_some() {
+                self.actor_state.mark_routing_changed_for_actor(&name);
+            }
             return Err(GossipError::ActorAlreadyExists(name));
         }
         let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
@@ -6055,7 +6159,9 @@ impl<T: 'static> GossipRegistry<T> {
             // legacy mutex bool is a redundant cache that lags the
             // atomic, so trust the atomic.
             if self.shutdown.load(Ordering::Acquire) {
-                let _ = self.actor_state.local_actors.remove_sync(name.as_str());
+                if self.actor_state.local_actors.remove_sync(name.as_str()).is_some() {
+                    self.actor_state.mark_routing_changed_for_actor(&name);
+                }
                 if let Some(tombstone) = previous_tombstone.clone() {
                     let _ = self
                         .actor_state
@@ -6127,6 +6233,9 @@ impl<T: 'static> GossipRegistry<T> {
             .local_actors
             .remove_sync(name)
             .map(|(_, v)| v);
+        if removed.is_some() {
+            self.actor_state.mark_routing_changed_for_actor(name);
+        }
 
         // If we learned our own actor via gossip (e.g., peers reflecting state back),
         // clear the known_actors entry too so re-register behaves as expected.
@@ -6138,6 +6247,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             if loc.node_id == self_node_id {
                 if self.actor_state.known_actors.remove_sync(name).is_some() {
+                    self.actor_state.mark_routing_changed_for_actor(name);
                     let mut gossip_state = self.gossip_state.lock().await;
                     gossip_state.release_actor_admission(name);
                 }
@@ -6157,6 +6267,11 @@ impl<T: 'static> GossipRegistry<T> {
                         .actor_state
                         .local_actors
                         .upsert_sync(name.to_string(), location.clone());
+                    // The removal was already published before this second
+                    // shutdown check. Publish the compensating restoration so
+                    // route consumers cannot acknowledge the temporary
+                    // absence and then park forever with a stale snapshot.
+                    self.actor_state.mark_routing_changed_for_actor(name);
                     return Err(GossipError::Shutdown);
                 }
 
@@ -6698,6 +6813,13 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         let peer_actor_changes = peer_actor_names_changed.len();
+        if applied_count > 0 {
+            let pubsub_changed = peer_actor_names_changed
+                .iter()
+                .any(|name| crate::pubsub::is_interest_actor_name(name));
+            self.actor_state
+                .mark_routing_changed_with_pubsub(pubsub_changed);
+        }
 
         debug!(
             sender = %sender_peer_id,
@@ -7391,6 +7513,20 @@ impl<T: 'static> GossipRegistry<T> {
         let mut out: Vec<(String, RemoteActorLocation)> = merged.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Monotonic revision of the actor directory used by route consumers.
+    #[inline]
+    pub fn actor_directory_revision(&self) -> u64 {
+        self.actor_state.routing_revision()
+    }
+
+    /// Wait until the actor directory moves beyond `after`.
+    ///
+    /// The revision check and notification registration are race-free, so
+    /// callers can park without polling and without missing a mutation.
+    pub async fn wait_for_actor_directory_change(&self, after: u64) -> u64 {
+        self.actor_state.wait_for_routing_change(after).await
     }
 
     /// Prepare gossip round with consistent lock ordering to prevent deadlocks
@@ -8565,6 +8701,8 @@ impl<T: 'static> GossipRegistry<T> {
 
         let mut new_actors = 0;
         let mut updated_actors = 0;
+        let mut removed_actors = 0;
+        let mut pubsub_changed = false;
         let mut peer_actors = std::collections::HashSet::new();
 
         // Collect wire candidates outside the lock; validate current state while applying.
@@ -8762,6 +8900,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .actor_state
                     .known_actors
                     .upsert_sync(name.clone(), location.clone());
+                pubsub_changed |= crate::pubsub::is_interest_actor_name(name);
                 gossip_state.record_actor_admission(&sender_peer_id, name);
                 if is_update {
                     updated_actors += 1;
@@ -8835,6 +8974,8 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(actor_name.as_str())
                     .is_some()
                 {
+                    pubsub_changed |= crate::pubsub::is_interest_actor_name(actor_name);
+                    removed_actors += 1;
                     gossip_state.release_actor_admission(actor_name);
                     info!(
                         actor_name = %actor_name,
@@ -8885,6 +9026,11 @@ impl<T: 'static> GossipRegistry<T> {
             }
             // _gossip_state guard drops here.
             let _ = gossip_state;
+        }
+
+        if new_actors + updated_actors + removed_actors > 0 {
+            self.actor_state
+                .mark_routing_changed_with_pubsub(pubsub_changed);
         }
 
         debug!(
@@ -8945,8 +9091,6 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Clean up stale known actors (using wall clock time for TTL)
         {
-            let before_count = self.actor_state.known_actors.len();
-
             let mut to_remove = Vec::new();
             self.actor_state.known_actors.iter_sync(|k, location| {
                 if now.saturating_sub(self.effective_actor_wall_clock_time(k, location)) >= ttl_secs
@@ -8964,6 +9108,7 @@ impl<T: 'static> GossipRegistry<T> {
             self.actor_state.fire_cleanup_stale_actors_race_hook();
 
             let mut gossip_state = self.gossip_state.lock().await;
+            let mut removed_names = Vec::new();
             for name in &to_remove {
                 // Re-check the same staleness condition inside the atomic
                 // removal itself rather than trusting the snapshot above: a
@@ -8981,11 +9126,17 @@ impl<T: 'static> GossipRegistry<T> {
                         });
                 if removed.is_some() {
                     gossip_state.release_actor_admission(name);
+                    removed_names.push(name.clone());
                 }
             }
 
-            let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
-            if removed > 0 {
+            let removed = removed_names.len();
+            if removed != 0 {
+                let pubsub_changed = removed_names
+                    .iter()
+                    .any(|name| crate::pubsub::is_interest_actor_name(name));
+                self.actor_state
+                    .mark_routing_changed_with_pubsub(pubsub_changed);
                 info!(removed_count = removed, "cleaned up stale actor entries");
             }
         }
@@ -9252,6 +9403,14 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                     gossip_state.peer_to_actors.remove(peer_addr);
 
+                    if actors_removed > 0 {
+                        let pubsub_changed = actor_names
+                            .iter()
+                            .any(|name| crate::pubsub::is_interest_actor_name(name));
+                        self.actor_state
+                            .mark_routing_changed_with_pubsub(pubsub_changed);
+                    }
+
                     info!(
                         peer = %peer_addr,
                         actors_removed,
@@ -9416,8 +9575,13 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Clear actor state
         {
+            let had_actors = !self.actor_state.local_actors.is_empty()
+                || !self.actor_state.known_actors.is_empty();
             self.actor_state.local_actors.clear_sync();
             self.actor_state.known_actors.clear_sync();
+            if had_actors {
+                self.actor_state.mark_routing_changed_with_pubsub(true);
+            }
         }
 
         // Clear gossip state
@@ -11841,6 +12005,28 @@ mod tests {
 
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    #[tokio::test]
+    async fn actor_routing_change_wakes_every_control_plane_consumer() {
+        let actor_state = Arc::new(ActorState::default());
+        let after = actor_state.routing_revision();
+        let first = Arc::clone(&actor_state);
+        let second = Arc::clone(&actor_state);
+        let first_waiter =
+            tokio::spawn(async move { first.wait_for_routing_change(after).await });
+        let second_waiter =
+            tokio::spawn(async move { second.wait_for_routing_change(after).await });
+        tokio::task::yield_now().await;
+
+        actor_state.mark_routing_changed();
+
+        tokio::time::timeout(Duration::from_millis(10), async {
+            first_waiter.await.unwrap();
+            second_waiter.await.unwrap();
+        })
+        .await
+        .expect("one actor change must wake every route snapshot consumer");
     }
 
     fn test_peer_id(seed: &str) -> PeerId {
@@ -15511,8 +15697,8 @@ mod tests {
     /// which is exactly why the source-keyed identity here has no other
     /// alias to be ranked against.
     #[tokio::test]
-    async fn gossip_peer_list_excludes_sole_transport_source_keyed_alias_with_no_live_connection()
-    {
+    async fn gossip_peer_list_excludes_sole_transport_source_keyed_alias_with_no_live_connection(
+    ) {
         let mut config =
             test_config_with_seed("periodic-gossip-sole-source-keyed-no-live-connection");
         config.enable_peer_discovery = true;
@@ -20372,6 +20558,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_stale_actors_publishes_revision_for_each_successful_removal() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_millis(50);
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(8083), config));
+
+        let stale_name = "icanact/pubsub/interest/v1/0000000000000001/peer";
+        let mut stale_location = test_location(test_addr(9003));
+        stale_location.wall_clock_time = current_timestamp().saturating_sub(100);
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(stale_name.to_owned(), stale_location);
+        let before_revision = registry.actor_state.pubsub_routing_revision();
+
+        // Hold the gossip lock after cleanup has taken its snapshot. A
+        // concurrent map insertion then offsets the successful removal in
+        // `known_actors.len()`, which must not suppress the revision publish.
+        let held = registry.gossip_state.lock().await;
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup = tokio::spawn(async move {
+            cleanup_registry.cleanup_stale_actors().await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut fresh_location = test_location(test_addr(9004));
+        fresh_location.wall_clock_time = current_timestamp();
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync("fresh_actor".to_owned(), fresh_location);
+        drop(held);
+        cleanup.await.unwrap();
+
+        assert!(!registry.actor_state.known_actors.contains_sync(stale_name));
+        assert!(registry
+            .actor_state
+            .known_actors
+            .contains_sync("fresh_actor"));
+        assert!(
+            registry.actor_state.pubsub_routing_revision() > before_revision,
+            "a successful stale pubsub-interest removal must publish a routing revision even when a concurrent insertion keeps the map length unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_stale_actors_expires_old_tombstones() {
         let mut config = test_config();
         config.vector_clock_retention_period = Duration::from_secs(10);
@@ -21460,8 +21693,85 @@ mod tests {
             .expect_err("registration should observe shutdown");
         assert!(matches!(err, GossipError::Shutdown));
         assert!(
+            registry.actor_state.routing_revision() >= 2,
+            "registration insertion and shutdown rollback must both publish routing revisions"
+        );
+        assert!(
             !registry.actor_state.local_actors.contains_sync(actor_name),
             "failed registration must not leave a local actor behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_actor_publishes_revision_for_visible_local_actor() {
+        let registry = GossipRegistry::<()>::new(test_addr(7144), test_config());
+        let actor_name = "icanact/pubsub/interest/v1/0000000000000001/registration-peer";
+        let before = registry.actor_state.pubsub_routing_revision();
+
+        registry
+            .register_actor(actor_name.to_owned(), test_location(test_addr(7145)))
+            .await
+            .unwrap();
+
+        assert!(
+            registry.actor_state.local_actors.contains_sync(actor_name),
+            "successful registration must publish the local actor before returning"
+        );
+        assert!(
+            registry.actor_state.pubsub_routing_revision() > before,
+            "the route revision must advance for the visible local actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_actor_publishes_shutdown_rollback_revision() {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7142), test_config()));
+        let actor_name = "actor.unregister.shutdown.rollback";
+        registry
+            .register_actor(actor_name.to_string(), test_location(test_addr(7143)))
+            .await
+            .unwrap();
+        let before_unregistration = registry.actor_state.routing_revision();
+
+        // Hold the gossip lock after the actor has been removed. This makes
+        // the second shutdown check deterministic: the task has already
+        // published the removal, but cannot commit its gossip change yet.
+        let held = registry.gossip_state.lock().await;
+        let unregister_registry = Arc::clone(&registry);
+        let unregister_handle =
+            tokio::spawn(async move { unregister_registry.unregister_actor(actor_name).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !registry.actor_state.local_actors.contains_sync(actor_name) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unregister did not publish its removal in time");
+        let after_removal = registry.actor_state.routing_revision();
+        assert!(
+            after_removal > before_unregistration,
+            "unregistration must publish the temporary removal before its commit check"
+        );
+
+        registry.shutdown.store(true, Ordering::Release);
+        drop(held);
+
+        let err = tokio::time::timeout(Duration::from_secs(2), unregister_handle)
+            .await
+            .expect("unregister did not finish in time")
+            .unwrap()
+            .expect_err("unregistration should observe shutdown");
+        assert!(matches!(err, GossipError::Shutdown));
+        assert!(
+            registry.actor_state.local_actors.contains_sync(actor_name),
+            "shutdown rollback must restore the local actor"
+        );
+        assert!(
+            registry.actor_state.routing_revision() > after_removal,
+            "shutdown rollback must publish a compensating actor revision"
         );
     }
 

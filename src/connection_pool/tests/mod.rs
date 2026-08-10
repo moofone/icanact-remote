@@ -1801,6 +1801,114 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
 }
 
 #[tokio::test]
+async fn routing_revision_tracks_connection_publish_and_removal() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("routing_revision").peer_id();
+    let addr: SocketAddr = "127.0.0.1:40554".parse().unwrap();
+    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    connection.set_state(ConnectionState::Connected);
+
+    let initial = pool.routing_revision();
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
+    let published = pool.routing_revision();
+    assert!(published > initial);
+    tokio::time::timeout(Duration::from_millis(10), pool.wait_for_routing_change(initial))
+        .await
+        .expect("connection publication must wake route refresh");
+
+    pool.disconnect_connection_by_peer_id(&peer_id)
+        .expect("expected connection to be removed");
+    assert!(pool.routing_revision() > published);
+    tokio::time::timeout(Duration::from_millis(10), pool.wait_for_routing_change(published))
+        .await
+        .expect("connection removal must wake route refresh");
+}
+
+#[tokio::test(start_paused = true)]
+async fn preferred_connection_wait_parks_until_connection_state_changes() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let remote = crate::KeyPair::new_for_testing("preferred_wait_parks").peer_id();
+    let mut config = crate::GossipConfig::default();
+    config.key_pair = Some(crate::KeyPair::new_for_testing("preferred_wait_registry"));
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    ));
+    let waiting_pool = Arc::clone(&pool);
+    let waiter = tokio::spawn(async move {
+        waiting_pool
+            .wait_for_preferred_connection(
+                &remote,
+                registry.as_ref(),
+                Duration::from_millis(100),
+            )
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(waiter.await.unwrap().is_none());
+    let checks = pool.preferred_connection_checks.load(Ordering::Relaxed);
+    assert!(checks <= 2, "idle preferred wait checked {checks} times");
+}
+
+#[tokio::test(start_paused = true)]
+async fn preferred_connection_publication_wakes_wait_without_advancing_time() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let remote = crate::KeyPair::new_for_testing("preferred_wait_publication").peer_id();
+    let mut config = crate::GossipConfig::default();
+    config.key_pair = Some(crate::KeyPair::new_for_testing(
+        "preferred_wait_publication_registry",
+    ));
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+    ));
+    let waiting_pool = Arc::clone(&pool);
+    let waiting_registry = Arc::clone(&registry);
+    let waiting_remote = remote.clone();
+    let waiter = tokio::spawn(async move {
+        waiting_pool
+            .wait_for_preferred_connection(
+                &waiting_remote,
+                waiting_registry.as_ref(),
+                Duration::from_secs(60),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let direction = if registry.should_keep_connection(&remote, true) {
+        ConnectionDirection::Outbound
+    } else {
+        ConnectionDirection::Inbound
+    };
+    let addr: SocketAddr = "127.0.0.1:40555".parse().unwrap();
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(addr, direction);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    let connection = Arc::new(connection);
+    connection.set_state(ConnectionState::Connected);
+    assert!(pool.add_connection_by_peer_id(remote, addr, connection));
+    let resolved = tokio::time::timeout(Duration::from_millis(10), waiter)
+        .await
+        .expect("connection publication must wake waiter without advancing time")
+        .expect("preferred-connection waiter must not panic");
+    assert!(
+        resolved.is_some(),
+        "published connection must satisfy waiter"
+    );
+}
+
+#[tokio::test]
 async fn disconnect_by_peer_id_removes_configured_addr_connection_without_alias_row() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer_id = crate::KeyPair::new_for_testing("configured_addr_disconnect").peer_id();
@@ -1890,8 +1998,18 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
+    let routing_revision = pool.routing_revision();
     pool.index_connection_by_addr(alias_addr, connection.clone());
+    let after_index = pool.routing_revision();
+    assert!(
+        after_index > routing_revision,
+        "an address-only connection index must wake route consumers"
+    );
     pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
+    assert!(
+        pool.routing_revision() > after_index,
+        "the paired address/owner publication must wake route consumers after the alias is resolvable"
+    );
 
     let resolved = pool
         .get_connection_by_peer_id(&peer_id)
@@ -11740,7 +11858,12 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
     pool.index_connection_by_addr(ephemeral_addr, target.clone());
     pool.add_addr_to_peer_id(ephemeral_addr, peer_id.clone());
 
+    let routing_revision = pool.routing_revision();
     assert!(pool.disconnect_connection_instance(&peer_id, &target));
+    assert!(
+        pool.routing_revision() > routing_revision,
+        "successful instance teardown must wake route consumers"
+    );
 
     assert!(
         pool.connections_by_addr
@@ -11842,6 +11965,25 @@ async fn connection_handle_direction_survives_a_same_address_reassignment() {
         "a handle's direction must survive the address it was resolved at being \
          reassigned to a different connection -- re-deriving it from a fresh lookup would \
          wrongly report the new occupant's direction instead"
+    );
+}
+
+#[test]
+fn aliasless_current_connection_clear_publishes_routing_revision() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("aliasless-current-clear").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7442".parse().unwrap();
+    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    connection.set_state(ConnectionState::Connected);
+    pool.get_or_create_peer_session(&peer_id)
+        .set_current_connection(Some(connection));
+    let routing_revision = pool.routing_revision();
+
+    pool.clear_current_peer_connection(&peer_id);
+
+    assert!(
+        pool.routing_revision() > routing_revision,
+        "clearing the primary slot must publish even without a connections_by_peer alias"
     );
 }
 
@@ -12033,7 +12175,12 @@ async fn ask_timeout_eviction_current_session_survives_stale_alias_without_destr
 
     let (pool_old, dead_old, instance_id) =
         setup_dead_current_session_with_staled_alias(&peer_id, addr).await;
+    let routing_revision = pool_old.routing_revision();
     pool_old.remove_connection_instance_by_id(addr, instance_id);
+    assert!(
+        pool_old.routing_revision() > routing_revision,
+        "address-indexed instance removal must wake route consumers"
+    );
     let old_still_published = pool_old
         .peer_sessions
         .read_sync(&peer_id, |_, s| {

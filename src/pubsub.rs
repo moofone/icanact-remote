@@ -9,12 +9,12 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use lru::LruCache;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::warn;
 
 use crate::{GossipError, PeerId, RegistrationPriority, RemoteActorLocation, Result};
 
-const CONTROL_PLANE_INTERVAL: Duration = Duration::from_millis(25);
+const CONTROL_PLANE_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_TTL: u8 = 8;
 const SEEN_MESSAGE_CAPACITY: usize = 16_384;
 const INTEREST_PREFIX: &str = "icanact/pubsub/interest/v1";
@@ -28,6 +28,23 @@ const FAST_FRAME_POOL_BUFFER_CAPACITY: usize = 4096;
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
 #[cfg(test)]
 const UDP_MAX_DATAGRAM_SIZE: usize = 65_507;
+
+async fn wait_for_route_provider_change(
+    revision: &AtomicU64,
+    notify: &tokio::sync::Notify,
+    after: u64,
+) -> u64 {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let current = revision.load(Ordering::Acquire);
+        if current != after {
+            return current;
+        }
+        notified.await;
+    }
+}
 
 type TopicKey = u64;
 type TypeHash = u64;
@@ -467,6 +484,26 @@ pub struct RoutedPubSub {
     msg_id_epoch: u64,
     next_msg_id: AtomicU64,
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
+    route_provider_revision: Arc<AtomicU64>,
+    route_provider_change_notify: Arc<tokio::sync::Notify>,
+    /// Serializes route-snapshot rebuilds. This is control-plane only;
+    /// publish and ingress never acquire it.
+    control_plane_refresh_lock: AsyncMutex<()>,
+    last_actor_routing_revision: AtomicU64,
+    last_connection_routing_revision: AtomicU64,
+    last_route_provider_revision: AtomicU64,
+    #[cfg(test)]
+    control_plane_refreshes: AtomicU64,
+    /// Test-only gate for opening the exact gap between the revision check and
+    /// construction of the control-plane select. A provider notification can
+    /// be consumed in this window, so the provider wait future itself must
+    /// re-check the revision instead of relying on the permit.
+    #[cfg(test)]
+    control_plane_wait_hook_enabled: AtomicBool,
+    #[cfg(test)]
+    control_plane_wait_hook_entered: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    control_plane_wait_hook_release: Arc<tokio::sync::Notify>,
 }
 
 /// Fires the test-only subscriber-map RMW hook (see
@@ -520,6 +557,20 @@ impl RoutedPubSub {
             msg_id_epoch,
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
+            route_provider_revision: Arc::new(AtomicU64::new(0)),
+            route_provider_change_notify: Arc::new(tokio::sync::Notify::new()),
+            control_plane_refresh_lock: AsyncMutex::new(()),
+            last_actor_routing_revision: AtomicU64::new(u64::MAX),
+            last_connection_routing_revision: AtomicU64::new(u64::MAX),
+            last_route_provider_revision: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            control_plane_refreshes: AtomicU64::new(0),
+            #[cfg(test)]
+            control_plane_wait_hook_enabled: AtomicBool::new(false),
+            #[cfg(test)]
+            control_plane_wait_hook_entered: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            control_plane_wait_hook_release: Arc::new(tokio::sync::Notify::new()),
         });
         this.registry
             .set_pubsub_ingress_handler(Arc::clone(&this))
@@ -530,6 +581,8 @@ impl RoutedPubSub {
 
     pub fn set_route_provider(&self, provider: Arc<dyn PubSubRouteProvider>) {
         self.route_provider.store(Arc::new(Some(provider)));
+        self.route_provider_revision.fetch_add(1, Ordering::AcqRel);
+        self.route_provider_change_notify.notify_one();
     }
 
     fn next_msg_id(&self) -> u128 {
@@ -1037,103 +1090,164 @@ impl RoutedPubSub {
     }
 
     pub async fn refresh_control_plane(&self) {
-        let mut interests: HashMap<TopicKey, HashSet<PeerId>> = HashMap::new();
-        for (name, _) in self.registry.snapshot_known_actors() {
-            if let Some((topic, peer)) = parse_interest_name(&name) {
-                interests.entry(topic).or_default().insert(peer);
-            }
-        }
+        self.refresh_control_plane_inner().await;
+    }
 
-        let provider = self.route_provider.load_full();
-        let mut next_routes = HashMap::new();
-        let mut next_conns = (*self.conns.load_full()).clone();
-        for (topic, peers) in interests {
-            let peers: Vec<PeerId> = peers
-                .into_iter()
-                .filter(|peer| peer != &self.local_peer_id)
+    async fn refresh_control_plane_if_changed(&self) {
+        self.refresh_control_plane_inner().await;
+    }
+
+    async fn refresh_control_plane_inner(&self) {
+        let _refresh_guard = self.control_plane_refresh_lock.lock().await;
+        #[cfg(test)]
+        self.control_plane_refreshes.fetch_add(1, Ordering::Relaxed);
+
+        // A route rebuild reads several independently revisioned projections.
+        // Keep the refresh lock across the whole operation, then verify that
+        // none of those revisions changed while the snapshot was assembled.
+        // Publishing the route map with a revision captured before a concurrent
+        // mutation would acknowledge that mutation without incorporating it;
+        // the control-plane loop could then park until the fallback timer.
+        loop {
+            let actor_revision = self.registry.actor_state.pubsub_routing_revision();
+            let connection_revision = self.registry.connection_pool.routing_revision();
+            let provider_revision = self.route_provider_revision.load(Ordering::Acquire);
+            let has_provider = self.route_provider.load().is_some();
+            if self.last_actor_routing_revision.load(Ordering::Acquire) == actor_revision
+                && self
+                    .last_connection_routing_revision
+                    .load(Ordering::Acquire)
+                    == connection_revision
+                && self.last_route_provider_revision.load(Ordering::Acquire) == provider_revision
+                && self.conns.load().values().all(|conn| !conn.is_closed())
+                // A provider is intentionally re-evaluated on every actual
+                // refresh. Its public trait accepts `&self`, so interior
+                // mutable topology has no revision to wake this loop; the
+                // one-second fallback is the provider's invalidation path.
+                && !has_provider
+            {
+                return;
+            }
+
+            let mut interests: HashMap<TopicKey, HashSet<PeerId>> = HashMap::new();
+            for (name, _) in self.registry.snapshot_known_actors() {
+                if let Some((topic, peer)) = parse_interest_name(&name) {
+                    interests.entry(topic).or_default().insert(peer);
+                }
+            }
+
+            let provider = self.route_provider.load_full();
+            let mut next_routes = HashMap::new();
+            let mut next_conns = (*self.conns.load_full()).clone();
+            for (topic, peers) in interests {
+                let peers: Vec<PeerId> = peers
+                    .into_iter()
+                    .filter(|peer| peer != &self.local_peer_id)
+                    .collect();
+                if peers.is_empty() {
+                    continue;
+                }
+                let grouped = if let Some(provider) = provider.as_ref() {
+                    provider.group_destinations(topic, &peers)
+                } else {
+                    peers
+                        .into_iter()
+                        .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                        .collect()
+                };
+
+                // Subscriptions are gated on the pool already holding a live
+                // connection to each next-hop. We deliberately do NOT call
+                // `client.lookup_peer` here: it goes through
+                // `pool.get_connection_to_peer` → `get_connection_by_peer_id`,
+                // which warn-logs the "No connection found for peer" pair on
+                // every miss (`connection_pool::pool_connect.rs:669-682`).
+                // Before route changes became event-driven, this refresh ticked
+                // every 25 ms. An unreachable peer whose interest entry is being
+                // re-gossiped to us produces ~80 warn lines/sec — observed on
+                // `stratum-devnet-a` 2026-05-11.
+                //
+                // Connection lifecycle belongs to the gossip/peer-discovery
+                // layer (`peer_discovery.rs`), not to pubsub. We just
+                // observe pool state via the non-warning
+                // `lookup_connected_peer` and route only to next-hops the
+                // pool currently has a usable connection for. When a peer
+                // (re)connects, the next refresh tick picks it up. When a
+                // peer drops, the next refresh tick removes it — the user's
+                // "subscription terminates on disconnect; re-subscribes on
+                // reconnect" invariant.
+                let mut routable: HashMap<PeerId, Arc<[PeerId]>> = HashMap::new();
+                for (next_hop, destinations) in grouped {
+                    let cached_live = next_conns
+                        .get(&next_hop)
+                        .map(|conn| !conn.is_closed())
+                        .unwrap_or(false);
+                    if cached_live {
+                        routable.insert(next_hop, destinations);
+                        continue;
+                    }
+                    // Silent pre-check: only call into pool lookup paths
+                    // (which warn on miss inside
+                    // `get_connection_by_peer_id`) when the pool already
+                    // holds a usable connection. `has_connection_by_peer_id`
+                    // is the only non-warning peer-presence test on the pool.
+                    if !self
+                        .registry
+                        .connection_pool
+                        .has_connection_by_peer_id(&next_hop)
+                    {
+                        next_conns.remove(&next_hop);
+                        continue;
+                    }
+                    if let Some(peer_ref) = self.client.lookup_connected_peer(&next_hop)
+                        && let Some(conn) = peer_ref.connection_ref()
+                    {
+                        next_conns.insert(next_hop.clone(), conn);
+                        routable.insert(next_hop, destinations);
+                    } else {
+                        next_conns.remove(&next_hop);
+                    }
+                }
+                if !routable.is_empty() {
+                    next_routes.insert(topic, Arc::new(routable));
+                }
+            }
+            // ACTOR_REM_2 R13(b): the conns cache is cloned forward each tick and
+            // only next-hops in the current interest set are visited above, so a
+            // peer that stops being any topic's next-hop would be carried forever.
+            // Retain only next-hops referenced by a current route (they are
+            // re-added by the loop above when interest and a live connection
+            // return), keeping the cache bounded by live routes, not history.
+            let live_next_hops: std::collections::HashSet<PeerId> = next_routes
+                .values()
+                .flat_map(|groups| groups.keys().cloned())
                 .collect();
-            if peers.is_empty() {
+            next_conns.retain(|next_hop, _| live_next_hops.contains(next_hop));
+
+            // Do not acknowledge a revision that changed while the snapshot
+            // was being built. The next pass incorporates that mutation before
+            // this refresh publishes any state or baseline.
+            let actor_after = self.registry.actor_state.pubsub_routing_revision();
+            let connection_after = self.registry.connection_pool.routing_revision();
+            let provider_after = self.route_provider_revision.load(Ordering::Acquire);
+            if actor_after != actor_revision
+                || connection_after != connection_revision
+                || provider_after != provider_revision
+            {
                 continue;
             }
-            let grouped = if let Some(provider) = provider.as_ref() {
-                provider.group_destinations(topic, &peers)
-            } else {
-                peers
-                    .into_iter()
-                    .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                    .collect()
-            };
 
-            // Subscriptions are gated on the pool already holding a live
-            // connection to each next-hop. We deliberately do NOT call
-            // `client.lookup_peer` here: it goes through
-            // `pool.get_connection_to_peer` → `get_connection_by_peer_id`,
-            // which warn-logs the "No connection found for peer" pair on
-            // every miss (`connection_pool::pool_connect.rs:669-682`).
-            // With this refresh ticking at `CONTROL_PLANE_INTERVAL`
-            // (25 ms), an unreachable peer whose interest entry is being
-            // re-gossiped to us produces ~80 warn lines/sec — observed on
-            // `stratum-devnet-a` 2026-05-11.
-            //
-            // Connection lifecycle belongs to the gossip/peer-discovery
-            // layer (`peer_discovery.rs`), not to pubsub. We just
-            // observe pool state via the non-warning
-            // `lookup_connected_peer` and route only to next-hops the
-            // pool currently has a usable connection for. When a peer
-            // (re)connects, the next refresh tick picks it up. When a
-            // peer drops, the next refresh tick removes it — the user's
-            // "subscription terminates on disconnect; re-subscribes on
-            // reconnect" invariant.
-            let mut routable: HashMap<PeerId, Arc<[PeerId]>> = HashMap::new();
-            for (next_hop, destinations) in grouped {
-                let cached_live = next_conns
-                    .get(&next_hop)
-                    .map(|conn| !conn.is_closed())
-                    .unwrap_or(false);
-                if cached_live {
-                    routable.insert(next_hop, destinations);
-                    continue;
-                }
-                // Silent pre-check: only call into pool lookup paths
-                // (which warn on miss inside
-                // `get_connection_by_peer_id`) when the pool already
-                // holds a usable connection. `has_connection_by_peer_id`
-                // is the only non-warning peer-presence test on the pool.
-                if !self
-                    .registry
-                    .connection_pool
-                    .has_connection_by_peer_id(&next_hop)
-                {
-                    next_conns.remove(&next_hop);
-                    continue;
-                }
-                if let Some(peer_ref) = self.client.lookup_connected_peer(&next_hop)
-                    && let Some(conn) = peer_ref.connection_ref()
-                {
-                    next_conns.insert(next_hop.clone(), conn);
-                    routable.insert(next_hop, destinations);
-                } else {
-                    next_conns.remove(&next_hop);
-                }
-            }
-            if !routable.is_empty() {
-                next_routes.insert(topic, Arc::new(routable));
-            }
+            self.refresh_hot_route_groups(&next_routes, &next_conns);
+            self.route_groups.store(Arc::new(next_routes));
+            self.conns.store(Arc::new(next_conns));
+            self.last_actor_routing_revision
+                .store(actor_revision, Ordering::Release);
+            self.last_connection_routing_revision
+                .store(connection_revision, Ordering::Release);
+            self.last_route_provider_revision
+                .store(provider_revision, Ordering::Release);
+            return;
         }
-        // ACTOR_REM_2 R13(b): the conns cache is cloned forward each tick and
-        // only next-hops in the current interest set are visited above, so a
-        // peer that stops being any topic's next-hop would be carried forever.
-        // Retain only next-hops referenced by a current route (they are
-        // re-added by the loop above when interest and a live connection
-        // return), keeping the cache bounded by live routes, not history.
-        let live_next_hops: std::collections::HashSet<PeerId> = next_routes
-            .values()
-            .flat_map(|groups| groups.keys().cloned())
-            .collect();
-        next_conns.retain(|next_hop, _| live_next_hops.contains(next_hop));
-        self.refresh_hot_route_groups(&next_routes, &next_conns);
-        self.route_groups.store(Arc::new(next_routes));
-        self.conns.store(Arc::new(next_conns));
     }
 
     fn refresh_hot_route_groups(
@@ -1493,14 +1607,87 @@ impl RoutedPubSub {
 
     fn spawn_control_plane(this: &Arc<Self>) {
         let weak = Arc::downgrade(this);
+        let actor_state = Arc::clone(&this.registry.actor_state);
+        let connection_pool = Arc::clone(&this.registry.connection_pool);
+        let provider_revision_signal = Arc::clone(&this.route_provider_revision);
+        let provider_changed = Arc::clone(&this.route_provider_change_notify);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(CONTROL_PLANE_INTERVAL);
+            let Some(initial) = weak.upgrade() else {
+                return;
+            };
+            initial.refresh_control_plane().await;
+
+            let mut actor_revision = initial.last_actor_routing_revision.load(Ordering::Acquire);
+            let mut connection_revision = initial
+                .last_connection_routing_revision
+                .load(Ordering::Acquire);
+            let mut provider_revision =
+                initial.last_route_provider_revision.load(Ordering::Acquire);
+            drop(initial);
+
             loop {
-                tick.tick().await;
+                // A provider notification can be consumed or lost while a
+                // refresh holds its serialization guard. Re-check every
+                // revision before constructing the next wait future so a
+                // mutation that landed between refresh completion and this
+                // loop iteration forces an immediate rebuild instead of
+                // parking until the fallback timer.
+                let current_actor_revision = actor_state.pubsub_routing_revision();
+                let current_connection_revision = connection_pool.routing_revision();
+                let current_provider_revision =
+                    provider_revision_signal.load(Ordering::Acquire);
+                if current_actor_revision != actor_revision
+                    || current_connection_revision != connection_revision
+                    || current_provider_revision != provider_revision
+                {
+                    let Some(this) = weak.upgrade() else {
+                        return;
+                    };
+                    this.refresh_control_plane_if_changed().await;
+                    actor_revision =
+                        this.last_actor_routing_revision.load(Ordering::Acquire);
+                    connection_revision = this
+                        .last_connection_routing_revision
+                        .load(Ordering::Acquire);
+                    provider_revision =
+                        this.last_route_provider_revision.load(Ordering::Acquire);
+                    continue;
+                }
+
+                #[cfg(test)]
+                if let Some(this) = weak.upgrade()
+                    && this
+                        .control_plane_wait_hook_enabled
+                        .swap(false, Ordering::AcqRel)
+                {
+                    this.control_plane_wait_hook_entered.notify_one();
+                    this.control_plane_wait_hook_release.notified().await;
+                }
+
+                tokio::select! {
+                    _ = actor_state.wait_for_pubsub_routing_change(actor_revision) => false,
+                    _ = connection_pool.wait_for_routing_change(connection_revision) => false,
+                    _ = wait_for_route_provider_change(
+                        provider_revision_signal.as_ref(),
+                        provider_changed.as_ref(),
+                        provider_revision,
+                    ) => false,
+                    _ = tokio::time::sleep(CONTROL_PLANE_FALLBACK_INTERVAL) => true,
+                };
                 let Some(this) = weak.upgrade() else {
                     return;
                 };
-                this.refresh_control_plane().await;
+                // Both event-driven and fallback passes use the same stable
+                // snapshot builder. A provider has no revision contract for
+                // interior state, so every actual pass re-evaluates it; the
+                // fallback is the bounded polling path when no notification
+                // exists for that state change.
+                this.refresh_control_plane_if_changed().await;
+                actor_revision = this.last_actor_routing_revision.load(Ordering::Acquire);
+                connection_revision = this
+                    .last_connection_routing_revision
+                    .load(Ordering::Acquire);
+                provider_revision = this.last_route_provider_revision.load(Ordering::Acquire);
             }
         });
     }
@@ -1928,6 +2115,11 @@ fn interest_name(topic_key: u64, peer: &PeerId) -> String {
     format!("{INTEREST_PREFIX}/{topic_key:016x}/{}", peer.to_hex())
 }
 
+pub(crate) fn is_interest_actor_name(name: &str) -> bool {
+    name.strip_prefix(INTEREST_PREFIX)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn parse_interest_name(name: &str) -> Option<(u64, PeerId)> {
     let rest = name.strip_prefix(INTEREST_PREFIX)?.strip_prefix('/')?;
     let (topic, peer) = rest.split_once('/')?;
@@ -1973,6 +2165,16 @@ mod tests {
             msg_id_epoch,
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
+            route_provider_revision: Arc::new(AtomicU64::new(0)),
+            route_provider_change_notify: Arc::new(tokio::sync::Notify::new()),
+            control_plane_refresh_lock: AsyncMutex::new(()),
+            last_actor_routing_revision: AtomicU64::new(u64::MAX),
+            last_connection_routing_revision: AtomicU64::new(u64::MAX),
+            last_route_provider_revision: AtomicU64::new(u64::MAX),
+            control_plane_refreshes: AtomicU64::new(0),
+            control_plane_wait_hook_enabled: AtomicBool::new(false),
+            control_plane_wait_hook_entered: Arc::new(tokio::sync::Notify::new()),
+            control_plane_wait_hook_release: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -1993,6 +2195,417 @@ mod tests {
             ),
         );
         pubsub.subscribers.store(Arc::new(next));
+    }
+
+    #[tokio::test]
+    async fn unchanged_control_plane_tick_reuses_published_routes() {
+        let pubsub = test_pubsub("pubsub-idle-control-plane");
+
+        pubsub.refresh_control_plane().await;
+        let first = pubsub.route_groups.load_full();
+        pubsub.refresh_control_plane().await;
+        let second = pubsub.route_groups.load_full();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged 25 ms control-plane tick must not rebuild and republish route state"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_control_plane_parks_instead_of_ticking_every_25_ms() {
+        let pubsub = test_pubsub("pubsub-idle-control-plane-parks");
+        RoutedPubSub::spawn_control_plane(&pubsub);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(150)).await;
+        tokio::task::yield_now().await;
+
+        let refreshes = pubsub.control_plane_refreshes.load(Ordering::Relaxed);
+        assert!(
+            refreshes <= 1,
+            "idle control plane refreshed {refreshes} times in 150 ms"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interest_actor_change_wakes_parked_control_plane_without_waiting_for_fallback() {
+        let pubsub = test_pubsub("pubsub-control-plane-notify");
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        tokio::task::yield_now().await;
+        let before = pubsub.control_plane_refreshes.load(Ordering::Relaxed);
+
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-control-plane-notify-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("control-plane-notify-probe"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19002".parse().unwrap(),
+                    pubsub.local_peer_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            pubsub.control_plane_refreshes.load(Ordering::Relaxed),
+            before + 1,
+            "actor mutation must wake route refresh immediately without advancing time"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_actor_change_does_not_wake_pubsub_control_plane() {
+        let pubsub = test_pubsub("pubsub-control-plane-unrelated-actor");
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        tokio::task::yield_now().await;
+        let before = pubsub.control_plane_refreshes.load(Ordering::Relaxed);
+
+        pubsub
+            .registry
+            .register_actor(
+                "unrelated-service".to_owned(),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19003".parse().unwrap(),
+                    pubsub.local_peer_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            pubsub.control_plane_refreshes.load(Ordering::Relaxed),
+            before,
+            "unrelated actor churn must not rebuild pubsub routes"
+        );
+    }
+
+    struct CountingRouteProvider {
+        calls: AtomicU64,
+    }
+
+    impl PubSubRouteProvider for CountingRouteProvider {
+        fn group_destinations(
+            &self,
+            _topic_key: u64,
+            destinations: &[PeerId],
+        ) -> HashMap<PeerId, Arc<[PeerId]>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            destinations
+                .iter()
+                .cloned()
+                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                .collect()
+        }
+    }
+
+    struct NotifyingRouteProvider {
+        calls: AtomicU64,
+        called: Arc<tokio::sync::Notify>,
+    }
+
+    impl PubSubRouteProvider for NotifyingRouteProvider {
+        fn group_destinations(
+            &self,
+            _topic_key: u64,
+            destinations: &[PeerId],
+        ) -> HashMap<PeerId, Arc<[PeerId]>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.called.notify_one();
+            destinations
+                .iter()
+                .cloned()
+                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                .collect()
+        }
+    }
+
+    struct BlockingRouteProvider {
+        calls: AtomicU64,
+        first_call_started: Arc<std::sync::Barrier>,
+        first_call_release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl PubSubRouteProvider for BlockingRouteProvider {
+        fn group_destinations(
+            &self,
+            _topic_key: u64,
+            destinations: &[PeerId],
+        ) -> HashMap<PeerId, Arc<[PeerId]>> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 {
+                self.first_call_started.wait();
+                let (release_lock, release_notify) = &*self.first_call_release;
+                let mut released = release_lock.lock().unwrap();
+                while !*released {
+                    released = release_notify.wait(released).unwrap();
+                }
+            }
+            destinations
+                .iter()
+                .cloned()
+                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_refresh_rechecks_stateful_route_provider() {
+        let pubsub = test_pubsub("pubsub-stateful-route-provider");
+        let provider = Arc::new(CountingRouteProvider {
+            calls: AtomicU64::new(0),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-stateful-route-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("stateful-provider"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19004".parse().unwrap(),
+                    interested_peer,
+                ),
+            )
+            .await
+            .unwrap();
+
+        pubsub.refresh_control_plane().await;
+        pubsub.refresh_control_plane().await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::Relaxed),
+            2,
+            "explicit/fallback refresh must re-evaluate provider interior state"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_refresh_rechecks_stateful_route_provider() {
+        let pubsub = test_pubsub("pubsub-stateful-route-provider-fallback");
+        let provider = Arc::new(CountingRouteProvider {
+            calls: AtomicU64::new(0),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-stateful-fallback-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("stateful-fallback"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19008".parse().unwrap(),
+                    interested_peer,
+                ),
+            )
+            .await
+            .unwrap();
+
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        tokio::task::yield_now().await;
+        let before_fallback = provider.calls.load(Ordering::Acquire);
+        tokio::time::advance(CONTROL_PLANE_FALLBACK_INTERVAL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            provider.calls.load(Ordering::Acquire) > before_fallback,
+            "the fallback tick must re-evaluate an installed provider whose interior state has no revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_plane_provider_revision_recheck_survives_consumed_notification() {
+        let pubsub = test_pubsub("pubsub-provider-revision-wait");
+        let initial_provider = Arc::new(CountingRouteProvider {
+            calls: AtomicU64::new(0),
+        });
+        pubsub.set_route_provider(initial_provider.clone());
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-provider-revision-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("provider-revision"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19009".parse().unwrap(),
+                    interested_peer,
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Pause the real control-plane task after its revision pre-check and
+        // before it constructs the select. This is the race in which another
+        // branch can consume the provider Notify permit.
+        pubsub
+            .control_plane_wait_hook_enabled
+            .store(true, Ordering::Release);
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        pubsub.control_plane_wait_hook_entered.notified().await;
+        assert_eq!(initial_provider.calls.load(Ordering::Acquire), 1);
+        let refreshes_before_change = pubsub.control_plane_refreshes.load(Ordering::Acquire);
+
+        let replacement_called = Arc::new(tokio::sync::Notify::new());
+        let replacement_provider = Arc::new(NotifyingRouteProvider {
+            calls: AtomicU64::new(0),
+            called: Arc::clone(&replacement_called),
+        });
+        pubsub.set_route_provider(replacement_provider.clone());
+
+        // Consume the only notification while the control-plane task is held
+        // before select construction. A revision-only implementation would
+        // now park until the one-second fallback; the wait future's revision
+        // check must still wake this actual control-plane turn.
+        pubsub.route_provider_change_notify.notified().await;
+        pubsub.control_plane_wait_hook_release.notify_one();
+
+        tokio::time::timeout(Duration::from_millis(100), replacement_called.notified())
+            .await
+            .expect("provider revision change must rebuild without the fallback timer");
+        assert!(replacement_provider.calls.load(Ordering::Acquire) > 0);
+        assert!(
+            pubsub.control_plane_refreshes.load(Ordering::Acquire) > refreshes_before_change,
+            "the provider revision change must drive an actual control-plane refresh"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_control_plane_refreshes_are_serialized() {
+        let pubsub = test_pubsub("pubsub-serialized-control-plane-refresh");
+        let first_call_started = Arc::new(std::sync::Barrier::new(2));
+        let first_call_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let provider = Arc::new(BlockingRouteProvider {
+            calls: AtomicU64::new(0),
+            first_call_started: Arc::clone(&first_call_started),
+            first_call_release: Arc::clone(&first_call_release),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-serialized-refresh-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("serialized-refresh"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19005".parse().unwrap(),
+                    interested_peer,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let first_pubsub = Arc::clone(&pubsub);
+        let first = tokio::spawn(async move { first_pubsub.refresh_control_plane().await });
+        first_call_started.wait();
+
+        let second_pubsub = Arc::clone(&pubsub);
+        let second = tokio::spawn(async move { second_pubsub.refresh_control_plane().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            provider.calls.load(Ordering::Acquire),
+            1,
+            "a second refresh must not evaluate or publish ahead of an in-flight snapshot"
+        );
+
+        let (release_lock, release_notify) = &*first_call_release;
+        *release_lock.lock().unwrap() = true;
+        release_notify.notify_all();
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(provider.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_retries_when_actor_revision_changes_during_snapshot() {
+        let pubsub = test_pubsub("pubsub-refresh-retries-on-actor-change");
+        let first_call_started = Arc::new(std::sync::Barrier::new(2));
+        let first_call_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let provider = Arc::new(BlockingRouteProvider {
+            calls: AtomicU64::new(0),
+            first_call_started: Arc::clone(&first_call_started),
+            first_call_release: Arc::clone(&first_call_release),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let first_peer = crate::KeyPair::new_for_testing("pubsub-refresh-first-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("refresh-first"), &first_peer),
+                RemoteActorLocation::new_with_peer("127.0.0.1:19006".parse().unwrap(), first_peer),
+            )
+            .await
+            .unwrap();
+
+        let refresh_pubsub = Arc::clone(&pubsub);
+        let refresh = tokio::spawn(async move {
+            refresh_pubsub.refresh_control_plane().await;
+        });
+        first_call_started.wait();
+
+        let second_peer = crate::KeyPair::new_for_testing("pubsub-refresh-second-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                // Keep both interests on one topic so the provider is called
+                // once per snapshot; the count below then measures the
+                // initial build plus exactly one retry.
+                interest_name(topic_key("refresh-first"), &second_peer),
+                RemoteActorLocation::new_with_peer("127.0.0.1:19007".parse().unwrap(), second_peer),
+            )
+            .await
+            .unwrap();
+
+        let (release_lock, release_notify) = &*first_call_release;
+        *release_lock.lock().unwrap() = true;
+        release_notify.notify_all();
+        refresh.await.unwrap();
+
+        assert_eq!(
+            provider.calls.load(Ordering::Acquire),
+            2,
+            "a routing mutation during snapshot assembly must force a retry"
+        );
+        assert_eq!(
+            pubsub.last_actor_routing_revision.load(Ordering::Acquire),
+            pubsub.registry.actor_state.pubsub_routing_revision(),
+            "the published route baseline must be the revision actually incorporated"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_directory_change_invalidates_idle_control_plane_snapshot() {
+        let pubsub = test_pubsub("pubsub-control-plane-actor-change");
+        pubsub.refresh_control_plane().await;
+        let before = pubsub.route_groups.load_full();
+
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-control-plane-interested-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("control-plane-change"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19001".parse().unwrap(),
+                    pubsub.local_peer_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        pubsub.refresh_control_plane().await;
+        let after_change = pubsub.route_groups.load_full();
+        assert!(!Arc::ptr_eq(&before, &after_change));
+
+        pubsub.refresh_control_plane().await;
+        let after_idle_tick = pubsub.route_groups.load_full();
+        assert!(Arc::ptr_eq(&after_change, &after_idle_tick));
     }
 
     #[tokio::test]
