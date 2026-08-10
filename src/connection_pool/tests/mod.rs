@@ -11836,7 +11836,12 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
     pool.index_connection_by_addr(ephemeral_addr, target.clone());
     pool.add_addr_to_peer_id(ephemeral_addr, peer_id.clone());
 
+    let routing_revision = pool.routing_revision();
     assert!(pool.disconnect_connection_instance(&peer_id, &target));
+    assert!(
+        pool.routing_revision() > routing_revision,
+        "successful instance teardown must wake route consumers"
+    );
 
     assert!(
         pool.connections_by_addr
@@ -11938,6 +11943,25 @@ async fn connection_handle_direction_survives_a_same_address_reassignment() {
         "a handle's direction must survive the address it was resolved at being \
          reassigned to a different connection -- re-deriving it from a fresh lookup would \
          wrongly report the new occupant's direction instead"
+    );
+}
+
+#[test]
+fn aliasless_current_connection_clear_publishes_routing_revision() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer_id = crate::KeyPair::new_for_testing("aliasless-current-clear").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7442".parse().unwrap();
+    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+    connection.set_state(ConnectionState::Connected);
+    pool.get_or_create_peer_session(&peer_id)
+        .set_current_connection(Some(connection));
+    let routing_revision = pool.routing_revision();
+
+    pool.clear_current_peer_connection(&peer_id);
+
+    assert!(
+        pool.routing_revision() > routing_revision,
+        "clearing the primary slot must publish even without a connections_by_peer alias"
     );
 }
 
@@ -12129,7 +12153,12 @@ async fn ask_timeout_eviction_current_session_survives_stale_alias_without_destr
 
     let (pool_old, dead_old, instance_id) =
         setup_dead_current_session_with_staled_alias(&peer_id, addr).await;
+    let routing_revision = pool_old.routing_revision();
     pool_old.remove_connection_instance_by_id(addr, instance_id);
+    assert!(
+        pool_old.routing_revision() > routing_revision,
+        "address-indexed instance removal must wake route consumers"
+    );
     let old_still_published = pool_old
         .peer_sessions
         .read_sync(&peer_id, |_, s| {

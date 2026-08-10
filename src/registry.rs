@@ -1917,6 +1917,8 @@ pub struct ActorState {
     /// local actor or remote actor route genuinely changes.
     routing_revision: AtomicU64,
     routing_change_notify: Arc<Notify>,
+    pubsub_routing_revision: AtomicU64,
+    pubsub_routing_change_notify: Arc<Notify>,
 }
 
 #[cfg(test)]
@@ -2003,9 +2005,41 @@ impl ActorState {
     }
 
     #[inline]
+    pub(crate) fn pubsub_routing_revision(&self) -> u64 {
+        self.pubsub_routing_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_pubsub_routing_change(&self, after: u64) -> u64 {
+        loop {
+            let notified = self.pubsub_routing_change_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.pubsub_routing_revision();
+            if current != after {
+                return current;
+            }
+            notified.await;
+        }
+    }
+
+    #[inline]
     fn mark_routing_changed(&self) {
         self.routing_revision.fetch_add(1, Ordering::AcqRel);
         self.routing_change_notify.notify_waiters();
+    }
+
+    #[inline]
+    fn mark_routing_changed_with_pubsub(&self, pubsub_changed: bool) {
+        self.mark_routing_changed();
+        if pubsub_changed {
+            self.pubsub_routing_revision.fetch_add(1, Ordering::AcqRel);
+            self.pubsub_routing_change_notify.notify_waiters();
+        }
+    }
+
+    #[inline]
+    fn mark_routing_changed_for_actor(&self, name: &str) {
+        self.mark_routing_changed_with_pubsub(crate::pubsub::is_interest_actor_name(name));
     }
 }
 
@@ -3208,6 +3242,10 @@ impl<T: 'static> GossipRegistry<T> {
             true
         };
 
+        let pubsub_actors_changed = snapshot
+            .known_actor_locations
+            .iter()
+            .any(|(name, _)| crate::pubsub::is_interest_actor_name(name));
         for (name, location) in &snapshot.known_actor_locations {
             match location {
                 Some(location) => {
@@ -3222,7 +3260,8 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
         if !snapshot.known_actor_locations.is_empty() {
-            self.actor_state.mark_routing_changed();
+            self.actor_state
+                .mark_routing_changed_with_pubsub(pubsub_actors_changed);
         }
 
         for (address, caps) in &snapshot.peer_capabilities {
@@ -4785,15 +4824,19 @@ impl<T: 'static> GossipRegistry<T> {
             // captured while the displacement guard was held; a concurrent
             // refresh or transfer of the same actor name therefore survives.
             let mut removed_any = false;
+            let mut pubsub_removed = false;
             for (actor_name, displaced_location) in &actor_locations {
-                removed_any |= self
+                let removed = self
                     .actor_state
                     .known_actors
                     .remove_if_sync(actor_name.as_str(), |current| current == displaced_location)
                     .is_some();
+                removed_any |= removed;
+                pubsub_removed |= removed && crate::pubsub::is_interest_actor_name(actor_name);
             }
             if removed_any {
-                self.actor_state.mark_routing_changed();
+                self.actor_state
+                    .mark_routing_changed_with_pubsub(pubsub_removed);
             }
         }
 
@@ -5998,7 +6041,7 @@ impl<T: 'static> GossipRegistry<T> {
             .remove_sync(name.as_str())
             .is_some()
         {
-            self.actor_state.mark_routing_changed();
+            self.actor_state.mark_routing_changed_for_actor(&name);
             let mut gossip_state = self.gossip_state.lock().await;
             gossip_state.release_actor_admission(&name);
         }
@@ -6047,7 +6090,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(name.as_str())
                     .is_some()
                 {
-                    self.actor_state.mark_routing_changed();
+                    self.actor_state.mark_routing_changed_for_actor(&name);
                     let mut gossip_state = self.gossip_state.lock().await;
                     gossip_state.release_actor_admission(&name);
                 }
@@ -6124,7 +6167,7 @@ impl<T: 'static> GossipRegistry<T> {
                 false
             }
         };
-        self.actor_state.mark_routing_changed();
+        self.actor_state.mark_routing_changed_for_actor(&name);
 
         if priority.should_trigger_immediate_gossip() {
             let gossip_trigger_time = crate::current_timestamp_nanos();
@@ -6171,7 +6214,7 @@ impl<T: 'static> GossipRegistry<T> {
             .remove_sync(name)
             .map(|(_, v)| v);
         if removed.is_some() {
-            self.actor_state.mark_routing_changed();
+            self.actor_state.mark_routing_changed_for_actor(name);
         }
 
         // If we learned our own actor via gossip (e.g., peers reflecting state back),
@@ -6184,7 +6227,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             if loc.node_id == self_node_id {
                 if self.actor_state.known_actors.remove_sync(name).is_some() {
-                    self.actor_state.mark_routing_changed();
+                    self.actor_state.mark_routing_changed_for_actor(name);
                     let mut gossip_state = self.gossip_state.lock().await;
                     gossip_state.release_actor_admission(name);
                 }
@@ -6746,7 +6789,11 @@ impl<T: 'static> GossipRegistry<T> {
 
         let peer_actor_changes = peer_actor_names_changed.len();
         if applied_count > 0 {
-            self.actor_state.mark_routing_changed();
+            let pubsub_changed = peer_actor_names_changed
+                .iter()
+                .any(|name| crate::pubsub::is_interest_actor_name(name));
+            self.actor_state
+                .mark_routing_changed_with_pubsub(pubsub_changed);
         }
 
         debug!(
@@ -8630,6 +8677,7 @@ impl<T: 'static> GossipRegistry<T> {
         let mut new_actors = 0;
         let mut updated_actors = 0;
         let mut removed_actors = 0;
+        let mut pubsub_changed = false;
         let mut peer_actors = std::collections::HashSet::new();
 
         // Collect wire candidates outside the lock; validate current state while applying.
@@ -8827,6 +8875,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .actor_state
                     .known_actors
                     .upsert_sync(name.clone(), location.clone());
+                pubsub_changed |= crate::pubsub::is_interest_actor_name(name);
                 gossip_state.record_actor_admission(&sender_peer_id, name);
                 if is_update {
                     updated_actors += 1;
@@ -8900,6 +8949,7 @@ impl<T: 'static> GossipRegistry<T> {
                     .remove_sync(actor_name.as_str())
                     .is_some()
                 {
+                    pubsub_changed |= crate::pubsub::is_interest_actor_name(actor_name);
                     removed_actors += 1;
                     gossip_state.release_actor_admission(actor_name);
                     info!(
@@ -8954,7 +9004,8 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         if new_actors + updated_actors + removed_actors > 0 {
-            self.actor_state.mark_routing_changed();
+            self.actor_state
+                .mark_routing_changed_with_pubsub(pubsub_changed);
         }
 
         debug!(
@@ -9056,7 +9107,11 @@ impl<T: 'static> GossipRegistry<T> {
 
             let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
             if removed > 0 {
-                self.actor_state.mark_routing_changed();
+                let pubsub_changed = to_remove
+                    .iter()
+                    .any(|name| crate::pubsub::is_interest_actor_name(name));
+                self.actor_state
+                    .mark_routing_changed_with_pubsub(pubsub_changed);
                 info!(removed_count = removed, "cleaned up stale actor entries");
             }
         }
@@ -9324,7 +9379,11 @@ impl<T: 'static> GossipRegistry<T> {
                     gossip_state.peer_to_actors.remove(peer_addr);
 
                     if actors_removed > 0 {
-                        self.actor_state.mark_routing_changed();
+                        let pubsub_changed = actor_names
+                            .iter()
+                            .any(|name| crate::pubsub::is_interest_actor_name(name));
+                        self.actor_state
+                            .mark_routing_changed_with_pubsub(pubsub_changed);
                     }
 
                     info!(
@@ -9496,7 +9555,7 @@ impl<T: 'static> GossipRegistry<T> {
             self.actor_state.local_actors.clear_sync();
             self.actor_state.known_actors.clear_sync();
             if had_actors {
-                self.actor_state.mark_routing_changed();
+                self.actor_state.mark_routing_changed_with_pubsub(true);
             }
         }
 

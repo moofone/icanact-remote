@@ -291,6 +291,10 @@ impl PeerSession {
         self.current_connection.store(connection);
     }
 
+    fn take_current_connection(&self) -> Option<Arc<LockFreeConnection>> {
+        self.current_connection.swap(None)
+    }
+
     /// Atomically clear the current connection iff it is still exactly
     /// `expected` (`Arc::ptr_eq`) — a single lock-free CAS on the slot
     /// itself via `ArcSwapOption::compare_and_swap`.
