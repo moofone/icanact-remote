@@ -250,7 +250,7 @@ impl<T> ConnectionPool<T> {
         // concurrent caller can observe neither a current connection nor an
         // active retry floor and start a redundant socket attempt.
         session.set_current_connection(Some(connection.clone()));
-        session.outbound_dial_retry.record_success();
+        session.outbound_dial_retry.record_published_connection();
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection);
@@ -1677,10 +1677,10 @@ impl<T> ConnectionPool<T> {
                     let retry_session = resolved_node_id.as_ref().map(|node_id| {
                         self.get_or_create_peer_session(&crate::PeerId::from(node_id))
                     });
-                    if retry_session
+                    let retry_attempt = retry_session
                         .as_ref()
-                        .is_some_and(|session| !session.outbound_dial_retry.try_claim_attempt())
-                    {
+                        .map(|session| session.outbound_dial_retry.try_claim_attempt());
+                    if retry_attempt.as_ref().is_some_and(Option::is_none) {
                         // This caller did not attempt a socket, so release the
                         // address ownership gate without extending the peer's
                         // failure streak/deadline.
@@ -1699,9 +1699,10 @@ impl<T> ConnectionPool<T> {
                             registry_weak.clone(),
                         )
                         .await;
-                    if let Some(session) = retry_session {
+                    if let (Some(session), Some(attempt)) = (retry_session, retry_attempt.flatten())
+                    {
                         match &result {
-                            Ok(_) => session.outbound_dial_retry.record_success(),
+                            Ok(_) => session.outbound_dial_retry.record_success(attempt),
                             Err(crate::GossipError::Network(error))
                                 if matches!(
                                     error.kind(),
@@ -1709,7 +1710,7 @@ impl<T> ConnectionPool<T> {
                                         | std::io::ErrorKind::InvalidInput
                                 ) => {}
                             Err(crate::GossipError::Shutdown) => {}
-                            Err(_) => session.outbound_dial_retry.record_failure(),
+                            Err(_) => session.outbound_dial_retry.record_failure(attempt),
                         }
                     }
                     gate_completion.finish(result.is_ok());

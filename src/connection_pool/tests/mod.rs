@@ -972,38 +972,61 @@ async fn test_outbound_dial_gate_is_released_when_leader_is_cancelled() {
 async fn outbound_retry_allows_one_immediate_retry_then_reopens_after_floor() {
     let retry = OutboundDialRetry::with_retry_floor(Duration::from_millis(10));
 
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("an untouched peer may dial immediately");
+    retry.record_failure(attempt);
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("first retry must be immediate");
+    retry.record_failure(attempt);
     assert!(
-        retry.try_claim_attempt(),
-        "an untouched peer may dial immediately"
-    );
-    retry.record_failure();
-    assert!(retry.try_claim_attempt(), "first retry must be immediate");
-    retry.record_failure();
-    assert!(
-        !retry.try_claim_attempt(),
+        retry.try_claim_attempt().is_none(),
         "second consecutive failure must arm the retry floor"
     );
 
-    retry.record_success();
+    retry.record_published_connection();
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("publication must clear an active retry floor");
+    retry.record_success(attempt);
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("successful completion must clear its reservation");
+    retry.record_failure(attempt);
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("the first failure after success must regain the immediate retry");
+    retry.record_failure(attempt);
     assert!(
-        retry.try_claim_attempt(),
-        "success must clear an active retry floor"
-    );
-    retry.record_failure();
-    assert!(
-        retry.try_claim_attempt(),
-        "the first failure after success must regain the immediate retry"
-    );
-    retry.record_failure();
-    assert!(
-        !retry.try_claim_attempt(),
+        retry.try_claim_attempt().is_none(),
         "the reset streak's second failure must re-arm the floor"
     );
 
     tokio::time::sleep(Duration::from_millis(15)).await;
     assert!(
-        retry.try_claim_attempt(),
+        retry.try_claim_attempt().is_some(),
         "a caller must be able to claim the dial after the floor expires"
+    );
+}
+
+#[tokio::test]
+async fn stale_outbound_completion_cannot_replace_a_newer_reservation() {
+    let retry = OutboundDialRetry::with_retry_floor(Duration::from_millis(10));
+
+    let attempt_a = retry
+        .try_claim_attempt()
+        .expect("attempt A must claim the slot");
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(
+        retry.try_claim_attempt().is_some(),
+        "attempt B must replace A after the bounded reservation expires"
+    );
+
+    retry.record_failure(attempt_a);
+    assert!(
+        retry.try_claim_attempt().is_none(),
+        "A's stale completion must not clear B's active reservation"
     );
 }
 
@@ -1018,12 +1041,12 @@ fn outbound_retry_claim_is_atomic_per_peer() {
         let retry = Arc::clone(&retry);
         let checked = Arc::clone(&checked);
         callers.push(std::thread::spawn(move || {
-            let eligible = retry.try_claim_attempt();
+            let attempt = retry.try_claim_attempt();
             checked.wait();
-            if eligible {
-                retry.record_failure();
+            if let Some(attempt) = attempt {
+                retry.record_failure(attempt);
             }
-            eligible
+            attempt.is_some()
         }));
     }
 
@@ -1042,12 +1065,18 @@ fn outbound_retry_claim_is_atomic_per_peer() {
 fn outbound_retry_failure_streak_never_wraps_to_an_immediate_retry() {
     let retry = OutboundDialRetry::with_retry_floor(Duration::from_secs(1));
 
-    for _ in 0..257 {
-        retry.record_failure();
-    }
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("an untouched peer may dial immediately");
+    retry
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .consecutive_failures = u8::MAX;
+    retry.record_failure(attempt);
 
     assert!(
-        !retry.try_claim_attempt(),
+        retry.try_claim_attempt().is_none(),
         "a saturated failure streak must keep the retry floor armed"
     );
 }
