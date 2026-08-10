@@ -11,7 +11,7 @@ use arc_swap::ArcSwapOption;
 use futures::future::{BoxFuture, poll_fn};
 use futures::task::AtomicWaker;
 use lru::LruCache;
-use scc::HashMap as SccHashMap;
+use scc::{HashMap as SccHashMap, hash_map::Entry};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -162,6 +162,12 @@ enum ActorUpsertPlan {
     },
     RefreshOwnerLease,
     Ignore,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KnownActorObservation {
+    observed_at: Instant,
+    generation: u64,
 }
 
 #[inline]
@@ -1454,7 +1460,8 @@ pub struct ActorState {
     /// must never be serialized: wire timestamps describe the actor version,
     /// while this map answers only whether the direct owner is still
     /// advertising that unchanged version.
-    pub known_actor_last_observed: SccHashMap<String, Instant>,
+    pub(crate) known_actor_last_observed: SccHashMap<String, KnownActorObservation>,
+    next_known_actor_observation_generation: AtomicU64,
     pub removed_actors: SccHashMap<String, RemovedActorTombstone>,
 }
 
@@ -3616,6 +3623,7 @@ impl<T: 'static> GossipRegistry<T> {
                             }
                             ActorUpsertPlan::Ignore => continue,
                         };
+                        let previous_observation = self.known_actor_observation(name.as_str());
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                         }
@@ -3626,6 +3634,7 @@ impl<T: 'static> GossipRegistry<T> {
                         self.reset_known_actor_owner_lease(
                             name.as_str(),
                             sender_peer_id == location.peer_id,
+                            previous_observation,
                         );
                         peer_actors_added.insert(name.clone());
                         applied_count += 1;
@@ -4009,26 +4018,82 @@ impl<T: 'static> GossipRegistry<T> {
 
     #[inline]
     fn mark_known_actor_observed(&self, name: &str) {
-        let now = Instant::now();
-        if self
+        let generation = match self
+            .actor_state
+            .next_known_actor_observation_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            }) {
+            Ok(previous) => previous.saturating_add(1),
+            Err(current) => current,
+        };
+        let observation = KnownActorObservation {
+            observed_at: Instant::now(),
+            generation,
+        };
+        match self
             .actor_state
             .known_actor_last_observed
-            .update_sync(name, |_, observed_at| *observed_at = now)
-            .is_none()
+            .entry_sync(name.to_owned())
         {
-            let _ = self
-                .actor_state
-                .known_actor_last_observed
-                .insert_sync(name.to_owned(), now);
+            Entry::Occupied(mut entry) => {
+                if generation > entry.get().generation {
+                    *entry.get_mut() = observation;
+                }
+            }
+            Entry::Vacant(entry) => {
+                let _ = entry.insert_entry(observation);
+            }
         }
     }
 
     #[inline]
-    fn reset_known_actor_owner_lease(&self, name: &str, observed_directly: bool) {
+    fn known_actor_observation(&self, name: &str) -> Option<KnownActorObservation> {
+        self.actor_state
+            .known_actor_last_observed
+            .read_sync(name, |_, observation| *observation)
+    }
+
+    #[inline]
+    fn remove_known_actor_observation_if_generation(
+        &self,
+        name: &str,
+        stale_observation: KnownActorObservation,
+    ) {
+        let _ = self
+            .actor_state
+            .known_actor_last_observed
+            .remove_if_sync(name, |current| {
+                current.generation == stale_observation.generation
+            });
+    }
+
+    #[inline]
+    fn remove_known_actor_observation_if_unchanged(
+        &self,
+        name: &str,
+        stale_observation: KnownActorObservation,
+    ) {
+        let _ = self
+            .actor_state
+            .known_actor_last_observed
+            .remove_if_sync(name, |current| {
+                current.generation == stale_observation.generation
+                    && !self.actor_state.known_actors.contains_sync(name)
+            });
+    }
+
+    #[inline]
+    fn reset_known_actor_owner_lease(
+        &self,
+        name: &str,
+        observed_directly: bool,
+        previous_observation: Option<KnownActorObservation>,
+    ) {
         if observed_directly {
             self.mark_known_actor_observed(name);
-        } else {
-            let _ = self.actor_state.known_actor_last_observed.remove_sync(name);
+        } else if let Some(previous_observation) = previous_observation {
+            self.remove_known_actor_observation_if_generation(name, previous_observation);
         }
     }
 
@@ -4036,7 +4101,7 @@ impl<T: 'static> GossipRegistry<T> {
     fn known_actor_age(&self, name: &str, location: &RemoteActorLocation) -> Duration {
         self.actor_state
             .known_actor_last_observed
-            .read_sync(name, |_, observed_at| observed_at.elapsed())
+            .read_sync(name, |_, observation| observation.observed_at.elapsed())
             .unwrap_or_else(|| {
                 Duration::from_secs(current_timestamp().saturating_sub(location.wall_clock_time))
             })
@@ -4044,8 +4109,11 @@ impl<T: 'static> GossipRegistry<T> {
 
     #[inline]
     fn remove_known_actor(&self, name: &str) -> Option<(String, RemoteActorLocation)> {
+        let previous_observation = self.known_actor_observation(name);
         let removed = self.actor_state.known_actors.remove_sync(name);
-        let _ = self.actor_state.known_actor_last_observed.remove_sync(name);
+        if let Some(previous_observation) = previous_observation {
+            self.remove_known_actor_observation_if_unchanged(name, previous_observation);
+        }
         removed
     }
 
@@ -5147,6 +5215,7 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                     ActorUpsertPlan::Ignore => continue,
                 };
+                let previous_observation = self.known_actor_observation(name.as_str());
                 if clear_tombstone {
                     let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                 }
@@ -5157,6 +5226,7 @@ impl<T: 'static> GossipRegistry<T> {
                 self.reset_known_actor_owner_lease(
                     name.as_str(),
                     sender_peer_id == location.peer_id,
+                    previous_observation,
                 );
                 if is_update {
                     updated_actors += 1;
@@ -5252,13 +5322,17 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let before_count = self.actor_state.known_actors.len();
 
-            let mut to_remove = Vec::new();
+            let mut known_snapshot = Vec::new();
             self.actor_state.known_actors.iter_sync(|k, location| {
-                if self.known_actor_age(k.as_str(), location) >= self.config.actor_ttl {
-                    to_remove.push(k.clone());
-                }
+                known_snapshot.push((k.clone(), location.clone()));
                 true
             });
+            let mut to_remove = Vec::new();
+            for (name, location) in known_snapshot {
+                if self.known_actor_age(name.as_str(), &location) >= self.config.actor_ttl {
+                    to_remove.push(name);
+                }
+            }
 
             for name in &to_remove {
                 let _ = self.remove_known_actor(name.as_str());
@@ -5272,20 +5346,15 @@ impl<T: 'static> GossipRegistry<T> {
             // The two lock-free maps cannot be mutated atomically. Prune any
             // observation left behind by a racing actor removal so the local
             // lease side table remains bounded by `known_actors`.
-            let mut observed_names = Vec::new();
+            let mut observed_entries = Vec::new();
             self.actor_state
                 .known_actor_last_observed
-                .iter_sync(|name, _| {
-                    observed_names.push(name.clone());
+                .iter_sync(|name, observation| {
+                    observed_entries.push((name.clone(), *observation));
                     true
                 });
-            for name in observed_names {
-                if !self.actor_state.known_actors.contains_sync(name.as_str()) {
-                    let _ = self
-                        .actor_state
-                        .known_actor_last_observed
-                        .remove_sync(name.as_str());
-                }
+            for (name, observation) in observed_entries {
+                self.remove_known_actor_observation_if_unchanged(name.as_str(), observation);
             }
         }
 
@@ -11058,8 +11127,8 @@ mod tests {
         let _ = reg
             .actor_state
             .known_actor_last_observed
-            .update_sync(actor, |_, observed_at| {
-                *observed_at = Instant::now() - Duration::from_secs(2);
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
             });
         assert!(
             reg.lookup_actor(actor).await.is_none(),
@@ -11126,8 +11195,8 @@ mod tests {
         let _ = reg
             .actor_state
             .known_actor_last_observed
-            .update_sync(actor, |_, observed_at| {
-                *observed_at = Instant::now() - Duration::from_secs(2);
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
             });
         let mut full_sync = HashMap::new();
         full_sync.insert(actor.to_string(), refreshed.clone());
@@ -11153,8 +11222,8 @@ mod tests {
         let _ = reg
             .actor_state
             .known_actor_last_observed
-            .update_sync(actor, |_, observed_at| {
-                *observed_at = Instant::now() - Duration::from_secs(2);
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
             });
         let mut relayed_sync = HashMap::new();
         relayed_sync.insert(actor.to_string(), refreshed.clone());
@@ -11202,10 +11271,7 @@ mod tests {
         );
         assert!(reg.lookup_actor(actor).await.is_none());
 
-        reg.actor_state
-            .known_actor_last_observed
-            .insert_sync("orphaned-observation".to_string(), Instant::now())
-            .unwrap();
+        reg.mark_known_actor_observed("orphaned-observation");
         reg.cleanup_stale_actors().await;
         assert!(read_known_actor(&reg, actor).is_none());
         assert_eq!(
@@ -11276,6 +11342,43 @@ mod tests {
                 .is_some_and(|actors| actors.contains(actor)),
             "a direct-owner refresh must attribute a relay-learned actor to its owner"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_lease_cleanup_preserves_concurrent_replacement_observation() {
+        let reg = GossipRegistry::<()>::new(test_addr(7011), test_config());
+        let actor = "actor.concurrent-lease-replacement";
+        let owner = test_peer_id("concurrent_lease_owner");
+        let original = RemoteActorLocation::new_with_peer(test_addr(9011), owner.clone());
+        let _ = reg
+            .actor_state
+            .known_actors
+            .insert_sync(actor.to_string(), original.clone());
+        reg.mark_known_actor_observed(actor);
+        let stale_observation = reg
+            .actor_state
+            .known_actor_last_observed
+            .read_sync(actor, |_, observation| *observation)
+            .unwrap();
+
+        let _ = reg.actor_state.known_actors.remove_sync(actor);
+        let replacement = RemoteActorLocation::new_with_peer(test_addr(9012), owner);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .insert_sync(actor.to_string(), replacement.clone());
+        reg.mark_known_actor_observed(actor);
+
+        reg.remove_known_actor_observation_if_unchanged(actor, stale_observation);
+
+        assert_eq!(read_known_actor(&reg, actor), Some(replacement));
+        assert!(
+            reg.actor_state
+                .known_actor_last_observed
+                .contains_sync(actor),
+            "cleanup for the removed generation must preserve a replacement generation's lease"
+        );
+        assert!(reg.lookup_actor(actor).await.is_some());
     }
 
     #[tokio::test]
