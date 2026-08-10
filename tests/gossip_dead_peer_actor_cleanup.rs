@@ -360,6 +360,7 @@ fn known_actors_owned_by_stale_peer_are_retained() -> Result<(), DynError> {
                     peer_addr: sub_addr,
                     sent_sequence: sequence as u64,
                     session_source: None,
+                    session_instance_id: None,
                     outcome: Ok(None),
                 }])
                 .await;
@@ -411,6 +412,7 @@ fn subsecond_liveness_window_counts_no_response() -> Result<(), DynError> {
                 peer_addr: sub_addr,
                 sent_sequence: 0,
                 session_source: None,
+                session_instance_id: None,
                 outcome: Ok(None),
             }])
             .await;
@@ -548,6 +550,7 @@ fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() ->
                     peer_addr: addr_b,
                     sent_sequence: sequence as u64,
                     session_source: None,
+                    session_instance_id: None,
                     outcome: Ok(None),
                 }])
                 .await;
@@ -601,6 +604,7 @@ fn discovered_non_required_peer_still_uses_response_asymmetry_liveness() -> Resu
                     peer_addr,
                     sent_sequence: sequence as u64,
                     session_source: None,
+                    session_instance_id: None,
                     outcome: Ok(None),
                 }])
                 .await;
@@ -774,6 +778,7 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
             peer_addr: sub_addr,
             sent_sequence: 0,
             session_source: None,
+            session_instance_id: None,
             outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "simulated peer socket termination",
@@ -820,6 +825,7 @@ fn hard_socket_error_does_not_enqueue_actor_removed_gossip() -> Result<(), DynEr
             peer_addr: sub_addr,
             sent_sequence: 0,
             session_source: None,
+            session_instance_id: None,
             outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "simulated peer socket termination",
@@ -1095,6 +1101,7 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                     peer_addr: sub_addr,
                     sent_sequence: sequence as u64,
                     session_source: None,
+                    session_instance_id: None,
                     outcome: Ok(None),
                 }])
                 .await;
@@ -1146,6 +1153,7 @@ fn transport_peer_death_retains_actor_without_gossip_tombstone() -> Result<(), D
             peer_addr: sub_addr,
             sent_sequence: 0,
             session_source: None,
+            session_instance_id: None,
             outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "simulated peer socket termination",

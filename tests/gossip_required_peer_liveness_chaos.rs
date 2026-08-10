@@ -498,6 +498,7 @@ async fn apply_no_response_rounds(node: &TlsHandle, peer_addr: SocketAddr, round
                 peer_addr,
                 sent_sequence: sequence as u64,
                 session_source: None,
+                session_instance_id: None,
                 outcome: Ok(None),
             }])
             .await;
