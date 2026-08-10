@@ -1634,8 +1634,7 @@ impl RoutedPubSub {
                 // parking until the fallback timer.
                 let current_actor_revision = actor_state.pubsub_routing_revision();
                 let current_connection_revision = connection_pool.routing_revision();
-                let current_provider_revision =
-                    provider_revision_signal.load(Ordering::Acquire);
+                let current_provider_revision = provider_revision_signal.load(Ordering::Acquire);
                 if current_actor_revision != actor_revision
                     || current_connection_revision != connection_revision
                     || current_provider_revision != provider_revision
@@ -1644,13 +1643,11 @@ impl RoutedPubSub {
                         return;
                     };
                     this.refresh_control_plane_if_changed().await;
-                    actor_revision =
-                        this.last_actor_routing_revision.load(Ordering::Acquire);
+                    actor_revision = this.last_actor_routing_revision.load(Ordering::Acquire);
                     connection_revision = this
                         .last_connection_routing_revision
                         .load(Ordering::Acquire);
-                    provider_revision =
-                        this.last_route_provider_revision.load(Ordering::Acquire);
+                    provider_revision = this.last_route_provider_revision.load(Ordering::Acquire);
                     continue;
                 }
 

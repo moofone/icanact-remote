@@ -2229,6 +2229,7 @@ async fn process_read_result_io<S>(
     // connection is the peer's fixed listening port, shared by every
     // connection we ever make to it).
     session_source: SocketAddr,
+    connection_instance_id: Option<u64>,
     authenticated_peer_id: Option<&crate::PeerId>,
     response_correlation: Option<&CorrelationTracker>,
     sync_actor_handler: Option<&crate::registry::ActorMessageHandlerSyncCell>,
@@ -2428,12 +2429,13 @@ where
             Ok(())
         }
         other => {
-            crate::protocol::process_read_result(
+            crate::protocol::process_read_result_with_instance(
                 other,
                 streaming_state,
                 registry,
                 peer_addr,
                 session_source,
+                connection_instance_id,
                 response_correlation,
                 None,
                 authenticated_peer_id,

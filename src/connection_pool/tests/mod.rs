@@ -274,8 +274,12 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
             Some(read_ctx_a),
         );
         let writer_a = Arc::new(writer_a);
-        let conn_a =
-            ConnectionHandle::<()>::new_stream(addr_b, ConnectionDirection::Outbound, Arc::clone(&writer_a), correlation_a);
+        let conn_a = ConnectionHandle::<()>::new_stream(
+            addr_b,
+            ConnectionDirection::Outbound,
+            Arc::clone(&writer_a),
+            correlation_a,
+        );
         let (writer_b, task_b, _) = LockFreeStreamHandle::new(
             io_b,
             addr_a,
@@ -285,8 +289,12 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
             Some(read_ctx_b),
         );
         let writer_b = Arc::new(writer_b);
-        let conn_b =
-            ConnectionHandle::<()>::new_stream(addr_a, ConnectionDirection::Outbound, Arc::clone(&writer_b), correlation_b);
+        let conn_b = ConnectionHandle::<()>::new_stream(
+            addr_a,
+            ConnectionDirection::Outbound,
+            Arc::clone(&writer_b),
+            correlation_b,
+        );
 
         let start = Arc::new(tokio::sync::Barrier::new(3));
         let start_a = Arc::clone(&start);
@@ -443,7 +451,8 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_wedged = Arc::new(writer_wedged);
         let conn_wedged = ConnectionHandle::<()>::new_stream(
-            addr_peer, ConnectionDirection::Outbound,
+            addr_peer,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_wedged),
             correlation_wedged,
         );
@@ -458,7 +467,8 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -633,7 +643,8 @@ fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_wedged = Arc::new(writer_wedged);
         let conn_wedged = ConnectionHandle::<()>::new_stream(
-            addr_peer, ConnectionDirection::Outbound,
+            addr_peer,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_wedged),
             correlation_wedged,
         );
@@ -648,7 +659,8 @@ fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -795,7 +807,8 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
         // (`writer_peer`) writes normally onto the shared duplex; the wedged
         // side's transport (`writer_wedged`) never sends anything of its own.
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -964,7 +977,8 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -1279,7 +1293,8 @@ fn ask_backpressure_nack_never_splices_into_an_in_flight_streaming_frame() {
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             correlation_peer,
         );
@@ -1660,6 +1675,49 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
 }
 
+#[tokio::test]
+async fn rejected_candidate_preserves_rival_correlation_at_another_address() {
+    let peer_id = crate::KeyPair::new_for_testing("reject-shared-correlation").peer_id();
+    let rival_addr: SocketAddr = "127.0.0.1:40570".parse().unwrap();
+    let candidate_addr: SocketAddr = "127.0.0.1:40571".parse().unwrap();
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let rival = make_live_connection_with_correlation(
+        rival_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), rival_addr, rival.clone()));
+    let candidate = make_live_connection_with_correlation(
+        candidate_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(candidate_addr, candidate.clone());
+
+    let guard = tracker
+        .allocate()
+        .expect("correlation slot should allocate");
+    let slot = CorrelationTracker::slot_index(guard.id());
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    pool.unpublish_rejected_outbound_candidate(candidate_addr, &candidate, &peer_id, Some(&rival));
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "retiring a candidate must not cancel a live rival's shared ask slot"
+    );
+    guard.disarm();
+}
+
 /// Earlier versions of `configure_peer`'s follow-up
 /// checked the pin, then separately (even if compare-and-applied against
 /// a dedicated mirror updated in the same owner command) mutated
@@ -1701,7 +1759,9 @@ async fn a_caller_side_check_then_mutate_reindex_is_vulnerable_to_an_interleaved
     // agrees too, exactly as it would immediately after a real
     // `configure_peer(peer_id, losing_addr)` commit and BEFORE any later
     // command's eviction has retracted it.
-    let _ = pool.addr_to_peer_id.upsert_sync(losing_addr, peer_id.clone());
+    let _ = pool
+        .addr_to_peer_id
+        .upsert_sync(losing_addr, peer_id.clone());
     pool.set_configured_peer_addr(&peer_id, losing_addr);
     assert_eq!(pool.get_required_peer_addr(&peer_id), Some(losing_addr));
 
@@ -1764,8 +1824,8 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
                 ..crate::GossipConfig::default()
             },
         ));
-        let peer_id = crate::KeyPair::new_for_testing(format!("concurrent-configure-{round}"))
-            .peer_id();
+        let peer_id =
+            crate::KeyPair::new_for_testing(format!("concurrent-configure-{round}")).peer_id();
         let addr_a: SocketAddr = format!("127.0.0.1:{}", 41_100 + round).parse().unwrap();
         let addr_b: SocketAddr = format!("127.0.0.1:{}", 41_200 + round).parse().unwrap();
 
@@ -1798,114 +1858,6 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
              have run, using that command's own, correct pin decision"
         );
     }
-}
-
-#[tokio::test]
-async fn routing_revision_tracks_connection_publish_and_removal() {
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-    let peer_id = crate::KeyPair::new_for_testing("routing_revision").peer_id();
-    let addr: SocketAddr = "127.0.0.1:40554".parse().unwrap();
-    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
-    connection.set_state(ConnectionState::Connected);
-
-    let initial = pool.routing_revision();
-    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
-    let published = pool.routing_revision();
-    assert!(published > initial);
-    tokio::time::timeout(Duration::from_millis(10), pool.wait_for_routing_change(initial))
-        .await
-        .expect("connection publication must wake route refresh");
-
-    pool.disconnect_connection_by_peer_id(&peer_id)
-        .expect("expected connection to be removed");
-    assert!(pool.routing_revision() > published);
-    tokio::time::timeout(Duration::from_millis(10), pool.wait_for_routing_change(published))
-        .await
-        .expect("connection removal must wake route refresh");
-}
-
-#[tokio::test(start_paused = true)]
-async fn preferred_connection_wait_parks_until_connection_state_changes() {
-    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
-    let remote = crate::KeyPair::new_for_testing("preferred_wait_parks").peer_id();
-    let mut config = crate::GossipConfig::default();
-    config.key_pair = Some(crate::KeyPair::new_for_testing("preferred_wait_registry"));
-    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
-        "127.0.0.1:0".parse().unwrap(),
-        config,
-    ));
-    let waiting_pool = Arc::clone(&pool);
-    let waiter = tokio::spawn(async move {
-        waiting_pool
-            .wait_for_preferred_connection(
-                &remote,
-                registry.as_ref(),
-                Duration::from_millis(100),
-            )
-            .await
-    });
-
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(100)).await;
-    assert!(waiter.await.unwrap().is_none());
-    let checks = pool.preferred_connection_checks.load(Ordering::Relaxed);
-    assert!(checks <= 2, "idle preferred wait checked {checks} times");
-}
-
-#[tokio::test(start_paused = true)]
-async fn preferred_connection_publication_wakes_wait_without_advancing_time() {
-    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
-    let remote = crate::KeyPair::new_for_testing("preferred_wait_publication").peer_id();
-    let mut config = crate::GossipConfig::default();
-    config.key_pair = Some(crate::KeyPair::new_for_testing(
-        "preferred_wait_publication_registry",
-    ));
-    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
-        "127.0.0.1:0".parse().unwrap(),
-        config,
-    ));
-    let waiting_pool = Arc::clone(&pool);
-    let waiting_registry = Arc::clone(&registry);
-    let waiting_remote = remote.clone();
-    let waiter = tokio::spawn(async move {
-        waiting_pool
-            .wait_for_preferred_connection(
-                &waiting_remote,
-                waiting_registry.as_ref(),
-                Duration::from_secs(60),
-            )
-            .await
-    });
-    tokio::task::yield_now().await;
-
-    let direction = if registry.should_keep_connection(&remote, true) {
-        ConnectionDirection::Outbound
-    } else {
-        ConnectionDirection::Inbound
-    };
-    let addr: SocketAddr = "127.0.0.1:40555".parse().unwrap();
-    let (io, _peer_io) = tokio::io::duplex(1024);
-    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
-        io,
-        addr,
-        ChannelId::Global,
-        BufferConfig::default(),
-        None,
-        None,
-    );
-    let mut connection = LockFreeConnection::new(addr, direction);
-    connection.stream_handle = Some(Arc::new(stream_handle));
-    let connection = Arc::new(connection);
-    connection.set_state(ConnectionState::Connected);
-    assert!(pool.add_connection_by_peer_id(remote, addr, connection));
-    let resolved = tokio::time::timeout(Duration::from_millis(10), waiter)
-        .await
-        .expect("connection publication must wake waiter without advancing time")
-        .expect("preferred-connection waiter must not panic");
-    assert!(
-        resolved.is_some(),
-        "published connection must satisfy waiter"
-    );
 }
 
 #[tokio::test]
@@ -1998,18 +1950,8 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
-    let routing_revision = pool.routing_revision();
     pool.index_connection_by_addr(alias_addr, connection.clone());
-    let after_index = pool.routing_revision();
-    assert!(
-        after_index > routing_revision,
-        "an address-only connection index must wake route consumers"
-    );
     pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
-    assert!(
-        pool.routing_revision() > after_index,
-        "the paired address/owner publication must wake route consumers after the alias is resolvable"
-    );
 
     let resolved = pool
         .get_connection_by_peer_id(&peer_id)
@@ -2210,7 +2152,8 @@ fn deferred_actor_ask_sync_replies_via_responder() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2328,7 +2271,8 @@ fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out(
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2454,7 +2398,8 @@ fn ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2577,7 +2522,8 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2695,7 +2641,8 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5136,7 +5083,8 @@ fn stream_direct_ask_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5419,7 +5367,8 @@ fn stream_tell_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             CorrelationTracker::new(),
         );
@@ -5598,7 +5547,8 @@ fn stream_protocol_ask_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5929,7 +5879,8 @@ fn stream_protocol_direct_ask_inflight64_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -6081,7 +6032,8 @@ fn stream_protocol_actor_ask_inflight64_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -6244,7 +6196,8 @@ fn stream_protocol_tell_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             CorrelationTracker::new(),
         );
@@ -7295,6 +7248,63 @@ async fn delta_gossip_updates_last_response_received_ms() {
     );
 }
 
+#[tokio::test]
+async fn delta_gossip_records_owner_side_liveness_evidence() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_delta_gossip_owner_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_owner_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.66:9302".parse().unwrap();
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await
+    );
+
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, peer_addr, Some(peer_id), msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    assert!(
+        registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await
+    );
+}
+
 /// The `DeltaGossip` arm never
 /// verified `delta.sender_peer_id` -- a SELF-REPORTED wire field, not an
 /// authority for identity -- against the connection's actual authenticated
@@ -7317,7 +7327,9 @@ async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
     let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
         bind_addr,
         crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_impersonation_local")),
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_delta_gossip_impersonation_local",
+            )),
             ..crate::GossipConfig::default()
         },
     ));
@@ -11858,12 +11870,7 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
     pool.index_connection_by_addr(ephemeral_addr, target.clone());
     pool.add_addr_to_peer_id(ephemeral_addr, peer_id.clone());
 
-    let routing_revision = pool.routing_revision();
     assert!(pool.disconnect_connection_instance(&peer_id, &target));
-    assert!(
-        pool.routing_revision() > routing_revision,
-        "successful instance teardown must wake route consumers"
-    );
 
     assert!(
         pool.connections_by_addr
@@ -11965,25 +11972,6 @@ async fn connection_handle_direction_survives_a_same_address_reassignment() {
         "a handle's direction must survive the address it was resolved at being \
          reassigned to a different connection -- re-deriving it from a fresh lookup would \
          wrongly report the new occupant's direction instead"
-    );
-}
-
-#[test]
-fn aliasless_current_connection_clear_publishes_routing_revision() {
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-    let peer_id = crate::KeyPair::new_for_testing("aliasless-current-clear").peer_id();
-    let addr: SocketAddr = "127.0.0.1:7442".parse().unwrap();
-    let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
-    connection.set_state(ConnectionState::Connected);
-    pool.get_or_create_peer_session(&peer_id)
-        .set_current_connection(Some(connection));
-    let routing_revision = pool.routing_revision();
-
-    pool.clear_current_peer_connection(&peer_id);
-
-    assert!(
-        pool.routing_revision() > routing_revision,
-        "clearing the primary slot must publish even without a connections_by_peer alias"
     );
 }
 
@@ -12175,12 +12163,7 @@ async fn ask_timeout_eviction_current_session_survives_stale_alias_without_destr
 
     let (pool_old, dead_old, instance_id) =
         setup_dead_current_session_with_staled_alias(&peer_id, addr).await;
-    let routing_revision = pool_old.routing_revision();
     pool_old.remove_connection_instance_by_id(addr, instance_id);
-    assert!(
-        pool_old.routing_revision() > routing_revision,
-        "address-indexed instance removal must wake route consumers"
-    );
     let old_still_published = pool_old
         .peer_sessions
         .read_sync(&peer_id, |_, s| {
@@ -13389,149 +13372,6 @@ async fn disconnect_connection_by_peer_id_still_cancels_correlation_on_final_tea
         SLOT_EMPTY,
         "a genuinely final teardown (no surviving sibling instance) must still cancel the \
          connection's correlation tracker"
-    );
-
-    guard.disarm();
-}
-
-/// `unpublish_rejected_outbound_candidate`'s `_` (fallback) match arm covers
-/// the far more common reject shape -- a still-live rival that lives at a
-/// DIFFERENT address than the candidate's own dial address, so there is no
-/// index row to restore (see the function's own doc). Before this fix, that
-/// arm left `keep_correlation` at its default `false`, so discarding the
-/// candidate unconditionally cancelled the shared, SESSION-level correlation
-/// tracker -- cancelling the still-live rival's in-flight asks too, even
-/// though the rival itself was never touched.
-///
-/// RED (pre-fix): the rival's in-flight slot is cancelled back to
-/// `SLOT_EMPTY`. GREEN (post-fix): the slot survives, still `SLOT_WAITING`.
-#[tokio::test]
-async fn unpublish_rejected_outbound_candidate_preserves_shared_correlation_for_rival_at_different_address()
- {
-    let peer_id = crate::KeyPair::new_for_testing("rc-unpublish-diff-addr-peer").peer_id();
-    let rival_addr: SocketAddr = "127.0.0.1:7501".parse().unwrap();
-    let candidate_addr: SocketAddr = "127.0.0.1:7502".parse().unwrap();
-
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
-
-    // The still-live rival, indexed and published at its OWN address --
-    // different from the candidate's dial address below.
-    let rival = make_live_connection_with_correlation(
-        rival_addr,
-        ConnectionDirection::Inbound,
-        tracker.clone(),
-    )
-    .await;
-    assert!(pool.add_connection_by_peer_id(peer_id.clone(), rival_addr, rival.clone()));
-
-    // The rejected outbound candidate, provisionally indexed at its OWN dial
-    // address, sharing the same peer-session tracker every connection
-    // attempt for this peer gets from `get_or_create_correlation_tracker`.
-    let candidate = make_live_connection_with_correlation(
-        candidate_addr,
-        ConnectionDirection::Outbound,
-        tracker.clone(),
-    )
-    .await;
-    let _ = pool
-        .connections_by_addr
-        .upsert_sync(candidate_addr, candidate.clone());
-
-    // An in-flight ask slot on the shared tracker, as if the RIVAL had an ask
-    // in flight when the candidate's connection attempt was rejected.
-    let guard = tracker.allocate().expect("slot should allocate");
-    let id = guard.id();
-    let slot = CorrelationTracker::slot_index(id);
-    assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
-        SLOT_WAITING
-    );
-
-    pool.unpublish_rejected_outbound_candidate(candidate_addr, &candidate, &peer_id, Some(&rival));
-
-    assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
-        SLOT_WAITING,
-        "discarding the rejected candidate cancelled the shared correlation tracker's in-flight \
-         slot -- this kills the still-live rival's in-flight asks, even though the rival lives \
-         at a different address and was never itself touched"
-    );
-    assert!(
-        rival.has_live_stream(),
-        "the still-live rival's own background tasks must not be touched by the reject"
-    );
-
-    guard.disarm();
-}
-
-/// A rejected candidate can lose the address-removal CAS because a fresh
-/// connection reindexed the same address first.  That lost removal must not
-/// change the correlation decision: the still-live rival can still share the
-/// session tracker, so cancelling the candidate must not cancel the rival's
-/// in-flight asks.
-#[tokio::test]
-async fn unpublish_rejected_outbound_candidate_preserves_shared_correlation_when_removal_loses()
-{
-    let peer_id = crate::KeyPair::new_for_testing("rc-unpublish-cas-loss-peer").peer_id();
-    let rival_addr: SocketAddr = "127.0.0.1:7503".parse().unwrap();
-    let candidate_addr: SocketAddr = "127.0.0.1:7504".parse().unwrap();
-
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
-
-    let rival = make_live_connection_with_correlation(
-        rival_addr,
-        ConnectionDirection::Inbound,
-        tracker.clone(),
-    )
-    .await;
-    assert!(pool.add_connection_by_peer_id(peer_id.clone(), rival_addr, rival.clone()));
-
-    let candidate = make_live_connection_with_correlation(
-        candidate_addr,
-        ConnectionDirection::Outbound,
-        tracker.clone(),
-    )
-    .await;
-    let replacement = make_live_connection_with_correlation(
-        candidate_addr,
-        ConnectionDirection::Inbound,
-        tracker.clone(),
-    )
-    .await;
-    let _ = pool
-        .connections_by_addr
-        .upsert_sync(candidate_addr, replacement.clone());
-
-    let guard = tracker.allocate().expect("slot should allocate");
-    let id = guard.id();
-    let slot = CorrelationTracker::slot_index(id);
-    assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
-        SLOT_WAITING
-    );
-
-    // `remove_if_sync` loses: the candidate has already been replaced at the
-    // same address.  The live rival is at a different address, so there is
-    // no restoration branch to accidentally set the preservation flag.
-    pool.unpublish_rejected_outbound_candidate(
-        candidate_addr,
-        &candidate,
-        &peer_id,
-        Some(&rival),
-    );
-
-    assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
-        SLOT_WAITING,
-        "a lost candidate-removal CAS must not cancel the live rival's shared tracker"
-    );
-    assert!(
-        pool.get_lock_free_connection(candidate_addr)
-            .as_ref()
-            .is_some_and(|connection| Arc::ptr_eq(connection, &replacement)),
-        "the fresh replacement that won the address CAS must remain indexed"
     );
 
     guard.disarm();

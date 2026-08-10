@@ -142,7 +142,9 @@ impl RemoteConnection {
         request_id: u64,
     ) -> crate::Result<crate::AlignedBytes> {
         self.inner
-            .ask_actor_frame_aligned_with_request_id(actor_id, type_hash, payload, timeout, request_id)
+            .ask_actor_frame_aligned_with_request_id(
+                actor_id, type_hash, payload, timeout, request_id,
+            )
             .await
     }
 
@@ -1334,7 +1336,7 @@ mod tests {
     use super::*;
     use crate::registry::{ActorMessageFuture, ActorMessageHandler};
     use crate::{GossipConfig, GossipRegistryHandle, KeyPair};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     struct NeverRespondsHandler;
 

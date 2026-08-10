@@ -1050,13 +1050,12 @@ impl<T: 'static> Peer<T> {
                 if !required_peer {
                     let mut gossip_state = self.registry.gossip_state.lock().await;
                     let node_id = Some(self.peer_id.to_node_id());
-                    let peer_info = gossip_state
-                        .peers
-                        .entry(*addr)
-                        .or_insert_with(|| crate::registry::PeerInfo::for_failed_connect_attempt(
+                    let peer_info = gossip_state.peers.entry(*addr).or_insert_with(|| {
+                        crate::registry::PeerInfo::for_failed_connect_attempt(
                             crate::registry::AttemptedRoute::new(*addr),
                             node_id,
-                        ));
+                        )
+                    });
                     peer_info.failures = self.registry.config.max_peer_failures;
                     peer_info.last_failure_time = Some(crate::current_timestamp());
                     peer_info.last_failure_instant = Some(std::time::Instant::now());
@@ -1088,13 +1087,12 @@ impl<T: 'static> Peer<T> {
                 if !required_peer {
                     let mut gossip_state = self.registry.gossip_state.lock().await;
                     let node_id = Some(self.peer_id.to_node_id());
-                    let peer_info = gossip_state
-                        .peers
-                        .entry(*addr)
-                        .or_insert_with(|| crate::registry::PeerInfo::for_failed_connect_attempt(
+                    let peer_info = gossip_state.peers.entry(*addr).or_insert_with(|| {
+                        crate::registry::PeerInfo::for_failed_connect_attempt(
                             crate::registry::AttemptedRoute::new(*addr),
                             node_id,
-                        ));
+                        )
+                    });
                     peer_info.failures = self.registry.config.max_peer_failures;
                     peer_info.last_failure_time = Some(crate::current_timestamp());
                     peer_info.last_failure_instant = Some(std::time::Instant::now());
@@ -1734,8 +1732,7 @@ mod tests {
     /// reconstructs it directly against the primitives to prove the
     /// vulnerability class.
     #[tokio::test]
-    async fn a_caller_side_pin_read_then_route_write_is_vulnerable_to_an_interleaved_pin_publish()
-     {
+    async fn a_caller_side_pin_read_then_route_write_is_vulnerable_to_an_interleaved_pin_publish() {
         let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
             "127.0.0.1:41010".parse().unwrap(),
             GossipConfig {
@@ -1753,9 +1750,7 @@ mod tests {
         // An owner command interleaves BETWEEN the read and the write
         // below, publishing a NEW pin -- exactly what a concurrent
         // `configure_peer` does.
-        registry
-            .configure_peer(peer_id.clone(), new_pin_addr)
-            .await;
+        registry.configure_peer(peer_id.clone(), new_pin_addr).await;
         assert_eq!(
             registry.connection_pool.get_required_peer_addr(&peer_id),
             Some(new_pin_addr)
@@ -1843,7 +1838,7 @@ mod tests {
     /// A, not a silent success.
     #[tokio::test]
     async fn ordinary_connect_falls_through_to_the_pinned_route_without_gossiping_the_declined_one()
-     {
+    {
         let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
             "127.0.0.1:41013".parse().unwrap(),
             GossipConfig {
@@ -1856,22 +1851,17 @@ mod tests {
         let pinned_addr: SocketAddr = "127.0.0.1:41014".parse().unwrap();
         let declined_addr: SocketAddr = "127.0.0.1:41015".parse().unwrap();
 
-        registry
-            .configure_peer(peer_id.clone(), pinned_addr)
-            .await;
+        registry.configure_peer(peer_id.clone(), pinned_addr).await;
 
         let peer = Peer {
             peer_id: peer_id.clone(),
             registry: registry.clone(),
         };
-        let err = peer
-            .connect(&declined_addr)
-            .await
-            .expect_err(
-                "a declined ordinary connect must still fall through to the pinned route and \
+        let err = peer.connect(&declined_addr).await.expect_err(
+            "a declined ordinary connect must still fall through to the pinned route and \
                  surface ITS failure -- nothing listens at the pin either, so silently \
                  returning Ok(()) here would prove the fallthrough never happened",
-            );
+        );
         assert!(
             matches!(err, GossipError::Network(_)),
             "the surfaced error must come from actually attempting the pinned route, not some \
@@ -1914,8 +1904,7 @@ mod tests {
     /// over many rounds to cover every ordering the owner's serialization
     /// can produce.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn ordinary_connect_never_inserts_a_gossip_state_entry_for_an_address_it_did_not_dial()
-     {
+    async fn ordinary_connect_never_inserts_a_gossip_state_entry_for_an_address_it_did_not_dial() {
         for round in 0..20u16 {
             let registry = std::sync::Arc::new(registry::GossipRegistry::<()>::new(
                 format!("127.0.0.1:{}", 41_400 + round).parse().unwrap(),
