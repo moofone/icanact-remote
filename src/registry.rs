@@ -3611,6 +3611,7 @@ impl<T: 'static> GossipRegistry<T> {
                             } => clear_tombstone,
                             ActorUpsertPlan::RefreshOwnerLease => {
                                 self.mark_known_actor_observed(name.as_str());
+                                peer_actors_added.insert(name);
                                 continue;
                             }
                             ActorUpsertPlan::Ignore => continue,
@@ -11211,6 +11212,69 @@ mod tests {
             reg.actor_state.known_actor_last_observed.len(),
             0,
             "lease state must remain bounded by known actors even across racing removals"
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_version_owner_refresh_records_peer_attribution_without_reapplying() {
+        let reg = GossipRegistry::<()>::new(test_addr(7008), test_config());
+        let actor = "actor.owner-attribution-refresh";
+        let owner = test_peer_id("owner_attribution_refresh");
+        let owner_addr = test_addr(7009);
+        let relay = test_peer_id("owner_attribution_relay");
+        let relay_addr = test_addr(7010);
+        reg.connection_pool
+            .set_configured_peer_addr(&owner, owner_addr);
+        reg.connection_pool
+            .set_configured_peer_addr(&relay, relay_addr);
+
+        let original = RemoteActorLocation::new_with_peer(test_addr(9008), owner.clone());
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: original.clone(),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: relay,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let mut refreshed = original.clone();
+        refreshed.wall_clock_time += 10_000;
+        refreshed.local_registration_time += 10_000;
+        let applied = reg
+            .apply_delta(RegistryDelta {
+                since_sequence: 1,
+                current_sequence: 2,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: refreshed,
+                    priority: RegistrationPriority::Immediate,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            applied.is_empty(),
+            "owner attribution must not turn a lease refresh into a registry update"
+        );
+        assert_eq!(read_known_actor(&reg, actor), Some(original));
+        let state = reg.gossip_state.lock().await;
+        assert!(
+            state
+                .peer_to_actors
+                .get(&owner_addr)
+                .is_some_and(|actors| actors.contains(actor)),
+            "a direct-owner refresh must attribute a relay-learned actor to its owner"
         );
     }
 
