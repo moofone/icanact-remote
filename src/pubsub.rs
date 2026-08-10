@@ -863,7 +863,7 @@ impl RoutedPubSub {
         #[cfg(test)]
         self.control_plane_refreshes.fetch_add(1, Ordering::Relaxed);
 
-        let actor_revision = self.registry.actor_state.routing_revision();
+        let actor_revision = self.registry.actor_state.pubsub_routing_revision();
         let connection_revision = self.registry.connection_pool.routing_revision();
         let provider_revision = self.route_provider_revision.load(Ordering::Acquire);
         if self.last_actor_routing_revision.load(Ordering::Acquire) == actor_revision
@@ -1234,12 +1234,12 @@ impl RoutedPubSub {
                 return;
             }
 
-            let mut actor_revision = actor_state.routing_revision();
+            let mut actor_revision = actor_state.pubsub_routing_revision();
             let mut connection_revision = connection_pool.routing_revision();
 
             loop {
                 tokio::select! {
-                    _ = actor_state.wait_for_routing_change(actor_revision) => {}
+                    _ = actor_state.wait_for_pubsub_routing_change(actor_revision) => {}
                     _ = connection_pool.wait_for_routing_change(connection_revision) => {}
                     _ = provider_changed.notified() => {}
                     _ = tokio::time::sleep(CONTROL_PLANE_FALLBACK_INTERVAL) => {}
@@ -1248,7 +1248,7 @@ impl RoutedPubSub {
                     return;
                 };
                 this.refresh_control_plane().await;
-                actor_revision = actor_state.routing_revision();
+                actor_revision = actor_state.pubsub_routing_revision();
                 connection_revision = connection_pool.routing_revision();
             }
         });
@@ -1790,6 +1790,11 @@ fn interest_name(topic_key: u64, peer: &PeerId) -> String {
     format!("{INTEREST_PREFIX}/{topic_key:016x}/{}", peer.to_hex())
 }
 
+pub(crate) fn is_interest_actor_name(name: &str) -> bool {
+    name.strip_prefix(INTEREST_PREFIX)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn parse_interest_name(name: &str) -> Option<(u64, PeerId)> {
     let rest = name.strip_prefix(INTEREST_PREFIX)?.strip_prefix('/')?;
     let (topic, peer) = rest.split_once('/')?;
@@ -1884,7 +1889,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn actor_change_wakes_parked_control_plane_without_waiting_for_fallback() {
+    async fn pubsub_interest_change_wakes_control_plane_without_waiting_for_fallback() {
         let pubsub = test_pubsub("pubsub-control-plane-notify");
         RoutedPubSub::spawn_control_plane(&pubsub);
         tokio::task::yield_now().await;
@@ -1893,7 +1898,10 @@ mod tests {
         pubsub
             .registry
             .register_actor(
-                "control-plane-notify-probe".to_owned(),
+                interest_name(
+                    topic_key("control-plane-notify-probe"),
+                    &crate::KeyPair::new_for_testing("control-plane-notify-peer").peer_id(),
+                ),
                 RemoteActorLocation::new_with_peer(
                     "127.0.0.1:19002".parse().unwrap(),
                     pubsub.local_peer_id.clone(),
@@ -1907,7 +1915,35 @@ mod tests {
         assert_eq!(
             pubsub.control_plane_refreshes.load(Ordering::Relaxed),
             before + 1,
-            "actor mutation must wake route refresh immediately without advancing time"
+            "pubsub interest mutation must wake route refresh immediately without advancing time"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_actor_change_does_not_wake_pubsub_control_plane() {
+        let pubsub = test_pubsub("pubsub-control-plane-unrelated-actor");
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        tokio::task::yield_now().await;
+        let before = pubsub.control_plane_refreshes.load(Ordering::Relaxed);
+
+        pubsub
+            .registry
+            .register_actor(
+                "unrelated-service".to_owned(),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19003".parse().unwrap(),
+                    pubsub.local_peer_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            pubsub.control_plane_refreshes.load(Ordering::Relaxed),
+            before,
+            "unrelated actor churn must not rebuild pubsub routes"
         );
     }
 
