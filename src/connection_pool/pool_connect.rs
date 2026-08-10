@@ -1719,11 +1719,13 @@ impl<T> ConnectionPool<T> {
                     if let (Some(session), Some(attempt)) = (
                         retry_session.as_ref(),
                         retry_attempt.as_ref().copied().flatten(),
-                    ) && let Some(handle) =
-                        self.reuse_published_connection_after_retry_claim(session, attempt)
-                    {
-                        gate_completion.finish(true);
-                        return Ok(handle);
+                    ) {
+                        if let Some(handle) =
+                            self.reuse_published_connection_after_retry_claim(session, attempt)
+                        {
+                            gate_completion.finish(true);
+                            return Ok(handle);
+                        }
                     }
                     let result = self
                         .connect_via_stream(
