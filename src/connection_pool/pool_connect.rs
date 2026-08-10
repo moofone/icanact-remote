@@ -738,9 +738,6 @@ impl<T> ConnectionPool<T> {
                 self.clear_capabilities_for_addr(&addr);
             }
         }
-        if routing_changed {
-            self.mark_routing_changed();
-        }
         self.release_counted_connection(expected);
         // `expected.correlation` is a SESSION-level
         // tracker shared BY POINTER across reconnect instances for this
@@ -756,6 +753,9 @@ impl<T> ConnectionPool<T> {
             expected.abort_tasks_keep_correlation();
         } else {
             expected.abort_tasks();
+        }
+        if routing_changed {
+            self.mark_routing_changed();
         }
     }
 
@@ -2546,15 +2546,14 @@ impl<T> ConnectionPool<T> {
                 self.clear_capabilities_for_addr(addr);
             }
 
-            // The primary-slot clear above can notify before these aliases
-            // are removed. A final revision after the complete sweep is the
-            // routing event consumers must incorporate.
-            self.mark_routing_changed();
-
             self.release_counted_connection(&connection);
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
             connection.abort_tasks();
+            // The primary-slot clear above can notify before these aliases
+            // are removed. Publish the final revision only after the
+            // connection is closed so route consumers cannot retain it.
+            self.mark_routing_changed();
 
             Some(connection)
         } else {
@@ -2649,7 +2648,6 @@ impl<T> ConnectionPool<T> {
                     // still-live sibling's in-flight asks.
                 }
             }
-            self.mark_routing_changed();
         }
         // Abort the writer/reader tasks regardless of whether the address
         // removal above found this exact instance still indexed — the
@@ -2659,6 +2657,9 @@ impl<T> ConnectionPool<T> {
             candidate.abort_tasks_keep_correlation();
         } else {
             candidate.abort_tasks();
+        }
+        if removed {
+            self.mark_routing_changed();
         }
     }
 
@@ -2812,14 +2813,13 @@ impl<T> ConnectionPool<T> {
             }
         }
 
-        if routing_changed {
-            self.mark_routing_changed();
-        }
-
         self.release_counted_connection(target);
 
         // H-004: Abort background tasks (writer, reader) to prevent resource leaks.
         target.abort_tasks();
+        if routing_changed {
+            self.mark_routing_changed();
+        }
         true
     }
 
@@ -3125,12 +3125,11 @@ impl<T> ConnectionPool<T> {
                 self.clear_capabilities_for_addr(&addr);
             }
         }
+        self.release_displaced_connection_count(failed_instance_id);
+        current.abort_tasks();
         if routing_changed {
             self.mark_routing_changed();
         }
-
-        self.release_displaced_connection_count(failed_instance_id);
-        current.abort_tasks();
     }
 
     /// Choose the least-recently-used connection eligible for eviction when

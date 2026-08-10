@@ -2443,7 +2443,10 @@ mod tests {
         pubsub
             .registry
             .register_actor(
-                interest_name(topic_key("refresh-second"), &second_peer),
+                // Keep both interests on one topic so the provider is called
+                // once per snapshot; the count below then measures the
+                // initial build plus exactly one retry.
+                interest_name(topic_key("refresh-first"), &second_peer),
                 RemoteActorLocation::new_with_peer("127.0.0.1:19007".parse().unwrap(), second_peer),
             )
             .await
@@ -2456,7 +2459,7 @@ mod tests {
 
         assert_eq!(
             provider.calls.load(Ordering::Acquire),
-            3,
+            2,
             "a routing mutation during snapshot assembly must force a retry"
         );
         assert_eq!(
