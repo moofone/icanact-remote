@@ -352,6 +352,7 @@ impl<T> ConnectionPool<T> {
             }
             return Some(ConnectionHandle::new_stream(
                 addr,
+                conn.direction,
                 stream_handle.clone(),
                 correlation,
             ));
@@ -440,6 +441,36 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_addr
             .remove_if_sync(&addr, |connection| {
+                connection.embedded_peer_id.as_ref() == Some(peer_id)
+                    || current
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(connection, current))
+            });
+    }
+
+    /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`,
+    /// called synchronously from `RoutingPublisher::
+    /// set_configured_peer_addr` when a same-command pin decision moves
+    /// `peer_id`'s pin away from `evicted_addr` -- otherwise traffic to a
+    /// different identity that later claims `evicted_addr` would be
+    /// delivered over this peer's still-live connection.
+    ///
+    /// Removes the alias unconditionally, with no exception for
+    /// `evicted_addr == connection.addr` (the connection's own dial
+    /// target): the correct question is not "is this a transport-source
+    /// entry" but "may an address-keyed lookup still reach this connection
+    /// after the address changed hands" -- and once evicted, the same
+    /// atomic owner transaction already released `peer_id`'s ownership of
+    /// `evicted_addr` too, so the answer is always no. `peer_id`'s
+    /// connection remains reachable through the identity-aware path
+    /// (`connections_by_peer`, untouched here).
+    pub(crate) fn evict_pin_alias(&self, peer_id: &crate::PeerId, evicted_addr: SocketAddr) {
+        let current = self
+            .connections_by_peer
+            .read_sync(peer_id, |_, connection| connection.clone());
+        let _ = self
+            .connections_by_addr
+            .remove_if_sync(&evicted_addr, |connection| {
                 connection.embedded_peer_id.as_ref() == Some(peer_id)
                     || current
                         .as_ref()
@@ -1824,6 +1855,16 @@ impl<T> ConnectionPool<T> {
     /// This is needed when a peer connects FROM an ephemeral TCP port but advertises
     /// a different bind address in gossip. We need to update `connections_by_addr` so
     /// that lookups by the advertised address find the connection.
+    ///
+    /// Called from `RoutingPublisher::set_configured_peer_addr`'s trait
+    /// impl synchronously, from INSIDE the owner's serialized
+    /// `install_pin`/`migrate` commands -- as well as directly by ordinary
+    /// connection-establishment paths. A caller-side read of the pin
+    /// followed by a separate call here can never be truly atomic with a
+    /// concurrent owner command (the owner runs as its own task;
+    /// `ConnectionPool`'s maps aren't protected by one lock spanning a
+    /// whole owner command); doing the reindex in the SAME synchronous
+    /// call that decides the pin removes that gap entirely.
     pub fn reindex_connection_addr(&self, peer_id: &crate::PeerId, new_addr: SocketAddr) {
         // First, check if this peer still has an active connection
         // This guards against race conditions where disconnect happens between checks
@@ -2729,8 +2770,8 @@ impl<T> ConnectionPool<T> {
         // to `connection`, and only afterward (past a log line and a
         // lifecycle-event construction — a real gap) stores `None`
         // unconditionally. A fresh publish for this peer landing in that gap
-        // was clobbered — the exact collateral-teardown/reconnect-thrash race
-        // this PR closes, reopened through this one call site. The CAS
+        // was clobbered — a collateral-teardown/reconnect-thrash race
+        // reopened through this one call site. The CAS
         // closes the gap completely: it either finds `connection` still
         // installed and atomically clears it, or finds something else — a
         // concurrent publish already superseded it — and leaves the slot
@@ -3226,21 +3267,39 @@ impl<T> ConnectionPool<T> {
         self.get_connection_to_peer_at(peer_id, addr).await
     }
 
+    /// Resolves the peer's required/configured address and dials/reuses a
+    /// connection to it, atomically -- both happen against the SAME lookup,
+    /// with no `.await` between resolving `addr` and using it. The
+    /// attempted address is always returned alongside the dial result,
+    /// including on failure, so a caller never needs its own separate,
+    /// independently re-resolved read of the same pool state to learn what
+    /// was attempted: a concurrent repin between a caller's own pre-read
+    /// and this call actually running used to leave the caller
+    /// attributing the outcome to a since-superseded address. `None` only
+    /// when no required/configured address exists for this peer at all --
+    /// nothing was resolved, and nothing was attempted.
     pub(crate) async fn get_connection_to_required_peer(
         &self,
         peer_id: &crate::PeerId,
-    ) -> Result<ConnectionHandle<T>> {
-        let addr = self
+    ) -> (
+        Option<crate::registry::AttemptedRoute>,
+        Result<ConnectionHandle<T>>,
+    ) {
+        let Some(addr) = self
             .get_required_peer_addr(peer_id)
             .or_else(|| self.get_configured_peer_addr(peer_id))
-            .ok_or_else(|| {
-                crate::GossipError::Network(std::io::Error::new(
+        else {
+            return (
+                None,
+                Err(crate::GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("No required address configured for peer '{}'", peer_id),
-                ))
-            })?;
+                ))),
+            );
+        };
 
-        self.get_connection_to_peer_at(peer_id, addr).await
+        let result = self.get_connection_to_peer_at(peer_id, addr).await;
+        (Some(crate::registry::AttemptedRoute::new(addr)), result)
     }
 
     async fn get_connection_to_peer_at(
@@ -3599,17 +3658,17 @@ impl<T> ConnectionPool<T> {
         //    risks it returning the brand new connection as its own
         //    "existing rival" — capturing the snapshot before the candidate
         //    is indexed closes that.
-        // 2. (reviewer finding P1, this fix) `get_connection_by_peer_id` is
-        //    ALSO not pure with respect to the candidate's own peer session:
-        //    when the primary slot holds an unusable connection it
-        //    self-heal-clears it as a side effect of being READ. A decision
-        //    snapshot must never mutate — if a PREFERRED inbound is
-        //    published for this peer in the internal check-then-clear gap of
-        //    that self-heal, the unconditional clear erases the fresh
-        //    session, `existing_before` comes back `None`, and the decision
-        //    below proceeds as if there were no rival at all, recreating the
-        //    exact collateral teardown this PR removes. A pure snapshot can
-        //    never trigger that clear in the first place, mutation or not.
+        // 2. `get_connection_by_peer_id` is ALSO not pure with respect to the
+        //    candidate's own peer session: when the primary slot holds an
+        //    unusable connection it self-heal-clears it as a side effect of
+        //    being READ. A decision snapshot must never mutate — if a
+        //    PREFERRED inbound is published for this peer in the internal
+        //    check-then-clear gap of that self-heal, the unconditional clear
+        //    erases the fresh session, `existing_before` comes back `None`,
+        //    and the decision below proceeds as if there were no rival at
+        //    all, recreating the exact collateral teardown this fixes. A
+        //    pure snapshot can never trigger that clear in the first place,
+        //    mutation or not.
         //
         // Capturing the rival here, while the candidate is still unindexed
         // and via a snapshot that cannot itself mutate anything, guarantees
@@ -3905,6 +3964,7 @@ impl<T> ConnectionPool<T> {
                         // Create a connection handle to send the message
                         let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
                             addr,
+                            connection_arc.direction,
                             stream_handle.clone(),
                             connection_arc
                                 .correlation
@@ -4001,6 +4061,7 @@ impl<T> ConnectionPool<T> {
                                   "✅ Successfully established outgoing connection - resetting failure state");
                         peer_info.failures = 0;
                         peer_info.last_failure_time = None;
+                        peer_info.last_failure_instant = None;
                     }
                     peer_info.last_success = crate::current_timestamp();
                 }
@@ -4021,6 +4082,7 @@ impl<T> ConnectionPool<T> {
 
         Ok(ConnectionHandle::new_stream(
             addr,
+            connection_arc.direction,
             stream_handle,
             connection_arc
                 .correlation
@@ -4370,6 +4432,34 @@ pub(crate) fn handle_incoming_message(
                     "received delta gossip message on bidirectional connection"
                 );
 
+                // Unlike `FullSync` below, this arm didn't verify
+                // `delta.sender_peer_id` -- a self-reported wire field --
+                // against the connection's actual authenticated identity:
+                // an authenticated peer could claim another identity and
+                // get that victim's address's failure-bookkeeping reset,
+                // manufacturing arbitrary liveness signal for any address
+                // of its choosing. Fixed with the same equality check
+                // `FullSync` performs, moved to the very top of this arm --
+                // before anything at all keyed on the claimed identity.
+                let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_sender = %delta.sender_peer_id,
+                        "Ignoring DeltaGossip without an authenticated transport identity"
+                    );
+                    return Ok(());
+                };
+                if authenticated_sender_peer_id != &delta.sender_peer_id {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        authenticated_sender = %authenticated_sender_peer_id,
+                        claimed_sender = %delta.sender_peer_id,
+                        "Ignoring DeltaGossip whose claimed sender does not match the \
+                         authenticated transport"
+                    );
+                    return Ok(());
+                }
+
                 let sender_socket_addr =
                     resolve_peer_state_addr(&registry, Some(&delta.sender_peer_id), _peer_addr)
                         .await;
@@ -4412,6 +4502,7 @@ pub(crate) fn handle_incoming_message(
                                 last_sent_sequence: 0,
                                 consecutive_deltas: 0,
                                 last_failure_time: None,
+                                last_failure_instant: None,
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
@@ -4467,6 +4558,7 @@ pub(crate) fn handle_incoming_message(
                               "🔄 Resetting failure state after receiving DeltaGossip");
                                 peer_info.failures = 0;
                                 peer_info.last_failure_time = None;
+                                peer_info.last_failure_instant = None;
                             }
                             peer_info.last_success = crate::current_timestamp();
                             // Inbound payload from peer — proves app-level liveness.
@@ -4681,6 +4773,7 @@ pub(crate) fn handle_incoming_message(
                                 last_sent_sequence: 0,
                                 consecutive_deltas: 0,
                                 last_failure_time: None,
+                                last_failure_instant: None,
                                 last_dns_refresh_attempt: None,
                                 last_response_received_ms: current_time_ms,
                                 accept_lower_sequence_from: None,
@@ -4769,6 +4862,7 @@ pub(crate) fn handle_incoming_message(
                               "🔄 Resetting failure state after receiving FullSync");
                             peer_info.failures = 0;
                             peer_info.last_failure_time = None;
+                            peer_info.last_failure_instant = None;
                         }
                         peer_info.last_success = crate::current_timestamp();
                         // Inbound payload from peer — proves app-level liveness.
@@ -5214,6 +5308,7 @@ pub(crate) fn handle_incoming_message(
                                 "resetting failure state after receiving FullSyncResponse");
                             peer_info.failures = 0;
                             peer_info.last_failure_time = None;
+                            peer_info.last_failure_instant = None;
                         }
                         peer_info.last_success = crate::current_timestamp();
                         // Inbound payload from peer — proves app-level liveness.

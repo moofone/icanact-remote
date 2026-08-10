@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, Notify};
 
 use rand::seq::SliceRandom;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::registry_owner::CommitSeq;
 
@@ -147,6 +147,17 @@ fn owner_recovery_wins_tombstone(
         && location.vector_clock.get(&location.node_id) >= tombstone.get(&location.node_id)
 }
 
+/// Does `location` (an actor's own, independently current record) still
+/// belong to whoever `peer_info` says currently occupies `peer_addr`?
+/// Filters `peer_to_actors[peer_addr]`, a side table that can list an
+/// actor which has since relocated, left behind because nothing removes
+/// it from the OLD address's entry the moment the actor's record moves.
+///
+/// `location` must be read fresh, immediately before this runs, not
+/// reused from an earlier snapshot -- a stale one reintroduces the bug
+/// `cleanup_dead_peers_does_not_prune_actor_that_moved_to_another_peer`
+/// catches: an actor already relocated to a live, different peer gets
+/// pruned anyway because the check compares against where it USED to be.
 #[inline]
 fn actor_location_belongs_to_peer(
     location: &RemoteActorLocation,
@@ -860,6 +871,9 @@ pub trait PeerDisconnectHandler: Send + Sync {
     ) -> BoxFuture<'_, ()>;
 }
 
+/// Two-parameter signature deliberately: `apply_configure_peer_connection_
+/// update`'s own `pin_is_current` guard already runs before this handler
+/// is invoked, so no notification-token parameter is needed for correctness.
 pub trait PeerConnectHandler: Send + Sync {
     fn handle_peer_connect(
         &self,
@@ -1088,8 +1102,193 @@ pub struct RegistryStats {
     pub tie_break_evictions: u64,
 }
 
+/// Three address concepts share the crate's plumbing, and only one is
+/// safe to attribute anything to. **Requested**: a caller's own input --
+/// never independently verified, never valid for attribution; stays a
+/// bare `SocketAddr`. **Attempted** (see [`AttemptedRoute`]): the address
+/// a connection attempt actually dialed or looked up against, win or
+/// lose -- valid for a *failure*/backoff claim, not a positive one.
+/// **Resolved** (this type): an address a connection-resolution path
+/// actually reached and verified -- valid for a positive liveness/health
+/// claim. Every `ResolvedRoute` was first an `AttemptedRoute`.
+///
+/// The only constructors are `pub(crate)`: nothing outside this crate can
+/// fabricate one, and within the crate it is built only where a
+/// connection was actually resolved. Every site that attributes a
+/// positive liveness/health outcome to an address takes this type
+/// instead of a bare `SocketAddr`, so a caller cannot attribute an
+/// outcome to an address it only asked for.
+///
+/// "Resolved" is NOT, on its own, "dialable" -- an INBOUND connection's
+/// `.addr` is its raw, ephemeral TCP source, never a corroborated dial
+/// target, and an undialable address becoming selectable/gossipable
+/// through a fresh, unflagged `PeerInfo` is a recurring bug class here.
+/// This type therefore also carries whether IT was independently
+/// corroborated as dialable, so that fact cannot be dropped by a caller
+/// who forgets to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolvedRoute {
+    addr: SocketAddr,
+    dialable: bool,
+}
+
+impl ResolvedRoute {
+    /// `direction` MUST be independently looked up from the connection
+    /// pool's `LockFreeConnection` (a bare `ConnectionHandle` carries none)
+    /// -- only a genuine OUTBOUND dial corroborates `addr` as dialable.
+    /// `None` (unknown, or not found) is treated the same as `Inbound`.
+    pub(crate) fn from_connection(
+        addr: SocketAddr,
+        direction: Option<crate::connection_pool::ConnectionDirection>,
+    ) -> Self {
+        Self {
+            addr,
+            dialable: direction == Some(crate::connection_pool::ConnectionDirection::Outbound),
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// `false` marks an inbound connection's raw, unverified transport
+    /// source; a consumer building gossip-visible state from this route
+    /// MUST propagate that (`PeerInfo::for_connect_attempt` does so
+    /// automatically).
+    pub fn is_dialable(&self) -> bool {
+        self.dialable
+    }
+}
+
+impl std::fmt::Display for ResolvedRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.addr, f)
+    }
+}
+
+impl PartialEq<SocketAddr> for ResolvedRoute {
+    fn eq(&self, other: &SocketAddr) -> bool {
+        self.addr == *other
+    }
+}
+
+impl PartialEq<ResolvedRoute> for SocketAddr {
+    fn eq(&self, other: &ResolvedRoute) -> bool {
+        *self == other.addr
+    }
+}
+
+/// The outcome of a successful `connect_to_peer`: a live connection for
+/// the peer identity was reached either way, but the two variants
+/// distinguish whether the resolution also independently corroborated a
+/// particular address as dialable. Wrapping a stale caller-provided/
+/// configured address in a `ResolvedRoute` just because SOME unrelated
+/// connection for the same identity happened to be open would reintroduce
+/// the exact guarantee `ResolvedRoute` exists to prevent, so when no
+/// dialable address was actually reached, `ConnectedUnverified` carries it
+/// as diagnostic/liveness signal only, never as a dialability claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectOutcome {
+    addr: SocketAddr,
+    resolved: Option<ResolvedRoute>,
+}
+
+impl ConnectOutcome {
+    /// A connection was resolved AND independently corroborated as
+    /// dialable at `route`'s own address (a genuine outbound dial, or the
+    /// non-required/discovered path's own connection resolution).
+    pub(crate) fn resolved(route: ResolvedRoute) -> Self {
+        Self {
+            addr: route.addr(),
+            resolved: Some(route),
+        }
+    }
+
+    /// A live connection was reused but nothing corroborates `addr` as
+    /// dialable. Callers MUST NOT perform gossip-visible address
+    /// bookkeeping (clearing failures, marking healthy) keyed to it.
+    pub(crate) fn connected_unverified(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            resolved: None,
+        }
+    }
+
+    /// The address associated with this outcome -- for logging and
+    /// liveness-signal purposes. NOT, on its own, a claim of dialability;
+    /// see [`Self::is_dialable`] and [`Self::resolved_route`].
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Whether this outcome independently corroborates its address as
+    /// dialable. `false` for `ConnectedUnverified` unconditionally.
+    pub fn is_dialable(&self) -> bool {
+        self.resolved.is_some_and(|route| route.is_dialable())
+    }
+
+    /// The inner `ResolvedRoute`, if this outcome corroborated one.
+    /// `None` for `ConnectedUnverified`.
+    pub fn resolved_route(&self) -> Option<ResolvedRoute> {
+        self.resolved
+    }
+}
+
+impl std::fmt::Display for ConnectOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.addr, f)
+    }
+}
+
+/// An address a connection attempt actually dialed or looked up against,
+/// regardless of success. See [`ResolvedRoute`]'s doc comment for the full
+/// three-concept hierarchy: weaker than `ResolvedRoute` (an attempt is not
+/// a success) but stronger than a bare requested/hinted `SocketAddr`,
+/// which can be stale relative to what a concurrent repin left in flight.
+/// Only constructor is `pub(crate)`, built where a connection-resolution
+/// path commits to the attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttemptedRoute(SocketAddr);
+
+impl AttemptedRoute {
+    /// Wrap `addr` as attempted. Callable only from within this crate, and
+    /// only where the caller is the connection-resolution path committing
+    /// to try `addr` (see the type's own doc comment).
+    pub(crate) fn new(addr: SocketAddr) -> Self {
+        Self(addr)
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AttemptedRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl PartialEq<SocketAddr> for AttemptedRoute {
+    fn eq(&self, other: &SocketAddr) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<AttemptedRoute> for SocketAddr {
+    fn eq(&self, other: &AttemptedRoute) -> bool {
+        *self == other.0
+    }
+}
+
 /// Peer information with failure tracking and delta state
+///
+/// `#[non_exhaustive]`: `last_failure_instant` is an unavoidable break for
+/// external struct-literal construction of this all-`pub`-field struct;
+/// marking it prevents the same break recurring, with no effect on this
+/// crate's own (unrestricted) struct-literal use.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PeerInfo {
     pub address: SocketAddr, // Listening address (resolved from DNS or direct IP)
     pub peer_address: Option<SocketAddr>, // Actual connection address (may be NATed)
@@ -1113,6 +1312,21 @@ pub struct PeerInfo {
     pub consecutive_deltas: u64,
     /// When this peer last failed (for tracking permanent failures)
     pub last_failure_time: Option<u64>,
+    /// The monotonic instant `last_failure_time` was recorded at, captured
+    /// directly (`Instant::now()`) at the same production write site as
+    /// `last_failure_time` rather than reconstructed from it.
+    ///
+    /// `last_failure_time` is whole-second wall-clock precision, so
+    /// subtracting its integer age from a monotonic "now" lands up to a
+    /// full second either side of the real failure instant: a claim and a
+    /// failure inside the same wall-clock second can be misordered in
+    /// either direction. Any caller that needs a causal `Instant` boundary
+    /// to fence a decision on (e.g. `cleanup_dead_peers`'s dead-peer
+    /// release fence) must use this field, not derive one from
+    /// `last_failure_time`. Kept in lockstep with `last_failure_time` at
+    /// every write site: `Some` exactly when it is, `None` exactly when it
+    /// is.
+    pub last_failure_instant: Option<std::time::Instant>,
     /// Last time we attempted a DNS refresh for this peer (rate limiting).
     pub last_dns_refresh_attempt: Option<u64>,
     /// Last time we received a gossip response *payload* from this peer
@@ -1281,6 +1495,7 @@ impl PeerInfo {
             last_sent_sequence: 0,
             consecutive_deltas: 0,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -1318,6 +1533,72 @@ impl PeerInfo {
             last_sent_sequence: 0,
             consecutive_deltas: 0,
             last_failure_time: None,
+            last_failure_instant: None,
+            last_dns_refresh_attempt: None,
+            last_response_received_ms: crate::current_timestamp_millis(),
+            accept_lower_sequence_from: None,
+            current_session_source: None,
+            current_session_connection: None,
+            current_session_epoch: 0,
+            identity_verified: false,
+            transport_source_keyed: false,
+        }
+    }
+
+    /// Create a `PeerInfo` for a peer this node has just attempted (or
+    /// resolved an existing connection to) at `address`, for `node_id` if
+    /// known. Baseline reflects "just added, outcome not yet applied"
+    /// (`failures: 0`, `last_success: 0`), with the caller applying the
+    /// real outcome immediately after via `entry(...).or_insert_with(...)`.
+    /// Keys to the address the dial actually resolved, never to a stale
+    /// pre-dial request, so a concurrent repin in the interim can't leave
+    /// a never-contacted entry behind.
+    ///
+    /// `transport_source_keyed`/`inbound_observed` are set directly from
+    /// `address.is_dialable()` rather than left for the caller to
+    /// remember (an unverified inbound connection being treated as
+    /// dialable recurred across call sites when this was hand-set) --
+    /// `ResolvedRoute::from_connection` is the only way to build `address`,
+    /// so the flag can't be silently dropped.
+    pub(crate) fn for_connect_attempt(
+        address: ResolvedRoute,
+        node_id: Option<crate::GossipNodeId>,
+    ) -> Self {
+        let mut info = Self::skeleton(address.addr(), node_id);
+        if !address.is_dialable() {
+            info.transport_source_keyed = true;
+            info.inbound_observed = true;
+        }
+        info
+    }
+
+    /// Takes an [`AttemptedRoute`], not a [`ResolvedRoute`]: a failed
+    /// attempt makes no claim of resolution, but must still be the address
+    /// genuinely attempted, not a bare requested/hinted `SocketAddr` that
+    /// can be stale relative to what a concurrent repin left in flight.
+    pub(crate) fn for_failed_connect_attempt(
+        address: AttemptedRoute,
+        node_id: Option<crate::GossipNodeId>,
+    ) -> Self {
+        Self::skeleton(address.addr(), node_id)
+    }
+
+    fn skeleton(address: SocketAddr, node_id: Option<crate::GossipNodeId>) -> Self {
+        Self {
+            address,
+            peer_address: None,
+            inbound_observed: false,
+            outbound_dial_success: false,
+            node_id,
+            dns_name: None,
+            failures: 0,
+            last_attempt: crate::current_timestamp(),
+            last_success: 0,
+            last_sequence: 0,
+            last_sent_sequence: 0,
+            consecutive_deltas: 0,
+            last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -1376,6 +1657,7 @@ impl PeerInfo {
             last_sent_sequence: 0,
             consecutive_deltas: 0,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -1430,8 +1712,8 @@ impl PeerInfo {
     /// earlier version of this method did): that field can be `false` for
     /// an entry that is nonetheless not fallback-created, and inferring
     /// "was this entry created by the fallback" from accumulated evidence
-    /// another code path also writes is the exact mistake this PR keeps
-    /// making. `claim_created_ownership` is instead a fact the claim path
+    /// another code path also writes is a recurring mistake in this area
+    /// of the code. `claim_created_ownership` is instead a fact the claim path
     /// itself knows for certain, not an inference.
     ///
     /// Symmetric to `mark_dialability_confirmed` above: that one only ever
@@ -1812,12 +2094,6 @@ pub(crate) struct InboundClaimProjectionSnapshot {
     pool: Vec<InboundPoolProjectionSnapshot>,
 }
 
-/// Latest owner-actor generation claimed by one authenticated transport
-/// session. The session source is unique per physical connection, so a stale
-/// teardown can release only its own generation; a reconnect at the same
-/// address remains fenced by the newer owner commit.
-type ConnectionScopedClaimKey = (PeerId, SocketAddr, SocketAddr);
-
 /// Core gossip registry implementation with separated locks
 #[derive(Clone, Copy)]
 struct PeerLivenessStatus {
@@ -1825,7 +2101,6 @@ struct PeerLivenessStatus {
     updated_at: Instant,
 }
 
-#[derive(Clone)]
 pub struct GossipRegistry<T = ()> {
     // Immutable config
     pub bind_addr: SocketAddr,
@@ -1852,10 +2127,6 @@ pub struct GossipRegistry<T = ()> {
     /// `identity_verified` are derived projections of what this handle
     /// returns, never inputs to the decision.
     pub registry_owner: crate::registry_owner::RegistryOwnerHandle,
-    /// Cold-path ownership receipts held by live authenticated sessions.
-    /// Operator-configured routes are intentionally not inserted here and
-    /// therefore survive connection teardown.
-    connection_scoped_claims: Arc<SccHashMap<ConnectionScopedClaimKey, CommitSeq>>,
     pub tls_config: Option<Arc<crate::tls::TlsConfig>>,
     pub peer_capabilities: Arc<SccHashMap<SocketAddr, crate::handshake::PeerCapabilities>>,
     pub peer_capabilities_by_node:
@@ -1910,6 +2181,74 @@ pub struct GossipRegistry<T = ()> {
 
     /// Injectable DNS resolver used for deterministic tests and uniform reconnect behavior.
     pub dns_resolver: Arc<tokio::sync::RwLock<Arc<dyn crate::dns::DnsResolver>>>,
+
+    /// Detached `configure_peer` retry tasks (`queue_configure_peer_until_
+    /// applied`), tracked so `shutdown` can abort them along with the
+    /// registry's other background work instead of leaving them to run
+    /// out their own bounded retry budget after `shutdown_and_wait` has
+    /// already returned. A dynamic set, not a single slot like
+    /// `discovery_task`: distinct peers can each have their own retry
+    /// in flight at once.
+    configure_peer_retry_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+}
+
+/// Manual, not derived: `#[derive(Clone)]` would bound EVERY `T` with
+/// `Clone`, even though every field here is either independent of `T` or
+/// reaches it only through `Arc<ConnectionPool<T>>`, which only ever holds
+/// `T` behind `PhantomData<fn() -> T>` -- cloning never needs to clone a
+/// `T`, only bump `Arc` counts. That derived bound became a real cost once
+/// `queue_configure_peer_until_applied` needed `self.clone()` inside a
+/// detached `tokio::spawn`: it would have forced `T: Clone + Send + Sync`
+/// onto `configure_peer`'s public signature. This impl removes the
+/// unnecessary bound at its source, matching `main`'s actual public
+/// surface.
+///
+/// Field-complete, not field-selective: every field is cloned explicitly,
+/// so adding a new field without extending this impl is a compile error.
+impl<T> Clone for GossipRegistry<T> {
+    fn clone(&self) -> Self {
+        Self {
+            bind_addr: self.bind_addr,
+            peer_id: self.peer_id.clone(),
+            boot_id: self.boot_id,
+            config: self.config.clone(),
+            start_time: self.start_time,
+            start_instant: self.start_instant,
+            shutdown: self.shutdown.clone(),
+            actor_state: self.actor_state.clone(),
+            gossip_state: self.gossip_state.clone(),
+            connection_pool: self.connection_pool.clone(),
+            registry_owner: self.registry_owner.clone(),
+            tls_config: self.tls_config.clone(),
+            peer_capabilities: self.peer_capabilities.clone(),
+            peer_capabilities_by_node: self.peer_capabilities_by_node.clone(),
+            peer_capability_addr_to_node: self.peer_capability_addr_to_node.clone(),
+            clock_probe_state: self.clock_probe_state.clone(),
+            tie_break_cooldown_until: self.tie_break_cooldown_until.clone(),
+            tie_break_last_eviction_at: self.tie_break_last_eviction_at.clone(),
+            pending_clock_probes: self.pending_clock_probes.clone(),
+            pending_clock_echoes: self.pending_clock_echoes.clone(),
+            peer_clock_snapshots: self.peer_clock_snapshots.clone(),
+            addr_substitutions: self.addr_substitutions.clone(),
+            relayed_unusable_addr_kept: self.relayed_unusable_addr_kept.clone(),
+            tie_break_evictions: self.tie_break_evictions.clone(),
+            actor_message_handler: self.actor_message_handler.clone(),
+            actor_tell_handler_sync: self.actor_tell_handler_sync.clone(),
+            actor_tell_handler_sync_context: self.actor_tell_handler_sync_context.clone(),
+            actor_ask_immediate_handler_sync: self.actor_ask_immediate_handler_sync.clone(),
+            actor_ask_handler_sync: self.actor_ask_handler_sync.clone(),
+            actor_message_handler_sync: self.actor_message_handler_sync.clone(),
+            pubsub_ingress_handler: self.pubsub_ingress_handler.clone(),
+            peer_disconnect_handler: self.peer_disconnect_handler.clone(),
+            peer_connect_handler: self.peer_connect_handler.clone(),
+            peer_liveness_handler: self.peer_liveness_handler.clone(),
+            peer_liveness_status: self.peer_liveness_status.clone(),
+            discovery_task: self.discovery_task.clone(),
+            peer_gossip_notify: self.peer_gossip_notify.clone(),
+            dns_resolver: self.dns_resolver.clone(),
+            configure_peer_retry_tasks: self.configure_peer_retry_tasks.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1936,6 +2275,60 @@ impl Drop for DiscoveryTaskTracker {
         self.abort();
     }
 }
+
+/// Which owner command `add_peer_with_node_id_generation_inner` submits a
+/// claim through -- the three production paths need different atomicity.
+/// See `PeerRegistryOwner::{claim, claim_connection_scoped, configure_peer}`.
+enum ClaimSubmission {
+    /// Gossip/discovery-derived claims: no receipt, no pin.
+    Plain,
+    /// An outbound dial or authenticated inbound session: commits the
+    /// session's connection-scoped receipt atomically with the decision.
+    ConnectionScoped(SocketAddr),
+    /// `configure_peer`: commits the operator pin (and any evicted pin's
+    /// release) atomically with the decision. `expected_generation` is
+    /// `None` for a peer's first call, `Some(gen)` for a queued retry,
+    /// validated atomically at the owner, not against a caller snapshot.
+    OperatorConfigured(Option<u64>),
+}
+
+/// Result of a `GossipRegistry::configure_peer_with_outcome` call -- the
+/// `pub(crate)` STRICT sibling of the public `configure_peer`: the public
+/// form's signature stays stable, while this richer form exists for
+/// internal callers (mostly tests) that need one attempt's precise outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigurePeerOutcome {
+    /// The pin was installed (or already was this exact pin) and every
+    /// follow-up side effect has run.
+    Applied,
+    /// Permanently refused -- a different, verified identity already
+    /// legitimately owns this address. Retrying will not succeed.
+    Rejected,
+    /// A `cleanup_dead_peers` sweep held a reap reservation for the full
+    /// retry budget; nothing applied. The public `configure_peer` treats
+    /// this as "not yet," not "gave up" -- see its own doc comment.
+    TemporarilyBlocked,
+    /// A LATER `configure_peer` call for the SAME peer already committed;
+    /// `expected_generation` is stale and generations only increase, so
+    /// retrying won't help. Distinct from `Rejected`: losing to a newer
+    /// request for the SAME peer, not to a competing claimant.
+    Superseded,
+}
+
+/// Time-based, not attempt-count-based: an earlier attempt-count version
+/// (~100ms total) silently discarded the request once exhausted -- silent
+/// data loss, since a reservation holder's work can legitimately outlast
+/// 100ms even though every reservation is guaranteed to release
+/// eventually. Bounds a SINGLE `configure_peer_with_outcome` attempt, not
+/// `configure_peer`'s overall guarantee -- see its own doc comment.
+const CONFIGURE_PEER_REAP_RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Doubles after each retry (capped at `CONFIGURE_PEER_REAP_RETRY_MAX_BACKOFF`).
+const CONFIGURE_PEER_REAP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Cap on `configure_peer`'s reap-reservation retry backoff -- see
+/// `CONFIGURE_PEER_REAP_RETRY_INITIAL_BACKOFF`.
+const CONFIGURE_PEER_REAP_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(500);
 
 impl<T: 'static> GossipRegistry<T> {
     /// The address this node should advertise to peers for anything it
@@ -2131,7 +2524,6 @@ impl<T: 'static> GossipRegistry<T> {
             })),
             connection_pool,
             registry_owner,
-            connection_scoped_claims: Arc::new(SccHashMap::default()),
             tls_config: None,
             peer_capabilities: peer_capabilities.clone(),
             peer_capabilities_by_node: Arc::new(SccHashMap::default()),
@@ -2162,6 +2554,7 @@ impl<T: 'static> GossipRegistry<T> {
                 crate::TokioDnsResolver::default(),
             )
                 as Arc<dyn crate::dns::DnsResolver>)),
+            configure_peer_retry_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         })
     }
 
@@ -2967,6 +3360,7 @@ impl<T: 'static> GossipRegistry<T> {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -3398,6 +3792,12 @@ impl<T: 'static> GossipRegistry<T> {
     /// released when that physical session exits. A required/operator route
     /// is deliberately excluded: its ownership is persistent rather than
     /// connection-scoped.
+    ///
+    /// The receipt bookkeeping lives inside the owner actor and commits in
+    /// the SAME serialized step as the ownership decision -- see
+    /// `PeerRegistryOwner::claim_connection_scoped`. Nothing here mutates
+    /// it directly, so two concurrent calls can never leave an
+    /// inconsistent intermediate state.
     pub(crate) async fn add_connection_scoped_peer_claim(
         &self,
         peer_addr: SocketAddr,
@@ -3408,110 +3808,42 @@ impl<T: 'static> GossipRegistry<T> {
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
     ) {
-        let peer_id = crate::PeerId::from(node_id);
-        let persistent = self
-            .connection_pool
-            .get_required_peer_addr(&peer_id)
-            .is_some_and(|configured| configured == peer_addr);
-        let (outcome, receipt) = self
-            .add_peer_with_node_id_generation(peer_addr, Some(peer_id.to_node_id()), claim_kind)
+        let (outcome, receipt, _evicted_release, _reap_in_progress, _generation, _superseded) = self
+            .add_peer_with_node_id_generation_inner(
+                peer_addr,
+                Some(node_id),
+                claim_kind,
+                ClaimSubmission::ConnectionScoped(session_source),
+            )
             .await;
-        if outcome == crate::addr_ownership::AddrClaimOutcome::Accepted
-            && !persistent
-            && let Some(receipt) = receipt
-        {
-            // A same-peer reconnect refreshes the owner generation. Transfer
-            // that current generation to every still-live session receipt for
-            // this address before adding the new session. If the newer
-            // session closes first, the surviving older session must still
-            // hold a receipt that can release the generation once it is the
-            // last owner; leaving its old generation behind leaks the route.
-            let mut existing_keys = Vec::new();
-            self.connection_scoped_claims.iter_sync(|key, _| {
-                if key.0 == peer_id && key.2 == peer_addr {
-                    existing_keys.push(key.clone());
-                }
-                true
-            });
-            for key in existing_keys {
-                let _ = self
-                    .connection_scoped_claims
-                    .upsert_sync(key, receipt.generation());
-            }
-            self.connection_scoped_claims
-                .upsert_sync((peer_id, session_source, peer_addr), receipt.generation());
-            return (outcome, Some(receipt));
-        }
         (outcome, receipt)
     }
 
-    fn take_connection_scoped_claims(
-        &self,
-        peer_id: &crate::PeerId,
-        session_source: SocketAddr,
-    ) -> Vec<(SocketAddr, CommitSeq)> {
-        let mut entries = Vec::new();
-        self.connection_scoped_claims.iter_sync(|key, generation| {
-            if &key.0 == peer_id && key.1 == session_source {
-                entries.push((key.clone(), *generation));
-            }
-            true
-        });
-        entries
-            .into_iter()
-            .filter_map(|(key, generation)| {
-                let removed = self
-                    .connection_scoped_claims
-                    .remove_if_sync(&key, |current| *current == generation)
-                    .is_some();
-                removed.then_some((key.2, generation))
-            })
-            .collect()
-    }
-
-    /// Release all non-persistent owner claims attributed to one physical
-    /// session. The map entries are removed before the first await so a
-    /// duplicate teardown is harmless and a reconnect cannot be released by
-    /// an older session's callback.
+    /// Release all owner claims attributed to one physical session.
+    /// `RegistryOwnerHandle::release_session` atomically finds every receipt
+    /// this session holds, decides whether each address is still covered
+    /// by another live session, and retracts ownership of every address
+    /// that is not -- all as ONE owner command (splitting retraction into
+    /// a separately-ordered `release` call stranded addresses
+    /// permanently). Addresses handed back here are therefore already
+    /// released; this only tombstones this registry's `gossip_state`
+    /// projection at the resulting commit sequence. An operator-pinned
+    /// address never has a receipt to hand back, and `release_session`
+    /// itself refuses to retract a pin regardless, so a stale connection
+    /// receipt racing a concurrent `configure_peer` can never retract a
+    /// pin out from under it.
     pub(crate) async fn release_connection_scoped_claims(
         &self,
         peer_id: &crate::PeerId,
         session_source: SocketAddr,
     ) {
-        let claims = self.take_connection_scoped_claims(peer_id, session_source);
-        for (addr, generation) in claims {
-            // Configuration can race a transport teardown. Once the address
-            // is an operator-required pin, a stale connection receipt must
-            // never retract it.
-            if self
-                .connection_pool
-                .get_required_peer_addr(peer_id)
-                .is_some_and(|configured| configured == addr)
-            {
-                continue;
-            }
-            let covered_by_other_session = {
-                let mut covered = false;
-                self.connection_scoped_claims.iter_sync(|key, _| {
-                    if &key.0 == peer_id && key.1 != session_source && key.2 == addr {
-                        covered = true;
-                        return false;
-                    }
-                    true
-                });
-                covered
-            };
-            if covered_by_other_session {
-                continue;
-            }
-            if let Some(release_seq) = self
-                .registry_owner
-                .release(addr, peer_id.clone(), generation)
-                .await
-            {
-                let mut state = self.gossip_state.lock().await;
-                state.tombstone_ownership_projection(addr, release_seq);
-            }
+        let released = self
+            .registry_owner
+            .release_session(peer_id.clone(), session_source)
+            .await;
+        for (addr, release_seq) in released {
+            let mut state = self.gossip_state.lock().await;
+            state.tombstone_ownership_projection(addr, release_seq);
         }
     }
 
@@ -3528,6 +3860,114 @@ impl<T: 'static> GossipRegistry<T> {
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
     ) {
+        let (outcome, receipt, _evicted_release, _reap_in_progress, _generation, _superseded) = self
+            .add_peer_with_node_id_generation_inner(
+                peer_addr,
+                node_id,
+                claim_kind,
+                ClaimSubmission::Plain,
+            )
+            .await;
+        (outcome, receipt)
+    }
+
+    /// Claim `peer_addr` for `node_id` with `ClaimKind::Verified`, and
+    /// install it as the operator's pin in the SAME serialized owner step
+    /// -- see `PeerRegistryOwner::configure_peer`. Sole caller:
+    /// `configure_peer`.
+    ///
+    /// Returns (in order): the claim outcome; the evicted pin's release
+    /// info if installing the new pin evicted a DIFFERENT previously-pinned
+    /// address, reported regardless of `outcome` since the caller must
+    /// apply it unconditionally; whether `Rejected` was a temporary
+    /// `ReapInProgress` rather than a permanent arbitration loss; the
+    /// resulting `configure_peer_generation` (`None` only if the call never
+    /// reached the owner); and whether `Rejected` was specifically
+    /// `SupersededByNewerConfiguration` (mutually exclusive with the
+    /// reap-in-progress element). `expected_generation` threads verbatim to
+    /// `ClaimSubmission::OperatorConfigured`: `None` for a first call,
+    /// `Some(gen)` for a queued retry, validated at the owner.
+    async fn add_operator_configured_peer_claim(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: crate::GossipNodeId,
+        expected_generation: Option<u64>,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        // This claim commit's receipt; `configure_peer` no longer consumes
+        // it directly, kept for the other callers that still do.
+        Option<crate::registry_owner::ClaimReceipt>,
+        Option<(SocketAddr, crate::registry_owner::CommitSeq)>,
+        bool,
+        Option<u64>,
+        bool,
+    ) {
+        let (outcome, receipt, evicted_release, reap_in_progress, generation, superseded) = self
+            .add_peer_with_node_id_generation_inner(
+                peer_addr,
+                Some(node_id),
+                crate::addr_ownership::ClaimKind::Verified,
+                ClaimSubmission::OperatorConfigured(expected_generation),
+            )
+            .await;
+        (
+            outcome,
+            receipt,
+            evicted_release,
+            reap_in_progress,
+            generation,
+            superseded,
+        )
+    }
+
+    /// Shared implementation behind `add_peer_with_node_id_generation` (no
+    /// receipt bookkeeping -- gossip/discovery-derived routes are not tied
+    /// to any one physical connection), `add_connection_scoped_peer_claim`
+    /// (`ClaimSubmission::ConnectionScoped`, which routes the claim through
+    /// the owner's connection-scoped command so the receipt transfer/insert
+    /// commits atomically with the ownership decision), and
+    /// `add_operator_configured_peer_claim`
+    /// (`ClaimSubmission::OperatorConfigured`, which routes the claim
+    /// through the owner's atomic configure_peer command so the operator
+    /// pin, and any evicted pin's release, commit atomically with the
+    /// ownership decision).
+    async fn add_peer_with_node_id_generation_inner(
+        &self,
+        peer_addr: SocketAddr,
+        node_id: Option<crate::GossipNodeId>,
+        claim_kind: crate::addr_ownership::ClaimKind,
+        claim_submission: ClaimSubmission,
+    ) -> (
+        crate::addr_ownership::AddrClaimOutcome,
+        Option<crate::registry_owner::ClaimReceipt>,
+        Option<(SocketAddr, crate::registry_owner::CommitSeq)>,
+        // Whether an `AddrClaimOutcome::Rejected` above is specifically a
+        // `ClaimRejection::ReapInProgress` -- a TEMPORARY refusal (another
+        // caller currently holds a reap reservation for this address via
+        // `RegistryOwnerHandle::reserve_for_reap`) rather than a permanent
+        // arbitration loss. Callers
+        // that collapse this indistinguishably from every other rejection
+        // silently discard a caller's explicit action for no better reason
+        // than losing a short-lived race -- see `configure_peer`'s doc
+        // comment for the operator-facing consequence. Always `false` when
+        // `AddrClaimOutcome::Accepted`.
+        bool,
+        // `ClaimSubmission::OperatorConfigured`'s `ConfigurePeerCommit::
+        // generation` -- this exact transaction's `configure_peer_
+        // generation` value for `peer_id`, needed by the caller
+        // (`configure_peer`) to capture `my_generation` from the owner's
+        // OWN atomic bump (a first call) or to confirm the value it
+        // already presented as `expected_generation` (a retry) still
+        // applied. `None` for every OTHER `ClaimSubmission` kind, and for
+        // every early-return path below that never reaches the owner
+        // (irrelevant there: `configure_peer` never calls this function
+        // with anything but `OperatorConfigured`, and always needs this).
+        Option<u64>,
+        // `true` only for `ClaimSubmission::OperatorConfigured`, when
+        // `Rejected` above was specifically `SupersededByNewerConfiguration`
+        // -- see `configure_peer_generation`'s doc comment.
+        bool,
+    ) {
         use crate::addr_ownership::AddrClaimOutcome;
 
         debug!(peer = %peer_addr, self_addr = %self.bind_addr, has_node_id = node_id.is_some(), "add_peer_with_node_id called");
@@ -3536,7 +3976,7 @@ impl<T: 'static> GossipRegistry<T> {
                 peer = %peer_addr,
                 "refusing to add peer with unspecified address or zero port"
             );
-            return (AddrClaimOutcome::Rejected, None);
+            return (AddrClaimOutcome::Rejected, None, None, false, None, false);
         }
         // Identity self-filter (authoritative — address alone is not
         // sufficient when advertise_address != bind_addr; see
@@ -3546,14 +3986,14 @@ impl<T: 'static> GossipRegistry<T> {
                 peer = %peer_addr,
                 "refusing to add self as peer (node_id identifies this node)"
             );
-            return (AddrClaimOutcome::Rejected, None);
+            return (AddrClaimOutcome::Rejected, None, None, false, None, false);
         }
         // Both the raw bind address and the (possibly different, e.g. NAT/
         // Kubernetes) advertised address identify this node; a remote claim
         // on either must be refused.
         if peer_addr == self.bind_addr || peer_addr == self.advertised_addr() {
             info!(peer = %peer_addr, "not adding peer - same as self");
-            return (AddrClaimOutcome::Rejected, None);
+            return (AddrClaimOutcome::Rejected, None, None, false, None, false);
         }
 
         // Effective verification kind to persist on this address's PeerInfo
@@ -3577,6 +4017,13 @@ impl<T: 'static> GossipRegistry<T> {
         // commit AND be projected in the meantime; the position is what lets
         // this call detect that and stand down.
         let mut projected_claim: Option<crate::registry_owner::ClaimReceipt> = None;
+        // Both set only by `ClaimSubmission::OperatorConfigured`, and both
+        // carried through to every return point below regardless of how
+        // the REST of this call's gossip_state projection resolves -- the
+        // owner-side `configure_peer` transaction they report on already
+        // fully committed, atomically, before this call reached this point.
+        let mut evicted_release: Option<(SocketAddr, crate::registry_owner::CommitSeq)> = None;
+        let mut configure_peer_generation: Option<u64> = None;
         if let Some(claimed_node_id) = node_id {
             // Decide and publish through the single-owner actor, and do it
             // BEFORE taking the `gossip_state` guard below. The decision, the
@@ -3591,11 +4038,49 @@ impl<T: 'static> GossipRegistry<T> {
                 node_id: claimed_node_id.to_peer_id(),
                 kind: claim_kind,
             };
-            let commit = self
-                .registry_owner
-                .claim(peer_addr, claim, /* is_local_addr */ false)
-                .await;
+            let commit = match claim_submission {
+                ClaimSubmission::ConnectionScoped(session_source) => {
+                    self.registry_owner
+                        .claim_connection_scoped(peer_addr, claim, session_source)
+                        .await
+                }
+                ClaimSubmission::Plain => {
+                    self.registry_owner
+                        .claim(peer_addr, claim, /* is_local_addr */ false)
+                        .await
+                }
+                ClaimSubmission::OperatorConfigured(expected_generation) => {
+                    let configured = self
+                        .registry_owner
+                        .configure_peer(peer_addr, claimed_node_id.to_peer_id(), expected_generation)
+                        .await;
+                    evicted_release = configured
+                        .evicted_pin()
+                        .zip(configured.evicted_release_seq());
+                    configure_peer_generation = Some(configured.generation());
+                    configured.claim().clone()
+                }
+            };
             let receipt = commit.receipt();
+            // Captured before the destructure below discards the reason:
+            // `ReapInProgress` is a TEMPORARY refusal, not a permanent
+            // arbitration loss -- see the 4th return element's doc.
+            let reap_in_progress = matches!(
+                commit,
+                crate::registry_owner::ClaimCommit::Rejected(
+                    crate::registry_owner::ClaimRejection::ReapInProgress
+                )
+            );
+            // Same capture-before-destructure pattern, same reason:
+            // `SupersededByNewerConfiguration` is a TEMPORARY-looking
+            // `Rejected` that actually means something else entirely --
+            // see `configure_peer_generation`'s doc comment.
+            let superseded = matches!(
+                commit,
+                crate::registry_owner::ClaimCommit::Rejected(
+                    crate::registry_owner::ClaimRejection::SupersededByNewerConfiguration
+                )
+            );
             let crate::registry_owner::ClaimCommit::Accepted {
                 kind, displaced, ..
             } = commit
@@ -3603,9 +4088,17 @@ impl<T: 'static> GossipRegistry<T> {
                 debug!(
                     peer = %peer_addr,
                     claimant = %claimed_node_id.fmt_short(),
+                    reap_in_progress,
                     "rejecting address claim: ownership conflict"
                 );
-                return (AddrClaimOutcome::Rejected, None);
+                return (
+                    AddrClaimOutcome::Rejected,
+                    None,
+                    None,
+                    reap_in_progress,
+                    configure_peer_generation,
+                    superseded,
+                );
             };
             owner_changed = displaced.is_some();
             displaced_owner = displaced;
@@ -3645,10 +4138,27 @@ impl<T: 'static> GossipRegistry<T> {
             // conflict. Its state already won the watermark race, so this
             // call must stand down without replaying anything but still tell
             // connection/configuration callers that their claim is valid.
+            // `evicted_release` is still reported: it reflects THIS call's
+            // own atomic transaction, already committed before this
+            // projection was attempted.
             return if authoritative_owner_unchanged {
-                (AddrClaimOutcome::Accepted, projected_claim)
+                (
+                    AddrClaimOutcome::Accepted,
+                    projected_claim,
+                    evicted_release,
+                    false,
+                    configure_peer_generation,
+                    false,
+                )
             } else {
-                (AddrClaimOutcome::Rejected, projected_claim)
+                (
+                    AddrClaimOutcome::Rejected,
+                    projected_claim,
+                    evicted_release,
+                    false,
+                    configure_peer_generation,
+                    false,
+                )
             };
         }
 
@@ -3718,6 +4228,7 @@ impl<T: 'static> GossipRegistry<T> {
                 existing_peer.current_session_epoch = next_session_epoch();
                 existing_peer.failures = 0;
                 existing_peer.last_failure_time = None;
+                existing_peer.last_failure_instant = None;
                 existing_peer.last_attempt = now;
                 existing_peer.last_success = now;
                 existing_peer.last_response_received_ms = now_ms;
@@ -3784,6 +4295,7 @@ impl<T: 'static> GossipRegistry<T> {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: current_time_ms,
                     accept_lower_sequence_from: None,
@@ -3888,73 +4400,400 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        (AddrClaimOutcome::Accepted, projected_claim)
+        (
+            AddrClaimOutcome::Accepted,
+            projected_claim,
+            evicted_release,
+            false,
+            configure_peer_generation,
+            false,
+        )
     }
 
-    /// Configure a peer by peer ID and its expected connection address
+    /// Configure a peer by peer ID and its expected connection address.
+    ///
+    /// The public signature is `()`, unchanged from `main`; the richer,
+    /// honestly-reporting form lives under
+    /// [`Self::configure_peer_with_outcome`].
+    ///
+    /// `()` here GUARANTEES eventual application, not a single attempt:
+    /// [`Self::configure_peer_with_outcome`]'s bounded attempt runs first;
+    /// if it still reports [`ConfigurePeerOutcome::TemporarilyBlocked`],
+    /// this hands off to [`Self::queue_configure_peer_until_applied`], a
+    /// detached background retry until the reservation clears (or the
+    /// claim is permanently rejected), without blocking the caller. The
+    /// one bound is `self.shutdown`.
     pub async fn configure_peer(&self, peer_id: crate::PeerId, connect_addr: SocketAddr) {
-        let previous_addr = self.connection_pool.get_required_peer_addr(&peer_id);
-        // Operator configuration is verified ownership evidence. Reserve the
-        // address in the single-owner authority before publishing the required
-        // dial route, so an offline configured peer cannot be displaced by a
-        // provisional remote self-report.
-        let outcome = self
-            .add_peer_with_node_id(
-                connect_addr,
-                Some(peer_id.to_node_id()),
-                crate::addr_ownership::ClaimKind::Verified,
-            )
+        // `None`: this is always a peer's FIRST attempt as far as THIS
+        // call is concerned, so it always proceeds and the owner bumps
+        // `configure_peer_generation` to a fresh value.
+        let (outcome, my_generation) = self
+            .configure_peer_with_outcome_and_generation(peer_id.clone(), connect_addr, None)
             .await;
+        match outcome {
+            ConfigurePeerOutcome::Applied
+            | ConfigurePeerOutcome::Rejected
+            | ConfigurePeerOutcome::Superseded => {}
+            ConfigurePeerOutcome::TemporarilyBlocked => {
+                self.queue_configure_peer_until_applied(peer_id, connect_addr, my_generation);
+            }
+        }
+    }
+
+    /// Guarantees [`Self::configure_peer`]'s eventual application once its
+    /// bounded attempt reported [`ConfigurePeerOutcome::TemporarilyBlocked`].
+    /// Spawned INTO `configure_peer_retry_tasks`, not a bare detached
+    /// `tokio::spawn`: checking `self.shutdown` cooperatively (both here and
+    /// inside every retry sub-attempt) only ever narrows the window a
+    /// shutdown beginning mid-sleep or mid-owner-round-trip can land in, it
+    /// cannot close it -- `shutdown`'s own `abort_all()` on this same set is
+    /// what makes "no configure_peer retry outlives `shutdown_and_wait`" a
+    /// guarantee rather than a probability. Unbounded in attempt count, but
+    /// can't hang forever on a healthy system: a reap reservation always
+    /// releases.
+    ///
+    /// `my_generation` threads through as `expected_generation` on every
+    /// retry, so a LATER `configure_peer` call for the SAME peer that
+    /// already superseded this one is detected via `Superseded` -- a
+    /// caller-side snapshot could never be atomic with the owner's own
+    /// pin-installing decision.
+    fn queue_configure_peer_until_applied(
+        &self,
+        peer_id: crate::PeerId,
+        connect_addr: SocketAddr,
+        my_generation: u64,
+    ) {
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let registry = self.clone();
+        let shutdown = self.shutdown.clone();
+        let mut tasks = self
+            .configure_peer_retry_tasks
+            .lock()
+            .expect("configure_peer_retry_tasks mutex");
+        // Opportunistic, non-blocking: reaps whatever already finished
+        // since the last spawn so this set does not grow without bound
+        // over a long-running process. Never blocks waiting for one still
+        // in flight -- `try_join_next` only returns already-completed
+        // entries.
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let mut cycle: u64 = 0;
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                cycle += 1;
+                warn!(
+                    peer_id = %peer_id,
+                    addr = %connect_addr,
+                    cycle,
+                    "configure_peer: queued retry -- the synchronous retry budget elapsed while \
+                     the address was still reap-reserved; retrying in the background so the \
+                     operator's configuration is delayed, not dropped"
+                );
+                let (outcome, _generation) = registry
+                    .configure_peer_with_outcome_and_generation(
+                        peer_id.clone(),
+                        connect_addr,
+                        Some(my_generation),
+                    )
+                    .await;
+                match outcome {
+                    ConfigurePeerOutcome::Applied => {
+                        info!(
+                            peer_id = %peer_id,
+                            addr = %connect_addr,
+                            cycle,
+                            "configure_peer: queued retry applied the operator's configuration"
+                        );
+                        return;
+                    }
+                    ConfigurePeerOutcome::Rejected => {
+                        warn!(
+                            peer_id = %peer_id,
+                            addr = %connect_addr,
+                            cycle,
+                            "configure_peer: queued retry lost permanently to a different, \
+                             verified identity -- giving up, retrying would not help"
+                        );
+                        return;
+                    }
+                    ConfigurePeerOutcome::Superseded => {
+                        info!(
+                            peer_id = %peer_id,
+                            addr = %connect_addr,
+                            cycle,
+                            my_generation,
+                            "configure_peer: queued retry superseded by a later configure_peer \
+                             call for the same peer, validated atomically at the owner -- \
+                             standing down without applying this stale request"
+                        );
+                        return;
+                    }
+                    ConfigurePeerOutcome::TemporarilyBlocked => {}
+                }
+            }
+        });
+    }
+
+    /// The full-featured form of [`Self::configure_peer`], returning
+    /// [`ConfigurePeerOutcome`]. A `ClaimRejection::ReapInProgress`
+    /// (TEMPORARY) must not collapse into the same `Rejected` a genuine,
+    /// PERMANENT arbitration loss produces -- retried, bounded by
+    /// `CONFIGURE_PEER_REAP_RETRY_BUDGET`; if it elapses still refused,
+    /// returns `TemporarilyBlocked` instead of silently applying nothing.
+    ///
+    /// `#[allow(dead_code)]`: every current caller of this single-attempt
+    /// form is this crate's own test suite; kept as a self-contained API
+    /// for internal callers that want the outcome directly.
+    #[allow(dead_code)]
+    pub(crate) async fn configure_peer_with_outcome(
+        &self,
+        peer_id: crate::PeerId,
+        connect_addr: SocketAddr,
+    ) -> ConfigurePeerOutcome {
+        self.configure_peer_with_outcome_and_generation(peer_id, connect_addr, None)
+            .await
+            .0
+    }
+
+    /// [`Self::configure_peer_with_outcome`]'s actual implementation, also
+    /// returning the `configure_peer_generation` this call established or
+    /// confirmed.
+    ///
+    /// A stale queued retry overwriting a newer `configure_peer` call isn't
+    /// preventable by any CALLER-side check, since a snapshot of
+    /// `configure_peer_generation` is never atomic with the owner's pin
+    /// update. So it lives as OWNER-side state, validated INSIDE the same
+    /// serialized command that installs the pin -- each sub-attempt submits
+    /// `expected_generation` fresh, and `Superseded` is the one atomic,
+    /// authoritative answer.
+    async fn configure_peer_with_outcome_and_generation(
+        &self,
+        peer_id: crate::PeerId,
+        connect_addr: SocketAddr,
+        expected_generation: Option<u64>,
+    ) -> (ConfigurePeerOutcome, u64) {
+        // No caller-side lock here: `PeerConnectHandler` is a public,
+        // unrestricted async callback, and holding a non-reentrant lock
+        // across a call into foreign code risks self-deadlock.
+        // `apply_configure_peer_connection_update` instead revalidates
+        // `pin_is_current` immediately before EACH side effect.
+        //
+        // Time-budgeted retry against `ClaimRejection::ReapInProgress`
+        // specifically -- every other rejection reason breaks out
+        // immediately, since only losing to a live reap reservation is
+        // guaranteed to eventually clear. `tokio::time::Instant`, not
+        // `std::time::Instant`, so `#[tokio::test(start_paused = true)]`
+        // can exercise the full budget via virtual time.
+        let retry_started = tokio::time::Instant::now();
+        let mut reap_retry_attempt = 0u32;
+        let mut reap_retry_backoff = CONFIGURE_PEER_REAP_RETRY_INITIAL_BACKOFF;
+        // A MUTABLE local, not the function's own fixed `expected_generation`:
+        // if sub-attempt 1 bumps to generation 5 then loses to
+        // `ReapInProgress`, sub-attempt 2 presenting `None` again would bump
+        // PAST a genuinely newer, unrelated `configure_peer` call that
+        // committed generation 6 while sub-attempt 1 slept, evicting its
+        // pin. Updating this after every sub-attempt ensures such a call is
+        // correctly detected as `Superseded` on the next sub-attempt.
+        let mut current_expected_generation = expected_generation;
+        let (outcome, evicted_release, generation) = loop {
+            let (outcome, _receipt, evicted_release, reap_in_progress, generation, superseded) =
+                self.add_operator_configured_peer_claim(
+                    connect_addr,
+                    peer_id.to_node_id(),
+                    current_expected_generation,
+                )
+                .await;
+            let generation = generation.unwrap_or(0);
+            current_expected_generation = Some(generation);
+            if superseded {
+                info!(
+                    peer_id = %peer_id,
+                    addr = %connect_addr,
+                    attempt = reap_retry_attempt,
+                    generation,
+                    "configure_peer: superseded by a later request for the same peer, validated \
+                     atomically at the owner -- standing down without applying this stale \
+                     request"
+                );
+                return (ConfigurePeerOutcome::Superseded, generation);
+            }
+            if !reap_in_progress {
+                break (outcome, evicted_release, generation);
+            }
+            // Checked on every sub-attempt, not just once before this whole
+            // call was first reached (`queue_configure_peer_until_applied`'s
+            // own gate at cycle entry): this call is itself the detached
+            // background retry's entire body, and a shutdown beginning
+            // partway through its up-to-30s budget must not let it keep
+            // sleeping and retrying past `shutdown_and_wait` returning. Only
+            // reached here between sub-attempts, never mid-attempt, so
+            // there is nothing partially applied to unwind -- a rejected
+            // `ReapInProgress` attempt mutates nothing.
+            if self.shutdown.load(Ordering::Acquire) {
+                info!(
+                    peer_id = %peer_id,
+                    addr = %connect_addr,
+                    attempt = reap_retry_attempt,
+                    "configure_peer: retry standing down -- shutdown began while still \
+                     reap-reserved; nothing was applied"
+                );
+                return (ConfigurePeerOutcome::TemporarilyBlocked, generation);
+            }
+            let elapsed = retry_started.elapsed();
+            if elapsed >= CONFIGURE_PEER_REAP_RETRY_BUDGET {
+                error!(
+                    peer_id = %peer_id,
+                    addr = %connect_addr,
+                    attempts = reap_retry_attempt + 1,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "configure_peer: address is still reap-reserved by a cleanup sweep after \
+                     exhausting the full retry budget; giving up -- nothing was applied. This \
+                     should be practically unreachable (reservations are bounded, in-memory, \
+                     single-address work) -- treat this as a symptom of something else being \
+                     wrong, not routine contention"
+                );
+                return (ConfigurePeerOutcome::TemporarilyBlocked, generation);
+            }
+            debug!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                attempt = reap_retry_attempt,
+                backoff_ms = reap_retry_backoff.as_millis() as u64,
+                "configure_peer: address is temporarily reap-reserved by a cleanup sweep; \
+                 retrying shortly"
+            );
+            reap_retry_attempt += 1;
+            tokio::time::sleep(reap_retry_backoff).await;
+            reap_retry_backoff = (reap_retry_backoff * 2).min(CONFIGURE_PEER_REAP_RETRY_MAX_BACKOFF);
+        };
+
+        // Applied unconditionally, before checking `outcome`: the evicted
+        // pin's release already fully committed inside the owner's atomic
+        // transaction regardless of whether THIS call's own claim
+        // projection was later superseded by a concurrent claim, and
+        // skipping it on `Rejected` would leave a different, genuinely-
+        // released address's watermark stale.
+        if let Some((evicted_addr, release_seq)) = evicted_release {
+            let mut state = self.gossip_state.lock().await;
+            state.tombstone_ownership_projection(evicted_addr, release_seq);
+        }
+
         if outcome == crate::addr_ownership::AddrClaimOutcome::Rejected {
             warn!(
                 peer_id = %peer_id,
                 addr = %connect_addr,
                 "refusing configured peer route because the ownership authority rejected it"
             );
-            return;
+            return (ConfigurePeerOutcome::Rejected, generation);
         }
 
         // Operator configuration is itself dialability evidence for
-        // `connect_addr`, independent of identity verification (see
-        // `add_peer_with_node_id_generation`, which deliberately does NOT
-        // clear this flag from a Verified claim alone -- the
-        // inbound-accept fallback also claims Verified for the raw
-        // observed TCP source, and that must stay excluded). An operator
-        // explicitly vouching for this exact address as a dial target
-        // means any stale `transport_source_keyed` inherited from an
-        // earlier inbound-accept fallback here no longer applies.
-        {
+        // `connect_addr`. Fenced against a concurrent `configure_peer` for
+        // a DIFFERENT identity landing between the owner transaction above
+        // and this `gossip_state` acquisition: `pin_is_current` answers
+        // "did I lose the race" (not "who owns this now"), a lock-free
+        // read of the snapshot just committed, so a losing identity's
+        // stale `PeerInfo` never gets marked dialable. Checked TWICE,
+        // before and after the `gossip_state` wait, which can be long
+        // enough on its own for a repin to land in.
+        //
+        // KNOWN, DEFERRED LIMITATION: the second check narrows this race,
+        // it does not close it -- a plain read is never atomic with a
+        // concurrent write from a separate domain (see `ReapReservation`'s
+        // doc comment). Accepted because the blast radius is small:
+        // `transport_source_keyed` is per-node advisory bookkeeping, never
+        // gossiped, self-correcting on the next classification event.
+        if self.registry_owner.pin_is_current(&connect_addr, &peer_id) {
             let mut gossip_state = self.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get_mut(&connect_addr) {
-                peer_info.mark_dialability_confirmed();
-            }
-        }
-
-        if let Some(previous_addr) = previous_addr.filter(|previous| *previous != connect_addr) {
-            if let Some(token) = self.registry_owner.ownership_token(&previous_addr)
-                && token.owner() == &peer_id
-                && let Some(release_seq) = self
-                    .registry_owner
-                    .release(previous_addr, peer_id.clone(), token.generation())
-                    .await
-            {
-                let mut state = self.gossip_state.lock().await;
-                state.tombstone_ownership_projection(previous_addr, release_seq);
+            if self.registry_owner.pin_is_current(&connect_addr, &peer_id) {
+                if let Some(peer_info) = gossip_state.peers.get_mut(&connect_addr) {
+                    peer_info.mark_dialability_confirmed();
+                }
             } else {
-                // Older state may have a pool-only configured route without a
-                // corresponding owner-actor token. Remove only this peer's
-                // stale derived route; never disturb a replacement owner.
-                let _ = self
-                    .connection_pool
-                    .addr_to_peer_id
-                    .remove_if_sync(&previous_addr, |current| current == &peer_id);
+                debug!(
+                    peer_id = %peer_id,
+                    addr = %connect_addr,
+                    "configure_peer: skipped dialability-confirmed marking -- a concurrent \
+                     reconfiguration moved this address's pin elsewhere while this call was \
+                     waiting for gossip_state"
+                );
             }
+        } else {
+            debug!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                "configure_peer: skipped dialability-confirmed marking -- a concurrent \
+                 reconfiguration moved this address's pin elsewhere before this call reached \
+                 gossip_state"
+            );
         }
 
-        let pool = &self.connection_pool;
+        // No `ConnectionPool`-derived "previous address" cleanup here:
+        // `required_addr` is written by every ordinary `.connect()`, not
+        // just configuration, so it is not necessarily this peer's actual
+        // previous OPERATOR PIN -- deriving cleanup from it could release a
+        // DIFFERENT, actively-occupied address. The owner's own atomic
+        // transaction above (`evicted_release`) is the only authoritative
+        // source for what this call may release.
+        //
+        // Skipped once shutdown has begun: the pin/claim above already
+        // committed at the owner regardless (that transaction cannot be
+        // partially applied), but the connect handler is a public,
+        // unrestricted callback that may dial out -- arbitrary foreign
+        // code with no bound on how long it runs, which `shutdown_and_wait`
+        // does not wait for. Calling it after shutdown started risks it
+        // still running, holding this cloned registry, after
+        // `shutdown_and_wait` has already returned to its caller.
+        if self.shutdown.load(Ordering::Acquire) {
+            info!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                "configure_peer: pin applied, connect-handler notification skipped -- shutdown \
+                 began before it could run"
+            );
+        } else {
+            self.apply_configure_peer_connection_update(peer_id, connect_addr)
+                .await;
+        }
+        (ConfigurePeerOutcome::Applied, generation)
+    }
+
+    /// `configure_peer`'s follow-up: notify the connect handler, but only
+    /// if `peer_id` is still the identity `connect_addr` is pinned for --
+    /// a concurrent `configure_peer`/`migrate` may have moved the pin
+    /// since. The connection-pool reindex itself no longer happens here:
+    /// it runs synchronously INSIDE the owner's own atomic transaction via
+    /// `RoutingPublisher::set_configured_peer_addr`, so the pin decision
+    /// and the route can never observably disagree; nothing is left for
+    /// this caller-side step to redo.
+    ///
+    /// The callback itself can't be folded into that transaction -- it may
+    /// run arbitrary foreign code (a network dial), and holding a lock
+    /// across it risks self-deadlock if the handler calls `configure_peer`
+    /// again. A pre-call `pin_is_current` check is enough since skipping it
+    /// leaves nothing to undo; it is not made atomic with a later
+    /// concurrent `configure_peer`, so a losing invocation still runs to
+    /// completion and must re-validate its own state on completion.
+    async fn apply_configure_peer_connection_update(
+        &self,
+        peer_id: crate::PeerId,
+        connect_addr: SocketAddr,
+    ) {
+        if !self.registry_owner.pin_is_current(&connect_addr, &peer_id) {
+            debug!(
+                peer_id = %peer_id,
+                addr = %connect_addr,
+                "configure_peer stood down before notifying the connect handler: a \
+                 concurrent reconfiguration moved this peer's pin elsewhere"
+            );
+            return;
+        }
+
         info!(peer_id = %peer_id, addr = %connect_addr, "Configured peer");
-        pool.set_configured_peer_addr(&peer_id, connect_addr);
-        pool.reindex_connection_addr(&peer_id, connect_addr);
         if let Some(cell) = self.peer_connect_handler.load_full() {
             cell.handler
                 .handle_peer_connect(connect_addr, Some(peer_id))
@@ -3962,13 +4801,11 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
-    /// p2p configured-peer supervisor tick. For every configured (required)
-    /// peer, keep a *direct point-to-point* connection alive: dial only when it
-    /// is down (a no-op when already connected, via pooled reuse), and surface a
-    /// liveness signal from the connect result. Point-to-point only — no gossip,
-    /// no broadcast (≤ N connect-attempts per tick for N configured peers, ~0 in
-    /// steady state). Driven by the background timer at `peer_supervisor_interval`;
-    /// gossip independently and complementarily observes these connections.
+    /// For every configured (required) peer, keep a direct point-to-point
+    /// connection alive: dial only when down (pooled reuse otherwise), and
+    /// surface a liveness signal from the result. No gossip/broadcast here
+    /// -- gossip independently and complementarily observes these
+    /// connections. Driven by `peer_supervisor_interval`.
     pub async fn supervise_configured_peers(&self) {
         let peers = self.connection_pool.list_configured_peers();
         for (peer_id, addr) in peers {
@@ -3976,13 +4813,27 @@ impl<T: 'static> GossipRegistry<T> {
             // re-dial (no storm) and do not reset liveness state (so gossip's own
             // dead-peer detection still fires). Data flows over this connection
             // at full speed.
-            if self
+            if let Some(conn) = self
                 .connection_pool
                 .get_connected_connection_to_peer(&peer_id)
-                .is_some()
             {
-                self.note_peer_liveness(&peer_id, addr, true, "connected")
-                    .await;
+                // Report the connection's OWN resolved address, not this
+                // loop's `list_configured_peers()` snapshot (`addr`), which
+                // a concurrent `configure_peer` can move the pin away from
+                // in between. Direction read from `conn` itself (captured
+                // when this exact handle was built), not re-looked-up by
+                // address -- `connections_by_addr` can be evicted or
+                // reassigned to a DIFFERENT connection in between (pin-alias
+                // eviction is one such reassignment), which would attribute
+                // the wrong connection's direction here; an INBOUND
+                // connection's `.addr` alone is not evidence of dialability.
+                let direction = Some(conn.direction());
+                self.note_peer_reachable(
+                    &peer_id,
+                    ConnectOutcome::resolved(ResolvedRoute::from_connection(conn.addr, direction)),
+                    "connected",
+                )
+                .await;
                 continue;
             }
             // A repeated duplicate-connection tie-break eviction for this
@@ -4013,32 +4864,65 @@ impl<T: 'static> GossipRegistry<T> {
             let budget = self.config.connection_timeout.min(Duration::from_millis(
                 crate::config::SUPERVISOR_PER_ATTEMPT_BUDGET_MS,
             ));
-            match tokio::time::timeout(budget, self.connect_to_peer(&peer_id)).await {
-                Ok(Ok(())) => {
-                    self.note_peer_liveness(&peer_id, addr, true, "established")
+            match tokio::time::timeout(budget, self.connect_to_peer_with_outcome(&peer_id)).await {
+                Ok((_, Ok(route))) => {
+                    // The address `connect_to_peer` actually resolved, not
+                    // the (possibly now-stale) `list_configured_peers()`
+                    // snapshot.
+                    self.note_peer_reachable(&peer_id, route, "established")
                         .await
                 }
-                Ok(Err(e)) => {
-                    self.note_peer_liveness(
+                Ok((attempted, Err(e))) => {
+                    // Same stale-snapshot concern: report what was
+                    // actually ATTEMPTED; `addr` only when nothing was.
+                    let failed_addr = attempted.map(|route| route.addr()).unwrap_or(addr);
+                    self.note_peer_unreachable(
                         &peer_id,
-                        addr,
-                        false,
+                        failed_addr,
                         &format!("connect failed: {e:?}"),
                     )
                     .await
                 }
                 Err(_) => {
-                    self.note_peer_liveness(&peer_id, addr, false, "connect timed out")
+                    // Budget elapsed with no attempted address to report;
+                    // falls back to the loop's own snapshot, honestly
+                    // labeled as a timeout, not a verified attempt.
+                    self.note_peer_unreachable(&peer_id, addr, "connect timed out")
                         .await
                 }
             }
         }
     }
 
+    /// Takes a [`ConnectOutcome`], not a bare `SocketAddr`: a "reachable"
+    /// signal must be backed by real evidence -- a corroborated
+    /// [`ResolvedRoute`], or `ConnectedUnverified` for a reused connection
+    /// that corroborated nothing -- not merely the address a caller
+    /// intended to reach.
+    async fn note_peer_reachable(
+        &self,
+        peer_id: &crate::PeerId,
+        outcome: ConnectOutcome,
+        reason: &str,
+    ) {
+        self.note_peer_liveness(peer_id, outcome.addr(), true, reason)
+            .await;
+    }
+
+    /// Takes a plain `SocketAddr`: a negative claim needs no proof any
+    /// connection-resolution path reached this address -- it may be a bare
+    /// snapshot, or the address a timed-out attempt was merely aimed at.
+    async fn note_peer_unreachable(&self, peer_id: &crate::PeerId, addr: SocketAddr, reason: &str) {
+        self.note_peer_liveness(peer_id, addr, false, reason).await;
+    }
+
     /// Emit the supervisor liveness signal. While a required peer is unreachable
     /// this logs a CRITICAL line every tick (continuous alert, greppable as
     /// `not connected; retrying`); the recovery edge logs once. The optional
     /// `PeerLivenessHandler` fires only on reachable<->unreachable edges.
+    ///
+    /// Private: reached only through the two callers above, which enforce
+    /// that `reachable = true` is always backed by a [`ResolvedRoute`].
     async fn note_peer_liveness(
         &self,
         peer_id: &crate::PeerId,
@@ -4347,6 +5231,7 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_info.address = new_addr;
                 peer_info.failures = 0; // Reset failures on DNS change
                 peer_info.last_failure_time = None;
+                peer_info.last_failure_instant = None;
                 gossip_state.peers.insert(new_addr, peer_info.clone());
 
                 // Migrate peer_to_actors mapping if it exists
@@ -4537,91 +5422,162 @@ impl<T: 'static> GossipRegistry<T> {
         Some(new_addr)
     }
 
-    /// Connect to a configured peer by peer ID
-    pub async fn connect_to_peer(&self, peer_id: &crate::PeerId) -> Result<()> {
+    /// Connect to a configured peer by peer ID -- the INTERNAL, detailed
+    /// form. `pub(crate)`, not `pub`: see [`GossipRegistry::connect_to_peer`]
+    /// for the public, stable-signature wrapper.
+    ///
+    /// Returns the address this call's own resolution ATTEMPTED, alongside
+    /// the outcome: `Ok` carries a [`ConnectOutcome`] (a genuinely
+    /// corroborated [`ResolvedRoute`], or `ConnectedUnverified` when a
+    /// reused connection corroborated nothing); `Err` carries the original
+    /// error. The attempted address is not necessarily whatever the caller
+    /// believes this peer's current route is -- `get_connection_to_
+    /// required_peer` resolves the pin fresh, atomically with the dial,
+    /// so a concurrent `configure_peer` can move it first. Callers MUST
+    /// attribute health, gossip, and failure state to THIS returned
+    /// address, never to whatever they originally intended to reach.
+    ///
+    /// Sole authority for `gossip_state.peers` bookkeeping on the
+    /// required-peer connect path, on BOTH outcomes: inserts an entry for
+    /// the resolved/attempted address if one doesn't already exist. A
+    /// caller-side insert keyed to the caller's originally-requested
+    /// address is exactly the bug this distinction prevents.
+    ///
+    /// Vocabulary: "requested" (a caller's own unverified input, a bare
+    /// `SocketAddr`) vs. "attempted" ([`AttemptedRoute`], what this call
+    /// actually dialed against, valid for the failure arm) vs. "resolved"
+    /// ([`ResolvedRoute`], valid only once genuinely reached, for the
+    /// success arm) vs. `conn.addr` (the raw connection socket, which for
+    /// an inbound connection can differ from the peer's advertised
+    /// address).
+    pub(crate) async fn connect_to_peer_with_outcome(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> (Option<AttemptedRoute>, Result<ConnectOutcome>) {
         let pool = &self.connection_pool;
-        let configured_addr = pool
-            .get_required_peer_addr(peer_id)
-            .or_else(|| pool.get_configured_peer_addr(peer_id));
-        match pool.get_connection_to_required_peer(peer_id).await {
+        let (attempted_route, dial_result) = pool.get_connection_to_required_peer(peer_id).await;
+        let outcome = match dial_result {
             Ok(conn) => {
+                // `attempted_route` is guaranteed `Some` here:
+                // `get_connection_to_required_peer` only returns `Ok` after
+                // resolving an address to dial/reuse against.
+                let configured_addr = attempted_route
+                    .expect("get_connection_to_required_peer resolved an address on success")
+                    .addr();
                 // `get_connection_to_required_peer` can resolve to an
-                // EXISTING connection rather than genuinely dialing out --
-                // including one published by an inbound accept. An
-                // inbound connection is exactly the case
-                // `transport_source_keyed` exists to describe, so scoping
-                // the clear to `conn.addr` alone is not sufficient: it
-                // must also be evidence of an actual outbound dial, not
-                // merely "this function happened to resolve a connection
-                // at this address."
-                let dialed_outbound = self
-                    .connection_pool
-                    .get_lock_free_connection(conn.addr)
-                    .is_some_and(|c| {
-                        c.direction == crate::connection_pool::ConnectionDirection::Outbound
-                    });
+                // EXISTING connection (including one published by an
+                // inbound accept) rather than genuinely dialing out, so
+                // this must also confirm an actual outbound dial, not just
+                // "resolved a connection at this address." Read from `conn`
+                // itself, captured when this exact handle was built, not
+                // re-looked-up by address: `connections_by_addr` can be
+                // evicted or reassigned to a DIFFERENT connection in
+                // between (pin-alias eviction is one such reassignment),
+                // which would attribute the wrong connection's direction
+                // here.
+                let dialed_outbound =
+                    conn.direction() == crate::connection_pool::ConnectionDirection::Outbound;
 
-                let mut recovered_addrs = Vec::with_capacity(2);
-                recovered_addrs.push(conn.addr);
-                if let Some(addr) = configured_addr
-                    && addr != conn.addr
-                {
-                    recovered_addrs.push(addr);
+                if !dialed_outbound {
+                    // Neither address was independently corroborated as
+                    // dialable this round. No positive address-level
+                    // bookkeeping, and no `ResolvedRoute` (valid only once
+                    // genuinely reached) -- `connected_unverified` carries
+                    // `configured_addr` purely as diagnostic information.
+                    debug!(
+                        peer_id = %peer_id,
+                        configured_addr = %configured_addr,
+                        connection_addr = %conn.addr,
+                        "connect_to_peer: reused a connection that is not a genuine outbound \
+                         dial; no address independently corroborated as dialable, so no \
+                         positive bookkeeping was recorded"
+                    );
+                    return (
+                        attempted_route,
+                        Ok(ConnectOutcome::connected_unverified(configured_addr)),
+                    );
                 }
+
+                // From here, `dialed_outbound` is true: `conn.addr` IS the
+                // authoritative, corroborated dialable address.
+                let conn_route =
+                    ResolvedRoute::from_connection(conn.addr, Some(conn.direction()));
+                let preferred_addr = conn_route.addr();
+
                 let mut gossip_state = self.gossip_state.lock().await;
                 let now = current_timestamp();
                 let now_ms = crate::current_timestamp_millis();
-                for (peer_addr, peer_info) in gossip_state.peers.iter_mut() {
-                    if recovered_addrs.contains(peer_addr) {
-                        peer_info.failures = 0;
-                        // We only independently proved `conn.addr` is
-                        // dialable, by a genuine outbound dial, when the
-                        // resolved connection is itself outbound --
-                        // nothing here corroborates dialability for
-                        // `configured_addr` too, when it differs (see
-                        // above), nor for an inbound connection that
-                        // merely happens to be published at `conn.addr`
-                        // (see PeerInfo::transport_source_keyed).
-                        // `outbound_dial_success`'s name is a promise this
-                        // address was proven by an actual outbound dial,
-                        // so setting it must be scoped identically to
-                        // `mark_dialability_confirmed`, not applied to
-                        // every recovered address.
-                        if *peer_addr == conn.addr && dialed_outbound {
-                            peer_info.outbound_dial_success = true;
-                            peer_info.mark_dialability_confirmed();
-                        }
-                        peer_info.last_success = now;
-                        peer_info.last_response_received_ms = now_ms;
-                        peer_info.last_failure_time = None;
-                    }
+                let node_id = Some(peer_id.to_node_id());
+                // `for_connect_attempt` sets `transport_source_keyed`/
+                // `inbound_observed` directly from `conn_route`.
+                let peer_info = gossip_state
+                    .peers
+                    .entry(preferred_addr)
+                    .or_insert_with(|| PeerInfo::for_connect_attempt(conn_route, node_id));
+                peer_info.failures = 0;
+                peer_info.outbound_dial_success = true;
+                peer_info.mark_dialability_confirmed();
+                peer_info.last_success = now;
+                peer_info.last_response_received_ms = now_ms;
+                peer_info.last_failure_time = None;
+                peer_info.last_failure_instant = None;
+
+                if let Some(peer_info) = gossip_state.known_peers.get_mut(&preferred_addr) {
+                    peer_info.failures = 0;
+                    peer_info.outbound_dial_success = true;
+                    peer_info.mark_dialability_confirmed();
+                    peer_info.last_success = now;
+                    peer_info.last_response_received_ms = now_ms;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
                 }
-                for (peer_addr, peer_info) in gossip_state.known_peers.iter_mut() {
-                    if recovered_addrs.contains(peer_addr) {
-                        peer_info.failures = 0;
-                        if *peer_addr == conn.addr && dialed_outbound {
-                            peer_info.outbound_dial_success = true;
-                            peer_info.mark_dialability_confirmed();
-                        }
-                        peer_info.last_success = now;
-                        peer_info.last_response_received_ms = now_ms;
-                        peer_info.last_failure_time = None;
-                    }
-                }
-                info!(peer_id = %peer_id, "Connected to peer");
-                Ok(())
+                // `preferred_addr`, not the bare connection address, is
+                // what every mutation above was keyed to, so it must also
+                // be what this call logs and returns.
+                info!(
+                    peer_id = %peer_id,
+                    addr = %preferred_addr,
+                    connection_addr = %conn.addr,
+                    "Connected to peer"
+                );
+                Ok(ConnectOutcome::resolved(conn_route))
             }
             Err(err) => {
-                if let Some(addr) = configured_addr {
+                // Insert-if-absent, not update-only: the first-ever failed
+                // connect to a brand-new required peer must still gain an
+                // entry, or its failure/backoff state silently never
+                // exists. Keyed to `attempted_route` -- the SAME resolution
+                // used for the dial itself -- never a bare requested address.
+                if let Some(attempted) = attempted_route {
                     let mut gossip_state = self.gossip_state.lock().await;
-                    if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
-                        peer_info.failures = self.config.max_peer_failures;
-                        peer_info.last_failure_time = Some(current_timestamp());
-                    }
+                    let node_id = Some(peer_id.to_node_id());
+                    let peer_info = gossip_state
+                        .peers
+                        .entry(attempted.addr())
+                        .or_insert_with(|| PeerInfo::for_failed_connect_attempt(attempted, node_id));
+                    peer_info.failures = self.config.max_peer_failures;
+                    peer_info.last_failure_time = Some(current_timestamp());
+                    peer_info.last_failure_instant = Some(std::time::Instant::now());
                 }
                 Err(err)
             }
-        }
+        };
+        (attempted_route, outcome)
+    }
+
+    /// Connect to a configured (required) peer by peer ID -- the PUBLIC,
+    /// stable-signature form.
+    ///
+    /// This signature must stay `Result<()>`. See `connect_to_peer_with_
+    /// outcome`'s own doc comment for the full reasoning: the richer `(Option<AttemptedRoute>,
+    /// Result<ConnectOutcome>)` return -- needed internally to attribute
+    /// health/gossip/failure state to the address a connection attempt
+    /// actually reached, never to a bare request -- is `pub(crate)` under
+    /// that distinct name instead of living here, so this public method
+    /// keeps returning exactly what it always has and no downstream
+    /// caller of `GossipRegistry::connect_to_peer` directly breaks.
+    pub async fn connect_to_peer(&self, peer_id: &crate::PeerId) -> Result<()> {
+        self.connect_to_peer_with_outcome(peer_id).await.1.map(|_| ())
     }
 
     /// Register a local actor (fast path - minimal locking) with vector clock increment
@@ -6118,6 +7074,7 @@ impl<T: 'static> GossipRegistry<T> {
                         last_sent_sequence: 0,
                         consecutive_deltas: 0,
                         last_failure_time: None,
+                        last_failure_instant: None,
                         last_dns_refresh_attempt: None,
                         last_response_received_ms: crate::current_timestamp_millis(),
                         accept_lower_sequence_from: None,
@@ -6321,6 +7278,18 @@ impl<T: 'static> GossipRegistry<T> {
                                 );
                                 if peer_info.failures == self.config.max_peer_failures {
                                     peer_info.last_failure_time = Some(current_time);
+                                    // Captured HERE, at this exact write, not
+                                    // hoisted from the batch's start: this
+                                    // loop awaits per-item, so a batch-start
+                                    // instant can be arbitrarily stale by the
+                                    // time this peer's failure is actually
+                                    // recorded -- a too-early instant here
+                                    // would make a later, unrelated reconnect
+                                    // look like it happened after this
+                                    // failure, wrongly and permanently
+                                    // blocking cleanup.
+                                    peer_info.last_failure_instant =
+                                        Some(std::time::Instant::now());
                                     crossed_threshold = true;
                                     info!(peer = %result.peer_addr,
                                           "peer reached max failures \
@@ -6388,6 +7357,12 @@ impl<T: 'static> GossipRegistry<T> {
                                 // Mark failure time if this puts us at max failures
                                 if peer_info.failures >= self.config.max_peer_failures {
                                     peer_info.last_failure_time = Some(current_time);
+                                    // See the matching comment in the `Ok`
+                                    // arm above: captured here, under this
+                                    // write, not hoisted from the batch
+                                    // start.
+                                    peer_info.last_failure_instant =
+                                        Some(std::time::Instant::now());
                                     crossed_threshold = true;
                                     info!(peer = %result.peer_addr,
                                           hard_socket_err,
@@ -6486,6 +7461,7 @@ impl<T: 'static> GossipRegistry<T> {
             if peer_info.failures > 0 {
                 peer_info.failures = 0;
                 peer_info.last_failure_time = None;
+                peer_info.last_failure_instant = None;
             }
         }
     }
@@ -7444,6 +8420,18 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Clean up actors from peers that have been disconnected for longer than dead_peer_timeout
     /// IMPORTANT: We keep the peer itself to allow reconnection, only clean up their actors
+    ///
+    /// SCOPE NOTE: unchanged from `main`. This function does NOT
+    /// release address ownership when a peer times out, and does NOT
+    /// re-validate a candidate's liveness/identity between selection and
+    /// destruction. Both are real, known gaps (the former is a
+    /// permanent ownership leak on a dead peer's address with no recovery
+    /// path short of a restart) that rebuilding this
+    /// function around the `ReapReservation` primitive
+    /// (`RegistryOwnerHandle::reserve_for_reap`/`try_consume`) -- see that
+    /// primitive's own doc comment -- would close, as a dedicated piece of
+    /// structural work tracked separately from ownership-release-on-teardown
+    /// and `configure_peer` atomicity.
     pub async fn cleanup_dead_peers(&self) {
         let current_time = current_timestamp();
         let dead_peer_timeout_secs = self.config.dead_peer_timeout.as_secs();
@@ -7685,6 +8673,18 @@ impl<T: 'static> GossipRegistry<T> {
             gossip_state.shutdown = true;
         }
 
+        // Abort every in-flight `configure_peer` retry task -- see
+        // `configure_peer_retry_tasks`'s own doc comment for why this, not
+        // the cooperative `self.shutdown` checks inside those tasks, is
+        // what makes "none outlives this call" a guarantee. `abort_all`
+        // does not wait for the aborted tasks to actually stop; nothing
+        // here needs to, since none of them hold a lock or resource this
+        // function's own cleanup below depends on.
+        self.configure_peer_retry_tasks
+            .lock()
+            .expect("configure_peer_retry_tasks mutex")
+            .abort_all();
+
         // Break callback -> client/router -> registry ownership cycles before
         // connection teardown can emit any terminal disconnect notifications.
         self.clear_runtime_handlers();
@@ -7764,12 +8764,14 @@ impl<T: 'static> GossipRegistry<T> {
                 if peer_info.failures < max_failures {
                     peer_info.failures = 0;
                     peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
                 }
             }
             if let Some(peer_info) = gossip_state.known_peers.get_mut(&peer_addr) {
                 if peer_info.failures < max_failures {
                     peer_info.failures = 0;
                     peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
                 }
             }
         }
@@ -8070,6 +9072,12 @@ impl<T: 'static> GossipRegistry<T> {
                 let was_below = peer_info.failures < self.config.max_peer_failures;
                 peer_info.failures = self.config.max_peer_failures;
                 peer_info.last_failure_time = Some(current_time);
+                // Captured HERE, at the write, not hoisted before the
+                // `clear_discovery_state_if_no_live_connection(...).await`
+                // above -- see `apply_gossip_results`'s matching comment
+                // for why an instant captured before an intervening await
+                // can be stale relative to when this write actually runs.
+                peer_info.last_failure_instant = Some(std::time::Instant::now());
                 peer_info.last_attempt = current_time; // Update last_attempt so retry happens after interval
                 crossed_threshold = was_below;
                 info!(
@@ -8254,6 +9262,9 @@ impl<T: 'static> GossipRegistry<T> {
                 let was_below = peer_info.failures < self.config.max_peer_failures;
                 peer_info.failures = self.config.max_peer_failures;
                 peer_info.last_failure_time = Some(current_time);
+                // Captured HERE, at the write -- see
+                // `handle_peer_connection_failure`'s matching comment.
+                peer_info.last_failure_instant = Some(std::time::Instant::now());
                 peer_info.last_attempt = current_time; // Update last_attempt so retry happens after interval
                 crossed_threshold = was_below;
                 info!(
@@ -9594,6 +10605,7 @@ impl<T: 'static> GossipRegistry<T> {
                 if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
                     peer_info.failures = 0;
                     peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
                     peer_info.last_success = peer_info.last_success.max(now);
                     peer_info.last_response_received_ms = peer_info
                         .last_response_received_ms
@@ -9604,6 +10616,7 @@ impl<T: 'static> GossipRegistry<T> {
                 if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
                     peer_info.failures = 0;
                     peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
                     peer_info.last_success = now;
                     if let Some(node_id) = peer_info.node_id {
                         let _ = self.peer_capability_addr_to_node.upsert_sync(addr, node_id);
@@ -9630,6 +10643,12 @@ impl<T: 'static> GossipRegistry<T> {
         // Notify peer connect handler (outgoing connections may only hit this path).
         if let Some(cell) = self.peer_connect_handler.load_full() {
             let peer_id = self.connection_pool.get_peer_id_by_addr(&addr);
+            // This path is never about an operator pin -- there is no
+            // claim/generation to fence anything against here at all, and
+            // the OLD membership check here (`Some(peer_id)` routed
+            // through `pin_is_current`) wrongly reported `false` for a
+            // perfectly valid, current, non-pinned connection whenever
+            // `addr` simply had no operator pin at all.
             cell.handler.handle_peer_connect(addr, peer_id).await;
         }
 
@@ -9670,6 +10689,7 @@ impl<T: 'static> GossipRegistry<T> {
             last_sent_sequence: 0,
             consecutive_deltas: 0,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: now_ms,
             accept_lower_sequence_from: None,
@@ -9692,6 +10712,7 @@ impl<T: 'static> GossipRegistry<T> {
         peer.last_response_received_ms = peer.last_response_received_ms.max(now_ms);
         peer.failures = 0;
         peer.last_failure_time = None;
+        peer.last_failure_instant = None;
         self.record_peer_discovery_connected(&mut gossip_state, peer_addr);
         drop(gossip_state);
         self.trigger_immediate_peer_gossip();
@@ -9790,6 +10811,7 @@ impl<T: 'static> GossipRegistry<T> {
         if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
             peer_info.failures = peer_info.failures.saturating_add(1);
             peer_info.last_failure_time = Some(now);
+            peer_info.last_failure_instant = Some(std::time::Instant::now());
             peer_info.last_attempt = now;
         }
 
@@ -9983,6 +11005,20 @@ impl<T: 'static> GossipRegistry<T> {
         let pool = &self.connection_pool;
         pool.has_connection_by_peer_id(peer_id)
     }
+}
+
+/// `configure_peer` must be callable for any `T: 'static`, not just
+/// `T: Send + Sync + Clone`. Compile-time proof, not a runtime test: this
+/// function is never actually invoked (it would need a concrete,
+/// runnable `T`) -- its mere existence compiling is the whole proof; if
+/// `configure_peer` ever regains an extra bound, this stops compiling.
+#[allow(dead_code)]
+fn _configure_peer_is_callable_for_any_static_t<T: 'static>(
+    registry: &GossipRegistry<T>,
+    peer_id: crate::PeerId,
+    addr: SocketAddr,
+) -> impl std::future::Future<Output = ()> + '_ {
+    registry.configure_peer(peer_id, addr)
 }
 
 #[cfg(test)]
@@ -11913,6 +12949,7 @@ mod tests {
             last_sent_sequence: 5,
             consecutive_deltas: 3,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -12224,6 +13261,7 @@ mod tests {
             last_sent_sequence: 0,
             consecutive_deltas: 0,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: now_ms,
             accept_lower_sequence_from: None,
@@ -12521,6 +13559,7 @@ mod tests {
                     // Recorded "in the future" relative to the wall clock read
                     // inside `prepare_gossip_round` — simulates a backward step.
                     last_failure_time: Some(current_timestamp() + 10_000),
+                    last_failure_instant: Some(std::time::Instant::now() + Duration::from_secs(10_000)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -13203,8 +14242,9 @@ mod tests {
             .add_connection_by_peer_id(peer_id.clone(), addr, conn.clone());
 
         registry
-            .connect_to_peer(&peer_id)
+            .connect_to_peer_with_outcome(&peer_id)
             .await
+            .1
             .expect("fake connection must resolve without a real dial");
 
         let state = registry.gossip_state.lock().await;
@@ -13374,8 +14414,9 @@ mod tests {
         );
 
         registry
-            .connect_to_peer(&peer_id)
+            .connect_to_peer_with_outcome(&peer_id)
             .await
+            .1
             .expect("existing connection must resolve without a real dial");
 
         let state = registry.gossip_state.lock().await;
@@ -13451,8 +14492,9 @@ mod tests {
             .add_connection_by_peer_id(peer_id.clone(), addr, conn.clone());
 
         registry
-            .connect_to_peer(&peer_id)
+            .connect_to_peer_with_outcome(&peer_id)
             .await
+            .1
             .expect("existing inbound connection must resolve without a real dial");
 
         let state = registry.gossip_state.lock().await;
@@ -13522,8 +14564,9 @@ mod tests {
         // The configured-peer supervisor's connect attempt: resolves the
         // existing INBOUND connection, no real dial occurs.
         registry
-            .connect_to_peer(&peer_id)
+            .connect_to_peer_with_outcome(&peer_id)
             .await
+            .1
             .expect("existing inbound connection must resolve without a real dial");
 
         // The write site under test: `outbound_dial_success` must stay
@@ -13585,13 +14628,477 @@ mod tests {
         );
     }
 
+    /// Positive bookkeeping must be scoped to `preferred_addr` alone, not
+    /// every alias sharing this peer's identity: reusing an OUTBOUND
+    /// connection at A while a different configured address B also names
+    /// this peer must not wrongly clear B's failures too.
+    #[tokio::test]
+    async fn connect_to_peer_reusing_a_connection_at_a_does_not_mark_a_different_configured_b_healthy()
+     {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(20_930), test_config());
+        let peer_id = test_peer_id("reuse-a-does-not-heal-configured-b");
+        let addr_a = test_addr(20_931);
+        let addr_b = test_addr(20_932);
+
+        // B is this peer's configured/required address -- `connect_to_peer`
+        // will resolve it fresh via `get_required_peer_addr` every call,
+        // independent of whatever connection ends up actually reused.
+        registry.configure_peer(peer_id.clone(), addr_b).await;
+
+        // B already carries STALE failure state -- e.g. a real, previous
+        // failed dial attempt directly against it -- so whether THIS
+        // call's success wrongly clears it is actually observable (an
+        // absent entry would make "not cleared" trivially true either
+        // way).
+        let b_failure_time;
+        let b_failure_instant;
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let peer_info = gossip_state
+                .peers
+                .get_mut(&addr_b)
+                .expect("configure_peer must create an entry for the configured address");
+            peer_info.failures = registry.config.max_peer_failures;
+            b_failure_time = Some(current_timestamp().saturating_sub(30));
+            b_failure_instant = Some(std::time::Instant::now() - Duration::from_secs(30));
+            peer_info.last_failure_time = b_failure_time;
+            peer_info.last_failure_instant = b_failure_instant;
+            // `configure_peer`'s own claim-insert unconditionally sets
+            // `last_success` to the insert time for a brand-new peer --
+            // reset it here so "never marked successful this round" is a
+            // meaningful assertion against a known baseline, not an
+            // artifact of that unrelated insert.
+            peer_info.last_success = 0;
+        }
+
+        // A live, genuinely OUTBOUND connection for the SAME peer
+        // identity, at a COMPLETELY DIFFERENT address A -- e.g. this node
+        // dialed A earlier via a discovered route, unrelated to the
+        // peer's own configured B.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr_a,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr_a, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id.clone(), addr_a, conn.clone());
+
+        // `get_connection_to_required_peer`'s identity-based fast path
+        // finds the existing connection at A before ever attempting to
+        // dial B.
+        let (attempted, result) = registry.connect_to_peer_with_outcome(&peer_id).await;
+        let route = result.expect("existing outbound connection must resolve without a real dial");
+        assert_eq!(
+            route.addr(),
+            addr_a,
+            "the resolved route must be A -- the connection actually reused, proven by a \
+             genuine outbound dial -- not B, which was never contacted this round"
+        );
+        assert_eq!(
+            attempted.map(|a| a.addr()),
+            Some(addr_b),
+            "sanity: this call's own resolution must still have resolved the configured \
+             address B, even though the connection it reused lives at A"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let b_entry = gossip_state
+            .peers
+            .get(&addr_b)
+            .expect("B's entry must still exist");
+        assert_eq!(
+            b_entry.failures, registry.config.max_peer_failures,
+            "B's failure count must be untouched -- it was never contacted this round"
+        );
+        assert_eq!(
+            b_entry.last_failure_time, b_failure_time,
+            "B's failure timestamp must be untouched"
+        );
+        assert_eq!(
+            b_entry.last_failure_instant, b_failure_instant,
+            "B's failure instant must be untouched"
+        );
+        assert_eq!(
+            b_entry.last_success, 0,
+            "B must never be marked successful -- this call resolved and reused a \
+             connection at a completely different address"
+        );
+
+        let a_entry = gossip_state
+            .peers
+            .get(&addr_a)
+            .expect("A -- the address actually resolved -- must gain/keep a healthy entry");
+        assert_eq!(a_entry.failures, 0, "A must be marked healthy");
+        assert!(a_entry.last_success > 0, "A must be marked successful");
+        assert!(
+            a_entry.outbound_dial_success,
+            "A was reused from a genuinely outbound connection"
+        );
+    }
+
+    /// Earlier fixes to `connect_to_peer`'s handling of an INBOUND
+    /// connection resolved at a raw, ephemeral transport source still
+    /// inserted a fresh, zero-failure `gossip_state` entry for the
+    /// configured address and returned it wrapped in a (dialable)
+    /// `ResolvedRoute` -- marking it reachable purely because the SAME
+    /// identity happened to have an unrelated inbound connection open
+    /// somewhere (see `ConnectOutcome`'s doc comment on why
+    /// `ResolvedRoute::from_configured` was deleted).
+    ///
+    /// Fixed: no positive `gossip_state` bookkeeping for EITHER address,
+    /// and the returned outcome is `ConnectOutcome::ConnectedUnverified`,
+    /// never a `ResolvedRoute`. The ephemeral connection source still
+    /// never gains an ordinary `gossip_state` entry either.
+    #[tokio::test]
+    async fn connect_to_peer_reusing_an_ephemeral_inbound_source_does_no_bookkeeping_for_either_address()
+     {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(20_910), test_config());
+        let peer_id = test_peer_id("alias-insert-not-ephemeral-source");
+        let advertised_addr = test_addr(20_911);
+        let ephemeral_addr = test_addr(20_912);
+
+        // The peer's required route, set via the SAME owner command
+        // `Peer::connect`'s ordinary path submits -- deliberately NOT
+        // `configure_peer`, whose own claim step would insert a
+        // zero-failure `gossip_state.peers` entry and mask the "no entry
+        // exists yet" starting point this test needs.
+        assert!(
+            registry
+                .registry_owner
+                .set_ordinary_connect_route(peer_id.clone(), advertised_addr)
+                .await,
+            "test setup: the route must be accepted (nothing else claims advertised_addr)"
+        );
+
+        // A connection published for the SAME peer identity, but
+        // resolved/indexed under a DIFFERENT, ephemeral address --
+        // simulating an inbound accept observed from a raw transport
+        // source, never reindexed under the advertised address. Neither
+        // address has a `gossip_state.peers` entry at this point (the
+        // "old source-keyed entry was migrated or removed" end state).
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            ephemeral_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(ephemeral_addr, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            ephemeral_addr,
+            conn.clone(),
+        );
+
+        let outcome = registry
+            .connect_to_peer_with_outcome(&peer_id)
+            .await
+            .1
+            .expect("the inbound connection must resolve without a real dial");
+        assert_eq!(
+            outcome.resolved_route(),
+            None,
+            "no address was independently corroborated as dialable this round -- the outcome \
+             must not carry a ResolvedRoute at all, configured or ephemeral"
+        );
+        assert_eq!(
+            outcome.addr(),
+            advertised_addr,
+            "the diagnostic/liveness-signal address must still be the configured one, never \
+             the ephemeral connection source -- but see the assertion above: carrying this \
+             address is NOT a dialability claim"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state.peers.contains_key(&ephemeral_addr),
+            "the ephemeral connection source must never gain an ordinary gossip_state entry"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&advertised_addr),
+            "the configured address must not gain a gossip_state entry either -- reusing an \
+             inbound connection at a different address is not evidence it is dialable, so no \
+             positive bookkeeping may happen for it"
+        );
+    }
+
+    /// Reusing an existing INBOUND connection at A for a required route B
+    /// must not be treated as a genuine dial of B -- see `ConnectOutcome`'s
+    /// own doc comment for the bug this prevents (an earlier version fell
+    /// back to `ResolvedRoute::from_configured(B)`, unconditionally
+    /// `dialable: true`, wrongly clearing failures for a never-contacted
+    /// caller-provided address). B carries STALE failure state from a real
+    /// previous attempt here, so "neither cleared nor marked successful"
+    /// is actually observable.
+    #[tokio::test]
+    async fn connect_to_peer_reusing_an_inbound_connection_does_not_resolve_a_different_caller_provided_b()
+     {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = GossipRegistry::<()>::new(test_addr(20_940), test_config());
+        let peer_id = test_peer_id("ordinary-connect-inbound-reuse-does-not-resolve-b");
+        let addr_a = test_addr(20_941);
+        let addr_b = test_addr(20_942);
+
+        // B: the ordinary `Peer::connect(&B)` path's own caller-provided
+        // route -- accepted because nothing else claims it, never
+        // independently verified as dialable.
+        assert!(
+            registry
+                .registry_owner
+                .set_ordinary_connect_route(peer_id.clone(), addr_b)
+                .await,
+            "test setup: the route must be accepted (nothing else claims addr_b)"
+        );
+
+        // B already carries a real, previous failed-dial's failure state,
+        // established directly (bypassing `connect_to_peer` itself, whose
+        // own failure arm is not under test here).
+        let b_failure_time;
+        let b_failure_instant;
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let node_id = Some(peer_id.to_node_id());
+            let peer_info = gossip_state
+                .peers
+                .entry(addr_b)
+                .or_insert_with(|| PeerInfo::for_failed_connect_attempt(AttemptedRoute::new(addr_b), node_id));
+            peer_info.failures = registry.config.max_peer_failures;
+            b_failure_time = Some(current_timestamp().saturating_sub(30));
+            b_failure_instant = Some(std::time::Instant::now() - Duration::from_secs(30));
+            peer_info.last_failure_time = b_failure_time;
+            peer_info.last_failure_instant = b_failure_instant;
+            peer_info.last_success = 0;
+        }
+
+        // An existing INBOUND connection for the SAME peer identity, at a
+        // COMPLETELY DIFFERENT address A -- e.g. an inbound accept this
+        // node never independently dialed.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr_a,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr_a, ConnectionDirection::Inbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id.clone(), addr_a, conn.clone());
+
+        // `get_connection_to_required_peer`'s identity-based fast path
+        // finds the existing INBOUND connection at A before ever
+        // attempting to dial B.
+        let outcome = registry
+            .connect_to_peer_with_outcome(&peer_id)
+            .await
+            .1
+            .expect("existing inbound connection must resolve without a real dial");
+
+        assert_eq!(
+            outcome.resolved_route(),
+            None,
+            "B must never be returned as resolved -- no address was independently \
+             corroborated as dialable this round, so the outcome must not carry a \
+             ResolvedRoute at all"
+        );
+        assert!(
+            !outcome.is_dialable(),
+            "the outcome must not claim dialability for anything"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let b_entry = gossip_state
+            .peers
+            .get(&addr_b)
+            .expect("B's entry must still exist");
+        assert_eq!(
+            b_entry.failures, registry.config.max_peer_failures,
+            "B's failure count must be untouched -- it was never contacted this round"
+        );
+        assert_eq!(
+            b_entry.last_failure_time, b_failure_time,
+            "B's failure timestamp must be untouched"
+        );
+        assert_eq!(
+            b_entry.last_failure_instant, b_failure_instant,
+            "B's failure instant must be untouched"
+        );
+        assert_eq!(
+            b_entry.last_success, 0,
+            "B must never be marked successful -- reusing an inbound connection at a \
+             completely different address is not evidence B is dialable"
+        );
+        assert!(
+            !gossip_state.peers.contains_key(&addr_a),
+            "A must not gain gossip_state bookkeeping either -- it was reused, not dialed"
+        );
+    }
+
+    /// An earlier version of the error arm updated an EXISTING `PeerInfo`
+    /// entry only, so the FIRST-EVER failed `connect_to_peer` for a
+    /// brand-new required peer recorded nothing at all -- no entry, no
+    /// failure state, no backoff.
+    ///
+    /// Fixed with `entry().or_insert_with(...)`, keyed to the address
+    /// this call actually ATTEMPTED (an `AttemptedRoute`), via
+    /// `PeerInfo::for_failed_connect_attempt`.
+    ///
+    /// Uses `set_ordinary_connect_route` rather than `configure_peer`:
+    /// the operator-pin path's own claim step inserts a zero-failure
+    /// entry as a side effect of establishing ownership, which would mask
+    /// the "no entry exists yet" scenario this test needs.
+    #[tokio::test]
+    async fn connect_to_peer_records_failure_state_on_a_first_ever_failed_attempt() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_920), test_config());
+        let peer_id = test_peer_id("first-failure-creates-entry");
+        // Nothing ever listens here -- the dial is guaranteed to fail.
+        let addr = test_addr(20_921);
+
+        assert!(
+            registry
+                .registry_owner
+                .set_ordinary_connect_route(peer_id.clone(), addr)
+                .await,
+            "test setup: the route must be accepted (nothing else claims addr)"
+        );
+        {
+            let gossip_state = registry.gossip_state.lock().await;
+            assert!(
+                !gossip_state.peers.contains_key(&addr),
+                "sanity: a required-peer route update alone must not pre-insert a peers entry"
+            );
+        }
+
+        let (attempted, result) = registry.connect_to_peer_with_outcome(&peer_id).await;
+        assert!(
+            result.is_err(),
+            "nothing listens at addr; the dial must fail"
+        );
+        assert_eq!(
+            attempted.map(|route| route.addr()),
+            Some(addr),
+            "the attempted address must be exactly the configured address this call dialed"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .peers
+            .get(&addr)
+            .expect("a first-ever failed connect must still create a peers entry");
+        assert_eq!(
+            peer_info.failures, registry.config.max_peer_failures,
+            "the new entry must carry failure state, not a fresh zero-failure default"
+        );
+        assert!(
+            peer_info.last_failure_time.is_some(),
+            "the new entry must record when the failure happened"
+        );
+        assert!(
+            peer_info.last_failure_instant.is_some(),
+            "the new entry must record the failure instant used for backoff timing"
+        );
+    }
+
+    /// `connect_to_peer`'s signature changing from `Result<()>` to a
+    /// tuple would break `.await?`/`.await.unwrap()` for any downstream
+    /// caller. The public signature stays `Result<()>`; the richer tuple
+    /// lives under `connect_to_peer_with_outcome` for internal callers
+    /// that need the attempted/resolved distinction.
+    ///
+    /// A COMPILE-level check as much as a runtime one: every line below
+    /// is written exactly as an external caller would -- `?` directly on
+    /// the `.await`, no `.1` extraction anywhere. If the public signature
+    /// ever regresses to the internal tuple shape, this test stops
+    /// compiling.
+    #[tokio::test]
+    async fn connect_to_peer_public_signature_stays_result_unit() -> Result<()> {
+        let registry = GossipRegistry::<()>::new(test_addr(20_925), test_config());
+        let peer_id = test_peer_id("public-signature-stays-result-unit");
+        // Nothing ever listens here -- the dial is guaranteed to fail,
+        // exercising the `Err` arm of the public wrapper.
+        let addr = test_addr(20_926);
+        registry.configure_peer(peer_id.clone(), addr).await;
+
+        // Written exactly as a downstream caller would: `?` directly on
+        // `.await`, no tuple, no `.1`. Only compiles at all if
+        // `connect_to_peer`'s public signature is `Result<()>`.
+        let err = registry
+            .connect_to_peer(&peer_id)
+            .await
+            .expect_err("nothing listens at addr; the dial must fail");
+        drop(err);
+
+        // The success arm, written the same way: a downstream caller
+        // that only wants to know "did this succeed" gets exactly a
+        // `Result<()>` back, nothing more to unwrap or index into.
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let live_addr = test_addr(20_927);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            live_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(live_addr, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id.clone(), live_addr, conn);
+        registry.configure_peer(peer_id.clone(), live_addr).await;
+        registry.connect_to_peer(&peer_id).await?;
+
+        Ok(())
+    }
+
     /// `record_peer_discovery_connected`'s early return for a
-    /// transport-source-keyed entry must not just decline to (re-)admit a
-    /// slot -- it must retract one already admitted before the flag was
-    /// known (e.g. `mark_peer_connected` ran before handle.rs learned this
-    /// connection was the inbound-accept fallback). Otherwise a stale
-    /// discovery slot for an address the code has since decided must never
-    /// occupy one stays occupied forever.
+    /// transport-source-keyed entry must retract a slot already admitted
+    /// before the flag was known, not just decline to re-admit -- otherwise
+    /// a stale discovery slot stays occupied forever.
     #[tokio::test]
     async fn marking_transport_source_keyed_after_discovery_admission_clears_the_slot() {
         let mut config = test_config_with_seed("transport-source-keyed-late-mark-clears-slot");
@@ -14388,6 +15895,7 @@ mod tests {
             last_sent_sequence: 0,
             consecutive_deltas: 0,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -14414,6 +15922,7 @@ mod tests {
             last_sent_sequence: 5,
             consecutive_deltas: 10,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -15026,6 +16535,65 @@ mod tests {
             failed_state_before.as_ref(),
             "a clear for a peer that has genuinely transitioned away from Connected must not \
              disturb its Failed backoff state"
+        );
+    }
+
+    /// `last_failure_instant`'s own doc comment promises it is kept in
+    /// lockstep with `last_failure_time` at every write site. `mark_peer_
+    /// failed` is a production writer of `last_failure_time` (on
+    /// `known_peers`, not `peers`) that must uphold that promise too, or a
+    /// caller fencing a decision on the instant sees it stale or absent for
+    /// a peer this function just marked failed.
+    #[tokio::test]
+    async fn mark_peer_failed_keeps_last_failure_instant_in_lockstep_with_last_failure_time() {
+        let registry = GossipRegistry::<()>::new(test_addr(7911), test_config());
+        let peer_addr = test_addr(9921);
+
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.known_peers.put(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: None,
+                    dns_name: None,
+                    failures: 0,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: None,
+                    last_failure_instant: None,
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        registry.mark_peer_failed(peer_addr).await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let peer_info = gossip_state
+            .known_peers
+            .peek(&peer_addr)
+            .expect("known_peers entry must still exist after mark_peer_failed");
+        assert!(
+            peer_info.last_failure_time.is_some(),
+            "sanity: last_failure_time must be recorded"
+        );
+        assert!(
+            peer_info.last_failure_instant.is_some(),
+            "last_failure_instant must be recorded in lockstep with last_failure_time"
         );
     }
 
@@ -16926,6 +18494,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp() - 100),
+                    last_failure_instant: Some(std::time::Instant::now() - Duration::from_secs(100)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -17002,6 +18571,7 @@ mod tests {
                     // inside `cleanup_dead_peers` — simulates the clock having
                     // stepped backward since this failure was recorded.
                     last_failure_time: Some(current_timestamp() + 10_000),
+                    last_failure_instant: Some(std::time::Instant::now() + Duration::from_secs(10_000)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -17074,6 +18644,7 @@ mod tests {
                     // Recorded "in the future" relative to the wall clock read
                     // inside `run_vector_clock_gc` — simulates a backward step.
                     last_failure_time: Some(current_timestamp() + 10_000),
+                    last_failure_instant: Some(std::time::Instant::now() + Duration::from_secs(10_000)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -17128,6 +18699,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now() - Duration::from_secs(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -17224,6 +18796,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now() - Duration::from_secs(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: 0,
                     accept_lower_sequence_from: None,
@@ -17349,6 +18922,7 @@ mod tests {
                     // Old enough to satisfy `cleanup_dead_peers`'s
                     // timeout check (50ms in our config).
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now() - Duration::from_secs(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: 0,
                     accept_lower_sequence_from: None,
@@ -17539,6 +19113,7 @@ mod tests {
                     last_sent_sequence: 1,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now() - Duration::from_secs(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -17632,6 +19207,7 @@ mod tests {
                         last_sent_sequence: 0,
                         consecutive_deltas: 0,
                         last_failure_time: None,
+                        last_failure_instant: None,
                         last_dns_refresh_attempt: None,
                         last_response_received_ms: crate::current_timestamp_millis(),
                         accept_lower_sequence_from: None,
@@ -17725,6 +19301,7 @@ mod tests {
                     last_sent_sequence: 1,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now() - Duration::from_secs(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -17810,6 +19387,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(current_timestamp().saturating_sub(10)),
+                    last_failure_instant: Some(std::time::Instant::now() - Duration::from_secs(10)),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -18600,6 +20178,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -18663,6 +20242,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -18716,6 +20296,7 @@ mod tests {
             last_sent_sequence: 8,
             consecutive_deltas: 5,
             last_failure_time: Some(950),
+            last_failure_instant: Some(std::time::Instant::now()),
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -19110,6 +20691,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(1),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis()
                         .saturating_sub(10_000),
@@ -19149,6 +20731,7 @@ mod tests {
         );
         assert!(peer.last_failure_time.is_none());
     }
+
 
     #[tokio::test]
     async fn apply_delta_records_tombstone_when_remove_arrives_before_add() {
@@ -19576,6 +21159,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -19721,6 +21305,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -19768,6 +21353,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -19815,6 +21401,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -19856,6 +21443,7 @@ mod tests {
         let reg = GossipRegistry::<()>::new(test_addr(7020), cfg);
         let peer_addr = test_addr(7021);
         let now = current_timestamp();
+        let now_instant = std::time::Instant::now();
 
         {
             let mut state = reg.gossip_state.lock().await;
@@ -19875,6 +21463,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(now),
+                    last_failure_instant: Some(now_instant),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -19942,6 +21531,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -20039,6 +21629,7 @@ mod tests {
             last_sent_sequence: 0,
             consecutive_deltas: 0,
             last_failure_time: None,
+            last_failure_instant: None,
             last_dns_refresh_attempt: None,
             last_response_received_ms: crate::current_timestamp_millis(),
             accept_lower_sequence_from: None,
@@ -20101,6 +21692,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: Some(0),
+                    last_failure_instant: Some(std::time::Instant::now()),
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -20186,6 +21778,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -20258,6 +21851,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -20322,6 +21916,7 @@ mod tests {
                     last_sent_sequence: 0,
                     consecutive_deltas: 0,
                     last_failure_time: None,
+                    last_failure_instant: None,
                     last_dns_refresh_attempt: None,
                     last_response_received_ms: crate::current_timestamp_millis(),
                     accept_lower_sequence_from: None,
@@ -20820,6 +22415,63 @@ mod tests {
         );
     }
 
+    /// `required_addr` is set by every plain `.connect()`, not only by
+    /// `configure_peer`. Treating it alone as proof of a permanent
+    /// reservation let an ordinary `.connect()`-only peer's address
+    /// ownership survive every session teardown by accident. Unit-level
+    /// pin of the same fix `test_reconnect_cleanup` exercises end to end.
+    #[tokio::test]
+    async fn connection_scoped_claim_releases_even_when_required_addr_is_set_without_configure_peer()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_040), test_config());
+        let peer = test_peer_id("required-addr-without-configure-peer");
+        let observed = test_addr(20_041);
+        let session = test_addr(30_041);
+
+        // Exactly what `Peer::connect()` does before dialing -- NOT
+        // `configure_peer`, which additionally pins the address in the
+        // owner authority.
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer, observed);
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                observed,
+                peer.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session,
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        registry
+            .release_connection_scoped_claims(&peer, session)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&observed),
+            None,
+            "an ordinary peer's address must release on session end even though \
+             `required_addr` (set by every `.connect()` call) is present -- only an \
+             explicit `configure_peer` pin may exempt an address from release"
+        );
+
+        // A genuinely different identity can now claim the address.
+        let other = test_peer_id("required-addr-without-configure-peer-claimant");
+        let (reclaim_outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                observed,
+                other.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                test_addr(30_042),
+            )
+            .await;
+        assert_eq!(
+            reclaim_outcome,
+            crate::addr_ownership::AddrClaimOutcome::Accepted
+        );
+    }
+
     #[tokio::test]
     async fn connection_scoped_owner_releases_after_last_session_but_configured_pin_survives() {
         let registry = GossipRegistry::<()>::new(test_addr(20_015), test_config());
@@ -20932,6 +22584,925 @@ mod tests {
         );
     }
 
+    /// An earlier design kept connection-scoped receipts in a plain map
+    /// mutated by
+    /// each caller after its own claim round-trip to the owner actor
+    /// returned, with no coordination between two concurrent callers. Two
+    /// genuinely concurrent claims for the same peer+address from different
+    /// sessions could each finish their own read-modify-write of that map in
+    /// an order that did not match the owner's actual commit order, leaving
+    /// a still-live session's receipt pinned to a generation the owner no
+    /// longer recognized as current -- so a later, perfectly legitimate
+    /// release of that session was refused forever and the address leaked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_peer_claims_keep_every_live_receipt_at_the_owners_current_generation()
+    {
+        for round in 0..2000u16 {
+            let registry = Arc::new(GossipRegistry::<()>::new(
+                test_addr(20_000 + round),
+                test_config(),
+            ));
+            let peer = test_peer_id("concurrent-receipt-transfer");
+            let node_id = peer.to_node_id();
+            let observed = test_addr(24_000 + round);
+            let session_a = test_addr(28_000 + round);
+            let session_b = test_addr(32_000 + round);
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let reg_a = registry.clone();
+            let barrier_a = barrier.clone();
+            let task_a = tokio::spawn(async move {
+                barrier_a.wait().await;
+                reg_a
+                    .add_connection_scoped_peer_claim(
+                        observed,
+                        node_id,
+                        crate::addr_ownership::ClaimKind::Verified,
+                        session_a,
+                    )
+                    .await
+            });
+
+            let reg_b = registry.clone();
+            let barrier_b = barrier.clone();
+            let task_b = tokio::spawn(async move {
+                barrier_b.wait().await;
+                reg_b
+                    .add_connection_scoped_peer_claim(
+                        observed,
+                        node_id,
+                        crate::addr_ownership::ClaimKind::Verified,
+                        session_b,
+                    )
+                    .await
+            });
+
+            let (result_a, result_b) = tokio::join!(task_a, task_b);
+            let (outcome_a, _) = result_a.expect("task a panicked");
+            let (outcome_b, _) = result_b.expect("task b panicked");
+            assert_eq!(outcome_a, crate::addr_ownership::AddrClaimOutcome::Accepted);
+            assert_eq!(outcome_b, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+            // Both sessions are live. Releasing either one alone must never
+            // drop ownership: the other session's receipt must still be
+            // recognized as covering the address, no matter which of the two
+            // commands the owner actually committed last.
+            registry
+                .release_connection_scoped_claims(&peer, session_a)
+                .await;
+            assert_eq!(
+                registry.registry_owner.routes_to(&observed),
+                Some(peer.clone()),
+                "round {round}: session_b is still live and must keep the address owned"
+            );
+
+            registry
+                .release_connection_scoped_claims(&peer, session_b)
+                .await;
+            assert_eq!(
+                registry.registry_owner.routes_to(&observed),
+                None,
+                "round {round}: the last live session must release ownership"
+            );
+        }
+    }
+
+    /// A session's exit racing a brand-new claim for the same address:
+    /// under an unsynced map, the exit's take-then-compare-and-remove
+    /// could lose to the claim's generation bump and leave a ghost receipt
+    /// for a session that no longer exists, permanently refusing every
+    /// future release for that address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_exit_racing_a_fresh_claim_never_strands_a_ghost_receipt() {
+        for round in 0..200u16 {
+            let registry = Arc::new(GossipRegistry::<()>::new(
+                test_addr(42_000 + round),
+                test_config(),
+            ));
+            let peer = test_peer_id("exit-races-fresh-claim");
+            let node_id = peer.to_node_id();
+            let observed = test_addr(42_500 + round);
+            let session_old = test_addr(43_000 + round);
+            let session_new = test_addr(43_500 + round);
+
+            let (outcome, _) = registry
+                .add_connection_scoped_peer_claim(
+                    observed,
+                    node_id,
+                    crate::addr_ownership::ClaimKind::Verified,
+                    session_old,
+                )
+                .await;
+            assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let reg_release = registry.clone();
+            let peer_release = peer.clone();
+            let barrier_release = barrier.clone();
+            let release_task = tokio::spawn(async move {
+                barrier_release.wait().await;
+                reg_release
+                    .release_connection_scoped_claims(&peer_release, session_old)
+                    .await;
+            });
+
+            let reg_claim = registry.clone();
+            let barrier_claim = barrier.clone();
+            let claim_task = tokio::spawn(async move {
+                barrier_claim.wait().await;
+                reg_claim
+                    .add_connection_scoped_peer_claim(
+                        observed,
+                        node_id,
+                        crate::addr_ownership::ClaimKind::Verified,
+                        session_new,
+                    )
+                    .await
+            });
+
+            let (release_result, claim_result) = tokio::join!(release_task, claim_task);
+            release_result.expect("release task panicked");
+            let (claim_outcome, _) = claim_result.expect("claim task panicked");
+            assert_eq!(
+                claim_outcome,
+                crate::addr_ownership::AddrClaimOutcome::Accepted
+            );
+
+            // Whichever order the owner actually serialized these two
+            // commands in, `session_new` ends up the address's sole live
+            // session. Its own exit must therefore release the address -- if
+            // a ghost receipt were left behind for `session_old`, this would
+            // wrongly find the address "covered" forever.
+            registry
+                .release_connection_scoped_claims(&peer, session_new)
+                .await;
+            assert_eq!(
+                registry.registry_owner.routes_to(&observed),
+                None,
+                "round {round}: no ghost receipt may survive to block session_new's own release"
+            );
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    /// The reservation's decision must also bind to the PEER IDENTITY
+    /// selection captured, not just the causal fence: a plain claim or
+    /// `configure_peer` deliberately does not refresh `claim_committed_at`,
+    /// so the causal fence alone would not notice a different peer taking
+    /// the address after selection.
+    #[tokio::test]
+    async fn reap_reservation_refuses_when_a_different_identity_claims_the_address_after_selection()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_900), test_config());
+        let dead_peer_id = test_peer_id("reap-identity-old-owner");
+        let new_peer_id = test_peer_id("reap-identity-new-owner");
+        let peer_addr = test_addr(20_901);
+        let actor_name = "svc-reap-identity-race";
+
+        // The dead peer here is only ever known through `GossipState` --
+        // no owner-level claim was ever made for it.
+        let evidence_before = std::time::Instant::now();
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(dead_peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp()),
+                    last_failure_instant: Some(evidence_before),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        // Selection's own capture: unowned, unpinned, matching the state
+        // above exactly.
+        let selected_ownership = registry.registry_owner.ownership_token(&peer_addr);
+        let selected_pin = registry.registry_owner.pin_owner(&peer_addr);
+        assert_eq!(
+            selected_ownership, None,
+            "sanity: no owner-level claim exists yet"
+        );
+        assert_eq!(selected_pin, None, "sanity: nothing is pinned yet");
+
+        // THE WINDOW: a DIFFERENT identity claims `peer_addr` -- a plain
+        // claim, which (like an operator `configure_peer`) deliberately
+        // does not touch `claim_committed_at`, so the causal fence alone
+        // would not notice this.
+        let commit = registry
+            .registry_owner
+            .claim(
+                peer_addr,
+                crate::addr_ownership::Claim {
+                    node_id: new_peer_id.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        assert!(commit.is_accepted(), "the new identity's claim must succeed");
+
+        // The new owner's own, entirely legitimate state: an actor, a
+        // capability record, and clock-calibration state -- exactly what
+        // a peer that has genuinely started using this address would
+        // have.
+        let location = RemoteActorLocation::new_with_peer(peer_addr, new_peer_id.clone());
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), location);
+        let _ = registry.peer_capabilities.upsert_sync(peer_addr, clock_caps());
+        let _ = registry
+            .clock_probe_state
+            .upsert_sync(peer_addr, PeerClockProbeState::default());
+
+        // Reserving with the STALE identity selection captured must be
+        // refused.
+        let stale_reservation = registry
+            .registry_owner
+            .reserve_for_reap(
+                peer_addr,
+                evidence_before,
+                selected_ownership,
+                selected_pin,
+                Some(dead_peer_id.clone()),
+            )
+            .await;
+        assert!(
+            stale_reservation.is_none(),
+            "a reservation carrying the SELECTED (now stale) identity must be refused once a \
+             different identity has claimed the address"
+        );
+
+        // The new owner's state is completely untouched -- nothing ever
+        // authorized destructive work against it.
+        assert!(
+            registry.actor_state.known_actors.contains_sync(actor_name),
+            "the new owner's actor must survive a refused reservation"
+        );
+        assert!(
+            registry.peer_capabilities.contains_sync(&peer_addr),
+            "the new owner's capability record must survive a refused reservation"
+        );
+        assert!(
+            registry.clock_probe_state.contains_sync(&peer_addr),
+            "the new owner's clock-calibration state must survive a refused reservation"
+        );
+
+        // For contrast: reserving with the CURRENT, correct identity
+        // succeeds -- proving the refusal above is specifically about the
+        // stale identity, not some unrelated reason (e.g. the address
+        // being unreservable for some other cause).
+        let current_ownership = registry.registry_owner.ownership_token(&peer_addr);
+        let current_pin = registry.registry_owner.pin_owner(&peer_addr);
+        let fresh_reservation = registry
+            .registry_owner
+            .reserve_for_reap(
+                peer_addr,
+                evidence_before,
+                current_ownership,
+                current_pin,
+                Some(new_peer_id.clone()),
+            )
+            .await;
+        assert!(
+            fresh_reservation.is_some(),
+            "the CURRENT identity must still be reservable"
+        );
+        fresh_reservation.expect("checked above").release().await;
+    }
+
+    /// Unlike the sibling test above (a stale ownership/pin read), this
+    /// isolates the OTHER gap: `expected_ownership`/`expected_pin` are
+    /// CURRENT here; only `node_id` is stale -- the exact tuple a real
+    /// race would leave. Only `expected_node_id` catches it.
+    #[tokio::test]
+    async fn reap_reservation_refuses_when_selections_node_id_predates_a_concurrent_claim() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_930), test_config());
+        let old_peer_id = test_peer_id("reap-node-id-race-old-owner");
+        let new_peer_id = test_peer_id("reap-node-id-race-new-owner");
+        let peer_addr = test_addr(20_931);
+        let new_actor_name = "svc-reap-node-id-race-new-owner";
+
+        // The dead candidate `cleanup_dead_peers` selected: `GossipState`
+        // shows the OLD peer's node_id.
+        let evidence_before = std::time::Instant::now();
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: false,
+                    node_id: Some(old_peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 3,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(current_timestamp()),
+                    last_failure_instant: Some(evidence_before),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis(),
+                    accept_lower_sequence_from: None,
+                    current_session_source: None,
+                    current_session_connection: None,
+                    current_session_epoch: 0,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+        // Selection's OWN `GossipState` read, captured FIRST -- exactly
+        // the `info.node_id` value `cleanup_dead_peers`'s real selection
+        // closure would have captured at this point in the race.
+        let selected_node_id = Some(old_peer_id.clone());
+
+        // THE WINDOW: a genuinely DIFFERENT identity claims `peer_addr` --
+        // a plain claim (like `configure_peer`'s own Verified claim) never
+        // touches `claim_committed_at`, so the causal fence alone would
+        // not notice this either.
+        let commit = registry
+            .registry_owner
+            .claim(
+                peer_addr,
+                crate::addr_ownership::Claim {
+                    node_id: new_peer_id.clone(),
+                    kind: crate::addr_ownership::ClaimKind::Verified,
+                },
+                false,
+            )
+            .await;
+        assert!(commit.is_accepted(), "the new identity's claim must succeed");
+
+        // Selection's SEPARATE, later owner reads -- evaluated AFTER the
+        // race, exactly as the real closure's `ownership_token`/
+        // `pin_owner` calls (a few lines after its `info.node_id` read)
+        // would be. These are the CURRENT, correct values.
+        let ownership = registry.registry_owner.ownership_token(&peer_addr);
+        let pin_owner = registry.registry_owner.pin_owner(&peer_addr);
+        assert_eq!(
+            ownership.as_ref().map(|token| token.owner().clone()),
+            Some(new_peer_id.clone()),
+            "sanity: ownership reads as the NEW identity, current and correct"
+        );
+
+        // The new owner's own, entirely legitimate state: an actor and a
+        // `peer_to_actors` side-table entry -- exactly what a peer that
+        // has genuinely started using this address would have.
+        let new_location = RemoteActorLocation::new_with_peer(peer_addr, new_peer_id.clone());
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(new_actor_name.to_string(), new_location);
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut actors = HashSet::new();
+            actors.insert(new_actor_name.to_string());
+            gossip_state.peer_to_actors.insert(peer_addr, actors);
+            // `GossipState`'s own node_id catches up to the new peer here
+            // -- see this test's own doc comment for why.
+            gossip_state
+                .peers
+                .get_mut(&peer_addr)
+                .expect("inserted above")
+                .node_id = Some(new_peer_id.to_node_id());
+        }
+
+        // The Frankenstein tuple: the OLD node_id selection captured,
+        // paired with the NEW, current, correct ownership/pin.
+        let mismatched_reservation = registry
+            .registry_owner
+            .reserve_for_reap(
+                peer_addr,
+                evidence_before,
+                ownership.clone(),
+                pin_owner.clone(),
+                selected_node_id,
+            )
+            .await;
+        assert!(
+            mismatched_reservation.is_none(),
+            "a reservation whose node_id does not correspond to the CURRENT, just-reconfirmed \
+             ownership/pin identity must be refused, even though ownership/pin alone would pass"
+        );
+
+        // Nothing was authorized, so nothing may have been destroyed --
+        // proved directly rather than merely inferred from the refusal.
+        assert!(
+            registry.actor_state.known_actors.contains_sync(new_actor_name),
+            "the new owner's actor must survive a refused reservation"
+        );
+        {
+            let gossip_state = registry.gossip_state.lock().await;
+            assert!(
+                gossip_state.peer_to_actors.contains_key(&peer_addr),
+                "the new owner's peer_to_actors side-table entry must survive a refused \
+                 reservation"
+            );
+        }
+        assert!(
+            registry
+                .actor_state
+                .removed_actors
+                .read_sync(new_actor_name, |_, _| ())
+                .is_none(),
+            "no tombstone may exist for the new owner's actor -- nothing was ever authorized to \
+             destroy it"
+        );
+
+        // For contrast: reserving with the CURRENT, correct node_id
+        // succeeds -- proving the refusal above is specifically about the
+        // mismatch, not some unrelated cause.
+        let correct_reservation = registry
+            .registry_owner
+            .reserve_for_reap(
+                peer_addr,
+                evidence_before,
+                ownership,
+                pin_owner,
+                Some(new_peer_id.clone()),
+            )
+            .await;
+        assert!(
+            correct_reservation.is_some(),
+            "the SAME ownership/pin, paired with the CORRECT node_id, must still be reservable"
+        );
+        correct_reservation.expect("checked above").release().await;
+    }
+
+
+    /// A TEMPORARY `ReapInProgress` refusal must not collapse into the SAME
+    /// `Rejected` a genuine PERMANENT arbitration loss produces. Holds a
+    /// reap reservation long enough to exhaust the retry budget, asserts
+    /// `TemporarilyBlocked`, then releases and retries, asserting success.
+    /// `start_paused = true`: exhausting a 30s budget for real would be
+    /// glacial.
+    #[tokio::test(start_paused = true)]
+    async fn configure_peer_reports_temporarily_blocked_instead_of_silently_discarding_a_reap_race()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_920), test_config());
+        let peer_id = test_peer_id("configure-peer-reap-race");
+        let connect_addr = test_addr(20_921);
+
+        // The address is unclaimed and unpinned -- exactly what a
+        // `cleanup_dead_peers` sweep would have selected and reserved for
+        // some OTHER, unrelated dead peer.
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(connect_addr, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        let outcome = registry
+            .configure_peer_with_outcome(peer_id.clone(), connect_addr)
+            .await;
+        assert_eq!(
+            outcome,
+            ConfigurePeerOutcome::TemporarilyBlocked,
+            "a configure_peer call that loses every retry against a live reap reservation must \
+             report TemporarilyBlocked, not silently collapse into the same outcome as a \
+             permanent rejection"
+        );
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            None,
+            "nothing must have been applied -- no ConnectionPool route"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            None,
+            "nothing must have been applied -- no ownership claim"
+        );
+
+        // Release the reservation and retry the IDENTICAL call: it must
+        // now succeed normally, proving TemporarilyBlocked was truthful
+        // (a retryable collision), not a disguised permanent failure.
+        reservation.release().await;
+        let outcome = registry
+            .configure_peer_with_outcome(peer_id.clone(), connect_addr)
+            .await;
+        assert_eq!(
+            outcome,
+            ConfigurePeerOutcome::Applied,
+            "the identical call must succeed once the reservation is released"
+        );
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(connect_addr)
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            Some(peer_id)
+        );
+    }
+
+    /// A detached background retry (`queue_configure_peer_until_applied`)
+    /// only checked `shutdown` before each call into this retry loop, not
+    /// on every sub-attempt inside it -- so a shutdown beginning partway
+    /// through the up-to-30s budget let it keep sleeping and retrying well
+    /// past `shutdown_and_wait` returning. Drives the retry loop directly
+    /// via `configure_peer_with_outcome` (not the queued wrapper) with
+    /// shutdown already set, so the ONLY thing that can make this return
+    /// promptly is the retry loop's own internal check, not the wrapper's
+    /// cycle-entry gate.
+    #[tokio::test(start_paused = true)]
+    async fn configure_peer_retry_stands_down_promptly_once_shutdown_begins() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_990), test_config());
+        let peer_id = test_peer_id("configure-peer-shutdown-mid-retry");
+        let connect_addr = test_addr(20_991);
+
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(connect_addr, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        registry
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let started = tokio::time::Instant::now();
+        let outcome = registry
+            .configure_peer_with_outcome(peer_id.clone(), connect_addr)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            ConfigurePeerOutcome::TemporarilyBlocked,
+            "a retry that discovers shutdown mid-loop must report TemporarilyBlocked, the same \
+             not-applied signal the budget-exhausted case reports"
+        );
+        assert!(
+            elapsed < CONFIGURE_PEER_REAP_RETRY_BUDGET,
+            "shutdown must cut the retry short well before the full budget elapses -- got \
+             {elapsed:?}"
+        );
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            None,
+            "nothing must have been applied"
+        );
+        assert_eq!(registry.registry_owner.routes_to(&connect_addr), None);
+
+        reservation.release().await;
+    }
+
+    /// The owner-level claim/pin transaction cannot be partially applied,
+    /// so it still commits even once shutdown has begun -- but the connect
+    /// handler that follows it is a public, unrestricted callback that may
+    /// dial out, arbitrary foreign code `shutdown_and_wait` does not wait
+    /// for. Invoking it after shutdown started risks it still running,
+    /// holding this cloned registry, after `shutdown_and_wait` has already
+    /// returned to its caller -- so it must be skipped, even though the
+    /// pin itself genuinely applies.
+    #[tokio::test]
+    async fn configure_peer_skips_the_connect_handler_once_shutdown_has_begun() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_992), test_config());
+        let peer_id = test_peer_id("configure-peer-shutdown-skip-handler");
+        let connect_addr = test_addr(20_993);
+
+        let recorder = Arc::new(RecordingConnectHandler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry
+            .set_peer_connect_handler(recorder.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        registry
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let outcome = registry
+            .configure_peer_with_outcome(peer_id.clone(), connect_addr)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ConfigurePeerOutcome::Applied,
+            "the owner-level claim/pin must still apply during shutdown -- that atomic \
+             transaction cannot be partially applied"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            Some(peer_id),
+            "ownership must be genuinely committed"
+        );
+        assert!(
+            recorder.calls.lock().expect("recorder mutex").is_empty(),
+            "the connect handler must not be invoked once shutdown has begun, even though the \
+             pin itself was applied"
+        );
+    }
+
+    /// A detached retry task's own cooperative `self.shutdown` checks only
+    /// narrow the window a shutdown beginning mid-sleep or
+    /// mid-owner-round-trip can land in -- they cannot close it: after
+    /// waking from its backoff sleep, the task attempts the next owner
+    /// command before checking `shutdown` again, so a reservation that
+    /// clears in that exact gap still gets applied. `shutdown`'s own
+    /// `abort_all()` on `configure_peer_retry_tasks` is what makes "no
+    /// queued retry outlives this call" structural rather than
+    /// probabilistic. Proven by starting the retry, letting it reach its
+    /// own sleep, shutting down while it is still asleep, THEN releasing
+    /// the reservation it was waiting on -- if the task were still alive,
+    /// waking up would find the address free and apply the configuration.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_a_queued_configure_peer_retry_asleep_between_sub_attempts() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_994), test_config());
+        let peer_id = test_peer_id("configure-peer-shutdown-aborts-queued-retry");
+        let connect_addr = test_addr(20_995);
+
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(connect_addr, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        registry.queue_configure_peer_until_applied(peer_id.clone(), connect_addr, 0);
+
+        // Let the spawned task reach its own retry loop and its first
+        // sleep -- no fixed wall-clock wait needed under paused time:
+        // yielding gives it every opportunity to run up to (but not past)
+        // that pending timer.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        registry.shutdown().await;
+
+        // Released only AFTER shutdown -- if the task were still alive and
+        // asleep, waking up would find this and apply it.
+        reservation.release().await;
+
+        // Advance well past both the backoff the task would have woken up
+        // at and the full retry budget besides, giving an unaborted task
+        // every opportunity to retry, succeed, and apply.
+        tokio::time::advance(CONFIGURE_PEER_REAP_RETRY_BUDGET * 2).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            None,
+            "an aborted retry task must never install a pin after shutdown returned"
+        );
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            None,
+            "an aborted retry task must never mutate routing after shutdown returned"
+        );
+    }
+
+    /// Proves the QUEUEING guarantee via the PUBLIC `configure_peer`:
+    /// holds a reap reservation for the entire first-attempt budget, then
+    /// asserts the call still RETURNS (no hang) with nothing applied yet,
+    /// then releases the reservation and polls for the queued retry to
+    /// apply it.
+    #[tokio::test(start_paused = true)]
+    async fn configure_peer_queues_and_eventually_applies_after_the_retry_budget_is_exhausted()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_930), test_config());
+        let peer_id = test_peer_id("configure-peer-queues-past-budget");
+        let connect_addr = test_addr(20_931);
+
+        // Exactly as in the sibling test above: an unclaimed, unpinned
+        // address a `cleanup_dead_peers` sweep would have reserved for some
+        // OTHER, unrelated dead peer.
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(connect_addr, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        let registry_for_call = registry.clone();
+        let peer_id_for_call = peer_id.clone();
+        let call = tokio::spawn(async move {
+            registry_for_call
+                .configure_peer(peer_id_for_call, connect_addr)
+                .await
+        });
+
+        // Never released during this call, so the first attempt exhausts
+        // its full budget and reports `TemporarilyBlocked`, which must
+        // turn into a queued retry. The call must still complete.
+        call.await.expect("configure_peer task panicked");
+
+        // Nothing applied yet -- the reservation is STILL held.
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            None,
+            "sanity: the configuration must not be applied yet -- the reservation is still held, \
+             so any success here would not be evidence of the queued retry actually working"
+        );
+
+        // Release the reservation. The queued background retry must
+        // notice and apply the configuration on its own.
+        reservation.release().await;
+        for _ in 0..200 {
+            if registry.connection_pool.get_required_peer_addr(&peer_id) == Some(connect_addr) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(connect_addr),
+            "the queued retry must eventually apply the operator's configuration once the \
+             reservation clears -- the request must be delayed, not dropped, once the first \
+             attempt's budget is exhausted"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            Some(peer_id)
+        );
+    }
+
+    /// Configure P at A (reap-reserved, queues a retry), then reconfigure
+    /// P at B (free, succeeds immediately): once A's reservation clears,
+    /// the stale queued retry must not evict B. Proves it: after B
+    /// succeeds, releases A's reservation and gives the queued retry
+    /// scheduling opportunities, then asserts B is STILL the pin.
+    #[tokio::test(start_paused = true)]
+    async fn queued_configure_peer_retry_does_not_overwrite_a_newer_configure_peer_call() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_935), test_config());
+        let peer_id = test_peer_id("configure-peer-generation-fence");
+        let addr_a = test_addr(20_936);
+        let addr_b = test_addr(20_937);
+
+        // A is unclaimed and unpinned -- exactly what a `cleanup_dead_peers`
+        // sweep would have reserved for some OTHER, unrelated dead peer.
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(addr_a, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        // Call 1: configure P at A. A is reap-reserved, so this exhausts
+        // its synchronous budget and queues a background retry carrying
+        // whatever generation it captured at entry.
+        let registry_for_call1 = registry.clone();
+        let peer_id_for_call1 = peer_id.clone();
+        let call1 = tokio::spawn(async move {
+            registry_for_call1
+                .configure_peer(peer_id_for_call1, addr_a)
+                .await
+        });
+        call1.await.expect("configure_peer task panicked");
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            None,
+            "sanity: nothing must be applied yet -- A is still reap-reserved"
+        );
+
+        // Call 2: the operator reconsiders and configures P at B instead.
+        // B is free, so this succeeds immediately and bumps
+        // `configure_peer_generation[peer_id]` past call 1's captured
+        // value.
+        registry.configure_peer(peer_id.clone(), addr_b).await;
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(addr_b),
+            "sanity: the newer call must have applied B"
+        );
+
+        // Release A's reservation -- call 1's queued retry can now make
+        // progress -- and give it real scheduling time to run its
+        // generation check (and, absent the fix, complete a full
+        // multi-step, cross-task claim against A). `sleep`, not
+        // `yield_now`: standing down itself needs only one scheduling
+        // step, but reproducing the PRE-fix behavior for this test's own
+        // red-confirmation requires the queued retry to fully complete a
+        // real owner round trip, which -- like the sibling test above --
+        // needs actual (paused-clock-friendly) scheduling time to unfold
+        // across tasks, not a fixed handful of yields.
+        reservation.release().await;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(addr_b),
+            "the operator's later, deliberate B configuration must survive -- a stale queued \
+             retry for A must recognize it has been superseded and must not overwrite it once \
+             A's reservation clears"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr_b),
+            Some(peer_id.clone()),
+            "B must still be P's genuine owned pin"
+        );
+        assert_ne!(
+            registry.registry_owner.routes_to(&addr_a),
+            Some(peer_id),
+            "A must not have been claimed by the stale, superseded retry"
+        );
+    }
+
+    /// Same bug class as the sibling test above, but for the internal
+    /// retry loop WITHIN one call: configures P at A (reap-reserved,
+    /// parks on backoff), then delivers a genuinely newer `configure_peer`
+    /// for the SAME peer to free address B. Once A's reservation clears,
+    /// the first call's next sub-attempt must stand down.
+    #[tokio::test(start_paused = true)]
+    async fn configure_peer_internal_retry_does_not_overwrite_a_newer_configure_peer_call() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_950), test_config());
+        let peer_id = test_peer_id("configure-peer-internal-retry-generation-fence");
+        let addr_a = test_addr(20_951);
+        let addr_b = test_addr(20_952);
+
+        let reservation = registry
+            .registry_owner
+            .reserve_for_reap(addr_a, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("an unclaimed, unpinned address must be reservable");
+
+        // Call 1: A is reap-reserved, so this call's own FIRST internal
+        // sub-attempt bumps the generation, hits ReapInProgress, and parks
+        // on its own internal backoff sleep, never reaching the outer
+        // queued-retry path.
+        let registry_for_call1 = registry.clone();
+        let peer_id_for_call1 = peer_id.clone();
+        let call1 = tokio::spawn(async move {
+            registry_for_call1
+                .configure_peer(peer_id_for_call1, addr_a)
+                .await;
+        });
+
+        // Give call 1 scheduling opportunity to park on its backoff sleep.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // TOO LATE for call 1's first sub-attempt: B is free, so this
+        // succeeds immediately and bumps the generation past it.
+        registry.configure_peer(peer_id.clone(), addr_b).await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr_b),
+            Some(peer_id.clone()),
+            "sanity: the newer call must have applied B"
+        );
+
+        // Release A's reservation and let call 1's own internal retry
+        // loop wake up and make its NEXT sub-attempt.
+        reservation.release().await;
+        call1.await.expect("call1 task panicked");
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr_b),
+            Some(peer_id.clone()),
+            "the newer call's own pin at addr_b must survive -- call 1's internal retry must \
+             recognize it was superseded and must not overwrite it"
+        );
+        assert_ne!(
+            registry.registry_owner.routes_to(&addr_a),
+            Some(peer_id),
+            "A must not have been claimed by call 1's stale internal retry"
+        );
+    }
+
+
+
+
     #[tokio::test]
     async fn reconfiguring_peer_releases_previous_configured_address() {
         let registry = GossipRegistry::<()>::new(test_addr(20_029), test_config());
@@ -20951,6 +23522,1085 @@ mod tests {
             registry.registry_owner.routes_to(&new_addr),
             Some(peer),
             "reconfiguration must retain the new verified pin"
+        );
+    }
+
+    /// Two concurrent `configure_peer` calls for the SAME peer, each to a
+    /// DIFFERENT address, must never leave the owner's pin and
+    /// `ConnectionPool`'s route disagreeing about which address is
+    /// current -- these used to be two separately-ordered, individually
+    /// atomic writes that could settle differently under real concurrency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_configure_peer_calls_keep_pin_and_configured_route_consistent() {
+        for round in 0..200u16 {
+            let registry = Arc::new(GossipRegistry::<()>::new(
+                test_addr(45_000 + round),
+                test_config(),
+            ));
+            let peer_id = test_peer_id("concurrent-configure-peer");
+            let addr_a = test_addr(45_500 + round);
+            let addr_b = test_addr(46_000 + round);
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let reg_a = registry.clone();
+            let peer_a = peer_id.clone();
+            let barrier_a = barrier.clone();
+            let task_a = tokio::spawn(async move {
+                barrier_a.wait().await;
+                reg_a.configure_peer(peer_a, addr_a).await;
+            });
+
+            let reg_b = registry.clone();
+            let peer_b = peer_id.clone();
+            let barrier_b = barrier.clone();
+            let task_b = tokio::spawn(async move {
+                barrier_b.wait().await;
+                reg_b.configure_peer(peer_b, addr_b).await;
+            });
+
+            let (a, b) = tokio::join!(task_a, task_b);
+            a.expect("task a panicked");
+            b.expect("task b panicked");
+
+            // Whichever address `ConnectionPool` reports as current MUST
+            // be exactly the address the owner actually protects from
+            // release -- the consistency property under test is about the
+            // WINNER: `ConnectionPool` and the owner must agree.
+            let configured = registry
+                .connection_pool
+                .get_required_peer_addr(&peer_id)
+                .unwrap_or_else(|| {
+                    panic!("round {round}: configure_peer must leave a configured route")
+                });
+            assert!(
+                configured == addr_a || configured == addr_b,
+                "round {round}: configured route must be one of the two addresses raced"
+            );
+
+            let token = registry
+                .registry_owner
+                .ownership_token(&configured)
+                .unwrap_or_else(|| panic!("round {round}: still owned"));
+            // The pinned/configured address must actually be OWNED by
+            // this exact peer, not merely pinned with no matching claim.
+            assert_eq!(
+                token.owner(),
+                &peer_id,
+                "round {round}: the configured/pinned address must be owned by the peer \
+                 it is configured for, not merely pinned independent of any claim"
+            );
+            assert!(
+                registry
+                    .registry_owner
+                    .release(configured, peer_id.clone(), token.generation())
+                    .await
+                    .is_none(),
+                "round {round}: ConnectionPool's configured route ({configured}) must \
+                 match the owner's actual pin, which must therefore refuse release"
+            );
+        }
+    }
+
+    struct RecordingConnectHandler {
+        calls: std::sync::Mutex<Vec<SocketAddr>>,
+    }
+
+    impl PeerConnectHandler for RecordingConnectHandler {
+        fn handle_peer_connect(
+            &self,
+            peer_addr: SocketAddr,
+            _peer_id: Option<crate::PeerId>,
+        ) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.calls.lock().expect("recorder mutex").push(peer_addr);
+            })
+        }
+    }
+
+    /// `configure_peer` must not serialize its whole sequence behind a
+    /// per-peer lock: `PeerConnectHandler` is a public callback, and a
+    /// handler that calls `configure_peer` again for the SAME peer would
+    /// deadlock on a non-reentrant lock -- ordinary application code, not
+    /// a contrived input. Fixed by revalidating `pin_is_current` before
+    /// EACH side effect instead of holding a lock.
+    #[tokio::test]
+    async fn configure_peer_does_not_deadlock_when_its_connect_handler_reenters_it_for_the_same_peer()
+     {
+        struct ReenteringConnectHandler {
+            registry: std::sync::OnceLock<Arc<GossipRegistry<()>>>,
+            peer_id: crate::PeerId,
+            reentrant_addr: SocketAddr,
+            reentered: std::sync::atomic::AtomicBool,
+            calls: std::sync::Mutex<Vec<SocketAddr>>,
+        }
+
+        impl PeerConnectHandler for ReenteringConnectHandler {
+            fn handle_peer_connect(
+                &self,
+                peer_addr: SocketAddr,
+                _peer_id: Option<crate::PeerId>,
+            ) -> futures::future::BoxFuture<'_, ()> {
+                Box::pin(async move {
+                    self.calls.lock().expect("recorder mutex").push(peer_addr);
+                    // Guard against infinite recursion: only reenter once,
+                    // from the OUTER call's own invocation.
+                    if !self.reentered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let registry = self
+                            .registry
+                            .get()
+                            .expect("registry must be set before configure_peer can run")
+                            .clone();
+                        registry
+                            .configure_peer(self.peer_id.clone(), self.reentrant_addr)
+                            .await;
+                    }
+                })
+            }
+        }
+
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(20_840), test_config()));
+        let peer_id = test_peer_id("configure-peer-reentrant-handler");
+        let outer_addr = test_addr(20_841);
+        let inner_addr = test_addr(20_842);
+
+        let handler = Arc::new(ReenteringConnectHandler {
+            registry: std::sync::OnceLock::new(),
+            peer_id: peer_id.clone(),
+            reentrant_addr: inner_addr,
+            reentered: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        handler
+            .registry
+            .set(registry.clone())
+            .unwrap_or_else(|_| panic!("registry set exactly once, before configure_peer runs"));
+        registry
+            .set_peer_connect_handler(handler.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.configure_peer(peer_id.clone(), outer_addr),
+        )
+        .await
+        .expect(
+            "configure_peer must not deadlock when its own connect handler reenters it for \
+             the same peer",
+        );
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&inner_addr),
+            Some(peer_id.clone()),
+            "the reentrant (later) call's target must win outright"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&outer_addr),
+            None,
+            "the outer call's now-evicted address must not still be owned"
+        );
+        let calls = handler.calls.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            calls,
+            vec![outer_addr, inner_addr],
+            "the outer call's follow-up must invoke the handler for its own address before \
+             the nested reentrant call invokes it for its address"
+        );
+    }
+
+
+    /// The atomic owner transaction only makes the COMMIT serial;
+    /// `configure_peer`'s own follow-up (reindexing the connection pool,
+    /// notifying the connect handler) runs after and is not itself
+    /// serialized -- a call whose pin was evicted by a concurrent
+    /// `configure_peer` for the same peer can still resume last and act on
+    /// its now-losing address.
+    ///
+    /// Drives the two halves of `configure_peer` by hand, by construction
+    /// rather than a real race (which could pass by accident): the first
+    /// call's owner transaction completes and is evicted BEFORE the
+    /// second, winning call runs start to finish, and only then does the
+    /// first call's deferred follow-up run.
+    #[tokio::test]
+    async fn configure_peer_stands_down_when_its_own_pin_was_evicted_before_it_resumes() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_800), test_config());
+        let peer_id = test_peer_id("configure-peer-stale-resume");
+        let losing_addr = test_addr(20_801);
+        let winning_addr = test_addr(20_802);
+
+        let recorder = Arc::new(RecordingConnectHandler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry
+            .set_peer_connect_handler(recorder.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        // The first call's owner transaction, run to completion in
+        // isolation -- exactly the atomic claim+pin commit `configure_peer`
+        // itself submits.
+        let (outcome, _receipt, _evicted, _reap_in_progress, _generation, _superseded) = registry
+            .add_operator_configured_peer_claim(losing_addr, peer_id.to_node_id(), None)
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // The second, winning call for the SAME peer runs start to finish,
+        // including its own follow-up work -- evicting and releasing
+        // `losing_addr`'s ownership atomically, then reindexing/notifying
+        // for `winning_addr`.
+        registry
+            .configure_peer(peer_id.clone(), winning_addr)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&losing_addr),
+            None,
+            "the losing address's ownership must already be released by the winner's own \
+             atomic transaction"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&winning_addr),
+            Some(peer_id.clone())
+        );
+
+        // The first call's own deferred follow-up work FINALLY runs now.
+        // It must discover its pin is gone and do nothing.
+        registry
+            .apply_configure_peer_connection_update(peer_id.clone(), losing_addr)
+            .await;
+
+        let calls = recorder.calls.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            calls,
+            vec![winning_addr],
+            "a configure_peer call that resumes after its own pin was evicted must not \
+             notify the connect handler for its losing address -- only the winner's \
+             follow-up work, from configure_peer's own call above, may have run"
+        );
+    }
+
+    /// Whatever closes the race for a concurrent `configure_peer` (the
+    /// sibling test above) must also close it for `migrate`: its pin carry
+    /// publishes into the SAME `pin_is_current` reads, in the SAME atomic
+    /// step as the address move. Driven through the owner's `migrate`
+    /// directly so the test doesn't depend on DNS timing.
+    #[tokio::test]
+    async fn configure_peer_stands_down_when_a_migration_moved_its_pin_before_it_resumes() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_820), test_config());
+        let peer_id = test_peer_id("configure-peer-migrate-race");
+        let old_addr = test_addr(20_821);
+        let migrated_addr = test_addr(20_822);
+
+        let recorder = Arc::new(RecordingConnectHandler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry
+            .set_peer_connect_handler(recorder.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        // The pin this call's follow-up will (stale-)validate against.
+        let (outcome, _receipt, _evicted, _reap_in_progress, _generation, _superseded) = registry
+            .add_operator_configured_peer_claim(old_addr, peer_id.to_node_id(), None)
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // A concurrent DNS re-resolution migrates this SAME peer's
+        // ownership -- and its pin, carried atomically -- from old_addr to
+        // migrated_addr, exactly what `refresh_peer_dns` does in
+        // production.
+        let token = registry
+            .registry_owner
+            .ownership_token(&old_addr)
+            .expect("old_addr must still be owned");
+        let migrated = registry
+            .registry_owner
+            .migrate(
+                old_addr,
+                migrated_addr,
+                crate::registry_owner::SourceExpectation::Owned(token),
+                false,
+            )
+            .await;
+        assert!(
+            migrated.moved(),
+            "migration must succeed for this test to be meaningful"
+        );
+
+        // The first call's own deferred follow-up work FINALLY runs now,
+        // still targeting `old_addr`. It must discover the pin has moved
+        // and do nothing.
+        registry
+            .apply_configure_peer_connection_update(peer_id.clone(), old_addr)
+            .await;
+
+        assert!(
+            recorder.calls.lock().expect("recorder mutex").is_empty(),
+            "a configure_peer follow-up that resumes after a migration moved its pin must \
+             not notify the connect handler for the now-stale address"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&migrated_addr),
+            Some(peer_id),
+            "the migration's destination must be the address actually owned/pinned now"
+        );
+    }
+
+    /// The fence must answer "did I lose the configuration", not "has
+    /// anything at all touched this address since". Ordinary gossip
+    /// chatter re-announcing the SAME identity advances the address's
+    /// general claim generation without touching the pin at all; this
+    /// drives exactly that traffic and asserts the follow-up work still
+    /// runs, which a fence keyed to the generation instead of pin identity
+    /// would wrongly abandon.
+    #[tokio::test]
+    async fn configure_peer_still_resumes_after_unrelated_claim_traffic_for_the_same_address() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_810), test_config());
+        let peer_id = test_peer_id("configure-peer-unrelated-traffic");
+        let addr = test_addr(20_811);
+
+        let recorder = Arc::new(RecordingConnectHandler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry
+            .set_peer_connect_handler(recorder.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        let (outcome, _receipt, _evicted, _reap_in_progress, _generation, _superseded) = registry
+            .add_operator_configured_peer_claim(addr, peer_id.to_node_id(), None)
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // Unrelated traffic for the SAME address lands in the window before
+        // this call's own follow-up work runs -- gossip/discovery
+        // re-announcing the SAME identity (a same-node refresh; the never-
+        // downgrade rule keeps it Verified). This is NOT a `configure_peer`
+        // call and does not touch the pin at all, but it DOES advance
+        // `addr`'s general claim generation.
+        let gossip_outcome = registry
+            .add_peer_with_node_id(
+                addr,
+                Some(peer_id.to_node_id()),
+                crate::addr_ownership::ClaimKind::Provisional,
+            )
+            .await;
+        assert_eq!(gossip_outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // The pin/configured route must be completely unaffected.
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(addr),
+            "unrelated gossip traffic must never move the operator's pin"
+        );
+
+        // The original call's own deferred follow-up work finally runs. It
+        // must NOT stand down: the pin is still exactly this peer's, at
+        // exactly this address, even though the address's general claim
+        // generation has since advanced.
+        registry
+            .apply_configure_peer_connection_update(peer_id.clone(), addr)
+            .await;
+
+        let calls = recorder.calls.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            calls,
+            vec![addr],
+            "unrelated claim traffic for the same address must not make a perfectly valid \
+             configure_peer call stand down and silently never initiate its connection"
+        );
+    }
+
+    /// Same fence, different source of unrelated churn: `required_addr`
+    /// is not authoritative for the pin -- written by every ordinary
+    /// `.connect()`, configured or not. Drives an ordinary connect for a
+    /// DIFFERENT address into the window, moving `required_addr` away
+    /// from the pinned address, and asserts the connect handler still
+    /// fires since the pin itself was never touched.
+    #[tokio::test]
+    async fn configure_peer_still_resumes_after_an_unrelated_ordinary_connect_moves_required_addr()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_820), test_config());
+        let peer_id = test_peer_id("configure-peer-unrelated-connect");
+        let addr = test_addr(20_821);
+        let unrelated_addr = test_addr(20_822);
+
+        let recorder = Arc::new(RecordingConnectHandler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry
+            .set_peer_connect_handler(recorder.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        let (outcome, _receipt, _evicted, _reap_in_progress, _generation, _superseded) = registry
+            .add_operator_configured_peer_claim(addr, peer_id.to_node_id(), None)
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(addr)
+        );
+
+        // An ordinary connect for a DIFFERENT address -- e.g. some other
+        // code path independently dialing this peer -- moves
+        // `ConnectionPool`'s derived `required_addr` away from `addr`,
+        // WITHOUT going through the owner's pin decision at all.
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer_id, unrelated_addr);
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(unrelated_addr),
+            "the ordinary connect must have moved ConnectionPool's derived required_addr"
+        );
+
+        // The original call's own deferred follow-up work finally runs. It
+        // must NOT stand down: the owner's own pin is still genuinely
+        // `addr` for this peer, regardless of what ConnectionPool's
+        // separately-mutated required_addr now shows.
+        registry
+            .apply_configure_peer_connection_update(peer_id.clone(), addr)
+            .await;
+
+        let calls = recorder.calls.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            calls,
+            vec![addr],
+            "an unrelated ordinary connect moving ConnectionPool's derived required_addr \
+             must not make a perfectly valid configure_peer call stand down -- the pin \
+             itself was never touched"
+        );
+    }
+
+    /// `required_addr` is not pin state -- also written by any ordinary
+    /// `.connect()`, so it can point at an address this peer was never
+    /// operator-pinned to. Drives the scenario: a live connection-scoped
+    /// session at B moves `required_addr` there via the ordinary-connect
+    /// path; the operator then configures this peer to C, evicting no
+    /// pin at all, and B's live session must survive untouched.
+    #[tokio::test]
+    async fn configure_peer_does_not_release_a_live_session_whose_required_addr_was_never_the_pin()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_830), test_config());
+        let peer_id = test_peer_id("configure-peer-live-session-not-pin");
+        let session_addr_b = test_addr(20_831);
+        let session_source = test_addr(20_832);
+        let configured_addr_c = test_addr(20_833);
+
+        // A live connection-scoped session at B -- e.g. an inbound accept
+        // or a completed outbound dial -- establishes real, receipted
+        // ownership there. No `configure_peer` call has ever run for this
+        // peer; B was never anyone's operator pin.
+        let (claim_outcome, _) = registry
+            .add_connection_scoped_peer_claim(
+                session_addr_b,
+                peer_id.to_node_id(),
+                crate::addr_ownership::ClaimKind::Verified,
+                session_source,
+            )
+            .await;
+        assert_eq!(claim_outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        assert_eq!(
+            registry.registry_owner.routes_to(&session_addr_b),
+            Some(peer_id.clone())
+        );
+
+        // The SAME ordinary-connect path a real dial uses moves
+        // `required_addr` to B, entirely independent of any pin.
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer_id, session_addr_b);
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(session_addr_b)
+        );
+
+        // The operator now configures this peer to a THIRD address, C.
+        // The owner transaction evicts no pin (there was never one to
+        // evict) and must not disturb B's live session at all.
+        registry
+            .configure_peer(peer_id.clone(), configured_addr_c)
+            .await;
+
+        assert_eq!(
+            registry.registry_owner.routes_to(&configured_addr_c),
+            Some(peer_id.clone()),
+            "the new pin at C must take effect"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&session_addr_b),
+            Some(peer_id.clone()),
+            "B's live session ownership must survive -- required_addr pointing there was \
+             never evidence of a pin to evict"
+        );
+
+        // The session at B must still be able to release itself later --
+        // proving its connection-scoped receipt was not purged out from
+        // under it by a wrongful release.
+        registry
+            .release_connection_scoped_claims(&peer_id, session_source)
+            .await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&session_addr_b),
+            None,
+            "B's own, later, genuinely correct teardown must still be able to release it -- \
+             proving its receipt survived configure_peer's unrelated reconfiguration to C"
+        );
+    }
+
+    /// An ordinary `.connect()` call writes `ConnectionPool`'s
+    /// required/configured route directly -- the SAME fields
+    /// `set_configured_peer_addr` writes from INSIDE the owner's
+    /// serialized `configure_peer`/`migrate` commands. Before this fix,
+    /// an ordinary connect to a DIFFERENT address for an operator-PINNED
+    /// peer would silently overwrite that pin's synchronized route
+    /// publication.
+    ///
+    /// Drives it directly: `configure_peer` pins the peer to A, then an
+    /// ordinary `.connect(&B)` call is made for the same peer. The owner
+    /// pin is obviously untouched (`Peer::connect` never talks to the
+    /// owner), but `ConnectionPool`'s required route must ALSO still show
+    /// A, not silently have moved to B.
+    #[tokio::test]
+    async fn ordinary_connect_does_not_overwrite_an_operator_pinned_required_addr() {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(20_840), test_config()));
+        let peer_id = test_peer_id("ordinary-connect-respects-pin");
+        let addr_a = test_addr(20_841);
+        let addr_b = test_addr(20_842);
+
+        registry.configure_peer(peer_id.clone(), addr_a).await;
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(addr_a)
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr_a),
+            Some(peer_id.clone())
+        );
+
+        // An ordinary connect to a DIFFERENT address for the SAME peer --
+        // e.g. some other code path independently dialing this peer, or a
+        // stale caller that hasn't learned about the reconfiguration.
+        let peer_handle = crate::Peer {
+            peer_id: peer_id.clone(),
+            registry: registry.clone(),
+        };
+        let _ = peer_handle.connect(&addr_b).await;
+
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(addr_a),
+            "an ordinary connect to a different address must not overwrite ConnectionPool's \
+             required/configured route out from under an operator pin"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr_a),
+            Some(peer_id.clone()),
+            "sanity: the owner's own pin was never touched by Peer::connect in the first \
+             place -- this is a ConnectionPool-side check"
+        );
+        assert_eq!(
+            registry.registry_owner.pinned_addr_for(&peer_id),
+            Some(addr_a),
+            "the reverse pin lookup this fix added must still agree"
+        );
+    }
+
+    /// `set_ordinary_connect_route`'s acceptance boolean is only accurate
+    /// at the instant the owner command executes: if it accepts B, and a
+    /// CONCURRENT `configure_peer` pins the peer to A before the dial
+    /// runs, the dial genuinely reaches A, so every outcome must attribute
+    /// to A, not B. Holds `gossip_state`'s lock so the ordinary connect
+    /// blocks right before the dial, lets `configure_peer(A)` complete,
+    /// then releases so the dial resolves to A.
+    #[tokio::test]
+    async fn ordinary_connect_attributes_the_outcome_to_the_address_actually_dialed() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(20_860), test_config()));
+        // Seed chosen so this identity sorts AFTER the registry's own
+        // ("registry_tests") -- `should_keep_connection`'s duplicate-
+        // connection tie-break then keeps an OUTBOUND connection for this
+        // peer rather than evicting it, so the pre-faked connection below
+        // survives `connect_with_route_mode`'s own existing-connection
+        // eviction check instead of being torn down by it before
+        // `connect_to_peer` ever runs.
+        let peer_id = test_peer_id("dial-attribution-race-b");
+        let addr_b = test_addr(20_861); // requested by the ordinary connect
+        let addr_a = test_addr(20_862); // wins the concurrent pin race
+
+        // A pre-faked, already-established outbound connection at A: once
+        // the pool's required route moves there, `connect_to_peer`
+        // resolves it immediately, with no real dial attempted.
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr_a,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr_a, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.set_state(ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        registry
+            .connection_pool
+            .add_connection_by_peer_id(peer_id.clone(), addr_a, conn.clone());
+
+        // Hold `gossip_state`'s lock so the spawned ordinary connect below
+        // completes its route write and then blocks on this exact lock,
+        // right before its own unconditional `PeerInfo` insert for B --
+        // before the dial has run at all.
+        let guard = registry.gossip_state.lock().await;
+
+        let peer = crate::Peer {
+            peer_id: peer_id.clone(),
+            registry: registry.clone(),
+        };
+        let connect_task = tokio::spawn(async move { peer.connect(&addr_b).await });
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // The pin race: `configure_peer`'s OWNER transaction -- the part
+        // that actually moves `ConnectionPool`'s required route to A --
+        // runs and completes here, BEFORE this call's own `gossip_state`
+        // access, which then ALSO blocks on the guard this test still
+        // holds.
+        let registry_for_pin = registry.clone();
+        let peer_id_for_pin = peer_id.clone();
+        let configure_task = tokio::spawn(async move {
+            registry_for_pin
+                .configure_peer(peer_id_for_pin, addr_a)
+                .await
+        });
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        drop(guard);
+        connect_task.await.expect("connect task panicked").expect(
+            "the dial must succeed -- it resolves the pre-faked connection at A once the \
+             pool's required route has moved there",
+        );
+        configure_task.await.expect("configure_peer task panicked");
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let b_marked_healthy = gossip_state
+            .peers
+            .get(&addr_b)
+            .is_some_and(|info| info.last_success != 0 || info.outbound_dial_success);
+        assert!(
+            !b_marked_healthy,
+            "B must never be marked healthy -- this node never actually contacted it, only A \
+             was ever dialed"
+        );
+        let a_entry = gossip_state
+            .peers
+            .get(&addr_a)
+            .expect("configure_peer must have created a peers entry for A");
+        assert!(
+            a_entry.last_success != 0,
+            "whatever is recorded as successfully contacted must be A -- the address actually \
+             dialed, not B -- the address originally requested"
+        );
+    }
+
+    /// Inverse of the above: a stale, losing call's follow-up must not
+    /// resume merely because an unrelated ordinary connect moves
+    /// `required_addr` back to coincide with its lost target. Only the
+    /// owner's own pin decision may authorize the follow-up to run.
+    #[tokio::test]
+    async fn configure_peer_does_not_resume_when_required_addr_coincidentally_matches_a_lost_pin()
+     {
+        let registry = GossipRegistry::<()>::new(test_addr(20_830), test_config());
+        let peer_id = test_peer_id("configure-peer-coincidental-match");
+        let losing_addr = test_addr(20_831);
+        let winning_addr = test_addr(20_832);
+
+        let recorder = Arc::new(RecordingConnectHandler {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry
+            .set_peer_connect_handler(recorder.clone() as Arc<dyn PeerConnectHandler>)
+            .await;
+
+        // Call 1's own transaction: pins `losing_addr`.
+        let (outcome, _receipt, _evicted, _reap_in_progress, _generation, _superseded) = registry
+            .add_operator_configured_peer_claim(losing_addr, peer_id.to_node_id(), None)
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+
+        // A concurrent, winning `configure_peer` for the SAME peer moves
+        // the pin to `winning_addr`, evicting and releasing `losing_addr`.
+        registry
+            .configure_peer(peer_id.clone(), winning_addr)
+            .await;
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(winning_addr)
+        );
+
+        // An unrelated ordinary connect then moves ConnectionPool's derived
+        // required_addr BACK to `losing_addr` -- coincidentally matching
+        // call 1's own stale target, even though the owner's actual pin is
+        // genuinely at `winning_addr`.
+        registry
+            .connection_pool
+            .set_configured_peer_addr(&peer_id, losing_addr);
+        assert_eq!(
+            registry.connection_pool.get_required_peer_addr(&peer_id),
+            Some(losing_addr)
+        );
+
+        // The winning `configure_peer` call above already ran its OWN
+        // follow-up work for `winning_addr` as part of completing
+        // normally; capture that baseline before simulating call 1's
+        // separate, stale resumption below.
+        let calls_before = recorder.calls.lock().expect("recorder mutex").clone();
+        assert_eq!(calls_before, vec![winning_addr]);
+
+        // Call 1's own deferred follow-up work finally runs. It must NOT
+        // resume just because ConnectionPool's required_addr happens to
+        // coincidentally match its own target again.
+        registry
+            .apply_configure_peer_connection_update(peer_id.clone(), losing_addr)
+            .await;
+
+        let calls = recorder.calls.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            calls, calls_before,
+            "a stale call must not resume merely because ConnectionPool's derived \
+             required_addr happens to coincidentally match its own losing target again -- \
+             the owner's actual pin is at winning_addr, not losing_addr"
+        );
+    }
+
+    /// `configure_peer` must not early-return on `outcome == Rejected`
+    /// BEFORE applying the evicted pin's tombstone: `Rejected` and
+    /// `Some(evicted_release)` genuinely co-occur when a concurrent call
+    /// for the SAME peer supersedes this call's `gossip_state` projection
+    /// even though the owner's transaction already evicted+released.
+    #[tokio::test]
+    async fn configure_peer_tombstones_an_evicted_release_even_when_its_own_projection_is_rejected()
+     {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(20_830), test_config()));
+        let peer_id = test_peer_id("configure-peer-tombstone-reorder");
+        let old_addr = test_addr(20_831);
+        let connect_addr = test_addr(20_832);
+        let third_addr = test_addr(20_833);
+
+        // The peer's initial pin, established normally.
+        registry.configure_peer(peer_id.clone(), old_addr).await;
+        let watermark_before = registry
+            .gossip_state
+            .lock()
+            .await
+            .ownership_watermark(&old_addr);
+        assert!(watermark_before.is_some());
+
+        // Hold `gossip_state`'s lock so call 1 (spawned below) is guaranteed
+        // to block right before its own projection check, once its owner
+        // transaction has landed.
+        let guard = registry.gossip_state.lock().await;
+
+        // Call 1: the real, full `configure_peer` under test, reconfiguring
+        // the peer to `connect_addr`. Its owner transaction (claim + pin +
+        // evict-and-release `old_addr`) needs no lock and completes
+        // immediately; it then blocks acquiring the lock held above.
+        let registry_for_call1 = registry.clone();
+        let peer_for_call1 = peer_id.clone();
+        let call1 = tokio::spawn(async move {
+            registry_for_call1
+                .configure_peer(peer_for_call1, connect_addr)
+                .await;
+        });
+
+        // Wait for call 1's own owner transaction to land -- observable,
+        // lock-free, and independent of `gossip_state` -- before submitting
+        // call 2's, so call 2 is guaranteed to find `connect_addr` genuinely
+        // owned by this peer to evict. Bounded and asserted, not a blind
+        // race: if this never becomes true, the test fails loudly here
+        // rather than silently mis-ordering the rest of the scenario.
+        for _ in 0..1000 {
+            if registry.registry_owner.routes_to(&connect_addr) == Some(peer_id.clone()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            Some(peer_id.clone()),
+            "call 1's own owner transaction must have committed before call 2 runs"
+        );
+
+        // Call 2: a concurrent reconfiguration of the SAME peer to a THIRD
+        // address, submitted directly through the owner actor (the full
+        // `configure_peer` would itself need the lock we're holding). This
+        // evicts and releases `connect_addr`, exactly as a second, later
+        // `configure_peer` call's own atomic transaction would.
+        let configured2 = registry
+            .registry_owner
+            .configure_peer(third_addr, peer_id.clone(), None)
+            .await;
+        assert!(configured2.claim().is_accepted());
+        assert_eq!(configured2.evicted_pin(), Some(connect_addr));
+        let release_seq2 = configured2
+            .evicted_release_seq()
+            .expect("connect_addr was genuinely owned by the peer and must be released");
+
+        // Admit call 2's own projection and tombstone the address it
+        // evicted -- exactly what a real winning `configure_peer` call
+        // does -- while still holding the lock, so call 1's own check is
+        // guaranteed to observe it once it resumes.
+        let mut guard = guard;
+        assert!(guard.admit_ownership_projection(
+            third_addr,
+            configured2.claim().commit_seq().expect("accepted claim commits"),
+        ));
+        guard.tombstone_ownership_projection(connect_addr, release_seq2);
+        drop(guard);
+
+        // Call 1 resumes: `connect_addr`'s authoritative owner is no longer
+        // this peer (released by call 2), and call 1's own projection
+        // commit is now stale relative to the watermark call 2 just
+        // advanced -- its claim is therefore reported Rejected. But call
+        // 1's OWN atomic transaction already genuinely evicted and released
+        // `old_addr`, a fact entirely independent of `connect_addr`'s fate.
+        call1.await.expect("call1 task panicked");
+
+        let watermark_after = registry
+            .gossip_state
+            .lock()
+            .await
+            .ownership_watermark(&old_addr);
+        assert!(
+            watermark_after > watermark_before,
+            "call 1's own atomic eviction of old_addr genuinely released it, and that \
+             release must tombstone old_addr's ownership watermark regardless of \
+             connect_addr's own (rejected) projection outcome -- left un-tombstoned, a \
+             still in-flight stale claim for old_addr could later be wrongly re-admitted"
+        );
+    }
+
+    /// The dialability-confirmed write must not run unconditionally: a
+    /// concurrent `configure_peer` that moves THIS SAME peer away from
+    /// `connect_addr` can land between the owner transaction committing
+    /// and this `gossip_state` acquisition. Fixed by fencing on
+    /// `pin_is_current`, the SAME check `apply_configure_peer_connection_
+    /// update` already uses. Constructs the window deterministically: call
+    /// 1 (peer A) commits instantly then blocks acquiring `gossip_state`;
+    /// while blocked, call 2 reconfigures peer A elsewhere directly
+    /// through the owner actor, evicting A's pin; releasing the lock lets
+    /// call 1 resume and `pin_is_current` must read `false`.
+    #[tokio::test]
+    async fn configure_peer_does_not_mark_dialability_for_a_released_address_repinned_mid_call() {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(20_840), test_config()));
+        let peer_a = test_peer_id("dialability-fence-a");
+        let elsewhere_addr = test_addr(20_842);
+        let connect_addr = test_addr(20_841);
+
+        // Simulates an existing, unverified inbound-accept-fallback entry
+        // at `connect_addr` -- the exact flag `mark_dialability_confirmed`
+        // exists to clear, and the one this finding is about NOT clearing
+        // for the wrong reason at the wrong time.
+        {
+            let mut gossip_state = registry.gossip_state.lock().await;
+            let mut info = PeerInfo::local(connect_addr);
+            info.transport_source_keyed = true;
+            gossip_state.peers.insert(connect_addr, info);
+        }
+
+        // Hold `gossip_state`'s lock so call 1 (spawned below) is
+        // guaranteed to block right after its own owner transaction has
+        // landed, but before its own routine claim projection runs.
+        let guard = registry.gossip_state.lock().await;
+
+        // Call 1: peer A's real, full `configure_peer` under test.
+        let registry_for_call1 = registry.clone();
+        let peer_a_for_call1 = peer_a.clone();
+        let call1 = tokio::spawn(async move {
+            registry_for_call1
+                .configure_peer_with_outcome(peer_a_for_call1, connect_addr)
+                .await
+        });
+
+        // Wait for call 1's own owner transaction to land -- observable,
+        // lock-free, and independent of `gossip_state` -- before call 2
+        // runs. Bounded and asserted, not a blind race.
+        for _ in 0..1000 {
+            if registry.registry_owner.routes_to(&connect_addr) == Some(peer_a.clone()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            Some(peer_a.clone()),
+            "call 1's own owner transaction must have committed before call 2 runs"
+        );
+
+        // Call 2: peer A is reconfigured to a DIFFERENT address, directly
+        // through the owner actor -- `gossip_state`-free, so it completes
+        // immediately even though this test still holds the lock call 1
+        // is blocked on. This evicts (and releases) A's pin at
+        // `connect_addr`, exactly as a second, later `configure_peer`
+        // call for the SAME peer would.
+        let configured2 = registry
+            .registry_owner
+            .configure_peer(elsewhere_addr, peer_a.clone(), None)
+            .await;
+        assert!(
+            configured2.claim().is_accepted(),
+            "reconfiguring the same peer to a free address must succeed"
+        );
+        assert_eq!(
+            configured2.evicted_pin(),
+            Some(connect_addr),
+            "sanity: this must be the same eviction connect_addr's own pin undergoes"
+        );
+        assert_eq!(
+            registry.registry_owner.routes_to(&connect_addr),
+            None,
+            "connect_addr must already be released before call 1 resumes"
+        );
+        assert_eq!(
+            registry.registry_owner.pin_owner(&connect_addr),
+            None,
+            "connect_addr's pin must already be cleared before call 1 resumes"
+        );
+
+        drop(guard);
+        let call1_outcome = call1.await.expect("call1 task panicked");
+        assert_eq!(
+            call1_outcome,
+            ConfigurePeerOutcome::Applied,
+            "sanity: call 1's own gossip_state projection must have succeeded (Applied, not \
+             Rejected) -- nothing else had touched gossip_state's ownership watermark for \
+             connect_addr yet, so this test actually reaches the dialability-confirmed \
+             write's own fence rather than being turned away by the unrelated \
+             stale-projection check"
+        );
+
+        let gossip_state = registry.gossip_state.lock().await;
+        let info = gossip_state
+            .peers
+            .get(&connect_addr)
+            .expect("peer entry must exist");
+        assert!(
+            info.transport_source_keyed,
+            "connect_addr must NOT be marked dialability-confirmed by call 1's stale \
+             resumption -- the owner's own authoritative pin had already moved A elsewhere by \
+             the time call 1 reached this write, so call 1's own pin decision is no longer \
+             current"
+        );
+    }
+
+
+    /// The atomic pin-replacement path must not release an evicted
+    /// address's OWNERSHIP without also removing its `connections_by_addr`
+    /// alias: configure P at A then B, and without this fix a lookup for a
+    /// new claimant Q at A would fall through to P's still-live connection
+    /// and deliver Q's traffic over P's TCP connection. Fixed by telling
+    /// `set_configured_peer_addr` which address this SAME pin decision
+    /// evicted, so `evict_pin_alias` removes it atomically in the same call.
+    #[tokio::test]
+    async fn configure_peer_evicts_the_old_pins_stale_connection_alias() {
+        let registry = GossipRegistry::<()>::new(test_addr(21_300), test_config());
+        let peer_p = test_peer_id("stale-alias-p");
+        let peer_q = test_peer_id("stale-alias-q");
+        let addr_a = test_addr(21_301);
+        let addr_b = test_addr(21_302);
+
+        // P has a real, live OUTBOUND connection whose own address (its
+        // dial target) IS A -- exactly the case the finding identified:
+        // an outbound connection's `connection.addr` is ordinarily the
+        // same as whatever it was pinned to when dialed.
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr_a,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr_a, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.embedded_peer_id = Some(peer_p.clone());
+        conn.set_state(ConnectionState::Connected);
+        let p_connection = Arc::new(conn);
+        registry.connection_pool.add_connection_by_peer_id(
+            peer_p.clone(),
+            addr_a,
+            p_connection.clone(),
+        );
+
+        // Configure P at A: matches P's connection's own address exactly,
+        // as it would after a normal dial-then-pin sequence.
+        registry.configure_peer(peer_p.clone(), addr_a).await;
+        assert!(
+            registry
+                .connection_pool
+                .connections_by_addr
+                .read_sync(&addr_a, |_, conn| Arc::ptr_eq(conn, &p_connection))
+                .unwrap_or(false),
+            "sanity: configuring P at A must alias P's connection under A"
+        );
+
+        // Configure P at B: the pin moves, evicting A -- while P's
+        // connection object (still `connection.addr == A`) has not
+        // actually redialed anywhere.
+        registry.configure_peer(peer_p.clone(), addr_b).await;
+
+        // Q claims A -- a legitimate, entirely different identity, now
+        // that A has genuinely been released.
+        registry.configure_peer(peer_q.clone(), addr_a).await;
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr_a),
+            Some(peer_q.clone()),
+            "sanity: Q must now genuinely own A"
+        );
+
+        // THE PROOF: a connection lookup for Q must never resolve to P's
+        // connection. Q has no connection of its own yet (never
+        // published), so the correct, safe answer is `None` -- not P's
+        // still-live stream, even though P's connection's own address IS
+        // the address Q just claimed.
+        let looked_up = registry.connection_pool.get_connection_by_peer_id(&peer_q);
+        assert!(
+            looked_up
+                .as_ref()
+                .is_none_or(|conn| !Arc::ptr_eq(conn, &p_connection)),
+            "a connection lookup for Q must never resolve to P's connection -- traffic \
+             addressed to Q would be delivered over P's actual TCP connection, got {looked_up:?}"
+        );
+
+        // The address-keyed alias at A is gone entirely -- not merely
+        // reassigned by coincidence of Q's own claim -- and P remains
+        // fully reachable through the identity-aware path, proving this
+        // is a routing fix, not a connection loss.
+        assert!(
+            !registry
+                .connection_pool
+                .connections_by_addr
+                .read_sync(&addr_a, |_, conn| Arc::ptr_eq(conn, &p_connection))
+                .unwrap_or(false),
+            "A's alias must no longer resolve to P's connection once A changed hands"
+        );
+        let p_by_identity = registry.connection_pool.get_connection_by_peer_id(&peer_p);
+        assert!(
+            p_by_identity.is_some_and(|conn| Arc::ptr_eq(&conn, &p_connection)),
+            "P's connection must remain reachable through the identity-aware (peer-id) path \
+             even though it is no longer reachable by address A"
         );
     }
 
@@ -21596,6 +25246,7 @@ mod tests {
                 last_sent_sequence: 0,
                 consecutive_deltas: 0,
                 last_failure_time: None,
+                last_failure_instant: None,
                 last_dns_refresh_attempt: None,
                 last_response_received_ms: crate::current_timestamp_millis(),
                 accept_lower_sequence_from: None,

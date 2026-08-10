@@ -2,6 +2,16 @@
 #[derive(Clone)]
 pub struct ConnectionHandle<T = ()> {
     pub addr: SocketAddr,
+    /// Captured once, from the SAME `LockFreeConnection` this handle was
+    /// built from (`ConnectionPool::make_connection_handle`), not
+    /// re-derived later by a second `connections_by_addr` lookup keyed on
+    /// `addr`: that index can be evicted or reassigned to a DIFFERENT
+    /// connection between this handle being resolved and a caller reading
+    /// its direction (pin-alias eviction is one such reassignment), which
+    /// would silently attribute the wrong connection's direction to this
+    /// one. Fixed at construction, correct for this handle's whole
+    /// lifetime -- a connection's own direction never changes.
+    direction: ConnectionDirection,
     // Stream-based writer path (TCP/TLS/Noise/QUIC stream transports).
     stream_handle: Option<Arc<LockFreeStreamHandle>>,
     schema_hash: Option<u64>,
@@ -14,6 +24,7 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionHandle")
             .field("addr", &self.addr)
+            .field("direction", &self.direction)
             .field("stream_handle", &self.stream_handle)
             .field("schema_hash", &self.schema_hash)
             .finish()
@@ -68,17 +79,28 @@ impl std::fmt::Debug for PendingAsk {
 impl<T> ConnectionHandle<T> {
     fn new_stream(
         addr: SocketAddr,
+        direction: ConnectionDirection,
         stream_handle: Arc<LockFreeStreamHandle>,
         correlation: Arc<CorrelationTracker>,
     ) -> Self {
         let schema_hash = stream_handle.schema_hash();
         Self {
             addr,
+            direction,
             stream_handle: Some(stream_handle),
             schema_hash,
             correlation,
             _marker: PhantomData,
         }
+    }
+
+    /// This connection's direction, captured once at construction from the
+    /// same `LockFreeConnection` this handle was built from -- see this
+    /// type's own doc comment for why callers must read it here rather
+    /// than re-deriving it from a fresh `connections_by_addr` lookup.
+    #[inline]
+    pub fn direction(&self) -> ConnectionDirection {
+        self.direction
     }
 
     /// Instance id of the specific stream-handle backing this connection
@@ -1419,7 +1441,7 @@ mod ask_nack_send_tests {
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
         let conn: ConnectionHandle =
-            ConnectionHandle::new_stream(test_addr(), stream_handle, correlation);
+            ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle, correlation);
 
         conn.send_ask_nack(77, crate::framing::AskNackReason::HandlerError)
             .await
@@ -1479,7 +1501,7 @@ mod pubsub_lane_tests {
         );
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
-        let conn = ConnectionHandle::new_stream(test_addr(), stream_handle.clone(), correlation);
+        let conn = ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle.clone(), correlation);
         (conn, stream_handle, task)
     }
 
@@ -1587,7 +1609,7 @@ mod oversized_inline_send_gate_tests {
         );
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
-        let conn = ConnectionHandle::new_stream(test_addr(), stream_handle.clone(), correlation);
+        let conn = ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle.clone(), correlation);
         (conn, stream_handle, task, peer)
     }
 
@@ -2030,7 +2052,7 @@ mod oversized_inline_send_gate_tests {
         );
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
-        let conn = ConnectionHandle::new_stream(test_addr(), stream_handle.clone(), correlation);
+        let conn = ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle.clone(), correlation);
         (conn, stream_handle, task, peer)
     }
 
