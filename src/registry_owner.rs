@@ -1516,7 +1516,7 @@ impl RegistryOwnerHandle {
     /// Take the receiving half before the task is ever spawned, simulating an
     /// owner that is gone so the fail-closed path can be exercised.
     #[cfg(test)]
-    fn simulate_owner_gone(&self) {
+    pub(crate) fn simulate_owner_gone(&self) {
         let _ = self.shared.pending_start.pop();
     }
 

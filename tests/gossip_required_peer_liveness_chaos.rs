@@ -492,13 +492,36 @@ async fn make_peer_silent(node: &TlsHandle, peer_addr: SocketAddr, silence: Dura
 }
 
 async fn apply_no_response_rounds(node: &TlsHandle, peer_addr: SocketAddr, rounds: usize) {
+    // These synthetic results represent the real send task, which carries
+    // the session identity captured when it prepared the request. Preserve
+    // that identity so an armed replacement session correctly rejects only
+    // stale results rather than all of this test's no-response rounds.
+    let (session_source, session_instance_id) = {
+        let state = node.registry.gossip_state.lock().await;
+        let peer = state
+            .peers
+            .get(&peer_addr)
+            .expect("peer must remain tracked while driving no-response rounds");
+        let instance_id = match peer.current_session_connection.as_ref() {
+            Some(connection) => match connection.upgrade() {
+                Some(connection) => match connection.stream_handle.as_ref() {
+                    Some(stream) => Some(stream.instance_id()),
+                    None => None,
+                },
+                None => None,
+            },
+            None => None,
+        };
+        (peer.current_session_source, instance_id)
+    };
+
     for sequence in 0..rounds {
         node.registry
             .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
                 peer_addr,
                 sent_sequence: sequence as u64,
-                session_source: None,
-                session_instance_id: None,
+                session_source,
+                session_instance_id,
                 outcome: Ok(None),
             }])
             .await;

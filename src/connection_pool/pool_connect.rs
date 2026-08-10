@@ -5237,14 +5237,21 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 }
 
-                registry
+                if !registry
                     .mark_authenticated_inbound_liveness(
                         sender_socket_addr,
                         &delta.sender_peer_id,
                         session_source,
                         crate::current_timestamp_millis(),
                     )
-                    .await;
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring delta gossip response after authenticated liveness revalidation failed"
+                    );
+                    return Ok(());
+                }
 
                 // Same §1.6 trust anchor as the DeltaGossip branch above:
                 // responses also carry actor additions, and repair must use

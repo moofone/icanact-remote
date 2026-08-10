@@ -7294,6 +7294,21 @@ impl<T: 'static> GossipRegistry<T> {
                     {
                         let mut gossip_state = self.gossip_state.lock().await;
                         if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
+                            if !self.gossip_result_session_is_current(
+                                result.peer_addr,
+                                peer_info,
+                                result.session_source,
+                                result.session_instance_id,
+                            ) {
+                                warn!(
+                                    peer = %result.peer_addr,
+                                    session_source = ?result.session_source,
+                                    session_instance_id = ?result.session_instance_id,
+                                    "discarding gossip outcome from a superseded or unproven session"
+                                );
+                                continue;
+                            }
+
                             peer_info.last_attempt = current_time;
                             peer_info.last_sent_sequence = result.sent_sequence;
 
@@ -7433,6 +7448,21 @@ impl<T: 'static> GossipRegistry<T> {
                     {
                         let mut gossip_state = self.gossip_state.lock().await;
                         if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
+                            if !self.gossip_result_session_is_current(
+                                result.peer_addr,
+                                peer_info,
+                                result.session_source,
+                                result.session_instance_id,
+                            ) {
+                                warn!(
+                                    peer = %result.peer_addr,
+                                    session_source = ?result.session_source,
+                                    session_instance_id = ?result.session_instance_id,
+                                    "discarding gossip outcome from a superseded or unproven session"
+                                );
+                                continue;
+                            }
+
                             // Hard socket termination (BrokenPipe, ConnectionReset,
                             // ConnectionAborted, NotConnected, RefusedConnection) is
                             // unambiguous evidence the peer is gone — jump straight
@@ -7543,6 +7573,59 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
+    /// Return whether an outbound gossip result still belongs to the session
+    /// that produced it. The caller must hold `gossip_state`'s lock while
+    /// invoking this function and while mutating the corresponding
+    /// `PeerInfo`; otherwise a replacement session could be published between
+    /// validation and the stale result's failure/attempt update.
+    fn gossip_result_session_is_current(
+        &self,
+        peer_addr: SocketAddr,
+        peer_info: &mut PeerInfo,
+        session_source: Option<SocketAddr>,
+        session_instance_id: Option<u64>,
+    ) -> bool {
+        let session_is_current = match peer_info.node_id.as_ref() {
+            Some(node_id) => {
+                let peer_id = node_id.to_peer_id();
+                self.peer_info_is_from_current_session(&peer_id, peer_info, session_source)
+            }
+            None => match peer_info.current_session_source {
+                Some(armed_source) => session_source == Some(armed_source),
+                None => true,
+            },
+        };
+        if !session_is_current {
+            return false;
+        }
+
+        let Some(expected_instance_id) = session_instance_id else {
+            return true;
+        };
+
+        let current_connection = match peer_info.node_id.as_ref() {
+            Some(node_id) => {
+                let peer_id = node_id.to_peer_id();
+                match self
+                    .connection_pool
+                    .peer_current_connection_snapshot(&peer_id)
+                {
+                    Some(connection) => Some(connection),
+                    None => self.connection_pool.get_lock_free_connection(peer_addr),
+                }
+            }
+            None => self.connection_pool.get_lock_free_connection(peer_addr),
+        };
+        let current_instance_id = match current_connection {
+            Some(connection) => match connection.stream_handle.as_ref() {
+                Some(stream) => Some(stream.instance_id()),
+                None => None,
+            },
+            None => None,
+        };
+        current_instance_id == Some(expected_instance_id)
+    }
+
     /// Record that we received a response payload from a peer. Updates
     /// `last_response_received_ms` so the response-asymmetry detector in
     /// `apply_gossip_results` knows the peer is alive at the application
@@ -7566,31 +7649,16 @@ impl<T: 'static> GossipRegistry<T> {
         let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) else {
             return false;
         };
-        let Some(peer_id) = peer_info.node_id.as_ref().map(|node_id| node_id.to_peer_id())
-        else {
-            return false;
-        };
-        if !self.peer_info_is_from_current_session(&peer_id, peer_info, session_source) {
+        if peer_info.node_id.is_none() {
             return false;
         }
-        if let Some(expected_instance_id) = session_instance_id {
-            let current_connection = self
-                .connection_pool
-                .peer_current_connection_snapshot(&peer_id);
-            let current_connection = match current_connection {
-                Some(connection) => Some(connection),
-                None => self.connection_pool.get_lock_free_connection(peer_addr),
-            };
-            let current_instance_id = match current_connection {
-                Some(connection) => match connection.stream_handle.as_ref() {
-                    Some(stream) => Some(stream.instance_id()),
-                    None => None,
-                },
-                None => None,
-            };
-            if current_instance_id != Some(expected_instance_id) {
-                return false;
-            }
+        if !self.gossip_result_session_is_current(
+            peer_addr,
+            peer_info,
+            session_source,
+            session_instance_id,
+        ) {
+            return false;
         }
 
         // Enqueue the owner fence while this validated state lock is still
@@ -24071,6 +24139,34 @@ mod tests {
                 .has_newer_liveness_evidence(peer_addr, evidence_before)
                 .await,
             "old stream result must not refresh owner-side replacement liveness"
+        );
+
+        // Fire-and-forget writes and failed writes carry no response payload,
+        // so they must pass the same session/instance fence before touching
+        // failure bookkeeping. A delayed result from the old stream must not
+        // manufacture the replacement's death verdict.
+        reg.apply_gossip_results(vec![GossipResult {
+            peer_addr,
+            sent_sequence: 2,
+            session_source: Some(peer_addr),
+            session_instance_id: Some(old_instance_id),
+            outcome: Ok(None),
+        }])
+        .await;
+        reg.apply_gossip_results(vec![GossipResult {
+            peer_addr,
+            sent_sequence: 3,
+            session_source: Some(peer_addr),
+            session_instance_id: Some(old_instance_id),
+            outcome: Err(GossipError::Timeout),
+        }])
+        .await;
+
+        let state = reg.gossip_state.lock().await;
+        let peer = state.peers.get(&peer_addr).expect("peer remains tracked");
+        assert_eq!(
+            peer.failures, 2,
+            "stale no-response and error outcomes must not mutate replacement failures"
         );
     }
 

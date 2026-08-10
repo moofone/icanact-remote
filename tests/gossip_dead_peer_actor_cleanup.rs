@@ -1087,6 +1087,29 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
         )
         .unwrap_or(u64::MAX);
 
+        // The synthetic results below stand in for the real send task, so
+        // carry the same session discriminators that task captures. Once the
+        // TLS session has armed a source, a sessionless synthetic result must
+        // be rejected just like a delayed real result from an old stream.
+        let (session_source, session_instance_id) = {
+            let state = publisher.registry.gossip_state.lock().await;
+            let peer = state
+                .peers
+                .get(&sub_addr)
+                .expect("connected subscriber must remain tracked");
+            let instance_id = match peer.current_session_connection.as_ref() {
+                Some(connection) => match connection.upgrade() {
+                    Some(connection) => match connection.stream_handle.as_ref() {
+                        Some(stream) => Some(stream.instance_id()),
+                        None => None,
+                    },
+                    None => None,
+                },
+                None => None,
+            };
+            (peer.current_session_source, instance_id)
+        };
+
         // Drive the verdict deterministically: the subscriber is alive at the
         // socket level (connection stays "usable") but is treated as having
         // stopped answering at the app level — the UDP black-hole shape.
@@ -1100,8 +1123,8 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
                     peer_addr: sub_addr,
                     sent_sequence: sequence as u64,
-                    session_source: None,
-                    session_instance_id: None,
+                    session_source,
+                    session_instance_id,
                     outcome: Ok(None),
                 }])
                 .await;

@@ -7241,6 +7241,70 @@ async fn delta_gossip_response_records_owner_side_liveness_evidence() {
     );
 }
 
+/// A response must not apply its delta when the authoritative owner cannot
+/// accept the liveness fence. The session check can pass while the bounded
+/// owner mailbox is full/closed; treating that failed revalidation as a
+/// success would let the response mutate routing state without protecting it
+/// from a concurrent dead-peer reap.
+#[tokio::test]
+async fn delta_gossip_response_is_dropped_when_owner_liveness_fence_fails() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_delta_response_owner_unavailable_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let peer_id = crate::KeyPair::new_for_testing("lrr_delta_response_owner_unavailable_remote")
+        .peer_id();
+    let peer_addr: SocketAddr = "10.77.0.74:9310".parse().unwrap();
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state.peers.insert(
+            peer_addr,
+            stale_peer_info(
+                peer_addr,
+                crate::current_timestamp_millis().saturating_sub(3_600_000),
+            ),
+        );
+    }
+
+    // Close the owner before the inbound response reaches the liveness fence.
+    // `mark_authenticated_inbound_liveness` must fail closed, and the
+    // response arm must return before applying even an empty delta.
+    registry.registry_owner.simulate_owner_gone();
+    let msg = crate::registry::RegistryMessage::DeltaGossipResponse {
+        delta: crate::registry::RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: Vec::new(),
+            sender_peer_id: peer_id.clone(),
+            wall_clock_time: crate::current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        },
+        extensions: None,
+    };
+
+    super::handle_incoming_message(
+        registry.clone(),
+        peer_addr,
+        peer_addr,
+        Some(peer_id),
+        msg,
+    )
+    .await
+    .expect("an unavailable owner must reject the response without surfacing an error");
+
+    let state = registry.gossip_state.lock().await;
+    assert_eq!(
+        state.delta_exchanges, 0,
+        "a response without an authoritative liveness fence must not apply its delta"
+    );
+}
+
 /// A `FullSyncRequest` is authenticated inbound traffic just like a delta, but
 /// it does not carry an actor update that would otherwise touch the normal
 /// gossip bookkeeping.  It must still refresh the owner's causal liveness
