@@ -361,6 +361,25 @@ impl<T> ConnectionPool<T> {
         None
     }
 
+    fn reuse_published_connection(
+        &self,
+        session: &Arc<PeerSession>,
+    ) -> Option<ConnectionHandle<T>> {
+        let connection = session.current_connection()?;
+        connection.update_last_used();
+        self.make_connection_handle(connection.addr, &connection)
+    }
+
+    fn reuse_published_connection_after_retry_claim(
+        &self,
+        session: &Arc<PeerSession>,
+        attempt: OutboundDialAttempt,
+    ) -> Option<ConnectionHandle<T>> {
+        let handle = self.reuse_published_connection(session)?;
+        session.outbound_dial_retry.record_success(attempt);
+        Some(handle)
+    }
+
     fn get_or_create_peer_session(&self, peer_id: &crate::PeerId) -> Arc<PeerSession> {
         let session = self
             .peer_sessions
@@ -540,7 +559,7 @@ impl<T> ConnectionPool<T> {
         // concurrent caller can observe neither a current connection nor an
         // active retry floor and start a redundant socket attempt.
         session.set_current_connection(Some(connection.clone()));
-        session.outbound_dial_retry.record_success();
+        session.outbound_dial_retry.record_published_connection();
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection);
@@ -584,7 +603,9 @@ impl<T> ConnectionPool<T> {
                 .as_ref()
                 .is_some_and(|cur| Arc::ptr_eq(cur, &connection))
             {
-                session.outbound_dial_retry.record_success();
+                session
+                    .outbound_dial_retry
+                    .record_published_connection();
                 let _ = self
                     .connections_by_peer
                     .upsert_sync(peer_id.clone(), connection);
@@ -593,7 +614,9 @@ impl<T> ConnectionPool<T> {
             return Err(current);
         }
 
-        session.outbound_dial_retry.record_success();
+        session
+            .outbound_dial_retry
+            .record_published_connection();
 
         let stream_instance_id = connection
             .stream_handle
@@ -3440,10 +3463,17 @@ impl<T> ConnectionPool<T> {
                     let retry_session = resolved_node_id.as_ref().map(|node_id| {
                         self.get_or_create_peer_session(&crate::PeerId::from(node_id))
                     });
-                    if retry_session
+                    let retry_attempt = retry_session
                         .as_ref()
-                        .is_some_and(|session| !session.outbound_dial_retry.try_claim_attempt())
-                    {
+                        .map(|session| session.outbound_dial_retry.try_claim_attempt());
+                    if retry_attempt.as_ref().is_some_and(Option::is_none) {
+                        if let Some(handle) = retry_session
+                            .as_ref()
+                            .and_then(|session| self.reuse_published_connection(session))
+                        {
+                            gate_completion.finish(true);
+                            return Ok(handle);
+                        }
                         // This caller did not attempt a socket, so release the
                         // address ownership gate without extending the peer's
                         // failure streak/deadline.
@@ -3452,6 +3482,17 @@ impl<T> ConnectionPool<T> {
                             std::io::ErrorKind::WouldBlock,
                             "outbound retry floor active",
                         )));
+                    }
+                    if let (Some(session), Some(attempt)) = (
+                        retry_session.as_ref(),
+                        retry_attempt.as_ref().copied().flatten(),
+                    ) {
+                        if let Some(handle) =
+                            self.reuse_published_connection_after_retry_claim(session, attempt)
+                        {
+                            gate_completion.finish(true);
+                            return Ok(handle);
+                        }
                     }
                     let result = self
                         .connect_via_stream(
@@ -3462,17 +3503,20 @@ impl<T> ConnectionPool<T> {
                             registry_weak.clone(),
                         )
                         .await;
-                    if let Some(session) = retry_session {
+                    if let (Some(session), Some(attempt)) = (retry_session, retry_attempt.flatten())
+                    {
                         match &result {
-                            Ok(_) => session.outbound_dial_retry.record_success(),
+                            Ok(_) => session.outbound_dial_retry.record_success(attempt),
                             Err(crate::GossipError::Network(error))
                                 if matches!(
                                     error.kind(),
                                     std::io::ErrorKind::WouldBlock
                                         | std::io::ErrorKind::InvalidInput
-                                ) => {}
-                            Err(crate::GossipError::Shutdown) => {}
-                            Err(_) => session.outbound_dial_retry.record_failure(),
+                                ) => session.outbound_dial_retry.record_neutral(attempt),
+                            Err(crate::GossipError::Shutdown) => {
+                                session.outbound_dial_retry.record_neutral(attempt)
+                            }
+                            Err(_) => session.outbound_dial_retry.record_failure(attempt),
                         }
                     }
                     gate_completion.finish(result.is_ok());
