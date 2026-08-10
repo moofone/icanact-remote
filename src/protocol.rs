@@ -1628,6 +1628,7 @@ pub(crate) async fn process_read_result(
             correlation_id,
             actor_id,
             type_hash,
+            request_id,
             schema_hash,
             payload,
         } => {
@@ -1652,6 +1653,7 @@ pub(crate) async fn process_read_result(
                 type_hash,
                 payload,
                 corr_id,
+                request_id,
                 schema_hash,
                 response_connection,
                 response_mode,
@@ -1716,6 +1718,7 @@ pub(crate) async fn process_read_result(
                                 crate::AlignedBytes::from_bytes(complete_data)
                                     .expect("stream buffer must be aligned"),
                                 corr_id,
+                                None,
                                 schema_hash,
                                 response_connection,
                                 ResponseMode::AutoStream,
@@ -1763,6 +1766,7 @@ pub(crate) async fn process_read_result(
                                 crate::AlignedBytes::from_bytes(complete_data)
                                     .expect("stream buffer must be aligned"),
                                 corr_id,
+                                None,
                                 schema_hash,
                                 response_connection,
                                 ResponseMode::AutoStream,
@@ -1787,6 +1791,7 @@ pub(crate) async fn process_read_result(
                             crate::AlignedBytes::from_bytes(complete_data)
                                 .expect("stream buffer must be aligned"),
                             corr_id,
+                            None,
                             schema_hash,
                             response_connection,
                             ResponseMode::AutoStream,
@@ -1923,6 +1928,7 @@ async fn handle_assembled_message(
     type_hash: u32,
     complete_data: crate::AlignedBytes,
     corr_id: u32,
+    request_id: Option<u64>,
     _schema_hash: Option<u64>,
     response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
     response_mode: ResponseMode,
@@ -1977,10 +1983,11 @@ async fn handle_assembled_message(
             if let Some(stream_handle) =
                 response_connection.and_then(|conn| conn.stream_handle.as_ref().cloned())
             {
-                let context = crate::AskContext::from_stream_handle(
+                let context = crate::AskContext::from_stream_handle_with_request_id(
                     corr_id,
                     &stream_handle,
                     authenticated_peer_id,
+                    request_id,
                 );
                 cell.handle(actor_id, type_hash, complete_data, context)
                     .and_then(|disposition| match disposition {
@@ -2019,10 +2026,11 @@ async fn handle_assembled_message(
         if let Some(stream_handle) =
             response_connection.and_then(|conn| conn.stream_handle.as_ref().cloned())
         {
-            let context = crate::AskContext::from_stream_handle(
+            let context = crate::AskContext::from_stream_handle_with_request_id(
                 corr_id,
                 &stream_handle,
                 authenticated_peer_id,
+                request_id,
             );
             cell.handle(actor_id, type_hash, complete_data, context)
                 .and_then(|disposition| match disposition {

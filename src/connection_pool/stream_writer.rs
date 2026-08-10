@@ -3924,6 +3924,69 @@ impl LockFreeStreamHandle {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<()> {
+        self.write_routed_actor_ask_with_optional_request_id(
+            correlation_id,
+            actor_id,
+            type_hash,
+            payload,
+            None,
+        )
+        .await
+    }
+
+    /// Queue an uncompact ActorAsk carrying a stable caller-controlled
+    /// request id. Compact routed asks have no spare identity bytes, so an
+    /// identity-bearing ask deliberately bypasses route-slot interning.
+    pub async fn write_routed_actor_ask_with_request_id(
+        &self,
+        correlation_id: u32,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        request_id: u64,
+    ) -> Result<()> {
+        if request_id == 0 {
+            return Err(crate::GossipError::InvalidConfig(
+                "actor ask request id must be nonzero".to_string(),
+            ));
+        }
+        self.write_routed_actor_ask_with_optional_request_id(
+            correlation_id,
+            actor_id,
+            type_hash,
+            payload,
+            Some(request_id),
+        )
+        .await
+    }
+
+    async fn write_routed_actor_ask_with_optional_request_id(
+        &self,
+        correlation_id: u32,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        request_id: Option<u64>,
+    ) -> Result<()> {
+        if let Some(request_id) = request_id {
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::ACTOR_ASK_HEADER_LEN,
+                payload.len(),
+                self.max_message_size,
+            )?;
+            self.wait_until_identified().await?;
+            let header = crate::framing::try_write_actor_ask_header_with_request_id(
+                correlation_id,
+                actor_id,
+                type_hash,
+                payload.len(),
+                Some(request_id),
+            )?;
+            return self
+                .write_header_and_payload_ask_inline32(header, payload)
+                .await;
+        }
+
         // Fast pre-check before anything else, using the smaller of the two
         // possible header overheads below (`ROUTED_ACTOR_ASK_HEADER_LEN`):
         // an inline ask over `max_message_size` gets a fatal `MessageTooLarge`
@@ -5037,6 +5100,43 @@ mod route_interning_tests {
             outcome.is_ok(),
             "routed-ask route-reuse flow must not hang (R-2): shutdown must wake the parked writer"
         );
+    }
+
+    #[tokio::test]
+    async fn request_id_actor_ask_uses_uncompact_frame_and_preserves_payload() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9902".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+
+        writer
+            .write_routed_actor_ask_with_request_id(
+                17,
+                7,
+                9,
+                bytes::Bytes::from_static(b"opaque"),
+                42,
+            )
+            .await
+            .unwrap();
+        let mut frame = vec![0u8; crate::framing::ACTOR_ASK_FRAME_HEADER_LEN + 6];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(
+            crate::framing::decode_control(frame[..4].try_into().unwrap())
+                .unwrap()
+                .kind,
+            crate::framing::WireKind::ActorAsk
+        );
+        assert_eq!(u64::from_be_bytes(frame[20..28].try_into().unwrap()), 42);
+        assert_eq!(&frame[crate::framing::ACTOR_ASK_FRAME_HEADER_LEN..], b"opaque");
+
+        writer.shutdown();
+        task.await.unwrap();
     }
 
     /// R-2: same route-reuse invariant on the multi-thread flavor, so the

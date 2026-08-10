@@ -309,6 +309,29 @@ pub fn write_actor_ask_header(
         .expect(FRAME_BODY_LEN_INVARIANT)
 }
 
+/// V5 actor ask header carrying an optional caller-controlled request id.
+///
+/// The request id occupies eight bytes of the existing trailing pad. The
+/// remaining four bytes stay zero so legacy actor-ask frames retain their
+/// exact size and alignment. A zero request id is reserved for the legacy,
+/// unmarked form and is rejected when explicitly supplied.
+pub fn write_actor_ask_header_with_request_id(
+    correlation_id: u32,
+    actor_id: u64,
+    type_hash: u32,
+    payload_len: usize,
+    request_id: Option<u64>,
+) -> [u8; ACTOR_ASK_FRAME_HEADER_LEN] {
+    try_write_actor_ask_header_with_request_id(
+        correlation_id,
+        actor_id,
+        type_hash,
+        payload_len,
+        request_id,
+    )
+    .expect(FRAME_BODY_LEN_INVARIANT)
+}
+
 /// Fallible sibling of `write_actor_ask_header` -- see the note on
 /// `FRAME_BODY_LEN_INVARIANT` above. Every internal caller in this crate
 /// uses this, not the infallible form above.
@@ -318,11 +341,36 @@ pub fn try_write_actor_ask_header(
     type_hash: u32,
     payload_len: usize,
 ) -> Result<[u8; ACTOR_ASK_FRAME_HEADER_LEN]> {
+    try_write_actor_ask_header_with_request_id(
+        correlation_id,
+        actor_id,
+        type_hash,
+        payload_len,
+        None,
+    )
+}
+
+/// Fallible actor-ask header writer with an optional out-of-band request id.
+pub fn try_write_actor_ask_header_with_request_id(
+    correlation_id: u32,
+    actor_id: u64,
+    type_hash: u32,
+    payload_len: usize,
+    request_id: Option<u64>,
+) -> Result<[u8; ACTOR_ASK_FRAME_HEADER_LEN]> {
+    if request_id == Some(0) {
+        return Err(crate::GossipError::InvalidConfig(
+            "actor ask request id must be nonzero".to_string(),
+        ));
+    }
     let body_len = try_checked_body_len(ACTOR_ASK_HEADER_LEN, payload_len)?;
     let mut header: [u8; ACTOR_ASK_FRAME_HEADER_LEN] = init_header(WireKind::ActorAsk, body_len)?;
     header[4..8].copy_from_slice(&correlation_id.to_be_bytes());
     header[8..16].copy_from_slice(&actor_id.to_be_bytes());
     header[16..20].copy_from_slice(&type_hash.to_be_bytes());
+    if let Some(request_id) = request_id {
+        header[20..28].copy_from_slice(&request_id.to_be_bytes());
+    }
     Ok(header)
 }
 
@@ -561,11 +609,10 @@ pub fn try_write_pubsub_frame_prefix(payload_len: usize) -> Result<[u8; PUBSUB_F
 /// could be consulted. It is wire surface kept ready for a future DirectAsk
 /// dispatcher, not a capability in use.
 ///
-/// In particular this is *not* what makes the actor-ask path idempotent.
-/// `WireKind::ActorAsk` carries no `request_id` (see
-/// `write_actor_ask_header`), and that is the frame real ask traffic uses.
-/// Dedupe on that path keys on an identity carried inside the payload
-/// instead, so it needs nothing from this header.
+/// Actor asks now expose the same bounded out-of-band identity through
+/// `write_actor_ask_header_with_request_id`; compact routed asks deliberately
+/// remain unmarked because their header has no spare identity bytes. Callers
+/// that need an actor request id therefore use the uncompact ActorAsk form.
 ///
 /// Occupies bytes the frame has always reserved and zeroed after
 /// `correlation_id`, so it costs no extra frame. Fail-closed: `request_id`
@@ -895,6 +942,21 @@ mod tests {
             42,
             "request_id must occupy the frame's previously-zeroed trailing bytes"
         );
+    }
+
+    #[test]
+    fn actor_ask_request_id_uses_reserved_bytes_without_changing_frame_size() {
+        let legacy = write_actor_ask_header(1, 2, 3, 4);
+        let marked = write_actor_ask_header_with_request_id(1, 2, 3, 4, Some(42));
+        assert_eq!(legacy.len(), ACTOR_ASK_FRAME_HEADER_LEN);
+        assert_eq!(marked.len(), ACTOR_ASK_FRAME_HEADER_LEN);
+        assert_eq!(u64::from_be_bytes(legacy[20..28].try_into().unwrap()), 0);
+        assert_eq!(u64::from_be_bytes(marked[20..28].try_into().unwrap()), 42);
+        assert_eq!(&marked[28..32], &[0; 4]);
+        assert!(matches!(
+            try_write_actor_ask_header_with_request_id(1, 2, 3, 4, Some(0)),
+            Err(GossipError::InvalidConfig(_))
+        ));
     }
 
     #[test]

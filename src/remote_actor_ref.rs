@@ -115,6 +115,36 @@ impl RemoteConnection {
             .await
     }
 
+    /// Ask an actor with a caller-controlled out-of-band request id. The
+    /// identity is carried in the uncompact ActorAsk header and is available
+    /// through the receiver's [`crate::AskContext::request_id`].
+    pub async fn ask_actor_frame_with_request_id(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+        request_id: u64,
+    ) -> crate::Result<bytes::Bytes> {
+        self.inner
+            .ask_actor_frame_with_request_id(actor_id, type_hash, payload, timeout, request_id)
+            .await
+    }
+
+    /// Aligned response variant of [`Self::ask_actor_frame_with_request_id`].
+    pub async fn ask_actor_frame_aligned_with_request_id(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+        request_id: u64,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner
+            .ask_actor_frame_aligned_with_request_id(actor_id, type_hash, payload, timeout, request_id)
+            .await
+    }
+
     pub async fn ask_actor_frame_no_timeout(
         &self,
         actor_id: u64,

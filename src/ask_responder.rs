@@ -130,6 +130,18 @@ impl<'a> TellContext<'a> {
     }
 }
 
+/// Observes the first reply claimed for one deferred ask.
+///
+/// The observer is called at most once for a context, after the responder's
+/// shared single-use claim succeeds and before transport enqueue. It receives
+/// an owned, exact-sized copy of the wire payload so an observer may retain it
+/// without keeping a larger decode or pool allocation alive. The callback must
+/// remain nonblocking: it runs on the responder's reply path, including the
+/// synchronous `try_reply_*` paths.
+pub trait AskReplyObserver: Send + Sync {
+    fn reply_claimed(&self, payload: Bytes);
+}
+
 #[derive(Clone)]
 enum AskResponseSink {
     StreamHandle(Arc<LockFreeStreamHandle>),
@@ -219,6 +231,7 @@ enum AskContextSink<'a> {
 
 pub struct AskContext<'a> {
     correlation_id: u32,
+    request_id: Option<u64>,
     authenticated_peer_id: Option<&'a crate::PeerId>,
     sink: AskContextSink<'a>,
     /// ACTOR_REM_2 R15: shared single-use guard for this inbound ask. Every
@@ -227,32 +240,48 @@ pub struct AskContext<'a> {
     /// would otherwise complete an unrelated ask after correlation-id reuse
     /// wraps.
     used: Arc<AtomicBool>,
+    reply_observer: Option<Arc<dyn AskReplyObserver>>,
 }
 
 impl<'a> AskContext<'a> {
-    pub(crate) fn from_stream_handle(
+    pub(crate) fn from_stream_handle_with_request_id(
         correlation_id: u32,
         stream_handle: &'a Arc<LockFreeStreamHandle>,
         authenticated_peer_id: Option<&'a crate::PeerId>,
+        request_id: Option<u64>,
     ) -> Self {
         Self {
             correlation_id,
+            request_id,
             authenticated_peer_id,
             sink: AskContextSink::StreamHandle(stream_handle),
             used: Arc::new(AtomicBool::new(false)),
+            reply_observer: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_writer(
         correlation_id: u32,
         writer: &'a Arc<ResponseWriter>,
         authenticated_peer_id: Option<&'a crate::PeerId>,
     ) -> Self {
+        Self::from_writer_with_request_id(correlation_id, writer, authenticated_peer_id, None)
+    }
+
+    pub(crate) fn from_writer_with_request_id(
+        correlation_id: u32,
+        writer: &'a Arc<ResponseWriter>,
+        authenticated_peer_id: Option<&'a crate::PeerId>,
+        request_id: Option<u64>,
+    ) -> Self {
         Self {
             correlation_id,
+            request_id,
             authenticated_peer_id,
             sink: AskContextSink::DeferredWriter(writer),
             used: Arc::new(AtomicBool::new(false)),
+            reply_observer: None,
         }
     }
 
@@ -260,22 +289,58 @@ impl<'a> AskContext<'a> {
         self.correlation_id
     }
 
+    /// Stable caller-controlled identity carried out-of-band by an actor ask.
+    /// `None` denotes a legacy ask without a request identity.
+    pub fn request_id(&self) -> Option<u64> {
+        self.request_id
+    }
+
     pub fn authenticated_peer_id(&self) -> Option<&crate::PeerId> {
         self.authenticated_peer_id
     }
 
+    /// Attach a nonblocking observer for the one reply eventually claimed by
+    /// this ask. Existing callers that do not attach one keep the zero-copy
+    /// response paths unchanged.
+    pub fn with_reply_observer(mut self, observer: Arc<dyn AskReplyObserver>) -> Self {
+        self.reply_observer = Some(observer);
+        self
+    }
+
     pub fn responder(&self) -> AskResponder {
         match &self.sink {
-            AskContextSink::StreamHandle(stream_handle) => AskResponder::from_stream_handle(
-                self.correlation_id,
-                (*stream_handle).clone(),
-                Arc::clone(&self.used),
-            ),
-            AskContextSink::DeferredWriter(writer) => AskResponder::from_writer(
-                self.correlation_id,
-                (*writer).clone(),
-                Arc::clone(&self.used),
-            ),
+            AskContextSink::StreamHandle(stream_handle) => {
+                if let Some(observer) = &self.reply_observer {
+                    AskResponder::from_stream_handle_with_observer(
+                        self.correlation_id,
+                        (*stream_handle).clone(),
+                        Arc::clone(&self.used),
+                        Some(Arc::clone(observer)),
+                    )
+                } else {
+                    AskResponder::from_stream_handle(
+                        self.correlation_id,
+                        (*stream_handle).clone(),
+                        Arc::clone(&self.used),
+                    )
+                }
+            }
+            AskContextSink::DeferredWriter(writer) => {
+                if let Some(observer) = &self.reply_observer {
+                    AskResponder::from_writer_with_observer(
+                        self.correlation_id,
+                        (*writer).clone(),
+                        Arc::clone(&self.used),
+                        Some(Arc::clone(observer)),
+                    )
+                } else {
+                    AskResponder::from_writer(
+                        self.correlation_id,
+                        (*writer).clone(),
+                        Arc::clone(&self.used),
+                    )
+                }
+            }
         }
     }
 }
@@ -288,6 +353,7 @@ pub struct AskResponder {
     /// Clones share the same `Arc`, so only the first reply across all clones
     /// and sibling responders for this correlation reaches the wire.
     used: Arc<AtomicBool>,
+    reply_observer: Option<Arc<dyn AskReplyObserver>>,
 }
 
 /// Exclusive fallback ownership after an immediate reply was rejected before
@@ -366,10 +432,20 @@ impl AskResponder {
         stream_handle: Arc<LockFreeStreamHandle>,
         used: Arc<AtomicBool>,
     ) -> Self {
+        Self::from_stream_handle_with_observer(correlation_id, stream_handle, used, None)
+    }
+
+    fn from_stream_handle_with_observer(
+        correlation_id: u32,
+        stream_handle: Arc<LockFreeStreamHandle>,
+        used: Arc<AtomicBool>,
+        reply_observer: Option<Arc<dyn AskReplyObserver>>,
+    ) -> Self {
         Self {
             correlation_id,
             sink: AskResponseSink::StreamHandle(stream_handle),
             used,
+            reply_observer,
         }
     }
 
@@ -378,10 +454,20 @@ impl AskResponder {
         writer: Arc<ResponseWriter>,
         used: Arc<AtomicBool>,
     ) -> Self {
+        Self::from_writer_with_observer(correlation_id, writer, used, None)
+    }
+
+    fn from_writer_with_observer(
+        correlation_id: u32,
+        writer: Arc<ResponseWriter>,
+        used: Arc<AtomicBool>,
+        reply_observer: Option<Arc<dyn AskReplyObserver>>,
+    ) -> Self {
         Self {
             correlation_id,
             sink: AskResponseSink::DeferredWriter(writer),
             used,
+            reply_observer,
         }
     }
 
@@ -391,6 +477,7 @@ impl AskResponder {
 
     pub async fn reply(self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
+        self.notify_observer(&response);
         self.sink
             .send_response_bytes(self.correlation_id, response)
             .await
@@ -406,6 +493,7 @@ impl AskResponder {
     /// exclusive retry or fallback path.
     pub fn try_reply_bytes(self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
+        self.notify_observer(&response);
         self.sink
             .try_send_response_bytes(self.correlation_id, response)
     }
@@ -421,6 +509,7 @@ impl AskResponder {
         if let Err(error) = claim_reply(&self.used) {
             return Err(TryReplyError::ClaimUnavailable(error));
         }
+        self.notify_observer(&response);
         match self
             .sink
             .try_send_response_bytes(self.correlation_id, response)
@@ -462,6 +551,7 @@ impl AskResponder {
     /// the caller needs an exclusive retry or fallback path.
     pub fn try_reply_bytes_immediate(self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
+        self.notify_observer(&response);
         self.sink
             .try_send_response_bytes_immediate(self.correlation_id, response)
     }
@@ -477,6 +567,7 @@ impl AskResponder {
         if let Err(error) = claim_reply(&self.used) {
             return Err(TryReplyError::ClaimUnavailable(error));
         }
+        self.notify_observer(&response);
         match self
             .sink
             .try_send_response_bytes_immediate(self.correlation_id, response)
@@ -496,9 +587,26 @@ impl AskResponder {
         claim_reply(&self.used)?;
         let payload = crate::typed::encode_typed_pooled(value)?;
         let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<M>(payload);
+        if self.reply_observer.is_some() && payload_len <= crate::MAX_STREAM_SIZE {
+            let bytes = pooled_payload_into_bytes(prefix, payload);
+            self.notify_observer(&bytes);
+            return self
+                .sink
+                .send_response_bytes(self.correlation_id, bytes)
+                .await;
+        }
         self.sink
             .send_response_pooled(self.correlation_id, payload, prefix, payload_len)
             .await
+    }
+
+    #[inline]
+    fn notify_observer(&self, response: &Bytes) {
+        if response.len() <= crate::MAX_STREAM_SIZE
+            && let Some(observer) = &self.reply_observer
+        {
+            observer.reply_claimed(Bytes::copy_from_slice(response.as_ref()));
+        }
     }
 }
 
@@ -595,14 +703,36 @@ impl ResponseWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingReplyObserver {
+        payloads: Mutex<Vec<Bytes>>,
+    }
+
+    impl AskReplyObserver for RecordingReplyObserver {
+        fn reply_claimed(&self, payload: Bytes) {
+            self.payloads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(payload);
+        }
+    }
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, PartialEq)]
+    struct ObservedTypedReply {
+        value: u64,
+    }
+    crate::wire_type!(ObservedTypedReply, "ask_responder::ObservedTypedReply");
 
     #[test]
     fn ask_context_exposes_authenticated_peer_id() {
         let peer_id = crate::KeyPair::new_for_testing("ask-context-peer").peer_id();
         let writer = Arc::new(ResponseWriter::new("127.0.0.1:12345".parse().unwrap()));
-        let context = AskContext::from_writer(7, &writer, Some(&peer_id));
+        let context = AskContext::from_writer_with_request_id(7, &writer, Some(&peer_id), Some(42));
 
         assert_eq!(context.correlation_id(), 7);
+        assert_eq!(context.request_id(), Some(42));
         assert_eq!(context.authenticated_peer_id(), Some(&peer_id));
     }
 
@@ -612,6 +742,56 @@ mod tests {
         let context = TellContext::new(Some(&peer_id));
 
         assert_eq!(context.authenticated_peer_id(), Some(&peer_id));
+    }
+
+    #[test]
+    fn reply_observer_is_one_shot_and_receives_owned_bytes_before_enqueue() {
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12349".parse().unwrap()));
+        let observer = Arc::new(RecordingReplyObserver::default());
+        let context = AskContext::from_writer(14, &writer, None)
+            .with_reply_observer(Arc::clone(&observer) as Arc<dyn AskReplyObserver>);
+
+        // The writer has no bound stream, so the transport enqueue fails after
+        // the claim. The observer must still record the response: a caller may
+        // need the bytes to replay a side effect whose direct reply was lost.
+        let first_result = context
+            .responder()
+            .try_reply_bytes(Bytes::from_static(b"reply"));
+        assert!(first_result.is_err());
+
+        let duplicate_result = context
+            .responder()
+            .try_reply_bytes(Bytes::from_static(b"again"));
+        assert!(is_duplicate(&duplicate_result));
+
+        let payloads = observer
+            .payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(payloads.as_slice(), [Bytes::from_static(b"reply")]);
+    }
+
+    #[tokio::test]
+    async fn reply_observer_copies_pooled_typed_wire_payload() {
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12350".parse().unwrap()));
+        let observer = Arc::new(RecordingReplyObserver::default());
+        let context = AskContext::from_writer(15, &writer, None)
+            .with_reply_observer(Arc::clone(&observer) as Arc<dyn AskReplyObserver>);
+        let reply = ObservedTypedReply { value: 7 };
+
+        // The response writer is intentionally unbound; the observer still
+        // receives the complete type-prefixed wire payload before enqueue.
+        let result = context.responder().reply_typed(&reply).await;
+        assert!(result.is_err());
+
+        let payloads = observer
+            .payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let encoded = crate::typed::encode_typed_pooled(&reply).unwrap();
+        let (payload, prefix, _) = crate::typed::typed_payload_parts::<ObservedTypedReply>(encoded);
+        let expected = pooled_payload_into_bytes(prefix, payload);
+        assert_eq!(payloads.as_slice(), [expected]);
     }
 
     fn is_duplicate(result: &Result<()>) -> bool {
