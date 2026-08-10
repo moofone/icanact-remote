@@ -6136,7 +6136,9 @@ impl<T: 'static> GossipRegistry<T> {
         // The lock-free actor insertion is visible to route readers before
         // the gossip-state commit below. Publish that visibility at the
         // mutation boundary, and publish every compensating removal in the
-        // rollback paths below as well.
+        // rollback paths below as well. Keep this after `insert_sync`: a
+        // control-plane refresh that observes this revision must also be able
+        // to observe the actor it is meant to route.
         self.actor_state.mark_routing_changed_for_actor(&name);
 
         // If a remote actor raced in concurrently, roll back and preserve original semantics.
@@ -21697,6 +21699,27 @@ mod tests {
         assert!(
             !registry.actor_state.local_actors.contains_sync(actor_name),
             "failed registration must not leave a local actor behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_actor_publishes_revision_for_visible_local_actor() {
+        let registry = GossipRegistry::<()>::new(test_addr(7144), test_config());
+        let actor_name = "icanact/pubsub/interest/v1/0000000000000001/registration-peer";
+        let before = registry.actor_state.pubsub_routing_revision();
+
+        registry
+            .register_actor(actor_name.to_owned(), test_location(test_addr(7145)))
+            .await
+            .unwrap();
+
+        assert!(
+            registry.actor_state.local_actors.contains_sync(actor_name),
+            "successful registration must publish the local actor before returning"
+        );
+        assert!(
+            registry.actor_state.pubsub_routing_revision() > before,
+            "the route revision must advance for the visible local actor"
         );
     }
 
