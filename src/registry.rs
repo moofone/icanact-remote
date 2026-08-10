@@ -154,13 +154,16 @@ fn stable_equal_version_location_cmp(
     candidate.metadata.cmp(&existing.metadata)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum ActorUpsertPlan {
     Apply {
         clear_tombstone: bool,
         is_update: bool,
     },
-    RefreshOwnerLease,
+    RefreshOwnerLease {
+        expected_location: RemoteActorLocation,
+    },
+    OwnerLeaseRefreshed,
     Ignore,
 }
 
@@ -3608,21 +3611,19 @@ impl<T: 'static> GossipRegistry<T> {
                         location,
                         priority,
                     } => {
-                        let clear_tombstone = match self.current_actor_upsert_plan(
-                            name.as_str(),
-                            &location,
-                            &sender_peer_id,
-                        ) {
-                            ActorUpsertPlan::Apply {
-                                clear_tombstone, ..
-                            } => clear_tombstone,
-                            ActorUpsertPlan::RefreshOwnerLease => {
-                                self.mark_known_actor_observed(name.as_str());
-                                peer_actors_added.insert(name);
-                                continue;
-                            }
-                            ActorUpsertPlan::Ignore => continue,
-                        };
+                        let clear_tombstone =
+                            match self.actor_upsert_plan(name.as_str(), &location, &sender_peer_id)
+                            {
+                                ActorUpsertPlan::Apply {
+                                    clear_tombstone, ..
+                                } => clear_tombstone,
+                                ActorUpsertPlan::OwnerLeaseRefreshed => {
+                                    peer_actors_added.insert(name);
+                                    continue;
+                                }
+                                ActorUpsertPlan::RefreshOwnerLease { .. }
+                                | ActorUpsertPlan::Ignore => continue,
+                            };
                         let previous_observation = self.known_actor_observation(name.as_str());
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
@@ -4017,7 +4018,7 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     #[inline]
-    fn mark_known_actor_observed(&self, name: &str) {
+    fn next_known_actor_observation(&self) -> KnownActorObservation {
         let generation = match self
             .actor_state
             .next_known_actor_observation_generation
@@ -4027,22 +4028,64 @@ impl<T: 'static> GossipRegistry<T> {
             Ok(previous) => previous.saturating_add(1),
             Err(current) => current,
         };
-        let observation = KnownActorObservation {
+        KnownActorObservation {
             observed_at: Instant::now(),
             generation,
-        };
+        }
+    }
+
+    #[inline]
+    fn mark_known_actor_observed(&self, name: &str) {
+        let observation = self.next_known_actor_observation();
         match self
             .actor_state
             .known_actor_last_observed
             .entry_sync(name.to_owned())
         {
             Entry::Occupied(mut entry) => {
-                if generation > entry.get().generation {
+                if observation.generation > entry.get().generation {
                     *entry.get_mut() = observation;
                 }
             }
             Entry::Vacant(entry) => {
                 let _ = entry.insert_entry(observation);
+            }
+        }
+    }
+
+    #[inline]
+    fn mark_known_actor_observed_if_location(
+        &self,
+        name: &str,
+        expected_location: &RemoteActorLocation,
+    ) -> bool {
+        let observation = self.next_known_actor_observation();
+        match self
+            .actor_state
+            .known_actor_last_observed
+            .entry_sync(name.to_owned())
+        {
+            Entry::Occupied(mut entry) => {
+                let location_matches = self
+                    .actor_state
+                    .known_actors
+                    .read_sync(name, |_, current| current == expected_location)
+                    .unwrap_or(false);
+                if location_matches && observation.generation > entry.get().generation {
+                    *entry.get_mut() = observation;
+                }
+                location_matches
+            }
+            Entry::Vacant(entry) => {
+                let location_matches = self
+                    .actor_state
+                    .known_actors
+                    .read_sync(name, |_, current| current == expected_location)
+                    .unwrap_or(false);
+                if location_matches {
+                    let _ = entry.insert_entry(observation);
+                }
+                location_matches
             }
         }
     }
@@ -4242,7 +4285,9 @@ impl<T: 'static> GossipRegistry<T> {
                             std::cmp::Ordering::Equal | std::cmp::Ordering::Less
                                 if refreshes_stored_owner =>
                             {
-                                ActorUpsertPlan::RefreshOwnerLease
+                                ActorUpsertPlan::RefreshOwnerLease {
+                                    expected_location: existing_location.clone(),
+                                }
                             }
                             std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
                                 ActorUpsertPlan::Ignore
@@ -4263,6 +4308,25 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             }
         }
+    }
+
+    fn actor_upsert_plan(
+        &self,
+        name: &str,
+        location: &RemoteActorLocation,
+        sender_peer_id: &PeerId,
+    ) -> ActorUpsertPlan {
+        for _ in 0..2 {
+            match self.current_actor_upsert_plan(name, location, sender_peer_id) {
+                ActorUpsertPlan::RefreshOwnerLease { expected_location } => {
+                    if self.mark_known_actor_observed_if_location(name, &expected_location) {
+                        return ActorUpsertPlan::OwnerLeaseRefreshed;
+                    }
+                }
+                plan => return plan,
+            }
+        }
+        ActorUpsertPlan::Ignore
     }
 
     fn current_actor_removal_plan(
@@ -5247,21 +5311,19 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
 
             for (name, location, addr) in &updates_to_apply {
-                let (clear_tombstone, is_update) = match self.current_actor_upsert_plan(
-                    name.as_str(),
-                    location,
-                    &sender_peer_id,
-                ) {
-                    ActorUpsertPlan::Apply {
-                        clear_tombstone,
-                        is_update,
-                    } => (clear_tombstone, is_update),
-                    ActorUpsertPlan::RefreshOwnerLease => {
-                        self.mark_known_actor_observed(name.as_str());
-                        continue;
-                    }
-                    ActorUpsertPlan::Ignore => continue,
-                };
+                let (clear_tombstone, is_update) =
+                    match self.actor_upsert_plan(name.as_str(), location, &sender_peer_id) {
+                        ActorUpsertPlan::Apply {
+                            clear_tombstone,
+                            is_update,
+                        } => (clear_tombstone, is_update),
+                        ActorUpsertPlan::OwnerLeaseRefreshed => {
+                            continue;
+                        }
+                        ActorUpsertPlan::RefreshOwnerLease { .. } | ActorUpsertPlan::Ignore => {
+                            continue;
+                        }
+                    };
                 let previous_observation = self.known_actor_observation(name.as_str());
                 if clear_tombstone {
                     let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
@@ -11532,6 +11594,32 @@ mod tests {
         assert!(
             reg.lookup_actor(actor).await.is_some(),
             "a direct-owner refresh after the age check must prevent stale cleanup removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_owner_lease_refresh_does_not_create_orphan_observation() {
+        let reg = GossipRegistry::<()>::new(test_addr(7015), test_config());
+        let actor = "actor.conditional-owner-refresh";
+        let owner = test_peer_id("conditional_owner_refresh");
+        let location = RemoteActorLocation::new_with_peer(test_addr(9015), owner);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .insert_sync(actor.to_string(), location.clone());
+        reg.mark_known_actor_observed(actor);
+
+        let _ = reg.remove_known_actor(actor);
+        assert!(
+            !reg.mark_known_actor_observed_if_location(actor, &location),
+            "a lease refresh planned for a removed location must be rejected"
+        );
+        assert!(read_known_actor(&reg, actor).is_none());
+        assert!(
+            !reg.actor_state
+                .known_actor_last_observed
+                .contains_sync(actor),
+            "a rejected refresh must not leave an orphan lease observation"
         );
     }
 
