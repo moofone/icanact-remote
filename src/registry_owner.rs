@@ -1563,6 +1563,10 @@ impl RegistryOwnerHandle {
 struct ReapReservationEntry {
     valid: Arc<AtomicBool>,
     consumed: bool,
+    /// The fixed failure-evidence instant this reservation was selected for.
+    /// Liveness captured before this fence must not invalidate the reservation
+    /// merely because its owner command was delayed in the mailbox.
+    evidence_before: std::time::Instant,
     /// Evidence received while the closing authorization is held is applied
     /// when the destructive phase releases the reservation. This keeps the
     /// owner from committing liveness in the middle of actor/tombstone
@@ -2226,16 +2230,19 @@ impl PeerRegistryOwner {
     ///
     /// Any owner command that commits a fact making `addr` no longer
     /// genuinely worth reaping should call this as part of that SAME
-    /// atomic commit. Two callers do: `note_liveness_evidence`, the
-    /// instant DIRECT liveness evidence commits for a currently-reserved
-    /// address (the consumed case is retained in the reservation instead of
-    /// being invalidated), and `configure_peer`, the instant an operator's
-    /// own reconfiguration evicts `addr` from a peer's pin -- which DOES
-    /// consult the return value, precisely because an already-consumed
-    /// reservation cannot be revoked.
-    fn invalidate_reap_reservation(&self, addr: SocketAddr) -> bool {
+    /// atomic commit. For liveness evidence, `at` must be at or after the
+    /// reservation's fixed failure fence: an observation captured before
+    /// that fence is stale and must not cancel a newer reservation merely
+    /// because its command was delayed. Two callers do:
+    /// `note_liveness_evidence`, when direct evidence is at or after the
+    /// fence (the consumed case is retained in the reservation instead of
+    /// being invalidated), and `configure_peer`, whose current-time
+    /// observation invalidates when an operator evicts `addr` from a peer's
+    /// pin -- which DOES consult the return value, precisely because an
+    /// already-consumed reservation cannot be revoked.
+    fn invalidate_reap_reservation(&self, addr: SocketAddr, at: std::time::Instant) -> bool {
         match self.reap_reserved.get(&addr) {
-            Some(entry) if !entry.consumed => {
+            Some(entry) if !entry.consumed && at >= entry.evidence_before => {
                 entry.valid.store(false, Ordering::Release);
                 true
             }
@@ -2251,15 +2258,17 @@ impl PeerRegistryOwner {
     /// one first) never rolls the recorded evidence backwards.
     ///
     /// Before the closing authorization is granted, this invalidates a
-    /// currently-held reap reservation for `addr`: a one-time verdict
-    /// obtained through an `.await` before the destructive phase's
-    /// irreversible steps run is stale the moment it returns. Once the
-    /// owner has granted the closing authorization, evidence is deferred
-    /// until `ReleaseReapReservation`; the authorization is the owner-side
+    /// currently-held reap reservation for `addr` when `at` is at or after
+    /// its fixed failure fence: a one-time verdict obtained through an
+    /// `.await` before the destructive phase's irreversible steps run is
+    /// stale the moment it returns. Older evidence is retained as history
+    /// but cannot postpone a newer reservation. Once the owner has granted
+    /// the closing authorization, evidence is deferred until
+    /// `ReleaseReapReservation`; the authorization is the owner-side
     /// linearization point that keeps liveness from committing between the
     /// final check and actor/tombstone destruction. Release commits any
-    /// deferred evidence before removing the reservation, so the evidence is
-    /// not lost and later commands observe the correct owner order.
+    /// deferred evidence before removing the reservation, so the evidence
+    /// is not lost and later commands observe the correct owner order.
     fn note_liveness_evidence(&mut self, addr: SocketAddr, at: std::time::Instant) {
         if let Some(entry) = self.reap_reserved.get_mut(&addr) {
             if entry.consumed {
@@ -2273,7 +2282,7 @@ impl PeerRegistryOwner {
         }
 
         self.commit_liveness_evidence(addr, at);
-        self.invalidate_reap_reservation(addr);
+        self.invalidate_reap_reservation(addr, at);
     }
 
     /// Commit direct liveness without consulting reap state. Used when the
@@ -2515,6 +2524,7 @@ impl PeerRegistryOwner {
             ReapReservationEntry {
                 valid: valid.clone(),
                 consumed: false,
+                evidence_before,
                 deferred_liveness_at: None,
             },
         );
@@ -2774,7 +2784,8 @@ impl PeerRegistryOwner {
             // `evicted_addr` is exactly `would_evict`, already confirmed
             // not consumed, and nothing since then (all synchronous, no
             // `.await`, within this one command) can have consumed it.
-            let invalidated = self.invalidate_reap_reservation(evicted_addr);
+            let invalidated = self
+                .invalidate_reap_reservation(evicted_addr, std::time::Instant::now());
             debug_assert!(
                 invalidated || !self.reap_reserved.contains_key(&evicted_addr),
                 "evicted_addr's reservation must not have become consumed between the \
@@ -3868,6 +3879,32 @@ mod tests {
             "equal monotonic timestamps must fail closed rather than purge a peer"
         );
         assert_eq!(owner.routes_to(&target), Some(node));
+    }
+
+    /// Liveness captured before a reap's fixed failure fence is stale for
+    /// that reservation. It must still be recorded for the owner, but must
+    /// not invalidate the reservation and repeatedly postpone the same
+    /// cleanup merely because its command was delayed in the mailbox.
+    #[tokio::test]
+    async fn stale_liveness_does_not_invalidate_a_newer_reap_reservation() {
+        let (owner, _publisher) = owner_handle();
+        let target = addr(30_049);
+        let stale_at = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let evidence_before = std::time::Instant::now();
+
+        let reservation = owner
+            .reserve_for_reap(target, evidence_before, None, None, None)
+            .await
+            .expect("an unclaimed address must be reservable");
+
+        owner.note_liveness_evidence(target, stale_at).await;
+
+        assert!(
+            reservation.try_consume().await,
+            "liveness older than the reservation fence must not cancel its authorization"
+        );
+        reservation.release().await;
     }
 
     /// Address re-resolution moves ownership rather than stranding it.

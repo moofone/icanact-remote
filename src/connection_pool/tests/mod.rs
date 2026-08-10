@@ -7307,7 +7307,7 @@ async fn full_sync_request_records_owner_side_liveness_evidence() {
         .expect("peer should remain in gossip state after FullSyncRequest");
     assert_eq!(info.failures, 0, "authenticated request must clear failures");
     assert!(
-        info.last_response_received_ms >= stale_time,
+        info.last_response_received_ms > stale_time,
         "authenticated request must refresh response bookkeeping"
     );
 }
